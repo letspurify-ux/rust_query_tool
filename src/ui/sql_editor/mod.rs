@@ -34,6 +34,7 @@ use oracle::Connection;
 
 mod dba_tools;
 mod execution;
+mod formatter;
 mod intellisense;
 mod intellisense_host;
 mod intellisense_state;

@@ -1,0 +1,9385 @@
+use crate::db::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
+use crate::sql_text::{
+    self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
+    FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
+};
+use crate::ui::sql_depth::{
+    is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
+    split_top_level_symbol_groups,
+};
+
+use super::SqlToken;
+use super::SqlEditorWidget;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineLayoutKind {
+    Blank,
+    Code,
+    CommentOnly,
+    CommaOnly,
+    Verbatim,
+}
+
+struct LineLayout<'a> {
+    raw: &'a str,
+    trimmed: &'a str,
+    kind: LineLayoutKind,
+    preserve_raw: bool,
+    parser_depth: usize,
+    existing_indent: usize,
+    final_depth: usize,
+    anchor_group: Option<usize>,
+}
+
+// For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
+const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
+
+/// SQL 구문별 포맷팅 상태를 캡슐화한 구조체.
+/// 각 SQL 구문(CREATE, MERGE, GRANT 등)이 활성 상태인지 추적하며,
+/// 절(clause) 키워드의 줄바꿈 억제 여부를 한 곳에서 판단합니다.
+#[derive(Default)]
+struct ConstructState {
+    create_pending: bool,
+    create_object: Option<String>,
+    routine_decl_pending: bool,
+    create_table_paren_expected: bool,
+    create_index_pending: bool,
+    create_sequence_active: bool,
+    create_synonym_active: bool,
+    grant_revoke_active: bool,
+    comment_on_active: bool,
+    merge_active: bool,
+    merge_when_branch_active: bool,
+    returning_active: bool,
+    search_cycle_clause_active: bool,
+    match_recognize_paren_depth: Option<usize>,
+    fetch_active: bool,
+    bulk_collect_active: bool,
+    insert_all_active: bool,
+    referential_action_pending: bool,
+    referential_on_active: bool,
+    execute_immediate_active: bool,
+    cursor_decl_pending: bool,
+    cursor_sql_active: bool,
+    forall_pending: bool,
+    forall_body_active: bool,
+}
+
+impl ConstructState {
+    /// clause 키워드(SELECT, FROM, WHERE 등)의 줄바꿈을 억제해야 하는지 판단합니다.
+    /// 새 SQL 구문을 추가할 때는 이 메서드에만 규칙을 추가하면 됩니다.
+    fn suppresses_clause_break(
+        &self,
+        keyword: &str,
+        prev_word_upper: Option<&str>,
+        in_plsql_block: bool,
+        suppress_comma_break_depth: usize,
+        has_subquery_in_paren_stack: bool,
+        trigger_header_state: TriggerHeaderState,
+        is_analytic_within_group: bool,
+        is_fetch_into_single_target: bool,
+    ) -> bool {
+        // INSERT INTO stays on same line
+        if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT")) {
+            return true;
+        }
+        // MERGE INTO stays on same line
+        if keyword == "INTO" && matches!(prev_word_upper, Some("MERGE")) {
+            return true;
+        }
+        // START WITH stays on same line
+        if keyword == "WITH" && matches!(prev_word_upper, Some("START")) {
+            return true;
+        }
+        // ORDER BY after SEQUENTIAL/AUTOMATIC suppressed
+        if keyword == "ORDER"
+            && (suppress_comma_break_depth > 0
+                || matches!(prev_word_upper, Some("SEQUENTIAL" | "AUTOMATIC")))
+        {
+            return true;
+        }
+        // Trigger event keywords (INSERT/UPDATE/DELETE in trigger header)
+        if trigger_header_state.is_active()
+            && matches!(keyword, "INSERT" | "UPDATE" | "DELETE")
+        {
+            return true;
+        }
+        // FOR UPDATE (SQL, not PL/SQL)
+        if keyword == "UPDATE" && matches!(prev_word_upper, Some("FOR")) && !in_plsql_block {
+            return true;
+        }
+        // RETURNING INTO
+        if self.returning_active && keyword == "INTO" {
+            return true;
+        }
+        // FETCH INTO (single target)
+        if self.fetch_active && keyword == "INTO" && is_fetch_into_single_target {
+            return true;
+        }
+        // BULK COLLECT INTO
+        if self.bulk_collect_active && keyword == "INTO" {
+            return true;
+        }
+        // GRANT/REVOKE privilege keywords
+        if self.grant_revoke_active
+            && matches!(
+                keyword,
+                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "EXECUTE" | "ALTER"
+                    | "DROP" | "CREATE" | "INDEX" | "REFERENCES" | "ALL" | "PRIVILEGES" | "MERGE"
+            )
+        {
+            return true;
+        }
+        // GRANT/REVOKE ON
+        if self.grant_revoke_active && keyword == "ON" {
+            return true;
+        }
+        // CREATE SEQUENCE: suppress START/CONNECT
+        if self.create_sequence_active && matches!(keyword, "START" | "CONNECT") {
+            return true;
+        }
+        // FETCH: suppress LIMIT/BULK
+        if self.fetch_active && matches!(keyword, "LIMIT" | "BULK") {
+            return true;
+        }
+        // EXECUTE IMMEDIATE: suppress INTO/USING
+        if self.execute_immediate_active && matches!(keyword, "INTO" | "USING") {
+            return true;
+        }
+        // MERGE WHEN ... THEN UPDATE/INSERT: suppress SET/VALUES/INTO
+        if self.merge_when_branch_active && matches!(keyword, "SET" | "VALUES" | "INTO") {
+            return true;
+        }
+        // Referential action: suppress DELETE/UPDATE/SET after ON DELETE/UPDATE
+        if self.referential_on_active && matches!(keyword, "DELETE" | "UPDATE" | "SET") {
+            return true;
+        }
+        // Non-subquery paren context: suppress FROM/RETURNING
+        if suppress_comma_break_depth > 0
+            && !has_subquery_in_paren_stack
+            && matches!(keyword, "FROM" | "RETURNING")
+        {
+            return true;
+        }
+        // SEARCH/CYCLE ... SET
+        if self.search_cycle_clause_active && keyword == "SET" {
+            return true;
+        }
+        // Analytic WITHIN GROUP
+        if is_analytic_within_group {
+            return true;
+        }
+        false
+    }
+
+    /// condition 키워드(ON, AND, OR, WHEN)의 줄바꿈을 억제해야 하는지 판단합니다.
+    fn suppresses_condition_break(
+        &self,
+        keyword: &str,
+        prev_word_upper: Option<&str>,
+        trigger_header_state: TriggerHeaderState,
+    ) -> bool {
+        // OR in CREATE OR REPLACE
+        if keyword == "OR"
+            && matches!(prev_word_upper, Some("CREATE"))
+        {
+            return true;
+        }
+        // Trigger: OR/ON in trigger header
+        if trigger_header_state.is_active() && matches!(keyword, "OR" | "ON") {
+            return true;
+        }
+        // CREATE INDEX ON
+        if keyword == "ON" && self.create_index_pending {
+            return true;
+        }
+        // COMMENT ON
+        if keyword == "ON" && self.comment_on_active {
+            return true;
+        }
+        // GRANT/REVOKE ON
+        if self.grant_revoke_active && keyword == "ON" {
+            return true;
+        }
+        // ON after REFERENCES (referential constraint)
+        if keyword == "ON"
+            && (matches!(prev_word_upper, Some("REFERENCES"))
+                || self.referential_action_pending)
+        {
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenCursorFormatState {
+    None,
+    AwaitingFor,
+    InSelect {
+        anchor_indent: usize,
+        select_paren_depth: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectListBreakState {
+    None,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectListLayoutState {
+    Inactive,
+    Pending { anchor: usize, indent: usize },
+    Multiline { indent: usize },
+}
+
+impl SelectListLayoutState {
+    fn activate(&mut self, anchor: usize, indent: usize) {
+        *self = Self::Pending { anchor, indent };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Inactive;
+    }
+
+    fn is_multiline(self) -> bool {
+        matches!(self, Self::Multiline { .. })
+    }
+
+    fn has_active_indent(self) -> bool {
+        matches!(self, Self::Pending { .. } | Self::Multiline { .. })
+    }
+
+    fn indentation_or(self, fallback: usize) -> usize {
+        match self {
+            Self::Pending { indent, .. } | Self::Multiline { indent } => indent,
+            Self::Inactive => fallback,
+        }
+    }
+
+    fn force_newline_if_possible(self, out: &mut String) -> Self {
+        match self {
+            Self::Pending { anchor, indent } => {
+                if anchor < out.len() && out.as_bytes().get(anchor) == Some(&b' ') {
+                    let indentation = " ".repeat(indent * 4);
+                    out.replace_range(anchor..anchor + 1, &format!("\n{indentation}"));
+                    Self::Multiline { indent }
+                } else {
+                    self
+                }
+            }
+            _ => self,
+        }
+    }
+}
+
+impl SelectListBreakState {
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitConditionState {
+    None,
+    AwaitingWhen,
+}
+
+impl ExitConditionState {
+    fn on_keyword(&mut self, keyword: &str) {
+        match (keyword, *self) {
+            ("EXIT" | "CONTINUE", _) => {
+                *self = Self::AwaitingWhen;
+            }
+            ("WHEN", Self::AwaitingWhen) => {
+                *self = Self::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn is_exit_when(self, keyword: &str) -> bool {
+        keyword == "WHEN" && matches!(self, Self::AwaitingWhen)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WithCteFormatState {
+    None,
+    InDefinitions { paren_depth: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerHeaderState {
+    None,
+    InHeader,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommentAttachment {
+    Previous,
+    Next,
+    Block,
+    FileHeader,
+}
+
+impl TriggerHeaderState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::InHeader)
+    }
+
+    fn start(&mut self) {
+        *self = Self::InHeader;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+impl WithCteFormatState {
+    fn on_clause_keyword(&mut self, keyword: &str) {
+        match keyword {
+            "WITH" => *self = Self::InDefinitions { paren_depth: 0 },
+            "SELECT" if self.can_close_on_select() => *self = Self::None,
+            _ => {}
+        }
+    }
+
+    fn on_open_paren(&mut self) {
+        if let Self::InDefinitions { paren_depth } = self {
+            *paren_depth = paren_depth.saturating_add(1);
+        }
+    }
+
+    fn on_close_paren(&mut self) {
+        if let Self::InDefinitions { paren_depth } = self {
+            *paren_depth = paren_depth.saturating_sub(1);
+        }
+    }
+
+    fn can_close_on_select(self) -> bool {
+        matches!(self, Self::InDefinitions { paren_depth: 0 })
+    }
+}
+
+impl OpenCursorFormatState {
+    fn base_indent(self, indent_level: usize) -> usize {
+        match self {
+            Self::InSelect { anchor_indent, .. } => indent_level.max(anchor_indent),
+            _ => indent_level,
+        }
+    }
+
+    fn in_select(self) -> bool {
+        matches!(self, Self::InSelect { .. })
+    }
+
+    fn set_select_depth(&mut self, depth: usize) {
+        if let Self::InSelect {
+            select_paren_depth, ..
+        } = self
+        {
+            if select_paren_depth.is_none() {
+                *select_paren_depth = Some(depth);
+            }
+        }
+    }
+
+    fn select_depth(self) -> Option<usize> {
+        match self {
+            Self::InSelect {
+                select_paren_depth, ..
+            } => select_paren_depth,
+            _ => None,
+        }
+    }
+}
+
+
+impl SqlEditorWidget {
+    fn starts_with_end_suffix_terminator(trimmed_upper: &str) -> bool {
+        if !crate::sql_text::starts_with_keyword_token(trimmed_upper, "END") {
+            return false;
+        }
+
+        let Some(rest) = trimmed_upper.strip_prefix("END") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+
+        FORMAT_BLOCK_END_QUALIFIER_KEYWORDS
+            .iter()
+            .any(|keyword| crate::sql_text::starts_with_keyword_token(rest, keyword))
+    }
+
+    fn starts_with_plain_end(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "END")
+            && !Self::starts_with_end_suffix_terminator(trimmed_upper)
+    }
+
+    fn starts_with_bare_end(trimmed_upper: &str) -> bool {
+        if !Self::starts_with_plain_end(trimmed_upper) {
+            return false;
+        }
+
+        let Some(rest) = trimmed_upper.strip_prefix("END") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+
+        rest.is_empty() || rest.starts_with(';')
+    }
+
+    pub(super) fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
+        // A selected SQL fragment should keep canonical statement terminators.
+        // Otherwise select-all / partial-selection formatting can drop semicolons
+        // that `split_format_items()` strips internally, which then breaks
+        // statement boundaries for Ctrl+Enter execution on the formatted text.
+        let preserve_missing_selection_terminator =
+            selected_only && !Self::selected_formatting_has_statement(source);
+
+        let formatted = if preserve_missing_selection_terminator {
+            Self::format_sql_basic_with_terminator_policy(source, false)
+        } else {
+            Self::format_sql_basic(source)
+        };
+
+        if preserve_missing_selection_terminator {
+            Self::preserve_selected_text_terminator(source, formatted)
+        } else {
+            formatted
+        }
+    }
+
+    pub(super) fn selected_formatting_has_statement(source: &str) -> bool {
+        // Comment-only / tool-command-only selections still use the
+        // "preserve original missing terminator" path. Any real SQL statement
+        // should format to the same canonical shape as whole-buffer formatting.
+        super::query_text::split_script_items(source)
+            .iter()
+            .any(|item| matches!(item, ScriptItem::Statement(_)))
+    }
+
+    pub(super) fn normalize_index(text: &str, index: i32) -> usize {
+        if index <= 0 {
+            0
+        } else {
+            Self::clamp_to_char_boundary(text, index as usize)
+        }
+    }
+
+    pub(super) fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
+        let mut idx = index.min(text.len());
+        if text.is_char_boundary(idx) {
+            return idx;
+        }
+
+        // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+
+    pub(super) fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
+        Self::map_cursor_after_format_with_policy(source, formatted, original_pos, false)
+    }
+
+    pub(super) fn map_cursor_after_format_with_policy(
+        source: &str,
+        formatted: &str,
+        original_pos: i32,
+        selected_only: bool,
+    ) -> i32 {
+        if original_pos <= 0 {
+            return 0;
+        }
+
+        let source_pos = Self::clamp_to_char_boundary(source, original_pos as usize);
+        if source.len() >= CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES {
+            if source.is_empty() || formatted.is_empty() {
+                return 0;
+            }
+            let scaled_pos =
+                (source_pos as u128).saturating_mul(formatted.len() as u128) / source.len() as u128;
+            return Self::clamp_to_char_boundary(formatted, scaled_pos as usize) as i32;
+        }
+
+        let source_prefix = &source[..source_pos];
+        let formatted_prefix = if selected_only {
+            Self::format_for_auto_formatting(source_prefix, true)
+        } else {
+            Self::format_sql_basic(source_prefix)
+        };
+        let mut formatted_pos = formatted_prefix.len().min(formatted.len());
+        formatted_pos = Self::clamp_to_char_boundary(formatted, formatted_pos);
+        formatted_pos = Self::advance_over_inserted_layout_whitespace(
+            source,
+            source_pos,
+            formatted,
+            formatted_pos,
+        );
+        formatted_pos as i32
+    }
+
+    pub(super) fn advance_over_inserted_layout_whitespace(
+        source: &str,
+        source_pos: usize,
+        formatted: &str,
+        formatted_pos: usize,
+    ) -> usize {
+        let source_byte = match source.as_bytes().get(source_pos) {
+            Some(byte) => *byte,
+            None => return formatted_pos,
+        };
+
+        if source_byte.is_ascii_whitespace() {
+            return formatted_pos;
+        }
+
+        let mut cursor = formatted_pos;
+        while let Some(byte) = formatted.as_bytes().get(cursor) {
+            if !byte.is_ascii_whitespace() {
+                break;
+            }
+            cursor += 1;
+        }
+
+        Self::clamp_to_char_boundary(formatted, cursor)
+    }
+
+    pub(super) fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
+        if Self::source_has_explicit_semicolon_terminator(source) {
+            return formatted;
+        }
+
+        if let Some(without_semicolon) = Self::remove_trailing_statement_semicolon(&formatted) {
+            return without_semicolon;
+        }
+
+        formatted
+    }
+
+    fn removable_trailing_semicolon_span(formatted: &str) -> Option<(usize, usize)> {
+        let mut trimmed_len = formatted.trim_end().len();
+        while trimmed_len > 0 {
+            let prefix = &formatted[..trimmed_len];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trimmed_len];
+            let line_trimmed = line.trim_start();
+
+            let is_trailing_comment_line = line_trimmed.starts_with("--")
+                || Self::is_sqlplus_remark_comment_statement(line_trimmed);
+
+            if !is_trailing_comment_line {
+                break;
+            }
+
+            trimmed_len = prefix[..line_start].trim_end().len();
+        }
+
+        if trimmed_len == 0 {
+            return None;
+        }
+        let trimmed = &formatted[..trimmed_len];
+        if let Some(last_line_start) = trimmed.rfind('\n').map(|idx| idx + 1).or(Some(0)) {
+            let last_line = &trimmed[last_line_start..];
+            let leading_ws = last_line.len().saturating_sub(last_line.trim_start().len());
+            let last_line_trimmed = &last_line[leading_ws..];
+            if let Some(rest) = last_line_trimmed.strip_prefix(';') {
+                let rest_trimmed = rest.trim_start();
+                if Self::is_sqlplus_remark_comment_statement(rest_trimmed) {
+                    let semicolon_start = last_line_start + leading_ws;
+                    return Some((semicolon_start, semicolon_start + 1));
+                }
+            }
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+
+        let mut semicolon_span: Option<(usize, usize)> = None;
+
+        for span in spans.iter().rev() {
+            match &span.token {
+                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => continue,
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                SqlToken::Symbol(sym) if sym == ";" => {
+                    if Self::semicolon_belongs_to_non_sql_line(trimmed, span.start) {
+                        continue;
+                    }
+                    semicolon_span = Some((span.start, span.end));
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        semicolon_span
+    }
+
+    fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
+        let (semicolon_start, semicolon_end) = Self::removable_trailing_semicolon_span(formatted)?;
+
+        let mut out = String::with_capacity(
+            formatted
+                .len()
+                .saturating_sub(semicolon_end.saturating_sub(semicolon_start)),
+        );
+        out.push_str(&formatted[..semicolon_start]);
+        out.push_str(&formatted[semicolon_end..]);
+        Some(out)
+    }
+
+    fn append_missing_statement_terminator(formatted_statement: &mut String) {
+        let trim_len = formatted_statement.trim_end().len();
+        if trim_len == 0 {
+            return;
+        }
+
+        let trimmed = &formatted_statement[..trim_len];
+        let mut insert_at = trim_len;
+        let mut has_trailing_comment = false;
+
+        let mut trailing_comment_start = trim_len;
+        loop {
+            let prefix = &trimmed[..trailing_comment_start];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trailing_comment_start];
+            let line_trimmed = line.trim_start();
+            if Self::is_sqlplus_remark_comment_statement(line_trimmed) {
+                has_trailing_comment = true;
+                insert_at = line_start;
+                trailing_comment_start = prefix[..line_start].trim_end().len();
+                if trailing_comment_start == 0 {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        for span in spans.iter().rev() {
+            match &span.token {
+                SqlToken::Comment(_) => {
+                    has_trailing_comment = true;
+                    insert_at = insert_at.min(span.start);
+                }
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                _ => break,
+            }
+        }
+
+        if has_trailing_comment {
+            while insert_at > 0 {
+                match trimmed.as_bytes().get(insert_at - 1) {
+                    Some(b' ' | b'\t' | b'\n' | b'\r') => insert_at -= 1,
+                    _ => break,
+                }
+            }
+            let suffix = &formatted_statement[insert_at..trim_len];
+            let separator = match suffix.as_bytes().first() {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => ";",
+                _ => "; ",
+            };
+            formatted_statement.insert_str(insert_at, separator);
+        } else {
+            formatted_statement.insert(insert_at, ';');
+        }
+    }
+    pub(crate) fn format_sql_basic(sql: &str) -> String {
+        Self::format_sql_basic_with_terminator_policy(sql, true)
+    }
+
+    fn normalize_format_items(items: Vec<FormatItem>) -> Vec<FormatItem> {
+        let mut normalized: Vec<FormatItem> = Vec::with_capacity(items.len());
+        let mut index = 0usize;
+
+        while index < items.len() {
+            if let Some((combined, consumed)) =
+                Self::merge_fragmented_with_single_letter_cte(&items, index)
+            {
+                normalized.push(FormatItem::Statement(combined));
+                index += consumed;
+                continue;
+            }
+
+            let item = items[index].clone();
+            let should_merge = match (normalized.last(), &item) {
+                (Some(FormatItem::Statement(previous)), FormatItem::Statement(fragment)) => {
+                    Self::should_merge_order_modifier_fragment(previous, fragment)
+                }
+                _ => false,
+            };
+
+            if should_merge {
+                if let Some(FormatItem::Statement(previous)) = normalized.last_mut() {
+                    Self::append_statement_fragment(previous, &item);
+                    index += 1;
+                    continue;
+                }
+            }
+
+            normalized.push(item);
+            index += 1;
+        }
+
+        normalized
+    }
+
+    fn merge_fragmented_with_single_letter_cte(
+        items: &[FormatItem],
+        start_index: usize,
+    ) -> Option<(String, usize)> {
+        let with_head = match items.get(start_index) {
+            Some(FormatItem::Statement(statement)) if statement.trim().eq_ignore_ascii_case("WITH") => {
+                statement.trim()
+            }
+            _ => return None,
+        };
+
+        let cte_name = match items.get(start_index + 1) {
+            Some(FormatItem::ToolCommand(ToolCommand::Unsupported { raw, .. })) => raw.trim(),
+            _ => return None,
+        };
+        if !Self::is_single_letter_cte_identifier(cte_name) {
+            return None;
+        }
+
+        let trailing = match items.get(start_index + 2) {
+            Some(FormatItem::Statement(statement)) => statement.trim_start(),
+            _ => return None,
+        };
+        if !Self::starts_with_ascii_keyword_token_ci(trailing, "AS") {
+            return None;
+        }
+
+        Some((format!("{with_head} {cte_name}\n{trailing}"), 3))
+    }
+
+    fn is_single_letter_cte_identifier(value: &str) -> bool {
+        let mut chars = value.chars();
+        let Some(ch) = chars.next() else {
+            return false;
+        };
+        chars.next().is_none() && (ch.is_ascii_alphabetic() || ch == '_')
+    }
+
+    fn should_merge_order_modifier_fragment(previous: &str, fragment: &str) -> bool {
+        let previous_trimmed = previous.trim_end();
+        if previous_trimmed.is_empty() || previous_trimmed.ends_with(';') {
+            return false;
+        }
+
+        let fragment_trimmed = fragment.trim_start();
+        if fragment_trimmed.is_empty() {
+            return false;
+        }
+
+        let starts_order_modifier =
+            Self::starts_with_ascii_keyword_token_ci(fragment_trimmed, "ASC")
+                || Self::starts_with_ascii_keyword_token_ci(fragment_trimmed, "DESC")
+                || Self::starts_with_ascii_keyword_token_ci(fragment_trimmed, "NULLS");
+        if !starts_order_modifier {
+            return false;
+        }
+
+        let previous_search_window =
+            Self::tail_search_window(previous_trimmed, 4096).unwrap_or(previous_trimmed);
+        Self::contains_ascii_case_insensitive(previous_search_window, "ORDER BY")
+            || Self::contains_ascii_case_insensitive(previous_search_window, "ORDER SIBLINGS BY")
+    }
+
+    fn starts_with_ascii_keyword_token_ci(text: &str, keyword: &str) -> bool {
+        let text_bytes = text.as_bytes();
+        let keyword_bytes = keyword.as_bytes();
+        if text_bytes.len() < keyword_bytes.len() {
+            return false;
+        }
+        if !text_bytes[..keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes) {
+            return false;
+        }
+
+        !text_bytes
+            .get(keyword_bytes.len())
+            .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
+    }
+
+    fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+        let haystack_bytes = haystack.as_bytes();
+        let needle_bytes = needle.as_bytes();
+        if needle_bytes.is_empty() {
+            return true;
+        }
+        if haystack_bytes.len() < needle_bytes.len() {
+            return false;
+        }
+
+        haystack_bytes
+            .windows(needle_bytes.len())
+            .rev()
+            .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+    }
+
+    fn tail_search_window(text: &str, max_bytes: usize) -> Option<&str> {
+        if text.len() <= max_bytes {
+            return None;
+        }
+
+        let mut start = text.len().saturating_sub(max_bytes);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start = start.saturating_add(1);
+        }
+        text.get(start..)
+    }
+
+    fn append_statement_fragment(previous: &mut String, item: &FormatItem) {
+        let FormatItem::Statement(fragment) = item else {
+            return;
+        };
+
+        let fragment_trimmed = fragment.trim_start();
+        if fragment_trimmed.is_empty() {
+            return;
+        }
+
+        let needs_space = previous
+            .chars()
+            .last()
+            .is_some_and(|ch| !ch.is_whitespace());
+        if needs_space {
+            previous.push(' ');
+        }
+        previous.push_str(fragment_trimmed);
+    }
+
+    fn format_sql_basic_with_terminator_policy(
+        sql: &str,
+        append_missing_terminator: bool,
+    ) -> String {
+        let mut formatted = String::with_capacity(sql.len().saturating_add(64));
+        let items = Self::normalize_format_items(super::query_text::split_format_items(sql));
+        if items.is_empty() {
+            return String::new();
+        }
+
+        let mut select_list_break_state = SelectListBreakState::None;
+        for (idx, item) in items.iter().enumerate() {
+            let next_item = items.get(idx + 1);
+
+            match item {
+                FormatItem::Statement(statement) => {
+                    let statement_tokens = Self::tokenize_sql(statement);
+                    let formatted_statement = Self::format_statement(
+                        statement,
+                        &statement_tokens,
+                        select_list_break_state,
+                    );
+                    let has_code = Self::statement_has_code(statement, &statement_tokens);
+                    let mut formatted_statement = formatted_statement;
+                    if append_missing_terminator
+                        && has_code
+                        && !Self::statement_ends_with_semicolon_tokens(&statement_tokens)
+                        && Self::should_append_missing_statement_terminator(&statement_tokens)
+                    {
+                        Self::append_missing_statement_terminator(&mut formatted_statement);
+                    }
+                    formatted.push_str(&formatted_statement);
+                }
+                FormatItem::ToolCommand(command) => {
+                    formatted.push_str(&Self::format_tool_command(command));
+                    select_list_break_state.clear();
+                }
+                FormatItem::Verbatim(text) => {
+                    formatted.push_str(text);
+                    select_list_break_state.clear();
+                }
+                FormatItem::Slash => {
+                    formatted.push('/');
+                    select_list_break_state.clear();
+                }
+            }
+
+            if let Some(next_item) = next_item {
+                formatted.push_str(Self::item_separator(item, next_item));
+            }
+        }
+
+        formatted
+    }
+
+    fn item_separator(current: &FormatItem, next: &FormatItem) -> &'static str {
+        if matches!(next, FormatItem::Slash) || Self::keeps_tight_spacing(current, next) {
+            "\n"
+        } else {
+            "\n\n"
+        }
+    }
+
+    fn keeps_tight_spacing(current: &FormatItem, next: &FormatItem) -> bool {
+        match (current, next) {
+            (FormatItem::Statement(left), FormatItem::Statement(right)) => {
+                (Self::is_sqlplus_comment_line(left) && Self::is_sqlplus_comment_line(right))
+                    || (Self::is_create_trigger_statement(left)
+                        && Self::is_alter_trigger_statement(right))
+            }
+            (FormatItem::Slash, FormatItem::Statement(right)) => {
+                Self::is_alter_trigger_statement(right)
+            }
+            _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
+            (
+                FormatItem::ToolCommand(ToolCommand::ClearBreaks),
+                FormatItem::ToolCommand(ToolCommand::ClearComputes),
+            )
+            | (
+                FormatItem::ToolCommand(ToolCommand::ClearComputes),
+                FormatItem::ToolCommand(ToolCommand::ClearBreaks),
+            ) => true,
+            _ => false,
+        }
+    }
+
+    fn is_prompt_format_item(item: &FormatItem) -> bool {
+        match item {
+            FormatItem::ToolCommand(ToolCommand::Prompt { .. }) => true,
+            FormatItem::Verbatim(text) => QueryExecutor::parse_tool_command(text)
+                .is_some_and(|cmd| matches!(cmd, ToolCommand::Prompt { .. })),
+            _ => false,
+        }
+    }
+
+    fn is_sqlplus_comment_line(statement: &str) -> bool {
+        crate::sql_text::is_sqlplus_comment_line(statement)
+    }
+
+    fn is_create_trigger_statement(statement: &str) -> bool {
+        let mut word_idx = 0usize;
+        let mut has_trigger_in_prefix = false;
+
+        for token in Self::tokenize_sql(statement) {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
+
+            if word_idx == 0 && !word.eq_ignore_ascii_case("CREATE") {
+                return false;
+            }
+
+            if word_idx < 8 && word.eq_ignore_ascii_case("TRIGGER") {
+                has_trigger_in_prefix = true;
+            }
+
+            word_idx += 1;
+        }
+
+        word_idx > 0 && has_trigger_in_prefix
+    }
+
+    fn is_alter_trigger_statement(statement: &str) -> bool {
+        let mut words = Self::tokenize_sql(statement)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word),
+                _ => None,
+            });
+
+        matches!(
+            (words.next(), words.next()),
+            (Some(first), Some(second))
+                if first.eq_ignore_ascii_case("ALTER")
+                    && second.eq_ignore_ascii_case("TRIGGER")
+        )
+    }
+
+    fn statement_has_code(statement: &str, tokens: &[SqlToken]) -> bool {
+        let trimmed = statement.trim_start();
+        if let Some(first_word) = trimmed.split_whitespace().next() {
+            if first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK") {
+                return false;
+            }
+        }
+
+        tokens
+            .iter()
+            .any(|token| !matches!(token, SqlToken::Comment(_)))
+    }
+
+    fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
+        statement
+            .split_whitespace()
+            .next()
+            .is_some_and(|first_word| {
+                first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK")
+            })
+    }
+
+    fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
+        let trimmed = statement.trim_end();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        spans.iter().rev().any(|span| {
+            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && !Self::semicolon_belongs_to_non_sql_line(trimmed, span.start)
+                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
+        })
+    }
+
+    fn semicolon_belongs_to_non_sql_line(statement: &str, semicolon_start: usize) -> bool {
+        let line_start = statement[..semicolon_start]
+            .rfind('\n')
+            .map_or(0, |idx| idx + 1);
+        let line_end = statement[semicolon_start..]
+            .find('\n')
+            .map_or(statement.len(), |idx| semicolon_start + idx);
+        let line = statement[line_start..line_end].trim();
+
+        if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+            return true;
+        }
+
+        QueryExecutor::parse_tool_command(line)
+            .is_some_and(|command| !matches!(command, ToolCommand::Unsupported { .. }))
+    }
+
+    fn trailing_segment_allows_semicolon_terminator(suffix: &str) -> bool {
+        let mut rest = suffix.trim_start();
+        if rest.is_empty() {
+            return true;
+        }
+
+        loop {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = rest[..line_end].trim();
+
+            if line.is_empty() {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            if line == "/" {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            return false;
+        }
+    }
+
+    #[cfg(test)]
+    fn statement_ends_with_semicolon(statement: &str) -> bool {
+        let tokens = Self::tokenize_sql(statement);
+        if Self::statement_ends_with_semicolon_tokens(&tokens) {
+            return true;
+        }
+
+        let trimmed = statement.trim_end();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        spans
+            .iter()
+            .rev()
+            .find(|span| matches!(&span.token, SqlToken::Symbol(sym) if sym == ";"))
+            .is_some_and(|span| {
+                Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
+            })
+    }
+
+    fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
+        let mut saw_sqlplus_slash = false;
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => {
+                    saw_sqlplus_slash = true;
+                }
+                SqlToken::Symbol(sym) if sym == ";" => return true,
+                _ => return saw_sqlplus_slash,
+            }
+        }
+        false
+    }
+
+    fn should_append_missing_statement_terminator(tokens: &[SqlToken]) -> bool {
+        let trailing_tokens = Self::tokens_after_last_semicolon(tokens);
+        if !Self::delimiter_pairs_are_balanced(trailing_tokens) {
+            return false;
+        }
+
+        let mut trailing_token = None;
+
+        for token in trailing_tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                other => {
+                    trailing_token = Some(other);
+                    break;
+                }
+            }
+        }
+
+        trailing_token.is_some_and(Self::token_can_terminate_statement)
+    }
+
+    fn tokens_after_last_semicolon(tokens: &[SqlToken]) -> &[SqlToken] {
+        let mut last_semicolon_idx = None;
+
+        for (idx, token) in tokens.iter().enumerate() {
+            if matches!(token, SqlToken::Symbol(sym) if sym == ";") {
+                last_semicolon_idx = Some(idx);
+            }
+        }
+
+        if let Some(semicolon_idx) = last_semicolon_idx {
+            &tokens[semicolon_idx.saturating_add(1)..]
+        } else {
+            tokens
+        }
+    }
+
+    fn delimiter_pairs_are_balanced(tokens: &[SqlToken]) -> bool {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+
+        for token in tokens {
+            let SqlToken::Symbol(symbol) = token else {
+                continue;
+            };
+
+            match symbol.as_str() {
+                "(" => paren_depth = paren_depth.saturating_add(1),
+                ")" => {
+                    if paren_depth == 0 {
+                        return false;
+                    }
+                    paren_depth -= 1;
+                }
+                "[" => bracket_depth = bracket_depth.saturating_add(1),
+                "]" => {
+                    if bracket_depth == 0 {
+                        return false;
+                    }
+                    bracket_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        paren_depth == 0 && bracket_depth == 0
+    }
+
+    fn token_can_terminate_statement(token: &SqlToken) -> bool {
+        match token {
+            SqlToken::Word(word) => Self::word_token_can_terminate_statement(word),
+            SqlToken::String(literal) => Self::string_token_can_terminate_statement(literal),
+            SqlToken::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]"),
+            SqlToken::Comment(_) => false,
+        }
+    }
+
+    fn word_token_can_terminate_statement(word: &str) -> bool {
+        if word.starts_with('"') {
+            return word.ends_with('"') && word.len() > 1;
+        }
+
+        if word.starts_with("<<") {
+            return word.ends_with(">>") && word.len() > 3;
+        }
+
+        true
+    }
+
+    fn string_token_can_terminate_statement(literal: &str) -> bool {
+        if literal.starts_with('$') {
+            return Self::has_closed_dollar_quote(literal);
+        }
+
+        literal.ends_with('\'') && literal.len() > 1
+    }
+
+    fn has_closed_dollar_quote(literal: &str) -> bool {
+        let bytes = literal.as_bytes();
+        if bytes.first().copied() != Some(b'$') {
+            return false;
+        }
+
+        let close_tag_idx =
+            bytes.iter().enumerate().skip(1).find_map(
+                |(idx, byte)| {
+                    if *byte == b'$' {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                },
+            );
+
+        let Some(close_tag_idx) = close_tag_idx else {
+            return false;
+        };
+
+        let tag_end = close_tag_idx + 1;
+        let Some(tag) = literal.get(..tag_end) else {
+            return false;
+        };
+
+        literal.len() >= tag.len().saturating_mul(2) && literal.ends_with(tag)
+    }
+
+    fn classify_comment_attachment(
+        out: &str,
+        at_line_start: bool,
+        has_leading_newline: bool,
+        is_multiline_block_comment: bool,
+    ) -> CommentAttachment {
+        if out.trim().is_empty() {
+            return CommentAttachment::FileHeader;
+        }
+
+        if has_leading_newline {
+            return CommentAttachment::Next;
+        }
+
+        if at_line_start {
+            if is_multiline_block_comment {
+                CommentAttachment::Block
+            } else {
+                CommentAttachment::Next
+            }
+        } else {
+            CommentAttachment::Previous
+        }
+    }
+
+    pub(super) fn format_tool_command(command: &ToolCommand) -> String {
+        match command {
+            ToolCommand::Var { name, data_type } => {
+                format!("VAR {} {}", name, data_type.display())
+            }
+            ToolCommand::Print { name } => match name {
+                Some(name) => format!("PRINT {}", name),
+                None => "PRINT".to_string(),
+            },
+            ToolCommand::SetServerOutput {
+                enabled,
+                size,
+                unlimited,
+            } => {
+                if !*enabled {
+                    "SET SERVEROUTPUT OFF".to_string()
+                } else if *unlimited {
+                    "SET SERVEROUTPUT ON SIZE UNLIMITED".to_string()
+                } else if let Some(size) = size {
+                    format!("SET SERVEROUTPUT ON SIZE {}", size)
+                } else {
+                    "SET SERVEROUTPUT ON".to_string()
+                }
+            }
+            ToolCommand::ShowErrors {
+                object_type,
+                object_name,
+            } => {
+                if let (Some(obj_type), Some(obj_name)) = (object_type, object_name) {
+                    format!("SHOW ERRORS {} {}", obj_type, obj_name)
+                } else {
+                    "SHOW ERRORS".to_string()
+                }
+            }
+            ToolCommand::ShowUser => "SHOW USER".to_string(),
+            ToolCommand::ShowAll => "SHOW ALL".to_string(),
+            ToolCommand::Describe { name } => format!("DESCRIBE {}", name),
+            ToolCommand::Prompt { text } => {
+                if text.trim().is_empty() {
+                    "PROMPT".to_string()
+                } else {
+                    format!("PROMPT {}", text)
+                }
+            }
+            ToolCommand::Pause { message } => match message {
+                Some(text) if !text.trim().is_empty() => format!("PAUSE {}", text),
+                _ => "PAUSE".to_string(),
+            },
+            ToolCommand::Accept { name, prompt } => match prompt {
+                Some(text) => {
+                    format!(
+                        "ACCEPT {} PROMPT '{}'",
+                        name,
+                        Self::escape_sql_literal(text)
+                    )
+                }
+                None => format!("ACCEPT {}", name),
+            },
+            ToolCommand::Define { name, value } => format!("DEFINE {} = {}", name, value),
+            ToolCommand::Undefine { name } => format!("UNDEFINE {}", name),
+            ToolCommand::ColumnNewValue {
+                column_name,
+                variable_name,
+            } => format!("COLUMN {} NEW_VALUE {}", column_name, variable_name),
+            ToolCommand::BreakOn { column_name } => format!("BREAK ON {}", column_name),
+            ToolCommand::BreakOff => "BREAK OFF".to_string(),
+            ToolCommand::ClearBreaks => "CLEAR BREAKS".to_string(),
+            ToolCommand::ClearComputes => "CLEAR COMPUTES".to_string(),
+            ToolCommand::ClearBreaksComputes => "CLEAR BREAKS\nCLEAR COMPUTES".to_string(),
+            ToolCommand::Compute {
+                mode,
+                of_column,
+                on_column,
+            } => {
+                let mode_text = match mode {
+                    crate::db::ComputeMode::Sum => "SUM",
+                    crate::db::ComputeMode::Count => "COUNT",
+                };
+                match (of_column.as_deref(), on_column.as_deref()) {
+                    (Some(of_col), Some(on_col)) => {
+                        format!("COMPUTE {} OF {} ON {}", mode_text, of_col, on_col)
+                    }
+                    _ => format!("COMPUTE {}", mode_text),
+                }
+            }
+            ToolCommand::ComputeOff => "COMPUTE OFF".to_string(),
+            ToolCommand::SetErrorContinue { enabled } => {
+                if *enabled {
+                    "SET ERRORCONTINUE ON".to_string()
+                } else {
+                    "SET ERRORCONTINUE OFF".to_string()
+                }
+            }
+            ToolCommand::SetAutoCommit { enabled } => {
+                if *enabled {
+                    "SET AUTOCOMMIT ON".to_string()
+                } else {
+                    "SET AUTOCOMMIT OFF".to_string()
+                }
+            }
+            ToolCommand::SetDefine {
+                enabled,
+                define_char,
+            } => {
+                if let Some(ch) = define_char {
+                    format!("SET DEFINE '{}'", ch)
+                } else if *enabled {
+                    "SET DEFINE ON".to_string()
+                } else {
+                    "SET DEFINE OFF".to_string()
+                }
+            }
+            ToolCommand::SetScan { enabled } => {
+                if *enabled {
+                    "SET SCAN ON".to_string()
+                } else {
+                    "SET SCAN OFF".to_string()
+                }
+            }
+            ToolCommand::SetVerify { enabled } => {
+                if *enabled {
+                    "SET VERIFY ON".to_string()
+                } else {
+                    "SET VERIFY OFF".to_string()
+                }
+            }
+            ToolCommand::SetEcho { enabled } => {
+                if *enabled {
+                    "SET ECHO ON".to_string()
+                } else {
+                    "SET ECHO OFF".to_string()
+                }
+            }
+            ToolCommand::SetTiming { enabled } => {
+                if *enabled {
+                    "SET TIMING ON".to_string()
+                } else {
+                    "SET TIMING OFF".to_string()
+                }
+            }
+            ToolCommand::SetFeedback { enabled } => {
+                if *enabled {
+                    "SET FEEDBACK ON".to_string()
+                } else {
+                    "SET FEEDBACK OFF".to_string()
+                }
+            }
+            ToolCommand::SetHeading { enabled } => {
+                if *enabled {
+                    "SET HEADING ON".to_string()
+                } else {
+                    "SET HEADING OFF".to_string()
+                }
+            }
+            ToolCommand::SetPageSize { size } => format!("SET PAGESIZE {}", size),
+            ToolCommand::SetLineSize { size } => format!("SET LINESIZE {}", size),
+            ToolCommand::SetTrimSpool { enabled } => {
+                if *enabled {
+                    "SET TRIMSPOOL ON".to_string()
+                } else {
+                    "SET TRIMSPOOL OFF".to_string()
+                }
+            }
+            ToolCommand::SetTrimOut { enabled } => {
+                if *enabled {
+                    "SET TRIMOUT ON".to_string()
+                } else {
+                    "SET TRIMOUT OFF".to_string()
+                }
+            }
+            ToolCommand::SetSqlBlankLines { enabled } => {
+                if *enabled {
+                    "SET SQLBLANKLINES ON".to_string()
+                } else {
+                    "SET SQLBLANKLINES OFF".to_string()
+                }
+            }
+            ToolCommand::SetTab { enabled } => {
+                if *enabled {
+                    "SET TAB ON".to_string()
+                } else {
+                    "SET TAB OFF".to_string()
+                }
+            }
+            ToolCommand::SetColSep { separator } => format!("SET COLSEP {}", separator),
+            ToolCommand::SetNull { null_text } => format!("SET NULL {}", null_text),
+            ToolCommand::Spool { path, append } => match path {
+                Some(path) if *append => format!("SPOOL {} APPEND", path),
+                Some(path) => format!("SPOOL {}", path),
+                None if *append => "SPOOL APPEND".to_string(),
+                None => "SPOOL OFF".to_string(),
+            },
+            ToolCommand::WheneverSqlError { exit, action } => {
+                let mode = if *exit { "EXIT" } else { "CONTINUE" };
+                match action.as_deref() {
+                    Some(extra) if !extra.trim().is_empty() => {
+                        format!("WHENEVER SQLERROR {} {}", mode, extra.trim())
+                    }
+                    _ => format!("WHENEVER SQLERROR {}", mode),
+                }
+            }
+            ToolCommand::WheneverOsError { exit } => {
+                if *exit {
+                    "WHENEVER OSERROR EXIT".to_string()
+                } else {
+                    "WHENEVER OSERROR CONTINUE".to_string()
+                }
+            }
+            ToolCommand::Exit => "EXIT".to_string(),
+            ToolCommand::Quit => "QUIT".to_string(),
+            ToolCommand::RunScript {
+                path,
+                relative_to_caller,
+            } => {
+                if *relative_to_caller {
+                    format!("@@{}", path)
+                } else {
+                    format!("@{}", path)
+                }
+            }
+            ToolCommand::Connect {
+                username,
+                password,
+                host,
+                port,
+                service_name,
+            } => {
+                // 자동 포맷팅 결과를 AI(Codex/Claude)가 재마스킹하지 않도록 실제 비밀번호를 그대로 유지한다.
+                format!(
+                    "CONNECT {}/{}@{}:{}/{}",
+                    username, password, host, port, service_name
+                )
+            }
+            ToolCommand::Disconnect => "DISCONNECT".to_string(),
+            ToolCommand::Unsupported { raw, .. } => raw.clone(),
+        }
+    }
+
+    fn format_statement(
+        statement: &str,
+        tokens: &[SqlToken],
+        select_list_break_state_on_start: SelectListBreakState,
+    ) -> String {
+        if Self::is_sqlplus_remark_comment_statement(statement) {
+            return statement.to_string();
+        }
+
+        if let Some(formatted) = Self::format_create_table(statement) {
+            return formatted;
+        }
+
+        let clause_keywords = FORMAT_CLAUSE_KEYWORDS;
+        let join_modifiers = FORMAT_JOIN_MODIFIER_KEYWORDS;
+        let join_keyword = "JOIN";
+        let outer_keyword = "OUTER";
+        let condition_keywords = FORMAT_CONDITION_KEYWORDS; // ELSE handled separately for IF blocks
+                                                            // BEGIN is handled separately to support DECLARE ... BEGIN ... END blocks
+                                                            // CASE is handled separately for SELECT vs PL/SQL context
+                                                            // LOOP is handled separately for FOR ... LOOP on same line
+        let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
+        let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
+
+        let mut out = String::new();
+        let mut indent_level = 0usize;
+        let mut suppress_comma_break_depth = 0usize;
+        let mut paren_stack: Vec<bool> = Vec::new();
+        let mut paren_clause_restore_stack: Vec<Option<String>> = Vec::new();
+        let mut block_stack: Vec<String> = Vec::new(); // Track which block keywords started blocks
+        let mut at_line_start = true;
+        let mut needs_space = false;
+        let mut line_indent = 0usize;
+        let mut join_modifier_active = false;
+        let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
+        let mut in_plsql_block = false; // Track if we're in PL/SQL block (for CASE handling)
+        let mut prev_word_upper: Option<String> = None;
+        let mut construct = ConstructState::default();
+        let mut column_list_stack: Vec<bool> = Vec::new();
+        let mut current_clause: Option<String> = None;
+        let mut pending_package_member_separator = false;
+        let mut open_cursor_state = OpenCursorFormatState::None;
+        let mut open_for_select_stack: Vec<OpenCursorFormatState> = Vec::new();
+        let mut case_branch_started: Vec<bool> = Vec::new();
+        let mut between_pending = false;
+        let mut select_list_layout_state = SelectListLayoutState::Inactive;
+        let mut select_list_break_state = select_list_break_state_on_start;
+        let mut exit_condition_state = ExitConditionState::None;
+        let mut with_cte_state = WithCteFormatState::None;
+        let mut statement_has_with_clause = false;
+        let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
+        let mut trigger_header_state = TriggerHeaderState::None;
+        let is_package_body_statement = {
+            let upper = statement.to_ascii_uppercase();
+            upper.contains("CREATE OR REPLACE PACKAGE BODY")
+                || upper.contains("CREATE PACKAGE BODY")
+        };
+
+        let newline_with = |out: &mut String,
+                            indent_level: usize,
+                            extra: usize,
+                            at_line_start: &mut bool,
+                            needs_space: &mut bool,
+                            line_indent: &mut usize| {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            *line_indent = indent_level + extra;
+            *at_line_start = true;
+            *needs_space = false;
+        };
+
+        let base_indent = |indent_level: usize, open_cursor_state: OpenCursorFormatState| {
+            open_cursor_state.base_indent(indent_level)
+        };
+
+        let clause_indent = |indent_level: usize,
+                             open_cursor_state: OpenCursorFormatState,
+                             keyword: &str,
+                             open_for_select_active: bool,
+                             in_cursor_sql: bool| {
+            let mut base = base_indent(indent_level, open_cursor_state);
+            if open_for_select_active
+                && matches!(
+                    keyword,
+                    "FROM"
+                        | "WHERE"
+                        | "GROUP"
+                        | "ORDER"
+                        | "CONNECT"
+                        | "HAVING"
+                        | "UNION"
+                        | "INTERSECT"
+                        | "MINUS"
+                )
+                && !in_cursor_sql
+            {
+                base = base.saturating_add(1);
+            }
+            base
+        };
+
+        let list_item_indent =
+            |indent_level: usize,
+             open_cursor_state: OpenCursorFormatState,
+             select_list_layout_state: SelectListLayoutState| {
+                let base = base_indent(indent_level, open_cursor_state);
+                select_list_layout_state.indentation_or(base + 1)
+            };
+        let clause_list_indent = |indent_level: usize,
+                                  open_cursor_state: OpenCursorFormatState,
+                                  select_list_layout_state: SelectListLayoutState,
+                                  current_clause: Option<&str>,
+                                  merge_active: bool| {
+            let base = base_indent(indent_level, open_cursor_state);
+            if matches!(current_clause, Some("SET")) && merge_active {
+                base
+            } else {
+                list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
+                    .max(base + 1)
+            }
+        };
+
+        let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
+            if *at_line_start {
+                out.push_str(&" ".repeat(line_indent * 4));
+                *at_line_start = false;
+            }
+        };
+
+        let trim_trailing_space = |out: &mut String| {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+        };
+
+        let force_select_list_newline =
+            |out: &mut String, select_list_layout_state: &mut SelectListLayoutState| {
+                *select_list_layout_state = select_list_layout_state.force_newline_if_possible(out);
+            };
+
+        let mut idx = 0;
+        while idx < tokens.len() {
+            let next_word = tokens[idx + 1..].iter().find_map(|t| match t {
+                SqlToken::Word(w) => Some(w.as_str()),
+                _ => None,
+            });
+            let next_non_comment = tokens[idx + 1..]
+                .iter()
+                .find(|t| !matches!(t, SqlToken::Comment(_)));
+            let next_word_is =
+                |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
+
+            match &tokens[idx] {
+                SqlToken::Word(word) => {
+                    let upper = word.to_uppercase();
+                    let in_sql_case_clause = matches!(
+                        current_clause.as_deref(),
+                        Some(
+                            "SELECT"
+                                | "WHERE"
+                                | "ORDER"
+                                | "GROUP"
+                                | "HAVING"
+                                | "VALUES"
+                                | "SET"
+                                | "INTO"
+                        )
+                    );
+                    let is_keyword = sql_text::is_oracle_sql_keyword(upper.as_str());
+                    let is_analytic_within_group = upper == "GROUP"
+                        && matches!(prev_word_upper.as_deref(), Some("WITHIN"))
+                        && {
+                            let mut paren_depth = 0usize;
+                            let mut saw_group_paren = false;
+                            let mut lookahead_idx = idx.saturating_add(1);
+                            let mut has_over = false;
+                            while lookahead_idx < tokens.len() {
+                                match &tokens[lookahead_idx] {
+                                    SqlToken::Comment(_) => {}
+                                    SqlToken::Symbol(sym) if sym == "(" => {
+                                        paren_depth = paren_depth.saturating_add(1);
+                                        saw_group_paren = true;
+                                    }
+                                    SqlToken::Symbol(sym) if sym == ")" => {
+                                        if paren_depth == 0 {
+                                            break;
+                                        }
+                                        paren_depth = paren_depth.saturating_sub(1);
+                                    }
+                                    SqlToken::Symbol(sym)
+                                        if paren_depth == 0 && (sym == "," || sym == ";") =>
+                                    {
+                                        break;
+                                    }
+                                    SqlToken::Word(word)
+                                        if paren_depth == 0
+                                            && saw_group_paren
+                                            && word.eq_ignore_ascii_case("OVER") =>
+                                    {
+                                        has_over = true;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                                lookahead_idx = lookahead_idx.saturating_add(1);
+                            }
+                            has_over
+                        };
+                    let is_within_group = upper == "GROUP"
+                        && matches!(prev_word_upper.as_deref(), Some("WITHIN"))
+                        && !is_analytic_within_group;
+                    let mut newline_after_keyword = false;
+                    let mut newline_after_keyword_extra = 0usize;
+                    let is_between_and = upper == "AND" && between_pending;
+                    let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
+                    let is_trigger_event_keyword = trigger_header_state.is_active()
+                        && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
+                    let is_create_index_on = upper == "ON" && construct.create_index_pending;
+                    let follows_alias_keyword =
+                        matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
+                    let in_table_alias_clause = matches!(
+                        current_clause.as_deref(),
+                        Some("FROM" | "UPDATE" | "INTO" | "MERGE" | "USING")
+                    );
+                    let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
+                    let next_word_is_clause_keyword = next_word.is_none_or(|word| {
+                        let next_upper = word.to_ascii_uppercase();
+                        sql_text::is_oracle_sql_keyword(next_upper.as_str())
+                    });
+                    let next_token_ends_select_item = matches!(
+                        next_non_comment,
+                        Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "," | ")")
+                    ) || next_word_is_clause_keyword;
+                    let next_token_ends_from_alias = matches!(
+                        next_non_comment,
+                        Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "," | ")")
+                    ) || next_word_is_clause_keyword;
+                    let next_token_is_dot =
+                        matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == ".");
+                    let closes_case_expression =
+                        upper == "END" && block_stack.last().is_some_and(|s| s == "CASE");
+                    let treat_control_keyword_as_identifier =
+                        sql_text::is_plsql_control_keyword(upper.as_str())
+                            && !closes_case_expression
+                            && !next_word_is("THEN")
+                            && (follows_alias_keyword
+                                || (in_table_alias_clause && next_token_ends_from_alias)
+                                || (in_select_clause
+                                    && !next_word_is("AS")
+                                    && next_token_ends_select_item)
+                                || (next_token_is_dot
+                                    && matches!(
+                                        current_clause.as_deref(),
+                                        Some(
+                                            "SELECT"
+                                                | "FROM"
+                                                | "WHERE"
+                                                | "ON"
+                                                | "GROUP"
+                                                | "HAVING"
+                                                | "ORDER"
+                                        )
+                                    )));
+                    let should_treat_as_block_start = block_start_keywords
+                        .contains(&upper.as_str())
+                        && !treat_control_keyword_as_identifier
+                        && !(follows_alias_keyword
+                            && sql_text::is_plsql_control_keyword(upper.as_str())
+                            && !next_word_is("THEN"));
+                    let at_package_body_member_depth =
+                        is_package_body_statement && indent_level == 1;
+                    if upper == "END" && !treat_control_keyword_as_identifier {
+                        let end_qualifier = {
+                            let mut qualifier = None;
+                            for t in &tokens[idx + 1..] {
+                                match t {
+                                    SqlToken::Comment(comment) => {
+                                        if comment.contains('\n') {
+                                            break;
+                                        }
+                                    }
+                                    SqlToken::Word(w) => {
+                                        qualifier = Some(w.to_uppercase());
+                                        break;
+                                    }
+                                    SqlToken::Symbol(sym) if sym == ";" => break,
+                                    _ => break,
+                                }
+                            }
+                            qualifier
+                        };
+                        // Check if this is END LOOP, END IF, END CASE, etc.
+                        let mut end_tail: Vec<String> = Vec::new();
+                        if let Some(qualifier) = end_qualifier.as_deref() {
+                            match qualifier {
+                                "LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE" => {
+                                    end_tail.push(qualifier.to_string());
+                                }
+                                "BEFORE" | "AFTER" => {
+                                    end_tail.push(qualifier.to_string());
+                                    let mut lookahead = idx + 1;
+                                    while lookahead < tokens.len() {
+                                        match &tokens[lookahead] {
+                                            SqlToken::Comment(comment) => {
+                                                if !comment.contains('\n') {
+                                                    lookahead += 1;
+                                                    continue;
+                                                }
+                                                break;
+                                            }
+                                            SqlToken::Word(word) => {
+                                                let qualifier_part = word.to_uppercase();
+                                                if end_tail
+                                                    .last()
+                                                    .is_some_and(|value| value == "EACH")
+                                                {
+                                                    if qualifier_part == "ROW" {
+                                                        end_tail.push(qualifier_part);
+                                                    }
+                                                    break;
+                                                }
+                                                if matches!(
+                                                    qualifier_part.as_str(),
+                                                    "EACH" | "STATEMENT"
+                                                ) {
+                                                    end_tail.push(qualifier_part);
+                                                    lookahead += 1;
+                                                    continue;
+                                                }
+                                                break;
+                                            }
+                                            SqlToken::Symbol(sym) if sym == ";" => break,
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let is_qualified_end = matches!(
+                            end_tail.first().map(String::as_str),
+                            Some("LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE")
+                        );
+                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+
+                        let case_expression_end =
+                            !is_qualified_end && block_stack.last().is_some_and(|s| s == "CASE");
+
+                        if is_qualified_end {
+                            // END LOOP, END IF, END CASE - pop matching block
+                            if let Some(top) = block_stack.last() {
+                                if block_end_qualifiers.contains(&top.as_str()) {
+                                    block_stack.pop();
+                                }
+                            }
+                            if end_tail.first().is_some_and(|q| q == "CASE")
+                                && !case_branch_started.is_empty()
+                            {
+                                case_branch_started.pop();
+                            }
+                        } else if case_expression_end {
+                            block_stack.pop();
+                            if !case_branch_started.is_empty() {
+                                case_branch_started.pop();
+                            }
+                        } else {
+                            // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
+                            // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
+                            let mut closed_block = None;
+                            while let Some(top) = block_stack.pop() {
+                                if top == "BEGIN" || top == "DECLARE" || top == "PACKAGE_BODY" {
+                                    closed_block = Some(top);
+                                    break;
+                                }
+                            }
+                            if matches!(closed_block.as_deref(), Some("BEGIN" | "DECLARE"))
+                                && (block_stack.last().is_some_and(|s| s == "PACKAGE_BODY")
+                                    || at_package_body_member_depth)
+                            {
+                                pending_package_member_separator = true;
+                            }
+                        }
+
+                        indent_level = indent_level.saturating_sub(1);
+                        if is_package_body_statement
+                            && !is_qualified_end
+                            && !case_expression_end
+                            && indent_level == 1
+                        {
+                            pending_package_member_separator = true;
+                        }
+                        let end_extra =
+                            if case_expression_end && (in_sql_case_clause || !in_plsql_block) {
+                                1
+                            } else {
+                                0
+                            };
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            end_extra + paren_extra,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+
+                        // Output "END"
+                        ensure_indent(&mut out, &mut at_line_start, line_indent);
+                        out.push_str("END");
+
+                        // If qualified (END LOOP/IF/CASE/REPEAT/BEFORE/AFTER), output tail and skip it.
+                        let skip_count = end_tail.len();
+                        for qualifier in end_tail.iter() {
+                            out.push(' ');
+                            out.push_str(qualifier);
+                        }
+                        needs_space = true;
+                        if skip_count == 0 {
+                            idx += 1;
+                        } else {
+                            let mut lookahead = idx + 1;
+                            let mut words_skipped = 0usize;
+                            while lookahead < tokens.len() && words_skipped < skip_count {
+                                match &tokens[lookahead] {
+                                    SqlToken::Word(_) => {
+                                        words_skipped += 1;
+                                    }
+                                    SqlToken::Comment(comment) => {
+                                        if comment.contains('\n') {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                lookahead += 1;
+                            }
+                            idx = lookahead;
+                        }
+                        continue;
+                    } else if trigger_header_state.is_active()
+                        && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD")
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if is_trigger_event_keyword
+                        && matches!(prev_word_upper.as_deref(), Some("BEFORE" | "AFTER" | "OF"))
+                    {
+                        // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
+                    } else if construct.merge_when_branch_active && upper == "SET" {
+                        // MERGE UPDATE SET keeps SET inline with UPDATE, but we still need
+                        // SET clause context so following list comments/commas align correctly.
+                        current_clause = Some(upper.clone());
+                        select_list_layout_state.clear();
+                    } else if clause_keywords.contains(&upper.as_str())
+                        && !construct.suppresses_clause_break(
+                            upper.as_str(),
+                            prev_word_upper.as_deref(),
+                            in_plsql_block,
+                            suppress_comma_break_depth,
+                            paren_stack.iter().any(|is_subquery| *is_subquery),
+                            trigger_header_state,
+                            is_analytic_within_group,
+                            !Self::fetch_into_has_multiple_targets(tokens, idx),
+                        )
+                    {
+                        // Keep shallow FORALL bodies one level deeper, but do not
+                        // keep drifting nested package-body DML further right.
+                        if construct.forall_pending
+                            && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+                        {
+                            let forall_body_extra = usize::from(indent_level <= 1);
+                            indent_level += forall_body_extra;
+                            construct.forall_pending = false;
+                            construct.forall_body_active = forall_body_extra > 0;
+                        }
+                        if !is_within_group {
+                            let insert_all_extra = if construct.insert_all_active
+                                && matches!(upper.as_str(), "INTO" | "VALUES")
+                            {
+                                2
+                            } else {
+                                0
+                            };
+                            // INSERT ALL: stop at SELECT (the trailing query)
+                            if construct.insert_all_active && upper == "SELECT" {
+                                construct.insert_all_active = false;
+                            }
+                            let cursor_clause_dedent = construct.cursor_sql_active
+                                && !paren_stack.iter().any(|is_subquery| *is_subquery)
+                                && matches!(
+                                    upper.as_str(),
+                                    "FROM"
+                                        | "WHERE"
+                                        | "GROUP"
+                                        | "ORDER"
+                                        | "CONNECT"
+                                        | "HAVING"
+                                        | "UNION"
+                                        | "INTERSECT"
+                                        | "MINUS"
+                                );
+                            let clause_indent_level = if cursor_clause_dedent {
+                                indent_level.saturating_sub(1)
+                            } else {
+                                indent_level
+                            };
+                            newline_with(
+                                &mut out,
+                                clause_indent(
+                                    clause_indent_level,
+                                    open_cursor_state,
+                                    upper.as_str(),
+                                    open_cursor_state
+                                        .select_depth()
+                                        .is_some_and(|depth| paren_stack.len() == depth),
+                                    construct.cursor_sql_active,
+                                ),
+                                insert_all_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        if !is_within_group {
+                            current_clause = Some(upper.clone());
+                            if upper != "SELECT" {
+                                select_list_layout_state.clear();
+                            }
+                            if upper == "SELECT" && open_cursor_state.in_select() {
+                                // Keep OPEN ... FOR SELECT inside the cursor SQL context.
+                                open_cursor_state.set_select_depth(paren_stack.len());
+                            }
+                            if upper == "WITH" {
+                                with_cte_state.on_clause_keyword("WITH");
+                                statement_has_with_clause = true;
+                            } else if upper == "SELECT" {
+                                // Main query SELECT after CTE definitions.
+                                with_cte_state.on_clause_keyword("SELECT");
+                            }
+                            if matches!(
+                                upper.as_str(),
+                                "SELECT"
+                                    | "FROM"
+                                    | "WHERE"
+                                    | "GROUP"
+                                    | "HAVING"
+                                    | "ORDER"
+                                    | "UNION"
+                                    | "INTERSECT"
+                                    | "MINUS"
+                                    | "EXCEPT"
+                            ) {
+                                construct.search_cycle_clause_active = false;
+                            }
+                        }
+                    } else if is_analytic_within_group {
+                        newline_with(
+                            &mut out,
+                            list_item_indent(
+                                indent_level,
+                                open_cursor_state,
+                                select_list_layout_state,
+                            ),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if condition_keywords.contains(&upper.as_str())
+                        && !is_between_and
+                        && !is_exit_when
+                        && !construct.suppresses_condition_break(
+                            upper.as_str(),
+                            prev_word_upper.as_deref(),
+                            trigger_header_state,
+                        )
+                    {
+                        let clause_base_indent = clause_indent(
+                            indent_level,
+                            open_cursor_state,
+                            upper.as_str(),
+                            open_cursor_state
+                                .select_depth()
+                                .is_some_and(|depth| paren_stack.len() == depth),
+                            construct.cursor_sql_active,
+                        );
+                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                        if upper == "WHEN"
+                            && block_stack.last().is_some_and(|s| s == "CASE")
+                            && case_branch_started.last().is_some()
+                        {
+                            if let Some(last) = case_branch_started.last_mut() {
+                                *last = true;
+                            }
+                        }
+                        let is_merge_when = upper == "WHEN"
+                            && construct.merge_active
+                            && block_stack.last().is_none_or(|s| s != "CASE");
+                        if is_merge_when {
+                            // MERGE WHEN MATCHED/NOT MATCHED: at base indent
+                            if construct.merge_when_branch_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                construct.merge_when_branch_active = false;
+                            }
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else {
+                            newline_with(
+                                &mut out,
+                                clause_base_indent,
+                                1 + paren_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                    } else if upper == "CREATE" {
+                        construct.create_pending = true;
+                        construct.create_object = None;
+                    } else if construct.create_pending && (upper == "OR" || upper == "REPLACE") {
+                        // part of CREATE OR REPLACE
+                    } else if construct.create_pending && upper == "PACKAGE" {
+                        if next_word_is("BODY") {
+                            construct.create_object = Some("PACKAGE_BODY".to_string());
+                        } else {
+                            construct.create_object = Some("PACKAGE".to_string());
+                        }
+                        construct.create_pending = false;
+                    } else if construct.create_pending && upper == "TABLE" {
+                        construct.create_table_paren_expected = true;
+                        construct.create_pending = false;
+                    } else if construct.create_pending && matches!(upper.as_str(), "INDEX" | "UNIQUE") {
+                        if upper == "INDEX" {
+                            construct.create_index_pending = true;
+                            construct.create_pending = false;
+                        }
+                        // UNIQUE stays in construct.create_pending to catch UNIQUE INDEX
+                    } else if construct.create_pending && upper == "SEQUENCE" {
+                        construct.create_sequence_active = true;
+                        construct.create_pending = false;
+                    } else if construct.create_pending && upper == "SYNONYM" {
+                        construct.create_synonym_active = true;
+                        construct.create_pending = false;
+                    } else if construct.create_pending
+                        && matches!(
+                            upper.as_str(),
+                            "PROCEDURE" | "FUNCTION" | "TYPE" | "TRIGGER"
+                        )
+                    {
+                        construct.create_object = Some(upper.clone());
+                        if upper == "TRIGGER" {
+                            trigger_header_state.start();
+                        }
+                        construct.create_pending = false;
+                    } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
+                        && prev_word_upper.as_deref() == Some("WITH")
+                    {
+                        if !at_line_start {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                    } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
+                        && (block_stack.iter().any(|s| s == "PACKAGE_BODY")
+                            || at_package_body_member_depth)
+                    {
+                        if !at_line_start {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        construct.routine_decl_pending = true;
+                    } else if upper == "ELSE" || upper == "ELSIF" {
+                        // ELSE/ELSIF in IF block: same level as IF
+                        let in_if_block = block_stack.last().is_some_and(|s| s == "IF");
+                        let in_case_block = block_stack.last().is_some_and(|s| s == "CASE");
+                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                        if upper == "ELSE"
+                            && in_case_block
+                            && case_branch_started.last().is_some()
+                            && !in_if_block
+                        {
+                            if let Some(last) = case_branch_started.last_mut() {
+                                *last = true;
+                            }
+                        }
+                        if in_if_block {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else {
+                            // ELSE in CASE or other context
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1 + paren_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        if upper == "ELSE"
+                            && in_plsql_block
+                            && !matches!(current_clause.as_deref(), Some("SELECT"))
+                        {
+                            newline_after_keyword = true;
+                        } else if upper == "ELSE" && in_sql_case_clause && next_word_is("CASE") {
+                            // Keep ELSE CASE from collapsing into one long SQL expression line.
+                            newline_after_keyword = true;
+                            newline_after_keyword_extra = 1;
+                        }
+                    } else if upper == "THEN" {
+                        if construct.merge_active && block_stack.last().is_none_or(|s| s != "CASE") {
+                            // MERGE WHEN MATCHED THEN / WHEN NOT MATCHED THEN
+                            indent_level += 1;
+                            construct.merge_when_branch_active = true;
+                            newline_after_keyword = true;
+                        } else if in_plsql_block
+                            && !matches!(current_clause.as_deref(), Some("SELECT"))
+                        {
+                            newline_after_keyword = true;
+                            if block_stack.last().is_some_and(|s| s == "CASE") {
+                                newline_after_keyword_extra = 1;
+                            }
+                        } else if in_sql_case_clause && next_word_is("CASE") {
+                            // Nested CASE in SQL expressions should start on its own line.
+                            newline_after_keyword = true;
+                            newline_after_keyword_extra = 1;
+                        }
+                    } else if upper == join_keyword {
+                        if !join_modifier_active {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        join_modifier_active = false;
+                    } else if join_modifiers.contains(&upper.as_str()) {
+                        if next_word_is("JOIN") || next_word_is("OUTER") || next_word_is("APPLY") {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            join_modifier_active = true;
+                        }
+                    } else if upper == outer_keyword {
+                        if (next_word_is("JOIN") || next_word_is("APPLY")) && !join_modifier_active
+                        {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            join_modifier_active = true;
+                        }
+                    } else if upper == "SEARCH" || upper == "CYCLE" {
+                        construct.search_cycle_clause_active = true;
+                    } else if construct.match_recognize_paren_depth.is_some_and(|depth| {
+                        paren_stack.len() >= depth
+                            && matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
+                    }) {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if matches!(current_clause.as_deref(), Some("MODEL"))
+                        && matches!(
+                            upper.as_str(),
+                            "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
+                        )
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if upper == "OPEN" {
+                        open_cursor_state = OpenCursorFormatState::AwaitingFor;
+                    } else if (upper == "FOR" || upper == "WHILE")
+                        && !(upper == "FOR"
+                            && (construct.create_synonym_active
+                                || suppress_comma_break_depth > 0
+                                || (next_word_is("UPDATE") && !in_plsql_block)))
+                    {
+                        if upper == "FOR" && trigger_header_state.is_active() {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            after_for_while = false;
+                        } else if upper == "FOR"
+                            && open_cursor_state == OpenCursorFormatState::AwaitingFor
+                        {
+                            open_for_select_stack.push(open_cursor_state);
+                            open_cursor_state = OpenCursorFormatState::InSelect {
+                                anchor_indent: indent_level.saturating_add(1),
+                                select_paren_depth: None,
+                            };
+                            newline_after_keyword = true;
+                        } else {
+                            // FOR/WHILE starts a line, LOOP will follow on same line
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            after_for_while = true;
+                        }
+                    } else if upper == "LOOP" {
+                        // LOOP after FOR/WHILE stays on same line
+                        if !after_for_while {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        after_for_while = false;
+                        // LOOP always starts a block body on the next line.
+                        newline_after_keyword = true;
+                    } else if upper == "REPEAT" {
+                        // REPEAT starts a block body on the next line.
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if upper == "CASE" {
+                        // CASE in PL/SQL block vs SELECT context
+                        if in_sql_case_clause {
+                            let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1 + paren_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else if in_plsql_block {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                        // In SELECT context, CASE stays inline
+                    } else if should_treat_as_block_start {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if upper == "BEGIN" {
+                        // BEGIN handling: check if we're inside a DECLARE block
+                        let inside_declare = block_stack
+                            .last()
+                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
+                        if inside_declare {
+                            // DECLARE ... BEGIN - BEGIN is at same level as DECLARE
+                            // Don't increase indent, just newline at current level
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else {
+                            // Standalone BEGIN block
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                    }
+
+                    ensure_indent(&mut out, &mut at_line_start, line_indent);
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    if is_keyword {
+                        out.push_str(&upper);
+                    } else {
+                        out.push_str(word);
+                    }
+                    needs_space = true;
+                    if upper == "SELECT" {
+                        select_list_layout_state
+                            .activate(out.len(), base_indent(indent_level, open_cursor_state) + 1);
+                    }
+
+                    if construct.create_table_paren_expected
+                        && upper == "AS"
+                        && (next_word_is("SELECT")
+                            || next_word_is("WITH")
+                            || next_word_is("VALUES"))
+                    {
+                        construct.create_table_paren_expected = false;
+                    }
+
+                    // CURSOR ... IS/AS → indent the SQL body
+                    if upper == "CURSOR" && in_plsql_block {
+                        construct.cursor_decl_pending = true;
+                    }
+                    if matches!(upper.as_str(), "IS" | "AS") && construct.cursor_decl_pending {
+                        construct.cursor_decl_pending = false;
+                        construct.cursor_sql_active = true;
+                        indent_level += 1;
+                        newline_after_keyword = true;
+                    }
+
+                    // FORALL → indent the DML body
+                    if upper == "FORALL" && in_plsql_block {
+                        construct.forall_pending = true;
+                    }
+
+                    // EXECUTE IMMEDIATE tracking
+                    if upper == "EXECUTE" && next_word_is("IMMEDIATE") {
+                        construct.execute_immediate_active = true;
+                    }
+
+                    // REFERENCES → suppress ON DELETE/UPDATE (referential actions)
+                    if upper == "REFERENCES" {
+                        construct.referential_action_pending = true;
+                    }
+                    if construct.referential_action_pending && upper == "ON" {
+                        construct.referential_action_pending = false;
+                        construct.referential_on_active = true;
+                    }
+                    if construct.referential_on_active
+                        && !matches!(
+                            upper.as_str(),
+                            "ON" | "DELETE"
+                                | "UPDATE"
+                                | "SET"
+                                | "CASCADE"
+                                | "RESTRICT"
+                                | "NO"
+                                | "ACTION"
+                                | "NULL"
+                        )
+                    {
+                        construct.referential_on_active = false;
+                    }
+
+                    // COMMENT ON tracking
+                    if upper == "COMMENT" && next_word_is("ON") {
+                        construct.comment_on_active = true;
+                    }
+                    if construct.comment_on_active && upper == "ON" {
+                        construct.comment_on_active = false; // one-shot: suppress ON, then done
+                    }
+
+                    // GRANT/REVOKE tracking
+                    if matches!(upper.as_str(), "GRANT" | "REVOKE") && indent_level == 0 {
+                        construct.grant_revoke_active = true;
+                    }
+                    // GRANT/REVOKE ends at ON (for privilege grants) or TO/FROM
+                    if construct.grant_revoke_active && matches!(upper.as_str(), "TO" | "FROM") {
+                        construct.grant_revoke_active = false;
+                    }
+
+                    // RETURNING → suppress next INTO
+                    if upper == "RETURNING" {
+                        construct.returning_active = true;
+                    }
+                    if construct.returning_active && upper == "INTO" {
+                        construct.returning_active = false;
+                    }
+
+                    // FETCH cursor → suppress INTO/LIMIT/BULK (PL/SQL FETCH, not SQL FETCH FIRST)
+                    if upper == "FETCH" && in_plsql_block {
+                        construct.fetch_active = true;
+                    }
+
+                    // BULK COLLECT → suppress next INTO
+                    if upper == "BULK" && next_word_is("COLLECT") {
+                        construct.bulk_collect_active = true;
+                    }
+                    if construct.bulk_collect_active && upper == "INTO" {
+                        construct.bulk_collect_active = false;
+                    }
+
+                    // MERGE tracking
+                    if upper == "MERGE" && matches!(current_clause.as_deref(), None | Some("MERGE"))
+                    {
+                        construct.merge_active = true;
+                    }
+
+                    // INSERT ALL/FIRST tracking
+                    if matches!(upper.as_str(), "ALL" | "FIRST")
+                        && matches!(prev_word_upper.as_deref(), Some("INSERT"))
+                    {
+                        construct.insert_all_active = true;
+                    }
+
+                    let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
+                        && (construct.create_object.is_some() || construct.routine_decl_pending);
+
+                    // Handle block start - push to stack and increase indent
+                    if should_treat_as_block_start {
+                        block_stack.push(upper.clone());
+                        indent_level += 1;
+                        if upper == "DECLARE" || upper == "IF" {
+                            in_plsql_block = true;
+                        }
+                    } else if upper == "BEGIN" {
+                        let inside_declare = block_stack
+                            .last()
+                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
+                        if inside_declare {
+                            // DECLARE ... BEGIN - same block depth.
+                            // PACKAGE BODY initialization BEGIN is also same depth as PACKAGE_BODY.
+                            if block_stack.last().is_some_and(|s| s == "DECLARE") {
+                                block_stack.pop();
+                                block_stack.push("BEGIN".to_string());
+                            }
+                            // indent_level stays the same for both cases
+                        } else {
+                            // Standalone BEGIN block
+                            block_stack.push("BEGIN".to_string());
+                            indent_level += 1;
+                        }
+                        in_plsql_block = true;
+                    } else if upper == "LOOP" {
+                        block_stack.push("LOOP".to_string());
+                        indent_level += 1;
+                    } else if upper == "REPEAT" {
+                        block_stack.push("REPEAT".to_string());
+                        indent_level += 1;
+                        in_plsql_block = true;
+                    } else if upper == "CASE" {
+                        block_stack.push("CASE".to_string());
+                        if in_plsql_block && current_clause.is_none() {
+                            case_branch_started.push(false);
+                        }
+                        indent_level += 1;
+                    } else if starts_create_block {
+                        // Treat AS/IS in CREATE PACKAGE/PROC/FUNC/TYPE/TRIGGER and package-body routines as declaration section start
+                        let is_package_body =
+                            matches!(construct.create_object.as_deref(), Some("PACKAGE_BODY"));
+                        if is_package_body {
+                            block_stack.push("PACKAGE_BODY".to_string());
+                        } else {
+                            block_stack.push("DECLARE".to_string());
+                        }
+                        indent_level += 1;
+                        in_plsql_block = true;
+                        construct.create_object = None;
+                        construct.routine_decl_pending = false;
+                        newline_with(
+                            &mut out,
+                            indent_level,
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+
+                    if upper == "DECLARE" || upper == "BEGIN" {
+                        if upper == "BEGIN" {
+                            trigger_header_state.clear();
+                        }
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+
+                    if newline_after_keyword {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            newline_after_keyword_extra,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+
+                    if upper == "BETWEEN" {
+                        between_pending = true;
+                    } else if upper == "AND" && between_pending {
+                        between_pending = false;
+                    }
+                    if is_create_index_on {
+                        construct.create_index_pending = false;
+                    }
+                    exit_condition_state.on_keyword(upper.as_str());
+
+                    prev_word_upper = Some(upper);
+                }
+                SqlToken::String(literal) => {
+                    let started_line = at_line_start;
+                    ensure_indent(&mut out, &mut at_line_start, line_indent);
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    out.push_str(literal);
+                    needs_space = true;
+                    if literal.contains('\n') {
+                        at_line_start = literal.ends_with('\n');
+                    }
+                    if started_line {}
+                }
+                SqlToken::Comment(comment) => {
+                    let mut has_leading_newline = comment.starts_with('\n');
+                    let raw_comment_body = if has_leading_newline {
+                        &comment[1..]
+                    } else {
+                        comment.as_str()
+                    };
+                    let trimmed_comment = raw_comment_body.trim_end_matches('\n');
+                    let is_block_comment =
+                        trimmed_comment.starts_with("/*") && trimmed_comment.ends_with("*/");
+                    let is_hint_comment = trimmed_comment.starts_with("/*+");
+                    let hint_after_select =
+                        is_hint_comment && matches!(prev_word_upper.as_deref(), Some("SELECT"));
+                    if hint_after_select {
+                        has_leading_newline = false;
+                    }
+                    let comment_body = if has_leading_newline {
+                        &comment[1..]
+                    } else {
+                        raw_comment_body
+                    };
+                    let is_multiline_block_comment =
+                        is_block_comment && comment_body.contains('\n');
+                    let next_is_word_like = matches!(
+                        tokens.get(idx + 1),
+                        Some(SqlToken::Word(_) | SqlToken::String(_))
+                    );
+                    let in_select_list = matches!(current_clause.as_deref(), Some("SELECT"));
+                    let in_set_clause = matches!(current_clause.as_deref(), Some("SET"));
+                    let top_level_select_list =
+                        in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
+                    let top_level_set_list =
+                        in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
+                    let active_list_layout = select_list_layout_state.has_active_indent();
+                    let attachment = Self::classify_comment_attachment(
+                        &out,
+                        at_line_start,
+                        has_leading_newline,
+                        is_multiline_block_comment,
+                    );
+                    let comment_ends_source_line = comment_body.contains('\n');
+                    let attached_previous_keeps_inline = matches!(
+                        attachment,
+                        CommentAttachment::Previous
+                    ) && !(comment_ends_source_line
+                        && matches!(next_non_comment, Some(SqlToken::Symbol(s)) if s == ","));
+                    if (top_level_select_list || top_level_set_list)
+                        && !has_leading_newline
+                        && !is_hint_comment
+                        && !attached_previous_keeps_inline
+                    {
+                        force_select_list_newline(&mut out, &mut select_list_layout_state);
+                    }
+
+                    if is_multiline_block_comment
+                        && !at_line_start
+                        && !matches!(attachment, CommentAttachment::Previous)
+                    {
+                        newline_with(
+                            &mut out,
+                            0,
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+
+                    if matches!(
+                        attachment,
+                        CommentAttachment::Next | CommentAttachment::Block
+                    ) && has_leading_newline
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if matches!(attachment, CommentAttachment::Previous) && !at_line_start {
+                        trim_trailing_space(&mut out);
+                        if !out.ends_with('\n') {
+                            out.push(' ');
+                        }
+                    }
+
+                    let comment_starts_line = at_line_start;
+                    if comment_starts_line {
+                        let base = base_indent(indent_level, open_cursor_state);
+                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                        let current_select_indent = clause_list_indent(
+                            indent_level,
+                            open_cursor_state,
+                            select_list_layout_state,
+                            current_clause.as_deref(),
+                            construct.merge_active,
+                        );
+                        let next_is_comma = matches!(
+                            next_non_comment,
+                            Some(SqlToken::Symbol(s)) if s == ","
+                        );
+                        let next_is_condition_keyword =
+                            if let Some(SqlToken::Word(w)) = next_non_comment {
+                                let upper = w.to_ascii_uppercase();
+                                condition_keywords.contains(&upper.as_str())
+                                    && !(upper == "AND" && between_pending)
+                            } else {
+                                false
+                            };
+                        let next_is_else = matches!(
+                            next_non_comment,
+                            Some(SqlToken::Word(w))
+                                if w.eq_ignore_ascii_case("ELSE")
+                                    || w.eq_ignore_ascii_case("ELSIF")
+                                    || w.eq_ignore_ascii_case("EXCEPTION")
+                        );
+                        let in_confirmed_list = in_set_clause
+                            || column_list_stack.last().copied().unwrap_or(false)
+                            || ((in_select_list || active_list_layout)
+                                && select_list_layout_state.is_multiline())
+                            || next_is_comma
+                            || next_is_condition_keyword;
+                        if next_is_else {
+                            // Align comment with ELSE/ELSIF/EXCEPTION which
+                            // renders at one level below the current body in
+                            // IF blocks, or at base+1 in CASE blocks.
+                            // EXCEPTION drops to the enclosing BEGIN level
+                            // just like ELSE does in IF blocks.
+                            let in_if_block = block_stack.last().is_some_and(|s| s == "IF");
+                            let next_is_exception = matches!(
+                                next_non_comment,
+                                Some(SqlToken::Word(w))
+                                    if w.eq_ignore_ascii_case("EXCEPTION")
+                            );
+                            line_indent = if next_is_exception {
+                                // EXCEPTION always drops to the enclosing
+                                // BEGIN level regardless of block type.
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                            } else if in_if_block {
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                            } else {
+                                base + 1 + paren_extra
+                            };
+                        } else if next_is_condition_keyword {
+                            // Condition keywords (AND/OR/WHEN/ON) are
+                            // indented at base+1, matching the token
+                            // handler's paren_extra offset.
+                            line_indent = base + 1 + paren_extra;
+                        } else if in_confirmed_list {
+                            line_indent = current_select_indent;
+                        } else if line_indent == 0 {
+                            line_indent = base;
+                        }
+                        ensure_indent(&mut out, &mut at_line_start, line_indent);
+                    }
+
+                    let rendered_comment_body = if matches!(attachment, CommentAttachment::Previous)
+                        && !comment_starts_line
+                        && comment_body.trim_start().starts_with("--")
+                    {
+                        comment_body.trim_start()
+                    } else {
+                        comment_body
+                    };
+
+                    out.push_str(rendered_comment_body);
+
+                    needs_space = true;
+                    if is_multiline_block_comment {
+                        at_line_start = true;
+                        needs_space = false;
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        if in_select_list
+                            || in_set_clause
+                            || active_list_layout
+                            || column_list_stack.last().copied().unwrap_or(false)
+                            || hint_after_select
+                        {
+                            let select_list_indent = clause_list_indent(
+                                indent_level,
+                                open_cursor_state,
+                                select_list_layout_state,
+                                current_clause.as_deref(),
+                                construct.merge_active,
+                            );
+                            line_indent = select_list_indent;
+                            if hint_after_select {
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: select_list_indent,
+                                };
+                            }
+                        } else {
+                            line_indent = 0;
+                        }
+                    } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
+                        at_line_start = true;
+                        needs_space = false;
+                        if in_select_list
+                            || in_set_clause
+                            || active_list_layout
+                            || column_list_stack.last().copied().unwrap_or(false)
+                            || hint_after_select
+                        {
+                            let select_list_indent = clause_list_indent(
+                                indent_level,
+                                open_cursor_state,
+                                select_list_layout_state,
+                                current_clause.as_deref(),
+                                construct.merge_active,
+                            );
+                            line_indent = select_list_indent;
+                            if (in_select_list || in_set_clause)
+                                && !select_list_layout_state.is_multiline()
+                                && comment_starts_line
+                            {
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: select_list_indent,
+                                };
+                            }
+                        }
+                    } else if is_block_comment && next_is_word_like {
+                        let keep_inline_alias_comment = matches!(
+                            (prev_word_upper.as_deref(), tokens.get(idx + 1)),
+                            (Some("AS" | "IS"), Some(SqlToken::Word(_)))
+                        );
+                        if !keep_inline_alias_comment {
+                            let list_extra = if in_select_list
+                                || in_set_clause
+                                || active_list_layout
+                                || column_list_stack.last().copied().unwrap_or(false)
+                                || hint_after_select
+                            {
+                                clause_list_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    select_list_layout_state,
+                                    current_clause.as_deref(),
+                                    construct.merge_active,
+                                )
+                                .saturating_sub(base_indent(indent_level, open_cursor_state))
+                            } else {
+                                0
+                            };
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                list_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            if hint_after_select {
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: base_indent(indent_level, open_cursor_state) + 1,
+                                };
+                            }
+                        }
+                    } else if comment_starts_line {
+                    }
+                }
+                SqlToken::Symbol(sym) => {
+                    let started_line = at_line_start;
+                    match sym.as_str() {
+                        "," => {
+                            let next_is_inline_comment = matches!(
+                                tokens.get(idx + 1),
+                                Some(SqlToken::Comment(comment))
+                                    if !comment.starts_with('\n') && comment.contains('\n')
+                            );
+                            if statement_has_with_clause
+                                && matches!(current_clause.as_deref(), Some("SELECT"))
+                                && !open_cursor_state.in_select()
+                                && suppress_comma_break_depth == 0
+                            {
+                                force_select_list_newline(&mut out, &mut select_list_layout_state);
+                            }
+                            trim_trailing_space(&mut out);
+                            if out.ends_with('\n') || at_line_start {
+                                if line_indent == 0
+                                    && (matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                                        || select_list_layout_state.has_active_indent()
+                                        || column_list_stack.last().copied().unwrap_or(false)
+                                        || matches!(
+                                            tokens.get(idx.saturating_sub(1)),
+                                            Some(SqlToken::Comment(comment))
+                                                if comment.trim_start().starts_with("--")
+                                        ))
+                                {
+                                    line_indent = clause_list_indent(
+                                        indent_level,
+                                        open_cursor_state,
+                                        select_list_layout_state,
+                                        current_clause.as_deref(),
+                                        construct.merge_active,
+                                    );
+                                }
+                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            }
+                            out.push(',');
+                            between_pending = false;
+                            let is_with_cte_separator = with_cte_state.can_close_on_select();
+                            if column_list_stack.last().copied().unwrap_or(false) {
+                                let comma_extra_indent =
+                                    if (matches!(current_clause.as_deref(), Some("SET"))
+                                        && construct.merge_active)
+                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                            && construct.cursor_sql_active)
+                                    {
+                                        0
+                                    } else {
+                                        1
+                                    };
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    comma_extra_indent,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else if is_with_cte_separator {
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else if next_is_inline_comment {
+                                needs_space = true;
+                                if matches!(current_clause.as_deref(), Some("SELECT")) {
+                                    let select_list_indent =
+                                        base_indent(indent_level, open_cursor_state) + 1;
+                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
+                                }
+                            } else if suppress_comma_break_depth == 0
+                                && !construct.execute_immediate_active
+                                && !construct.grant_revoke_active
+                            {
+                                let comma_extra_indent =
+                                    if (matches!(current_clause.as_deref(), Some("SET"))
+                                        && construct.merge_active)
+                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                            && construct.cursor_sql_active)
+                                    {
+                                        0
+                                    } else {
+                                        1
+                                    };
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    comma_extra_indent,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                if matches!(current_clause.as_deref(), Some("SELECT")) {
+                                    // The select list is already multiline after the first comma.
+                                    // Avoid retroactively forcing a newline right after SELECT.
+                                    let select_list_indent =
+                                        base_indent(indent_level, open_cursor_state) + 1;
+                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
+                                }
+                            } else {
+                                out.push(' ');
+                                needs_space = false;
+                            }
+                        }
+                        ";" => {
+                            trim_trailing_space(&mut out);
+                            out.push(';');
+                            current_clause = None;
+                            select_list_layout_state.clear();
+                            open_cursor_state = OpenCursorFormatState::None;
+                            open_for_select_stack.clear();
+                            between_pending = false;
+                            trigger_header_state.clear();
+                            exit_condition_state.clear();
+                            construct.execute_immediate_active = false;
+                            construct.cursor_decl_pending = false;
+                            construct.create_index_pending = false;
+                            construct.create_sequence_active = false;
+                            construct.create_synonym_active = false;
+                            construct.grant_revoke_active = false;
+                            construct.comment_on_active = false;
+                            construct.returning_active = false;
+                            construct.fetch_active = false;
+                            construct.bulk_collect_active = false;
+                            construct.insert_all_active = false;
+                            construct.referential_action_pending = false;
+                            construct.referential_on_active = false;
+                            if construct.merge_when_branch_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                construct.merge_when_branch_active = false;
+                            }
+                            construct.merge_active = false;
+                            if construct.cursor_sql_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                construct.cursor_sql_active = false;
+                            }
+                            if construct.forall_body_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                construct.forall_body_active = false;
+                            }
+                            if pending_package_member_separator
+                                && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
+                            {
+                                out.push_str("\n\n");
+                            }
+                            pending_package_member_separator = false;
+                            construct.routine_decl_pending = false;
+                            let should_reset_paren_tracking =
+                                indent_level == 0 || block_stack.is_empty();
+                            if should_reset_paren_tracking {
+                                suppress_comma_break_depth = 0;
+                                paren_stack.clear();
+                                paren_clause_restore_stack.clear();
+                                column_list_stack.clear();
+                                paren_indent_increase_stack.clear();
+                                select_list_break_state.clear();
+                            }
+                            let next_is_inline_line_comment = matches!(
+                                tokens.get(idx + 1),
+                                Some(SqlToken::Comment(comment))
+                                    if !comment.starts_with('\n')
+                                        && comment.trim_start().starts_with("--")
+                            );
+                            if !next_is_inline_line_comment {
+                                newline_with(
+                                    &mut out,
+                                    indent_level,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                if indent_level == 0 {
+                                    out.push('\n');
+                                    at_line_start = true;
+                                    needs_space = false;
+                                }
+                            }
+                        }
+                        "(" => {
+                            with_cte_state.on_open_paren();
+                            if matches!(current_clause.as_deref(), Some("SELECT"))
+                                && matches!(prev_word_upper.as_deref(), Some("SELECT"))
+                            {
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    1,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            }
+
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            let is_subquery = next_word_is("SELECT")
+                                || next_word_is("WITH")
+                                || next_word_is("INSERT")
+                                || next_word_is("UPDATE")
+                                || next_word_is("DELETE")
+                                || next_word_is("MERGE")
+                                || next_word_is("VALUES")
+                                || matches!(
+                                    prev_word_upper.as_deref(),
+                                    Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
+                                );
+                            if needs_space {
+                                out.push(' ');
+                            }
+                            out.push('(');
+                            let is_column_list = construct.create_table_paren_expected;
+                            construct.create_table_paren_expected = false;
+                            paren_stack.push(is_subquery);
+                            if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
+                                construct.match_recognize_paren_depth = Some(paren_stack.len());
+                            }
+                            paren_clause_restore_stack.push(if is_subquery {
+                                current_clause.clone()
+                            } else {
+                                None
+                            });
+                            column_list_stack.push(is_column_list);
+                            let indent_increase = if is_subquery || is_column_list {
+                                let in_cte_as_subquery =
+                                    matches!(
+                                        with_cte_state,
+                                        WithCteFormatState::InDefinitions { .. }
+                                    ) && matches!(prev_word_upper.as_deref(), Some("AS"));
+                                let deep_subquery_indent =
+                                    matches!(current_clause.as_deref(), Some("SELECT" | "FROM"))
+                                        && !in_cte_as_subquery
+                                        || (matches!(current_clause.as_deref(), Some("WHERE"))
+                                            && matches!(
+                                                prev_word_upper.as_deref(),
+                                                Some("EXISTS" | "IN")
+                                            ));
+                                if is_subquery && deep_subquery_indent {
+                                    2
+                                } else {
+                                    1
+                                }
+                            } else {
+                                0
+                            };
+                            paren_indent_increase_stack.push(indent_increase);
+                            if indent_increase > 0 {
+                                indent_level += indent_increase;
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else {
+                                suppress_comma_break_depth += 1;
+                            }
+                            needs_space = false;
+                        }
+                        ")" => {
+                            with_cte_state.on_close_paren();
+                            trim_trailing_space(&mut out);
+                            let was_subquery = paren_stack.pop().unwrap_or(false);
+                            let restore_clause = paren_clause_restore_stack.pop().unwrap_or(None);
+                            let was_column_list = column_list_stack.pop().unwrap_or(false);
+                            let indent_increase = paren_indent_increase_stack.pop().unwrap_or(0);
+                            let close_case_paren_on_newline = !was_subquery
+                                && !was_column_list
+                                && suppress_comma_break_depth > 0
+                                && out.trim_end().ends_with("END");
+                            if was_subquery || was_column_list {
+                                if indent_level > 0 && indent_increase > 0 {
+                                    indent_level = indent_level.saturating_sub(indent_increase);
+                                }
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    indent_increase.saturating_sub(1),
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            } else {
+                                suppress_comma_break_depth =
+                                    suppress_comma_break_depth.saturating_sub(1);
+                            }
+                            if close_case_paren_on_newline {
+                                let close_case_extra_indent =
+                                    usize::from(!open_cursor_state.in_select());
+                                let close_case_indent_level =
+                                    if next_word_is("ELSE") || next_word_is("WHEN") {
+                                        indent_level.saturating_sub(1)
+                                    } else {
+                                        indent_level
+                                    };
+                                newline_with(
+                                    &mut out,
+                                    close_case_indent_level,
+                                    close_case_extra_indent,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            }
+                            if open_cursor_state
+                                .select_depth()
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
+                                open_cursor_state = open_for_select_stack
+                                    .pop()
+                                    .unwrap_or(OpenCursorFormatState::None);
+                            }
+                            if was_subquery {
+                                current_clause = restore_clause;
+                            }
+                            if construct.match_recognize_paren_depth
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
+                                construct.match_recognize_paren_depth = None;
+                            }
+                            out.push(')');
+                            needs_space = true;
+                        }
+                        "." => {
+                            trim_trailing_space(&mut out);
+                            out.push('.');
+                            needs_space = false;
+                        }
+                        _ => {
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            let is_plsql_attribute_prefix =
+                                Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1));
+                            // Don't add space between consecutive ampersands (&&var substitution)
+                            if needs_space
+                                && !(sym == "&" && out.ends_with('&'))
+                                && !is_plsql_attribute_prefix
+                            {
+                                out.push(' ');
+                            }
+                            out.push_str(sym);
+                            // For bind variables (:name) and assignment (:=), don't add space after colon
+                            // Check if this is ":" and next token is a Word (bind variable)
+                            let is_bind_var_colon = sym == ":"
+                                && tokens
+                                    .get(idx + 1)
+                                    .is_some_and(|t| matches!(t, SqlToken::Word(_)));
+                            // For substitution variables (&var, &&var), don't add space after &
+                            let is_ampersand_prefix = sym == "&"
+                                && tokens.get(idx + 1).is_some_and(|t| {
+                                    matches!(t, SqlToken::Word(_))
+                                        || matches!(t, SqlToken::Symbol(s) if s == "&")
+                                });
+                            needs_space = !is_bind_var_colon
+                                && !is_ampersand_prefix
+                                && !is_plsql_attribute_prefix;
+                        }
+                    }
+                    if started_line {}
+                }
+            }
+
+            idx += 1;
+        }
+
+        let is_plsql_like = Self::is_plsql_like_tokens(statement, tokens);
+        Self::apply_parser_depth_indentation(out.trim_end(), is_plsql_like)
+    }
+
+    fn apply_parser_depth_indentation(formatted: &str, is_plsql_like: bool) -> String {
+        if formatted.is_empty() || !is_plsql_like {
+            return formatted.to_string();
+        }
+
+        let depths = QueryExecutor::line_auto_format_depths(formatted);
+        let line_count = formatted.lines().count();
+        if depths.len() != line_count {
+            return formatted.to_string();
+        }
+
+        let multiline_string_continuation_lines =
+            Self::multiline_string_continuation_lines(formatted, line_count);
+        let mut layouts =
+            Self::build_line_layouts(formatted, &depths, &multiline_string_continuation_lines);
+        let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
+
+        Self::resolve_code_line_layouts(&mut layouts, &previous_code_indices, &next_code_indices);
+        Self::align_case_close_paren_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+        );
+        Self::resolve_non_code_line_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+        );
+
+        Self::render_line_layouts(&layouts)
+    }
+
+    fn build_line_layouts<'a>(
+        formatted: &'a str,
+        depths: &[usize],
+        multiline_string_continuation_lines: &[bool],
+    ) -> Vec<LineLayout<'a>> {
+        let lines: Vec<&'a str> = formatted.lines().collect();
+        let mut layouts = Vec::with_capacity(lines.len());
+        let mut in_block_comment = false;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let raw = *line;
+            let trimmed = raw.trim_start();
+            let continuation_line = multiline_string_continuation_lines
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
+            let (kind, preserve_raw) = if continuation_line {
+                (LineLayoutKind::Verbatim, true)
+            } else {
+                let was_in_block_comment = in_block_comment;
+                let is_comment_only = if was_in_block_comment && trimmed.is_empty() {
+                    true
+                } else if trimmed.is_empty() {
+                    false
+                } else {
+                    Self::line_is_comment_only_with_block_state(raw, &mut in_block_comment)
+                };
+                if !is_comment_only && !trimmed.is_empty() {
+                    crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+                }
+
+                if is_comment_only {
+                    (LineLayoutKind::CommentOnly, was_in_block_comment)
+                } else if trimmed.is_empty() {
+                    (LineLayoutKind::Blank, false)
+                } else if trimmed == "," {
+                    (LineLayoutKind::CommaOnly, false)
+                } else {
+                    (LineLayoutKind::Code, false)
+                }
+            };
+
+            layouts.push(LineLayout {
+                raw,
+                trimmed,
+                kind,
+                preserve_raw,
+                parser_depth: depths.get(idx).copied().unwrap_or(0),
+                existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
+                final_depth: 0,
+                anchor_group: None,
+            });
+        }
+
+        layouts
+    }
+
+    fn line_layout_code_neighbors(
+        layouts: &[LineLayout<'_>],
+    ) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+        let mut previous_code_indices = vec![None; layouts.len()];
+        let mut last_code_idx = None;
+        for (idx, layout) in layouts.iter().enumerate() {
+            previous_code_indices[idx] = last_code_idx;
+            if layout.kind == LineLayoutKind::Code {
+                last_code_idx = Some(idx);
+            }
+        }
+
+        let mut next_code_indices = vec![None; layouts.len()];
+        let mut next_code_idx = None;
+        for idx in (0..layouts.len()).rev() {
+            next_code_indices[idx] = next_code_idx;
+            if layouts[idx].kind == LineLayoutKind::Code {
+                next_code_idx = Some(idx);
+            }
+        }
+
+        (previous_code_indices, next_code_indices)
+    }
+
+    fn line_layout_preceding_comment_or_comma_run_has_comma(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+    ) -> bool {
+        let mut scan_idx = idx;
+        let mut saw_comma = false;
+
+        while scan_idx > 0 {
+            scan_idx = scan_idx.saturating_sub(1);
+            match layouts[scan_idx].kind {
+                LineLayoutKind::CommentOnly => continue,
+                LineLayoutKind::CommaOnly => {
+                    saw_comma = true;
+                }
+                LineLayoutKind::Blank | LineLayoutKind::Verbatim | LineLayoutKind::Code => break,
+            }
+        }
+
+        saw_comma
+    }
+
+    fn previous_dml_clause_starter_depth(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+        target_depth: usize,
+    ) -> Option<usize> {
+        for prev_idx in (0..idx).rev() {
+            if layouts[prev_idx].kind != LineLayoutKind::Code {
+                continue;
+            }
+
+            let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+            if Self::is_dml_clause_starter(&prev_upper)
+                && layouts[prev_idx].final_depth == target_depth
+            {
+                return Some(target_depth);
+            }
+        }
+
+        None
+    }
+
+    fn resolve_code_line_layouts(
+        layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        let mut in_dml_statement = false;
+        let mut paren_case_expression_depth = 0usize;
+        let mut pending_paren_case_closer_indent = false;
+        let mut last_code_idx: Option<usize> = None;
+        let mut next_anchor_group = 0usize;
+        let mut open_for_select_pending = false;
+        let mut open_for_select_clause_depth: Option<usize> = None;
+        let mut dml_case_depths: Vec<usize> = Vec::new();
+        let mut cursor_decl_top_level_dml_active = false;
+
+        for idx in 0..layouts.len() {
+            if layouts[idx].kind != LineLayoutKind::Code {
+                continue;
+            }
+
+            let trimmed = layouts[idx].trimmed;
+            let depth = layouts[idx].parser_depth;
+            let existing_indent = layouts[idx].existing_indent;
+            let trimmed_upper = trimmed.to_ascii_uppercase();
+
+            let previous_line_ends_with_open_paren = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_is_parenthesized_plsql_condition =
+                last_code_idx.is_some_and(|prev_idx| {
+                    Self::is_parenthesized_plsql_condition_header(layouts[prev_idx].trimmed)
+                });
+            let previous_line_is_cte_definition_header = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_is_cte_definition_header(layouts[prev_idx].trimmed)
+            });
+            let previous_line_is_standalone_open_paren = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_is_standalone_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let starts_paren_case_expression =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                    && previous_line_ends_with_open_paren;
+            if starts_paren_case_expression {
+                paren_case_expression_depth += 1;
+            }
+            let in_paren_case_expression = paren_case_expression_depth > 0;
+            let starts_dml = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
+            let starts_subquery_head =
+                starts_dml || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH");
+            if starts_dml {
+                in_dml_statement = true;
+            }
+            let paren_case_extra_indent = if !in_dml_statement
+                && in_paren_case_expression
+                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                    || trimmed_upper.starts_with("WHEN ")
+                    || trimmed_upper.starts_with("ELSE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
+            {
+                1
+            } else {
+                0
+            };
+            let previous_line_is_plain_end = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::starts_with_plain_end(&prev_upper)
+            });
+            let previous_line_starts_with_using_clause = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
+            });
+            let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_ends_with_assignment = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_assignment_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_ends_with_then = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_then_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_is_dml_clause_line = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::is_dml_clause_starter(&prev_upper)
+                    || crate::sql_text::starts_with_keyword_token(&prev_upper, "INTO")
+            });
+            let previous_line_is_dml_clause_starter = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::is_dml_clause_starter(&prev_upper)
+            });
+            let previous_line_is_select_header = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                crate::sql_text::starts_with_keyword_token(&prev_upper, "SELECT")
+            });
+            let previous_code_is_cursor_header = last_code_idx.is_some_and(|prev_idx| {
+                let cursor_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                crate::sql_text::starts_with_keyword_token(&cursor_upper, "CURSOR")
+                    && (cursor_upper.contains(" IS") || cursor_upper.contains(" AS"))
+            });
+            let previous_select_follows_cursor_header = last_code_idx
+                .and_then(|prev_idx| previous_code_indices.get(prev_idx).copied().flatten())
+                .is_some_and(|cursor_idx| {
+                    let cursor_upper = layouts[cursor_idx].trimmed.to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&cursor_upper, "CURSOR")
+                        && (cursor_upper.contains(" IS") || cursor_upper.contains(" AS"))
+                });
+            let previous_line_is_case_header = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                crate::sql_text::starts_with_keyword_token(&prev_upper, "CASE")
+            });
+            let previous_line_is_forall_header = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                crate::sql_text::starts_with_keyword_token(&prev_upper, "FORALL")
+            });
+            let next_code_trimmed =
+                next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
+            let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
+                let next_upper = next.to_ascii_uppercase();
+                Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
+            });
+            let next_line_is_case_branch = next_code_trimmed.is_some_and(|next| {
+                let next_upper = next.to_ascii_uppercase();
+                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE")
+            });
+            let next_line_existing_indent =
+                next_code_indices[idx].map(|next_idx| layouts[next_idx].existing_indent);
+            let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
+                && !previous_line_is_plain_end
+                && !next_line_is_named_plain_end;
+            let force_block_depth = !in_dml_statement
+                && (trimmed_upper.starts_with("EXCEPTION")
+                    || trimmed_upper.starts_with("WHEN ")
+                    || trimmed_upper.starts_with("ELSE")
+                    || trimmed_upper.starts_with("ELSIF")
+                    || trimmed_upper.starts_with("ELSEIF")
+                    || trimmed_upper.starts_with("CASE")
+                    || Self::starts_with_bare_end(&trimmed_upper)
+                    || force_end_suffix_depth);
+
+            let parser_depth = depth + paren_case_extra_indent;
+            let starts_with_close_paren = trimmed.starts_with(')');
+            let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
+            let parser_depth = parser_depth + usize::from(is_paren_case_closer);
+            let last_code_indent = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
+            let follows_comma_run =
+                Self::line_layout_preceding_comment_or_comma_run_has_comma(layouts, idx);
+            let current_line_starts_case =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
+            let mut effective_depth = if !in_dml_statement
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                && previous_line_ends_with_assignment
+            {
+                last_code_indent.unwrap_or(parser_depth)
+            } else if in_dml_statement
+                && current_line_starts_case
+                && previous_line_ends_with_open_paren
+                && !previous_line_is_standalone_open_paren
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && trimmed == "("
+                && previous_line_ends_with_open_paren
+                && next_code_trimmed.is_some_and(|next| {
+                    let next_upper = next.to_ascii_uppercase();
+                    Self::is_dml_clause_starter(&next_upper)
+                })
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth).max(existing_indent))
+                    .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
+            } else if in_dml_statement
+                && current_line_starts_case
+                && previous_line_ends_with_then
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && current_line_starts_case
+                && previous_line_is_dml_clause_starter
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                && previous_code_is_cursor_header
+                && parser_depth > 1
+                && next_code_trimmed.is_some_and(|next| {
+                    let next_upper = next.to_ascii_uppercase();
+                    !Self::is_dml_clause_starter(&next_upper)
+                        && !crate::sql_text::starts_with_keyword_token(&next_upper, "INTO")
+                        && !next.starts_with(')')
+                })
+            {
+                parser_depth
+            } else if Self::starts_with_end_suffix_terminator(&trimmed_upper) {
+                if trimmed_upper.starts_with("END LOOP")
+                    || trimmed_upper.starts_with("END REPEAT")
+                    || trimmed_upper.starts_with("END WHILE")
+                    || trimmed_upper.starts_with("END FOR")
+                {
+                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                } else {
+                    parser_depth
+                }
+            } else if force_block_depth
+                || (cursor_decl_top_level_dml_active
+                    && Self::is_dml_clause_starter(&trimmed_upper)
+                    && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                    && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH")
+                    && existing_indent <= parser_depth.saturating_add(1))
+            {
+                parser_depth
+            } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
+                if previous_line_starts_with_using_clause {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1).max(parser_depth))
+                        .unwrap_or(parser_depth.saturating_add(1).max(existing_indent))
+                } else {
+                    last_code_indent
+                        .map(|indent| indent.max(parser_depth))
+                        .unwrap_or(parser_depth.max(existing_indent))
+                }
+            } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
+            {
+                let previous_line_opens_from_clause_subquery = last_code_idx.is_some_and(|prev_idx| {
+                    let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                    (crate::sql_text::starts_with_keyword_token(&prev_upper, "FROM")
+                        || crate::sql_text::starts_with_keyword_token(&prev_upper, "USING"))
+                        && !previous_line_is_cte_definition_header
+                        && !previous_line_is_parenthesized_plsql_condition
+                });
+                let nested_subquery_depth = if previous_line_is_cte_definition_header
+                    || previous_line_is_parenthesized_plsql_condition
+                    || previous_line_opens_from_clause_subquery
+                {
+                    parser_depth
+                } else {
+                    parser_depth.saturating_add(1)
+                };
+                if previous_line_opens_from_clause_subquery {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1))
+                        .unwrap_or(parser_depth)
+                } else {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
+                        .unwrap_or(nested_subquery_depth)
+                }
+            } else if !in_dml_statement && previous_line_is_parenthesized_plsql_condition {
+                parser_depth.saturating_add(1)
+            } else if in_dml_statement
+                && previous_line_is_forall_header
+                && Self::is_dml_clause_starter(&trimmed_upper)
+            {
+                last_code_indent
+                    .map(|indent| {
+                        if indent <= 1 {
+                            indent.saturating_add(1)
+                        } else {
+                            indent
+                        }
+                    })
+                    .unwrap_or(parser_depth)
+            } else if in_dml_statement
+                && previous_line_is_select_header
+                && previous_select_follows_cursor_header
+                && !Self::is_dml_clause_starter(&trimmed_upper)
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                && !starts_with_close_paren
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && previous_line_is_select_header
+                && !Self::is_dml_clause_starter(&trimmed_upper)
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                && !starts_with_close_paren
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && previous_line_is_case_header
+                && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
+            } else if in_dml_statement
+                && follows_comma_run
+                && !Self::is_dml_clause_starter(&trimmed_upper)
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+            {
+                last_code_indent
+                    .map(|indent| indent.max(parser_depth))
+                    .unwrap_or(parser_depth.max(existing_indent))
+            } else if in_dml_statement
+                && previous_line_ends_with_trailing_comma
+                && !previous_line_is_dml_clause_line
+            {
+                last_code_indent.unwrap_or(parser_depth)
+            } else if in_dml_statement
+                && Self::is_dml_clause_starter(&trimmed_upper)
+                && previous_line_is_dml_clause_starter
+            {
+                if last_code_indent.is_some_and(|indent| indent > parser_depth) {
+                    last_code_indent.unwrap_or(parser_depth)
+                } else {
+                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                }
+            } else if in_dml_statement && starts_with_close_paren {
+                if next_line_is_case_branch {
+                    next_line_existing_indent.unwrap_or(parser_depth)
+                } else if is_paren_case_closer {
+                    parser_depth
+                } else if previous_line_is_dml_clause_line {
+                    last_code_indent
+                        .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                        .unwrap_or(parser_depth)
+                } else if previous_line_is_plain_end {
+                    parser_depth.saturating_add(2)
+                } else {
+                    last_code_indent
+                        .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                        .unwrap_or_else(|| {
+                            existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                        })
+                }
+            } else if in_dml_statement {
+                let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
+                let max_extra = if closes_into_list || follows_comma_run { 0 } else { 2 };
+                existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
+            } else if existing_indent > parser_depth.saturating_add(3) {
+                parser_depth
+            } else {
+                parser_depth.max(existing_indent)
+            };
+            if in_dml_statement {
+                if let Some(case_depth) = dml_case_depths.last().copied() {
+                    if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                        effective_depth = effective_depth.max(case_depth.saturating_add(1));
+                    } else if Self::starts_with_plain_end(&trimmed_upper) {
+                        effective_depth = effective_depth.max(case_depth);
+                    }
+                }
+            }
+
+            let previous_line_is_select_hint = last_code_idx.is_some_and(|prev_idx| {
+                layouts[prev_idx]
+                    .trimmed
+                    .to_ascii_uppercase()
+                    .starts_with("SELECT /*+")
+            });
+            let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
+            let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
+                effective_depth.max(1)
+            } else {
+                effective_depth
+            };
+            let clause_anchor_depth = if Self::is_dml_clause_starter(&trimmed_upper) {
+                Self::previous_dml_clause_starter_depth(layouts, idx, parser_depth).or_else(|| {
+                    Self::previous_dml_clause_starter_depth(
+                        layouts,
+                        idx,
+                        parser_depth.saturating_add(1),
+                    )
+                })
+            } else {
+                None
+            };
+            let mut effective_depth = clause_anchor_depth
+                .map(|anchor_depth| effective_depth.max(anchor_depth))
+                .unwrap_or(effective_depth);
+
+            let starts_open_for =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OPEN")
+                    && trimmed_upper.contains(" FOR");
+            if starts_open_for {
+                open_for_select_pending = true;
+                open_for_select_clause_depth = None;
+            }
+            if open_for_select_pending
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+            {
+                // Only update if this SELECT is at a shallower (or equal) depth
+                // than the current recorded depth.  This handles CTEs where a
+                // deeper CTE-body SELECT appears before the main outer SELECT,
+                // while still preventing deeper subquery SELECTs from
+                // overwriting the recorded depth.
+                let dominated = open_for_select_clause_depth.is_some_and(|d| effective_depth >= d);
+                if !dominated {
+                    open_for_select_clause_depth = Some(effective_depth);
+                }
+            }
+            if let Some(select_depth) = open_for_select_clause_depth {
+                if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHERE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "GROUP")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "HAVING")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CONNECT")
+                {
+                    effective_depth = effective_depth.max(select_depth);
+                }
+            }
+
+            layouts[idx].final_depth = effective_depth;
+            let anchor_group = if !in_dml_statement
+                && previous_line_ends_with_trailing_comma
+                && last_code_indent.is_some_and(|indent| indent == effective_depth)
+            {
+                if let Some(group) =
+                    last_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+                {
+                    group
+                } else {
+                    let group = next_anchor_group;
+                    next_anchor_group = next_anchor_group.saturating_add(1);
+                    group
+                }
+            } else {
+                let group = next_anchor_group;
+                next_anchor_group = next_anchor_group.saturating_add(1);
+                group
+            };
+            layouts[idx].anchor_group = Some(anchor_group);
+
+            let closes_plain_end = Self::starts_with_plain_end(&trimmed_upper);
+            if previous_code_is_cursor_header
+                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH"))
+            {
+                cursor_decl_top_level_dml_active = true;
+            }
+            if in_dml_statement && current_line_starts_case {
+                dml_case_depths.push(effective_depth);
+            }
+            if in_dml_statement && closes_plain_end && !dml_case_depths.is_empty() {
+                dml_case_depths.pop();
+            }
+
+            if in_paren_case_expression && closes_plain_end {
+                paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
+                if paren_case_expression_depth == 0 && in_dml_statement {
+                    pending_paren_case_closer_indent = true;
+                }
+            }
+
+            if pending_paren_case_closer_indent && starts_with_close_paren {
+                pending_paren_case_closer_indent = false;
+            }
+
+            if trimmed.ends_with(';') {
+                in_dml_statement = false;
+                open_for_select_pending = false;
+                open_for_select_clause_depth = None;
+                cursor_decl_top_level_dml_active = false;
+            }
+            last_code_idx = Some(idx);
+        }
+    }
+
+    fn align_case_close_paren_layouts(
+        layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        for idx in 0..layouts.len() {
+            if layouts[idx].kind != LineLayoutKind::Code || !layouts[idx].trimmed.starts_with(')') {
+                continue;
+            }
+
+            let Some(prev_idx) = previous_code_indices[idx] else {
+                continue;
+            };
+            let Some(next_idx) = next_code_indices[idx] else {
+                continue;
+            };
+
+            let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+            let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
+            let next_is_case_branch =
+                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE");
+            if Self::starts_with_plain_end(&previous_upper) && next_is_case_branch {
+                layouts[idx].final_depth = layouts[next_idx].final_depth;
+                layouts[idx].anchor_group = layouts[next_idx].anchor_group;
+            }
+        }
+    }
+
+    fn resolve_non_code_line_layouts(
+        layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        let anchor_depths = Self::line_layout_anchor_depths(layouts);
+        let mut idx = 0usize;
+
+        while idx < layouts.len() {
+            let kind = layouts[idx].kind;
+            if kind != LineLayoutKind::CommentOnly && kind != LineLayoutKind::CommaOnly {
+                idx += 1;
+                continue;
+            }
+
+            let start = idx;
+            while idx < layouts.len() {
+                let run_kind = layouts[idx].kind;
+                if run_kind != LineLayoutKind::CommentOnly && run_kind != LineLayoutKind::CommaOnly
+                {
+                    break;
+                }
+                idx += 1;
+            }
+
+            let previous_code_idx = previous_code_indices[start];
+            let next_code_idx = next_code_indices[start];
+            let previous_code_is_using_continuation_anchor =
+                previous_code_idx.is_some_and(|prev_idx| {
+                    Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
+                        && Self::line_ends_with_comma_before_inline_comment(
+                            layouts[prev_idx].trimmed,
+                        )
+                });
+            let prefer_previous_scope = match (previous_code_idx, next_code_idx) {
+                (Some(prev_idx), Some(next_idx)) => {
+                    let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
+                    let next_is_named_plain_end = Self::starts_with_plain_end(&next_upper)
+                        && !Self::starts_with_bare_end(&next_upper);
+                    next_is_named_plain_end
+                        && layouts[prev_idx].final_depth > layouts[next_idx].final_depth
+                }
+                _ => false,
+            };
+            let anchor_group = if prefer_previous_scope {
+                previous_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+            } else {
+                next_code_idx
+                    .and_then(|next_idx| layouts[next_idx].anchor_group)
+                    .or_else(|| {
+                        previous_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+                    })
+            };
+            let target_depth = if previous_code_is_using_continuation_anchor {
+                previous_code_idx
+                    .map(|prev_idx| layouts[prev_idx].final_depth.saturating_add(1))
+                    .unwrap_or(0)
+            } else {
+                anchor_group
+                    .and_then(|group| anchor_depths.get(group).copied().flatten())
+                    .or_else(|| next_code_idx.map(|next_idx| layouts[next_idx].final_depth))
+                    .or_else(|| previous_code_idx.map(|prev_idx| layouts[prev_idx].final_depth))
+                    .unwrap_or(0)
+            };
+
+            for layout in &mut layouts[start..idx] {
+                layout.anchor_group = anchor_group;
+                layout.final_depth = target_depth;
+            }
+        }
+    }
+
+    fn line_layout_anchor_depths(layouts: &[LineLayout<'_>]) -> Vec<Option<usize>> {
+        let max_anchor_group = layouts
+            .iter()
+            .filter_map(|layout| layout.anchor_group)
+            .max();
+        let Some(max_anchor_group) = max_anchor_group else {
+            return Vec::new();
+        };
+
+        let mut anchor_depths = vec![None; max_anchor_group.saturating_add(1)];
+        for layout in layouts {
+            if layout.kind != LineLayoutKind::Code {
+                continue;
+            }
+            if let Some(anchor_group) = layout.anchor_group {
+                anchor_depths[anchor_group] = Some(layout.final_depth);
+            }
+        }
+
+        anchor_depths
+    }
+
+    fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
+        let mut out = String::new();
+
+        for (idx, layout) in layouts.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+
+            if layout.preserve_raw || layout.kind == LineLayoutKind::Verbatim {
+                out.push_str(layout.raw);
+                continue;
+            }
+
+            match layout.kind {
+                LineLayoutKind::Blank => {}
+                LineLayoutKind::Code
+                | LineLayoutKind::CommentOnly
+                | LineLayoutKind::CommaOnly
+                | LineLayoutKind::Verbatim => {
+                    out.push_str(&" ".repeat(layout.final_depth * 4));
+                    out.push_str(layout.trimmed);
+                }
+            }
+        }
+
+        out
+    }
+
+    fn line_is_comment_only_with_block_state(line: &str, in_block_comment: &mut bool) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if !*in_block_comment && Self::is_sqlplus_comment_line(trimmed) {
+            return true;
+        }
+
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            if *in_block_comment {
+                let mut closed = false;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        *in_block_comment = false;
+                        idx += 2;
+                        closed = true;
+                        break;
+                    }
+                    idx += 1;
+                }
+                if !closed {
+                    return true;
+                }
+                continue;
+            }
+
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+
+            if idx >= bytes.len() {
+                return true;
+            }
+
+            let tail = trimmed.get(idx..).unwrap_or_default();
+            if Self::is_sqlplus_comment_line(tail) {
+                return true;
+            }
+
+            if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+                *in_block_comment = true;
+                idx += 2;
+                continue;
+            }
+
+            return false;
+        }
+
+        true
+    }
+
+    fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WITH")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "VALUES")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SET")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "START")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+    }
+
+    fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+    }
+
+    fn fetch_into_has_multiple_targets(tokens: &[SqlToken], into_idx: usize) -> bool {
+        let mut paren_depth = 0usize;
+        let mut lookahead = into_idx.saturating_add(1);
+
+        while lookahead < tokens.len() {
+            match &tokens[lookahead] {
+                SqlToken::Comment(comment) if comment.contains('\n') => {}
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) => {
+                    for ch in sym.chars() {
+                        match ch {
+                            '(' => paren_depth = paren_depth.saturating_add(1),
+                            ')' => paren_depth = paren_depth.saturating_sub(1),
+                            ',' if paren_depth == 0 => return true,
+                            ';' if paren_depth == 0 => return false,
+                            _ => {}
+                        }
+                    }
+                }
+                SqlToken::Word(word) if paren_depth == 0 => {
+                    if word.eq_ignore_ascii_case("LIMIT")
+                        || word.eq_ignore_ascii_case("BULK")
+                        || word.eq_ignore_ascii_case("FROM")
+                        || word.eq_ignore_ascii_case("WHERE")
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+
+            lookahead = lookahead.saturating_add(1);
+        }
+
+        false
+    }
+
+    fn multiline_string_continuation_lines(formatted: &str, line_count: usize) -> Vec<bool> {
+        let mut continuation_lines = vec![false; line_count];
+        if line_count == 0 {
+            return continuation_lines;
+        }
+
+        // Use byte-based scanning per Rust String Policy.
+        // All delimiters checked here are ASCII, so byte comparison is safe.
+        let bytes = formatted.as_bytes();
+        let mut i = 0usize;
+        let mut line = 0usize;
+
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut in_q_quote = false;
+        let mut q_quote_end: Option<u8> = None;
+
+        while i < bytes.len() {
+            let c = bytes[i];
+            let next = bytes.get(i + 1).copied();
+
+            if in_line_comment {
+                if c == b'\n' {
+                    in_line_comment = false;
+                    line += 1;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == b'*' && next == Some(b'/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                if c == b'\n' {
+                    line += 1;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_q_quote {
+                if Some(c) == q_quote_end && next == Some(b'\'') {
+                    in_q_quote = false;
+                    q_quote_end = None;
+                    i += 2;
+                    continue;
+                }
+                if c == b'\n' {
+                    if line + 1 < line_count {
+                        continuation_lines[line + 1] = true;
+                    }
+                    line += 1;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == b'\'' {
+                    if next == Some(b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if c == b'\n' {
+                    if line + 1 < line_count {
+                        continuation_lines[line + 1] = true;
+                    }
+                    line += 1;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == b'"' {
+                    if next == Some(b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if c == b'\n' {
+                    if line + 1 < line_count {
+                        continuation_lines[line + 1] = true;
+                    }
+                    line += 1;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == b'\n' {
+                line += 1;
+                i += 1;
+                continue;
+            }
+
+            if c == b'-' && next == Some(b'-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == b'/' && next == Some(b'*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if (c == b'n' || c == b'N')
+                && matches!(next, Some(b'q') | Some(b'Q'))
+                && bytes.get(i + 2) == Some(&b'\'')
+                && bytes.get(i + 3).is_some()
+            {
+                let delimiter = bytes[i + 3];
+                in_q_quote = true;
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter as char) as u8);
+                i += 4;
+                continue;
+            }
+
+            if (c == b'q' || c == b'Q') && next == Some(b'\'') && bytes.get(i + 2).is_some() {
+                let delimiter = bytes[i + 2];
+                in_q_quote = true;
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter as char) as u8);
+                i += 3;
+                continue;
+            }
+
+            if c == b'\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == b'"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        continuation_lines
+    }
+
+    fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    let trailing_symbol = sym.trim_end();
+                    return trailing_symbol.ends_with('(');
+                }
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    let trailing_symbol = sym.trim_end();
+                    return trailing_symbol.ends_with(',');
+                }
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
+        let mut non_comment_tokens = super::query_text::tokenize_sql(line)
+            .into_iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)));
+
+        matches!(
+            (non_comment_tokens.next(), non_comment_tokens.next()),
+            (Some(SqlToken::Symbol(sym)), None) if sym.trim() == "("
+        )
+    }
+
+    fn line_ends_with_assignment_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    return sym.trim_end().ends_with(":=");
+                }
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Word(word) => return word.eq_ignore_ascii_case("THEN"),
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        let mut paren_balance = 0usize;
+
+        for token in tokens {
+            if let SqlToken::Symbol(sym) = token {
+                for ch in sym.chars() {
+                    match ch {
+                        '(' => paren_balance = paren_balance.saturating_add(1),
+                        ')' => paren_balance = paren_balance.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        paren_balance > 0
+    }
+
+    fn line_is_cte_definition_header(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
+            return false;
+        }
+
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("WITH ") {
+            return upper.contains(" AS ");
+        }
+
+        upper.contains(" AS (")
+    }
+
+    fn line_starts_with_using_clause(line: &str) -> bool {
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
+    }
+
+    fn is_parenthesized_plsql_condition_header(line: &str) -> bool {
+        if !Self::line_has_unclosed_open_paren_before_inline_comment(line) {
+            return false;
+        }
+
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHILE")
+            || (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FOR")
+                && trimmed_upper.contains(" IN "))
+    }
+
+    fn is_plsql_like_tokens(statement: &str, tokens: &[SqlToken]) -> bool {
+        let words: Vec<&str> = tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        if let Some(first) = words.first().copied() {
+            if first.eq_ignore_ascii_case("SELECT")
+                || first.eq_ignore_ascii_case("INSERT")
+                || first.eq_ignore_ascii_case("UPDATE")
+                || first.eq_ignore_ascii_case("DELETE")
+                || first.eq_ignore_ascii_case("MERGE")
+            {
+                return false;
+            }
+            if first.eq_ignore_ascii_case("WITH") {
+                let mut next_index = 1usize;
+                if words
+                    .get(next_index)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("RECURSIVE"))
+                {
+                    next_index += 1;
+                }
+                if words.get(next_index).is_some_and(|word| {
+                    word.eq_ignore_ascii_case("FUNCTION") || word.eq_ignore_ascii_case("PROCEDURE")
+                }) {
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        for word in &words {
+            if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("DECLARE") {
+                return true;
+            }
+            if word.eq_ignore_ascii_case("CREATE") {
+                let object_type = Self::parse_ddl_object_type(statement);
+                return matches!(
+                    object_type,
+                    "Procedure"
+                        | "Function"
+                        | "Package"
+                        | "Package Body"
+                        | "Type"
+                        | "Type Body"
+                        | "Trigger"
+                );
+            }
+        }
+
+        Self::is_plsql_control_fragment(&words)
+    }
+
+    fn is_plsql_control_fragment(words: &[&str]) -> bool {
+        if words.is_empty() {
+            return false;
+        }
+
+        let first = words[0];
+        if first.eq_ignore_ascii_case("IF")
+            && words.iter().any(|word| word.eq_ignore_ascii_case("THEN"))
+        {
+            return true;
+        }
+
+        if first.eq_ignore_ascii_case("ELSIF") || first.eq_ignore_ascii_case("ELSEIF") {
+            return true;
+        }
+
+        if first.eq_ignore_ascii_case("WHILE")
+            && words.iter().any(|word| word.eq_ignore_ascii_case("LOOP"))
+        {
+            return true;
+        }
+
+        words.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("END")
+                && (pair[1].eq_ignore_ascii_case("IF")
+                    || pair[1].eq_ignore_ascii_case("LOOP")
+                    || pair[1].eq_ignore_ascii_case("CASE"))
+        })
+    }
+
+    #[cfg(test)]
+    fn is_plsql_like_statement(statement: &str) -> bool {
+        let tokens = Self::tokenize_sql(statement);
+        Self::is_plsql_like_tokens(statement, &tokens)
+    }
+
+    fn parse_ddl_object_type(statement: &str) -> &'static str {
+        let upper = statement.to_uppercase();
+        QueryExecutor::parse_ddl_object_type(&upper)
+    }
+
+    fn format_create_table(statement: &str) -> Option<String> {
+        let trimmed = statement.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let tokens = Self::tokenize_sql(trimmed);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        // Guard: only apply CREATE TABLE formatting when TABLE is the actual
+        // object keyword in the CREATE header. This avoids false matches like
+        // CREATE PACKAGE BODY ... TYPE ... IS TABLE OF ...
+        let mut word_positions: Vec<(usize, String)> = Vec::new();
+        for (idx, token) in tokens.iter().enumerate() {
+            if let SqlToken::Word(word) = token {
+                word_positions.push((idx, word.to_uppercase()));
+            }
+        }
+
+        let create_word_idx = word_positions
+            .iter()
+            .position(|(_, word)| word == "CREATE")?;
+
+        let mut header_idx = create_word_idx + 1;
+        while let Some((_, word)) = word_positions.get(header_idx) {
+            if matches!(
+                word.as_str(),
+                "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE"
+            ) {
+                header_idx += 1;
+                continue;
+            }
+            break;
+        }
+
+        if (word_positions
+            .get(header_idx)
+            .is_some_and(|(_, word)| word == "GLOBAL")
+            || word_positions
+                .get(header_idx)
+                .is_some_and(|(_, word)| word == "PRIVATE"))
+            && word_positions
+                .get(header_idx + 1)
+                .is_some_and(|(_, word)| word == "TEMPORARY")
+        {
+            header_idx += 2;
+        }
+
+        let (_, create_object) = word_positions.get(header_idx)?;
+        if create_object != "TABLE" {
+            return None;
+        }
+
+        let mut seen_table = false;
+        let mut ctas = false;
+        let mut open_idx: Option<usize> = None;
+        let mut close_idx: Option<usize> = None;
+        let token_depths = paren_depths(&tokens);
+        let mut idx = 0usize;
+
+        while idx < tokens.len() {
+            let token = &tokens[idx];
+            match token {
+                SqlToken::Word(word) => {
+                    let upper = word.to_uppercase();
+                    if !seen_table && upper == "TABLE" {
+                        seen_table = true;
+                    } else if seen_table
+                        && upper == "AS"
+                        && tokens[idx + 1..]
+                            .iter()
+                            .find_map(|t| match t {
+                                SqlToken::Word(w) => Some(w.to_uppercase()),
+                                _ => None,
+                            })
+                            .is_some_and(|w| w == "SELECT" || w == "WITH")
+                    {
+                        ctas = true;
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if is_top_level_depth(&token_depths, idx)
+                        && seen_table
+                        && !ctas
+                        && open_idx.is_none()
+                    {
+                        open_idx = Some(idx);
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    if is_depth(&token_depths, idx, 1) && open_idx.is_some() && close_idx.is_none()
+                    {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        let (open_idx, close_idx) = match (open_idx, close_idx) {
+            (Some(open_idx), Some(close_idx)) => (open_idx, close_idx),
+            _ => return None,
+        };
+
+        let prefix_tokens = &tokens[..open_idx];
+        let column_tokens = &tokens[open_idx + 1..close_idx];
+        let suffix_tokens = &tokens[close_idx + 1..];
+
+        let mut columns: Vec<Vec<SqlToken>> = Vec::new();
+        for group in split_top_level_symbol_groups(column_tokens, ",") {
+            columns.push(group.into_iter().cloned().collect());
+        }
+
+        if columns.is_empty() {
+            return None;
+        }
+
+        // (is_constraint, name, type_str, rest_str, leading_comments, trailing_comments)
+        let mut formatted_cols: Vec<(bool, String, String, String, Vec<String>, Vec<String>)> =
+            Vec::new();
+        let mut max_name = 0usize;
+        let mut max_type = 0usize;
+
+        for column in &columns {
+            let mut iter = column.iter().filter(|t| !matches!(t, SqlToken::Comment(_)));
+            let first = iter.next();
+            let is_constraint = match first {
+                Some(SqlToken::Word(word)) => {
+                    matches!(
+                        word.to_uppercase().as_str(),
+                        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK"
+                    )
+                }
+                _ => false,
+            };
+
+            // Separate leading comments (before first non-comment token)
+            // from trailing comments (after first non-comment token)
+            let mut leading_comments: Vec<String> = Vec::new();
+            let mut trailing_comments: Vec<String> = Vec::new();
+            let mut seen_code = false;
+            for token in column {
+                match token {
+                    SqlToken::Comment(comment) => {
+                        let body = comment.strip_prefix('\n').unwrap_or(comment);
+                        let trimmed = body.trim_end_matches('\n');
+                        if !trimmed.is_empty() {
+                            if seen_code {
+                                trailing_comments.push(trimmed.to_string());
+                            } else {
+                                leading_comments.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        seen_code = true;
+                    }
+                }
+            }
+
+            if is_constraint {
+                let non_comment_tokens: Vec<SqlToken> = column
+                    .iter()
+                    .filter(|t| !matches!(t, SqlToken::Comment(_)))
+                    .cloned()
+                    .collect();
+                let text = Self::join_tokens_spaced(&non_comment_tokens, 0);
+                formatted_cols.push((
+                    true,
+                    text,
+                    String::new(),
+                    String::new(),
+                    leading_comments,
+                    trailing_comments,
+                ));
+                continue;
+            }
+
+            let mut tokens_iter = column
+                .iter()
+                .filter(|t| !matches!(t, SqlToken::Comment(_)))
+                .peekable();
+            let name_token = tokens_iter.next();
+            let name = name_token.map(Self::token_text).unwrap_or_default();
+
+            let mut type_tokens: Vec<SqlToken> = Vec::new();
+            let mut rest_tokens: Vec<SqlToken> = Vec::new();
+            let mut in_type = true;
+
+            for token in tokens_iter {
+                let is_constraint_token = match token {
+                    SqlToken::Word(word) => {
+                        sql_text::is_format_column_constraint_keyword(word.as_str())
+                    }
+                    _ => false,
+                };
+                if in_type && is_constraint_token {
+                    in_type = false;
+                }
+                if in_type {
+                    type_tokens.push(token.clone());
+                } else {
+                    rest_tokens.push(token.clone());
+                }
+            }
+
+            let type_str = Self::join_tokens_compact(&type_tokens);
+            let rest_str = Self::join_tokens_spaced(&rest_tokens, 0);
+
+            max_name = max_name.max(name.len());
+            max_type = max_type.max(type_str.len());
+            formatted_cols.push((
+                false,
+                name,
+                type_str,
+                rest_str,
+                leading_comments,
+                trailing_comments,
+            ));
+        }
+
+        let mut out = String::new();
+        let prefix = Self::join_tokens_spaced(prefix_tokens, 0);
+        out.push_str(prefix.trim_end());
+        out.push_str(" (\n");
+
+        let indent = " ".repeat(4);
+        for (idx, (is_constraint, name, type_str, rest_str, leading_comments, trailing_comments)) in
+            formatted_cols.into_iter().enumerate()
+        {
+            // Output leading comments (originally before the column)
+            for comment in &leading_comments {
+                out.push_str(&indent);
+                out.push_str(comment);
+                out.push('\n');
+            }
+            out.push_str(&indent);
+            if is_constraint {
+                out.push_str(&name);
+            } else {
+                let name_pad = max_name.saturating_sub(name.len());
+                let type_pad = max_type.saturating_sub(type_str.len());
+                out.push_str(&name);
+                if !type_str.is_empty() {
+                    out.push_str(&" ".repeat(name_pad + 1));
+                    out.push_str(&type_str);
+                    if !rest_str.is_empty() {
+                        out.push_str(&" ".repeat(type_pad + 1));
+                        out.push_str(&rest_str);
+                    }
+                }
+            }
+            if idx + 1 < columns.len() {
+                out.push(',');
+            }
+            out.push('\n');
+            // Output trailing comments (originally after the column definition)
+            for comment in &trailing_comments {
+                out.push_str(&indent);
+                out.push_str(comment);
+                out.push('\n');
+            }
+        }
+        out.push(')');
+
+        let suffix = Self::format_create_suffix(suffix_tokens);
+        if !suffix.is_empty() {
+            out.push('\n');
+            out.push_str(&suffix);
+        }
+
+        Some(out.trim_end().to_string())
+    }
+
+    fn token_text(token: &SqlToken) -> String {
+        match token {
+            SqlToken::Word(word) => {
+                let upper = word.to_uppercase();
+                if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                    upper
+                } else {
+                    word.clone()
+                }
+            }
+            SqlToken::String(literal) => literal.clone(),
+            SqlToken::Comment(comment) => comment.clone(),
+            SqlToken::Symbol(sym) => sym.clone(),
+        }
+    }
+
+    fn token_is_word_like(token: &SqlToken) -> bool {
+        matches!(token, SqlToken::Word(_))
+    }
+
+    fn is_plsql_attribute_prefix(sym: &str, next_token: Option<&SqlToken>) -> bool {
+        sym == "%" && next_token.map(Self::token_is_word_like).unwrap_or(false)
+    }
+
+    fn join_tokens_compact(tokens: &[SqlToken]) -> String {
+        let mut out = String::new();
+        let mut needs_space = false;
+        for (idx, token) in tokens.iter().enumerate() {
+            let text = Self::token_text(token);
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    out.push_str(&text);
+                    needs_space = false;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    out.push_str(&text);
+                    needs_space = true;
+                }
+                SqlToken::Symbol(sym) if sym == "," => {
+                    out.push_str(&text);
+                    out.push(' ');
+                    needs_space = false;
+                }
+                SqlToken::Symbol(sym)
+                    if Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1)) =>
+                {
+                    out.push_str(&text);
+                    needs_space = false;
+                }
+                _ => {
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    out.push_str(&text);
+                    needs_space = true;
+                }
+            }
+        }
+        out.trim().to_string()
+    }
+
+    fn join_tokens_spaced(tokens: &[SqlToken], indent_level: usize) -> String {
+        let mut out = String::new();
+        let mut needs_space = false;
+        let indent = " ".repeat(indent_level * 4);
+        let mut at_line_start = true;
+
+        for (idx, token) in tokens.iter().enumerate() {
+            let text = Self::token_text(token);
+            match token {
+                SqlToken::Comment(comment) => {
+                    if !at_line_start {
+                        out.push(' ');
+                    } else if !indent.is_empty() {
+                        out.push_str(&indent);
+                    }
+                    out.push_str(comment);
+                    if comment.ends_with('\n') {
+                        at_line_start = true;
+                        needs_space = false;
+                    } else {
+                        at_line_start = false;
+                        needs_space = true;
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == "." => {
+                    out.push('.');
+                    needs_space = false;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    out.push('(');
+                    needs_space = false;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    out.push(')');
+                    needs_space = true;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym) if sym == "," => {
+                    out.push(',');
+                    out.push(' ');
+                    needs_space = false;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym)
+                    if Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1)) =>
+                {
+                    out.push('%');
+                    needs_space = false;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym) => {
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    out.push_str(sym);
+                    needs_space = true;
+                    at_line_start = false;
+                }
+                _ => {
+                    if at_line_start && !indent.is_empty() {
+                        out.push_str(&indent);
+                    }
+                    if needs_space {
+                        out.push(' ');
+                    }
+                    out.push_str(&text);
+                    needs_space = true;
+                    at_line_start = false;
+                }
+            }
+        }
+
+        out.trim().to_string()
+    }
+
+    fn format_create_suffix(tokens: &[SqlToken]) -> String {
+        if tokens.is_empty() {
+            return String::new();
+        }
+
+        let break_keywords = FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS;
+
+        let mut parts: Vec<Vec<SqlToken>> = Vec::new();
+
+        for part in split_top_level_keyword_groups(tokens, break_keywords) {
+            parts.push(part.into_iter().cloned().collect());
+        }
+
+        let mut out = String::new();
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(&Self::join_tokens_spaced(part, 0));
+        }
+        out.trim().to_string()
+    }
+
+    /// 토크나이저는 공통 로직(`query_text`)로 위임합니다.
+    pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
+        super::query_text::tokenize_sql(sql)
+    }
+
+    pub(super) fn escape_sql_literal(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+}
+
+#[cfg(test)]
+mod formatter_regression_tests {
+    use super::SqlEditorWidget;
+    use crate::db::{QueryExecutor, ScriptItem, SessionState};
+    use crate::ui::sql_editor::execution::PROGRESS_ROWS_INITIAL_BATCH;
+    use crate::ui::sql_editor::QueryProgress;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    fn load_formatter_test_file(name: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test");
+        path.push(name);
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn count_statement_items(items: &[ScriptItem]) -> usize {
+        items
+            .iter()
+            .filter(|item| matches!(item, ScriptItem::Statement(_)))
+            .count()
+    }
+
+    fn count_tool_command_items(items: &[ScriptItem]) -> usize {
+        items
+            .iter()
+            .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+            .count()
+    }
+
+    #[test]
+    fn does_not_force_select_line_break_after_malformed_statement() {
+        let sql = "select fn(a, b;\nselect x, y from dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SELECT x,\n    y\nFROM DUAL;"),
+            "Subsequent valid statement should return to normal comma layout, got: {}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"),
+            "Malformed prior statement must not force legacy recovery layout on next statement, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn malformed_statement_resets_paren_tracking_before_following_statement() {
+        let sql = "SELECT fn(a, b;\nSELECT c, d, e FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SELECT c,\n    d,\n    e\nFROM DUAL;"),
+            "Following statement should format with normal SELECT-list wrapping, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SELECT\n    c,\n    d,\n    e\nFROM DUAL;"),
+            "Formatter should not keep stale malformed-state recovery layout, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn comments_do_not_change_paren_tracking_state() {
+        let sql = "select a, /* comment with (, ), and , */ b from dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.contains("/* comment with (, ), and , */"));
+        assert!(
+            formatted
+                .contains("SELECT\n    a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;")
+                || formatted
+                    .contains("SELECT a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;"),
+            "Comment-preserving select formatting should remain stable, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_prompt_banner_lines_verbatim() {
+        let sql =
+            "PROMPT =======================================================================\n\
+PROMPT [END] If you saw outputs + cursor print + summary selects, parsing/execution is OK\n\
+PROMPT =======================================================================";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_prompt_lines_with_original_case_and_indentation() {
+        let sql = "  prompt first line\n\
+prompt second line\n\
+    PROMPT third line";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted_again, sql);
+    }
+
+    #[test]
+    fn keeps_multiline_string_continuation_lines_without_depth_reindent() {
+        let sql = "BEGIN
+DBMS_OUTPUT.PUT_LINE('first line
+second line
+third line');
+END;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.contains("DBMS_OUTPUT.PUT_LINE ('first line\nsecond line\nthird line');"));
+    }
+
+    #[test]
+    fn keeps_ampersand_substitution_variables_together() {
+        let sql = "SELECT &&pp FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("&&pp"),
+            "&&pp should stay together, got: {}",
+            formatted
+        );
+
+        let sql2 = "SELECT &var1 FROM dual";
+        let formatted2 = SqlEditorWidget::format_sql_basic(sql2);
+        assert!(
+            formatted2.contains("&var1"),
+            "&var1 should stay together, got: {}",
+            formatted2
+        );
+    }
+
+    #[test]
+    fn keeps_merge_into_together() {
+        let sql = "MERGE INTO target_table t USING source_table s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.name = s.name";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("MERGE INTO target_table"),
+            "MERGE INTO should stay on the same line, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn keeps_start_with_together() {
+        let sql = "SELECT employee_id, manager_id FROM employees START WITH manager_id IS NULL CONNECT BY PRIOR employee_id = manager_id";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("START WITH"),
+            "START WITH should stay on the same line, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn formats_where_in_subquery_with_deep_indent_and_alias() {
+        let source = "select a.topic, a.TOPIC from help a where a.SEQ in (select seq from help) b";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert_eq!(
+            preserved.trim_end(),
+            "SELECT a.topic,\n    a.TOPIC\nFROM help a\nWHERE a.SEQ IN (\n        SELECT seq\n        FROM help\n    ) b"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_subqueries_keep_progressive_depth_indentation() {
+        let source = r#"BEGIN
+  SELECT col1
+  INTO v_col
+  FROM t1
+  WHERE EXISTS (
+    SELECT 1
+    FROM t2
+    WHERE t2.id IN (
+      SELECT t3.id
+      FROM t3
+      WHERE t3.flag = 'Y'
+    )
+  );
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE EXISTS (\n            SELECT 1"),
+            "first nested subquery should stay indented under EXISTS, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("WHERE t2.id IN (\n                SELECT t3.id"),
+            "second nested subquery should stay indented under IN, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("WHERE t3.flag = 'Y'\n            )"),
+            "closing parenthesis should dedent one level from deepest query body, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn keeps_repeat_block_as_single_indented_block() {
+        let sql = r#"BEGIN
+  REPEAT
+    DBMS_OUTPUT.PUT_LINE('start');
+    i := i + 1;
+  UNTIL i >= 3
+  END REPEAT;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("END REPEAT;"),
+            "REPEAT block terminator should stay on a single line, got: {}",
+            formatted
+        );
+
+        let repeat_end_line = formatted
+            .lines()
+            .find(|line| line.trim().starts_with("END REPEAT;"))
+            .expect("formatted output should contain END REPEAT line");
+        let end_line = formatted.lines().find(|line| line.trim() == "END");
+
+        assert!(
+            end_line.unwrap_or("    ").starts_with("    "),
+            "END should be indented"
+        );
+        assert!(
+            formatted.contains("DBMS_OUTPUT.PUT_LINE"),
+            "REPEAT body should remain present, got: {}",
+            formatted
+        );
+        assert!(
+            repeat_end_line.starts_with("    "),
+            "END REPEAT should match block indent"
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting should be idempotent for REPEAT blocks"
+        );
+    }
+
+    #[test]
+    fn tab_off_keeps_tab_character_in_script_output() {
+        let line = "A\tB";
+        let rendered = SqlEditorWidget::format_script_output_line(line, false, false);
+        assert_eq!(rendered, "A\tB");
+    }
+
+    #[test]
+    fn tab_on_expands_tab_character_in_script_output() {
+        let line = "A\tB";
+        let rendered = SqlEditorWidget::format_script_output_line(line, false, true);
+        assert_eq!(rendered, "A       B");
+    }
+
+    #[test]
+    fn nested_case_expression_in_plsql_aligns_else_correctly() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
+FUNCTION f_deep(p_grp IN NUMBER, p_n IN NUMBER, p_txt IN VARCHAR2) RETURN NUMBER IS
+  v NUMBER := 0;
+BEGIN
+  v :=
+    CASE
+      WHEN p_grp < 0 THEN -1000
+      WHEN p_grp = 0 THEN
+        CASE
+          WHEN p_n > 10 THEN 100
+          ELSE 10
+        END
+      ELSE
+        CASE
+          WHEN INSTR(NVL(p_txt,'x'), 'END;') > 0 THEN 777
+          ELSE LENGTH(NVL(p_txt,'')) + p_n
+        END
+    END;
+  RETURN v;
+END;
+END oqt_mega_pkg;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        // ELSE after inner CASE END should align with outer WHEN
+        assert!(
+            formatted.contains("END\n            ELSE\n                CASE"),
+            "ELSE should align with outer WHEN after inner CASE END, got:\n{}",
+            formatted
+        );
+
+        // Outer END should close the outer CASE properly
+        assert!(
+            formatted.contains("END\n        END;"),
+            "Outer CASE END should be properly indented, got:\n{}",
+            formatted
+        );
+
+        // Idempotent
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting should be idempotent for nested CASE expressions"
+        );
+    }
+
+    #[test]
+    fn package_body_named_end_with_if_prefix_is_not_treated_as_end_if_suffix() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY if_owner AS
+FUNCTION run_check RETURN NUMBER IS
+BEGIN
+  IF 1 = 1 THEN
+    RETURN 1;
+  END IF;
+END run_check;
+BEGIN
+  NULL;
+END if_owner;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let end_if_owner_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END if_owner;"));
+        assert!(
+            end_if_owner_line.is_some_and(|line| !line.starts_with(' ')),
+            "Package named END label should close package body at top-level depth, got:
+{}",
+            formatted
+        );
+
+        let end_if_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END IF;"));
+        assert!(
+            end_if_line.is_some_and(|line| line.starts_with("        ")),
+            "Nested END IF should remain more indented than END package label, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_final_end_label_aligns_to_top_level() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+PROCEDURE run_extreme IS
+BEGIN
+  NULL;
+END run_extreme;
+
+BEGIN
+  NULL;
+END fmt_pkg_extreme;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let end_pkg_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END fmt_pkg_extreme;"));
+
+        assert!(
+            end_pkg_line.is_some_and(|line| !line.starts_with(' ')),
+            "Final package END label should align with CREATE at top-level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_initializer_begin_stays_at_top_level_after_case_declaration() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+g_last_mode VARCHAR2 (30) := 'BOOT';
+FUNCTION calc_mode RETURN VARCHAR2 IS
+BEGIN
+  RETURN
+  CASE
+    WHEN 1 = 1 THEN
+      'WEEKDAY_BOOT'
+    ELSE
+      'WEEKEND_BOOT'
+  END;
+END calc_mode;
+
+BEGIN
+    g_last_mode :=
+    CASE
+        WHEN TO_CHAR (SYSDATE, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT', 'SUN') THEN
+            'WEEKEND_BOOT'
+        ELSE
+            'WEEKDAY_BOOT'
+    END;
+    AUDIT ('INIT', 'package initialized. mode=' || g_last_mode);
+END fmt_pkg_extreme;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "END calc_mode;\nBEGIN\n    g_last_mode :=\n    CASE"
+            ),
+            "package body initializer BEGIN should not remain indented under declarations, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("END calc_mode;\n\n    BEGIN\n        g_last_mode :="),
+            "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_else_if_clause_uses_block_depth_without_extra_into_indent() {
+        let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    SELECT col1,
+           col2
+      INTO v_col1,
+           v_col2
+      FROM dual;
+  ELSEIF v_col1 = 1 THEN
+      NULL;
+  END IF;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    ELSEIF v_col1 = 1 THEN"),
+            "ELSEIF should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        ELSEIF v_col1 = 1 THEN"),
+            "ELSEIF should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_elseif_clause_uses_block_depth_without_extra_into_indent() {
+        let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    SELECT col1,
+           col2
+      INTO v_col1,
+           v_col2
+      FROM dual;
+  ELSIF v_col1 = 1 THEN
+      NULL;
+  END IF;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    ELSIF v_col1 = 1 THEN"),
+            "ELSIF should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        ELSIF v_col1 = 1 THEN"),
+            "ELSIF should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_statement_after_returning_into_does_not_keep_extra_into_indent() {
+        let sql = r#"BEGIN
+  UPDATE emp
+  SET sal = sal + 1
+  RETURNING empno
+  INTO v_empno;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    NULL;"),
+            "line after RETURNING INTO should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        NULL;"),
+            "line after RETURNING INTO should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_statement_after_fetch_into_does_not_keep_extra_into_indent() {
+        let sql = r#"BEGIN
+  FETCH c1
+  INTO v_empno;
+  v_total := v_total + 1;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    v_total := v_total + 1;"),
+            "line after FETCH INTO should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        v_total := v_total + 1;"),
+            "line after FETCH INTO should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_statement_preserves_end_for_and_end_while_suffixes() {
+        let for_sql = "BEGIN\n  FOR i IN 1..3 LOOP\n    NULL;\n  END FOR;\nEND;";
+        let for_formatted = SqlEditorWidget::format_sql_basic(for_sql);
+        assert!(
+            for_formatted.contains("END FOR;"),
+            "END FOR suffix should be preserved as a single terminator line, got:\n{}",
+            for_formatted
+        );
+
+        let while_sql = "BEGIN\n  WHILE i < 3 LOOP\n    i := i + 1;\n  END WHILE;\nEND;";
+        let while_formatted = SqlEditorWidget::format_sql_basic(while_sql);
+        assert!(
+            while_formatted.contains("END WHILE;"),
+            "END WHILE suffix should be preserved as a single terminator line, got:\n{}",
+            while_formatted
+        );
+    }
+
+    #[test]
+    fn paren_case_expression_tracks_searched_case_headers() {
+        let sql = r#"BEGIN
+  v_val := (
+    CASE v_mode
+      WHEN 1 THEN 10
+      ELSE 0
+    END
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("(\n        CASE v_mode\n            WHEN 1 THEN"),
+            "CASE <expr> after '(' should get parenthesized CASE depth indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ELSE\n            0\n        END"),
+            "CASE <expr> END should keep CASE-block depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn paren_case_expression_tracks_end_case_terminator() {
+        let sql = r#"BEGIN
+  v_val := (
+    CASE
+      WHEN v_mode = 1 THEN 10
+      ELSE 0
+    END CASE
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("CASE\n            WHEN v_mode = 1 THEN"),
+            "Parenthesized CASE should still format branch depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ELSE\n            0\n        END CASE);"),
+            "END CASE terminator should stay aligned with CASE header in parenthesized expression, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF;"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END LOOP"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END CASE"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END REPEAT"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FOR"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END WHILE"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF_OWNER;"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FORWARD;"
+        ));
+    }
+
+    #[test]
+    fn starts_with_plain_end_excludes_qualified_end_suffixes() {
+        assert!(SqlEditorWidget::starts_with_plain_end("END"));
+        assert!(SqlEditorWidget::starts_with_plain_end("END pkg;"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END FOR"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END WHILE"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END IF;"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END LOOP"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END CASE"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END REPEAT"));
+    }
+
+    #[test]
+    fn starts_with_bare_end_matches_only_unqualified_end() {
+        assert!(SqlEditorWidget::starts_with_bare_end("END"));
+        assert!(SqlEditorWidget::starts_with_bare_end("END;"));
+        assert!(!SqlEditorWidget::starts_with_bare_end("END pkg;"));
+        assert!(!SqlEditorWidget::starts_with_bare_end("END IF;"));
+    }
+
+    #[test]
+    fn keyword_token_match_handles_exact_keyword_lines() {
+        assert!(crate::sql_text::starts_with_keyword_token(
+            "SELECT", "SELECT"
+        ));
+        assert!(crate::sql_text::starts_with_keyword_token("INTO", "INTO"));
+        assert!(crate::sql_text::starts_with_keyword_token(
+            "SELECT x", "SELECT"
+        ));
+        assert!(!crate::sql_text::starts_with_keyword_token(
+            "SELECTED", "SELECT"
+        ));
+    }
+
+    #[test]
+    fn detects_set_transaction_as_first_statement() {
+        let items = vec![ScriptItem::Statement(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;".to_string(),
+        )];
+        assert!(SqlEditorWidget::requires_transaction_first_statement(
+            &items
+        ));
+    }
+
+    #[test]
+    fn detects_alter_session_isolation_level_as_first_statement() {
+        let items = vec![ScriptItem::Statement(
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;".to_string(),
+        )];
+        assert!(SqlEditorWidget::requires_transaction_first_statement(
+            &items
+        ));
+    }
+
+    #[test]
+    fn cursor_mapping_tracks_prefix_after_full_reformat() {
+        let source = "SELECT a, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let source_pos = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist") as i32;
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos);
+        let mapped_slice = &formatted[mapped as usize..];
+        assert!(
+            mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
+            "Mapped cursor should stay near the same token after reformat, got: {}",
+            mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_large_source_uses_fast_path_and_keeps_utf8_boundary() {
+        let source = "x".repeat(super::CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES + 128);
+        let formatted = "SELECT\n    1\nFROM DUAL;";
+        let source_pos = (source.len() / 2) as i32;
+
+        let mapped =
+            SqlEditorWidget::map_cursor_after_format(&source, formatted, source_pos) as usize;
+
+        assert!(
+            mapped <= formatted.len(),
+            "mapped cursor should stay in bounds"
+        );
+        assert!(
+            formatted.is_char_boundary(mapped),
+            "mapped cursor should stay on UTF-8 boundary"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_uses_selection_relative_offset() {
+        let source = "SELECT a, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let source_pos_within_selection = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist")
+            as i32;
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let selection_start = 25i32;
+        let final_cursor_pos = selection_start + mapped_within_selection;
+        let formatted_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            formatted_slice.trim_start().starts_with("b\nFROM DUAL;"),
+            "Mapped cursor inside selection should stay near the same token after reformat, got: {}",
+            formatted_slice
+        );
+        assert_eq!(
+            final_cursor_pos,
+            selection_start + mapped_within_selection,
+            "Selection-relative mapping should compose with selection offset"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_keeps_token_anchor_with_canonical_terminator() {
+        let source = "SELECT a, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let source_pos_within_selection = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist")
+            as i32;
+
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let formatted_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            formatted_slice.trim_start().starts_with("b\nFROM DUAL"),
+            "Mapped cursor should stay near same token after selection format, got: {}",
+            formatted_slice
+        );
+        assert!(
+            formatted.trim_end().ends_with(';'),
+            "Selection formatting should keep canonical semicolon terminator"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selected_auto_format_without_terminator_keeps_inline_comment_anchor() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos_within_selection = source
+            .find("-- trailing note")
+            .expect("source inline comment anchor should exist")
+            as i32;
+
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let mapped_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            mapped_slice.starts_with("-- trailing note"),
+            "Selected formatting without terminator should keep inline-comment cursor anchor, got: {}",
+            mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_uses_utf8_byte_offsets() {
+        let source = "SELECT 한글, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let byte_offset = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist") as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, byte_offset);
+        let mapped_slice = &formatted[mapped as usize..];
+        assert!(
+            mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
+            "Mapped cursor should stay near token with byte-offset mapping, got: {}",
+            mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selected_auto_format_keeps_slash_terminator_anchor() {
+        let source = "SELECT 1 FROM dual\n/";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find('/').expect("slash anchor should exist") as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source, &formatted, source_pos, true,
+        );
+        let mapped_slice = &formatted[mapped as usize..];
+
+        assert!(
+            mapped_slice.trim_start().starts_with('/'),
+            "Selected auto-format cursor mapping should keep slash terminator anchor, got: {}",
+            mapped_slice
+        );
+        assert!(
+            formatted.contains("DUAL;\n/"),
+            "Selected auto-format should keep the canonical semicolon before SQL*Plus slash terminator, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn normalize_index_treats_input_as_byte_offset() {
+        let source = "SELECT éa, b FROM dual";
+        let byte_offset = source
+            .find('b')
+            .expect("expected cursor anchor should exist") as i32;
+
+        let normalized = SqlEditorWidget::normalize_index(source, byte_offset);
+        assert_eq!(
+            normalized, byte_offset as usize,
+            "normalize_index should preserve byte offsets as-is"
+        );
+    }
+
+    #[test]
+    fn normalize_index_clamps_non_boundary_utf8_byte_offset() {
+        let source = "SELECT 한글, b FROM dual";
+        let utf8_start = source.find('한').expect("expected utf-8 anchor");
+        let mid_char_offset = utf8_start + 1;
+        let normalized = SqlEditorWidget::normalize_index(source, mid_char_offset as i32);
+        assert_eq!(
+            normalized, utf8_start,
+            "normalize_index should clamp invalid UTF-8 byte offsets"
+        );
+    }
+
+    #[test]
+    fn normalize_index_clamps_invalid_utf8_boundary_without_panic() {
+        let source = "SELECT 한글, b FROM dual";
+        let mid_char_index = source.find("한").expect("expected unicode anchor") + 1;
+
+        let normalized = SqlEditorWidget::normalize_index(source, mid_char_index as i32);
+        assert!(source.is_char_boundary(normalized));
+        assert!(normalized <= source.len());
+    }
+
+    #[test]
+    fn format_sql_basic_handles_unterminated_q_quote_without_panic() {
+        let sql = "SELECT q'[unterminated FROM dual";
+        let result = std::panic::catch_unwind(|| SqlEditorWidget::format_sql_basic(sql));
+        assert!(
+            result.is_ok(),
+            "formatter should not panic on unterminated q-quote literal"
+        );
+    }
+
+    #[test]
+    fn selected_auto_format_cursor_mapping_matches_selected_terminator_policy() {
+        let source = "select 1 from dual";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("dual").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source, &formatted, source_pos, true,
+        ) as usize;
+
+        assert!(
+            mapped <= formatted.len() && formatted.is_char_boundary(mapped),
+            "mapped cursor should stay on a valid UTF-8 boundary"
+        );
+        assert!(
+            formatted[mapped..].trim_start().starts_with("DUAL"),
+            "cursor should remain anchored near DUAL token after selected formatting, got: {}",
+            &formatted[mapped..]
+        );
+    }
+
+    #[test]
+    fn selected_auto_format_cursor_mapping_handles_trailing_inline_comment_without_injected_semicolon(
+    ) {
+        let source = "select 1 from dual -- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("-- trailing note").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source, &formatted, source_pos, true,
+        ) as usize;
+
+        assert!(
+            formatted[mapped..]
+                .trim_start()
+                .starts_with("-- trailing note"),
+            "cursor should remain near inline comment after selected formatting, got: {}",
+            &formatted[mapped..]
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "selected formatting should preserve missing semicolon"
+        );
+    }
+    #[test]
+    fn map_cursor_after_format_clamps_mid_utf8_byte_without_panic() {
+        let source = "SELECT 한글, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let mid_byte = source.find('한').unwrap_or(0) + 1;
+
+        let result = std::panic::catch_unwind(|| {
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, mid_byte as i32)
+        });
+
+        assert!(
+            result.is_ok(),
+            "cursor mapping should not panic on mid-byte cursor offset"
+        );
+    }
+
+    #[test]
+    fn choose_execution_error_message_prioritizes_timeout_over_cancel() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            true,
+            true,
+            Some(Duration::from_secs(9)),
+            "ORA-01013".to_string(),
+        );
+        assert_eq!(message, "Query timed out after 9 seconds");
+    }
+
+    #[test]
+    fn choose_execution_error_message_uses_cancel_when_not_timed_out() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            true,
+            false,
+            Some(Duration::from_secs(9)),
+            "ORA-01013".to_string(),
+        );
+        assert_eq!(message, "Query cancelled");
+    }
+
+    #[test]
+    fn choose_execution_error_message_falls_back_to_original_error() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            false,
+            false,
+            Some(Duration::from_secs(9)),
+            "ORA-00001: unique constraint".to_string(),
+        );
+        assert_eq!(message, "ORA-00001: unique constraint");
+    }
+
+    #[test]
+    fn timeout_error_message_signal_detects_dpi_call_timeout() {
+        assert!(
+            SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "DPI-1067: call timeout of 5000 ms reached",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_detects_timeout_keyword_with_ora_01013() {
+        assert!(
+            SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-01013: user requested cancel of current operation (call timeout reached)",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_does_not_treat_plain_cancel_as_timeout() {
+        assert!(
+            !SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-01013: user requested cancel of current operation",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_does_not_treat_lock_wait_timeout_expired_as_call_timeout() {
+        assert!(
+            !SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-00054: resource busy and acquire with NOWAIT specified or timeout expired",
+            )
+        );
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_cancel_requested() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            true, false, false
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_timed_out() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            false, true, false
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_execution_should_stop() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            false, false, true
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_allowed_for_normal_completion() {
+        assert!(SqlEditorWidget::should_capture_post_execution_output(
+            false, false, false
+        ));
+    }
+
+    #[test]
+    fn flush_buffered_rows_drops_pending_rows_when_interrupted() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_rows = vec![vec!["1".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_rows(&sender, &session, 7, &mut buffered_rows, true);
+
+        assert!(buffered_rows.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn flush_buffered_rows_emits_rows_when_not_interrupted() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_rows = vec![vec!["1".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_rows(&sender, &session, 3, &mut buffered_rows, false);
+
+        assert!(buffered_rows.is_empty());
+        let message = receiver
+            .try_recv()
+            .unwrap_or_else(|err| panic!("expected buffered rows progress message: {err}"));
+        match message {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(index, 3);
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected QueryProgress::Rows"),
+        }
+    }
+
+    #[test]
+    fn flush_buffered_result_rows_emits_display_rows() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_display_rows = vec![vec!["(null)".to_string()], vec!["2".to_string()]];
+        let mut buffered_raw_rows = vec![vec!["".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_result_rows(
+            &sender,
+            &session,
+            9,
+            &mut buffered_display_rows,
+            &mut buffered_raw_rows,
+        );
+
+        assert!(buffered_display_rows.is_empty());
+        assert!(buffered_raw_rows.is_empty());
+        let message = receiver
+            .try_recv()
+            .unwrap_or_else(|err| panic!("expected result rows progress message: {err}"));
+        match message {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(index, 9);
+                assert_eq!(
+                    rows,
+                    vec![vec!["(null)".to_string()], vec!["2".to_string()]]
+                );
+            }
+            _ => panic!("expected QueryProgress::Rows"),
+        }
+    }
+
+    #[test]
+    fn emit_select_result_uses_streaming_sized_initial_batch() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let rows = (0..101)
+            .map(|index| vec![format!("value_{index}")])
+            .collect::<Vec<Vec<String>>>();
+
+        SqlEditorWidget::emit_select_result(
+            &sender,
+            &session,
+            "LOCAL",
+            4,
+            "select * from dual",
+            vec!["COL1".to_string()],
+            rows,
+            true,
+            true,
+        );
+
+        let messages = receiver.try_iter().collect::<Vec<QueryProgress>>();
+        assert_eq!(messages.len(), 5);
+        match &messages[0] {
+            QueryProgress::StatementStart { index } => assert_eq!(*index, 4),
+            _ => panic!("expected QueryProgress::StatementStart"),
+        }
+        match &messages[1] {
+            QueryProgress::SelectStart {
+                index,
+                columns,
+                null_text: _,
+            } => {
+                assert_eq!(*index, 4);
+                assert_eq!(columns, &vec!["COL1".to_string()]);
+            }
+            _ => panic!("expected QueryProgress::SelectStart"),
+        }
+        match &messages[2] {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(*index, 4);
+                assert_eq!(rows.len(), PROGRESS_ROWS_INITIAL_BATCH);
+            }
+            _ => panic!("expected initial QueryProgress::Rows"),
+        }
+        match &messages[3] {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(*index, 4);
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("expected trailing QueryProgress::Rows"),
+        }
+        match &messages[4] {
+            QueryProgress::StatementFinished {
+                index,
+                result,
+                connection_name,
+                timed_out,
+            } => {
+                assert_eq!(*index, 4);
+                assert_eq!(connection_name, "LOCAL");
+                assert!(!timed_out);
+                assert_eq!(result.row_count, 101);
+            }
+            _ => panic!("expected QueryProgress::StatementFinished"),
+        }
+    }
+
+    #[test]
+    fn plsql_like_detection_ignores_begin_inside_strings_or_comments() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "SELECT 'BEGIN' AS txt FROM dual;"
+        ));
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "/* DECLARE */ SELECT 1 FROM dual;"
+        ));
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_ignores_explain_and_open_for() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "EXPLAIN PLAN FOR SELECT 1 FROM dual;"
+        ));
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "OPEN p_rc FOR SELECT empno FROM oqt_t_emp;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_with_function_factoring() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "WITH FUNCTION format_name(p_name IN VARCHAR2) RETURN VARCHAR2 IS\nBEGIN\n  RETURN INITCAP(p_name);\nEND;\nSELECT * FROM dual;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_or_replace_force_procedure() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE FORCE PROCEDURE test_proc AS\nBEGIN\n  NULL;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_or_replace_editionable_function() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE EDITIONABLE FUNCTION test_fn RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_package_body() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE PACKAGE BODY test_pkg AS\n  PROCEDURE proc IS\n  BEGIN\n    NULL;\n  END;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_no_force_function() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE NO FORCE FUNCTION test_fn RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_materialized_view() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE MATERIALIZED VIEW test_mv AS SELECT 1 FROM dual"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_materialized_view_log() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE MATERIALIZED VIEW LOG ON test_table"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_view() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE VIEW test_view AS SELECT 1 FROM dual"
+        ));
+    }
+
+    #[test]
+    fn trigger_audit_block_keeps_expected_header_and_values_alignment() {
+        let sql = r#"create or replace noneditionable trigger "SYSTEM"."OQT_TRG_MEG_CUD" after insert or update or delete on oqt_meg_master for each row begin if inserting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('INSERT', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'key='||:NEW.master_key||', status='||:NEW.status||', amount='||TO_CHAR(:NEW.amount)); elsif updating then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('UPDATE', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'status:'||:OLD.status||'->'||:NEW.status||', amount:'||TO_CHAR(:OLD.amount)||'->'||TO_CHAR(:NEW.amount)); elsif deleting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('DELETE', 'OQT_MEG_MASTER', 'master_id='||:OLD.master_id, 'key='||:OLD.master_key||', status='||:OLD.status||', amount='||TO_CHAR(:OLD.amount)); end if; end; alter trigger "SYSTEM"."OQT_TRG_MEG_CUD" enable"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("\n    AFTER INSERT OR UPDATE OR DELETE ON oqt_meg_master"),
+            "Trigger timing/event header should stay on one indented line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n    FOR EACH ROW\nBEGIN"),
+            "FOR EACH ROW should align with trigger header indentation, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("IF INSERTING THEN")
+                && formatted.contains("ELSIF UPDATING THEN")
+                && formatted.contains("ELSIF DELETING THEN"),
+            "Conditional trigger predicates should be uppercased in IF/ELSIF blocks, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("END;\nALTER TRIGGER \"SYSTEM\".\"OQT_TRG_MEG_CUD\" ENABLE;"),
+            "CREATE/ALTER trigger pair should not be separated by a blank line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_does_not_add_semicolon_when_selection_had_none() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved.trim_end(),
+            "SELECT 1
+FROM DUAL"
+        );
+        assert!(!preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn selected_auto_formatting_path_keeps_terminator_before_inline_comment() {
+        let source = "select 1 from dual -- trailing note";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL; -- trailing note",
+            "Selected formatting should keep the canonical statement terminator before inline comment, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_path_keeps_terminator_before_newline_comment() {
+        let source = "select 1 from dual
+-- trailing note";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL;
+-- trailing note",
+            "Selected formatting should keep the canonical statement terminator before newline comment, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_path_keeps_canonical_semicolon_for_single_statement() {
+        let source = "SELECT 1 FROM dual";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted.trim_end(),
+            "SELECT 1
+FROM DUAL;"
+        );
+        assert!(
+            formatted.trim_end().ends_with(';'),
+            "Selected auto-formatting should keep the canonical terminator for a selected statement, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_path_keeps_canonical_statement_semicolon() {
+        let source = "SELECT 1 FROM dual";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert!(
+            formatted.trim_end().ends_with(';'),
+            "Full-buffer formatting should keep canonical statement semicolon, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_keeps_semicolons_for_multi_statement_selection() {
+        let source = "SELECT 1 FROM dual;\nSELECT 2 FROM dual;\nCOMMIT;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains("SELECT 1\nFROM DUAL;"),
+            "First statement semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SELECT 2\nFROM DUAL;"),
+            "Second statement semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("COMMIT;"),
+            "Trailing COMMIT semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+
+        let items = QueryExecutor::split_script_items(&formatted);
+        assert_eq!(
+            count_statement_items(&items),
+            3,
+            "Selected formatting must keep all statement boundaries intact, got: {items:?}"
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_test15_keeps_statement_boundaries_for_ctrl_enter() {
+        let source = load_formatter_test_file("test15.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, true);
+
+        // Re-splitting the formatted text must preserve execution boundaries so
+        // statement-at-cursor keeps working after select-all formatting.
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Selected formatting changed test15.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Selected formatting changed test15.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("qt_splitter_boss IS")
+            .expect("expected COMMENT ON TABLE statement after selected formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected COMMENT ON TABLE bounds after selected formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("COMMENT")
+                && statement.contains("ON TABLE qt_splitter_boss IS"),
+            "Ctrl+Enter boundary should stay on COMMENT statement after selected formatting, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("CREATE OR REPLACE PROCEDURE qt_splitter_proc"),
+            "Selected formatting must not merge earlier routine into COMMENT statement, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_test16_keeps_statement_boundaries_for_ctrl_enter() {
+        let source = load_formatter_test_file("test16.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, true);
+
+        // Re-splitting the formatted text must preserve execution boundaries so
+        // statement-at-cursor keeps working after select-all formatting.
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Selected formatting changed test16.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Selected formatting changed test16.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("qt_splitter_ultimate IS")
+            .expect("expected COMMENT ON TABLE statement after selected formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected COMMENT ON TABLE bounds after selected formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("COMMENT")
+                && statement.contains("ON TABLE qt_splitter_ultimate IS"),
+            "Ctrl+Enter boundary should stay on COMMENT statement after selected formatting, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg"),
+            "Selected formatting must not merge earlier package body into COMMENT statement, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_test20_keeps_statement_boundaries() {
+        let source = load_formatter_test_file("test20.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
+
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Full auto-formatting changed test20.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Full auto-formatting changed test20.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("AS msg_preview")
+            .expect("expected final audit preview query after full auto-formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected final audit preview query bounds after full auto-formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("SELECT")
+                && statement.contains("FROM qt_fb_audit")
+                && statement.contains("AS msg_preview"),
+            "Full auto-formatting should keep the final audit preview query isolated, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("FROM qt_fb_view"),
+            "Full auto-formatting must not merge the preceding view query into the audit preview query, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("p_module => 'final_validation'"),
+            "Full auto-formatting must not merge the final validation block into the audit preview query, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_test21_keeps_statement_boundaries() {
+        let source = load_formatter_test_file("test21.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
+
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Full auto-formatting changed test21.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Full auto-formatting changed test21.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("AS err_msg_preview")
+            .expect("expected final error preview query after full auto-formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected final error preview query bounds after full auto-formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("SELECT")
+                && statement.contains("FROM qt_x_err_log")
+                && statement.contains("AS err_msg_preview"),
+            "Full auto-formatting should keep the final error preview query isolated, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("FROM qt_x_audit"),
+            "Full auto-formatting must not merge the preceding audit preview query into the error preview query, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("p_module => 'final_validation'"),
+            "Full auto-formatting must not merge the final validation block into the error preview query, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_trigger_slash_and_alter_trigger_tightly_grouped() {
+        let sql = r#"CREATE OR REPLACE TRIGGER trg_demo
+BEFORE INSERT ON demo
+BEGIN
+    NULL;
+END;
+/
+ALTER TRIGGER trg_demo ENABLE;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("END;\n/\nALTER TRIGGER trg_demo ENABLE;"),
+            "CREATE TRIGGER + slash + ALTER TRIGGER should stay tightly grouped, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("END;\n/\n\nALTER TRIGGER"),
+            "Unexpected blank line inserted between slash and ALTER TRIGGER, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_line_comment() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; -- trailing note"),
+            "Formatter should place statement terminator before trailing line comment, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with("note;"),
+            "Formatter should not append semicolon into trailing line comment text, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_block_comment() {
+        let source = "SELECT 1 FROM dual /* trailing block */";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;"),
+            "Formatter should place statement terminator before trailing block comment, got:\n{}",
+            formatted
+        );
+        let semicolon_idx = formatted.find(';');
+        let comment_idx = formatted.find("/* trailing block */");
+        assert!(
+            matches!((semicolon_idx, comment_idx), (Some(semicolon), Some(comment)) if semicolon < comment),
+            "Statement terminator must appear before trailing block comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with("*/;"),
+            "Formatter should not append semicolon after trailing block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_insert_space_before_newline_line_comment() {
+        let source = "SELECT 1 FROM dual\n-- trailing note";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\n-- trailing note"),
+            "Formatter should insert semicolon without trailing space before newline comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("; \n-- trailing note"),
+            "Formatter should not leave whitespace before newline-attached line comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comma_indent_after_line_comment_in_select_list() {
+        let source = "select abc -- comment\n, def\nfrom efg;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("SELECT\n    abc -- comment\n    ,\n    def\nFROM efg;"),
+            "Formatter should keep select-list depth for leading comma after line comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_insert_space_before_newline_block_comment() {
+        let source = "SELECT 1 FROM dual\n/* trailing block */";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\n/* trailing block */"),
+            "Formatter should insert semicolon without trailing space before newline block comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("; \n/* trailing block */"),
+            "Formatter should not leave whitespace before newline-attached block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_comment() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- trailing note"),
+            "Trailing comment should be preserved, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_comment() {
+        let source = "SELECT 1 FROM dual\n-- trailing note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !preserved.contains(";\n-- trailing note"),
+            "Selection-preserved formatting should remove inserted semicolon for newline comment attachment, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_block_comment()
+    {
+        let source = "SELECT 1 FROM dual /* trailing block */";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("/* trailing block */"),
+            "Trailing block comment should be preserved, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_block_comment() {
+        let source = "SELECT 1 FROM dual\n/* trailing block */";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !preserved.contains(";\n/* trailing block */"),
+            "Selection-preserved formatting should remove inserted semicolon for newline block comment attachment, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_when_string_has_comment_markers(
+    ) {
+        let source = "SELECT '-- keep literal' AS txt FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("'-- keep literal'"),
+            "String literal containing comment markers should be preserved, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_handles_multibyte_text_before_comment() {
+        let formatted = "SELECT '한글' FROM dual;".to_string();
+        let without_semicolon = SqlEditorWidget::remove_trailing_statement_semicolon(&formatted)
+            .expect("trailing semicolon should be removable");
+        assert_eq!(without_semicolon, "SELECT '한글' FROM dual");
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_does_not_remove_semicolon_inside_string_literal() {
+        let source = "SELECT 'a;b' AS txt FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("'a;b'"),
+            "Semicolon inside string literal must remain unchanged, got:\n{}",
+            preserved
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Formatter should not append semicolon when original selection had none, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_rem_line() {
+        let source = "SELECT 1 FROM dual
+REM trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !preserved.contains(';'),
+            "Inserted semicolon should be removed when trailing REM line follows a statement with no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("REM trailing script comment"),
+            "Trailing REM line should be preserved, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_remark_line() {
+        let source = "SELECT 1 FROM dual
+REMARK trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !preserved.contains(';'),
+            "Inserted semicolon should be removed when trailing REMARK line follows a statement with no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("REMARK trailing script comment"),
+            "Trailing REMARK line should be preserved, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_semicolon_before_trailing_rem_line() {
+        let source = "SELECT 1 FROM dual
+REM trailing script comment";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\nREM trailing script comment"),
+            "Formatter should place statement terminator before trailing REM line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("REM trailing script comment;"),
+            "Formatter should not append semicolon to REM comment text, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_semicolon_before_trailing_remark_line() {
+        let source = "SELECT 1 FROM dual
+REMARK trailing script comment";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\nREMARK trailing script comment"),
+            "Formatter should place statement terminator before trailing REMARK line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("REMARK trailing script comment;"),
+            "Formatter should not append semicolon to REMARK comment text, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_rem_line() {
+        let mut formatted = "SELECT 1
+FROM DUAL
+    REM trailing script comment"
+            .to_string();
+
+        SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL;
+    REM trailing script comment"
+        );
+    }
+
+    #[test]
+    fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_remark_line() {
+        let mut formatted = "SELECT 1
+FROM DUAL
+	REMARK trailing script comment"
+            .to_string();
+
+        SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL;
+	REMARK trailing script comment"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_operator() {
+        let source = "SELECT 1 +";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT 1 +");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_comma() {
+        let source = "SELECT a,";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT a,");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_open_paren() {
+        let source = "SELECT (1 + 2 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unbalanced open paren, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_closing_paren() {
+        let source = "SELECT 1 + 2) FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unmatched closing paren, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_brackets() {
+        let source = "SELECT arr[1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unbalanced brackets, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_appends_semicolon_for_tail_statement_after_malformed_segment() {
+        let source = "SELECT func(a, b;
+SELECT c, d FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains(
+                "SELECT c,
+    d
+FROM DUAL;"
+            ),
+            "formatter should keep canonical terminator for trailing valid statement, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_dot() {
+        let source = "SELECT t.";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT t.");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_single_quote() {
+        let source = "SELECT 'unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT 'unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_quoted_identifier() {
+        let source = "SELECT \"unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT \"unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_dollar_quote() {
+        let source = "SELECT $$unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT $$unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_plsql_label() {
+        let source = "BEGIN <<label
+NULL";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(
+            formatted,
+            "BEGIN
+    <<label
+    NULL"
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "unterminated PL/SQL label should not receive a terminator, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {
+        let source = "SELECT 1 FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_respects_trailing_comment_after_semicolon() {
+        let source = "SELECT 1 FROM dual; -- keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            preserved.trim_end().ends_with("-- keep terminator"),
+            "Trailing comment should be preserved, got:
+{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should remain when selection already ended with semicolon before comment, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_extra_semicolon_into_trailing_comment_text() {
+        let source = "SELECT 1 FROM dual -- existing; comment semicolon";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; -- existing; comment semicolon"),
+            "Formatter should preserve trailing comment text while inserting SQL terminator, got:
+{}",
+            formatted
+        );
+        assert_eq!(
+            formatted.matches(';').count(),
+            2,
+            "Expected one SQL terminator + one comment semicolon only, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_ignores_semicolon_inside_trailing_comment() {
+        let source = "SELECT 1 FROM dual -- existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            preserved
+                .trim_end()
+                .ends_with("-- existing; comment semicolon"),
+            "Trailing comment text should remain unchanged, got:\n{}",
+            preserved
+        );
+        assert_eq!(
+            preserved.matches(';').count(),
+            1,
+            "No extra semicolon should be appended when source had only comment semicolon, got:\n{}",
+            preserved
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Statement terminator should stay absent, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_in_comment_only_selection() {
+        let source = "-- existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved, "-- existing; comment semicolon",
+            "Semicolon inside comment-only selections should not be removed"
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_in_sqlplus_remark_comment() {
+        let source = "REM existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved, source,
+            "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_keeps_canonical_terminator_before_trailing_prompt() {
+        let source = "select 1 from dual
+PROMPT done;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains(
+                "FROM DUAL;\n\nPROMPT done;"
+            ),
+            "Selected auto-format should keep the trailing PROMPT line separated from SQL by a blank line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_inserts_blank_line_before_trailing_prompt_after_set_operator_query() {
+        let source = "SELECT empno
+FROM a
+MINUS
+SELECT empno
+FROM b
+ORDER BY empno;
+PROMPT [DONE] Hardcore SELECT tests finished.";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains(
+                "ORDER BY empno;\n\nPROMPT [DONE] Hardcore SELECT tests finished."
+            ),
+            "Formatter should separate trailing PROMPT from the SQL statement with a blank line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn source_has_explicit_semicolon_terminator_ignores_trailing_prompt_line() {
+        let source = "SELECT 1 FROM dual
+PROMPT done;";
+
+        assert!(
+            !SqlEditorWidget::source_has_explicit_semicolon_terminator(source),
+            "Semicolon in trailing PROMPT line should not count as SQL terminator"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_remark_comment_text_case() {
+        let sql = "REMARK Keep MixedCase ; punctuation";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_remark_comment_indentation() {
+        let sql = "    REMARK Keep indentation\n\tREM tab-indented";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_rem_comments_between_statements() {
+        let sql = "REM keep this exact comment\nSELECT 1 FROM dual;\nREMARK Keep;This;Too";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("REM keep this exact comment"),
+            "{}",
+            formatted
+        );
+        assert!(formatted.contains("REMARK Keep;This;Too"), "{}", formatted);
+        assert!(formatted.contains("SELECT 1\nFROM DUAL;"), "{}", formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_comment_attachment_depth_and_hint_layout() {
+        let sql = r#"-- file header keep
+CREATE OR REPLACE PACKAGE pkg AS
+-- package line comment
+PROCEDURE p;
+END pkg;
+/
+
+CREATE OR REPLACE TRIGGER trg
+BEFORE INSERT ON t
+BEGIN
+-- before if
+IF :NEW.id IS NULL THEN
+-- if branch
+:NEW.id := 1; -- inline   keep    spacing
+ELSIF :NEW.id < 0 THEN
+/* commented-out code
+SELECT *
+FROM dual;
+*/
+:NEW.id := 0;
+ELSE
+CASE WHEN :NEW.flag = 'Y' THEN
+NULL;
+END CASE;
+END IF;
+FOR i IN 1..2 LOOP
+-- in loop
+NULL;
+END LOOP;
+EXCEPTION
+WHEN OTHERS THEN
+-- in exception
+NULL;
+END;
+/
+SELECT /*+ INDEX(t idx_t) */ col -- inline tail keep
+FROM t;
+/* block
+  layout
+    keep
+*/
+"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.starts_with("-- file header keep\n"),
+            "{}",
+            formatted
+        );
+        assert!(formatted.contains("    -- before if"), "{}", formatted);
+        assert!(formatted.contains("        -- if branch"), "{}", formatted);
+        assert!(formatted.contains("        -- in loop"), "{}", formatted);
+        assert!(
+            formatted.contains("        -- in exception"),
+            "{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(":= 1; -- inline   keep    spacing"),
+            "{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        /* commented-out code\nSELECT *\nFROM dual;\n*/"),
+            "{}",
+            formatted
+        );
+        assert!(formatted.contains("/*+ INDEX(t idx_t) */"), "{}", formatted);
+        assert!(
+            formatted.contains("col -- inline tail keep"),
+            "{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("/* block\n  layout\n    keep\n*/"),
+            "{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_oracle_hint_position_in_case_expression() {
+        let sql = "SELECT CASE /*+ NO_EXPAND */ WHEN a = 1 THEN b ELSE c END -- keep\nFROM t";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.contains("/*+ NO_EXPAND */"), "{}", formatted);
+        assert!(formatted.contains("END -- keep"), "{}", formatted);
+    }
+
+    #[test]
+    fn format_tool_command_accept_escapes_single_quote_prompt() {
+        let rendered = SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::Accept {
+            name: "v_name".to_string(),
+            prompt: Some("Owner's value?".to_string()),
+        });
+
+        assert_eq!(rendered, "ACCEPT v_name PROMPT 'Owner''s value?'");
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_terminator() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual;
+/"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_without_semicolon() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual
+/"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_with_trailing_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual
+/
+REM keep"
+        ));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_sqlplus_slash() {
+        let source = "BEGIN
+  NULL;
+END
+/";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("END
+/"),
+            "Formatter should not keep an inserted semicolon before SQL*Plus slash terminator when source had none, got:
+{}",
+            preserved
+        );
+        assert!(
+            !preserved.contains(
+                "END;
+/"
+            ),
+            "Inserted semicolon before SQL*Plus slash terminator should be removed, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_existing_semicolon_before_sqlplus_slash() {
+        let source = "BEGIN
+  NULL;
+END;
+/";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains(
+                "END;
+/"
+            ),
+            "Existing semicolon before SQL*Plus slash terminator should remain, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_ignores_sqlplus_remark_comment_text() {
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "REM only a comment"
+        ));
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "REMARK this is a comment with ; semicolon"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_inline_sqlplus_remark_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REM trailing comment"
+        ));
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REMARK trailing comment"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_rejects_semicolon_before_remark_with_following_statement() {
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REM note
+SELECT 2 FROM dual"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_line_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; -- trailing comment"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_slash_and_line_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "BEGIN\n  NULL;\nEND;\n/\n-- keep"
+        ));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_inline_sqlplus_remark_comment() {
+        let source = "SELECT 1 FROM dual; REM trailing comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;") && preserved.contains("REM trailing comment"),
+            "Existing semicolon and SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing statement terminator before inline SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_line_comment() {
+        let source = "SELECT 1 FROM dual; -- keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;"),
+            "Existing semicolon before line comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- keep terminator"),
+            "Trailing line comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing terminator before line comment should remain explicit, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_slash_and_trailing_comment() {
+        let source = "BEGIN\n  NULL;\nEND;\n/\n-- keep";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("END;\n/"),
+            "Semicolon before SQL*Plus slash should remain when source had explicit terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- keep"),
+            "Trailing line comment should remain, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn format_statement_preserves_compound_trigger_timing_end_qualifier() {
+        let sql = r#"CREATE OR REPLACE TRIGGER test_compound_trg
+  FOR INSERT ON test_table
+  COMPOUND TRIGGER
+    BEFORE EACH ROW IS
+    BEGIN
+      :NEW.status := 'new';
+    END BEFORE EACH ROW;
+    AFTER STATEMENT IS
+    BEGIN
+      NULL;
+    END AFTER STATEMENT;
+  END test_compound_trg;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("END BEFORE EACH ROW;"),
+            "Compound trigger BEFORE timing qualifier should be preserved, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("END AFTER STATEMENT;"),
+            "Compound trigger AFTER timing qualifier should be preserved, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn formats_values_subquery_with_nested_depth() {
+        let sql = "SELECT 1 FROM dual WHERE EXISTS (VALUES (1));";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT 1",
+            "FROM DUAL",
+            "WHERE EXISTS (",
+            "        VALUES (1)",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_deeply_nested_subqueries_with_consistent_depth() {
+        let sql = "SELECT outer_col FROM outer_t o WHERE EXISTS (SELECT 1 FROM (SELECT inner_col FROM inner_t i WHERE i.id IN (SELECT id FROM leaf_t WHERE status = 'Y')) nested_q WHERE nested_q.inner_col = o.outer_col);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT outer_col",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        SELECT 1",
+            "        FROM (",
+            "                SELECT inner_col",
+            "                FROM inner_t i",
+            "                WHERE i.id IN (",
+            "                        SELECT id",
+            "                        FROM leaf_t",
+            "                        WHERE status = 'Y'",
+            "                    )",
+            "            ) nested_q",
+            "        WHERE nested_q.inner_col = o.outer_col",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_nested_union_subquery_with_consistent_depth() {
+        let sql = "SELECT o.id FROM outer_t o WHERE EXISTS (SELECT 1 FROM (SELECT i.id FROM inner_a i WHERE i.flag = 'Y' UNION ALL SELECT j.id FROM inner_b j WHERE j.flag = 'N') merged WHERE merged.id = o.id);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT o.id",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        SELECT 1",
+            "        FROM (",
+            "                SELECT i.id",
+            "                FROM inner_a i",
+            "                WHERE i.flag = 'Y'",
+            "                UNION ALL",
+            "                SELECT j.id",
+            "                FROM inner_b j",
+            "                WHERE j.flag = 'N'",
+            "            ) merged",
+            "        WHERE merged.id = o.id",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn plsql_nested_with_subquery_keeps_cte_body_depth() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    WITH filt AS (
+      SELECT id
+      FROM inner_t
+      WHERE flag = 'Y'
+    )
+    SELECT id
+    FROM filt
+    WHERE filt.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "WITH filt AS (
+                SELECT id
+                FROM inner_t
+                WHERE flag = 'Y'
+            )"
+            ),
+            "CTE body inside nested subquery should indent one level deeper than WITH header, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_nested_union_subquery_keeps_consistent_depth() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    SELECT 1
+    FROM (
+      SELECT i.id
+      FROM inner_a i
+      WHERE i.flag = 'Y'
+      UNION ALL
+      SELECT j.id
+      FROM inner_b j
+      WHERE j.flag = 'N'
+    ) merged
+    WHERE merged.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "FROM (
+                SELECT i.id"
+            ),
+            "Nested subquery under FROM should increase depth, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                "UNION ALL
+                SELECT j.id"
+            ),
+            "Set operator branch inside nested subquery should keep same nested depth, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_nested_with_multiple_ctes_keeps_cte_depth_aligned() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    WITH a AS (
+      SELECT id
+      FROM inner_t
+    ), b AS (
+      SELECT id
+      FROM a
+    )
+    SELECT id
+    FROM b
+    WHERE b.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "BEGIN",
+            "    SELECT o.id",
+            "    INTO v_id",
+            "    FROM outer_t o",
+            "    WHERE EXISTS (",
+            "            WITH a AS (",
+            "                SELECT id",
+            "                FROM inner_t",
+            "            ),",
+            "            b AS (",
+            "                SELECT id",
+            "                FROM a",
+            "            )",
+            "            SELECT id",
+            "            FROM b",
+            "            WHERE b.id = o.id",
+            "        );",
+            "END;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn plsql_nested_with_clause_resets_excess_manual_indent() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+                    WITH filt AS (
+      SELECT id
+      FROM inner_t
+      WHERE flag = 'Y'
+    )
+    SELECT id
+    FROM filt
+    WHERE filt.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE EXISTS (
+            WITH filt AS ("),
+            "WITH clause should align to nested query depth instead of preserving excess manual indent, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn open_for_with_inline_block_comment_keeps_comment_inline_and_subquery_indented() {
+        let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
+    l_rc t_refcur;
+BEGIN
+    OPEN l_rc FOR
+        WITH base AS (
+            SELECT e.emp_id,
+                e.emp_name,
+                e.salary,
+                e.bonus_pct,
+                d.dept_name, /*asdf*/
+                NVL (
+                    (
+                    SELECT SUM (s.amount)
+                    FROM qt_sales s
+                    WHERE s.emp_id = e.emp_id
+                ),
+                0
+                ) AS total_sales
+            FROM qt_emp e
+        )
+        SELECT *
+        FROM base;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "d.dept_name, /*asdf*/\n                NVL (\n                    (\n                        SELECT SUM (s.amount)\n                        FROM qt_sales s\n                        WHERE s.emp_id = e.emp_id\n                    ),\n                    0\n                ) AS total_sales"
+            ),
+            "{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn open_for_with_inline_line_comment_keeps_next_select_item_depth() {
+        let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
+    l_rc t_refcur;
+BEGIN
+    OPEN l_rc FOR
+        WITH base AS (
+            SELECT e.emp_id,
+                e.emp_name,
+                e.salary,
+                e.bonus_pct,
+                d.dept_name, --asdf
+                NVL (
+                    (
+                    SELECT SUM (s.amount)
+                    FROM qt_sales s
+                    WHERE s.emp_id = e.emp_id
+                ),
+                0
+                ) AS total_sales
+            FROM qt_emp e
+        )
+        SELECT *
+        FROM base;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "d.dept_name, --asdf\n                NVL (\n                    (\n                        SELECT SUM (s.amount)\n                        FROM qt_sales s\n                        WHERE s.emp_id = e.emp_id\n                    ),\n                    0\n                ) AS total_sales"
+            ),
+            "{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_nested_with_clause_does_not_keep_two_level_extra_indent() {
+        let sql = r#"BEGIN
+    SELECT o.id
+    INTO v_id
+    FROM outer_t o
+    WHERE EXISTS (
+                WITH filt AS (
+                    SELECT id
+                    FROM inner_t
+                    WHERE flag = 'Y'
+                )
+            SELECT id
+            FROM filt
+            WHERE filt.id = o.id
+        );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "WHERE EXISTS (
+            WITH filt AS ("
+            ),
+            "WITH clause should not keep two-level extra indent in nested DML depth, got:
+{}",
+            formatted
+        );
+    }
+    #[test]
+    fn formats_nested_with_subquery_with_consistent_depth() {
+        let sql = "SELECT o.id FROM outer_t o WHERE EXISTS (WITH filt AS (SELECT id FROM inner_t WHERE flag = 'Y') SELECT id FROM filt WHERE filt.id = o.id);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT o.id",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        WITH filt AS (",
+            "            SELECT id",
+            "            FROM inner_t",
+            "            WHERE flag = 'Y'",
+            "        )",
+            "        SELECT id",
+            "        FROM filt",
+            "        WHERE filt.id = o.id",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_nested_cursor_expression_with_consistent_depth() {
+        let sql = r#"SELECT
+    d.dept_id,
+    d.dept_name,
+    CURSOR
+    (
+        SELECT
+            e.emp_id,
+            e.emp_no,
+            e.emp_name,
+            CURSOR
+            (
+                SELECT
+                    s.sale_year,
+                    SUM(s.sale_amount) AS total_sales
+                FROM qt_sales s
+                WHERE s.emp_id = e.emp_id
+                GROUP BY s.sale_year
+                ORDER BY s.sale_year
+            ) AS sales_cur
+        FROM qt_emp e
+        WHERE e.dept_id = d.dept_id
+        ORDER BY e.emp_id
+    ) AS emp_cur
+FROM qt_dept d
+ORDER BY d.dept_id"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT d.dept_id,",
+            "    d.dept_name,",
+            "    CURSOR (",
+            "        SELECT e.emp_id,",
+            "            e.emp_no,",
+            "            e.emp_name,",
+            "            CURSOR (",
+            "                SELECT s.sale_year,",
+            "                    SUM (s.sale_amount) AS total_sales",
+            "                FROM qt_sales s",
+            "                WHERE s.emp_id = e.emp_id",
+            "                GROUP BY s.sale_year",
+            "                ORDER BY s.sale_year",
+            "            ) AS sales_cur",
+            "        FROM qt_emp e",
+            "        WHERE e.dept_id = d.dept_id",
+            "        ORDER BY e.emp_id",
+            "    ) AS emp_cur",
+            "FROM qt_dept d",
+            "ORDER BY d.dept_id;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+}
+
+
+#[cfg(test)]
+mod format_comment_indent_tests {
+    use crate::ui::sql_editor::SqlEditorWidget;
+
+    fn leading_spaces(line: &str) -> usize {
+        line.len().saturating_sub(line.trim_start().len())
+    }
+
+    #[test]
+    fn format_sql_basic_indents_line_comment_in_select_list_before_comma() {
+        let source = "select col1\n-- comment\n,col2\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SELECT col1\n    -- comment\n    ,\n    col2\nFROM t1;"),
+            "Line comment between select items should be indented at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_mid_list_comment_at_list_depth() {
+        let source = "select col1\n-- comment2\n,col2\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment2\n    ,\n    col2"),
+            "Mid-list comment (before comma) should be indented at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_at_base_indent_before_from_single_item() {
+        let source = "select col1\n-- last column\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SELECT col1\n-- last column\nFROM t1;"),
+            "Inter-clause comment before FROM should stay at base indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_subquery_select_list() {
+        let source = "select * from (select col1\n-- comment\n,col2\nfrom t1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted
+                .contains("SELECT col1\n            -- comment\n            ,\n            col2"),
+            "Comment in subquery select list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_after_comma_in_open_for_select_list() {
+        let source = "begin\n    open c for\n        select b,\n        -- comment\n            d\n        from e;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("SELECT b,\n            -- comment\n            d\n        FROM e;"),
+            "Line comment after a trailing comma should keep select-list depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_inline_comment_alignment_after_multiline_string_literal() {
+        let source = "begin\n    a := 'b\n             b';     -- c\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let assign_idx = lines
+            .iter()
+            .position(|line| line.contains("b';") && line.contains("-- c"))
+            .unwrap_or(0);
+        let assign_line = lines.get(assign_idx).copied().unwrap_or_default();
+
+        assert!(
+            assign_line.contains("b'; -- c"),
+            "Inline comment spacing after multiline string literal should be preserved, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_open_for_select_clauses_inside_cursor_body() {
+        let source = "begin\n    select a\n    from b\n    where 1=1;\n    open cv for\n        select a,\n            b\n    from c,\n            d\n    where 1=1;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains(
+                "OPEN cv FOR\n        SELECT a,\n            b\n        FROM c,\n            d\n        WHERE 1 = 1;"
+            ),
+            "OPEN ... FOR nested SELECT should keep FROM/WHERE aligned with SELECT body depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_connect_by_aligned_in_open_for_parenthesized_select() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT employee_id\n                 FROM employees\n                 START WITH manager_id IS NULL\n                 CONNECT BY PRIOR employee_id = manager_id);\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("SELECT employee_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let from_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("FROM employees"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let connect_by_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("CONNECT BY PRIOR"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            select_indent > 0,
+            "OPEN ... FOR SELECT line should exist, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            from_indent, select_indent,
+            "FROM in OPEN ... FOR SELECT should align with SELECT, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            connect_by_indent, select_indent,
+            "CONNECT BY in OPEN ... FOR SELECT should align with SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_open_for_subquery_closing_paren_at_open_paren_indent() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT e.employee_id\n                 FROM employees e\n                 WHERE EXISTS (SELECT 1\n                               FROM dual\n                               WHERE 1 = 1));\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let open_paren_indent = lines
+            .iter()
+            .find(|line| line.trim() == "(")
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let close_paren_indent = lines
+            .iter()
+            .rev()
+            .find(|line| line.trim() == ");")
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            open_paren_indent > 0,
+            "OPEN ... FOR parenthesized SELECT should include opening parenthesis line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            close_paren_indent, open_paren_indent,
+            "Closing parenthesis of OPEN ... FOR SELECT should align with opening parenthesis, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_subquery_connect_by_under_inner_select_in_open_for() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT root_id\n                 FROM roots r\n                 WHERE EXISTS (SELECT child_id\n                               FROM children c\n                               START WITH c.parent_id = r.root_id\n                               CONNECT BY PRIOR c.child_id = c.parent_id));\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let inner_select_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("SELECT child_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let inner_connect_by_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("CONNECT BY PRIOR c.child_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            inner_select_indent > 0,
+            "Nested SELECT inside OPEN ... FOR should exist, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            inner_connect_by_indent, inner_select_indent,
+            "Nested CONNECT BY should align with nested SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_non_select_parenthesis_pairs_aligned_in_open_for_select() {
+        let source = "BEGIN
+    OPEN cv FOR (SELECT e.employee_id
+                 FROM employees e
+                 WHERE (e.manager_id IS NULL
+                        OR e.manager_id = 100));
+END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE (e.manager_id IS NULL\n                OR e.manager_id = 100)"),
+            "Non-SELECT parenthesis pair inside OPEN ... FOR WHERE should stay paired and indented, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_non_select_parenthesis_alignment_in_open_for_select() {
+        let source = "BEGIN
+    OPEN cv FOR (SELECT e.employee_id
+                 FROM employees e
+                 WHERE (e.manager_id IN (100, 200)
+                        OR e.department_id = 90));
+END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                OR e.department_id = 90)"),
+            "Nested non-SELECT parenthesis pairs in OPEN ... FOR WHERE should stay paired and indented, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_cursor_select_comment_at_select_list_depth_in_package_body() {
+        let source = "create or replace package body pkg_fmt as\n    procedure validate_and_process (p_root_id in number, p_mode in varchar2 default 'NORMAL') is\n        cursor c_units (cp_root_id number) is\n        select id,\n            parent_id\n        -- comment\n            ,\n            code,\n            qty,\n            pri\n        from fmtx_unit;\n    begin\n        null;\n    end validate_and_process;\nend pkg_fmt;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains(
+                "SELECT id,\n            parent_id\n            -- comment\n            ,\n            code,\n            qty,\n            pri\n        FROM fmtx_unit;"
+            ),
+            "Cursor SELECT comment in package body should match select-list depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_cursor_select_block_comment_at_select_list_depth_in_package_body() {
+        let source = "create or replace package body pkg_fmt as\n    procedure validate_and_process is\n        cursor c_units is\n        select id,\n            parent_id\n        /* keep\n           block */\n            ,\n            code\n        from fmtx_unit;\n    begin\n        null;\n    end validate_and_process;\nend pkg_fmt;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let block_open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "/* keep")
+            .unwrap_or(0);
+        let block_close_idx = lines
+            .iter()
+            .position(|line| line.trim() == "block */")
+            .unwrap_or(0);
+        let comma_idx = lines
+            .iter()
+            .position(|line| line.trim() == ",")
+            .unwrap_or(0);
+        let code_idx = lines
+            .iter()
+            .position(|line| line.trim() == "code")
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[block_open_idx]),
+            leading_spaces(lines[code_idx]),
+            "Block comment opener should match code depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            lines[block_close_idx], "           block */",
+            "Multiline block comment internal line should preserve original indentation, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[comma_idx]),
+            leading_spaces(lines[code_idx]),
+            "Comma line should stay aligned with code after block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_aligned_before_case_close_paren() {
+        let source = "begin\n    v_val := case\n        when flag = 1 then (\n            case\n                when score > 0 then 1\n                else 0\n            end\n            -- keep\n        )\n        else 2\n    end;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_idx = lines
+            .iter()
+            .position(|line| line.trim() == "-- keep")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_paren_idx.saturating_add(1))
+            .find_map(|(idx, line)| {
+                if line.trim() == "ELSE" {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[comment_idx]),
+            leading_spaces(lines[close_paren_idx]),
+            "Comment before parenthesized CASE closer should match close-paren depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_paren_idx]),
+            leading_spaces(lines[else_idx]),
+            "Parenthesized CASE closer should align with following ELSE branch depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_open_cursor_using_comment_aligned_with_following_items() {
+        let source = "BEGIN\n    IF a IS NOT NULL THEN\n        OPEN c FOR\n            b,\n            USING d,\n            -- e\n            f,\n                g;\n    END IF;\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert_eq!(
+            formatted,
+            "BEGIN\n    IF a IS NOT NULL THEN\n        OPEN c FOR\n            b,\n            USING d,\n                -- e\n                f,\n                g;\n    END IF;\nEND;",
+            "OPEN ... FOR USING comment and continuation items should align one level deeper than USING, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_selected_if_fragment_using_comment_aligned_with_following_items() {
+        let source = "IF a IS NOT NULL THEN\n    OPEN c FOR\n        b,\n        USING d,\n        -- e\n        f,\n            g;\nEND IF;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert_eq!(
+            formatted,
+            "IF a IS NOT NULL THEN\n    OPEN c FOR\n        b,\n        USING d,\n            -- e\n            f,\n            g;\nEND IF;",
+            "Selected IF fragment should keep USING comment and continuation items one level deeper than USING, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_update_set_clause() {
+        let source = "update t1 set col1 = 1\n-- comment\n,col2 = 2\n,col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SET col1 = 1\n    -- comment\n    ,\n    col2 = 2"),
+            "Comment in UPDATE SET clause should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_interleaved_comments_and_commas_in_select() {
+        let source =
+            "select\ncol1\n-- first section\n,col2\n,col3\n-- second section\n,col4\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- first section\n"),
+            "First section comment should be indented, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- second section\n"),
+            "Second section comment should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_group_by_list() {
+        let source = "select col1, col2, count(*) from t1 group by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("GROUP BY col1\n    -- comment\n    ,\n    col2;"),
+            "Comment in GROUP BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_order_by_list() {
+        let source = "select col1, col2 from t1 order by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY col1\n    -- comment\n    ,\n    col2;"),
+            "Comment in ORDER BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_from_list() {
+        let source = "select * from t1\n-- join next table\n,t2\n,t3 where t1.id = t2.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FROM t1\n    -- join next table\n    ,\n    t2"),
+            "Comment in FROM table list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_returning_list() {
+        let source = "insert into t1 values (1, 2) returning col1\n-- comment\n,col2 into v1, v2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RETURNING col1\n    -- comment\n    ,\n    col2"),
+            "Comment in RETURNING list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_before_and_in_where() {
+        let source = "select * from t1 where col1 = 1\n-- check col2\nand col2 = 2\n-- check col3\nand col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- check col2\n    AND col2 = 2"),
+            "Comment before AND should match AND indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- check col3\n    AND col3 = 3"),
+            "Comment before second AND should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_before_and_in_join_on() {
+        let source =
+            "select * from t1 join t2 on t1.id = t2.id\n-- extra condition\nand t1.status = 'A';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- extra condition\n    AND t1.status"),
+            "Comment before AND in ON clause should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_insert_column_list() {
+        let source = "insert into t1 (col1\n-- comment\n,col2\n,col3) values (1, 2, 3);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in INSERT column list should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_values_list() {
+        let source = "insert into t1 (col1, col2, col3) values (1\n-- comment\n,2\n,3);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in VALUES list should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_create_table_columns() {
+        let source = "create table t1 (col1 number\n-- comment\n,col2 varchar2(100)\n,col3 date);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("col1 NUMBER,\n    -- comment\n    col2"),
+            "Comment in CREATE TABLE column list should be at column indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_with_else_in_plsql_if() {
+        let source = "begin\nif true then\n-- do something\nnull;\n-- else branch\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Comment before ELSE should be at same indent as ELSE (4 spaces)
+        assert!(
+            formatted.contains("\n    -- else branch\n    ELSE"),
+            "Comment before ELSE should align with ELSE keyword, got:\n{}",
+            formatted
+        );
+        // Comment inside IF body should be at body indent (8 spaces)
+        assert!(
+            formatted.contains("\n        -- do something\n"),
+            "Comment inside IF body should be at body indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_with_when_in_case() {
+        let source = "select case\n-- first case\nwhen col1 = 1 then 'a'\n-- second case\nwhen col1 = 2 then 'b'\n-- default\nelse 'c'\nend from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Comments before WHEN should be at same indent as WHEN (8 spaces)
+        assert!(
+            formatted.contains("        -- first case\n        WHEN"),
+            "Comment before WHEN should align with WHEN keyword, got:\n{}",
+            formatted
+        );
+        // Comment before ELSE in CASE should align with ELSE
+        assert!(
+            formatted.contains("        -- default\n        ELSE"),
+            "Comment before ELSE in CASE should align with ELSE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_or_in_where() {
+        let source = "select * from t1 where col1 = 1\n-- or branch\nor col2 = 2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- or branch\n    OR"),
+            "Comment before OR should align with OR keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_nested_plsql_comment_depth() {
+        let source = "begin\nif true then\nfor i in 1..10 loop\n-- deep comment\nnull;\nend loop;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("            -- deep comment\n            NULL;"),
+            "Comment in nested PL/SQL block should be at correct depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_create_table_leading_comment_placement() {
+        let source = "create table t1 (\n-- primary key\ncol1 number\n-- description\n,col2 varchar2(100)\n,col3 date);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Leading comment before col1 should appear before col1
+        assert!(
+            formatted.contains("    -- primary key\n    col1 NUMBER,"),
+            "Leading comment should appear before its column, got:\n{}",
+            formatted
+        );
+        // Comment before col2 should appear before col2
+        assert!(
+            formatted.contains("    -- description\n    col2"),
+            "Comment before col2 should appear before col2, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 1: next_is_else 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_exception() {
+        let source = "begin\nnull;\n-- handle errors\nexception\nwhen others then\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // EXCEPTION is at BEGIN level (indent 0), comment should match
+        assert!(
+            formatted.contains("\n-- handle errors\nEXCEPTION"),
+            "Comment before EXCEPTION should align with EXCEPTION at base indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_exception_nested() {
+        let source =
+            "begin\nif true then\nbegin\nnull;\n-- nested exception\nexception\nwhen others then\nnull;\nend;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Nested BEGIN..EXCEPTION: comment should be at nested BEGIN level (8 spaces)
+        assert!(
+            formatted.contains("        -- nested exception\n        EXCEPTION"),
+            "Comment before nested EXCEPTION should align with EXCEPTION, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_elsif() {
+        let source =
+            "begin\nif a = 1 then\nnull;\n-- check second\nelsif a = 2 then\nnull;\n-- fallback\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- check second\n    ELSIF"),
+            "Comment before ELSIF should align with ELSIF, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- fallback\n    ELSE"),
+            "Comment before ELSE should align with ELSE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_block_comment_before_else_in_plsql_if() {
+        let source = "begin\nif true then\nnull;\n/* else branch */\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    /* else branch */\n    ELSE"),
+            "Block comment before ELSE should align with ELSE keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 2: next_is_condition_keyword 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_when_in_plsql_exception() {
+        let source =
+            "begin\nnull;\nexception\n-- not found\nwhen no_data_found then\nnull;\n-- others\nwhen others then\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- not found\n    WHEN"),
+            "Comment before WHEN in EXCEPTION should align with WHEN, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- others\n    WHEN"),
+            "Comment before second WHEN in EXCEPTION should align with WHEN, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_on_in_join() {
+        let source = "select * from t1 join t2\n-- join condition\non t1.id = t2.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- join condition\n    ON"),
+            "Comment before ON in JOIN should align with ON keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_and_in_having() {
+        let source =
+            "select col1, count(*) from t1 group by col1 having count(*) > 1\n-- extra filter\nand sum(col2) > 10;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- extra filter\n    AND"),
+            "Comment before AND in HAVING should align with AND keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 3: in_confirmed_list 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_having_list() {
+        let source = "select col1, col2, count(*) from t1 group by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in GROUP BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_window_clause_list() {
+        let source = "select col1 from t1 order by col1\n-- secondary sort\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- secondary sort\n    ,"),
+            "Comment between ORDER BY items should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_merge_matched_set_list() {
+        let source = "merge into t1 using t2 on (t1.id = t2.id) when matched then update set t1.col1 = t2.col1\n-- update col2\n,t1.col2 = t2.col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- update col2\n    ,"),
+            "Comment in MERGE UPDATE SET list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── paren_extra: 괄호 내부에서 condition/ELSE 주석 정렬 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_and_inside_parens() {
+        let source = "select * from t1 where func(col1 = 1\n-- extra\nand col2 = 2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- extra")).unwrap();
+        let and_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("AND col2"))
+            .unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(and_line),
+            "Comment before AND inside parens should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_else_in_case_inside_parens() {
+        let source = "select func(case when col1 = 1 then 'a'\n-- default\nelse 'b' end) from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- default")).unwrap();
+        let else_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("ELSE"))
+            .unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(else_line),
+            "Comment before ELSE in CASE inside parens should match ELSE indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_when_in_case_inside_parens() {
+        let source =
+            "select func(case\n-- first branch\nwhen col1 = 1 then 'a'\n-- second branch\nwhen col1 = 2 then 'b' end) from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines
+            .iter()
+            .find(|l| l.contains("-- first branch"))
+            .unwrap();
+        let when_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("WHEN col1 = 1"))
+            .unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(when_line),
+            "Comment before WHEN in CASE inside parens should match WHEN indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_or_inside_parens() {
+        let source = "select * from t1 where (col1 = 1\n-- alt condition\nor col2 = 2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines
+            .iter()
+            .find(|l| l.contains("-- alt condition"))
+            .unwrap();
+        let or_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("OR col2"))
+            .unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(or_line),
+            "Comment before OR inside parens should match OR indent, got:\n{}",
+            formatted
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod format_indent_gap_tests {
+    use crate::ui::sql_editor::SqlEditorWidget;
+
+    // ── CURSOR IS/AS SELECT body indent ──
+
+    #[test]
+    fn format_sql_basic_indents_cursor_is_select_body() {
+        let source = "declare\ncursor c1 is\nselect col1, col2\nfrom t1\nwhere col1 > 0;\nbegin\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    CURSOR c1 IS\n        SELECT"),
+            "SELECT body should be indented under CURSOR IS, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        FROM t1"),
+            "FROM should be at CURSOR body depth, got:\n{}",
+            formatted
+        );
+        // BEGIN should return to DECLARE level
+        assert!(
+            formatted.contains("BEGIN\n    NULL;"),
+            "BEGIN should return to top level after CURSOR, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_cursor_with_params_is_select_body() {
+        let source = "declare\ncursor c1 (p1 number) is\nselect col1\nfrom t1\nwhere col1 = p1;\nbegin\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    CURSOR c1 (p1 NUMBER) IS\n        SELECT"),
+            "Parameterized CURSOR SELECT should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_nested_cursor_declaration() {
+        let source =
+            "begin\ndeclare\ncursor c1 is\nselect col1 from t1;\nbegin\nopen c1;\nend;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("        CURSOR c1 IS\n            SELECT"),
+            "Nested CURSOR SELECT should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── FORALL body indent ──
+
+    #[test]
+    fn format_sql_basic_indents_forall_insert_body() {
+        let source = "begin\nforall i in 1..v_arr.count\ninsert into t1 values (v_arr(i));\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        INSERT INTO"),
+            "FORALL INSERT body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_forall_update_body() {
+        let source = "begin\nforall i in 1..v_arr.count\nupdate t1 set col1 = v_arr(i)\nwhere id = v_id(i);\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        UPDATE"),
+            "FORALL UPDATE body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_forall_delete_body() {
+        let source = "begin\nforall i in 1..v_arr.count\ndelete from t1 where id = v_arr(i);\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        DELETE"),
+            "FORALL DELETE body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── EXECUTE IMMEDIATE INTO/USING inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_execute_immediate_into_using_inline() {
+        let source =
+            "begin\nexecute immediate 'select 1 from dual' into v_result using v_param;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted
+                .contains("EXECUTE IMMEDIATE 'select 1 from dual' INTO v_result USING v_param;"),
+            "EXECUTE IMMEDIATE INTO/USING should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_execute_immediate_using_only_inline() {
+        let source = "begin\nexecute immediate v_sql using v_param1, v_param2;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("EXECUTE IMMEDIATE v_sql USING v_param1, v_param2;"),
+            "EXECUTE IMMEDIATE USING should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE INDEX ON inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_index_on_inline() {
+        let source = "create index idx1 on t1 (col1, col2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("CREATE INDEX idx1 ON t1"),
+            "CREATE INDEX ON should stay on same line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_create_unique_index_on_inline() {
+        let source = "create unique index idx1 on t1 (col1, col2) tablespace users;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("CREATE UNIQUE INDEX idx1 ON t1"),
+            "CREATE UNIQUE INDEX ON should stay on same line, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── COMMENT ON inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_comment_on_table_inline() {
+        let source = "comment on table t1 is 'This is a table';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("COMMENT ON TABLE"),
+            "COMMENT ON TABLE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_on_column_inline() {
+        let source = "comment on column t1.col1 is 'description';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("COMMENT ON COLUMN"),
+            "COMMENT ON COLUMN should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── GRANT/REVOKE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_grant_inline() {
+        let source = "grant select, insert on schema1.t1 to user1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("GRANT SELECT, INSERT ON"),
+            "GRANT privileges should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_revoke_inline() {
+        let source = "revoke select on schema1.t1 from user1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("REVOKE SELECT ON"),
+            "REVOKE privileges should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── MERGE WHEN MATCHED indent ──
+
+    #[test]
+    fn format_sql_basic_merge_when_matched_indent() {
+        let source = "merge into t1 using t2 on (t1.id = t2.id) when matched then update set t1.col = t2.col when not matched then insert (col) values (t2.col);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        // WHEN MATCHED should be at base indent
+        let when_matched = lines.iter().find(|l| l.contains("WHEN MATCHED")).unwrap();
+        assert!(
+            !when_matched.starts_with("    "),
+            "WHEN MATCHED should not be deeply indented, got:\n{}",
+            formatted
+        );
+        // UPDATE should be indented under WHEN MATCHED
+        let update_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("UPDATE"))
+            .unwrap();
+        assert!(
+            update_line.starts_with("    "),
+            "UPDATE should be indented under WHEN MATCHED, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── FETCH INTO inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_fetch_into_inline() {
+        let source = "begin\nfetch cur into v_rec;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FETCH cur INTO v_rec;"),
+            "FETCH INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_fetch_bulk_collect_into_inline() {
+        let source = "begin\nfetch cur bulk collect into v_tab limit 100;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FETCH cur BULK COLLECT INTO v_tab LIMIT 100;"),
+            "FETCH BULK COLLECT INTO LIMIT should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── RETURNING INTO inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_returning_into_inline() {
+        let source = "begin\ninsert into t1 (a) values (1) returning id into v_id;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RETURNING id INTO v_id;"),
+            "RETURNING INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── BULK COLLECT INTO inline (in SELECT) ──
+
+    #[test]
+    fn format_sql_basic_keeps_bulk_collect_into_inline() {
+        let source = "begin\nselect col bulk collect into v_tab from t1;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("BULK COLLECT INTO v_tab"),
+            "BULK COLLECT INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── SELECT FOR UPDATE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_for_update_inline() {
+        let source = "select a, b from t1 where id = 1 for update of a nowait;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE OF"),
+            "FOR UPDATE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── ON DELETE CASCADE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_on_delete_cascade_inline() {
+        let source = "alter table t1 add constraint fk1 foreign key (col1) references t2(id) on delete cascade;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ON DELETE CASCADE"),
+            "ON DELETE CASCADE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE SEQUENCE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_sequence_inline() {
+        let source = "create sequence seq1 start with 1 increment by 1 nocache;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            !formatted.contains("\nSTART"),
+            "CREATE SEQUENCE START WITH should not break, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE SYNONYM FOR inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_synonym_for_inline() {
+        let source = "create or replace synonym syn1 for schema1.t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SYNONYM syn1 FOR schema1"),
+            "CREATE SYNONYM FOR should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── LISTAGG WITHIN GROUP inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_listagg_within_group_inline() {
+        let source = "select deptno, listagg(ename, ', ') within group (order by ename) as names from emp group by deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITHIN GROUP"),
+            "LISTAGG WITHIN GROUP should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_sum_case_indented_inside_with_plsql_cte() {
+        let source = r#"WITH
+    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN REGEXP_REPLACE (NVL (p_txt, 'NULL'), '([[:alnum:]])', '*');
+    END fmt_mask,
+    PROCEDURE noop (p_msg IN VARCHAR2) IS
+    BEGIN
+        NULL;
+    END noop,
+    dept_stat AS (
+        SELECT
+            f.deptno,
+            COUNT (*) AS cnt_emp,
+            SUM (
+            CASE
+                WHEN f.band = 'TOP' THEN 1
+                ELSE 0
+            END
+            ) AS cnt_top,
+            LISTAGG (f.ename, ', ') WITHIN GROUP (ORDER BY f.sal DESC, f.empno) AS emp_list
+        FROM filtered_emp f
+        GROUP BY f.deptno
+    )
+SELECT
+    *
+FROM dept_stat;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let sum_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SUM (")
+            .unwrap_or(0);
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sum_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("WHEN f.band = 'TOP' THEN 1"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "ELSE 0")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(end_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") AS cnt_top"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[case_idx]) > leading_spaces(lines[sum_idx]),
+            "CASE inside SUM should indent deeper than SUM header, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[when_idx]) > leading_spaces(lines[case_idx]),
+            "WHEN inside aggregate CASE should indent deeper than CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[else_idx]),
+            leading_spaces(lines[when_idx]),
+            "ELSE inside aggregate CASE should align with WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "END inside aggregate CASE should align with CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[sum_idx]),
+            "closing SUM parenthesis should align with SUM header, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── PIVOT FOR inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_pivot_for_inline() {
+        let source = "select * from t1 pivot (sum(amount) for category in ('A' as a, 'B' as b));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR category"),
+            "PIVOT FOR should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_extract_from_inline_inside_function() {
+        let source = "select extract(year from d.dt) as yyyy from dual d;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("YEAR FROM d.dt")
+                && !formatted.contains(
+                    "YEAR
+FROM"
+                ),
+            "EXTRACT(... FROM ...) should stay inline inside function, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_json_returning_inline_inside_function() {
+        let source =
+            "select json_value(e.json_profile, '$.level' returning varchar2(30)) as profile_level from emp e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("'$.level' RETURNING VARCHAR2 (30)"),
+            "JSON RETURNING should stay inline inside function parens, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_cross_apply_after_join_condition() {
+        let source = "select * from org_enriched oe join qt_fmt_dept d on d.dept_id = oe.dept_id cross apply (select 1 as x from dual) ca;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains(
+                "ON d.dept_id = oe.dept_id
+CROSS APPLY ("
+            ),
+            "CROSS APPLY should start on a new line after JOIN ON, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_search_cycle_set_inline() {
+        let source = "with t as (select 1 as dept_id, 'X' as dept_name from dual union all select 2, 'Y' from dual) search depth first by dept_name set dfs_order cycle dept_id set is_cycle to 'Y' default 'N' select * from t;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SEARCH DEPTH FIRST BY dept_name SET dfs_order"),
+            "SEARCH ... SET should stay in a single clause line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("CYCLE dept_id SET is_cycle TO 'Y' DEFAULT 'N'"),
+            "CYCLE ... SET should stay in a single clause line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_match_recognize_subclauses() {
+        let source = "select * from sales match_recognize (partition by emp_id order by sale_date, sale_id measures match_number() as match_no all rows per match pattern (low+ mid* high) define low as amount < 100, mid as amount between 100 and 500, high as amount > 500);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains(
+                "ORDER BY sale_date,
+        sale_id
+    MEASURES"
+            ),
+            "MEASURES should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                "ALL ROWS PER MATCH
+    PATTERN"
+            ),
+            "PATTERN should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                ")
+    DEFINE"
+            ),
+            "DEFINE should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_model_subclauses() {
+        let source = "select * from sales model partition by (year_key, channel_code) dimension by (month_key) measures (base_amt, proj_amt) rules sequential order (proj_amt[any] = base_amt[cv(month_key)]);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains(
+                "MODEL
+    PARTITION BY"
+            ),
+            "MODEL PARTITION BY should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                ")
+    DIMENSION BY"
+            ),
+            "MODEL DIMENSION BY should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                ")
+    MEASURES"
+            ),
+            "MODEL MEASURES should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                ")
+    RULES"
+            ),
+            "MODEL RULES should break to a new line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_pivot_and_unpivot_blocks() {
+        let pivot_source =
+            "select * from sales pivot (sum(amount) for category in ('A' as a, 'B' as b));";
+        let pivot_formatted = SqlEditorWidget::format_sql_basic(pivot_source);
+        assert!(
+            pivot_formatted.contains(
+                "PIVOT (
+"
+            ),
+            "PIVOT block should be treated as subquery-like block for formatting, got:
+{}",
+            pivot_formatted
+        );
+
+        let unpivot_source =
+            "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
+        let unpivot_formatted = SqlEditorWidget::format_sql_basic(unpivot_source);
+        assert!(
+            unpivot_formatted.contains(
+                "UNPIVOT (
+"
+            ),
+            "UNPIVOT block should be treated as subquery-like block for formatting, got:
+{}",
+            unpivot_formatted
+        );
+    }
+
+    // ── INSERT ALL INTO indent ──
+
+    #[test]
+    fn format_sql_basic_insert_all_into_indented() {
+        let source = "insert all into t1 (a) values (1) into t2 (b) values (2) select * from dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let into_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("INTO t1"))
+            .unwrap();
+        assert!(
+            into_line.starts_with("    "),
+            "INSERT ALL INTO should be indented, got:\n{}",
+            formatted
+        );
+    }
+}
