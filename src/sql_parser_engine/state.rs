@@ -334,7 +334,10 @@ impl SplitState {
 
         match classify_line_leading_marker(line) {
             LineLeadingMarker::Slash(kind)
-                if self.is_idle() && self.can_terminate_on_slash() && kind.consumes_as_terminator() =>
+                if self.is_idle()
+                    && self.paren_depth == 0
+                    && self.can_terminate_on_slash()
+                    && kind.consumes_as_terminator() =>
             {
                 if current_is_empty {
                     LineBoundaryAction::ConsumeLine
