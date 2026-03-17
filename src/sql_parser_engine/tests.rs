@@ -7849,3 +7849,36 @@ fn create_function_is_language_rust_call_spec_splits_before_following_statement(
     );
     assert_eq!(statements[1], "SELECT 779 FROM dual".to_string());
 }
+
+#[test]
+fn slash_on_own_line_inside_parens_is_not_terminator() {
+    let input = "SELECT\n    (\n        (1 + 2)\n        /\n        NULLIF(x, 0)\n    ) AS result\nFROM dual";
+    let mut engine = SqlParserEngine::new();
+    let lines: Vec<&str> = input.lines().collect();
+
+    // Process lines up to the `/` line and check state
+    for (i, line) in lines.iter().enumerate() {
+        let stmts = engine.process_line_and_take_statements(line);
+        let idle = engine.is_idle();
+        let pd = engine.paren_depth();
+        let bd = engine.block_depth();
+        eprintln!(
+            "After line {}: {:?} -> idle={}, paren_depth={}, block_depth={}, stmts={:?}",
+            i, line, idle, pd, bd, stmts
+        );
+        if line.trim() == "/" {
+            assert!(
+                !idle || pd > 0,
+                "Parser should not be idle with paren_depth=0 before `/` line"
+            );
+        }
+    }
+
+    let final_stmts = engine.finalize_and_take_statements();
+    let all_text: String = final_stmts.join(" | ");
+    assert!(
+        all_text.contains("/ NULLIF") || all_text.contains("/\n") || all_text.contains("NULLIF"),
+        "Division operator should be part of the statement, not treated as terminator: {:?}",
+        final_stmts
+    );
+}

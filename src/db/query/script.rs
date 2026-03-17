@@ -4867,12 +4867,27 @@ impl QueryExecutor {
             return false;
         };
 
-        let is_alias = first.eq_ignore_ascii_case("RUN") || first.eq_ignore_ascii_case("R");
-        if !is_alias {
+        let is_full = first.eq_ignore_ascii_case("RUN");
+        let is_abbrev = first.eq_ignore_ascii_case("R");
+        if !is_full && !is_abbrev {
             return false;
         }
 
-        parts.next().is_some()
+        let Some(second) = parts.next() else {
+            return false;
+        };
+
+        // When the abbreviation `R` is used (single char), reject patterns that
+        // are clearly SQL rather than script paths:
+        //   - `r AS (...)` → CTE definition
+        //   - `r (col1, col2) AS ...` → recursive CTE with column list
+        if is_abbrev && !is_full {
+            if second.starts_with('(') || second.eq_ignore_ascii_case("AS") {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn is_word_command(upper: &str, command: &str) -> bool {

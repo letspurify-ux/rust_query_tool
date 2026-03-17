@@ -6051,3 +6051,49 @@ fn format_sql_multiline_string_as_procedure_argument() {
         "multiline string in procedure call must be preserved, got: {formatted}"
     );
 }
+
+#[test]
+fn format_sql_oracle_final_boss_idempotent() {
+    let input = load_test_file("oracle_format_final_boss.sql");
+    assert!(!input.is_empty(), "Test file oracle_format_final_boss.sql should not be empty");
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for oracle_format_final_boss.sql"
+    );
+}
+
+#[test]
+fn split_format_items_does_not_treat_division_slash_as_terminator() {
+    // Division operator `/` on its own line inside parenthesized expression
+    // must NOT be treated as a SQL*Plus slash terminator.
+    // `/` on its own line inside parentheses must not be a SQL*Plus slash terminator
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "SELECT\n    (\n        (1 + 2)\n        /\n        NULLIF(x, 0)\n    ) AS result\nFROM dual",
+            "nested parens with / on own line",
+        ),
+        (
+            "SELECT (a\n/\nb) FROM dual",
+            "simple paren with / on own line",
+        ),
+    ];
+
+    for (input, label) in &cases {
+        let items = crate::db::QueryExecutor::split_format_items(input);
+        let slash_count = items.iter().filter(|i| matches!(i, crate::db::FormatItem::Slash)).count();
+        assert_eq!(slash_count, 0, "[{}] Division `/` inside parens should not be a slash terminator; items: {:?}", label, items);
+    }
+}
+
+#[test]
+fn split_format_items_does_not_treat_cte_alias_r_as_run_command() {
+    // CTE alias `r` must NOT be treated as a RUN script command.
+    let input = "WITH\n    a AS (SELECT 1 FROM dual),\n    r AS (SELECT 2 FROM dual)\nSELECT * FROM r";
+    let items = crate::db::QueryExecutor::split_format_items(input);
+    let tool_count = items.iter().filter(|i| matches!(i, crate::db::FormatItem::ToolCommand(_))).count();
+    assert_eq!(tool_count, 0, "CTE alias `r` should not become a ToolCommand; items: {:?}", items);
+}
