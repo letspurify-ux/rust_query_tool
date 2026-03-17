@@ -6051,3 +6051,18 @@ fn format_sql_multiline_string_as_procedure_argument() {
         "multiline string in procedure call must be preserved, got: {formatted}"
     );
 }
+
+#[test]
+#[ignore] // Known failures: slash-as-division (UNIT 8), CTE alias 'r' as RUN (UNIT 3)
+fn format_sql_oracle_final_boss_idempotent() {
+    let input = load_test_file("oracle_format_final_boss.sql");
+    assert!(!input.is_empty(), "Test file oracle_format_final_boss.sql should not be empty");
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for oracle_format_final_boss.sql"
+    );
+}
