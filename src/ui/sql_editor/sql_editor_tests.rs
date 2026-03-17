@@ -6097,3 +6097,15 @@ fn split_format_items_does_not_treat_cte_alias_r_as_run_command() {
     let tool_count = items.iter().filter(|i| matches!(i, crate::db::FormatItem::ToolCommand(_))).count();
     assert_eq!(tool_count, 0, "CTE alias `r` should not become a ToolCommand; items: {:?}", items);
 }
+
+#[test]
+fn format_sql_oracle_ultimate_boss_idempotent() {
+    let input = load_test_file("oracle_format_ultimate_boss.sql");
+    assert!(!input.is_empty(), "Test file oracle_format_ultimate_boss.sql should not be empty");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for oracle_format_ultimate_boss.sql"
+    );
+}
