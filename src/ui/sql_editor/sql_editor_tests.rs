@@ -790,6 +790,82 @@ fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
 }
 
 #[test]
+fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
+    let input = load_test_file("oracle_format_final_boss_v2.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "-- FORMATTER FINAL BOSS : Oracle SQL / PL-SQL One-Script Stress Set",
+        "CREATE OR REPLACE PACKAGE BODY qt_fmt_pkg",
+        "OPEN l_rc FOR",
+        "WITH base",
+        "OUTER APPLY",
+        "MODEL",
+        "q'[TOP_IN_DEPT]'",
+        "WITHIN GROUP (ORDER BY b2.bonus_year, b2.bonus_type)",
+        "ORDER BY a.audit_id;",
+    ];
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for oracle_format_final_boss_v2.sql"
+    );
+
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for oracle_format_final_boss_v2.sql"
+    );
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let find_line = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(needle))
+    };
+
+    let open_idx = find_line("OPEN l_rc FOR").unwrap_or(0);
+    let with_idx = find_line("WITH base").unwrap_or(0);
+    assert!(
+        indent(lines[with_idx]) > indent(lines[open_idx]),
+        "WITH inside OPEN FOR should be indented deeper than OPEN l_rc FOR, got:\n{formatted}"
+    );
+
+    let case_idx = find_line("CASE").unwrap_or(0);
+    let when_idx = find_line("WHEN e.salary >= 100000 THEN").unwrap_or(0);
+    assert!(
+        indent(lines[when_idx]) > indent(lines[case_idx]),
+        "WHEN branch should be indented under CASE, got:\n{formatted}"
+    );
+
+    let update_set_idx = find_line("SET t.action_name  = 'UPSERT',").unwrap_or(0);
+    let update_idx = find_line("UPDATE").unwrap_or(0);
+    assert!(
+        indent(lines[update_set_idx]) > indent(lines[update_idx]),
+        "UPDATE SET assignments should stay deeper than UPDATE keyword, got:\n{formatted}"
+    );
+
+    let apply_idx = find_line("OUTER APPLY").unwrap_or(0);
+    let select_idx = find_line("SELECT b.bonus_type AS top_bonus_type,").unwrap_or(0);
+    assert!(
+        indent(lines[select_idx]) > indent(lines[apply_idx]),
+        "OUTER APPLY inline SELECT should be indented deeper than OUTER APPLY, got:\n{formatted}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for oracle_format_final_boss_v2.sql"
+    );
+}
+
+#[test]
 fn format_sql_preserves_whenever_sqlerror_options() {
     let input = [
         "WHENEVER SQLERROR EXIT SQL.SQLCODE",
