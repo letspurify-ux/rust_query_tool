@@ -1674,6 +1674,8 @@ impl SqlEditorWidget {
         let mut merge_active = false; // MERGE statement tracking
         let mut merge_when_branch_active = false; // WHEN MATCHED/NOT MATCHED → indent body
         let mut returning_active = false; // RETURNING → suppress INTO clause break
+        let mut search_cycle_clause_active = false; // SEARCH/CYCLE ... SET should not be treated as UPDATE SET
+        let mut match_recognize_paren_depth: Option<usize> = None;
         let mut fetch_active = false; // FETCH cursor → suppress INTO clause break
         let mut bulk_collect_active = false; // BULK COLLECT → suppress INTO clause break
         let mut insert_all_active = false; // INSERT ALL → indent INTO/VALUES
@@ -2088,6 +2090,9 @@ impl SqlEditorWidget {
                             && matches!(upper.as_str(), "SET" | "VALUES" | "INTO"))
                         && !(referential_on_active
                             && matches!(upper.as_str(), "DELETE" | "UPDATE" | "SET"))
+                        && !(suppress_comma_break_depth > 0
+                            && matches!(upper.as_str(), "FROM" | "RETURNING"))
+                        && !(search_cycle_clause_active && upper == "SET")
                     {
                         // FORALL: indent the DML body under FORALL
                         if forall_pending
@@ -2140,6 +2145,21 @@ impl SqlEditorWidget {
                             } else if upper == "SELECT" {
                                 // Main query SELECT after CTE definitions.
                                 with_cte_state.on_clause_keyword("SELECT");
+                            }
+                            if matches!(
+                                upper.as_str(),
+                                "SELECT"
+                                    | "FROM"
+                                    | "WHERE"
+                                    | "GROUP"
+                                    | "HAVING"
+                                    | "ORDER"
+                                    | "UNION"
+                                    | "INTERSECT"
+                                    | "MINUS"
+                                    | "EXCEPT"
+                            ) {
+                                search_cycle_clause_active = false;
                             }
                         }
                     } else if condition_keywords.contains(&upper.as_str())
@@ -2321,7 +2341,7 @@ impl SqlEditorWidget {
                         }
                         join_modifier_active = false;
                     } else if join_modifiers.contains(&upper.as_str()) {
-                        if next_word_is("JOIN") || next_word_is("OUTER") {
+                        if next_word_is("JOIN") || next_word_is("OUTER") || next_word_is("APPLY") {
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
@@ -2344,6 +2364,34 @@ impl SqlEditorWidget {
                             );
                             join_modifier_active = true;
                         }
+                    } else if upper == "SEARCH" || upper == "CYCLE" {
+                        search_cycle_clause_active = true;
+                    } else if match_recognize_paren_depth.is_some_and(|depth| {
+                        paren_stack.len() >= depth
+                            && matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
+                    }) {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if matches!(current_clause.as_deref(), Some("MODEL"))
+                        && matches!(
+                            upper.as_str(),
+                            "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
+                        )
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if upper == "OPEN" {
                         open_cursor_state = OpenCursorFormatState::AwaitingFor;
                     } else if (upper == "FOR" || upper == "WHILE")
@@ -3149,7 +3197,7 @@ impl SqlEditorWidget {
                                 || next_word_is("VALUES")
                                 || matches!(
                                     prev_word_upper.as_deref(),
-                                    Some("MATCH_RECOGNIZE")
+                                    Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
                                 );
                             if needs_space {
                                 out.push(' ');
@@ -3158,6 +3206,9 @@ impl SqlEditorWidget {
                             let is_column_list = create_table_paren_expected;
                             create_table_paren_expected = false;
                             paren_stack.push(is_subquery);
+                            if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
+                                match_recognize_paren_depth = Some(paren_stack.len());
+                            }
                             paren_clause_restore_stack.push(if is_subquery {
                                 current_clause.clone()
                             } else {
@@ -3259,6 +3310,9 @@ impl SqlEditorWidget {
                             }
                             if was_subquery {
                                 current_clause = restore_clause;
+                            }
+                            if match_recognize_paren_depth.is_some_and(|depth| paren_stack.len() < depth) {
+                                match_recognize_paren_depth = None;
                             }
                             out.push(')');
                             needs_space = true;
@@ -15213,6 +15267,152 @@ mod format_indent_gap_tests {
             formatted.contains("FOR category"),
             "PIVOT FOR should stay inline, got:\n{}",
             formatted
+        );
+    }
+
+
+
+    #[test]
+    fn format_sql_basic_keeps_extract_from_inline_inside_function() {
+        let source = "select extract(year from d.dt) as yyyy from dual d;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("YEAR FROM d.dt") && !formatted.contains("YEAR
+FROM"),
+            "EXTRACT(... FROM ...) should stay inline inside function, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_json_returning_inline_inside_function() {
+        let source =
+            "select json_value(e.json_profile, '$.level' returning varchar2(30)) as profile_level from emp e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("'$.level' RETURNING VARCHAR2 (30)"),
+            "JSON RETURNING should stay inline inside function parens, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_cross_apply_after_join_condition() {
+        let source = "select * from org_enriched oe join qt_fmt_dept d on d.dept_id = oe.dept_id cross apply (select 1 as x from dual) ca;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ON d.dept_id = oe.dept_id
+CROSS APPLY ("),
+            "CROSS APPLY should start on a new line after JOIN ON, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_search_cycle_set_inline() {
+        let source = "with t as (select 1 as dept_id, 'X' as dept_name from dual union all select 2, 'Y' from dual) search depth first by dept_name set dfs_order cycle dept_id set is_cycle to 'Y' default 'N' select * from t;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SEARCH DEPTH FIRST BY dept_name SET dfs_order"),
+            "SEARCH ... SET should stay in a single clause line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("CYCLE dept_id SET is_cycle TO 'Y' DEFAULT 'N'"),
+            "CYCLE ... SET should stay in a single clause line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_match_recognize_subclauses() {
+        let source = "select * from sales match_recognize (partition by emp_id order by sale_date, sale_id measures match_number() as match_no all rows per match pattern (low+ mid* high) define low as amount < 100, mid as amount between 100 and 500, high as amount > 500);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY sale_date,
+        sale_id
+    MEASURES"),
+            "MEASURES should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ALL ROWS PER MATCH
+    PATTERN"),
+            "PATTERN should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(")
+    DEFINE"),
+            "DEFINE should start on its own line inside MATCH_RECOGNIZE, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_model_subclauses() {
+        let source = "select * from sales model partition by (year_key, channel_code) dimension by (month_key) measures (base_amt, proj_amt) rules sequential order (proj_amt[any] = base_amt[cv(month_key)]);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("MODEL
+    PARTITION BY"),
+            "MODEL PARTITION BY should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(")
+    DIMENSION BY"),
+            "MODEL DIMENSION BY should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(")
+    MEASURES"),
+            "MODEL MEASURES should break to a new line, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(")
+    RULES"),
+            "MODEL RULES should break to a new line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_breaks_pivot_and_unpivot_blocks() {
+        let pivot_source =
+            "select * from sales pivot (sum(amount) for category in ('A' as a, 'B' as b));";
+        let pivot_formatted = SqlEditorWidget::format_sql_basic(pivot_source);
+        assert!(
+            pivot_formatted.contains("PIVOT (
+"),
+            "PIVOT block should be treated as subquery-like block for formatting, got:
+{}",
+            pivot_formatted
+        );
+
+        let unpivot_source =
+            "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
+        let unpivot_formatted = SqlEditorWidget::format_sql_basic(unpivot_source);
+        assert!(
+            unpivot_formatted.contains("UNPIVOT (
+"),
+            "UNPIVOT block should be treated as subquery-like block for formatting, got:
+{}",
+            unpivot_formatted
         );
     }
 
