@@ -1708,7 +1708,8 @@ impl SqlEditorWidget {
         let clause_indent = |indent_level: usize,
                              open_cursor_state: OpenCursorFormatState,
                              keyword: &str,
-                             open_for_select_active: bool| {
+                             open_for_select_active: bool,
+                             in_cursor_sql: bool| {
             let mut base = base_indent(indent_level, open_cursor_state);
             if open_for_select_active
                 && matches!(
@@ -1723,6 +1724,7 @@ impl SqlEditorWidget {
                         | "INTERSECT"
                         | "MINUS"
                 )
+                && !in_cursor_sql
             {
                 base = base.saturating_add(1);
             }
@@ -1735,6 +1737,20 @@ impl SqlEditorWidget {
              select_list_layout_state: SelectListLayoutState| {
                 let base = base_indent(indent_level, open_cursor_state);
                 select_list_layout_state.indentation_or(base + 1)
+            };
+        let clause_list_indent =
+            |indent_level: usize,
+             open_cursor_state: OpenCursorFormatState,
+             select_list_layout_state: SelectListLayoutState,
+             current_clause: Option<&str>,
+             merge_active: bool| {
+                let base = base_indent(indent_level, open_cursor_state);
+                if matches!(current_clause, Some("SET")) && merge_active {
+                    base
+                } else {
+                    list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
+                        .max(base + 1)
+                }
             };
 
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
@@ -2070,6 +2086,11 @@ impl SqlEditorWidget {
                         && matches!(prev_word_upper.as_deref(), Some("BEFORE" | "AFTER" | "OF"))
                     {
                         // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
+                    } else if merge_when_branch_active && upper == "SET" {
+                        // MERGE UPDATE SET keeps SET inline with UPDATE, but we still need
+                        // SET clause context so following list comments/commas align correctly.
+                        current_clause = Some(upper.clone());
+                        select_list_layout_state.clear();
                     } else if clause_keywords.contains(&upper.as_str())
                         && !is_insert_into
                         && !is_merge_into
@@ -2114,15 +2135,34 @@ impl SqlEditorWidget {
                             if insert_all_active && upper == "SELECT" {
                                 insert_all_active = false;
                             }
+                            let cursor_clause_dedent = cursor_sql_active
+                                && matches!(
+                                    upper.as_str(),
+                                    "FROM"
+                                        | "WHERE"
+                                        | "GROUP"
+                                        | "ORDER"
+                                        | "CONNECT"
+                                        | "HAVING"
+                                        | "UNION"
+                                        | "INTERSECT"
+                                        | "MINUS"
+                                );
+                            let clause_indent_level = if cursor_clause_dedent {
+                                indent_level.saturating_sub(1)
+                            } else {
+                                indent_level
+                            };
                             newline_with(
                                 &mut out,
                                 clause_indent(
-                                    indent_level,
+                                    clause_indent_level,
                                     open_cursor_state,
                                     upper.as_str(),
                                     open_cursor_state
                                         .select_depth()
                                         .is_some_and(|depth| paren_stack.len() == depth),
+                                    cursor_sql_active,
                                 ),
                                 insert_all_extra,
                                 &mut at_line_start,
@@ -2181,6 +2221,7 @@ impl SqlEditorWidget {
                             open_cursor_state
                                 .select_depth()
                                 .is_some_and(|depth| paren_stack.len() == depth),
+                            cursor_sql_active,
                         );
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         if upper == "WHEN"
@@ -2841,10 +2882,12 @@ impl SqlEditorWidget {
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
-                        let current_select_indent = list_item_indent(
+                        let current_select_indent = clause_list_indent(
                             indent_level,
                             open_cursor_state,
                             select_list_layout_state,
+                            current_clause.as_deref(),
+                            merge_active,
                         );
                         let next_is_comma = matches!(
                             next_non_comment,
@@ -2929,10 +2972,12 @@ impl SqlEditorWidget {
                             || column_list_stack.last().copied().unwrap_or(false)
                             || hint_after_select
                         {
-                            let select_list_indent = list_item_indent(
+                            let select_list_indent = clause_list_indent(
                                 indent_level,
                                 open_cursor_state,
                                 select_list_layout_state,
+                                current_clause.as_deref(),
+                                merge_active,
                             );
                             line_indent = select_list_indent;
                             if hint_after_select {
@@ -2952,10 +2997,12 @@ impl SqlEditorWidget {
                             || column_list_stack.last().copied().unwrap_or(false)
                             || hint_after_select
                         {
-                            let select_list_indent = list_item_indent(
+                            let select_list_indent = clause_list_indent(
                                 indent_level,
                                 open_cursor_state,
                                 select_list_layout_state,
+                                current_clause.as_deref(),
+                                merge_active,
                             );
                             line_indent = select_list_indent;
                             if (in_select_list || in_set_clause)
@@ -2979,10 +3026,12 @@ impl SqlEditorWidget {
                                 || column_list_stack.last().copied().unwrap_or(false)
                                 || hint_after_select
                             {
-                                list_item_indent(
+                                clause_list_indent(
                                     indent_level,
                                     open_cursor_state,
                                     select_list_layout_state,
+                                    current_clause.as_deref(),
+                                    merge_active,
                                 )
                                 .saturating_sub(base_indent(indent_level, open_cursor_state))
                             } else {
@@ -3033,10 +3082,12 @@ impl SqlEditorWidget {
                                                 if comment.trim_start().starts_with("--")
                                         ))
                                 {
-                                    line_indent = list_item_indent(
+                                    line_indent = clause_list_indent(
                                         indent_level,
                                         open_cursor_state,
                                         select_list_layout_state,
+                                        current_clause.as_deref(),
+                                        merge_active,
                                     );
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
@@ -3045,10 +3096,19 @@ impl SqlEditorWidget {
                             between_pending = false;
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
                             if column_list_stack.last().copied().unwrap_or(false) {
+                                let comma_extra_indent = if (matches!(current_clause.as_deref(), Some("SET"))
+                                    && merge_active)
+                                    || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                        && cursor_sql_active)
+                                {
+                                    0
+                                } else {
+                                    1
+                                };
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
-                                    1,
+                                    comma_extra_indent,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -3075,10 +3135,19 @@ impl SqlEditorWidget {
                                 && !execute_immediate_active
                                 && !grant_revoke_active
                             {
+                                let comma_extra_indent = if (matches!(current_clause.as_deref(), Some("SET"))
+                                    && merge_active)
+                                    || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                        && cursor_sql_active)
+                                {
+                                    0
+                                } else {
+                                    1
+                                };
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
-                                    1,
+                                    comma_extra_indent,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
