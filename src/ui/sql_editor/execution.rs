@@ -3746,16 +3746,26 @@ impl SqlEditorWidget {
                 }
             } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
             {
+                let previous_line_opens_from_clause_subquery = previous_line_is_dml_clause_line
+                    && !previous_line_is_cte_definition_header
+                    && !previous_line_is_parenthesized_plsql_condition;
                 let nested_subquery_depth = if previous_line_is_cte_definition_header
                     || previous_line_is_parenthesized_plsql_condition
+                    || previous_line_opens_from_clause_subquery
                 {
                     parser_depth
                 } else {
                     parser_depth.saturating_add(1)
                 };
-                last_code_indent
-                    .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
-                    .unwrap_or(nested_subquery_depth)
+                if previous_line_opens_from_clause_subquery {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1))
+                        .unwrap_or(parser_depth)
+                } else {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
+                        .unwrap_or(nested_subquery_depth)
+                }
             } else if !in_dml_statement && previous_line_is_parenthesized_plsql_condition {
                 parser_depth.saturating_add(1)
             } else if in_dml_statement

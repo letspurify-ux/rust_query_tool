@@ -2416,6 +2416,159 @@ FROM dual;"#;
 }
 
 #[test]
+fn format_sql_boss7_extreme_scalar_subqueries_nested_case_keeps_depth() {
+    let input = r#"/*===========================================================================
+  BOSS 7
+  Extreme scalar subqueries + nested CASE + LISTAGG + analytic in inline views
+===========================================================================*/
+WITH
+    t AS
+    (
+        SELECT 1 AS grp_id, 'A' AS code, 10 AS val FROM dual
+        UNION ALL
+        SELECT 1, 'B', 20 FROM dual
+        UNION ALL
+        SELECT 1, 'C', 30 FROM dual
+        UNION ALL
+        SELECT 2, 'A', 5  FROM dual
+        UNION ALL
+        SELECT 2, 'B', 15 FROM dual
+        UNION ALL
+        SELECT 2, 'C', 25 FROM dual
+    )
+SELECT
+    x.grp_id,
+    x.code,
+    x.val,
+    (
+        SELECT LISTAGG(y.code || ':' || y.val, ',')
+               WITHIN GROUP (ORDER BY y.val DESC, y.code)
+        FROM t y
+        WHERE y.grp_id = x.grp_id
+    ) AS grp_summary,
+    (
+        SELECT MAX(z.val)
+        FROM
+        (
+            SELECT
+                t2.*,
+                DENSE_RANK() OVER (PARTITION BY t2.grp_id ORDER BY t2.val DESC, t2.code) AS dr
+            FROM t t2
+            WHERE t2.grp_id = x.grp_id
+        ) z
+        WHERE z.dr = 1
+    ) AS grp_top_val,
+    CASE
+        WHEN x.val =
+             (
+                 SELECT MAX(m.val)
+                 FROM t m
+                 WHERE m.grp_id = x.grp_id
+             )
+        THEN
+            CASE
+                WHEN x.code =
+                     (
+                         SELECT MIN(n.code) KEEP (DENSE_RANK FIRST ORDER BY n.val DESC, n.code)
+                         FROM t n
+                         WHERE n.grp_id = x.grp_id
+                     )
+                THEN 'TOP_AND_FIRST_CODE'
+                ELSE 'TOP_BUT_NOT_FIRST_CODE'
+            END
+        ELSE
+            CASE
+                WHEN x.val >
+                     (
+                         SELECT AVG(a.val)
+                         FROM t a
+                         WHERE a.grp_id = x.grp_id
+                     )
+                THEN 'ABOVE_AVG'
+                ELSE 'NOT_ABOVE_AVG'
+            END
+    END AS class_flag
+FROM t x
+ORDER BY
+    x.grp_id,
+    x.code;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let inline_from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FROM ("))
+        .unwrap_or(0);
+    let inline_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inline_from_idx.saturating_add(1))
+        .find_map(|(idx, line)| (line.trim_start() == "SELECT").then_some(idx))
+        .unwrap_or(0);
+
+    let inline_from_indent = lines[inline_from_idx]
+        .len()
+        .saturating_sub(lines[inline_from_idx].trim_start().len());
+    let inline_select_indent = lines[inline_select_idx]
+        .len()
+        .saturating_sub(lines[inline_select_idx].trim_start().len());
+
+    assert!(
+        inline_select_indent > inline_from_indent,
+        "inline-view SELECT should be indented deeper than FROM (, got:\n{}",
+        formatted
+    );
+
+    let case_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "CASE")
+        .unwrap_or(0);
+    let when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN x.val = ("))
+        .unwrap_or(0);
+    let inner_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(case_idx.saturating_add(1))
+        .find_map(|(idx, line)| (line.trim_start() == "CASE").then_some(idx))
+        .unwrap_or(0);
+
+    let case_indent = lines[case_idx]
+        .len()
+        .saturating_sub(lines[case_idx].trim_start().len());
+    let when_indent = lines[when_idx]
+        .len()
+        .saturating_sub(lines[when_idx].trim_start().len());
+    let inner_case_indent = lines[inner_case_idx]
+        .len()
+        .saturating_sub(lines[inner_case_idx].trim_start().len());
+
+    assert!(
+        when_indent > case_indent,
+        "WHEN branch should be indented under CASE, got:\n{}",
+        formatted
+    );
+    assert!(
+        inner_case_indent >= when_indent,
+        "nested CASE should not outdent before parent WHEN depth, got:\n{}",
+        formatted
+    );
+
+    assert!(
+        formatted.contains("WITH t AS ("),
+        "CTE header should stay intact, got:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("ORDER BY x.grp_id,"),
+        "ORDER BY should remain attached to first sort key line, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_package_body_with_nested_case_keeps_block_newlines() {
     let input = "CREATE OR REPLACE PACKAGE BODY pkg_case AS PROCEDURE run_demo IS BEGIN CASE v_mode WHEN 1 THEN CASE WHEN v_flag = 'Y' THEN NULL; ELSE NULL; END CASE; ELSE NULL; END CASE; END run_demo; END pkg_case;";
 
@@ -4986,27 +5139,54 @@ END;"#;
     // OPEN p_rc FOR should be at indent 1
     let open_line = lines.iter().find(|l| l.contains("OPEN p_rc FOR")).unwrap();
     let open_indent = open_line.len() - open_line.trim_start().len();
-    assert_eq!(open_indent, 4, "OPEN should be at indent 1 (4 spaces), got: {formatted}");
+    assert_eq!(
+        open_indent, 4,
+        "OPEN should be at indent 1 (4 spaces), got: {formatted}"
+    );
 
     // SELECT should be at indent 2
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
-    assert_eq!(select_indent, 8, "SELECT should be at indent 2, got: {formatted}");
+    assert_eq!(
+        select_indent, 8,
+        "SELECT should be at indent 2, got: {formatted}"
+    );
 
     // WHERE should be at same level as SELECT
-    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE a IN")).unwrap();
+    let where_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("WHERE a IN"))
+        .unwrap();
     let where_indent = where_line.len() - where_line.trim_start().len();
-    assert_eq!(where_indent, 8, "WHERE should be at indent 2, got: {formatted}");
+    assert_eq!(
+        where_indent, 8,
+        "WHERE should be at indent 2, got: {formatted}"
+    );
 
     // Subquery SELECT inside IN() should be indented further
-    let sub_select = lines.iter().find(|l| l.trim_start().starts_with("SELECT x")).unwrap();
+    let sub_select = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT x"))
+        .unwrap();
     let sub_indent = sub_select.len() - sub_select.trim_start().len();
-    assert!(sub_indent > where_indent, "subquery SELECT should be deeper than WHERE, got: {formatted}");
+    assert!(
+        sub_indent > where_indent,
+        "subquery SELECT should be deeper than WHERE, got: {formatted}"
+    );
 
     // ORDER BY should be back at the outer SELECT level
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
-    assert_eq!(order_indent, select_indent, "ORDER BY should align with SELECT, got: {formatted}");
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5024,10 +5204,16 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Verify the NVL line stays coherent and the FROM returns to correct depth
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     assert_eq!(
@@ -5049,10 +5235,16 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Verify FROM returns to correct level after deeply nested parens
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT DECODE")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT DECODE"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     assert_eq!(
@@ -5061,7 +5253,10 @@ END;"#;
     );
 
     // WHERE should also align
-    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE EXISTS")).unwrap();
+    let where_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("WHERE EXISTS"))
+        .unwrap();
     let where_indent = where_line.len() - where_line.trim_start().len();
     assert_eq!(
         where_indent, select_indent,
@@ -5083,24 +5278,40 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     // Both OPEN lines should have the same indent
-    let open_lines: Vec<&str> = formatted.lines()
+    let open_lines: Vec<&str> = formatted
+        .lines()
         .filter(|l| l.trim_start().starts_with("OPEN "))
         .collect();
-    assert_eq!(open_lines.len(), 2, "should have 2 OPEN lines, got: {formatted}");
+    assert_eq!(
+        open_lines.len(),
+        2,
+        "should have 2 OPEN lines, got: {formatted}"
+    );
 
     let indent1 = open_lines[0].len() - open_lines[0].trim_start().len();
     let indent2 = open_lines[1].len() - open_lines[1].trim_start().len();
-    assert_eq!(indent1, indent2, "both OPEN should have same indent, got: {formatted}");
+    assert_eq!(
+        indent1, indent2,
+        "both OPEN should have same indent, got: {formatted}"
+    );
 
     // Second OPEN's SELECT should also be properly indented
-    let select_lines: Vec<&str> = formatted.lines()
+    let select_lines: Vec<&str> = formatted
+        .lines()
         .filter(|l| l.trim_start().starts_with("SELECT "))
         .collect();
-    assert_eq!(select_lines.len(), 2, "should have 2 SELECT lines, got: {formatted}");
+    assert_eq!(
+        select_lines.len(),
+        2,
+        "should have 2 SELECT lines, got: {formatted}"
+    );
 
     let sel_indent1 = select_lines[0].len() - select_lines[0].trim_start().len();
     let sel_indent2 = select_lines[1].len() - select_lines[1].trim_start().len();
-    assert_eq!(sel_indent1, sel_indent2, "both SELECTs should have same indent, got: {formatted}");
+    assert_eq!(
+        sel_indent1, sel_indent2,
+        "both SELECTs should have same indent, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5125,7 +5336,10 @@ END;"#;
     let case_indent = case_line.len() - case_line.trim_start().len();
 
     // END AS should align with CASE
-    let end_line = lines.iter().find(|l| l.trim_start().starts_with("END AS")).unwrap();
+    let end_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("END AS"))
+        .unwrap();
     let end_indent = end_line.len() - end_line.trim_start().len();
 
     assert_eq!(
@@ -5134,9 +5348,15 @@ END;"#;
     );
 
     // FROM should be back at SELECT level
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM main_table")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM main_table"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
@@ -5157,10 +5377,16 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // FROM should return to SELECT level
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
 
     assert_eq!(
@@ -5187,23 +5413,35 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // OPEN inside IF should be at indent 2 (BEGIN + IF)
-    let open_lines: Vec<&str> = lines.iter()
+    let open_lines: Vec<&str> = lines
+        .iter()
         .filter(|l| l.trim_start().starts_with("OPEN p_rc FOR"))
         .copied()
         .collect();
-    assert_eq!(open_lines.len(), 2, "should have 2 OPEN lines, got: {formatted}");
+    assert_eq!(
+        open_lines.len(),
+        2,
+        "should have 2 OPEN lines, got: {formatted}"
+    );
 
     let open_indent = open_lines[0].len() - open_lines[0].trim_start().len();
-    assert_eq!(open_indent, 8, "OPEN in IF should be at indent 2 (8 spaces), got: {formatted}");
+    assert_eq!(
+        open_indent, 8,
+        "OPEN in IF should be at indent 2 (8 spaces), got: {formatted}"
+    );
 
     // SELECT inside nested OPEN should be at indent 3
-    let select_lines: Vec<&str> = lines.iter()
+    let select_lines: Vec<&str> = lines
+        .iter()
         .filter(|l| l.trim_start().starts_with("SELECT "))
         .copied()
         .collect();
     for sel in &select_lines {
         let sel_indent = sel.len() - sel.trim_start().len();
-        assert_eq!(sel_indent, 12, "SELECT in IF>OPEN should be at indent 3 (12 spaces), got: {formatted}");
+        assert_eq!(
+            sel_indent, 12,
+            "SELECT in IF>OPEN should be at indent 3 (12 spaces), got: {formatted}"
+        );
     }
 }
 
@@ -5221,20 +5459,34 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Both SELECTs should be at the same indent
-    let select_lines: Vec<&str> = lines.iter()
+    let select_lines: Vec<&str> = lines
+        .iter()
         .filter(|l| l.trim_start().starts_with("SELECT "))
         .copied()
         .collect();
-    assert_eq!(select_lines.len(), 2, "should have 2 SELECT lines, got: {formatted}");
+    assert_eq!(
+        select_lines.len(),
+        2,
+        "should have 2 SELECT lines, got: {formatted}"
+    );
 
     let indent1 = select_lines[0].len() - select_lines[0].trim_start().len();
     let indent2 = select_lines[1].len() - select_lines[1].trim_start().len();
-    assert_eq!(indent1, indent2, "both SELECTs in UNION should have same indent, got: {formatted}");
+    assert_eq!(
+        indent1, indent2,
+        "both SELECTs in UNION should have same indent, got: {formatted}"
+    );
 
     // UNION ALL should be at the same level as SELECT
-    let union_line = lines.iter().find(|l| l.trim_start().starts_with("UNION ALL")).unwrap();
+    let union_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("UNION ALL"))
+        .unwrap();
     let union_indent = union_line.len() - union_line.trim_start().len();
-    assert_eq!(union_indent, indent1, "UNION ALL should align with SELECT in OPEN FOR, got: {formatted}");
+    assert_eq!(
+        union_indent, indent1,
+        "UNION ALL should align with SELECT in OPEN FOR, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5253,10 +5505,16 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // The outer FROM should be at SELECT level
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a.id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM (") || l.trim_start().starts_with("FROM(")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM (") || l.trim_start().starts_with("FROM("))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
@@ -5264,14 +5522,26 @@ END;"#;
     );
 
     // Subquery SELECT should be deeper
-    let sub_select = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let sub_select = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT id"))
+        .unwrap();
     let sub_indent = sub_select.len() - sub_select.trim_start().len();
-    assert!(sub_indent > from_indent, "subquery SELECT should be deeper than FROM, got: {formatted}");
+    assert!(
+        sub_indent > from_indent,
+        "subquery SELECT should be deeper than FROM, got: {formatted}"
+    );
 
     // JOIN should be at outer FROM level
-    let join_line = lines.iter().find(|l| l.trim_start().starts_with("JOIN ")).unwrap();
+    let join_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("JOIN "))
+        .unwrap();
     let join_indent = join_line.len() - join_line.trim_start().len();
-    assert_eq!(join_indent, from_indent, "JOIN should align with FROM, got: {formatted}");
+    assert_eq!(
+        join_indent, from_indent,
+        "JOIN should align with FROM, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5287,9 +5557,15 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // v_count assignment should be at indent 1 (BEGIN level), not at OPEN FOR level
-    let assign_line = lines.iter().find(|l| l.trim_start().starts_with("v_count")).unwrap();
+    let assign_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("v_count"))
+        .unwrap();
     let assign_indent = assign_line.len() - assign_line.trim_start().len();
-    assert_eq!(assign_indent, 4, "statement after OPEN FOR should be at indent 1, got: {formatted}");
+    assert_eq!(
+        assign_indent, 4,
+        "statement after OPEN FOR should be at indent 1, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5315,7 +5591,10 @@ END;"#;
     let case_line = lines.iter().find(|l| l.trim_start() == "CASE").unwrap();
     let case_indent = case_line.len() - case_line.trim_start().len();
 
-    let end_line = lines.iter().find(|l| l.trim_start().starts_with("END AS val")).unwrap();
+    let end_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("END AS val"))
+        .unwrap();
     let end_indent = end_line.len() - end_line.trim_start().len();
     assert_eq!(
         case_indent, end_indent,
@@ -5323,10 +5602,16 @@ END;"#;
     );
 
     // FROM should return to SELECT level
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
@@ -5359,13 +5644,15 @@ END;"#;
 
     // Find the main (outer) SELECT that follows the CTE closing paren
     let cte_close_idx = lines.iter().position(|l| l.trim_start() == ")").unwrap();
-    let outer_select_line = lines[cte_close_idx + 1..].iter()
+    let outer_select_line = lines[cte_close_idx + 1..]
+        .iter()
         .find(|l| l.trim_start().starts_with("SELECT"))
         .unwrap();
     let outer_select_indent = outer_select_line.len() - outer_select_line.trim_start().len();
 
     // FROM cte should align with outer SELECT
-    let from_cte_line = lines.iter()
+    let from_cte_line = lines
+        .iter()
         .find(|l| l.trim_start().starts_with("FROM cte"))
         .unwrap();
     let from_cte_indent = from_cte_line.len() - from_cte_line.trim_start().len();
@@ -5376,7 +5663,10 @@ END;"#;
     );
 
     // ORDER BY should also align
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, outer_select_indent,
@@ -5396,9 +5686,15 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // v_count should be at indent 1 (not affected by OPEN FOR)
-    let assign_line = lines.iter().find(|l| l.trim_start().starts_with("v_count")).unwrap();
+    let assign_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("v_count"))
+        .unwrap();
     let assign_indent = assign_line.len() - assign_line.trim_start().len();
-    assert_eq!(assign_indent, 4, "statement after dynamic OPEN FOR should be at indent 1, got: {formatted}");
+    assert_eq!(
+        assign_indent, 4,
+        "statement after dynamic OPEN FOR should be at indent 1, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5420,13 +5716,15 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Find main SELECT (after the second CTE closing paren)
-    let main_select = lines.iter()
+    let main_select = lines
+        .iter()
         .find(|l| l.trim_start().starts_with("SELECT cte1"))
         .unwrap();
     let main_select_indent = main_select.len() - main_select.trim_start().len();
 
     // FROM should align with main SELECT
-    let from_line = lines.iter()
+    let from_line = lines
+        .iter()
         .find(|l| l.trim_start().starts_with("FROM cte1"))
         .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
@@ -5451,11 +5749,17 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a.id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     // ORDER BY should align with outer SELECT after nested subqueries in both FROM and WHERE
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5478,19 +5782,37 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // OPEN inside FOR LOOP should be at indent 2
-    let open_line = lines.iter().find(|l| l.trim_start().starts_with("OPEN p_rc FOR")).unwrap();
+    let open_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("OPEN p_rc FOR"))
+        .unwrap();
     let open_indent = open_line.len() - open_line.trim_start().len();
-    assert_eq!(open_indent, 8, "OPEN in LOOP should be at indent 2, got: {formatted}");
+    assert_eq!(
+        open_indent, 8,
+        "OPEN in LOOP should be at indent 2, got: {formatted}"
+    );
 
     // SELECT should be at indent 3
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
-    assert_eq!(select_indent, 12, "SELECT in LOOP>OPEN should be at indent 3, got: {formatted}");
+    assert_eq!(
+        select_indent, 12,
+        "SELECT in LOOP>OPEN should be at indent 3, got: {formatted}"
+    );
 
     // CLOSE should be back at indent 2
-    let close_line = lines.iter().find(|l| l.trim_start().starts_with("CLOSE")).unwrap();
+    let close_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("CLOSE"))
+        .unwrap();
     let close_indent = close_line.len() - close_line.trim_start().len();
-    assert_eq!(close_indent, 8, "CLOSE after OPEN FOR should be at indent 2, got: {formatted}");
+    assert_eq!(
+        close_indent, 8,
+        "CLOSE after OPEN FOR should be at indent 2, got: {formatted}"
+    );
 }
 
 #[test]
@@ -5508,11 +5830,17 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a.id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     // FROM should align with SELECT
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
@@ -5520,7 +5848,10 @@ END;"#;
     );
 
     // WHERE should align with SELECT
-    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE a.val")).unwrap();
+    let where_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("WHERE a.val"))
+        .unwrap();
     let where_indent = where_line.len() - where_line.trim_start().len();
     assert_eq!(
         where_indent, select_indent,
@@ -5528,7 +5859,10 @@ END;"#;
     );
 
     // ORDER BY should align with SELECT
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5556,11 +5890,17 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     // ORDER BY should come back to outer SELECT level
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5586,13 +5926,17 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Outer SELECT
-    let outer_select = lines.iter()
+    let outer_select = lines
+        .iter()
         .find(|l| l.trim_start().starts_with("SELECT b.id"))
         .unwrap();
     let outer_select_indent = outer_select.len() - outer_select.trim_start().len();
 
     // ORDER BY must align with the outer SELECT
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, outer_select_indent,
@@ -5614,12 +5958,21 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // SELECT a, b should be at indent 2 (OPEN FOR level)
-    let sel_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let sel_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a"))
+        .unwrap();
     let sel_indent = sel_line.len() - sel_line.trim_start().len();
-    assert_eq!(sel_indent, 8, "SELECT inside OPEN FOR should be at indent 2, got: {formatted}");
+    assert_eq!(
+        sel_indent, 8,
+        "SELECT inside OPEN FOR should be at indent 2, got: {formatted}"
+    );
 
     // ORDER BY should align with it
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, sel_indent,
@@ -5643,11 +5996,15 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     for keyword in &["FROM t1", "WHERE a", "GROUP BY", "HAVING COUNT", "ORDER BY"] {
-        let kw_line = lines.iter()
+        let kw_line = lines
+            .iter()
             .find(|l| l.trim_start().starts_with(keyword))
             .unwrap_or_else(|| panic!("expected line starting with {keyword}, got: {formatted}"));
         let kw_indent = kw_line.len() - kw_line.trim_start().len();
@@ -5677,18 +6034,27 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
     // FROM t1 and ORDER BY should be back at SELECT level
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
         "FROM should align with SELECT after multiline subquery in SELECT list, got: {formatted}"
     );
 
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5713,15 +6079,22 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Find second OPEN's SELECT
-    let select_lines: Vec<(usize, &&str)> = lines.iter()
+    let select_lines: Vec<(usize, &&str)> = lines
+        .iter()
         .enumerate()
         .filter(|(_, l)| l.trim_start().starts_with("SELECT b"))
         .collect();
-    assert!(!select_lines.is_empty(), "should have SELECT b line, got: {formatted}");
+    assert!(
+        !select_lines.is_empty(),
+        "should have SELECT b line, got: {formatted}"
+    );
     let second_select_indent = select_lines[0].1.len() - select_lines[0].1.trim_start().len();
 
     // ORDER BY in second OPEN should align with second SELECT
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, second_select_indent,
@@ -5742,17 +6115,26 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT a"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
         "FROM should align with SELECT when subquery is inline, got: {formatted}"
     );
 
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5779,17 +6161,26 @@ END my_pkg;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("SELECT id"))
+        .unwrap();
     let select_indent = select_line.len() - select_line.trim_start().len();
 
-    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("FROM t1"))
+        .unwrap();
     let from_indent = from_line.len() - from_line.trim_start().len();
     assert_eq!(
         from_indent, select_indent,
         "FROM should align with SELECT in package body OPEN FOR, got: {formatted}"
     );
 
-    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("ORDER BY"))
+        .unwrap();
     let order_indent = order_line.len() - order_line.trim_start().len();
     assert_eq!(
         order_indent, select_indent,
@@ -5823,7 +6214,10 @@ fn format_sql_multiline_string_next_statement_indent() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("b :="))
+        .unwrap();
     let b_indent = b_line.len() - b_line.trim_start().len();
     assert_eq!(
         b_indent, 4,
@@ -5846,7 +6240,10 @@ fn format_sql_multiline_string_concat_then_next_statement() {
     );
 
     // Next statement at correct indent
-    let next_line = lines.iter().find(|l| l.trim_start().starts_with("v_next")).unwrap();
+    let next_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("v_next"))
+        .unwrap();
     let next_indent = next_line.len() - next_line.trim_start().len();
     assert_eq!(
         next_indent, 4,
@@ -5857,8 +6254,7 @@ fn format_sql_multiline_string_concat_then_next_statement() {
 #[test]
 fn format_sql_multiline_string_with_large_indent_inside() {
     // String has very deep indentation inside — must not be altered.
-    let input =
-        "BEGIN\n    v := 'start\n                        deep inside\n    back';\nEND;";
+    let input = "BEGIN\n    v := 'start\n                        deep inside\n    back';\nEND;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
@@ -5883,7 +6279,10 @@ fn format_sql_multiline_string_closing_quote_alone_on_line() {
     );
 
     // b := 2 at correct indent
-    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("b :="))
+        .unwrap();
     let b_indent = b_line.len() - b_line.trim_start().len();
     assert_eq!(
         b_indent, 4,
@@ -5919,7 +6318,10 @@ fn format_sql_multiline_string_in_plsql_if_block() {
     );
 
     // w := 1 at correct indent (inside IF, so indent 2)
-    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("w :="))
+        .unwrap();
     let w_indent = w_line.len() - w_line.trim_start().len();
     assert_eq!(
         w_indent, 8,
@@ -5949,10 +6351,19 @@ fn format_sql_multiple_multiline_strings_in_sequence() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    assert!(formatted.contains("'x\ny'"), "first multiline string must be preserved, got: {formatted}");
-    assert!(formatted.contains("'p\nq'"), "second multiline string must be preserved, got: {formatted}");
+    assert!(
+        formatted.contains("'x\ny'"),
+        "first multiline string must be preserved, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("'p\nq'"),
+        "second multiline string must be preserved, got: {formatted}"
+    );
 
-    let c_line = lines.iter().find(|l| l.trim_start().starts_with("c :=")).unwrap();
+    let c_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("c :="))
+        .unwrap();
     let c_indent = c_line.len() - c_line.trim_start().len();
     assert_eq!(
         c_indent, 4,
@@ -5973,7 +6384,10 @@ fn format_sql_multiline_string_with_escaped_quotes() {
     );
 
     let lines: Vec<&str> = formatted.lines().collect();
-    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("w :="))
+        .unwrap();
     let w_indent = w_line.len() - w_line.trim_start().len();
     assert_eq!(
         w_indent, 4,
@@ -5994,7 +6408,10 @@ fn format_sql_multiline_q_quote_preserves_content() {
     );
 
     let lines: Vec<&str> = formatted.lines().collect();
-    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("w :="))
+        .unwrap();
     let w_indent = w_line.len() - w_line.trim_start().len();
     assert_eq!(
         w_indent, 4,
@@ -6018,7 +6435,10 @@ fn format_sql_multiline_string_deeply_indented_trailing_code() {
     );
 
     // d := 1 must be at indent 1
-    let d_line = lines.iter().find(|l| l.trim_start().starts_with("d :=")).unwrap();
+    let d_line = lines
+        .iter()
+        .find(|l| l.trim_start().starts_with("d :="))
+        .unwrap();
     let d_indent = d_line.len() - d_line.trim_start().len();
     assert_eq!(
         d_indent, 4,
@@ -6055,7 +6475,10 @@ fn format_sql_multiline_string_as_procedure_argument() {
 #[test]
 fn format_sql_oracle_final_boss_idempotent() {
     let input = load_test_file("oracle_format_final_boss.sql");
-    assert!(!input.is_empty(), "Test file oracle_format_final_boss.sql should not be empty");
+    assert!(
+        !input.is_empty(),
+        "Test file oracle_format_final_boss.sql should not be empty"
+    );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
@@ -6084,24 +6507,42 @@ fn split_format_items_does_not_treat_division_slash_as_terminator() {
 
     for (input, label) in &cases {
         let items = crate::db::QueryExecutor::split_format_items(input);
-        let slash_count = items.iter().filter(|i| matches!(i, crate::db::FormatItem::Slash)).count();
-        assert_eq!(slash_count, 0, "[{}] Division `/` inside parens should not be a slash terminator; items: {:?}", label, items);
+        let slash_count = items
+            .iter()
+            .filter(|i| matches!(i, crate::db::FormatItem::Slash))
+            .count();
+        assert_eq!(
+            slash_count, 0,
+            "[{}] Division `/` inside parens should not be a slash terminator; items: {:?}",
+            label, items
+        );
     }
 }
 
 #[test]
 fn split_format_items_does_not_treat_cte_alias_r_as_run_command() {
     // CTE alias `r` must NOT be treated as a RUN script command.
-    let input = "WITH\n    a AS (SELECT 1 FROM dual),\n    r AS (SELECT 2 FROM dual)\nSELECT * FROM r";
+    let input =
+        "WITH\n    a AS (SELECT 1 FROM dual),\n    r AS (SELECT 2 FROM dual)\nSELECT * FROM r";
     let items = crate::db::QueryExecutor::split_format_items(input);
-    let tool_count = items.iter().filter(|i| matches!(i, crate::db::FormatItem::ToolCommand(_))).count();
-    assert_eq!(tool_count, 0, "CTE alias `r` should not become a ToolCommand; items: {:?}", items);
+    let tool_count = items
+        .iter()
+        .filter(|i| matches!(i, crate::db::FormatItem::ToolCommand(_)))
+        .count();
+    assert_eq!(
+        tool_count, 0,
+        "CTE alias `r` should not become a ToolCommand; items: {:?}",
+        items
+    );
 }
 
 #[test]
 fn format_sql_oracle_ultimate_boss_idempotent() {
     let input = load_test_file("oracle_format_ultimate_boss.sql");
-    assert!(!input.is_empty(), "Test file oracle_format_ultimate_boss.sql should not be empty");
+    assert!(
+        !input.is_empty(),
+        "Test file oracle_format_ultimate_boss.sql should not be empty"
+    );
     let formatted = SqlEditorWidget::format_sql_basic(&input);
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(
