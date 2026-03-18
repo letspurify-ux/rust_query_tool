@@ -2441,6 +2441,7 @@ impl SqlEditorWidget {
                             .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
                         let begin_after_if_then = matches!(prev_word_upper.as_deref(), Some("THEN"))
                             && block_stack.last().is_some_and(|s| s == "IF");
+                        let inside_package_body = block_stack.iter().any(|s| s == "PACKAGE_BODY");
                         if inside_declare {
                             // DECLARE ... BEGIN - BEGIN is at same level as DECLARE
                             // Don't increase indent, just newline at current level
@@ -2453,11 +2454,11 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         } else {
-                            // BEGIN nested directly under IF THEN should align with IF body depth.
+                            // BEGIN inside block statements should align with current block depth.
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
-                                usize::from(begin_after_if_then),
+                                usize::from(begin_after_if_then && !inside_package_body),
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
@@ -5543,6 +5544,39 @@ END a;"#;
             indent(lines[end_if_idx]),
             indent(lines[if_idx]),
             "END IF should align with IF, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_procedure_if_then_nested_begin_uses_expected_alignment() {
+        let input = r#"create package body a as
+    procedure b (c in varchar2) as
+    begin
+        if (1 = 1) then
+            begin
+                select * from d;
+            end;
+        end if;
+    end b;
+end a;"#;
+        let expected = r#"CREATE PACKAGE BODY a AS
+    PROCEDURE b (c IN VARCHAR2) AS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                SELECT *
+                FROM d;
+            END;
+        END IF;
+    END b;
+END a;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        assert_eq!(
+            formatted.trim(),
+            expected.trim(),
+            "package body procedure nested BEGIN alignment regression, got:\n{}",
             formatted
         );
     }
