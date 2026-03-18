@@ -1,68 +1,92 @@
+use crate::db::QueryExecutor;
 use crate::ui::sql_editor::SqlToken;
 
 #[derive(Default)]
 pub(crate) struct ParenDepthState {
-    stack: Vec<char>,
+    tokens: Vec<SqlToken>,
+    depth: usize,
 }
 
 impl ParenDepthState {
     #[inline]
     pub(crate) fn depth(&self) -> usize {
-        self.stack.len()
+        self.depth
     }
 
     pub(crate) fn apply_token(&mut self, token: &SqlToken) {
-        let SqlToken::Symbol(symbol) = token else {
-            return;
-        };
+        self.tokens.push(token.clone());
+        self.depth = depth_after_tokens(&self.tokens);
+    }
+}
 
-        for sym_ch in symbol.chars() {
-            match sym_ch {
-                '(' | '[' | '{' => {
-                    self.stack.push(sym_ch);
-                }
-                ')' | ']' | '}' => {
-                    self.consume_close(sym_ch);
-                }
-                _ => {}
+fn token_depths_with_line_engine(tokens: &[SqlToken]) -> Vec<usize> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut synthetic = String::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if idx > 0 {
+            synthetic.push('\n');
+        }
+        match token {
+            SqlToken::Word(text)
+            | SqlToken::Symbol(text)
+            | SqlToken::String(text)
+            | SqlToken::Comment(text) => {
+                let normalized = text.replace('\n', " ");
+                synthetic.push_str(normalized.trim_end());
             }
         }
     }
 
-    fn consume_close(&mut self, close_ch: char) {
-        let Some(expected_open) = matching_open_for_close(close_ch) else {
-            return;
-        };
+    QueryExecutor::line_block_depths(&synthetic)
+}
 
-        if self.stack.last().copied() == Some(expected_open) {
-            self.stack.pop();
+fn depth_after_tokens(tokens: &[SqlToken]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+
+    let mut synthetic = String::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if idx > 0 {
+            synthetic.push('\n');
+        }
+        match token {
+            SqlToken::Word(text)
+            | SqlToken::Symbol(text)
+            | SqlToken::String(text)
+            | SqlToken::Comment(text) => {
+                let normalized = text.replace('\n', " ");
+                synthetic.push_str(normalized.trim_end());
+            }
         }
     }
+    synthetic.push('\n');
+    synthetic.push('X');
+
+    QueryExecutor::line_block_depths(&synthetic)
+        .last()
+        .copied()
+        .unwrap_or(0)
 }
 
-#[inline]
-fn matching_open_for_close(close_ch: char) -> Option<char> {
-    match close_ch {
-        ')' => Some('('),
-        ']' => Some('['),
-        '}' => Some('{'),
-        _ => None,
+fn normalized_token_depths(tokens: &[SqlToken]) -> Vec<usize> {
+    let depths = token_depths_with_line_engine(tokens);
+    if depths.len() == tokens.len() {
+        depths
+    } else {
+        vec![0; tokens.len()]
     }
 }
 
-/// Returns the parenthesis depth *before* each token is processed.
+/// Returns token depth *before* each token is processed.
 ///
-/// Depth changes for grouping symbols (`()`, `[]`, `{}`) and never goes below zero.
+/// Depth combines PL/SQL block keywords (BEGIN/END, IF/END IF, LOOP/END LOOP, etc.)
+/// and subquery parenthesis depth from the parser line-depth engine.
 pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
-    let mut depths = Vec::with_capacity(tokens.len());
-    let mut state = ParenDepthState::default();
-
-    for token in tokens {
-        depths.push(state.depth());
-        state.apply_token(token);
-    }
-
-    depths
+    normalized_token_depths(tokens)
 }
 
 /// Applies parenthesis depth transition for a single token.
@@ -74,11 +98,7 @@ pub(crate) fn apply_paren_token(state: &mut ParenDepthState, token: &SqlToken) {
 /// Returns the final parenthesis depth after all tokens are processed.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn paren_depth_after(tokens: &[SqlToken]) -> usize {
-    let mut state = ParenDepthState::default();
-    for token in tokens {
-        state.apply_token(token);
-    }
-    state.depth()
+    depth_after_tokens(tokens)
 }
 
 /// Returns token depth at `idx`, treating out-of-range indices as depth 0.
@@ -107,12 +127,12 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
     tokens: &'a [SqlToken],
     delimiter: &str,
 ) -> Vec<Vec<&'a SqlToken>> {
+    let token_depths = paren_depths(tokens);
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
-    let mut state = ParenDepthState::default();
 
-    for token in tokens {
-        let at_root = state.depth() == 0;
+    for (idx, token) in tokens.iter().enumerate() {
+        let at_root = is_top_level_depth(&token_depths, idx);
         if let SqlToken::Symbol(sym) = token {
             if sym == delimiter && at_root {
                 if !current.is_empty() {
@@ -123,7 +143,6 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
         }
 
         current.push(token);
-        state.apply_token(token);
     }
 
     if !current.is_empty() {
@@ -141,14 +160,14 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
     tokens: &'a [SqlToken],
     break_keywords: &[&str],
 ) -> Vec<Vec<&'a SqlToken>> {
+    let token_depths = paren_depths(tokens);
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
-    let mut state = ParenDepthState::default();
 
-    for token in tokens {
+    for (idx, token) in tokens.iter().enumerate() {
         let is_break = match token {
             SqlToken::Word(word) => {
-                state.depth() == 0
+                is_top_level_depth(&token_depths, idx)
                     && break_keywords
                         .iter()
                         .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -161,7 +180,6 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
         }
 
         current.push(token);
-        state.apply_token(token);
     }
 
     if !current.is_empty() {

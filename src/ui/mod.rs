@@ -13,7 +13,7 @@ pub mod query_tabs;
 pub mod result_table;
 pub mod result_tabs;
 pub mod settings_dialog;
-pub(crate) mod sql_depth;
+pub(crate) mod token_depth;
 pub mod sql_editor;
 pub mod syntax_highlight;
 pub(crate) mod text_buffer_access;

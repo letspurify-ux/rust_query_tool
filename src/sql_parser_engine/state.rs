@@ -42,7 +42,7 @@ pub(crate) struct SplitState {
     //
     // `paren_stack` tracks open-paren characters so that mismatched closers
     // (e.g. `)` when top-of-stack is `[`) are ignored – matching the policy
-    // used by `ui::sql_depth::ParenDepthState`.
+    // used by `ui::token_depth::ParenDepthState`.
     paren_stack: Vec<char>,
     // Derived depth kept in sync for efficient reads; equals `paren_stack.len()`.
     // Private — use `paren_depth()` to read, `push_open_paren`/`pop_close_paren`/
@@ -78,7 +78,7 @@ impl SplitState {
     /// Attempt to pop a close-paren character from the stack.
     ///
     /// If the stack is empty or the top does not match the expected opener for
-    /// `close_ch`, the call is ignored – mirroring `sql_depth::ParenDepthState`.
+    /// `close_ch`, the call is ignored – mirroring `token_depth::ParenDepthState`.
     pub(crate) fn pop_close_paren(&mut self, close_ch: char) {
         let expected_open = match close_ch {
             ')' => '(',

@@ -820,7 +820,7 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
         return Err("Cannot edit rows: no base table was resolved from this query.".to_string());
     }
 
-    let mut paren_state = crate::ui::sql_depth::ParenDepthState::default();
+    let mut paren_state = crate::ui::token_depth::ParenDepthState::default();
     let mut in_select = false;
     let mut idx = 0usize;
     let mut rowid_qualifier: Option<String> = None;

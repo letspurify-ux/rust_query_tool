@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::sql_parser_engine::SplitState;
 use crate::sql_text;
-use crate::ui::sql_depth::{
+use crate::ui::token_depth::{
     apply_paren_token, is_top_level_depth, paren_depths, split_top_level_symbol_groups,
     ParenDepthState,
 };

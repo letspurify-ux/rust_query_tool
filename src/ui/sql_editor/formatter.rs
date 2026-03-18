@@ -1,15 +1,14 @@
+use super::SqlEditorWidget;
+use super::SqlToken;
 use crate::db::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 use crate::sql_text::{
     self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
     FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
-use crate::ui::sql_depth::{
+use crate::ui::token_depth::{
     is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
 };
-
-use super::SqlToken;
-use super::SqlEditorWidget;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineLayoutKind {
@@ -99,9 +98,7 @@ impl ConstructState {
             return true;
         }
         // Trigger event keywords (INSERT/UPDATE/DELETE in trigger header)
-        if trigger_header_state.is_active()
-            && matches!(keyword, "INSERT" | "UPDATE" | "DELETE")
-        {
+        if trigger_header_state.is_active() && matches!(keyword, "INSERT" | "UPDATE" | "DELETE") {
             return true;
         }
         // FOR UPDATE (SQL, not PL/SQL)
@@ -124,8 +121,19 @@ impl ConstructState {
         if self.grant_revoke_active
             && matches!(
                 keyword,
-                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "EXECUTE" | "ALTER"
-                    | "DROP" | "CREATE" | "INDEX" | "REFERENCES" | "ALL" | "PRIVILEGES" | "MERGE"
+                "SELECT"
+                    | "INSERT"
+                    | "UPDATE"
+                    | "DELETE"
+                    | "EXECUTE"
+                    | "ALTER"
+                    | "DROP"
+                    | "CREATE"
+                    | "INDEX"
+                    | "REFERENCES"
+                    | "ALL"
+                    | "PRIVILEGES"
+                    | "MERGE"
             )
         {
             return true;
@@ -180,9 +188,7 @@ impl ConstructState {
         trigger_header_state: TriggerHeaderState,
     ) -> bool {
         // OR in CREATE OR REPLACE
-        if keyword == "OR"
-            && matches!(prev_word_upper, Some("CREATE"))
-        {
+        if keyword == "OR" && matches!(prev_word_upper, Some("CREATE")) {
             return true;
         }
         // Trigger: OR/ON in trigger header
@@ -203,8 +209,7 @@ impl ConstructState {
         }
         // ON after REFERENCES (referential constraint)
         if keyword == "ON"
-            && (matches!(prev_word_upper, Some("REFERENCES"))
-                || self.referential_action_pending)
+            && (matches!(prev_word_upper, Some("REFERENCES")) || self.referential_action_pending)
         {
             return true;
         }
@@ -400,7 +405,6 @@ impl OpenCursorFormatState {
         }
     }
 }
-
 
 impl SqlEditorWidget {
     fn starts_with_end_suffix_terminator(trimmed_upper: &str) -> bool {
@@ -739,7 +743,9 @@ impl SqlEditorWidget {
         start_index: usize,
     ) -> Option<(String, usize)> {
         let with_head = match items.get(start_index) {
-            Some(FormatItem::Statement(statement)) if statement.trim().eq_ignore_ascii_case("WITH") => {
+            Some(FormatItem::Statement(statement))
+                if statement.trim().eq_ignore_ascii_case("WITH") =>
+            {
                 statement.trim()
             }
             _ => return None,
@@ -2160,7 +2166,9 @@ impl SqlEditorWidget {
                     } else if construct.create_pending && upper == "TABLE" {
                         construct.create_table_paren_expected = true;
                         construct.create_pending = false;
-                    } else if construct.create_pending && matches!(upper.as_str(), "INDEX" | "UNIQUE") {
+                    } else if construct.create_pending
+                        && matches!(upper.as_str(), "INDEX" | "UNIQUE")
+                    {
                         if upper == "INDEX" {
                             construct.create_index_pending = true;
                             construct.create_pending = false;
@@ -2256,7 +2264,8 @@ impl SqlEditorWidget {
                             newline_after_keyword_extra = 1;
                         }
                     } else if upper == "THEN" {
-                        if construct.merge_active && block_stack.last().is_none_or(|s| s != "CASE") {
+                        if construct.merge_active && block_stack.last().is_none_or(|s| s != "CASE")
+                        {
                             // MERGE WHEN MATCHED THEN / WHEN NOT MATCHED THEN
                             indent_level += 1;
                             construct.merge_when_branch_active = true;
@@ -2439,8 +2448,9 @@ impl SqlEditorWidget {
                         let inside_declare = block_stack
                             .last()
                             .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
-                        let begin_after_if_then = matches!(prev_word_upper.as_deref(), Some("THEN"))
-                            && block_stack.last().is_some_and(|s| s == "IF");
+                        let begin_after_if_then =
+                            matches!(prev_word_upper.as_deref(), Some("THEN"))
+                                && block_stack.last().is_some_and(|s| s == "IF");
                         let inside_package_body = block_stack.iter().any(|s| s == "PACKAGE_BODY");
                         if inside_declare {
                             // DECLARE ... BEGIN - BEGIN is at same level as DECLARE
@@ -3292,7 +3302,8 @@ impl SqlEditorWidget {
                             if was_subquery {
                                 current_clause = restore_clause;
                             }
-                            if construct.match_recognize_paren_depth
+                            if construct
+                                .match_recognize_paren_depth
                                 .is_some_and(|depth| paren_stack.len() < depth)
                             {
                                 construct.match_recognize_paren_depth = None;
@@ -3671,12 +3682,14 @@ impl SqlEditorWidget {
                 })
             {
                 last_code_indent
-                    .map(|indent| indent.saturating_add(1).max(parser_depth).max(existing_indent))
+                    .map(|indent| {
+                        indent
+                            .saturating_add(1)
+                            .max(parser_depth)
+                            .max(existing_indent)
+                    })
                     .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
-            } else if in_dml_statement
-                && current_line_starts_case
-                && previous_line_ends_with_then
-            {
+            } else if in_dml_statement && current_line_starts_case && previous_line_ends_with_then {
                 last_code_indent
                     .map(|indent| indent.saturating_add(1).max(parser_depth))
                     .unwrap_or(parser_depth.saturating_add(1))
@@ -3729,13 +3742,14 @@ impl SqlEditorWidget {
                 }
             } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
             {
-                let previous_line_opens_from_clause_subquery = last_code_idx.is_some_and(|prev_idx| {
-                    let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                    (crate::sql_text::starts_with_keyword_token(&prev_upper, "FROM")
-                        || crate::sql_text::starts_with_keyword_token(&prev_upper, "USING"))
-                        && !previous_line_is_cte_definition_header
-                        && !previous_line_is_parenthesized_plsql_condition
-                });
+                let previous_line_opens_from_clause_subquery =
+                    last_code_idx.is_some_and(|prev_idx| {
+                        let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                        (crate::sql_text::starts_with_keyword_token(&prev_upper, "FROM")
+                            || crate::sql_text::starts_with_keyword_token(&prev_upper, "USING"))
+                            && !previous_line_is_cte_definition_header
+                            && !previous_line_is_parenthesized_plsql_condition
+                    });
                 let nested_subquery_depth = if previous_line_is_cte_definition_header
                     || previous_line_is_parenthesized_plsql_condition
                     || previous_line_opens_from_clause_subquery
@@ -3836,7 +3850,11 @@ impl SqlEditorWidget {
                 }
             } else if in_dml_statement {
                 let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
-                let max_extra = if closes_into_list || follows_comma_run { 0 } else { 2 };
+                let max_extra = if closes_into_list || follows_comma_run {
+                    0
+                } else {
+                    2
+                };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth
@@ -8084,7 +8102,6 @@ ORDER BY d.dept_id"#;
     }
 }
 
-
 #[cfg(test)]
 mod format_comment_indent_tests {
     use crate::ui::sql_editor::SqlEditorWidget;
@@ -8857,7 +8874,6 @@ END;";
         );
     }
 }
-
 
 #[cfg(test)]
 mod format_indent_gap_tests {
