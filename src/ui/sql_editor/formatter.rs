@@ -2439,6 +2439,8 @@ impl SqlEditorWidget {
                         let inside_declare = block_stack
                             .last()
                             .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
+                        let begin_after_if_then = matches!(prev_word_upper.as_deref(), Some("THEN"))
+                            && block_stack.last().is_some_and(|s| s == "IF");
                         if inside_declare {
                             // DECLARE ... BEGIN - BEGIN is at same level as DECLARE
                             // Don't increase indent, just newline at current level
@@ -2451,11 +2453,11 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         } else {
-                            // Standalone BEGIN block
+                            // BEGIN nested directly under IF THEN should align with IF body depth.
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
-                                0,
+                                usize::from(begin_after_if_then),
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
@@ -5476,6 +5478,71 @@ END fmt_pkg_extreme;"#;
         assert!(
             !formatted.contains("END calc_mode;\n\n    BEGIN\n        g_last_mode :="),
             "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_procedure_if_then_nested_begin_aligns_under_then() {
+        let sql = r#"CREATE PACKAGE a AS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+        BEGIN
+                SELECT * FROM d;
+            END;
+        END IF;
+    END b;
+END a;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("IF (1 = 1) THEN"))
+            .unwrap_or(0);
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(idx, line)| *idx > if_idx && line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT *"))
+            .unwrap_or(0);
+        let inner_end_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(idx, line)| *idx > select_idx && line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[begin_idx]) > indent(lines[if_idx]),
+            "BEGIN inside IF THEN should indent deeper than IF, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[select_idx]) > indent(lines[begin_idx]),
+            "SELECT inside nested BEGIN should indent deeper than BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inner_end_idx]),
+            indent(lines[begin_idx]),
+            "END; for nested BEGIN should align with BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should align with IF, got:\n{}",
             formatted
         );
     }
