@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult,
-    QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
+    lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, QueryExecutor,
+    QueryResult, ScriptItem, SessionState, ToolCommand,
 };
 use crate::sql_text;
 
@@ -165,7 +165,6 @@ impl Drop for QueryRunningReservation {
         }
     }
 }
-
 
 impl SqlEditorWidget {
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
@@ -4882,7 +4881,11 @@ impl SqlEditorWidget {
         out
     }
 
-    pub(super) fn format_script_output_line(line: &str, trimout_enabled: bool, tab_enabled: bool) -> String {
+    pub(super) fn format_script_output_line(
+        line: &str,
+        trimout_enabled: bool,
+        tab_enabled: bool,
+    ) -> String {
         let mut rendered = if tab_enabled {
             SqlEditorWidget::expand_tabs(line)
         } else {
@@ -5816,7 +5819,6 @@ impl SqlEditorWidget {
             )),
         }
     }
-
 
     fn strip_wrapping_single_quotes(value: &str) -> Option<String> {
         let trimmed = value.trim();
@@ -6828,4 +6830,3 @@ mod query_running_reservation_tests {
         assert!(*running);
     }
 }
-

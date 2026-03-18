@@ -4,6 +4,92 @@ use crate::sql_text;
 
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AutoFormatQueryRole {
+    #[default]
+    None,
+    Base,
+    Continuation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AutoFormatLineContext {
+    pub(crate) parser_depth: usize,
+    pub(crate) auto_depth: usize,
+    pub(crate) query_role: AutoFormatQueryRole,
+    pub(crate) query_base_depth: Option<usize>,
+    pub(crate) starts_query_frame: bool,
+    pub(crate) next_query_head_depth: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoFormatClauseKind {
+    With,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Merge,
+    Call,
+    Values,
+    Table,
+    From,
+    Where,
+    Group,
+    Having,
+    Order,
+    Connect,
+    Start,
+    Union,
+    Intersect,
+    Minus,
+    Set,
+    Into,
+}
+
+impl AutoFormatClauseKind {
+    fn is_query_head(self) -> bool {
+        matches!(
+            self,
+            Self::With
+                | Self::Select
+                | Self::Insert
+                | Self::Update
+                | Self::Delete
+                | Self::Merge
+                | Self::Call
+                | Self::Values
+                | Self::Table
+        )
+    }
+
+    fn ends_into_continuation(self) -> bool {
+        matches!(
+            self,
+            Self::From
+                | Self::Where
+                | Self::Group
+                | Self::Having
+                | Self::Order
+                | Self::Connect
+                | Self::Union
+                | Self::Intersect
+                | Self::Minus
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryBaseDepthFrame {
+    query_base_depth: usize,
+    start_parser_depth: usize,
+    head_kind: Option<AutoFormatClauseKind>,
+    into_continuation: bool,
+    trailing_comma_continuation: bool,
+    multitable_insert_branch_depth: usize,
+    is_multitable_insert: bool,
+}
+
 // ── TopLevelScanner ─────────────────────────────────────────────────────────
 //
 // Byte-based SQL scanner that yields top-level tokens while skipping
@@ -1067,208 +1153,505 @@ impl QueryExecutor {
     /// Returns line depths tailored for auto-format indentation.
     ///
     /// This builds on [`line_block_depths`] and folds in formatter-specific
-    /// continuation depth for INTO lists and DML comma chains.
-    pub fn line_auto_format_depths(sql: &str) -> Vec<usize> {
-        #[derive(Copy, Clone, Eq, PartialEq)]
-        enum ContinuationContext {
-            IntoList,
-        }
-
-        struct AutoFormatDepthState {
-            in_dml_statement: bool,
-            in_block_comment: bool,
-            continuation_stack: Vec<ContinuationContext>,
-            last_code_had_trailing_comma: bool,
-        }
-
-        impl AutoFormatDepthState {
-            fn new() -> Self {
-                Self {
-                    in_dml_statement: false,
-                    in_block_comment: false,
-                    continuation_stack: Vec::new(),
-                    last_code_had_trailing_comma: false,
-                }
-            }
-
-            fn has_context(&self, context: ContinuationContext) -> bool {
-                self.continuation_stack.contains(&context)
-            }
-
-            fn enter_context(&mut self, context: ContinuationContext) {
-                if !self.has_context(context) {
-                    self.continuation_stack.push(context);
-                }
-            }
-
-            fn clear_context(&mut self, context: ContinuationContext) {
-                self.continuation_stack.retain(|entry| *entry != context);
-            }
-
-            fn clear_all_contexts(&mut self) {
-                self.continuation_stack.clear();
-            }
-
-            fn extra_depth(&self) -> usize {
-                usize::from(
-                    self.has_context(ContinuationContext::IntoList)
-                        || (self.in_dml_statement && self.last_code_had_trailing_comma),
-                )
-            }
-        }
-
-        fn starts_with_any_keyword_token(trimmed_upper: &str, keywords: &[&str]) -> bool {
-            keywords
-                .iter()
-                .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword))
-        }
-
-        fn is_dml_starter(trimmed_upper: &str) -> bool {
-            starts_with_any_keyword_token(
-                trimmed_upper,
-                &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"],
-            )
-        }
-
-        fn is_into_ender(trimmed_upper: &str) -> bool {
-            starts_with_any_keyword_token(
-                trimmed_upper,
-                &[
-                    "FROM",
-                    "WHERE",
-                    "GROUP",
-                    "ORDER",
-                    "CONNECT",
-                    "HAVING",
-                    "UNION",
-                    "INTERSECT",
-                    "MINUS",
-                ],
-            )
-        }
-
-        fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
-            let bytes = line.as_bytes();
-            let mut idx = 0usize;
-            let mut last_non_ws: Option<u8> = None;
-            let mut in_single_quote = false;
-            let mut in_double_quote = false;
-
-            while idx < bytes.len() {
-                let current = bytes[idx];
-
-                if in_single_quote {
-                    if current == b'\'' {
-                        if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
-                            idx += 2;
-                            continue;
-                        }
-                        in_single_quote = false;
-                    }
-                    idx += 1;
-                    continue;
-                }
-
-                if in_double_quote {
-                    if current == b'"' {
-                        in_double_quote = false;
-                    }
-                    idx += 1;
-                    continue;
-                }
-
-                if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-                    break;
-                }
-                if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-                    break;
-                }
-                if current == b'\'' {
-                    in_single_quote = true;
-                    idx += 1;
-                    continue;
-                }
-                if current == b'"' {
-                    in_double_quote = true;
-                    idx += 1;
-                    continue;
-                }
-
-                if !current.is_ascii_whitespace() {
-                    last_non_ws = Some(current);
-                }
-                idx += 1;
-            }
-
-            last_non_ws == Some(b',')
-        }
-
-        let base_depths = Self::line_block_depths(sql);
+    /// continuation depth while normalizing query base depth from parent
+    /// query ancestry instead of context-specific formatter heuristics.
+    pub(crate) fn auto_format_line_contexts(sql: &str) -> Vec<AutoFormatLineContext> {
+        let parser_depths = Self::line_block_depths(sql);
         let lines: Vec<&str> = sql.lines().collect();
-        if base_depths.len() != lines.len() {
-            return base_depths;
+        if parser_depths.len() != lines.len() {
+            return parser_depths
+                .into_iter()
+                .map(|depth| AutoFormatLineContext {
+                    parser_depth: depth,
+                    auto_depth: depth,
+                    ..AutoFormatLineContext::default()
+                })
+                .collect();
         }
 
-        let mut state = AutoFormatDepthState::new();
-        let mut depths = Vec::with_capacity(base_depths.len());
+        let mut contexts = Vec::with_capacity(lines.len());
+        let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
+        let mut pending_query_base: Option<usize> = None;
+        let mut in_block_comment = false;
+        let mut non_query_into_continuation_depth: Option<usize> = None;
 
         for (idx, line) in lines.iter().enumerate() {
+            let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
             let trimmed = line.trim_start();
-            let base_depth = base_depths.get(idx).copied().unwrap_or(0);
+            let existing_indent = line.len().saturating_sub(trimmed.len()) / 4;
+            let mut context = AutoFormatLineContext {
+                parser_depth,
+                auto_depth: parser_depth,
+                ..AutoFormatLineContext::default()
+            };
 
             if trimmed.is_empty() {
-                depths.push(base_depth);
+                contexts.push(context);
                 continue;
             }
 
-            if state.in_block_comment {
-                depths.push(base_depth);
-                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
+            let was_in_block_comment = in_block_comment;
+            if in_block_comment {
+                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+                contexts.push(context);
                 continue;
             }
-
             if trimmed.starts_with("/*") {
-                depths.push(base_depth);
-                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
+                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+                contexts.push(context);
+                continue;
+            }
+            if trimmed.starts_with("--")
+                || sql_text::is_sqlplus_comment_line(trimmed)
+                || (was_in_block_comment && trimmed.starts_with("*/"))
+            {
+                contexts.push(context);
                 continue;
             }
 
-            if trimmed == "*/"
-                || trimmed.starts_with("--")
-                || sql_text::is_sqlplus_comment_line(trimmed)
+            while query_frames
+                .last()
+                .is_some_and(|frame| parser_depth < frame.start_parser_depth)
             {
-                depths.push(base_depth);
-                continue;
+                query_frames.pop();
             }
 
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            if is_dml_starter(&trimmed_upper) {
-                state.in_dml_statement = true;
-                state.clear_all_contexts();
+            let clause_kind = Self::auto_format_clause_kind(&trimmed_upper);
+            let active_frame = query_frames.last().copied();
+            if let Some(frame) = active_frame {
+                context.query_base_depth = Some(frame.query_base_depth);
+            }
+            let starts_new_query_frame = clause_kind
+                .filter(|kind| kind.is_query_head())
+                .is_some_and(|head_kind| {
+                    Self::line_starts_new_query_frame(
+                        head_kind,
+                        parser_depth,
+                        active_frame,
+                        pending_query_base.is_some(),
+                    )
+                });
+
+            if starts_new_query_frame {
+                let parent_base_depth = pending_query_base
+                    .take()
+                    .or_else(|| active_frame.map(|frame| frame.query_base_depth));
+                let query_base_depth = parent_base_depth
+                    .map(|depth| depth.saturating_add(1))
+                    .unwrap_or(parser_depth);
+                context.auto_depth = query_base_depth;
+                context.query_role = AutoFormatQueryRole::Base;
+                context.query_base_depth = Some(query_base_depth);
+                context.starts_query_frame = true;
+                query_frames.push(QueryBaseDepthFrame {
+                    query_base_depth,
+                    start_parser_depth: parser_depth,
+                    head_kind: clause_kind,
+                    into_continuation: false,
+                    trailing_comma_continuation: false,
+                    multitable_insert_branch_depth: 0,
+                    is_multitable_insert: Self::line_is_multitable_insert_header(&trimmed_upper),
+                });
+            } else if let Some(frame) = query_frames.last().copied() {
+                let reuses_active_query_base = clause_kind.is_some_and(|kind| {
+                    !kind.is_query_head() || parser_depth == frame.query_base_depth
+                });
+                let is_merge_branch_dml = frame.head_kind == Some(AutoFormatClauseKind::Merge)
+                    && matches!(
+                        clause_kind,
+                        Some(AutoFormatClauseKind::Update | AutoFormatClauseKind::Delete)
+                    );
+                let is_multitable_insert_branch_clause = frame.is_multitable_insert
+                    && matches!(
+                        clause_kind,
+                        Some(AutoFormatClauseKind::Into | AutoFormatClauseKind::Values)
+                    );
+                let is_multitable_insert_branch_header = frame.is_multitable_insert
+                    && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"));
+
+                if frame.head_kind == Some(AutoFormatClauseKind::With)
+                    && Self::line_is_cte_definition_header(trimmed)
+                {
+                    let cte_base_depth = existing_indent.max(frame.query_base_depth);
+                    context.auto_depth = cte_base_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(cte_base_depth);
+                } else if is_multitable_insert_branch_header {
+                    context.auto_depth = frame.query_base_depth.saturating_add(1);
+                } else if is_multitable_insert_branch_clause {
+                    context.auto_depth = frame
+                        .query_base_depth
+                        .saturating_add(1)
+                        .saturating_add(frame.multitable_insert_branch_depth);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if reuses_active_query_base && !is_merge_branch_dml {
+                    if clause_kind.is_some() {
+                        context.auto_depth = frame.query_base_depth;
+                        context.query_role = AutoFormatQueryRole::Base;
+                        context.query_base_depth = Some(frame.query_base_depth);
+                    }
+                } else if frame.into_continuation || frame.trailing_comma_continuation {
+                    context.auto_depth = frame.query_base_depth.saturating_add(1);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                }
+            } else if let Some(into_depth) = non_query_into_continuation_depth {
+                context.auto_depth = into_depth.saturating_add(1);
+                context.query_role = AutoFormatQueryRole::Continuation;
             }
 
-            if is_into_ender(&trimmed_upper) {
-                state.clear_context(ContinuationContext::IntoList);
+            if pending_query_base.is_some() && !starts_new_query_frame {
+                pending_query_base = None;
             }
 
-            depths.push(base_depth.saturating_add(state.extra_depth()));
+            if let Some(frame) = query_frames.last_mut() {
+                if context
+                    .query_base_depth
+                    .is_some_and(|depth| depth == frame.query_base_depth)
+                    || parser_depth >= frame.start_parser_depth
+                {
+                    if let Some(kind) = clause_kind {
+                        if kind == AutoFormatClauseKind::Into {
+                            frame.into_continuation = true;
+                        } else if kind.ends_into_continuation() {
+                            frame.into_continuation = false;
+                        }
+                    }
+                    frame.trailing_comma_continuation =
+                        Self::line_ends_with_comma_before_inline_comment(trimmed)
+                            && !trimmed.starts_with(')');
+                    if frame.is_multitable_insert {
+                        if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                            frame.multitable_insert_branch_depth = 1;
+                        } else if clause_kind == Some(AutoFormatClauseKind::Select) {
+                            frame.multitable_insert_branch_depth = 0;
+                        }
+                    }
+                }
+            }
 
-            let starts_into = sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                && !trimmed_upper.contains("SELECT INTO");
-            if starts_into {
-                state.enter_context(ContinuationContext::IntoList);
+            if query_frames.is_empty() {
+                if clause_kind == Some(AutoFormatClauseKind::Into) {
+                    non_query_into_continuation_depth = Some(context.auto_depth);
+                } else if non_query_into_continuation_depth.is_some() {
+                    let continues_into_list =
+                        Self::line_ends_with_comma_before_inline_comment(trimmed);
+                    if !continues_into_list {
+                        non_query_into_continuation_depth = None;
+                    }
+                }
+            } else {
+                non_query_into_continuation_depth = None;
+            }
+
+            let next_query_head_depth =
+                Self::next_query_head_depth(existing_indent, context, &trimmed_upper);
+            let base_depth_for_child_query =
+                Self::pending_query_owner_base_depth(existing_indent, context);
+            let owns_next_query = Self::line_owns_next_query(&trimmed_upper)
+                || Self::line_ends_with_open_paren_before_inline_comment(trimmed);
+            if owns_next_query {
+                context.next_query_head_depth = Some(next_query_head_depth);
+                pending_query_base = Some(base_depth_for_child_query);
             }
 
             if trimmed.ends_with(';') {
-                state.clear_all_contexts();
-                state.in_dml_statement = false;
+                query_frames.pop();
+                pending_query_base = None;
             }
 
-            state.last_code_had_trailing_comma =
-                line_ends_with_comma_before_inline_comment(trimmed);
+            contexts.push(context);
         }
 
-        depths
+        contexts
+    }
+
+    pub fn line_auto_format_depths(sql: &str) -> Vec<usize> {
+        Self::auto_format_line_contexts(sql)
+            .into_iter()
+            .map(|context| context.auto_depth)
+            .collect()
+    }
+
+    fn auto_format_clause_kind(trimmed_upper: &str) -> Option<AutoFormatClauseKind> {
+        if sql_text::starts_with_keyword_token(trimmed_upper, "WITH") {
+            Some(AutoFormatClauseKind::With)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "SELECT") {
+            Some(AutoFormatClauseKind::Select)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "INSERT") {
+            Some(AutoFormatClauseKind::Insert)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "UPDATE") {
+            Some(AutoFormatClauseKind::Update)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "DELETE") {
+            Some(AutoFormatClauseKind::Delete)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "MERGE") {
+            Some(AutoFormatClauseKind::Merge)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "CALL") {
+            Some(AutoFormatClauseKind::Call)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "VALUES") {
+            Some(AutoFormatClauseKind::Values)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "TABLE") {
+            Some(AutoFormatClauseKind::Table)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "FROM") {
+            Some(AutoFormatClauseKind::From)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "WHERE") {
+            Some(AutoFormatClauseKind::Where)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "GROUP") {
+            Some(AutoFormatClauseKind::Group)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "HAVING") {
+            Some(AutoFormatClauseKind::Having)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "ORDER") {
+            Some(AutoFormatClauseKind::Order)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT") {
+            Some(AutoFormatClauseKind::Connect)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "START") {
+            Some(AutoFormatClauseKind::Start)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "UNION") {
+            Some(AutoFormatClauseKind::Union)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT") {
+            Some(AutoFormatClauseKind::Intersect)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "MINUS") {
+            Some(AutoFormatClauseKind::Minus)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "SET") {
+            Some(AutoFormatClauseKind::Set)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTO") {
+            Some(AutoFormatClauseKind::Into)
+        } else {
+            None
+        }
+    }
+
+    fn line_starts_new_query_frame(
+        head_kind: AutoFormatClauseKind,
+        parser_depth: usize,
+        active_frame: Option<QueryBaseDepthFrame>,
+        has_pending_query_base: bool,
+    ) -> bool {
+        if has_pending_query_base {
+            if active_frame.is_some_and(|frame| {
+                frame.head_kind == Some(AutoFormatClauseKind::Merge)
+                    && matches!(
+                        head_kind,
+                        AutoFormatClauseKind::Update | AutoFormatClauseKind::Delete
+                    )
+            }) {
+                return false;
+            }
+            return true;
+        }
+
+        let Some(frame) = active_frame else {
+            return true;
+        };
+
+        if parser_depth > frame.query_base_depth {
+            return true;
+        }
+
+        head_kind == AutoFormatClauseKind::With
+            && !(frame.head_kind == Some(AutoFormatClauseKind::With)
+                && parser_depth == frame.query_base_depth)
+    }
+
+    fn line_owns_next_query(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "BEGIN")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "EXCEPTION")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "ELSE")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "ELSIF")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "ELSEIF")
+            || (sql_text::starts_with_keyword_token(trimmed_upper, "CURSOR")
+                && (trimmed_upper.contains(" IS") || trimmed_upper.contains(" AS")))
+            || (sql_text::starts_with_keyword_token(trimmed_upper, "OPEN")
+                && trimmed_upper.contains(" FOR"))
+            || Self::line_ends_with_then_before_inline_comment(trimmed_upper)
+    }
+
+    fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
+        Self::trailing_identifier_before_inline_comment(line)
+            .is_some_and(|identifier| identifier.eq_ignore_ascii_case("THEN"))
+    }
+
+    fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
+        Self::trailing_significant_byte_before_inline_comment(line) == Some(b'(')
+    }
+
+    fn pending_query_owner_base_depth(
+        existing_indent: usize,
+        context: AutoFormatLineContext,
+    ) -> usize {
+        existing_indent.max(context.auto_depth)
+    }
+
+    fn next_query_head_depth(
+        existing_indent: usize,
+        context: AutoFormatLineContext,
+        trimmed_upper: &str,
+    ) -> usize {
+        let visual_owner_base = Self::pending_query_owner_base_depth(existing_indent, context);
+        let is_visually_promoted_owner = context
+            .query_base_depth
+            .is_some_and(|depth| visual_owner_base > depth);
+        let effective_owner_depth =
+            if !is_visually_promoted_owner && Self::line_has_direct_query_owner(trimmed_upper) {
+                visual_owner_base.saturating_add(1)
+            } else {
+                visual_owner_base
+            };
+
+        effective_owner_depth.saturating_add(1)
+    }
+
+    fn line_has_direct_query_owner(trimmed_upper: &str) -> bool {
+        trimmed_upper.starts_with("FROM (")
+            || trimmed_upper.starts_with("USING (")
+            || (trimmed_upper.ends_with(" IN (")
+                && !sql_text::starts_with_keyword_token(trimmed_upper, "FOR"))
+            || trimmed_upper.ends_with(" EXISTS (")
+            || trimmed_upper.ends_with(" NOT EXISTS (")
+            || trimmed_upper.contains(" JOIN (")
+            || trimmed_upper.contains(" APPLY (")
+    }
+
+    fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
+        trimmed_upper.starts_with("INSERT ALL") || trimmed_upper.starts_with("INSERT FIRST")
+    }
+
+    fn line_is_cte_definition_header(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
+            return false;
+        }
+
+        let upper = trimmed.to_ascii_uppercase();
+        if sql_text::starts_with_keyword_token(&upper, "WITH") {
+            return upper.contains(" AS ");
+        }
+
+        upper.contains(" AS (")
+    }
+
+    fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+        Self::trailing_significant_byte_before_inline_comment(line) == Some(b',')
+    }
+
+    fn trailing_identifier_before_inline_comment(line: &str) -> Option<&str> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut last_identifier: Option<(usize, usize)> = None;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        idx += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                break;
+            }
+            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                break;
+            }
+            if current == b'\'' {
+                in_single_quote = true;
+                idx += 1;
+                continue;
+            }
+            if current == b'"' {
+                in_double_quote = true;
+                idx += 1;
+                continue;
+            }
+            if sql_text::is_identifier_start_byte(current) {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+                    idx += 1;
+                }
+                last_identifier = Some((start, idx));
+                continue;
+            }
+
+            idx += 1;
+        }
+
+        last_identifier.and_then(|(start, end)| line.get(start..end))
+    }
+
+    fn trailing_significant_byte_before_inline_comment(line: &str) -> Option<u8> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut last_non_ws: Option<u8> = None;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        idx += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                break;
+            }
+            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                break;
+            }
+            if current == b'\'' {
+                in_single_quote = true;
+                idx += 1;
+                continue;
+            }
+            if current == b'"' {
+                in_double_quote = true;
+                idx += 1;
+                continue;
+            }
+
+            if !current.is_ascii_whitespace() {
+                last_non_ws = Some(current);
+            }
+            idx += 1;
+        }
+
+        last_non_ws
     }
 
     pub fn strip_leading_comments(sql: &str) -> String {
@@ -2906,7 +3289,9 @@ impl QueryExecutor {
         start_index: usize,
     ) -> Option<(String, usize)> {
         let with_head = match items.get(start_index) {
-            Some(ScriptItem::Statement(statement)) if statement.trim().eq_ignore_ascii_case("WITH") => {
+            Some(ScriptItem::Statement(statement))
+                if statement.trim().eq_ignore_ascii_case("WITH") =>
+            {
                 statement.trim()
             }
             _ => return None,
@@ -4951,9 +5336,7 @@ impl QueryExecutor {
         // are clearly SQL rather than script paths:
         //   - `r AS (...)` → CTE definition
         //   - `r (col1, col2) AS ...` → recursive CTE with column list
-        if is_abbrev && !is_full
-            && (second.starts_with('(') || second.eq_ignore_ascii_case("AS"))
-        {
+        if is_abbrev && !is_full && (second.starts_with('(') || second.eq_ignore_ascii_case("AS")) {
             return false;
         }
 
@@ -5121,7 +5504,11 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
             "WITH\n    r\n    AS\n    (\n        SELECT 1 AS id\n        FROM dual\n    )\nSELECT *\nFROM r\n;";
         let items = QueryExecutor::split_script_items(sql);
 
-        assert_eq!(items.len(), 1, "single-letter CTE should stay a single statement");
+        assert_eq!(
+            items.len(),
+            1,
+            "single-letter CTE should stay a single statement"
+        );
         let statement = match items.first() {
             Some(super::ScriptItem::Statement(statement)) => statement,
             other => panic!("expected single statement item, got: {other:?}"),
@@ -5174,6 +5561,194 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
 
         assert_eq!(block_depths.len(), auto_depths.len());
         assert_eq!(auto_depths[3], block_depths[3].saturating_add(1));
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_with_main_query_on_same_base_after_then() {
+        let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    WITH filt AS (
+      SELECT id
+      FROM src_t
+    )
+    SELECT id
+    INTO v_id
+    FROM filt;
+  END IF;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start().ends_with("THEN"))
+            .unwrap_or(0);
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().to_ascii_uppercase().starts_with("WITH "))
+            .unwrap_or(0);
+        let cte_select_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("SELECT ID")
+            })
+            .unwrap_or(0);
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| {
+                line.trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("SELECT ID")
+                    .then_some(idx)
+            })
+            .nth(1)
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("FROM FILT")
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[with_idx].auto_depth,
+            contexts[then_idx].auto_depth.saturating_add(1),
+            "WITH after THEN should start exactly one level deeper than its parent block"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "Main SELECT after WITH should reuse the WITH base depth"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth, contexts[with_idx].auto_depth,
+            "Clause starters inside the same query should stay on the shared base depth"
+        );
+        assert_eq!(
+            contexts[cte_select_idx].auto_depth,
+            contexts[with_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT should be one level deeper than the WITH base"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_indent_all_supported_child_query_heads_from_parent_base() {
+        let scenarios = [
+            (
+                "VALUES",
+                "SELECT *\nFROM (\n  VALUES (1), (2)\n) AS t(n);",
+            ),
+            (
+                "INSERT",
+                "SELECT *\nFROM (\n  INSERT INTO dst(id) SELECT id FROM src RETURNING id\n) q;",
+            ),
+            (
+                "UPDATE",
+                "SELECT *\nFROM (\n  UPDATE dst SET id = src.id FROM src WHERE dst.id = src.id RETURNING dst.id\n) q;",
+            ),
+            (
+                "MERGE",
+                "SELECT *\nFROM (\n  MERGE INTO dst d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id\n) q;",
+            ),
+            (
+                "TABLE",
+                "SELECT *\nFROM (\n  TABLE(pkg_rows())\n) q;",
+            ),
+            (
+                "CALL",
+                "BEGIN\n  OPEN rc FOR (\n    CALL pkg_do_work()\n  );\nEND;",
+            ),
+        ];
+
+        for (head, sql) in scenarios {
+            let contexts = QueryExecutor::auto_format_line_contexts(sql);
+            let lines: Vec<&str> = sql.lines().collect();
+            let parent_idx = lines
+                .iter()
+                .position(|line| line.trim_start().ends_with('('))
+                .unwrap_or(0);
+            let head_idx = lines
+                .iter()
+                .position(|line| line.trim_start().to_ascii_uppercase().starts_with(head))
+                .unwrap_or(0);
+
+            assert_eq!(
+                contexts[head_idx].auto_depth,
+                contexts[parent_idx].auto_depth.saturating_add(1),
+                "{head} child query head should inherit parent base depth + 1"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_scalar_subquery_under_with_function_cte_on_parent_base() {
+        let sql = r#"WITH
+    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN p_txt;
+    END fmt_mask,
+    PROCEDURE noop (p_msg IN VARCHAR2) IS
+    BEGIN
+        NULL;
+    END noop,
+    base_emp AS (
+        SELECT
+            e.empno,
+            (
+                SELECT MAX (x.sal)
+                FROM emp x
+                WHERE x.deptno = e.deptno
+            ) AS max_sal
+        FROM emp e
+    )
+SELECT 1
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let cte_header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "base_emp AS (")
+            .unwrap_or(0);
+        let cte_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT")
+            .unwrap_or(0);
+        let scalar_open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "(")
+            .unwrap_or(0);
+        let scalar_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT MAX"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let scalar_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM emp x"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cte_select_idx].auto_depth,
+            contexts[cte_header_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT should be exactly one level deeper than the CTE header base"
+        );
+        assert_eq!(
+            contexts[scalar_select_idx].auto_depth,
+            contexts[scalar_open_idx].auto_depth.saturating_add(1),
+            "scalar subquery SELECT should be exactly one level deeper than its owner line base"
+        );
+        assert_eq!(
+            contexts[scalar_from_idx].auto_depth, contexts[scalar_select_idx].auto_depth,
+            "scalar subquery clauses should reuse the same query base depth"
+        );
     }
 
     #[test]

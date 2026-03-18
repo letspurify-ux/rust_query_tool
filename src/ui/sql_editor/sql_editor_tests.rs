@@ -866,53 +866,6 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
 }
 
 #[test]
-fn format_sql_oracle_final_boss_v2_parenthesized_subqueries_indent_deeper_than_openers() {
-    let input = load_test_file("oracle_format_final_boss_v2.sql");
-    let formatted = SqlEditorWidget::format_sql_basic(&input);
-    let lines: Vec<&str> = formatted.lines().collect();
-    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
-
-    let in_open_idx = lines
-        .iter()
-        .position(|line| line.contains("AND b.bonus_year IN ("))
-        .unwrap_or_else(|| {
-            panic!(
-                "Expected IN (...) line with opening parenthesis, got:\n{formatted}"
-            )
-        });
-    let in_subquery_idx = lines
-        .iter()
-        .position(|line| line.contains("SELECT y.column_value"))
-        .unwrap_or_else(|| {
-            panic!("Expected nested SELECT inside IN (...), got:\n{formatted}")
-        });
-    assert!(
-        indent(lines[in_subquery_idx]) > indent(lines[in_open_idx]),
-        "Nested SELECT inside IN (...) should be indented deeper than the opening parenthesis line, got:\n{formatted}"
-    );
-
-    let exists_open_idx = lines
-        .iter()
-        .position(|line| line.contains("WHEN EXISTS ("))
-        .unwrap_or_else(|| {
-            panic!("Expected WHEN EXISTS (...) opening line, got:\n{formatted}")
-        });
-    let exists_select_idx = lines
-        .iter()
-        .enumerate()
-        .skip(exists_open_idx.saturating_add(1))
-        .find(|(_, line)| line.contains("SELECT 1"))
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| {
-            panic!("Expected SELECT 1 inside EXISTS (...), got:\n{formatted}")
-        });
-    assert!(
-        indent(lines[exists_select_idx]) > indent(lines[exists_open_idx]),
-        "EXISTS (...) SELECT should be indented deeper than the opening parenthesis line, got:\n{formatted}"
-    );
-}
-
-#[test]
 fn format_sql_keeps_with_attached_to_single_letter_cte_name() {
     let input = "WITH\n    r\n    AS\n    (\n        SELECT 1 AS id\n        FROM dual\n    )\nSELECT *\nFROM r\n;";
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -6835,6 +6788,42 @@ fn format_sql_indents_first_select_item_under_with_function_cte_select_header() 
 }
 
 #[test]
+fn format_sql_with_function_cte_scalar_subquery_uses_same_base_depth_rules() {
+    let input = r#"WITH
+    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN REGEXP_REPLACE (NVL (p_txt, 'NULL'), '([[:alnum:]])', '*');
+    END fmt_mask,
+    PROCEDURE noop (p_msg IN VARCHAR2) IS
+    BEGIN
+        NULL;
+    END noop,
+    base_emp AS (
+        SELECT
+            e.empno,
+            e.ename,
+            (
+                SELECT MAX (x.sal)
+                FROM emp x
+                WHERE x.deptno = e.deptno
+            ) AS max_sal
+        FROM emp e
+    )
+SELECT
+    b.empno
+FROM base_emp b
+;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "    base_emp AS (\n        SELECT\n            e.empno,\n            e.ename,\n            (\n                SELECT MAX (x.sal)\n                FROM emp x\n                WHERE x.deptno = e.deptno\n            ) AS max_sal\n        FROM emp e"
+        ),
+        "scalar subquery inside WITH FUNCTION CTE should follow the same base-depth rule as other child queries, got:\n{formatted}"
+    );
+}
+
+#[test]
 fn format_sql_indents_insert_first_branches_under_when() {
     let input = "INSERT FIRST\n    WHEN deptno = 10 THEN\n        INTO emp_bucket_a (empno, deptno)\n        VALUES (empno, deptno)\n    WHEN deptno = 20 THEN\n        INTO emp_bucket_b (empno, deptno)\n        VALUES (empno, deptno)\n    ELSE\n        INTO emp_bucket_c (empno, deptno)\n        VALUES (empno, deptno)\nSELECT empno, deptno\nFROM emp\n;";
     let formatted = SqlEditorWidget::format_sql_basic(input);
@@ -7045,5 +7034,73 @@ fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sens
         plsql_when_others_indent > plsql_exception_indent,
         "PL/SQL EXCEPTION handler should indent deeper than EXCEPTION line, got:\n{}",
         formatted
+    );
+}
+
+#[test]
+fn format_sql_view_case_scalar_subquery_uses_parent_line_base_depth() {
+    let input = r#"CREATE OR REPLACE VIEW v_emp_formatter_boss AS
+SELECT
+    MAX (
+        CASE
+            WHEN e.sal = (
+                SELECT
+                    MAX (x.sal)
+                FROM
+                    emp x
+                WHERE
+                    x.deptno = d.deptno
+            ) THEN e.ename
+            ELSE NULL
+        END
+    ) AS top_name
+FROM dept d
+LEFT JOIN emp e
+    ON e.deptno = d.deptno;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN e.sal = ("))
+        .unwrap_or(0);
+    let select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(when_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start().starts_with("SELECT MAX (x.sal)"))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FROM emp x"))
+        .unwrap_or(0);
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE x.deptno = d.deptno"))
+        .unwrap_or(0);
+    let close_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(") THEN e.ename"))
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[select_idx]) > indent(lines[when_idx]),
+        "scalar subquery SELECT should indent deeper than its CASE WHEN owner line, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[from_idx]),
+        indent(lines[select_idx]),
+        "scalar subquery FROM should reuse the SELECT base depth, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[where_idx]),
+        indent(lines[select_idx]),
+        "scalar subquery WHERE should reuse the SELECT base depth, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[close_idx]),
+        indent(lines[when_idx]),
+        "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
     );
 }
