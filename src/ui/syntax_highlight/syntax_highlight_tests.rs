@@ -1220,6 +1220,95 @@ IF",
 }
 
 #[test]
+fn test_plsql_begin_after_routine_as_inline_comment_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE OR REPLACE PROCEDURE p AS /* comment */ BEGIN
+NULL;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let begin_start = text.find("BEGIN").unwrap_or(0);
+    let begin_end = begin_start + "BEGIN".len();
+    assert!(
+        styles[begin_start..begin_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL BEGIN should remain keyword style after AS inline comment"
+    );
+}
+
+#[test]
+fn test_plsql_declare_after_comment_banner_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "-- banner
+DECLARE
+    v_count NUMBER;
+BEGIN
+    NULL;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let declare_start = text.find("DECLARE").unwrap_or(0);
+    let declare_end = declare_start + "DECLARE".len();
+    assert!(
+        styles[declare_start..declare_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "top-level DECLARE after comment banner should stay keyword"
+    );
+}
+
+#[test]
+fn test_plsql_if_after_comment_banner_inside_block_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "BEGIN
+    -- branch
+    IF 1 = 1 THEN
+        NULL;
+    END IF;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find("IF 1 = 1 THEN").unwrap_or(0);
+    let if_end = if_start + "IF".len();
+    assert!(
+        styles[if_start..if_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL IF after comment banner inside block should stay keyword"
+    );
+}
+
+#[test]
+fn test_plsql_loop_after_close_paren_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "BEGIN
+    WHILE (v_count < 10) LOOP
+        v_count := v_count + 1;
+    END LOOP;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let loop_start = text.find(") LOOP").unwrap_or(0) + 2;
+    let loop_end = loop_start + "LOOP".len();
+    assert!(
+        styles[loop_start..loop_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "LOOP after close paren should remain keyword-highlighted"
+    );
+
+    let end_loop_start = text.rfind("LOOP").unwrap_or(0);
+    let end_loop_end = end_loop_start + "LOOP".len();
+    assert!(
+        styles[end_loop_start..end_loop_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "END LOOP qualifier should remain keyword-highlighted"
+    );
+}
+
+#[test]
 fn test_package_spec_first_procedure_after_as_newline_is_keyword() {
     let highlighter = SqlHighlighter::new();
     let text =

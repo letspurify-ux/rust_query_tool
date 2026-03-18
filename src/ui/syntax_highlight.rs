@@ -801,7 +801,8 @@ impl SqlHighlighter {
                     self.classify_word(word, treat_control_keyword_as_alias)
                 };
                 styles[start..idx].fill(token_type.to_style_byte());
-                expect_alias_identifier = word.eq_ignore_ascii_case("AS");
+                expect_alias_identifier =
+                    should_expect_alias_identifier_after_keyword(text, bytes, idx, word);
                 continue;
             }
 
@@ -896,6 +897,24 @@ impl SqlHighlighter {
     }
 }
 
+fn should_expect_alias_identifier_after_keyword(
+    text: &str,
+    bytes: &[u8],
+    word_end: usize,
+    word: &str,
+) -> bool {
+    if !word.eq_ignore_ascii_case("AS") {
+        return false;
+    }
+
+    match next_significant_token_kind(text, bytes, word_end) {
+        Some(SignificantTokenKind::Identifier | SignificantTokenKind::QuotedIdentifier) => true,
+        Some(SignificantTokenKind::ClauseWord) => next_significant_word_upper(text, bytes, word_end)
+            .is_some_and(|next_word| !is_non_alias_structural_keyword(next_word.as_str())),
+        _ => false,
+    }
+}
+
 fn should_treat_control_keyword_as_implicit_alias(
     text: &str,
     bytes: &[u8],
@@ -903,24 +922,29 @@ fn should_treat_control_keyword_as_implicit_alias(
     word_end: usize,
     word: &str,
 ) -> bool {
-    if !sql_text::is_plsql_control_keyword(word) || word.eq_ignore_ascii_case("THEN") {
+    if !is_alias_eligible_plsql_control_keyword(word) {
         return false;
     }
     if has_significant_line_break_before(bytes, word_start) {
         return false;
     }
 
-    let Some(next_kind) = next_significant_token_kind(bytes, word_end) else {
+    let Some(next_kind) = next_significant_token_kind(text, bytes, word_end) else {
         return false;
     };
-    if !matches!(
-        next_kind,
+    match next_kind {
         SignificantTokenKind::Comma
-            | SignificantTokenKind::Dot
-            | SignificantTokenKind::ClauseWord
-            | SignificantTokenKind::RightParen
-    ) {
-        return false;
+        | SignificantTokenKind::Dot
+        | SignificantTokenKind::RightParen => {}
+        SignificantTokenKind::ClauseWord => {
+            let Some(next_word) = next_significant_word_upper(text, bytes, word_end) else {
+                return false;
+            };
+            if !is_implicit_alias_following_clause_word(next_word.as_str()) {
+                return false;
+            }
+        }
+        _ => return false,
     }
 
     if word.eq_ignore_ascii_case("FOR")
@@ -933,15 +957,58 @@ fn should_treat_control_keyword_as_implicit_alias(
         return false;
     };
 
-    matches!(
-        prev_kind,
+    match prev_kind {
         SignificantTokenKind::Identifier
-            | SignificantTokenKind::Number
-            | SignificantTokenKind::String
-            | SignificantTokenKind::RightParen
-            | SignificantTokenKind::ClauseWord
-            | SignificantTokenKind::Comma
+        | SignificantTokenKind::Number
+        | SignificantTokenKind::String
+        | SignificantTokenKind::RightParen => true,
+        SignificantTokenKind::ClauseWord => prev_significant_word_upper(text, bytes, word_start)
+            .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str())),
+        _ => false,
+    }
+}
+
+fn is_alias_eligible_plsql_control_keyword(word: &str) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+
+    matches!(
+        upper.as_ref(),
+        "IF" | "ELSE" | "ELSIF" | "CASE" | "END" | "FOR"
     )
+}
+
+fn is_implicit_alias_following_clause_word(word: &str) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+    let upper = upper.as_ref();
+
+    sql_text::FORMAT_CLAUSE_KEYWORDS.contains(&upper)
+        || sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&upper)
+        || matches!(upper, "JOIN" | "ON" | "APPLY" | "PIVOT" | "UNPIVOT")
+}
+
+fn is_non_alias_structural_keyword(word: &str) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+    let upper = upper.as_ref();
+
+    sql_text::is_statement_head_keyword(upper)
+        || sql_text::is_with_main_query_keyword(upper)
+        || sql_text::is_with_plsql_declaration_keyword(upper)
+        || matches!(
+            upper,
+            "LOOP" | "THEN" | "EXCEPTION" | "CURSOR" | "PRAGMA" | "BODY"
+        )
 }
 
 fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
@@ -1017,7 +1084,7 @@ fn should_treat_function_name_as_identifier(
     }
 
     if matches!(
-        next_significant_token_kind(bytes, word_end),
+        next_significant_token_kind(text, bytes, word_end),
         Some(SignificantTokenKind::Dot)
     ) {
         return true;
@@ -1055,7 +1122,7 @@ fn should_treat_keyword_as_identifier_context(
         prev_significant_token_kind(text, bytes, word_start),
         Some(SignificantTokenKind::Dot)
     ) || matches!(
-        next_significant_token_kind(bytes, word_end),
+        next_significant_token_kind(text, bytes, word_end),
         Some(SignificantTokenKind::Dot)
     )
 }
@@ -1188,13 +1255,18 @@ enum SignificantTokenKind {
     Identifier,
     Number,
     String,
+    QuotedIdentifier,
     RightParen,
     Comma,
     Dot,
     ClauseWord,
 }
 
-fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<SignificantTokenKind> {
+fn next_significant_token_kind(
+    text: &str,
+    bytes: &[u8],
+    mut idx: usize,
+) -> Option<SignificantTokenKind> {
     while let Some(&byte) = bytes.get(idx) {
         if byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n' {
             idx += 1;
@@ -1226,6 +1298,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
             b',' => Some(SignificantTokenKind::Comma),
             b'.' => Some(SignificantTokenKind::Dot),
             b')' => Some(SignificantTokenKind::RightParen),
+            b'"' => Some(SignificantTokenKind::QuotedIdentifier),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
                 let start = idx;
                 idx += 1;
@@ -1235,7 +1308,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
                 {
                     idx += 1;
                 }
-                let word = std::str::from_utf8(bytes.get(start..idx)?).ok()?;
+                let word = text.get(start..idx)?;
                 let upper = word.to_ascii_uppercase();
                 if sql_text::is_oracle_sql_keyword(upper.as_str()) {
                     Some(SignificantTokenKind::ClauseWord)
@@ -1245,6 +1318,52 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
             }
             _ => None,
         };
+    }
+
+    None
+}
+
+fn next_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Option<String> {
+    while let Some(&byte) = bytes.get(idx) {
+        if byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n' {
+            idx += 1;
+            continue;
+        }
+        if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            idx += 2;
+            while let Some(&comment_byte) = bytes.get(idx) {
+                idx += 1;
+                if is_line_terminator(comment_byte) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            idx += 2;
+            while bytes.get(idx).is_some() {
+                if bytes.get(idx) == Some(&b'*') && bytes.get(idx + 1) == Some(&b'/') {
+                    idx += 2;
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+        if !sql_text::is_identifier_start_byte(byte) {
+            return None;
+        }
+
+        let start = idx;
+        idx += 1;
+        while bytes
+            .get(idx)
+            .is_some_and(|&next_byte| sql_text::is_identifier_byte(next_byte))
+        {
+            idx += 1;
+        }
+
+        return text.get(start..idx).map(str::to_ascii_uppercase);
     }
 
     None
