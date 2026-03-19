@@ -723,14 +723,9 @@ impl SplitState {
 
     /// Sub-handler: IF state machine transitions on keyword tokens.
     fn handle_if_state_on_token(&mut self, upper: &str) {
-        match &self.if_state {
-            IfState::ExpectConditionStart => {
-                if upper != "IF" {
-                    // Saw a keyword (not another IF), so no paren – just wait for THEN.
-                    self.if_state = IfState::AwaitingThen;
-                }
-            }
-            _ => {}
+        if matches!(&self.if_state, IfState::ExpectConditionStart) && upper != "IF" {
+            // Saw a keyword (not another IF), so no paren – just wait for THEN.
+            self.if_state = IfState::AwaitingThen;
         }
     }
 
@@ -854,14 +849,9 @@ impl SplitState {
         }
 
         // THEN resolves IF → block open
-        if upper == "THEN" {
-            match &self.if_state {
-                IfState::AwaitingThen => {
-                    self.block_stack.push(BlockKind::If);
-                    self.if_state = IfState::None;
-                }
-                _ => {}
-            }
+        if upper == "THEN" && matches!(&self.if_state, IfState::AwaitingThen) {
+            self.block_stack.push(BlockKind::If);
+            self.if_state = IfState::None;
         }
 
         // LOOP (opening, not END LOOP)

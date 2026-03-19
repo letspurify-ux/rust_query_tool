@@ -731,30 +731,27 @@ impl SqlParserEngine {
             let symbol_role = SymbolRole::from_char(c, next);
 
             // IF state machine on symbol characters
-            match &self.state.if_state {
-                IfState::ExpectConditionStart => {
-                    match IfSymbolEvent::from_char(c) {
-                        IfSymbolEvent::Whitespace => {
-                            // Keep waiting.
-                        }
-                        IfSymbolEvent::OpenParen => {
-                            let condition_depth = self.state.paren_depth().saturating_add(1);
-                            self.state.if_state = IfState::InConditionParen {
-                                depth: condition_depth,
-                            };
-                        }
-                        IfSymbolEvent::Dot => {
-                            // `if.column` / `schema.if.field` style aliases can appear in SQL
-                            // expressions. A dot immediately after IF means identifier usage,
-                            // so cancel the IF...THEN state machine arm.
-                            self.state.if_state = IfState::None;
-                        }
-                        IfSymbolEvent::Other => {
-                            self.state.if_state = IfState::AwaitingThen;
-                        }
+            if matches!(&self.state.if_state, IfState::ExpectConditionStart) {
+                match IfSymbolEvent::from_char(c) {
+                    IfSymbolEvent::Whitespace => {
+                        // Keep waiting.
+                    }
+                    IfSymbolEvent::OpenParen => {
+                        let condition_depth = self.state.paren_depth().saturating_add(1);
+                        self.state.if_state = IfState::InConditionParen {
+                            depth: condition_depth,
+                        };
+                    }
+                    IfSymbolEvent::Dot => {
+                        // `if.column` / `schema.if.field` style aliases can appear in SQL
+                        // expressions. A dot immediately after IF means identifier usage,
+                        // so cancel the IF...THEN state machine arm.
+                        self.state.if_state = IfState::None;
+                    }
+                    IfSymbolEvent::Other => {
+                        self.state.if_state = IfState::AwaitingThen;
                     }
                 }
-                _ => {}
             }
 
             // Check if closing paren matches IF condition paren

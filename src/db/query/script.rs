@@ -142,12 +142,21 @@ struct QueryBaseDepthFrame {
     trailing_comma_continuation: bool,
     multitable_insert_branch_depth: usize,
     is_multitable_insert: bool,
+    merge_branch_body_depth: Option<usize>,
+    merge_branch_action: Option<MergeBranchAction>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MultilineClauseDepthFrame {
     owner_depth: usize,
     nested_paren_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeBranchAction {
+    Update,
+    Delete,
+    Insert,
 }
 
 // ── TopLevelScanner ─────────────────────────────────────────────────────────
@@ -1321,15 +1330,58 @@ impl QueryExecutor {
                     trailing_comma_continuation: false,
                     multitable_insert_branch_depth: 0,
                     is_multitable_insert: Self::line_is_multitable_insert_header(&trimmed_upper),
+                    merge_branch_body_depth: None,
+                    merge_branch_action: None,
                 });
             } else if let Some(frame) = query_frames.last().copied() {
                 let reuses_active_query_base = clause_kind.is_some_and(|kind| {
                     !kind.is_query_head() || parser_depth == frame.query_base_depth
                 });
+                let is_merge_using_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
+                    && Self::auto_format_is_merge_using_clause(&trimmed_upper);
+                let is_merge_on_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
+                    && Self::auto_format_is_merge_on_clause(&trimmed_upper);
+                let is_merge_branch_header = frame.head_kind == Some(AutoFormatClauseKind::Merge)
+                    && Self::auto_format_is_merge_branch_header(&trimmed_upper);
+                let merge_branch_body_depth = frame
+                    .merge_branch_body_depth
+                    .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
+                let is_merge_branch_action_clause = frame.head_kind
+                    == Some(AutoFormatClauseKind::Merge)
+                    && Self::merge_branch_action_from_clause_kind(clause_kind).is_some();
+                let is_merge_branch_base_clause = frame.merge_branch_body_depth.is_some()
+                    && matches!(
+                        (frame.merge_branch_action, clause_kind),
+                        (
+                            Some(MergeBranchAction::Update),
+                            Some(AutoFormatClauseKind::Set)
+                        ) | (
+                            Some(MergeBranchAction::Update),
+                            Some(AutoFormatClauseKind::Where)
+                        ) | (
+                            Some(MergeBranchAction::Delete),
+                            Some(AutoFormatClauseKind::Where)
+                        ) | (
+                            Some(MergeBranchAction::Insert),
+                            Some(AutoFormatClauseKind::Into)
+                        ) | (
+                            Some(MergeBranchAction::Insert),
+                            Some(AutoFormatClauseKind::Values)
+                        ) | (
+                            Some(MergeBranchAction::Insert),
+                            Some(AutoFormatClauseKind::Where)
+                        )
+                    );
+                let is_merge_branch_condition_clause = frame.merge_branch_body_depth.is_some()
+                    && Self::auto_format_is_merge_branch_condition_clause(&trimmed_upper);
                 let is_merge_branch_dml = frame.head_kind == Some(AutoFormatClauseKind::Merge)
                     && matches!(
                         clause_kind,
-                        Some(AutoFormatClauseKind::Update | AutoFormatClauseKind::Delete)
+                        Some(
+                            AutoFormatClauseKind::Update
+                                | AutoFormatClauseKind::Delete
+                                | AutoFormatClauseKind::Insert
+                        )
                     );
                 let is_multitable_insert_branch_clause = frame.is_multitable_insert
                     && matches!(
@@ -1349,6 +1401,18 @@ impl QueryExecutor {
                     context.auto_depth = cte_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(cte_base_depth);
+                } else if is_merge_using_clause || is_merge_on_clause || is_merge_branch_header {
+                    context.auto_depth = frame.query_base_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if is_merge_branch_action_clause || is_merge_branch_base_clause {
+                    context.auto_depth = merge_branch_body_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(merge_branch_body_depth);
+                } else if is_merge_branch_condition_clause {
+                    context.auto_depth = merge_branch_body_depth.saturating_add(1);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(merge_branch_body_depth);
                 } else if is_join_clause {
                     context.auto_depth = frame.query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
@@ -1407,6 +1471,25 @@ impl QueryExecutor {
                             frame.multitable_insert_branch_depth = 1;
                         } else if clause_kind == Some(AutoFormatClauseKind::Select) {
                             frame.multitable_insert_branch_depth = 0;
+                        }
+                    }
+                    if frame.head_kind == Some(AutoFormatClauseKind::Merge) {
+                        if Self::auto_format_is_merge_branch_header(&trimmed_upper) {
+                            frame.merge_branch_body_depth = Some(
+                                existing_indent
+                                    .max(frame.query_base_depth)
+                                    .saturating_add(1),
+                            );
+                            frame.merge_branch_action = None;
+                        } else if let Some(action) =
+                            Self::merge_branch_action_from_clause_kind(clause_kind)
+                        {
+                            frame.merge_branch_body_depth.get_or_insert_with(|| {
+                                existing_indent
+                                    .max(frame.query_base_depth)
+                                    .saturating_add(1)
+                            });
+                            frame.merge_branch_action = Some(action);
                         }
                     }
                 }
@@ -1847,7 +1930,9 @@ impl QueryExecutor {
                 frame.head_kind == Some(AutoFormatClauseKind::Merge)
                     && matches!(
                         head_kind,
-                        AutoFormatClauseKind::Update | AutoFormatClauseKind::Delete
+                        AutoFormatClauseKind::Update
+                            | AutoFormatClauseKind::Delete
+                            | AutoFormatClauseKind::Insert
                     )
             }) {
                 return false;
@@ -1879,6 +1964,33 @@ impl QueryExecutor {
             || (sql_text::starts_with_keyword_token(trimmed_upper, "OPEN")
                 && trimmed_upper.contains(" FOR"))
             || Self::line_ends_with_then_before_inline_comment(trimmed_upper)
+    }
+
+    fn auto_format_is_merge_using_clause(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "USING")
+    }
+
+    fn auto_format_is_merge_on_clause(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "ON")
+    }
+
+    fn auto_format_is_merge_branch_header(trimmed_upper: &str) -> bool {
+        trimmed_upper.starts_with("WHEN MATCHED") || trimmed_upper.starts_with("WHEN NOT MATCHED")
+    }
+
+    fn auto_format_is_merge_branch_condition_clause(trimmed_upper: &str) -> bool {
+        trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ")
+    }
+
+    fn merge_branch_action_from_clause_kind(
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> Option<MergeBranchAction> {
+        match clause_kind {
+            Some(AutoFormatClauseKind::Update) => Some(MergeBranchAction::Update),
+            Some(AutoFormatClauseKind::Delete) => Some(MergeBranchAction::Delete),
+            Some(AutoFormatClauseKind::Insert) => Some(MergeBranchAction::Insert),
+            _ => None,
+        }
     }
 
     fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
@@ -6236,6 +6348,122 @@ END;"#;
             contexts[cte_select_idx].auto_depth,
             contexts[with_idx].auto_depth.saturating_add(1),
             "CTE body SELECT should be one level deeper than the WITH base"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_merge_branch_depths_on_branch_body_base() {
+        let sql = r#"MERGE INTO emp_bonus b
+    USING src_bonus s
+    ON (b.empno = s.empno)
+WHEN MATCHED THEN
+    UPDATE SET b.bonus_amount = s.calc_bonus
+WHERE s.sal > 0
+    AND b.bonus_amount <> s.calc_bonus
+    DELETE
+WHERE s.sal < 500
+WHEN NOT MATCHED THEN
+    INSERT (empno)
+    VALUES (s.empno);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let merge_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MERGE INTO"))
+            .unwrap_or(0);
+        let using_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("USING"))
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON ("))
+            .unwrap_or(0);
+        let when_matched_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN MATCHED THEN")
+            .unwrap_or(0);
+        let update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("UPDATE SET"))
+            .unwrap_or(0);
+        let update_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE s.sal > 0")
+            .unwrap_or(0);
+        let update_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND b.bonus_amount"))
+            .unwrap_or(0);
+        let delete_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DELETE")
+            .unwrap_or(0);
+        let delete_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE s.sal < 500")
+            .unwrap_or(0);
+        let when_not_matched_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN NOT MATCHED THEN")
+            .unwrap_or(0);
+        let insert_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("INSERT ("))
+            .unwrap_or(0);
+        let values_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("VALUES ("))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[using_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "MERGE USING should stay on the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "MERGE ON should stay on the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[when_matched_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "WHEN MATCHED should stay on the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[update_idx].auto_depth,
+            contexts[when_matched_idx].auto_depth.saturating_add(1),
+            "MERGE UPDATE action should be exactly one level deeper than WHEN MATCHED"
+        );
+        assert_eq!(
+            contexts[update_where_idx].auto_depth, contexts[update_idx].auto_depth,
+            "UPDATE WHERE should stay on the branch body depth"
+        );
+        assert_eq!(
+            contexts[update_and_idx].auto_depth,
+            contexts[update_where_idx].auto_depth.saturating_add(1),
+            "branch condition continuations should be one level deeper than branch WHERE"
+        );
+        assert_eq!(
+            contexts[delete_idx].auto_depth, contexts[update_idx].auto_depth,
+            "DELETE should reuse the current branch body depth"
+        );
+        assert_eq!(
+            contexts[delete_where_idx].auto_depth, contexts[delete_idx].auto_depth,
+            "DELETE WHERE should stay on the DELETE branch depth"
+        );
+        assert_eq!(
+            contexts[when_not_matched_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "WHEN NOT MATCHED should stay on the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[insert_idx].auto_depth,
+            contexts[when_not_matched_idx].auto_depth.saturating_add(1),
+            "MERGE INSERT action should be exactly one level deeper than WHEN NOT MATCHED"
+        );
+        assert_eq!(
+            contexts[values_idx].auto_depth, contexts[insert_idx].auto_depth,
+            "VALUES should stay on the INSERT branch depth"
         );
     }
 

@@ -3830,7 +3830,7 @@ impl SqlEditorWidget {
                 .iter()
                 .rev()
                 .take(closing_query_frame_count)
-                .last()
+                .next_back()
                 .map(|(_, _, _, close_align_depth)| *close_align_depth);
             let parenthesized_condition_header_depth =
                 Self::parenthesized_condition_header_depth(layouts, idx);
@@ -3973,11 +3973,10 @@ impl SqlEditorWidget {
                 } else {
                     parser_depth
                 }
-            } else if current_line_is_parenthesized_condition_close {
-                parenthesized_condition_header_depth.unwrap_or(parser_depth)
-            } else if current_line_is_parenthesized_condition
-                && current_line_is_condition_keyword
-                && previous_line_starts_with_close_paren
+            } else if current_line_is_parenthesized_condition_close
+                || (current_line_is_parenthesized_condition
+                    && current_line_is_condition_keyword
+                    && previous_line_starts_with_close_paren)
             {
                 parenthesized_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
@@ -4389,9 +4388,7 @@ impl SqlEditorWidget {
                 pending_paren_case_closer_indent = false;
             }
 
-            if starts_query_head {
-                pending_query_head_depth = None;
-            } else if pending_query_head_depth.is_some() {
+            if starts_query_head || pending_query_head_depth.is_some() {
                 pending_query_head_depth = None;
             }
             if let Some(next_query_head_depth) = layouts[idx].next_query_head_depth {
@@ -10029,6 +10026,81 @@ mod format_indent_gap_tests {
         assert!(
             update_line.starts_with("    "),
             "UPDATE should be indented under WHEN MATCHED, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_merge_branches_keep_branch_depths_stable() {
+        let source = "merge into emp_bonus b using src_bonus s on (b.empno = s.empno) when matched then update set b.bonus_amount = case when s.calc_bonus > 1000 then s.calc_bonus else s.calc_bonus + 100 end, b.updated_at = systimestamp where s.sal > 0 and (b.bonus_amount is null or b.bonus_amount <> s.calc_bonus) delete where s.sal < 500 when not matched then insert (b.empno, b.deptno, b.bonus_amount, b.created_at, b.note_text) values (s.empno, s.deptno, s.calc_bonus, systimestamp, case when s.calc_bonus >= 500 then 'HIGH' else 'LOW' end);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.trim_start().starts_with(prefix))
+        };
+
+        let when_matched = find_line("WHEN MATCHED THEN").unwrap_or("");
+        let update_set = find_line("UPDATE SET").unwrap_or("");
+        let update_where = find_line("WHERE s.sal > 0").unwrap_or("");
+        let delete = find_line("DELETE").unwrap_or("");
+        let delete_where = find_line("WHERE s.sal < 500").unwrap_or("");
+        let when_not_matched = find_line("WHEN NOT MATCHED THEN").unwrap_or("");
+        let insert = find_line("INSERT (").unwrap_or("");
+        let insert_values_inline = lines.iter().copied().find(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("INSERT (") && trimmed.contains(" VALUES (")
+        });
+        let values = find_line("VALUES (").or(insert_values_inline).unwrap_or("");
+
+        assert!(
+            !when_matched.is_empty()
+                && !update_set.is_empty()
+                && !update_where.is_empty()
+                && !delete.is_empty()
+                && !delete_where.is_empty()
+                && !when_not_matched.is_empty()
+                && !insert.is_empty()
+                && !values.is_empty(),
+            "expected all MERGE branch lines to be present, got:\n{}",
+            formatted
+        );
+
+        assert_eq!(
+            leading_spaces(when_matched),
+            leading_spaces(when_not_matched),
+            "MERGE branch headers should share the same base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(update_set),
+            leading_spaces(update_where),
+            "UPDATE and its WHERE should stay on the same branch depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(delete),
+            leading_spaces(delete_where),
+            "DELETE and its WHERE should stay on the same branch depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(insert),
+            leading_spaces(values),
+            "INSERT branch body should keep VALUES on the same depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(update_set) > leading_spaces(when_matched),
+            "UPDATE branch body should be deeper than WHEN MATCHED, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(insert) > leading_spaces(when_not_matched),
+            "INSERT branch body should be deeper than WHEN NOT MATCHED, got:\n{}",
             formatted
         );
     }
