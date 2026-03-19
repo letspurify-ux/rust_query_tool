@@ -1269,6 +1269,9 @@ impl QueryExecutor {
                     );
                 let is_multitable_insert_branch_header = frame.is_multitable_insert
                     && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"));
+                let is_join_clause = Self::auto_format_is_join_clause(&trimmed_upper);
+                let is_join_condition_clause =
+                    Self::auto_format_is_join_condition_clause(&trimmed_upper);
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(trimmed)
@@ -1277,6 +1280,14 @@ impl QueryExecutor {
                     context.auto_depth = cte_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(cte_base_depth);
+                } else if is_join_clause {
+                    context.auto_depth = frame.query_base_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if is_join_condition_clause {
+                    context.auto_depth = frame.query_base_depth.saturating_add(1);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(frame.query_base_depth);
                 } else if is_multitable_insert_branch_header {
                     context.auto_depth = frame.query_base_depth.saturating_add(1);
                 } else if is_multitable_insert_branch_clause {
@@ -1421,6 +1432,28 @@ impl QueryExecutor {
         } else {
             None
         }
+    }
+
+    fn auto_format_is_join_clause(trimmed_upper: &str) -> bool {
+        if sql_text::starts_with_keyword_token(trimmed_upper, "JOIN")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "APPLY")
+        {
+            return true;
+        }
+
+        let starts_with_join_modifier = [
+            "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
+        ]
+        .iter()
+        .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword));
+
+        starts_with_join_modifier
+            && (trimmed_upper.contains(" JOIN") || trimmed_upper.contains(" APPLY"))
+    }
+
+    fn auto_format_is_join_condition_clause(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "ON")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "USING")
     }
 
     fn line_starts_new_query_frame(
@@ -3673,6 +3706,47 @@ impl QueryExecutor {
                 }
             }
 
+            if builder.block_depth() == 0 && !builder.in_create_plsql() {
+                if let Some((statement_segment, trailing_comment)) =
+                    Self::split_inline_trailing_line_comment_after_semicolon(line)
+                {
+                    let statement_trimmed = statement_segment.trim();
+                    let mut line_items: Vec<FormatItem> = Vec::new();
+                    Self::process_split_line(
+                        statement_segment,
+                        statement_trimmed,
+                        &mut builder,
+                        &mut sqlblanklines_enabled,
+                        &mut line_items,
+                        &mut add_statement,
+                        &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
+                            if matches!(cmd, ToolCommand::Prompt { .. }) {
+                                items.push(FormatItem::Verbatim(raw_line.to_string()));
+                            } else {
+                                items.push(FormatItem::ToolCommand(cmd));
+                            }
+                        },
+                        &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
+                    );
+
+                    if let Some(FormatItem::Statement(statement)) = line_items.last_mut() {
+                        if !statement.trim_end().ends_with(';') {
+                            statement.push(';');
+                        }
+                        if !statement.ends_with(' ') {
+                            statement.push(' ');
+                        }
+                        statement.push_str(trailing_comment.trim_start());
+                        items.extend(line_items);
+                        continue;
+                    }
+
+                    items.extend(line_items);
+                    items.push(FormatItem::Statement(trailing_comment.trim_start().to_string()));
+                    continue;
+                }
+            }
+
             // Delegate to the shared termination-check sequence
             Self::process_split_line(
                 line,
@@ -3696,6 +3770,81 @@ impl QueryExecutor {
             add_statement(stmt, &mut items);
         }
         Self::merge_fragmented_standalone_routine_format_items(items)
+    }
+
+    fn split_inline_trailing_line_comment_after_semicolon(line: &str) -> Option<(&str, &str)> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut last_semicolon_idx: Option<usize> = None;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if bytes.get(idx + 1) == Some(&b'\'') {
+                        idx += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if current == b'\'' {
+                in_single_quote = true;
+                idx += 1;
+                continue;
+            }
+
+            if current == b'"' {
+                in_double_quote = true;
+                idx += 1;
+                continue;
+            }
+
+            if current == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if current == b';' {
+                last_semicolon_idx = Some(idx);
+                idx += 1;
+                continue;
+            }
+
+            if current == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+                let semicolon_idx = last_semicolon_idx?;
+                let between = line.get(semicolon_idx + 1..idx)?;
+                if between.trim().is_empty() {
+                    return Some((line.get(..=semicolon_idx)?, line.get(idx..)?));
+                }
+                return None;
+            }
+
+            idx += 1;
+        }
+
+        None
     }
 
     fn merge_fragmented_standalone_routine_format_items(items: Vec<FormatItem>) -> Vec<FormatItem> {
@@ -5637,6 +5786,70 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_nested_join_and_condition_depths_on_query_base() {
+        let sql = r#"SELECT D
+FROM E
+WHERE F IN (
+    SELECT G
+    FROM (
+        SELECT H
+        FROM J
+        INNER JOIN K
+            ON 1 = 1
+                AND 2 = 2
+                OR 3 = 3
+        OUTER JOIN K
+            ON 1 = 1
+                AND 2 = 2
+                OR 3 = 3
+    ) I
+);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let inner_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT H"))
+            .unwrap_or(0);
+        let from_j_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM J")
+            .unwrap_or(0);
+        let inner_join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "INNER JOIN K")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ON 1 = 1")
+            .unwrap_or(0);
+        let outer_join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OUTER JOIN K")
+            .unwrap_or(0);
+
+        let query_base_depth = contexts[inner_select_idx].auto_depth;
+        assert_eq!(
+            contexts[from_j_idx].auto_depth, query_base_depth,
+            "Nested FROM should stay on the child query base depth"
+        );
+        assert_eq!(
+            contexts[inner_join_idx].auto_depth, query_base_depth,
+            "JOIN should reuse the child query base depth instead of falling back to parser depth"
+        );
+        assert_eq!(
+            contexts[outer_join_idx].auto_depth, query_base_depth,
+            "Subsequent JOIN branches should stay aligned to the same child query base"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth,
+            query_base_depth.saturating_add(1),
+            "ON should be one level deeper than the query base"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_indent_all_supported_child_query_heads_from_parent_base() {
         let scenarios = [
             (
@@ -5925,6 +6138,53 @@ END fmt_pkg_extreme;"#;
         assert_eq!(
             depths[end_idx], 0,
             "package body END label should return to top-level depth"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_keep_if_scope_after_parenthesized_case_expression_continues() {
+        let sql = r#"BEGIN
+    IF (
+        CASE
+            WHEN flag = 'Y' THEN 1
+            ELSE 0
+        END
+    ) = 1 THEN
+        NULL;
+    END IF;
+END;"#;
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim() == "IF (")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim() == ") = 1 THEN")
+            .unwrap_or(0);
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim() == "NULL;")
+            .unwrap_or(0);
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim() == "END IF;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[close_paren_idx], depths[if_idx],
+            "closing a parenthesized CASE inside IF condition should not end the IF scope early"
+        );
+        assert_eq!(
+            depths[null_idx],
+            depths[if_idx].saturating_add(1),
+            "statement after THEN should still be one level deeper than IF"
+        );
+        assert_eq!(
+            depths[end_if_idx], depths[if_idx],
+            "END IF should stay aligned with IF after parenthesized CASE condition continuations"
         );
     }
 

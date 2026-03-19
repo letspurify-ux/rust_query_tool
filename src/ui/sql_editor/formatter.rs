@@ -430,6 +430,24 @@ impl SqlEditorWidget {
             .any(|keyword| crate::sql_text::starts_with_keyword_token(rest, keyword))
     }
 
+    fn tokens_continue_plsql_condition_terminator(tokens: &[SqlToken], idx: usize) -> bool {
+        for token in tokens.iter().skip(idx.saturating_add(1)) {
+            match token {
+                SqlToken::Comment(comment) if comment.contains('\n') => break,
+                SqlToken::Symbol(sym) if sym == ";" => break,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("THEN")
+                        || word.eq_ignore_ascii_case("LOOP") =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     fn starts_with_plain_end(trimmed_upper: &str) -> bool {
         crate::sql_text::starts_with_keyword_token(trimmed_upper, "END")
             && !Self::starts_with_end_suffix_terminator(trimmed_upper)
@@ -3217,14 +3235,23 @@ impl SqlEditorWidget {
                             paren_indent_increase_stack.push(indent_increase);
                             if indent_increase > 0 {
                                 indent_level += indent_increase;
-                                newline_with(
-                                    &mut out,
-                                    base_indent(indent_level, open_cursor_state),
-                                    0,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
+                                let keeps_inline_comment_after_open_paren = matches!(
+                                    tokens.get(idx + 1),
+                                    Some(SqlToken::Comment(comment))
+                                        if !comment.starts_with('\n') && comment.contains('\n')
                                 );
+                                if keeps_inline_comment_after_open_paren {
+                                    line_indent = base_indent(indent_level, open_cursor_state);
+                                } else {
+                                    newline_with(
+                                        &mut out,
+                                        base_indent(indent_level, open_cursor_state),
+                                        0,
+                                        &mut at_line_start,
+                                        &mut needs_space,
+                                        &mut line_indent,
+                                    );
+                                }
                             } else {
                                 suppress_comma_break_depth += 1;
                             }
@@ -3259,14 +3286,22 @@ impl SqlEditorWidget {
                                     suppress_comma_break_depth.saturating_sub(1);
                             }
                             if close_case_paren_on_newline {
+                                let closes_plsql_condition_terminator =
+                                    Self::tokens_continue_plsql_condition_terminator(tokens, idx);
                                 let close_case_extra_indent =
-                                    usize::from(!open_cursor_state.in_select());
-                                let close_case_indent_level =
-                                    if next_word_is("ELSE") || next_word_is("WHEN") {
-                                        indent_level.saturating_sub(1)
-                                    } else {
-                                        indent_level
-                                    };
+                                    if closes_plsql_condition_terminator {
+                                    0
+                                } else {
+                                    usize::from(!open_cursor_state.in_select())
+                                };
+                                let close_case_indent_level = if closes_plsql_condition_terminator
+                                    || next_word_is("ELSE")
+                                    || next_word_is("WHEN")
+                                {
+                                    indent_level.saturating_sub(1)
+                                } else {
+                                    indent_level
+                                };
                                 newline_with(
                                     &mut out,
                                     close_case_indent_level,
@@ -3506,6 +3541,23 @@ impl SqlEditorWidget {
         None
     }
 
+    fn previous_parenthesized_plsql_condition_header_depth(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+    ) -> Option<usize> {
+        for prev_idx in (0..idx).rev() {
+            if layouts[prev_idx].kind != LineLayoutKind::Code {
+                continue;
+            }
+
+            if Self::is_parenthesized_plsql_condition_header(layouts[prev_idx].trimmed) {
+                return Some(layouts[prev_idx].final_depth);
+            }
+        }
+
+        None
+    }
+
     fn line_has_direct_query_owner(trimmed_upper: &str) -> bool {
         Self::line_has_clause_query_owner(trimmed_upper)
             || Self::line_has_condition_query_owner(trimmed_upper)
@@ -3696,6 +3748,11 @@ impl SqlEditorWidget {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 prev_upper.starts_with("AND ") || prev_upper.starts_with("OR ")
             });
+            let previous_line_is_join_condition_clause = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                crate::sql_text::starts_with_keyword_token(&prev_upper, "ON")
+                    || crate::sql_text::starts_with_keyword_token(&prev_upper, "USING")
+            });
             let previous_code_is_inline_merge_update_set = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 prev_upper.starts_with("UPDATE SET ") || prev_upper.eq("UPDATE SET")
@@ -3730,6 +3787,8 @@ impl SqlEditorWidget {
             let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
             let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
+            let closes_parenthesized_plsql_condition =
+                starts_with_close_paren && Self::line_continues_plsql_condition_terminator(trimmed);
             let parser_depth = parser_depth + usize::from(is_paren_case_closer);
             let last_code_indent = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
             let follows_comma_run =
@@ -3760,6 +3819,12 @@ impl SqlEditorWidget {
                 .take(closing_query_frame_count)
                 .last()
                 .map(|(_, _, _, close_align_depth)| *close_align_depth);
+            let parenthesized_plsql_condition_header_depth = if closes_parenthesized_plsql_condition
+            {
+                Self::previous_parenthesized_plsql_condition_header_depth(layouts, idx)
+            } else {
+                None
+            };
             let resolved_query_base_depth = layouts[idx].query_base_depth.map(|query_base_depth| {
                 resolved_query_base_depths
                     .iter()
@@ -3899,6 +3964,8 @@ impl SqlEditorWidget {
                 } else {
                     parser_depth
                 }
+            } else if closes_parenthesized_plsql_condition {
+                parenthesized_plsql_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
                 parser_depth
             } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
@@ -3996,6 +4063,24 @@ impl SqlEditorWidget {
                     last_code_indent
                         .map(|indent| indent.max(condition_indent))
                         .unwrap_or(condition_indent)
+                } else if previous_line_is_join_condition_clause {
+                    let current_query_base_depth = resolved_query_base_depth
+                        .or(layouts[idx].query_base_depth)
+                        .unwrap_or(0);
+                    if current_query_base_depth >= 2 {
+                        last_code_indent
+                            .map(|indent| {
+                                indent
+                                    .saturating_add(1)
+                                    .max(condition_indent.saturating_add(1))
+                                    .max(parser_depth)
+                            })
+                            .unwrap_or(condition_indent.saturating_add(1).max(parser_depth))
+                    } else {
+                        last_code_indent
+                            .map(|indent| indent.max(condition_indent).max(parser_depth))
+                            .unwrap_or(condition_indent.max(parser_depth))
+                    }
                 } else if previous_line_is_condition_keyword {
                     if previous_line_has_unclosed_open_paren {
                         last_code_indent
@@ -4823,6 +4908,32 @@ impl SqlEditorWidget {
         false
     }
 
+    fn line_continues_plsql_condition_terminator(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        let mut saw_leading_close_paren = false;
+
+        for token in tokens {
+            match token {
+                SqlToken::Comment(comment) if comment.contains('\n') => break,
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if !saw_leading_close_paren && sym.trim() == ")" => {
+                    saw_leading_close_paren = true;
+                }
+                SqlToken::Word(word)
+                    if saw_leading_close_paren
+                        && (word.eq_ignore_ascii_case("THEN")
+                            || word.eq_ignore_ascii_case("LOOP")) =>
+                {
+                    return true;
+                }
+                SqlToken::Symbol(sym) if saw_leading_close_paren && sym == ";" => break,
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
         let tokens = super::query_text::tokenize_sql(line);
         let mut paren_balance = 0usize;
@@ -5428,7 +5539,7 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod formatter_regression_tests {
     use super::SqlEditorWidget;
-    use crate::db::{QueryExecutor, ScriptItem, SessionState};
+    use crate::db::{FormatItem, QueryExecutor, ScriptItem, SessionState};
     use crate::ui::sql_editor::execution::PROGRESS_ROWS_INITIAL_BATCH;
     use crate::ui::sql_editor::QueryProgress;
     use std::fs;
@@ -5934,6 +6045,152 @@ END a;"#;
             formatted.trim(),
             expected.trim(),
             "package body procedure nested BEGIN alignment regression, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_if_condition_with_parenthesized_case_keeps_case_and_close_paren_depths_stable() {
+        let input = r#"BEGIN
+    IF (
+        CASE
+            WHEN flag = 'Y' THEN 1
+            ELSE 0
+        END
+    ) = 1 THEN
+        NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF (")
+            .unwrap_or(0);
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") = 1 THEN"))
+            .unwrap_or(0);
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[case_idx]) > indent(lines[if_idx]),
+            "CASE inside IF condition should still indent deeper than the IF header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_paren_idx]),
+            indent(lines[if_idx]),
+            "close paren line should return to the IF header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should stay aligned with IF after parenthesized CASE condition continuations, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_while_condition_with_parenthesized_case_keeps_case_and_close_paren_depths_stable() {
+        let input = r#"BEGIN
+    WHILE (
+        CASE
+            WHEN flag = 'Y' THEN 1
+            ELSE 0
+        END
+    ) = 1 LOOP
+        NULL;
+    END LOOP;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let while_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHILE (")
+            .unwrap_or(0);
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") = 1 LOOP"))
+            .unwrap_or(0);
+        let end_loop_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END LOOP;")
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[case_idx]) > indent(lines[while_idx]),
+            "CASE inside WHILE condition should still indent deeper than the WHILE header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_paren_idx]),
+            indent(lines[while_idx]),
+            "close paren line should return to the WHILE header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_loop_idx]),
+            indent(lines[while_idx]),
+            "END LOOP should stay aligned with WHILE after parenthesized CASE condition continuations, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_elsif_condition_with_parenthesized_case_keeps_close_paren_depth_stable() {
+        let input = r#"BEGIN
+    IF flag = 'N' THEN
+        NULL;
+    ELSIF (
+        CASE
+            WHEN flag = 'Y' THEN 1
+            ELSE 0
+        END
+    ) = 1 THEN
+        NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let elsif_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ELSIF (")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") = 1 THEN"))
+            .unwrap_or(0);
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[close_paren_idx]),
+            indent(lines[elsif_idx]),
+            "ELSIF close paren line should return to the ELSIF header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[elsif_idx]),
+            "END IF should stay aligned with ELSIF/IF block after parenthesized CASE continuations, got:\n{}",
             formatted
         );
     }
@@ -8304,6 +8561,71 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_keeps_test26_reference_layout_exactly() {
+        let expected = r#"PROCEDURE A (B IN NUMBER) AS
+BEGIN
+    SELECT D --4
+    FROM E --4
+    WHERE F IN (
+            --4
+            SELECT G -- 12
+            FROM ( -- 12
+                    SELECT H -- 20
+                    FROM J -- 20
+                    INNER JOIN K -- 20
+                        ON 1 = 1 -- 24
+                            AND 2 = 2 -- 28
+                            OR 3 = 3 -- 28
+                    OUTER JOIN K -- 20
+                        ON 1 = 1 -- 24
+                            AND 2 = 2 -- 28
+                            OR 3 = 3 -- 28
+                ) I -- 16
+        ); -- 8
+END A;
+
+SELECT D
+FROM E
+WHERE F IN (
+        SELECT G --8
+        FROM ( --8
+                SELECT H --16
+                FROM J --16
+                INNER JOIN K --16
+                    ON 1 = 1 --20
+                        AND 2 = 2 -- 24
+                OUTER JOIN K -- 16
+                    ON 1 = 1 --20
+                        AND 2 = 2 -- 24
+            ) I --12
+    ); --4"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(expected);
+
+        assert_eq!(
+            formatted, expected,
+            "Formatting must preserve the reference base-depth layout exactly for nested IN/FROM subqueries with JOIN conditions"
+        );
+    }
+
+    #[test]
+    fn split_format_items_keeps_existing_inline_line_comment_after_semicolon() {
+        let items = QueryExecutor::split_format_items("SELECT 1 FROM dual; -- keep terminator");
+
+        assert_eq!(items.len(), 1, "Trailing inline comment must stay in the same format item");
+        match &items[0] {
+            FormatItem::Statement(statement) => {
+                assert!(
+                    statement.contains("; -- keep terminator"),
+                    "Trailing inline comment should remain attached to the statement, got:\n{}",
+                    statement
+                );
+            }
+            other => panic!("Expected a statement item, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn open_for_with_inline_block_comment_keeps_comment_inline_and_subquery_indented() {
         let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
     l_rc t_refcur;
@@ -8809,6 +9131,46 @@ END;";
             leading_spaces(lines[close_paren_idx]),
             leading_spaces(lines[else_idx]),
             "Parenthesized CASE closer should align with following ELSE branch depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_aligned_before_end_case_close_paren() {
+        let source = "begin\n    v_val := case\n        when flag = 1 then (\n            case\n                when score > 0 then 1\n                else 0\n            end case\n            -- keep\n        )\n        else 2\n    end;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_idx = lines
+            .iter()
+            .position(|line| line.trim() == "-- keep")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_paren_idx.saturating_add(1))
+            .find_map(|(idx, line)| {
+                if line.trim() == "ELSE" {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[comment_idx]),
+            leading_spaces(lines[close_paren_idx]),
+            "Comment before parenthesized END CASE closer should match close-paren depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_paren_idx]),
+            leading_spaces(lines[else_idx]),
+            "Parenthesized END CASE closer should align with following ELSE branch depth, got:\n{}",
             formatted
         );
     }
@@ -9740,6 +10102,38 @@ CROSS APPLY ("
             ),
             "CROSS APPLY should start on a new line after JOIN ON, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_inline_comment_after_cross_apply_open_paren() {
+        let source = "select * from org_enriched oe cross apply (-- inline\nselect oe.dept_id from dual\n) ca;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("CROSS APPLY ( -- inline"),
+            "inline comment after CROSS APPLY ( should stay on the opener line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SELECT oe.dept_id"),
+            "CROSS APPLY body should still be formatted as a nested query, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_inline_comment_after_merge_using_open_paren() {
+        let source = "merge into dst d using (-- inline\nselect 1 as id from dual\n) s on (d.id = s.id) when matched then update set d.id = s.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("USING ( -- inline"),
+            "inline comment after MERGE USING ( should stay on the opener line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SELECT 1 AS id"),
+            "MERGE USING body should still be formatted as a nested query, got:\n{}",
             formatted
         );
     }

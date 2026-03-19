@@ -167,8 +167,6 @@ pub(crate) enum IfState {
     ExpectConditionStart,
     /// Saw IF followed by `(`, tracking condition paren depth.
     InConditionParen { depth: usize },
-    /// Condition paren closed, waiting for THEN.
-    AfterConditionParen,
     /// Saw IF (no paren), waiting for THEN.
     AwaitingThen,
 }

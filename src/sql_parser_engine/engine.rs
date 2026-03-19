@@ -754,11 +754,6 @@ impl SqlParserEngine {
                         }
                     }
                 }
-                IfState::AfterConditionParen => {
-                    if !c.is_whitespace() {
-                        self.state.if_state = IfState::None;
-                    }
-                }
                 _ => {}
             }
 
@@ -766,7 +761,12 @@ impl SqlParserEngine {
             if symbol_role == SymbolRole::CloseParen {
                 if let IfState::InConditionParen { depth } = self.state.if_state {
                     if depth == self.state.paren_depth() {
-                        self.state.if_state = IfState::AfterConditionParen;
+                        // The first parenthesized group in an IF condition does
+                        // not necessarily terminate the whole condition:
+                        // `IF (CASE ... END) = 1 THEN` is still awaiting THEN
+                        // after the close paren. Keep the state armed until a
+                        // non-THEN keyword proves otherwise.
+                        self.state.if_state = IfState::AwaitingThen;
                     }
                 }
             }

@@ -1214,7 +1214,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
     engine.state.pending_do = PendingDo::While {
         armed_at_block_depth: 1,
     };
-    engine.state.if_state = IfState::AfterConditionParen;
+    engine.state.if_state = IfState::AwaitingThen;
     engine.state.clear_paren_stack();
 
     engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
