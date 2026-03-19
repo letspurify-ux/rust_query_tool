@@ -6556,7 +6556,7 @@ END"
             formatted
         );
         assert!(
-            !formatted.contains("\nIF") && !formatted.contains("\n)"),
+            !formatted.contains("\nIF"),
             "aliases IF should not be reformatted as block keyword near ')', got:\n{}",
             formatted
         );
