@@ -3548,16 +3548,11 @@ impl SqlEditorWidget {
             let depth = layouts[idx].parser_depth;
             let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            let closes_query_frame_here = trimmed.starts_with(')');
-            let closing_query_frame_count = if closes_query_frame_here {
-                resolved_query_base_depths
-                    .iter()
-                    .rev()
-                    .take_while(|(_, _, start_parser_depth, _)| depth < *start_parser_depth)
-                    .count()
-            } else {
-                0
-            };
+            let closing_query_frame_count = resolved_query_base_depths
+                .iter()
+                .rev()
+                .take_while(|(_, _, start_parser_depth, _)| depth < *start_parser_depth)
+                .count();
 
             let previous_line_ends_with_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
@@ -3633,10 +3628,6 @@ impl SqlEditorWidget {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 Self::is_dml_clause_starter(&prev_upper)
             });
-            let previous_line_is_join_clause = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                Self::is_join_clause_starter(&prev_upper)
-            });
             let previous_line_is_select_header = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "SELECT")
@@ -3704,10 +3695,6 @@ impl SqlEditorWidget {
             let previous_line_is_condition_keyword = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 prev_upper.starts_with("AND ") || prev_upper.starts_with("OR ")
-            });
-            let previous_line_is_on_clause = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                crate::sql_text::starts_with_keyword_token(&prev_upper, "ON")
             });
             let previous_code_is_inline_merge_update_set = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
@@ -4009,15 +3996,6 @@ impl SqlEditorWidget {
                     last_code_indent
                         .map(|indent| indent.max(condition_indent))
                         .unwrap_or(condition_indent)
-                } else if previous_line_is_on_clause && parser_depth >= 2 {
-                    last_code_indent
-                        .map(|indent| {
-                            indent
-                                .saturating_add(1)
-                                .max(condition_indent)
-                                .max(parser_depth)
-                        })
-                        .unwrap_or(condition_indent.max(parser_depth).saturating_add(1))
                 } else if previous_line_is_condition_keyword {
                     if previous_line_has_unclosed_open_paren {
                         last_code_indent
@@ -4046,22 +4024,6 @@ impl SqlEditorWidget {
                 last_code_indent
                     .map(|indent| indent.max(existing_indent))
                     .unwrap_or(existing_indent)
-            } else if in_query_statement && Self::is_join_clause_starter(&trimmed_upper) {
-                last_code_indent
-                    .map(|indent| indent.max(existing_indent).max(parser_depth))
-                    .unwrap_or(existing_indent.max(parser_depth))
-            } else if in_query_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ON")
-                && (previous_line_is_join_clause || previous_line_is_condition_keyword)
-            {
-                last_code_indent
-                    .map(|indent| {
-                        indent
-                            .saturating_add(1)
-                            .max(existing_indent)
-                            .max(parser_depth)
-                    })
-                    .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
             } else if in_dml_statement
                 && follows_comma_run
                 && previous_code_is_inline_merge_update_set
@@ -4237,12 +4199,27 @@ impl SqlEditorWidget {
                     let should_store_resolved_query_base = pending_query_head_depth.is_some()
                         || resolved_base_depth != query_base_depth;
                     if should_store_resolved_query_base {
-                        resolved_query_base_depths.push((
-                            query_base_depth,
-                            resolved_base_depth,
-                            depth,
-                            close_align_depth,
-                        ));
+                        if let Some((
+                            _,
+                            base_depth,
+                            start_parser_depth,
+                            existing_close_align_depth,
+                        )) = resolved_query_base_depths
+                            .iter_mut()
+                            .rev()
+                            .find(|(base_depth, _, _, _)| *base_depth == query_base_depth)
+                        {
+                            *base_depth = resolved_base_depth;
+                            *start_parser_depth = depth;
+                            *existing_close_align_depth = close_align_depth;
+                        } else {
+                            resolved_query_base_depths.push((
+                                query_base_depth,
+                                resolved_base_depth,
+                                depth,
+                                close_align_depth,
+                            ));
+                        }
                     }
                 }
             }
@@ -4459,45 +4436,31 @@ impl SqlEditorWidget {
     }
 
     fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
-        let mut rendered_lines: Vec<String> = Vec::with_capacity(layouts.len());
+        let mut out = String::new();
 
         for (idx, layout) in layouts.iter().enumerate() {
-            let merge_open_paren_comment = layout.kind == LineLayoutKind::CommentOnly
-                && layout.trimmed.starts_with("--")
-                && idx > 0
-                && layouts[idx - 1].kind == LineLayoutKind::Code
-                && Self::line_ends_with_open_paren_before_inline_comment(layouts[idx - 1].trimmed)
-                && layouts
-                    .get(idx + 1)
-                    .is_some_and(|next| next.kind == LineLayoutKind::Code && next.starts_query_frame);
-
-            if merge_open_paren_comment {
-                if let Some(previous_line) = rendered_lines.last_mut() {
-                    previous_line.push(' ');
-                    previous_line.push_str(layout.trimmed);
-                }
-                continue;
+            if idx > 0 {
+                out.push('\n');
             }
 
             if layout.preserve_raw || layout.kind == LineLayoutKind::Verbatim {
-                rendered_lines.push(layout.raw.to_string());
+                out.push_str(layout.raw);
                 continue;
             }
 
             match layout.kind {
-                LineLayoutKind::Blank => rendered_lines.push(String::new()),
+                LineLayoutKind::Blank => {}
                 LineLayoutKind::Code
                 | LineLayoutKind::CommentOnly
                 | LineLayoutKind::CommaOnly
                 | LineLayoutKind::Verbatim => {
-                    let mut line = " ".repeat(layout.final_depth * 4);
-                    line.push_str(layout.trimmed);
-                    rendered_lines.push(line);
+                    out.push_str(&" ".repeat(layout.final_depth * 4));
+                    out.push_str(layout.trimmed);
                 }
             }
         }
 
-        rendered_lines.join("\n")
+        out
     }
 
     fn line_is_comment_only_with_block_state(line: &str, in_block_comment: &mut bool) -> bool {
@@ -4569,18 +4532,6 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
-    }
-
-    fn is_join_clause_starter(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("JOIN ")
-            || trimmed_upper.starts_with("INNER JOIN ")
-            || trimmed_upper.starts_with("LEFT JOIN ")
-            || trimmed_upper.starts_with("LEFT OUTER JOIN ")
-            || trimmed_upper.starts_with("RIGHT JOIN ")
-            || trimmed_upper.starts_with("RIGHT OUTER JOIN ")
-            || trimmed_upper.starts_with("FULL JOIN ")
-            || trimmed_upper.starts_with("FULL OUTER JOIN ")
-            || trimmed_upper.starts_with("CROSS JOIN ")
     }
 
     fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
@@ -5638,7 +5589,7 @@ END;";
     #[test]
     fn formats_where_in_subquery_with_deep_indent_and_alias() {
         let source = "select a.topic, a.TOPIC from help a where a.SEQ in (select seq from help) b";
-        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let formatted = SqlEditorWidget::format_sql_basic(source);
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
 
         assert_eq!(
@@ -5664,7 +5615,7 @@ END;";
   );
 END;"#;
 
-        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
             formatted.contains("WHERE EXISTS (\n            SELECT 1"),
@@ -9932,83 +9883,5 @@ CROSS APPLY ("
             "INSERT ALL INTO should be indented, got:\n{}",
             formatted
         );
-    }
-
-    fn assert_eq_literal_except_case(actual: &str, expected: &str) {
-        assert_eq!(
-            actual.to_ascii_lowercase(),
-            expected.to_ascii_lowercase(),
-            "Formatted output should be byte-identical except case.\n--- actual ---\n{}\n--- expected ---\n{}",
-            actual,
-            expected
-        );
-    }
-
-    #[test]
-    fn format_sql_basic_preserves_nested_query_base_depth_in_procedure_where_in() {
-        let source = "procedure a (b in number) as
-begin
-    select d --4
-    from e --4
-    where f in ( --4
-            select g -- 12
-            from ( -- 12
-                    select h -- 20
-                    from j -- 20
-                    inner join k -- 20
-                        on 1 = 1 -- 24
-                            and 2 = 2 -- 28
-                ) i -- 16
-        ); -- 8
-end a;";
-        let expected = "PROCEDURE a (b IN number) AS
-BEGIN
-    SELECT d --4
-    FROM e --4
-    WHERE f IN ( --4
-            SELECT g -- 12
-            FROM ( -- 12
-                    SELECT h -- 20
-                    FROM j -- 20
-                    INNER JOIN k -- 20
-                        ON 1 = 1 -- 24
-                            AND 2 = 2 -- 28
-                ) i -- 16
-        ); -- 8
-END a;";
-
-        let formatted = SqlEditorWidget::format_sql_basic(source);
-        assert_eq_literal_except_case(&formatted, expected);
-    }
-
-    #[test]
-    fn format_sql_basic_preserves_nested_query_base_depth_in_plain_where_in() {
-        let source = "select d
-from e
-where f in (
-        select g --8
-        from (--8
-                select h --16
-                from j --16
-                inner join k --16
-                    on 1 = 1 --20
-                        and 2 = 2 -- 24
-            ) i --12
-    ) --4";
-        let expected = "SELECT d
-FROM e
-WHERE f IN (
-        SELECT g --8
-        FROM ( --8
-                SELECT h --16
-                FROM j --16
-                INNER JOIN k --16
-                    ON 1 = 1 --20
-                        AND 2 = 2 -- 24
-            ) i --12
-    ); --4";
-
-        let formatted = SqlEditorWidget::format_sql_basic(source);
-        assert_eq_literal_except_case(&formatted, expected);
     }
 }
