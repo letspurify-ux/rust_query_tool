@@ -13,6 +13,15 @@ pub(crate) enum AutoFormatQueryRole {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AutoFormatConditionRole {
+    #[default]
+    None,
+    Header,
+    Continuation,
+    Closer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AutoFormatLineContext {
     pub(crate) parser_depth: usize,
     pub(crate) auto_depth: usize,
@@ -20,6 +29,54 @@ pub(crate) struct AutoFormatLineContext {
     pub(crate) query_base_depth: Option<usize>,
     pub(crate) starts_query_frame: bool,
     pub(crate) next_query_head_depth: Option<usize>,
+    pub(crate) condition_header_line: Option<usize>,
+    pub(crate) condition_header_depth: Option<usize>,
+    pub(crate) condition_role: AutoFormatConditionRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoFormatConditionTerminator {
+    Then,
+    Loop,
+}
+
+impl AutoFormatConditionTerminator {
+    fn matches_keyword(self, upper: &str) -> bool {
+        matches!(
+            (self, upper),
+            (Self::Then, "THEN") | (Self::Loop, "LOOP")
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingConditionHeader {
+    header_line_idx: usize,
+    header_depth: usize,
+    terminator: AutoFormatConditionTerminator,
+    requires_in_keyword: bool,
+    saw_in_keyword: bool,
+}
+
+impl PendingConditionHeader {
+    fn is_ready_for_open_paren(self) -> bool {
+        !self.requires_in_keyword || self.saw_in_keyword
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveConditionFrame {
+    header_line_idx: usize,
+    header_depth: usize,
+    terminator: AutoFormatConditionTerminator,
+    paren_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ConditionLineAnnotation {
+    header_line_idx: Option<usize>,
+    header_depth: Option<usize>,
+    role: AutoFormatConditionRole,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1174,6 +1231,8 @@ impl QueryExecutor {
         let mut pending_query_base: Option<usize> = None;
         let mut in_block_comment = false;
         let mut non_query_into_continuation_depth: Option<usize> = None;
+        let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
+        let mut active_condition_frames: Vec<ActiveConditionFrame> = Vec::new();
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1357,6 +1416,17 @@ impl QueryExecutor {
                 non_query_into_continuation_depth = None;
             }
 
+            let condition_annotation = Self::annotate_parenthesized_condition_line(
+                line,
+                idx,
+                existing_indent.max(context.auto_depth),
+                &mut pending_condition_headers,
+                &mut active_condition_frames,
+            );
+            context.condition_header_line = condition_annotation.header_line_idx;
+            context.condition_header_depth = condition_annotation.header_depth;
+            context.condition_role = condition_annotation.role;
+
             let next_query_head_depth =
                 Self::next_query_head_depth(existing_indent, context, &trimmed_upper);
             let base_depth_for_child_query =
@@ -1456,6 +1526,275 @@ impl QueryExecutor {
             || sql_text::starts_with_keyword_token(trimmed_upper, "USING")
     }
 
+    fn pending_condition_header_for_word(
+        word_upper: &str,
+        header_line_idx: usize,
+        header_depth: usize,
+    ) -> Option<PendingConditionHeader> {
+        let (terminator, requires_in_keyword) = match word_upper {
+            "IF" | "ELSIF" | "ELSEIF" | "WHEN" => {
+                (AutoFormatConditionTerminator::Then, false)
+            }
+            "WHILE" => (AutoFormatConditionTerminator::Loop, false),
+            "FOR" => (AutoFormatConditionTerminator::Loop, true),
+            _ => return None,
+        };
+
+        Some(PendingConditionHeader {
+            header_line_idx,
+            header_depth,
+            terminator,
+            requires_in_keyword,
+            saw_in_keyword: false,
+        })
+    }
+
+    fn annotate_parenthesized_condition_line(
+        line: &str,
+        line_idx: usize,
+        line_owner_depth: usize,
+        pending_headers: &mut Vec<PendingConditionHeader>,
+        active_frames: &mut Vec<ActiveConditionFrame>,
+    ) -> ConditionLineAnnotation {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut annotation = active_frames.last().copied().map_or_else(
+            ConditionLineAnnotation::default,
+            |frame| ConditionLineAnnotation {
+                header_line_idx: Some(frame.header_line_idx),
+                header_depth: Some(frame.header_depth),
+                ..ConditionLineAnnotation::default()
+            },
+        );
+        let mut saw_significant_token = false;
+        let mut saw_leading_close_paren = false;
+
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+
+            if byte.is_ascii_whitespace() {
+                idx += 1;
+                continue;
+            }
+
+            if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+                break;
+            }
+
+            if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if (byte == b'q' || byte == b'Q') && bytes.get(idx + 1) == Some(&b'\'') {
+                if let Some(&delimiter) = bytes.get(idx + 2) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delimiter) {
+                        idx += 3;
+                        let closing = sql_text::q_quote_closing_byte(delimiter);
+                        while idx + 1 < bytes.len() {
+                            if bytes[idx] == closing && bytes[idx + 1] == b'\'' {
+                                idx += 2;
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if (byte == b'n' || byte == b'N' || byte == b'u' || byte == b'U')
+                && matches!(bytes.get(idx + 1), Some(b'q' | b'Q'))
+                && bytes.get(idx + 2) == Some(&b'\'')
+            {
+                if let Some(&delimiter) = bytes.get(idx + 3) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delimiter) {
+                        idx += 4;
+                        let closing = sql_text::q_quote_closing_byte(delimiter);
+                        while idx + 1 < bytes.len() {
+                            if bytes[idx] == closing && bytes[idx + 1] == b'\'' {
+                                idx += 2;
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if byte == b'\'' {
+                idx += 1;
+                while idx < bytes.len() {
+                    if bytes[idx] == b'\'' {
+                        idx += 1;
+                        if bytes.get(idx) == Some(&b'\'') {
+                            idx += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if byte == b'"' {
+                idx += 1;
+                while idx < bytes.len() {
+                    if bytes[idx] == b'"' {
+                        idx += 1;
+                        if bytes.get(idx) == Some(&b'"') {
+                            idx += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if sql_text::is_identifier_start_byte(byte) {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+                    idx += 1;
+                }
+
+                let is_leading_word = !saw_significant_token;
+                if !saw_significant_token {
+                    saw_significant_token = true;
+                }
+
+                let word_upper = line[start..idx].to_ascii_uppercase();
+
+                if word_upper == "IN" {
+                    if let Some(header) = pending_headers
+                        .iter_mut()
+                        .rev()
+                        .find(|header| header.requires_in_keyword && !header.saw_in_keyword)
+                    {
+                        header.saw_in_keyword = true;
+                    }
+                }
+
+                if active_frames
+                    .last()
+                    .is_some_and(|frame| frame.paren_depth == 0 && frame.terminator.matches_keyword(&word_upper))
+                {
+                    if let Some(frame) = active_frames.pop() {
+                        annotation.header_line_idx = Some(frame.header_line_idx);
+                        annotation.header_depth = Some(frame.header_depth);
+                    }
+                }
+
+                if pending_headers
+                    .last()
+                    .is_some_and(|header| header.terminator.matches_keyword(&word_upper))
+                {
+                    pending_headers.pop();
+                }
+
+                if is_leading_word {
+                    if let Some(header) = Self::pending_condition_header_for_word(
+                        &word_upper,
+                        line_idx,
+                        line_owner_depth,
+                    ) {
+                        pending_headers.push(header);
+                    }
+                }
+
+                continue;
+            }
+
+            if byte == b'(' {
+                if !saw_significant_token {
+                    saw_significant_token = true;
+                }
+
+                for frame in active_frames.iter_mut() {
+                    frame.paren_depth = frame.paren_depth.saturating_add(1);
+                }
+
+                if let Some(header_idx) = pending_headers
+                    .iter()
+                    .rposition(|header| header.is_ready_for_open_paren())
+                {
+                    let header = pending_headers.remove(header_idx);
+                    annotation.header_line_idx = Some(header.header_line_idx);
+                    annotation.header_depth = Some(header.header_depth);
+                    if header.header_line_idx == line_idx {
+                        annotation.role = AutoFormatConditionRole::Header;
+                    }
+                    active_frames.push(ActiveConditionFrame {
+                        header_line_idx: header.header_line_idx,
+                        header_depth: header.header_depth,
+                        terminator: header.terminator,
+                        paren_depth: 1,
+                    });
+                } else if let Some(frame) = active_frames.last().copied() {
+                    annotation.header_line_idx = Some(frame.header_line_idx);
+                    annotation.header_depth = Some(frame.header_depth);
+                }
+
+                idx += 1;
+                continue;
+            }
+
+            if byte == b')' {
+                if !saw_significant_token {
+                    saw_significant_token = true;
+                    saw_leading_close_paren = true;
+                }
+
+                if let Some(frame) = active_frames.last().copied() {
+                    annotation.header_line_idx = Some(frame.header_line_idx);
+                    annotation.header_depth = Some(frame.header_depth);
+                }
+
+                for frame in active_frames.iter_mut() {
+                    frame.paren_depth = frame.paren_depth.saturating_sub(1);
+                }
+
+                idx += 1;
+                continue;
+            }
+
+            if !saw_significant_token {
+                saw_significant_token = true;
+            }
+
+            if byte == b';' {
+                pending_headers.clear();
+                active_frames.clear();
+                break;
+            }
+
+            idx += 1;
+        }
+
+        if annotation.role == AutoFormatConditionRole::None
+            && annotation.header_line_idx.is_some()
+        {
+            annotation.role = if saw_leading_close_paren {
+                AutoFormatConditionRole::Closer
+            } else {
+                AutoFormatConditionRole::Continuation
+            };
+        }
+
+        annotation
+    }
+
     fn line_starts_new_query_frame(
         head_kind: AutoFormatClauseKind,
         parser_depth: usize,
@@ -1514,6 +1853,12 @@ impl QueryExecutor {
         existing_indent: usize,
         context: AutoFormatLineContext,
     ) -> usize {
+        if context.condition_role != AutoFormatConditionRole::None {
+            if let Some(header_depth) = context.condition_header_depth {
+                return header_depth;
+            }
+        }
+
         existing_indent.max(context.auto_depth)
     }
 
@@ -5564,7 +5909,7 @@ impl QueryExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryExecutor;
+    use super::{AutoFormatConditionRole, QueryExecutor};
 
     #[test]
     fn strip_extra_trailing_semicolons_preserves_plsql_end_terminator() {
@@ -5961,6 +6306,65 @@ FROM dual;"#;
         assert_eq!(
             contexts[scalar_from_idx].auto_depth, contexts[scalar_select_idx].auto_depth,
             "scalar subquery clauses should reuse the same query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_for_in_subquery_on_for_header_depth() {
+        let sql = r#"BEGIN
+    FOR rec IN
+    (
+        SELECT 1
+        FROM dual
+    ) LOOP
+        NULL;
+    END LOOP;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FOR rec IN")
+            .expect("formatted source should contain FOR header");
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "(")
+            .expect("formatted source should contain split open paren");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted source should contain child SELECT");
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") LOOP")
+            .expect("formatted source should contain close paren LOOP line");
+
+        assert_eq!(
+            contexts[open_idx].condition_header_line,
+            Some(for_idx),
+            "split IN open-paren line should retain the FOR owner"
+        );
+        assert_eq!(
+            contexts[select_idx].condition_header_line,
+            Some(for_idx),
+            "child SELECT should stay attached to the FOR condition owner"
+        );
+        assert_eq!(
+            contexts[close_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "close paren line should be marked as a condition closer"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[for_idx].auto_depth.saturating_add(1),
+            "split FOR ... IN subquery should inherit the FOR header base depth"
+        );
+        assert_eq!(
+            contexts[select_idx].query_base_depth,
+            Some(contexts[for_idx].auto_depth.saturating_add(1)),
+            "child query base depth should be anchored from the FOR header"
         );
     }
 

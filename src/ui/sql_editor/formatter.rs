@@ -1,5 +1,6 @@
 use crate::db::{
-    AutoFormatLineContext, AutoFormatQueryRole, FormatItem, QueryExecutor, ScriptItem, ToolCommand,
+    AutoFormatConditionRole, AutoFormatLineContext, AutoFormatQueryRole, FormatItem,
+    QueryExecutor, ScriptItem, ToolCommand,
 };
 use crate::sql_text::{
     self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
@@ -33,6 +34,8 @@ struct LineLayout<'a> {
     query_base_depth: Option<usize>,
     starts_query_frame: bool,
     next_query_head_depth: Option<usize>,
+    condition_header_line: Option<usize>,
+    condition_role: AutoFormatConditionRole,
     existing_indent: usize,
     final_depth: usize,
     anchor_group: Option<usize>,
@@ -3466,6 +3469,11 @@ impl SqlEditorWidget {
                     .map(|ctx| ctx.starts_query_frame)
                     .unwrap_or(false),
                 next_query_head_depth: contexts.get(idx).and_then(|ctx| ctx.next_query_head_depth),
+                condition_header_line: contexts.get(idx).and_then(|ctx| ctx.condition_header_line),
+                condition_role: contexts
+                    .get(idx)
+                    .map(|ctx| ctx.condition_role)
+                    .unwrap_or(AutoFormatConditionRole::None),
                 existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
                 final_depth: 0,
                 anchor_group: None,
@@ -3541,21 +3549,14 @@ impl SqlEditorWidget {
         None
     }
 
-    fn previous_parenthesized_plsql_condition_header_depth(
+    fn parenthesized_condition_header_depth(
         layouts: &[LineLayout<'_>],
         idx: usize,
     ) -> Option<usize> {
-        for prev_idx in (0..idx).rev() {
-            if layouts[prev_idx].kind != LineLayoutKind::Code {
-                continue;
-            }
-
-            if Self::is_parenthesized_plsql_condition_header(layouts[prev_idx].trimmed) {
-                return Some(layouts[prev_idx].final_depth);
-            }
-        }
-
-        None
+        layouts[idx]
+            .condition_header_line
+            .and_then(|header_idx| layouts.get(header_idx))
+            .map(|header| header.final_depth)
     }
 
     fn line_has_direct_query_owner(trimmed_upper: &str) -> bool {
@@ -3609,10 +3610,6 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
             });
-            let previous_line_is_parenthesized_plsql_condition =
-                last_code_idx.is_some_and(|prev_idx| {
-                    Self::is_parenthesized_plsql_condition_header(layouts[prev_idx].trimmed)
-                });
             let previous_line_is_cte_definition_header = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_is_cte_definition_header(layouts[prev_idx].trimmed)
             });
@@ -3787,8 +3784,12 @@ impl SqlEditorWidget {
             let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
             let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
-            let closes_parenthesized_plsql_condition =
-                starts_with_close_paren && Self::line_continues_plsql_condition_terminator(trimmed);
+            let current_line_is_parenthesized_condition =
+                layouts[idx].condition_header_line.is_some();
+            let current_line_is_parenthesized_condition_header =
+                layouts[idx].condition_role == AutoFormatConditionRole::Header;
+            let current_line_is_parenthesized_condition_close =
+                layouts[idx].condition_role == AutoFormatConditionRole::Closer;
             let parser_depth = parser_depth + usize::from(is_paren_case_closer);
             let last_code_indent = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
             let follows_comma_run =
@@ -3819,12 +3820,8 @@ impl SqlEditorWidget {
                 .take(closing_query_frame_count)
                 .last()
                 .map(|(_, _, _, close_align_depth)| *close_align_depth);
-            let parenthesized_plsql_condition_header_depth = if closes_parenthesized_plsql_condition
-            {
-                Self::previous_parenthesized_plsql_condition_header_depth(layouts, idx)
-            } else {
-                None
-            };
+            let parenthesized_condition_header_depth =
+                Self::parenthesized_condition_header_depth(layouts, idx);
             let resolved_query_base_depth = layouts[idx].query_base_depth.map(|query_base_depth| {
                 resolved_query_base_depths
                     .iter()
@@ -3964,8 +3961,13 @@ impl SqlEditorWidget {
                 } else {
                     parser_depth
                 }
-            } else if closes_parenthesized_plsql_condition {
-                parenthesized_plsql_condition_header_depth.unwrap_or(parser_depth)
+            } else if current_line_is_parenthesized_condition_close {
+                parenthesized_condition_header_depth.unwrap_or(parser_depth)
+            } else if current_line_is_parenthesized_condition
+                && current_line_is_condition_keyword
+                && previous_line_starts_with_close_paren
+            {
+                parenthesized_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
                 parser_depth
             } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
@@ -3981,7 +3983,7 @@ impl SqlEditorWidget {
             } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
             {
                 let nested_subquery_depth = if previous_line_is_cte_definition_header
-                    || previous_line_is_parenthesized_plsql_condition
+                    || current_line_is_parenthesized_condition
                 {
                     parser_depth
                 } else {
@@ -3990,7 +3992,11 @@ impl SqlEditorWidget {
                 last_code_indent
                     .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
                     .unwrap_or(nested_subquery_depth)
-            } else if !in_dml_statement && previous_line_is_parenthesized_plsql_condition {
+            } else if !in_dml_statement
+                && current_line_is_parenthesized_condition
+                && !current_line_is_parenthesized_condition_header
+                && !current_line_is_parenthesized_condition_close
+            {
                 parser_depth.saturating_add(1)
             } else if in_dml_statement
                 && previous_line_is_forall_header
@@ -4138,11 +4144,6 @@ impl SqlEditorWidget {
                 } else {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
                 }
-            } else if in_query_statement
-                && starts_with_close_paren
-                && trimmed_upper.contains(") THEN")
-            {
-                parser_depth
             } else if in_query_statement
                 && starts_with_close_paren
                 && current_line_query_close_align_depth.is_some()
@@ -4908,32 +4909,6 @@ impl SqlEditorWidget {
         false
     }
 
-    fn line_continues_plsql_condition_terminator(line: &str) -> bool {
-        let tokens = super::query_text::tokenize_sql(line);
-        let mut saw_leading_close_paren = false;
-
-        for token in tokens {
-            match token {
-                SqlToken::Comment(comment) if comment.contains('\n') => break,
-                SqlToken::Comment(_) => continue,
-                SqlToken::Symbol(sym) if !saw_leading_close_paren && sym.trim() == ")" => {
-                    saw_leading_close_paren = true;
-                }
-                SqlToken::Word(word)
-                    if saw_leading_close_paren
-                        && (word.eq_ignore_ascii_case("THEN")
-                            || word.eq_ignore_ascii_case("LOOP")) =>
-                {
-                    return true;
-                }
-                SqlToken::Symbol(sym) if saw_leading_close_paren && sym == ";" => break,
-                _ => {}
-            }
-        }
-
-        false
-    }
-
     fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
         let tokens = super::query_text::tokenize_sql(line);
         let mut paren_balance = 0usize;
@@ -4970,20 +4945,6 @@ impl SqlEditorWidget {
     fn line_starts_with_using_clause(line: &str) -> bool {
         let trimmed_upper = line.trim_start().to_ascii_uppercase();
         crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
-    }
-
-    fn is_parenthesized_plsql_condition_header(line: &str) -> bool {
-        if !Self::line_has_unclosed_open_paren_before_inline_comment(line) {
-            return false;
-        }
-
-        let trimmed_upper = line.trim_start().to_ascii_uppercase();
-        crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF")
-            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
-            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
-            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHILE")
-            || (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FOR")
-                && trimmed_upper.contains(" IN "))
     }
 
     #[cfg(test)]
@@ -6191,6 +6152,170 @@ END;"#;
             indent(lines[end_if_idx]),
             indent(lines[elsif_idx]),
             "END IF should stay aligned with ELSIF/IF block after parenthesized CASE continuations, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_if_multigroup_exists_conditions_keep_owner_depths_stable() {
+        let input = r#"BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM dual
+    ) AND EXISTS (
+        SELECT 1
+        FROM dual
+    ) THEN
+        NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("IF EXISTS ("))
+            .expect("formatted output should contain IF EXISTS header");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND EXISTS ("))
+            .expect("formatted output should contain AND EXISTS continuation");
+        let first_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain first child SELECT");
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(and_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain second child SELECT");
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") THEN"))
+            .expect("formatted output should contain close THEN line");
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .expect("formatted output should contain END IF");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[if_idx]),
+            "AND/OR continuation inside the same parenthesized IF condition should stay at the IF header depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[first_select_idx]) > indent(lines[if_idx]),
+            "first EXISTS subquery should stay nested under IF, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[second_select_idx]) > indent(lines[if_idx]),
+            "second EXISTS subquery should stay nested under IF, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_then_idx]),
+            indent(lines[if_idx]),
+            "final close paren line should return to the IF header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should stay aligned after multi-group parenthesized conditions, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn searched_case_when_exists_subquery_keeps_close_paren_at_when_depth() {
+        let input = r#"SELECT
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM dual
+        ) THEN 1
+        ELSE 0
+    END AS flag
+FROM dual;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN EXISTS ("))
+            .expect("formatted output should contain WHEN EXISTS header");
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") THEN 1"))
+            .expect("formatted output should contain close THEN line");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain EXISTS child SELECT");
+
+        assert!(
+            indent(lines[select_idx]) > indent(lines[when_idx]),
+            "searched CASE EXISTS subquery should stay nested under WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_then_idx]),
+            indent(lines[when_idx]),
+            "close paren THEN line should return to the WHEN header depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_for_split_in_subquery_keeps_child_query_on_for_depth() {
+        let input = r#"BEGIN
+    FOR rec IN
+    (
+        SELECT 1
+        FROM dual
+    ) LOOP
+        NULL;
+    END LOOP;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR rec IN"))
+            .expect("formatted output should contain FOR header");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain child SELECT");
+        let close_loop_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") LOOP")
+            .expect("formatted output should contain close LOOP line");
+        let end_loop_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END LOOP;")
+            .expect("formatted output should contain END LOOP");
+
+        assert!(
+            indent(lines[select_idx]) > indent(lines[for_idx]),
+            "split FOR ... IN subquery should stay nested under FOR, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_loop_idx]),
+            indent(lines[for_idx]),
+            "close LOOP line should return to the FOR header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_loop_idx]),
+            indent(lines[for_idx]),
+            "END LOOP should stay aligned with FOR after split IN subquery, got:\n{}",
             formatted
         );
     }
