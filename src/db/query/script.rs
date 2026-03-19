@@ -45,6 +45,7 @@ enum AutoFormatClauseKind {
     Minus,
     Set,
     Into,
+    Join,
 }
 
 impl AutoFormatClauseKind {
@@ -1418,6 +1419,8 @@ impl QueryExecutor {
             Some(AutoFormatClauseKind::Set)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTO") {
             Some(AutoFormatClauseKind::Into)
+        } else if Self::line_starts_join_clause(trimmed_upper) {
+            Some(AutoFormatClauseKind::Join)
         } else {
             None
         }
@@ -1493,8 +1496,9 @@ impl QueryExecutor {
         let is_visually_promoted_owner = context
             .query_base_depth
             .is_some_and(|depth| visual_owner_base > depth);
-        let effective_owner_depth =
-            if !is_visually_promoted_owner && Self::line_has_direct_query_owner(trimmed_upper) {
+        let effective_owner_depth = if !is_visually_promoted_owner
+            && Self::line_has_condition_query_owner(trimmed_upper)
+        {
                 visual_owner_base.saturating_add(1)
             } else {
                 visual_owner_base
@@ -1503,15 +1507,55 @@ impl QueryExecutor {
         effective_owner_depth.saturating_add(1)
     }
 
-    fn line_has_direct_query_owner(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("FROM (")
-            || trimmed_upper.starts_with("USING (")
-            || (trimmed_upper.ends_with(" IN (")
-                && !sql_text::starts_with_keyword_token(trimmed_upper, "FOR"))
+    fn line_has_condition_query_owner(trimmed_upper: &str) -> bool {
+        (trimmed_upper.ends_with(" IN (")
+            && !sql_text::starts_with_keyword_token(trimmed_upper, "FOR"))
             || trimmed_upper.ends_with(" EXISTS (")
             || trimmed_upper.ends_with(" NOT EXISTS (")
-            || trimmed_upper.contains(" JOIN (")
-            || trimmed_upper.contains(" APPLY (")
+    }
+
+    fn line_starts_join_clause(trimmed_upper: &str) -> bool {
+        if sql_text::starts_with_keyword_token(trimmed_upper, "JOIN")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "APPLY")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "STRAIGHT_JOIN")
+        {
+            return true;
+        }
+
+        let mut words = trimmed_upper.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        if first == "NATURAL" {
+            let second = words.next().unwrap_or_default();
+            if second == "JOIN" || second == "APPLY" {
+                return true;
+            }
+            if sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS
+                .iter()
+                .any(|modifier| second == *modifier)
+            {
+                let third = words.next().unwrap_or_default();
+                if third == "JOIN" || (third == "OUTER" && words.next() == Some("JOIN")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS
+            .iter()
+            .any(|modifier| first == *modifier)
+        {
+            let second = words.next().unwrap_or_default();
+            if second == "JOIN" || second == "APPLY" {
+                return true;
+            }
+            if second == "OUTER" {
+                let third = words.next().unwrap_or_default();
+                return third == "JOIN";
+            }
+        }
+
+        false
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
