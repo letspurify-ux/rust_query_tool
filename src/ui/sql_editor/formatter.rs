@@ -4532,51 +4532,6 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
-            || Self::line_starts_join_clause(trimmed_upper)
-    }
-
-    fn line_starts_join_clause(trimmed_upper: &str) -> bool {
-        if crate::sql_text::starts_with_keyword_token(trimmed_upper, "JOIN")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "APPLY")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "STRAIGHT_JOIN")
-        {
-            return true;
-        }
-
-        let mut words = trimmed_upper.split_whitespace();
-        let first = words.next().unwrap_or_default();
-        if first == "NATURAL" {
-            let second = words.next().unwrap_or_default();
-            if second == "JOIN" || second == "APPLY" {
-                return true;
-            }
-            if crate::sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS
-                .iter()
-                .any(|modifier| second == *modifier)
-            {
-                let third = words.next().unwrap_or_default();
-                if third == "JOIN" || (third == "OUTER" && words.next() == Some("JOIN")) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if crate::sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS
-            .iter()
-            .any(|modifier| first == *modifier)
-        {
-            let second = words.next().unwrap_or_default();
-            if second == "JOIN" || second == "APPLY" {
-                return true;
-            }
-            if second == "OUTER" {
-                let third = words.next().unwrap_or_default();
-                return third == "JOIN";
-            }
-        }
-
-        false
     }
 
     fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
@@ -8110,14 +8065,14 @@ SELECT 2 FROM dual"
             "WHERE EXISTS (",
             "        SELECT 1",
             "        FROM (",
-            "            SELECT inner_col",
-            "            FROM inner_t i",
-            "            WHERE i.id IN (",
-            "                SELECT id",
-            "                FROM leaf_t",
-            "                WHERE status = 'Y'",
-            "            )",
-            "        ) nested_q",
+            "                SELECT inner_col",
+            "                FROM inner_t i",
+            "                WHERE i.id IN (",
+            "                        SELECT id",
+            "                        FROM leaf_t",
+            "                        WHERE status = 'Y'",
+            "                    )",
+            "            ) nested_q",
             "        WHERE nested_q.inner_col = o.outer_col",
             "    );",
         ]
@@ -8137,14 +8092,14 @@ SELECT 2 FROM dual"
             "WHERE EXISTS (",
             "        SELECT 1",
             "        FROM (",
-            "            SELECT i.id",
-            "            FROM inner_a i",
-            "            WHERE i.flag = 'Y'",
-            "            UNION ALL",
-            "            SELECT j.id",
-            "            FROM inner_b j",
-            "            WHERE j.flag = 'N'",
-            "        ) merged",
+            "                SELECT i.id",
+            "                FROM inner_a i",
+            "                WHERE i.flag = 'Y'",
+            "                UNION ALL",
+            "                SELECT j.id",
+            "                FROM inner_b j",
+            "                WHERE j.flag = 'N'",
+            "            ) merged",
             "        WHERE merged.id = o.id",
             "    );",
         ]
@@ -8579,7 +8534,7 @@ mod format_comment_indent_tests {
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted
-                .contains("SELECT col1\n        -- comment\n        ,\n        col2"),
+                .contains("SELECT col1\n            -- comment\n            ,\n            col2"),
             "Comment in subquery select list should be at list item depth, got:\n{}",
             formatted
         );

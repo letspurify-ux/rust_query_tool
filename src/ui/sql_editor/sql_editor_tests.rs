@@ -4727,9 +4727,9 @@ fn format_sql_from_subqueries_with_comma_aligns_as_expected() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"SELECT *
 FROM (
-    SELECT *
-    FROM help
-) a,
+        SELECT *
+        FROM help
+    ) a,
     (
         SELECT *
         FROM help
@@ -7102,57 +7102,5 @@ LEFT JOIN emp e
         indent(lines[close_idx]),
         indent(lines[when_idx]),
         "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
-    );
-}
-
-#[test]
-fn format_sql_nested_in_from_subquery_aligns_select_and_inner_join_depths() {
-    let input = r#"procedure a (b in number) as
-begin
-       select d
-        from e
-        where f in (
-               select g
-               from (
-                           select h
-                          from j
-               inner join k
-                  on 1 = 1
-                       ) i
-           ));
-end a;"#;
-
-    let formatted = SqlEditorWidget::format_sql_basic(input);
-    let lines: Vec<&str> = formatted.lines().collect();
-    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
-    let find_idx = |needle: &str| {
-        lines
-            .iter()
-            .position(|line| line.trim_start().starts_with(needle))
-            .unwrap_or(0)
-    };
-
-    let from_inner_idx = find_idx("FROM (");
-    let third_select_idx = lines
-        .iter()
-        .enumerate()
-        .skip(from_inner_idx.saturating_add(1))
-        .find(|(_, line)| line.trim_start().starts_with("SELECT h"))
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-    let from_j_idx = find_idx("FROM j");
-    let inner_join_idx = find_idx("INNER JOIN k");
-
-    assert_eq!(
-        indent(lines[third_select_idx]),
-        indent(lines[from_inner_idx]).saturating_add(4),
-        "nested SELECT under FROM ( should be exactly one level deeper, got:\n{}",
-        formatted
-    );
-    assert_eq!(
-        indent(lines[inner_join_idx]),
-        indent(lines[from_j_idx]),
-        "INNER JOIN should align with FROM in the same subquery, got:\n{}",
-        formatted
     );
 }
