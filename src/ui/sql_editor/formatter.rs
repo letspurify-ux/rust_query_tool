@@ -1,6 +1,6 @@
 use crate::db::{
-    AutoFormatConditionRole, AutoFormatLineContext, AutoFormatQueryRole, FormatItem,
-    QueryExecutor, ScriptItem, ToolCommand,
+    AutoFormatConditionRole, AutoFormatLineContext, AutoFormatQueryRole, FormatItem, QueryExecutor,
+    ScriptItem, ToolCommand,
 };
 use crate::sql_text::{
     self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
@@ -39,6 +39,12 @@ struct LineLayout<'a> {
     existing_indent: usize,
     final_depth: usize,
     anchor_group: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct MultilineClauseLayoutFrame {
+    owner_depth: usize,
+    nested_paren_depth: usize,
 }
 
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
@@ -439,8 +445,7 @@ impl SqlEditorWidget {
                 SqlToken::Comment(comment) if comment.contains('\n') => break,
                 SqlToken::Symbol(sym) if sym == ";" => break,
                 SqlToken::Word(word)
-                    if word.eq_ignore_ascii_case("THEN")
-                        || word.eq_ignore_ascii_case("LOOP") =>
+                    if word.eq_ignore_ascii_case("THEN") || word.eq_ignore_ascii_case("LOOP") =>
                 {
                     return true;
                 }
@@ -3291,8 +3296,7 @@ impl SqlEditorWidget {
                             if close_case_paren_on_newline {
                                 let closes_plsql_condition_terminator =
                                     Self::tokens_continue_plsql_condition_terminator(tokens, idx);
-                                let close_case_extra_indent =
-                                    if closes_plsql_condition_terminator {
+                                let close_case_extra_indent = if closes_plsql_condition_terminator {
                                     0
                                 } else {
                                     usize::from(!open_cursor_state.in_select())
@@ -3591,6 +3595,7 @@ impl SqlEditorWidget {
         let mut dml_case_depths: Vec<usize> = Vec::new();
         let mut pending_query_head_depth: Option<usize> = None;
         let mut resolved_query_base_depths: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -3798,6 +3803,13 @@ impl SqlEditorWidget {
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let current_line_is_condition_keyword =
                 trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ");
+            let current_line_starts_multiline_clause =
+                in_dml_statement && Self::line_starts_multiline_clause_block(trimmed);
+            let current_line_closes_multiline_clause = multiline_clause_frames
+                .last()
+                .copied()
+                .is_some_and(|frame| starts_with_close_paren && frame.nested_paren_depth == 1);
+            let active_multiline_clause = multiline_clause_frames.last().copied();
             let starts_query_head = layouts[idx].starts_query_frame;
             let use_cursor_parser_depth = in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
@@ -4276,6 +4288,15 @@ impl SqlEditorWidget {
                 } else {
                     effective_depth
                 };
+            let effective_depth = if let Some(frame) = active_multiline_clause {
+                if current_line_closes_multiline_clause {
+                    frame.owner_depth
+                } else {
+                    effective_depth.max(frame.owner_depth.saturating_add(1))
+                }
+            } else {
+                effective_depth
+            };
 
             if starts_query_head {
                 if let Some(query_base_depth) = layouts[idx].query_base_depth {
@@ -4311,6 +4332,24 @@ impl SqlEditorWidget {
             }
 
             layouts[idx].final_depth = effective_depth;
+            if let Some(frame) = multiline_clause_frames.last_mut() {
+                if !current_line_starts_multiline_clause {
+                    let (open_count, close_count) = Self::line_significant_paren_counts(trimmed);
+                    frame.nested_paren_depth = frame
+                        .nested_paren_depth
+                        .saturating_add(open_count)
+                        .saturating_sub(close_count);
+                }
+            }
+            if current_line_closes_multiline_clause {
+                multiline_clause_frames.pop();
+            }
+            if current_line_starts_multiline_clause {
+                multiline_clause_frames.push(MultilineClauseLayoutFrame {
+                    owner_depth: effective_depth,
+                    nested_paren_depth: 1,
+                });
+            }
             let anchor_group = if !in_dml_statement
                 && previous_line_ends_with_trailing_comma
                 && last_code_indent.is_some_and(|indent| indent == effective_depth)
@@ -4364,25 +4403,23 @@ impl SqlEditorWidget {
                 let condition_owner_keeps_raw_depth =
                     Self::line_has_condition_query_owner(&trimmed_upper)
                         && (layouts[idx].query_role == AutoFormatQueryRole::None
-                            || layouts[idx].final_depth
-                                <= next_query_head_depth.saturating_sub(1));
-                let adjusted_next_query_head_depth = if non_direct_opener_keeps_raw_depth
-                    || condition_owner_keeps_raw_depth
-                {
-                    next_query_head_depth
-                } else if layouts[idx].final_depth >= layouts[idx].existing_indent {
-                    next_query_head_depth.saturating_add(
-                        layouts[idx]
-                            .final_depth
-                            .saturating_sub(layouts[idx].existing_indent),
-                    )
-                } else {
-                    next_query_head_depth.saturating_sub(
-                        layouts[idx]
-                            .existing_indent
-                            .saturating_sub(layouts[idx].final_depth),
-                    )
-                };
+                            || layouts[idx].final_depth <= next_query_head_depth.saturating_sub(1));
+                let adjusted_next_query_head_depth =
+                    if non_direct_opener_keeps_raw_depth || condition_owner_keeps_raw_depth {
+                        next_query_head_depth
+                    } else if layouts[idx].final_depth >= layouts[idx].existing_indent {
+                        next_query_head_depth.saturating_add(
+                            layouts[idx]
+                                .final_depth
+                                .saturating_sub(layouts[idx].existing_indent),
+                        )
+                    } else {
+                        next_query_head_depth.saturating_sub(
+                            layouts[idx]
+                                .existing_indent
+                                .saturating_sub(layouts[idx].final_depth),
+                        )
+                    };
                 pending_query_head_depth = Some(adjusted_next_query_head_depth);
             }
 
@@ -4390,6 +4427,7 @@ impl SqlEditorWidget {
                 in_dml_statement = false;
                 pending_query_head_depth = None;
                 resolved_query_base_depths.clear();
+                multiline_clause_frames.clear();
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -4945,6 +4983,40 @@ impl SqlEditorWidget {
     fn line_starts_with_using_clause(line: &str) -> bool {
         let trimmed_upper = line.trim_start().to_ascii_uppercase();
         crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
+    }
+
+    fn line_starts_multiline_clause_block(line: &str) -> bool {
+        if !Self::line_ends_with_open_paren_before_inline_comment(line) {
+            return false;
+        }
+
+        super::query_text::tokenize_sql(line)
+            .into_iter()
+            .any(|token| match token {
+                SqlToken::Word(word) => {
+                    word.eq_ignore_ascii_case("MATCH_RECOGNIZE")
+                        || word.eq_ignore_ascii_case("PIVOT")
+                        || word.eq_ignore_ascii_case("UNPIVOT")
+                }
+                _ => false,
+            })
+    }
+
+    fn line_significant_paren_counts(line: &str) -> (usize, usize) {
+        super::query_text::tokenize_sql(line).into_iter().fold(
+            (0usize, 0usize),
+            |(open_count, close_count), token| {
+                if let SqlToken::Symbol(symbol) = token {
+                    match symbol.as_str() {
+                        "(" => (open_count.saturating_add(1), close_count),
+                        ")" => (open_count, close_count.saturating_add(1)),
+                        _ => (open_count, close_count),
+                    }
+                } else {
+                    (open_count, close_count)
+                }
+            },
+        )
     }
 
     #[cfg(test)]
@@ -8737,7 +8809,11 @@ WHERE F IN (
     fn split_format_items_keeps_existing_inline_line_comment_after_semicolon() {
         let items = QueryExecutor::split_format_items("SELECT 1 FROM dual; -- keep terminator");
 
-        assert_eq!(items.len(), 1, "Trailing inline comment must stay in the same format item");
+        assert_eq!(
+            items.len(),
+            1,
+            "Trailing inline comment must stay in the same format item"
+        );
         match &items[0] {
             FormatItem::Statement(statement) => {
                 assert!(

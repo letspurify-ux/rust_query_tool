@@ -6730,6 +6730,27 @@ fn format_sql_oracle_ultimate_boss_idempotent() {
 }
 
 #[test]
+fn format_sql_keeps_test_format_pivot_reference_layout_exactly() {
+    let expected = load_test_file("test_format_pivot.sql");
+    assert!(
+        !expected.is_empty(),
+        "Test file test_format_pivot.sql should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&expected);
+    assert_eq!(
+        formatted, expected,
+        "Formatting must preserve the reference pivot layout exactly"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_format_pivot.sql"
+    );
+}
+
+#[test]
 fn format_sql_keeps_multiline_start_with_clause_as_sql() {
     let input =
         "SELECT LEVEL\nFROM emp e\nSTART WITH\n    e.mgr IS NULL\nCONNECT BY PRIOR e.empno = e.mgr\n;";

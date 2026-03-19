@@ -42,10 +42,7 @@ enum AutoFormatConditionTerminator {
 
 impl AutoFormatConditionTerminator {
     fn matches_keyword(self, upper: &str) -> bool {
-        matches!(
-            (self, upper),
-            (Self::Then, "THEN") | (Self::Loop, "LOOP")
-        )
+        matches!((self, upper), (Self::Then, "THEN") | (Self::Loop, "LOOP"))
     }
 }
 
@@ -145,6 +142,12 @@ struct QueryBaseDepthFrame {
     trailing_comma_continuation: bool,
     multitable_insert_branch_depth: usize,
     is_multitable_insert: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MultilineClauseDepthFrame {
+    owner_depth: usize,
+    nested_paren_depth: usize,
 }
 
 // ── TopLevelScanner ─────────────────────────────────────────────────────────
@@ -1233,6 +1236,7 @@ impl QueryExecutor {
         let mut non_query_into_continuation_depth: Option<usize> = None;
         let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
         let mut active_condition_frames: Vec<ActiveConditionFrame> = Vec::new();
+        let mut multiline_clause_frames: Vec<MultilineClauseDepthFrame> = Vec::new();
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1278,6 +1282,12 @@ impl QueryExecutor {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let clause_kind = Self::auto_format_clause_kind(&trimmed_upper);
             let active_frame = query_frames.last().copied();
+            let starts_multiline_clause =
+                Self::line_starts_multiline_clause_block(trimmed, &trimmed_upper);
+            let closes_multiline_clause = multiline_clause_frames
+                .last()
+                .copied()
+                .is_some_and(|frame| trimmed.starts_with(')') && frame.nested_paren_depth == 1);
             if let Some(frame) = active_frame {
                 context.query_base_depth = Some(frame.query_base_depth);
             }
@@ -1416,6 +1426,18 @@ impl QueryExecutor {
                 non_query_into_continuation_depth = None;
             }
 
+            if let Some(frame) = multiline_clause_frames.last().copied() {
+                if closes_multiline_clause {
+                    context.auto_depth = frame.owner_depth;
+                } else {
+                    context.auto_depth =
+                        context.auto_depth.max(frame.owner_depth.saturating_add(1));
+                }
+            }
+            if starts_multiline_clause {
+                context.auto_depth = context.auto_depth.max(existing_indent);
+            }
+
             let condition_annotation = Self::annotate_parenthesized_condition_line(
                 line,
                 idx,
@@ -1438,9 +1460,29 @@ impl QueryExecutor {
                 pending_query_base = Some(base_depth_for_child_query);
             }
 
+            if let Some(frame) = multiline_clause_frames.last_mut() {
+                if !starts_multiline_clause {
+                    let (open_count, close_count) = Self::line_significant_paren_counts(trimmed);
+                    frame.nested_paren_depth = frame
+                        .nested_paren_depth
+                        .saturating_add(open_count)
+                        .saturating_sub(close_count);
+                }
+            }
+            if closes_multiline_clause {
+                multiline_clause_frames.pop();
+            }
+            if starts_multiline_clause {
+                multiline_clause_frames.push(MultilineClauseDepthFrame {
+                    owner_depth: existing_indent.max(context.auto_depth),
+                    nested_paren_depth: 1,
+                });
+            }
+
             if trimmed.ends_with(';') {
                 query_frames.pop();
                 pending_query_base = None;
+                multiline_clause_frames.clear();
             }
 
             contexts.push(context);
@@ -1532,9 +1574,7 @@ impl QueryExecutor {
         header_depth: usize,
     ) -> Option<PendingConditionHeader> {
         let (terminator, requires_in_keyword) = match word_upper {
-            "IF" | "ELSIF" | "ELSEIF" | "WHEN" => {
-                (AutoFormatConditionTerminator::Then, false)
-            }
+            "IF" | "ELSIF" | "ELSEIF" | "WHEN" => (AutoFormatConditionTerminator::Then, false),
             "WHILE" => (AutoFormatConditionTerminator::Loop, false),
             "FOR" => (AutoFormatConditionTerminator::Loop, true),
             _ => return None,
@@ -1558,14 +1598,17 @@ impl QueryExecutor {
     ) -> ConditionLineAnnotation {
         let bytes = line.as_bytes();
         let mut idx = 0usize;
-        let mut annotation = active_frames.last().copied().map_or_else(
-            ConditionLineAnnotation::default,
-            |frame| ConditionLineAnnotation {
-                header_line_idx: Some(frame.header_line_idx),
-                header_depth: Some(frame.header_depth),
-                ..ConditionLineAnnotation::default()
-            },
-        );
+        let mut annotation =
+            active_frames
+                .last()
+                .copied()
+                .map_or_else(ConditionLineAnnotation::default, |frame| {
+                    ConditionLineAnnotation {
+                        header_line_idx: Some(frame.header_line_idx),
+                        header_depth: Some(frame.header_depth),
+                        ..ConditionLineAnnotation::default()
+                    }
+                });
         let mut saw_significant_token = false;
         let mut saw_leading_close_paren = false;
 
@@ -1686,10 +1729,9 @@ impl QueryExecutor {
                     }
                 }
 
-                if active_frames
-                    .last()
-                    .is_some_and(|frame| frame.paren_depth == 0 && frame.terminator.matches_keyword(&word_upper))
-                {
+                if active_frames.last().is_some_and(|frame| {
+                    frame.paren_depth == 0 && frame.terminator.matches_keyword(&word_upper)
+                }) {
                     if let Some(frame) = active_frames.pop() {
                         annotation.header_line_idx = Some(frame.header_line_idx);
                         annotation.header_depth = Some(frame.header_depth);
@@ -1782,8 +1824,7 @@ impl QueryExecutor {
             idx += 1;
         }
 
-        if annotation.role == AutoFormatConditionRole::None
-            && annotation.header_line_idx.is_some()
+        if annotation.role == AutoFormatConditionRole::None && annotation.header_line_idx.is_some()
         {
             annotation.role = if saw_leading_close_paren {
                 AutoFormatConditionRole::Closer
@@ -1847,6 +1888,72 @@ impl QueryExecutor {
 
     fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
         Self::trailing_significant_byte_before_inline_comment(line) == Some(b'(')
+    }
+
+    fn line_starts_multiline_clause_block(line: &str, trimmed_upper: &str) -> bool {
+        Self::line_ends_with_open_paren_before_inline_comment(line)
+            && (trimmed_upper.contains("MATCH_RECOGNIZE")
+                || trimmed_upper.contains("PIVOT")
+                || trimmed_upper.contains("UNPIVOT"))
+    }
+
+    fn line_significant_paren_counts(line: &str) -> (usize, usize) {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut open_count = 0usize;
+        let mut close_count = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        idx += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                break;
+            }
+            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                break;
+            }
+            if current == b'\'' {
+                in_single_quote = true;
+                idx += 1;
+                continue;
+            }
+            if current == b'"' {
+                in_double_quote = true;
+                idx += 1;
+                continue;
+            }
+
+            if current == b'(' {
+                open_count = open_count.saturating_add(1);
+            } else if current == b')' {
+                close_count = close_count.saturating_add(1);
+            }
+            idx += 1;
+        }
+
+        (open_count, close_count)
     }
 
     fn pending_query_owner_base_depth(
@@ -4087,7 +4194,9 @@ impl QueryExecutor {
                     }
 
                     items.extend(line_items);
-                    items.push(FormatItem::Statement(trailing_comment.trim_start().to_string()));
+                    items.push(FormatItem::Statement(
+                        trailing_comment.trim_start().to_string(),
+                    ));
                     continue;
                 }
             }
@@ -6365,6 +6474,60 @@ END;"#;
             contexts[select_idx].query_base_depth,
             Some(contexts[for_idx].auto_depth.saturating_add(1)),
             "child query base depth should be anchored from the FOR header"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_pivot_body_one_level_deeper_than_owner_line() {
+        let sql = r#"SELECT pvt.deptno,
+    pvt."CLERK" AS clerk_cnt,
+    pvt."MANAGER" AS manager_cnt,
+    pvt."ANALYST" AS analyst_cnt,
+    pvt."SALESMAN" AS salesman_cnt,
+    pvt."PRESIDENT" AS president_cnt
+FROM (
+        SELECT e.deptno,
+            e.job
+        FROM emp e
+    ) PIVOT (
+        COUNT (*)
+        FOR job IN ('CLERK' AS "CLERK", 'MANAGER' AS "MANAGER", 'ANALYST' AS "ANALYST", 'SALESMAN' AS "SALESMAN", 'PRESIDENT' AS "PRESIDENT")
+    ) pvt
+ORDER BY pvt.deptno;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start().contains(") PIVOT ("))
+            .unwrap_or(0);
+        let count_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COUNT (*)")
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR job IN"))
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") pvt")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[count_idx].auto_depth,
+            contexts[pivot_idx].auto_depth.saturating_add(1),
+            "PIVOT aggregate line should be exactly one level deeper than the PIVOT owner line"
+        );
+        assert_eq!(
+            contexts[for_idx].auto_depth,
+            contexts[pivot_idx].auto_depth.saturating_add(1),
+            "PIVOT FOR line should stay aligned with the aggregate line"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[pivot_idx].auto_depth,
+            "PIVOT closing line should realign with the PIVOT owner line"
         );
     }
 
