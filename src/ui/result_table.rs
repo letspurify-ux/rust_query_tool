@@ -323,20 +323,6 @@ struct ActiveInlineEdit {
     input: Input,
 }
 
-/// Per-page cache of edit state tuples populated once during `StartPage` and
-/// read back per-cell during `Cell` rendering.  This eliminates repeated mutex
-/// acquisitions and per-cell `cell_edit_state_for_draw` computations.
-/// Captured as a plain owned value inside the `FnMut` draw_cell closure.
-struct DrawPageEditCache {
-    /// Whether an active edit session existed when the page was last computed.
-    active: bool,
-    /// First visible row index – used as offset into `cell_states`.
-    start_row: usize,
-    /// Per visible-row, per column: (is_edited, is_explicit_null, is_original_null).
-    /// Indexed as `cell_states[row_idx - start_row][col_idx]`.
-    cell_states: Vec<Vec<(bool, bool, bool)>>,
-}
-
 impl ResultTableWidget {
     fn current_epoch_millis() -> u64 {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -1283,15 +1269,6 @@ impl ResultTableWidget {
         let edit_session_for_draw = edit_session.clone();
         let sort_state_for_draw = sort_state.clone();
 
-        // Page-level cache for edit state: populated once per StartPage,
-        // looked up per Cell.  Captured as a plain owned value since the
-        // draw_cell closure is FnMut (no interior mutability needed).
-        let mut page_edit_cache = DrawPageEditCache {
-            active: false,
-            start_row: 0,
-            cell_states: Vec::new(),
-        };
-
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
             let normal_font = font_settings_for_draw.normal_font();
             let bold_font = font_settings_for_draw.bold_font();
@@ -1299,46 +1276,6 @@ impl ResultTableWidget {
             match ctx {
                 TableContext::StartPage => {
                     draw::set_font(normal_font, font_size);
-
-                    // Pre-compute edit states for all visible cells on this page.
-                    page_edit_cache.active = false;
-                    page_edit_cache.cell_states.clear();
-
-                    let total_rows = table_for_draw.rows().max(0) as usize;
-                    let total_cols = table_for_draw.cols().max(0) as usize;
-                    if total_rows == 0 || total_cols == 0 {
-                        return;
-                    }
-                    let start_row = (table_for_draw.row_position().max(0) as usize).min(total_rows);
-                    let table_h = table_for_draw.h();
-                    let row_h = table_for_draw.row_height(start_row as i32).max(1);
-                    let visible_row_count =
-                        ((table_h / row_h) as usize + 2).min(total_rows - start_row);
-                    let end_row = start_row + visible_row_count;
-
-                    page_edit_cache.start_row = start_row;
-
-                    if let Ok(session_guard) = edit_session_for_draw.try_lock() {
-                        if let Some(session) = session_guard.as_ref() {
-                            page_edit_cache.active = true;
-                            if let Ok(data) = full_data_for_draw.try_lock() {
-                                page_edit_cache.cell_states.reserve(visible_row_count);
-                                for row_idx in start_row..end_row {
-                                    let mut row_states = Vec::with_capacity(total_cols);
-                                    if let Some(row_data) = data.get(row_idx) {
-                                        for col_idx in 0..total_cols {
-                                            row_states.push(Self::cell_edit_state_for_draw(
-                                                session, row_idx, col_idx, row_data,
-                                            ));
-                                        }
-                                    } else {
-                                        row_states.resize(total_cols, (false, false, false));
-                                    }
-                                    page_edit_cache.cell_states.push(row_states);
-                                }
-                            }
-                        }
-                    }
                 }
                 TableContext::ColHeader => {
                     draw::push_clip(x, y, w, h);
@@ -1473,20 +1410,15 @@ impl ResultTableWidget {
                     {
                         if let Ok(data) = full_data_for_draw.try_lock() {
                             if let Some(row_data) = data.get(row_idx) {
-                                // Look up pre-computed edit state from the page cache
-                                // instead of locking edit_session per cell.
-                                if page_edit_cache.active && row_idx >= page_edit_cache.start_row {
-                                    let row_offset = row_idx - page_edit_cache.start_row;
-                                    if let Some(row_cache) =
-                                        page_edit_cache.cell_states.get(row_offset)
-                                    {
-                                        if let Some(&state) = row_cache.get(col_idx) {
-                                            (
-                                                is_edited_cell,
-                                                is_explicit_null_cell,
-                                                is_original_null_cell,
-                                            ) = state;
-                                        }
+                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                    if let Some(session) = session_guard.as_ref() {
+                                        (
+                                            is_edited_cell,
+                                            is_explicit_null_cell,
+                                            is_original_null_cell,
+                                        ) = Self::cell_edit_state_for_draw(
+                                            session, row_idx, col_idx, row_data,
+                                        );
                                     }
                                 }
                                 draw_cell_contents(
