@@ -1475,6 +1475,7 @@ impl ResultTableWidget {
                             if let Some(row_data) = data.get(row_idx) {
                                 // Look up pre-computed edit state from the page cache
                                 // instead of locking edit_session per cell.
+                                let mut has_cached_edit_state = false;
                                 if page_edit_cache.active && row_idx >= page_edit_cache.start_row {
                                     let row_offset = row_idx - page_edit_cache.start_row;
                                     if let Some(row_cache) =
@@ -1486,6 +1487,20 @@ impl ResultTableWidget {
                                                 is_explicit_null_cell,
                                                 is_original_null_cell,
                                             ) = state;
+                                            has_cached_edit_state = true;
+                                        }
+                                    }
+                                }
+                                if !has_cached_edit_state {
+                                    if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                        if let Some(session) = session_guard.as_ref() {
+                                            (
+                                                is_edited_cell,
+                                                is_explicit_null_cell,
+                                                is_original_null_cell,
+                                            ) = Self::cell_edit_state_for_draw(
+                                                session, row_idx, col_idx, row_data,
+                                            );
                                         }
                                     }
                                 }
