@@ -220,6 +220,32 @@ fn with_function_recovery_splits_before_script_commands_after_leading_block_comm
 }
 
 #[test]
+fn with_function_end_label_comma_recovers_before_following_cte_as_clause() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH");
+    engine.process_line("    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS");
+    engine.process_line("    BEGIN");
+    engine.process_line("        RETURN p_txt;");
+    engine.process_line("    END fmt_mask,");
+
+    assert_eq!(engine.state.block_depth(), 0);
+    assert_eq!(
+        engine.state.with_clause_state,
+        WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery)
+    );
+
+    engine.process_line("    base_emp AS (");
+
+    assert_eq!(
+        engine.state.block_depth(),
+        0,
+        "CTE AS must not be reinterpreted as a nested PL/SQL AS/IS block"
+    );
+    assert_eq!(engine.state.paren_depth(), 1);
+}
+
+#[test]
 fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
     let waiting_main_query = SplitState {
         with_clause_state: WithClauseState::InPlsqlDeclaration(
@@ -4246,6 +4272,89 @@ fn with_function_followed_by_non_recursive_with_query_stays_single_statement() {
         "CTE WITH should be treated as a valid main query head: {}",
         statements[0]
     );
+}
+
+#[test]
+fn with_function_declaration_with_end_label_and_trailing_ctes_stays_single_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH");
+    engine.process_line(
+        "    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;",
+    );
+    engine.process_line("BEGIN");
+    engine.process_line("    SELECT MAX (LEVEL)");
+    engine.process_line("    INTO v_depth");
+    engine.process_line("    FROM org_tree");
+    engine.process_line("    START WITH parent_id IS NULL");
+    engine.process_line("    CONNECT BY PRIOR node_id = parent_id;");
+    engine.process_line("    RETURN v_depth;");
+    engine.process_line("END calc_depth;");
+    engine.process_line("");
+    engine.process_line("recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (");
+    engine.process_line("    SELECT node_id,");
+    engine.process_line("        parent_id,");
+    engine.process_line("        node_name,");
+    engine.process_line("        1 AS DEPTH,");
+    engine.process_line("        CAST (node_name AS VARCHAR2 (4000)) AS PATH");
+    engine.process_line("    FROM org_tree");
+    engine.process_line("    WHERE parent_id IS NULL");
+    engine.process_line("    UNION ALL");
+    engine.process_line("    SELECT t.node_id,");
+    engine.process_line("        t.parent_id,");
+    engine.process_line("        t.node_name,");
+    engine.process_line("        rt.DEPTH + 1,");
+    engine.process_line("        rt.PATH || ' > ' || t.node_name");
+    engine.process_line("    FROM org_tree t");
+    engine.process_line("    JOIN recursive_tree rt");
+    engine.process_line("        ON t.parent_id = rt.node_id");
+    engine.process_line("    WHERE rt.DEPTH < calc_depth (t.node_id)");
+    engine.process_line("),");
+    engine.process_line("    aggregated AS (");
+    engine.process_line("        SELECT parent_id,");
+    engine.process_line("            COUNT (*) AS child_count,");
+    engine.process_line("            MAX (DEPTH) AS max_depth,");
+    engine.process_line(
+        "            LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children",
+    );
+    engine.process_line("        FROM recursive_tree");
+    engine.process_line("        WHERE DEPTH > 1");
+    engine.process_line("        GROUP BY parent_id");
+    engine.process_line("    )");
+    engine.process_line("SELECT rt.*,");
+    engine.process_line("    a.child_count,");
+    engine.process_line("    a.max_depth,");
+    engine.process_line("    a.children");
+    engine.process_line("FROM recursive_tree rt");
+    engine.process_line("LEFT JOIN aggregated a");
+    engine.process_line("    ON rt.node_id = a.parent_id");
+    engine.process_line("ORDER BY rt.PATH;");
+    engine.process_line("SELECT 2 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END calc_depth;"),
+        "function end label should remain attached: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS"),
+        "CTE header should remain attached after WITH FUNCTION declaration: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("aggregated AS ("),
+        "trailing CTE should remain attached after WITH FUNCTION declaration: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("ORDER BY rt.PATH"),
+        "main SELECT should remain attached after trailing CTEs: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 2 FROM dual"));
 }
 
 #[test]

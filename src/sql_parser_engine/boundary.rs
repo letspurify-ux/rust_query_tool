@@ -809,6 +809,8 @@ impl AsIsBlockStart {
         }
 
         if state.as_is_state == AsIsState::AwaitingNestedSubprogram
+            || (state.collecting_with_plsql_routine_declaration()
+                && state.block_depth() == 0)
             || (state.in_create_plsql()
                 && !state.in_java_source_create()
                 && state.block_depth() == 0)

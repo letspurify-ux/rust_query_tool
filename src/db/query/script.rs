@@ -3672,6 +3672,8 @@ impl QueryExecutor {
         let mut with_plsql_waiting_main_query = false;
         let mut with_plsql_block_depth = 0usize;
         let mut with_plsql_pending_end = false;
+        let mut with_plsql_starts_routine_body = false;
+        let mut with_plsql_pending_routine_begin = false;
         let mut top_level_closed_paren_recently = false;
         let mut parenthesized_main_query_depth: Option<usize> = None;
         let mut q_quote_end_byte: Option<u8> = None;
@@ -3801,6 +3803,8 @@ impl QueryExecutor {
                 if in_with_plsql_declaration && with_plsql_block_depth == 0 {
                     in_with_plsql_declaration = false;
                     with_plsql_waiting_main_query = true;
+                    with_plsql_starts_routine_body = false;
+                    with_plsql_pending_routine_begin = false;
                 }
                 pos += 1;
                 continue;
@@ -3827,12 +3831,27 @@ impl QueryExecutor {
                 };
 
                 if in_with_plsql_declaration {
+                    if (token.eq_ignore_ascii_case("AS") || token.eq_ignore_ascii_case("IS"))
+                        && with_plsql_starts_routine_body
+                        && with_plsql_block_depth == 0
+                    {
+                        with_plsql_block_depth = 1;
+                        with_plsql_pending_routine_begin = true;
+                        continue;
+                    }
                     if token.eq_ignore_ascii_case("BEGIN")
                         || token.eq_ignore_ascii_case("DECLARE")
                         || token.eq_ignore_ascii_case("CASE")
                         || token.eq_ignore_ascii_case("IF")
                         || token.eq_ignore_ascii_case("LOOP")
                     {
+                        if token.eq_ignore_ascii_case("BEGIN")
+                            && with_plsql_pending_routine_begin
+                            && with_plsql_block_depth == 1
+                        {
+                            with_plsql_pending_routine_begin = false;
+                            continue;
+                        }
                         resolve_pending(&mut with_plsql_pending_end, &mut with_plsql_block_depth);
                         with_plsql_block_depth += 1;
                         continue;
@@ -3857,6 +3876,18 @@ impl QueryExecutor {
                     with_plsql_waiting_main_query = false;
                     with_plsql_block_depth = 0;
                     with_plsql_pending_end = false;
+                    with_plsql_starts_routine_body = true;
+                    with_plsql_pending_routine_begin = false;
+                    continue;
+                }
+
+                if token.eq_ignore_ascii_case("PACKAGE") || token.eq_ignore_ascii_case("TYPE") {
+                    in_with_plsql_declaration = true;
+                    with_plsql_waiting_main_query = false;
+                    with_plsql_block_depth = 0;
+                    with_plsql_pending_end = false;
+                    with_plsql_starts_routine_body = false;
+                    with_plsql_pending_routine_begin = false;
                     continue;
                 }
 
@@ -6266,6 +6297,38 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
     }
 
     #[test]
+    fn with_function_end_label_and_trailing_ctes_is_recognized_as_select_statement() {
+        let sql = "WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;
+
+BEGIN
+    SELECT MAX (LEVEL)
+    INTO v_depth
+    FROM org_tree
+    START WITH parent_id IS NULL
+    CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+)
+SELECT *
+FROM recursive_tree";
+
+        assert!(
+            QueryExecutor::is_select_statement(sql),
+            "WITH FUNCTION + labeled END + trailing CTEs should be treated as SELECT"
+        );
+    }
+
+    #[test]
     fn parse_tool_command_start_with_inline_comment_is_not_script_command() {
         assert!(
             QueryExecutor::parse_tool_command("START /*tree*/ WITH manager_id IS NULL").is_none(),
@@ -7087,6 +7150,51 @@ END;"#;
         assert_eq!(
             depths[end_if_idx], depths[if_idx],
             "END IF should stay aligned with IF after parenthesized CASE condition continuations"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_close_case_before_for_loop_header_loop() {
+        let sql = r#"DECLARE
+    v_x NUMBER := 1;
+BEGIN
+    FOR i IN 1..CASE WHEN v_x = 1 THEN 5 ELSE 10 END LOOP
+        NULL;
+    END LOOP;
+END;"#;
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim() == "FOR i IN 1..CASE WHEN v_x = 1 THEN 5 ELSE 10 END LOOP")
+            .unwrap_or(0);
+        let body_idx = lines
+            .iter()
+            .position(|line| line.trim() == "NULL;")
+            .unwrap_or(0);
+        let end_loop_idx = lines
+            .iter()
+            .position(|line| line.trim() == "END LOOP;")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .rposition(|line| line.trim() == "END;")
+            .unwrap_or(0);
+
+        assert_eq!(depths[for_idx], 1, "FOR header should stay at outer BEGIN body depth");
+        assert_eq!(
+            depths[body_idx],
+            depths[for_idx].saturating_add(1),
+            "loop body should indent exactly one level deeper than the FOR header"
+        );
+        assert_eq!(
+            depths[end_loop_idx], depths[for_idx],
+            "END LOOP should align with the FOR header after CASE expression range"
+        );
+        assert_eq!(
+            depths[end_idx], 0,
+            "final END should return to top-level depth after CASE expression loop header"
         );
     }
 

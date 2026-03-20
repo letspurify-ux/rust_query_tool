@@ -88,6 +88,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CONNECT_BY_ISLEAF",
     "CONNECT_BY_ROOT",
     "CONSTRAINT",
+    "CONSTRUCTOR",
     "CONTAINER",
     "CONTENT",
     "CONTEXT",
@@ -165,6 +166,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "FAST",
     "FEEDBACK",
     "FETCH",
+    "FINAL",
     "FIRST",
     "FIRST_VALUE",
     "FLASHBACK",
@@ -205,6 +207,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "INNER",
     "INSERT",
     "INSERTING",
+    "INSTANTIABLE",
     "INSTEAD",
     "INTEGER",
     "INTERSECT",
@@ -253,6 +256,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "LONG",
     "LOOP",
     "MAIN",
+    "MAP",
     "MAPPING",
     "MATCH",
     "MATCHED",
@@ -343,6 +347,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OVER",
     "OVERFLOW",
     "OVERLAY",
+    "OVERRIDING",
     "PACKAGE",
     "PACKAGE_BODY",
     "PARALLEL",
@@ -470,6 +475,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SQL_TRACE",
     "START",
     "STARTUP",
+    "STATIC",
     "STATISTICS_LEVEL",
     "STORAGE",
     "STORE",
@@ -1133,6 +1139,12 @@ pub(crate) fn is_with_plsql_declaration_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_PLSQL_DECLARATION_KEYWORDS)
 }
 
+/// Returns true when a top-level `WITH` PL/SQL declaration uses `AS/IS` to
+/// open a routine body that stays active until a matching `END`.
+pub(crate) fn with_plsql_declaration_starts_routine_body(word: &str) -> bool {
+    matches!(word.to_ascii_uppercase().as_str(), "FUNCTION" | "PROCEDURE")
+}
+
 /// Returns true when a top-level `WITH` token clearly belongs to a non-PL/SQL
 /// clause (for example `WITH READ ONLY` in view definitions).
 pub(crate) fn is_with_non_plsql_clause_keyword(word: &str) -> bool {
@@ -1409,10 +1421,16 @@ mod tests {
     #[test]
     fn shared_keyword_pool_includes_parser_and_highlighter_keywords() {
         for keyword in [
+            "CONSTRUCTOR",
+            "FINAL",
+            "INSTANTIABLE",
+            "MAP",
+            "OVERRIDING",
             "PACKAGE_BODY",
             "RECOGNIZE",
             "REPEATABLE",
             "SHARE",
+            "STATIC",
             "SUBMULTISET",
             "TABLESAMPLE",
             "WRAPPED",

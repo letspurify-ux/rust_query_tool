@@ -6947,6 +6947,86 @@ fn format_sql_keeps_test25_cursor_block_case_and_end_loop_aligned() {
 }
 
 #[test]
+fn format_sql_keeps_final_end_at_depth_zero_after_case_in_for_loop_header() {
+    let input = r#"DECLARE
+    v_x NUMBER := 1;
+    v_y VARCHAR2(100);
+BEGIN
+    v_y := CASE
+        WHEN v_x = 1 THEN
+            CASE v_x
+                WHEN 1 THEN 'ONE'
+                WHEN 2 THEN 'TWO'
+                ELSE CASE WHEN v_x > 2 THEN 'BIG' ELSE 'SMALL' END
+            END
+        WHEN v_x = 2 THEN
+            'TWO'
+        ELSE
+            CASE
+                WHEN v_x IS NULL THEN 'NULL'
+                ELSE 'OTHER'
+            END
+    END;
+
+    FOR i IN 1..CASE WHEN v_x = 1 THEN 5 ELSE 10 END LOOP
+        DBMS_OUTPUT.PUT_LINE(
+            CASE i WHEN 1 THEN 'first' WHEN 2 THEN 'second' ELSE 'other' END
+        );
+    END LOOP;
+
+    UPDATE my_table
+    SET status = CASE
+        WHEN id IN (SELECT CASE WHEN active = 'Y' THEN id ELSE NULL END FROM sub_t) THEN 'ACTIVE'
+        ELSE 'INACTIVE'
+    END,
+    priority = CASE category
+        WHEN 'A' THEN 1
+        WHEN 'B' THEN 2
+        ELSE CASE WHEN amount > 1000 THEN 3 ELSE 4 END
+    END
+    WHERE dept_id = v_x;
+
+    COMMIT;
+END;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FOR i IN 1.."))
+        .unwrap_or(0);
+    let end_loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END LOOP;")
+        .unwrap_or(0);
+    let commit_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "COMMIT;")
+        .unwrap_or(0);
+    let end_idx = lines
+        .iter()
+        .rposition(|line| line.trim_start() == "END;")
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[end_loop_idx]),
+        indent(lines[loop_idx]),
+        "END LOOP should align with FOR header after CASE range expression, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[commit_idx]), 4,
+        "COMMIT should stay one level deeper than the outer DECLARE/BEGIN block, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[end_idx]), 0,
+        "final END should return to depth 0 after mixed CASE/LOOP/UPDATE formatting, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sensitive() {
     let input = load_test_file("test25.sql");
     assert!(

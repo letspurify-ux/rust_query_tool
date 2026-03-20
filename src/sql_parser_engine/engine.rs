@@ -784,6 +784,10 @@ impl SqlParserEngine {
                 self.state.resolve_pending_end_on_separator();
             }
 
+            if c == ',' {
+                self.state.advance_with_clause_after_comma();
+            }
+
             if symbol_role == SymbolRole::Semicolon {
                 self.state.clear_skip_next_end_label_token();
                 let semicolon_action = self.state.prepare_semicolon_action();

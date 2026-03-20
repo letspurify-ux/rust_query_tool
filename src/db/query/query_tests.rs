@@ -948,6 +948,85 @@ fn test_statement_bounds_at_cursor_splits_after_with_function_and_run_script_com
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_keeps_with_function_end_label_and_trailing_ctes_attached() {
+    let sql = "WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;
+
+BEGIN
+    SELECT MAX (LEVEL)
+    INTO v_depth
+    FROM org_tree
+    START WITH parent_id IS NULL
+    CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+    aggregated AS (
+        SELECT parent_id,
+            COUNT (*) AS child_count,
+            MAX (DEPTH) AS max_depth,
+            LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+        FROM recursive_tree
+        WHERE DEPTH > 1
+        GROUP BY parent_id
+    )
+SELECT rt.*,
+    a.child_count,
+    a.max_depth,
+    a.children
+FROM recursive_tree rt
+LEFT JOIN aggregated a
+    ON rt.node_id = a.parent_id
+ORDER BY rt.PATH;
+SELECT 2 FROM dual;";
+    let cursor = sql.find("aggregated AS").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for WITH FUNCTION + trailing CTE query");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("WITH\n    FUNCTION calc_depth"),
+        "statement bounds should start from WITH FUNCTION declaration: {statement}"
+    );
+    assert!(
+        statement.contains("END calc_depth;"),
+        "function end label should remain inside statement bounds: {statement}"
+    );
+    assert!(
+        statement.contains("aggregated AS ("),
+        "trailing CTE should remain inside statement bounds: {statement}"
+    );
+    assert!(
+        statement.contains("ORDER BY rt.PATH"),
+        "main query tail should remain inside statement bounds: {statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 2 FROM dual;"),
+        "next statement must not leak into current statement bounds: {statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_keeps_multiline_alter_session_set_clause() {
     let sql = "ALTER SESSION\nSET NLS_DATE_FORMAT = 'YYYY-MM-DD';\nSELECT 1 FROM dual;";
     let cursor = sql.find("NLS_DATE_FORMAT").unwrap_or(0);
@@ -11957,6 +12036,89 @@ SELECT 2 FROM dual;";
     assert!(
         stmts[0].contains("SELECT n FROM cte"),
         "first statement should include the main SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_end_label_and_trailing_ctes_keep_single_statement()
+{
+    let sql = "WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;
+
+BEGIN
+    SELECT MAX (LEVEL)
+    INTO v_depth
+    FROM org_tree
+    START WITH parent_id IS NULL
+    CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+    aggregated AS (
+        SELECT parent_id,
+            COUNT (*) AS child_count,
+            MAX (DEPTH) AS max_depth,
+            LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+        FROM recursive_tree
+        WHERE DEPTH > 1
+        GROUP BY parent_id
+    )
+SELECT rt.*,
+    a.child_count,
+    a.max_depth,
+    a.children
+FROM recursive_tree rt
+LEFT JOIN aggregated a
+    ON rt.node_id = a.parent_id
+ORDER BY rt.PATH;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION end label + trailing CTEs must remain a single statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("END calc_depth;"),
+        "first statement should preserve the labeled function END: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS"),
+        "first statement should preserve the first trailing CTE: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("aggregated AS ("),
+        "first statement should preserve subsequent trailing CTEs: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("ORDER BY rt.PATH"),
+        "first statement should include the main SELECT tail: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));

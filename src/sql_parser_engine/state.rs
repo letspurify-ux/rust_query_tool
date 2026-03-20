@@ -51,6 +51,7 @@ pub(crate) struct SplitState {
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
     with_clause_state: WithClauseState,
+    with_plsql_declaration_starts_routine_body: bool,
     top_level_token_state: TopLevelTokenState,
 
     // -- Reusable buffer --
@@ -526,6 +527,14 @@ impl SplitState {
         )
     }
 
+    fn collecting_with_plsql_routine_declaration(&self) -> bool {
+        self.with_plsql_declaration_starts_routine_body
+            && matches!(
+                self.with_clause_state,
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration)
+            )
+    }
+
     pub(crate) fn has_pending_declare_begin(&self) -> bool {
         self.begin_state == BeginState::AfterDeclare
     }
@@ -682,7 +691,12 @@ impl SplitState {
                     self.handle_pending_end_on_token(upper, end_token_role.suffix());
 
                 if !consume_as_end_label {
-                    self.handle_block_openers(upper, end_token_role);
+                    let block_opener_end_token_role = EndTokenRole::from_token(
+                        upper,
+                        self.pending_end,
+                        self.allow_timing_point_end_suffix(),
+                    );
+                    self.handle_block_openers(upper, block_opener_end_token_role);
                 }
             }
         }
@@ -753,7 +767,17 @@ impl SplitState {
         }
 
         if let Some(suffix) = suffix {
+            let top_is_case_before_suffix = self.top_is_case();
             let parsed_suffix_closed_block = suffix.apply_to_state(self);
+            if top_is_case_before_suffix && suffix != PendingEndSuffix::Case {
+                // `CASE ... END LOOP` in a FOR/WHILE header is a CASE-expression close
+                // followed by a new LOOP token, not an `END LOOP` terminator.
+                self.resolve_plain_end("");
+                self.pending_end = PendingEnd::None;
+                self.pending_end_label_segments.clear();
+                self.skip_next_end_label_token = false;
+                return false;
+            }
             let treat_suffix_as_label = !parsed_suffix_closed_block
                 && self.pending_end_suffix_token_should_be_treated_as_label(token_upper);
             if treat_suffix_as_label && !self.top_is_case() {
@@ -1135,6 +1159,14 @@ impl SplitState {
         self.resolve_pending_end_with_policy(EndResolutionPolicy::ResetCreateStateWhenTopLevel);
     }
 
+    pub(crate) fn advance_with_clause_after_comma(&mut self) {
+        if self.in_with_plsql_declaration() && self.block_depth() == 0 && self.paren_depth == 0 {
+            self.with_clause_state =
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery);
+            self.with_plsql_declaration_starts_routine_body = false;
+        }
+    }
+
     fn advance_with_clause_after_semicolon(&mut self) {
         if self.in_with_plsql_declaration() && self.block_depth() == 0 && self.paren_depth == 0 {
             self.with_clause_state =
@@ -1295,6 +1327,7 @@ impl SplitState {
         self.if_state = IfState::None;
         self.clear_paren_stack();
         self.with_clause_state = WithClauseState::None;
+        self.with_plsql_declaration_starts_routine_body = false;
         self.top_level_token_state = TopLevelTokenState::NoneSeen;
         self.pending_implicit_external_top_level_split = false;
     }
@@ -1539,14 +1572,18 @@ impl SplitState {
             at_statement_start || self.with_clause_state == WithClauseState::None;
         if upper == "WITH" && can_start_with_clause {
             self.with_clause_state = WithClauseState::PendingClause;
+            self.with_plsql_declaration_starts_routine_body = false;
             return;
         }
 
         if self.with_clause_state == WithClauseState::None {
+            self.with_plsql_declaration_starts_routine_body = false;
             return;
         }
 
         if sql_text::is_with_plsql_declaration_keyword(upper) {
+            self.with_plsql_declaration_starts_routine_body =
+                sql_text::with_plsql_declaration_starts_routine_body(upper);
             self.with_clause_state =
                 WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
             return;
@@ -1556,6 +1593,7 @@ impl SplitState {
             && sql_text::is_with_non_plsql_clause_keyword(upper)
         {
             self.with_clause_state = WithClauseState::None;
+            self.with_plsql_declaration_starts_routine_body = false;
             return;
         }
 
@@ -1565,6 +1603,7 @@ impl SplitState {
         // a PL/SQL declaration keyword has already been seen.
         if upper == "AS" && self.with_clause_state == WithClauseState::PendingClause {
             self.with_clause_state = WithClauseState::None;
+            self.with_plsql_declaration_starts_routine_body = false;
             return;
         }
 
@@ -1580,6 +1619,7 @@ impl SplitState {
             }
 
             self.with_clause_state = WithClauseState::None;
+            self.with_plsql_declaration_starts_routine_body = false;
         }
     }
 
@@ -1593,6 +1633,7 @@ impl SplitState {
 
         if ch == '(' {
             self.with_clause_state = WithClauseState::None;
+            self.with_plsql_declaration_starts_routine_body = false;
         }
     }
 }

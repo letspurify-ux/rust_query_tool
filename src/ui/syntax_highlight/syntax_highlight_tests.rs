@@ -101,6 +101,31 @@ fn test_keyword_highlighting() {
     // "SELECT" should be keyword (B)
     assert!(styles.starts_with("BBBBBB"));
 }
+
+#[test]
+fn test_type_body_member_modifiers_are_highlighted_as_keywords() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"CREATE OR REPLACE TYPE BODY money_t AS
+    CONSTRUCTOR FUNCTION money_t (p_amount IN NUMBER) RETURN SELF AS RESULT IS
+    BEGIN
+        RETURN;
+    END;
+
+    MAP MEMBER FUNCTION get_normalized RETURN NUMBER IS
+    BEGIN
+        RETURN 1;
+    END;"#;
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["CONSTRUCTOR", "MAP", "MEMBER"] {
+        let start = text.find(token).unwrap_or(0);
+        let end = start + token.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{token} should be highlighted as a keyword"
+        );
+    }
+}
 #[test]
 fn test_if_alias_member_access_is_not_highlighted_as_keyword() {
     let highlighter = SqlHighlighter::new();
