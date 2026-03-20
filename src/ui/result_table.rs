@@ -1309,15 +1309,12 @@ impl ResultTableWidget {
                     if total_rows == 0 || total_cols == 0 {
                         return;
                     }
-                    let (start_row, end_row) =
-                        match Self::visible_row_range_for_draw(&table_for_draw, total_rows) {
-                            Some(range) => range,
-                            None => return,
-                        };
-                    let visible_row_count = end_row.saturating_sub(start_row);
-                    if visible_row_count == 0 {
-                        return;
-                    }
+                    let start_row = (table_for_draw.row_position().max(0) as usize).min(total_rows);
+                    let table_h = table_for_draw.h();
+                    let row_h = table_for_draw.row_height(start_row as i32).max(1);
+                    let visible_row_count =
+                        ((table_h / row_h) as usize + 2).min(total_rows - start_row);
+                    let end_row = start_row + visible_row_count;
 
                     page_edit_cache.start_row = start_row;
 
@@ -2875,72 +2872,6 @@ impl ResultTableWidget {
         } else {
             None
         }
-    }
-
-    fn visible_row_range_for_draw(table: &Table, total_rows: usize) -> Option<(usize, usize)> {
-        if total_rows == 0 {
-            return None;
-        }
-
-        let total_rows_i32 = i32::try_from(total_rows).ok()?;
-        let last_row = total_rows_i32.saturating_sub(1);
-        let anchor_row = table.row_position().max(0).min(last_row);
-        let data_top = table.y() + table.col_header_height();
-        let data_bottom = table.y() + table.h();
-        if data_bottom <= data_top {
-            return None;
-        }
-
-        let scan_start = Self::fallback_scan_start(anchor_row, MAX_HITTEST_ROW_BACKTRACK);
-        let mut first_visible: Option<i32> = None;
-        let mut row = scan_start;
-        while row <= last_row {
-            let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, 0) else {
-                row += 1;
-                continue;
-            };
-            if ch <= 0 {
-                row += 1;
-                continue;
-            }
-            let row_bottom = cy.saturating_add(ch);
-            if row_bottom > data_top && cy < data_bottom {
-                first_visible = Some(row);
-                break;
-            }
-            if cy >= data_bottom {
-                break;
-            }
-            row += 1;
-        }
-
-        let start_row = first_visible.unwrap_or(anchor_row).max(0).min(last_row);
-        let mut end_row_exclusive = start_row;
-        let mut scan_row = start_row;
-        while scan_row <= last_row {
-            let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, scan_row, 0) else {
-                break;
-            };
-            if ch <= 0 || cy >= data_bottom {
-                break;
-            }
-            let row_bottom = cy.saturating_add(ch);
-            if row_bottom > data_top {
-                end_row_exclusive = scan_row.saturating_add(1);
-            }
-            scan_row = scan_row.saturating_add(1);
-        }
-
-        if end_row_exclusive <= start_row {
-            end_row_exclusive = start_row.saturating_add(1).min(total_rows_i32);
-        }
-
-        let start = usize::try_from(start_row).ok()?;
-        let end = usize::try_from(end_row_exclusive).ok()?;
-        Some((
-            start.min(total_rows),
-            end.min(total_rows).max(start.min(total_rows)),
-        ))
     }
 
     fn pointer_moved_beyond_tolerance(
