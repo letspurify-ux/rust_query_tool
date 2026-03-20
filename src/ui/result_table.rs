@@ -1309,11 +1309,14 @@ impl ResultTableWidget {
                     if total_rows == 0 || total_cols == 0 {
                         return;
                     }
-                    let start_row = (table_for_draw.row_position().max(0) as usize).min(total_rows);
-                    let table_h = table_for_draw.h();
-                    let row_h = table_for_draw.row_height(start_row as i32).max(1);
-                    let visible_row_count =
-                        ((table_h / row_h) as usize + 2).min(total_rows - start_row);
+                    let (start_row, visible_row_count) =
+                        Self::visible_row_window_for_draw(&table_for_draw, total_rows, total_cols)
+                            .unwrap_or_else(|| {
+                                let fallback_start = (table_for_draw.row_position().max(0)
+                                    as usize)
+                                    .min(total_rows.saturating_sub(1));
+                                (fallback_start, (total_rows - fallback_start).min(1))
+                            });
                     let end_row = start_row + visible_row_count;
 
                     page_edit_cache.start_row = start_row;
@@ -2806,6 +2809,80 @@ impl ResultTableWidget {
         } else {
             start.saturating_sub(limit)
         }
+    }
+
+    /// Compute the visible row window using FLTK's rendered cell bounds instead of
+    /// relying only on `row_position()`, which can transiently point at the last row
+    /// after keyboard paging near the dataset tail.
+    ///
+    /// Returns `(start_row, visible_row_count)`.
+    fn visible_row_window_for_draw(
+        table: &Table,
+        total_rows: usize,
+        total_cols: usize,
+    ) -> Option<(usize, usize)> {
+        if total_rows == 0 || total_cols == 0 {
+            return None;
+        }
+
+        let rows = i32::try_from(total_rows).ok()?;
+        let cols = i32::try_from(total_cols).ok()?;
+        if rows <= 0 || cols <= 0 {
+            return None;
+        }
+
+        let last_row = rows.saturating_sub(1);
+        let last_col = cols.saturating_sub(1);
+        let start_row_guess = table.row_position().max(0).min(last_row);
+        let start_col = table.col_position().max(0).min(last_col);
+        let data_top = table.y().saturating_add(table.col_header_height());
+        let data_bottom = table.y().saturating_add(table.h());
+
+        let mut first_visible_row: Option<i32> = None;
+        let mut row = Self::fallback_scan_start(start_row_guess, MAX_HITTEST_ROW_BACKTRACK);
+        while row < rows {
+            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) {
+                if ch > 0 {
+                    let row_bottom = cy.saturating_add(ch);
+                    if row_bottom > data_top && cy < data_bottom {
+                        first_visible_row = Some(row);
+                        break;
+                    }
+                    if cy >= data_bottom {
+                        break;
+                    }
+                }
+            }
+            row = row.saturating_add(1);
+        }
+
+        let first_visible_row = first_visible_row?;
+        let mut visible_count = 0usize;
+        let mut scan_row = first_visible_row;
+        while scan_row < rows {
+            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, scan_row, start_col) {
+                if ch > 0 {
+                    if cy >= data_bottom {
+                        break;
+                    }
+                    visible_count = visible_count.saturating_add(1);
+                    if cy.saturating_add(ch) >= data_bottom {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+            scan_row = scan_row.saturating_add(1);
+        }
+
+        if visible_count == 0 {
+            return None;
+        }
+
+        usize::try_from(first_visible_row)
+            .ok()
+            .map(|start_row| (start_row, visible_count))
     }
 
     fn estimate_row_hit(
@@ -9151,7 +9228,10 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        assert!(session.is_some(), "edit session should be restored from backup");
+        assert!(
+            session.is_some(),
+            "edit session should be restored from backup"
+        );
         let session = session.unwrap_or_else(|| TableEditSession {
             rowid_col: 0,
             table_name: String::new(),
@@ -9945,7 +10025,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_none());
     }
-
 }
 
 impl Default for ResultTableWidget {
