@@ -1309,32 +1309,21 @@ impl ResultTableWidget {
                     if total_rows == 0 || total_cols == 0 {
                         return;
                     }
-                    let requested_start_row = (table_for_draw.row_position().max(0) as usize)
-                        .min(total_rows.saturating_sub(1));
+                    let start_row = (table_for_draw.row_position().max(0) as usize).min(total_rows);
                     let table_h = table_for_draw.h();
-                    let row_h = table_for_draw.row_height(requested_start_row as i32).max(1);
+                    let row_h = table_for_draw.row_height(start_row as i32).max(1);
                     let visible_row_count =
-                        ((table_h / row_h) as usize + 2).min(total_rows - requested_start_row);
-                    // FLTK can briefly render rows above `row_position()` near the tail
-                    // (e.g. PageDown with fewer remaining rows than one viewport). To keep
-                    // null/edited tinting stable, precompute a small backfill window above
-                    // the requested anchor while keeping work bounded for very large result sets.
-                    let cache_backfill = visible_row_count.saturating_add(2);
-                    let cache_start_row = requested_start_row.saturating_sub(cache_backfill);
-                    let cache_row_count = visible_row_count.saturating_add(cache_backfill);
-                    let end_row = cache_start_row
-                        .saturating_add(cache_row_count)
-                        .min(total_rows);
+                        ((table_h / row_h) as usize + 2).min(total_rows - start_row);
+                    let end_row = start_row + visible_row_count;
 
-                    page_edit_cache.start_row = cache_start_row;
+                    page_edit_cache.start_row = start_row;
 
                     if let Ok(session_guard) = edit_session_for_draw.try_lock() {
                         if let Some(session) = session_guard.as_ref() {
                             page_edit_cache.active = true;
                             if let Ok(data) = full_data_for_draw.try_lock() {
-                                let cache_rows = end_row.saturating_sub(cache_start_row);
-                                page_edit_cache.cell_states.reserve(cache_rows);
-                                for row_idx in cache_start_row..end_row {
+                                page_edit_cache.cell_states.reserve(visible_row_count);
+                                for row_idx in start_row..end_row {
                                     let mut row_states = Vec::with_capacity(total_cols);
                                     if let Some(row_data) = data.get(row_idx) {
                                         for col_idx in 0..total_cols {
