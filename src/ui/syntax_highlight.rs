@@ -909,8 +909,10 @@ fn should_expect_alias_identifier_after_keyword(
 
     match next_significant_token_kind(text, bytes, word_end) {
         Some(SignificantTokenKind::Identifier | SignificantTokenKind::QuotedIdentifier) => true,
-        Some(SignificantTokenKind::ClauseWord) => next_significant_word_upper(text, bytes, word_end)
-            .is_some_and(|next_word| !is_non_alias_structural_keyword(next_word.as_str())),
+        Some(SignificantTokenKind::ClauseWord) => {
+            next_significant_word_upper(text, bytes, word_end)
+                .is_some_and(|next_word| !is_non_alias_structural_keyword(next_word.as_str()))
+        }
         _ => false,
     }
 }
@@ -929,13 +931,16 @@ fn should_treat_control_keyword_as_implicit_alias(
         return false;
     }
 
-    let Some(next_kind) = next_significant_token_kind(text, bytes, word_end) else {
+    let Some(next_token) = next_significant_token(text, bytes, word_end) else {
         return false;
     };
-    match next_kind {
-        SignificantTokenKind::Comma
-        | SignificantTokenKind::Dot
-        | SignificantTokenKind::RightParen => {}
+    match next_token.kind {
+        SignificantTokenKind::Comma | SignificantTokenKind::RightParen => {}
+        SignificantTokenKind::Dot => {
+            if !is_member_access_dot(bytes, next_token.start) {
+                return false;
+            }
+        }
         SignificantTokenKind::ClauseWord => {
             let Some(next_word) = next_significant_word_upper(text, bytes, word_end) else {
                 return false;
@@ -1073,17 +1078,11 @@ fn should_treat_function_name_as_identifier(
         return false;
     }
 
-    if matches!(
-        next_significant_token_kind(text, bytes, word_end),
-        Some(SignificantTokenKind::Dot)
-    ) {
+    if next_significant_token_is_member_access_dot(text, bytes, word_end) {
         return true;
     }
 
-    if matches!(
-        prev_significant_token_kind(text, bytes, word_start),
-        Some(SignificantTokenKind::Dot)
-    ) {
+    if prev_significant_token_is_member_access_dot(text, bytes, word_start) {
         return true;
     }
 
@@ -1108,13 +1107,8 @@ fn should_treat_keyword_as_identifier_context(
         return false;
     }
 
-    matches!(
-        prev_significant_token_kind(text, bytes, word_start),
-        Some(SignificantTokenKind::Dot)
-    ) || matches!(
-        next_significant_token_kind(text, bytes, word_end),
-        Some(SignificantTokenKind::Dot)
-    )
+    prev_significant_token_is_member_access_dot(text, bytes, word_start)
+        || next_significant_token_is_member_access_dot(text, bytes, word_end)
 }
 
 fn prev_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Option<String> {
@@ -1236,11 +1230,13 @@ enum SignificantTokenKind {
     ClauseWord,
 }
 
-fn next_significant_token_kind(
-    text: &str,
-    bytes: &[u8],
-    mut idx: usize,
-) -> Option<SignificantTokenKind> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SignificantToken {
+    kind: SignificantTokenKind,
+    start: usize,
+}
+
+fn next_significant_token(text: &str, bytes: &[u8], mut idx: usize) -> Option<SignificantToken> {
     while let Some(&byte) = bytes.get(idx) {
         if byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n' {
             idx += 1;
@@ -1269,10 +1265,22 @@ fn next_significant_token_kind(
         }
 
         return match byte {
-            b',' => Some(SignificantTokenKind::Comma),
-            b'.' => Some(SignificantTokenKind::Dot),
-            b')' => Some(SignificantTokenKind::RightParen),
-            b'"' => Some(SignificantTokenKind::QuotedIdentifier),
+            b',' => Some(SignificantToken {
+                kind: SignificantTokenKind::Comma,
+                start: idx,
+            }),
+            b'.' => Some(SignificantToken {
+                kind: SignificantTokenKind::Dot,
+                start: idx,
+            }),
+            b')' => Some(SignificantToken {
+                kind: SignificantTokenKind::RightParen,
+                start: idx,
+            }),
+            b'"' => Some(SignificantToken {
+                kind: SignificantTokenKind::QuotedIdentifier,
+                start: idx,
+            }),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
                 let start = idx;
                 idx += 1;
@@ -1284,17 +1292,28 @@ fn next_significant_token_kind(
                 }
                 let word = text.get(start..idx)?;
                 let upper = word.to_ascii_uppercase();
-                if sql_text::is_oracle_sql_keyword(upper.as_str()) {
-                    Some(SignificantTokenKind::ClauseWord)
-                } else {
-                    Some(SignificantTokenKind::Identifier)
-                }
+                Some(SignificantToken {
+                    kind: if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                        SignificantTokenKind::ClauseWord
+                    } else {
+                        SignificantTokenKind::Identifier
+                    },
+                    start,
+                })
             }
             _ => None,
         };
     }
 
     None
+}
+
+fn next_significant_token_kind(
+    text: &str,
+    bytes: &[u8],
+    idx: usize,
+) -> Option<SignificantTokenKind> {
+    next_significant_token(text, bytes, idx).map(|token| token.kind)
 }
 
 fn next_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Option<String> {
@@ -1343,11 +1362,7 @@ fn next_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Opti
     None
 }
 
-fn prev_significant_token_kind(
-    text: &str,
-    bytes: &[u8],
-    mut idx: usize,
-) -> Option<SignificantTokenKind> {
+fn prev_significant_token(text: &str, bytes: &[u8], mut idx: usize) -> Option<SignificantToken> {
     while idx > 0 {
         let prev = *bytes.get(idx - 1)?;
         if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
@@ -1371,19 +1386,42 @@ fn prev_significant_token_kind(
         }
 
         if prev == b')' {
-            return Some(SignificantTokenKind::RightParen);
+            return Some(SignificantToken {
+                kind: SignificantTokenKind::RightParen,
+                start: idx - 1,
+            });
         }
         if prev == b'.' {
-            return Some(SignificantTokenKind::Dot);
+            return Some(SignificantToken {
+                kind: SignificantTokenKind::Dot,
+                start: idx - 1,
+            });
         }
         if prev == b',' {
-            return Some(SignificantTokenKind::Comma);
+            return Some(SignificantToken {
+                kind: SignificantTokenKind::Comma,
+                start: idx - 1,
+            });
         }
         if prev.is_ascii_digit() {
-            return Some(SignificantTokenKind::Number);
+            let mut start = idx - 1;
+            while start > 0
+                && bytes
+                    .get(start - 1)
+                    .is_some_and(|byte| byte.is_ascii_digit())
+            {
+                start -= 1;
+            }
+            return Some(SignificantToken {
+                kind: SignificantTokenKind::Number,
+                start,
+            });
         }
         if prev == b'\'' || prev == b'"' {
-            return Some(SignificantTokenKind::String);
+            return Some(SignificantToken {
+                kind: SignificantTokenKind::String,
+                start: idx - 1,
+            });
         }
         if sql_text::is_identifier_byte(prev) {
             let mut start = idx - 1;
@@ -1396,16 +1434,54 @@ fn prev_significant_token_kind(
             }
             let word = text.get(start..idx)?;
             let upper = word.to_ascii_uppercase();
-            if sql_text::is_oracle_sql_keyword(upper.as_str()) {
-                return Some(SignificantTokenKind::ClauseWord);
-            }
-            return Some(SignificantTokenKind::Identifier);
+            return Some(SignificantToken {
+                kind: if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                    SignificantTokenKind::ClauseWord
+                } else {
+                    SignificantTokenKind::Identifier
+                },
+                start,
+            });
         }
 
         return None;
     }
 
     None
+}
+
+fn prev_significant_token_kind(
+    text: &str,
+    bytes: &[u8],
+    idx: usize,
+) -> Option<SignificantTokenKind> {
+    prev_significant_token(text, bytes, idx).map(|token| token.kind)
+}
+
+fn is_member_access_dot(bytes: &[u8], dot_idx: usize) -> bool {
+    if bytes.get(dot_idx).copied() != Some(b'.') {
+        return false;
+    }
+
+    let prev_is_dot = dot_idx
+        .checked_sub(1)
+        .and_then(|idx| bytes.get(idx))
+        .copied()
+        == Some(b'.');
+    let next_is_dot = bytes.get(dot_idx + 1).copied() == Some(b'.');
+    !prev_is_dot && !next_is_dot
+}
+
+fn next_significant_token_is_member_access_dot(text: &str, bytes: &[u8], idx: usize) -> bool {
+    next_significant_token(text, bytes, idx).is_some_and(|token| {
+        token.kind == SignificantTokenKind::Dot && is_member_access_dot(bytes, token.start)
+    })
+}
+
+fn prev_significant_token_is_member_access_dot(text: &str, bytes: &[u8], idx: usize) -> bool {
+    prev_significant_token(text, bytes, idx).is_some_and(|token| {
+        token.kind == SignificantTokenKind::Dot && is_member_access_dot(bytes, token.start)
+    })
 }
 
 impl Default for SqlHighlighter {

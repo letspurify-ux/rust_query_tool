@@ -69,6 +69,12 @@ struct ActiveConditionFrame {
     paren_depth: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InlineCommentOperandContinuation {
+    depth: usize,
+    query_base_depth: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ConditionLineAnnotation {
     header_line_idx: Option<usize>,
@@ -1246,6 +1252,9 @@ impl QueryExecutor {
         let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
         let mut active_condition_frames: Vec<ActiveConditionFrame> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseDepthFrame> = Vec::new();
+        let mut pending_inline_comment_operand_continuation: Option<
+            InlineCommentOperandContinuation,
+        > = None;
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1291,6 +1300,8 @@ impl QueryExecutor {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let clause_kind = Self::auto_format_clause_kind(&trimmed_upper);
             let active_frame = query_frames.last().copied();
+            let active_inline_comment_operand_continuation =
+                pending_inline_comment_operand_continuation.take();
             let starts_multiline_clause =
                 Self::line_starts_multiline_clause_block(trimmed, &trimmed_upper);
             let closes_multiline_clause = multiline_clause_frames
@@ -1446,6 +1457,15 @@ impl QueryExecutor {
                 context.query_role = AutoFormatQueryRole::Continuation;
             }
 
+            if clause_kind.is_none() {
+                if let Some(continuation) = active_inline_comment_operand_continuation {
+                    context.auto_depth = context.auto_depth.max(continuation.depth);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth =
+                        context.query_base_depth.or(continuation.query_base_depth);
+                }
+            }
+
             if pending_query_base.is_some() && !starts_new_query_frame {
                 pending_query_base = None;
             }
@@ -1562,10 +1582,18 @@ impl QueryExecutor {
                 });
             }
 
+            pending_inline_comment_operand_continuation =
+                Self::inline_comment_operand_continuation_for_line(
+                    trimmed,
+                    existing_indent.max(context.auto_depth),
+                    context.query_base_depth,
+                );
+
             if trimmed.ends_with(';') {
                 query_frames.pop();
                 pending_query_base = None;
                 multiline_clause_frames.clear();
+                pending_inline_comment_operand_continuation = None;
             }
 
             contexts.push(context);
@@ -2131,6 +2159,46 @@ impl QueryExecutor {
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
         Self::trailing_significant_byte_before_inline_comment(line) == Some(b',')
+    }
+
+    fn inline_comment_operand_continuation_for_line(
+        line: &str,
+        depth: usize,
+        query_base_depth: Option<usize>,
+    ) -> Option<InlineCommentOperandContinuation> {
+        if Self::line_has_inline_block_comment_operand_continuation(line) {
+            Some(InlineCommentOperandContinuation {
+                depth,
+                query_base_depth,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn line_has_inline_block_comment_operand_continuation(line: &str) -> bool {
+        let trimmed = line.trim_end();
+        if !trimmed.ends_with("*/") {
+            return false;
+        }
+
+        let trailing_operator_keyword = Self::trailing_identifier_before_inline_comment(trimmed)
+            .map(|identifier| identifier.to_ascii_uppercase())
+            .is_some_and(|upper| {
+                matches!(
+                    upper.as_str(),
+                    "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT"
+                )
+            });
+        let trailing_operator_symbol =
+            Self::trailing_significant_byte_before_inline_comment(trimmed).is_some_and(|byte| {
+                matches!(
+                    byte,
+                    b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'^'
+                )
+            });
+
+        trailing_operator_keyword || trailing_operator_symbol
     }
 
     fn trailing_identifier_before_inline_comment(line: &str) -> Option<&str> {
@@ -6130,7 +6198,7 @@ impl QueryExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutoFormatConditionRole, QueryExecutor};
+    use super::{AutoFormatConditionRole, AutoFormatQueryRole, QueryExecutor};
 
     #[test]
     fn strip_extra_trailing_semicolons_preserves_plsql_end_terminator() {
@@ -6702,6 +6770,45 @@ END;"#;
             contexts[select_idx].query_base_depth,
             Some(contexts[for_idx].auto_depth.saturating_add(1)),
             "child query base depth should be anchored from the FOR header"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_operator_continuation_after_inline_block_comment() {
+        let sql = r#"SELECT 1
+FROM order_item oi
+WHERE oi.order_id = v.order_id
+    AND oi.qty <= /* X: 0 이하 */
+    0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND oi.qty <="))
+            .unwrap_or(0);
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[operand_idx].auto_depth,
+            contexts[and_idx]
+                .query_base_depth
+                .unwrap_or(contexts[and_idx].auto_depth)
+                .saturating_add(1),
+            "inline block comment after an infix operator should promote the next operand to the condition continuation depth"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "line following an inline-comment operator split should stay marked as query continuation"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_base_depth,
+            contexts[and_idx].query_base_depth,
+            "operator continuation should preserve the active query base depth"
         );
     }
 

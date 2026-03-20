@@ -256,6 +256,12 @@ enum SelectListLayoutState {
     Multiline { indent: usize },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineCommentContinuationState {
+    None,
+    Operand { indent: usize },
+}
+
 impl SelectListLayoutState {
     fn activate(&mut self, anchor: usize, indent: usize) {
         *self = Self::Pending { anchor, indent };
@@ -343,6 +349,14 @@ enum TriggerHeaderState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum CompoundTriggerState {
+    None,
+    AwaitingOuterBodyStart,
+    InOuterBody,
+    AwaitingTimingPointBodyStart,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CommentAttachment {
     Previous,
     Next,
@@ -357,6 +371,38 @@ impl TriggerHeaderState {
 
     fn start(&mut self) {
         *self = Self::InHeader;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+impl CompoundTriggerState {
+    fn awaiting_outer_body_start(self) -> bool {
+        matches!(self, Self::AwaitingOuterBodyStart)
+    }
+
+    fn mark_compound_header(&mut self) {
+        *self = Self::AwaitingOuterBodyStart;
+    }
+
+    fn enter_outer_body(&mut self) {
+        *self = Self::InOuterBody;
+    }
+
+    fn is_in_outer_body(self) -> bool {
+        matches!(self, Self::InOuterBody | Self::AwaitingTimingPointBodyStart)
+    }
+
+    fn start_timing_point(&mut self) {
+        *self = Self::AwaitingTimingPointBodyStart;
+    }
+
+    fn begin_timing_point_body(&mut self) {
+        if matches!(self, Self::AwaitingTimingPointBodyStart) {
+            *self = Self::InOuterBody;
+        }
     }
 
     fn clear(&mut self) {
@@ -1608,6 +1654,8 @@ impl SqlEditorWidget {
         let mut statement_has_with_clause = false;
         let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
         let mut trigger_header_state = TriggerHeaderState::None;
+        let mut compound_trigger_state = CompoundTriggerState::None;
+        let mut inline_comment_continuation_state = InlineCommentContinuationState::None;
         let is_package_body_statement = {
             let upper = statement.to_ascii_uppercase();
             upper.contains("CREATE OR REPLACE PACKAGE BODY")
@@ -1698,6 +1746,14 @@ impl SqlEditorWidget {
 
         let mut idx = 0;
         while idx < tokens.len() {
+            if at_line_start && !matches!(tokens[idx], SqlToken::Comment(_)) {
+                if let InlineCommentContinuationState::Operand { indent } =
+                    inline_comment_continuation_state
+                {
+                    line_indent = indent;
+                    inline_comment_continuation_state = InlineCommentContinuationState::None;
+                }
+            }
             let next_word = tokens[idx + 1..].iter().find_map(|t| match t {
                 SqlToken::Word(w) => Some(w.as_str()),
                 _ => None,
@@ -1773,6 +1829,17 @@ impl SqlEditorWidget {
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
+                    let is_compound_trigger_timing_header =
+                        compound_trigger_state.is_in_outer_body()
+                            && block_stack.last().is_some_and(|s| s == "COMPOUND_TRIGGER")
+                            && (matches!(upper.as_str(), "BEFORE" | "AFTER")
+                                && next_word.is_some_and(|word| {
+                                    matches!(
+                                        word.to_ascii_uppercase().as_str(),
+                                        "STATEMENT" | "EACH"
+                                    )
+                                })
+                                || (upper == "INSTEAD" && next_word_is("OF")));
                     let is_create_index_on = upper == "ON" && construct.create_index_pending;
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
@@ -1926,7 +1993,11 @@ impl SqlEditorWidget {
                             // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
                             let mut closed_block = None;
                             while let Some(top) = block_stack.pop() {
-                                if top == "BEGIN" || top == "DECLARE" || top == "PACKAGE_BODY" {
+                                if top == "BEGIN"
+                                    || top == "DECLARE"
+                                    || top == "PACKAGE_BODY"
+                                    || top == "COMPOUND_TRIGGER"
+                                {
                                     closed_block = Some(top);
                                     break;
                                 }
@@ -1940,6 +2011,9 @@ impl SqlEditorWidget {
                         }
 
                         indent_level = indent_level.saturating_sub(1);
+                        if !block_stack.iter().any(|s| s == "COMPOUND_TRIGGER") {
+                            compound_trigger_state.clear();
+                        }
                         if is_package_body_statement
                             && !is_qualified_end
                             && !case_expression_end
@@ -1995,6 +2069,16 @@ impl SqlEditorWidget {
                             idx = lookahead;
                         }
                         continue;
+                    } else if is_compound_trigger_timing_header {
+                        compound_trigger_state.start_timing_point();
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if trigger_header_state.is_active()
                         && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD")
                     {
@@ -2524,6 +2608,14 @@ impl SqlEditorWidget {
                             .activate(out.len(), base_indent(indent_level, open_cursor_state) + 1);
                     }
 
+                    if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
+                        compound_trigger_state.mark_compound_header();
+                    }
+
+                    if matches!(upper.as_str(), "IS" | "AS" | "BEGIN" | "DECLARE") {
+                        compound_trigger_state.begin_timing_point_body();
+                    }
+
                     if construct.create_table_paren_expected
                         && upper == "AS"
                         && (next_word_is("SELECT")
@@ -2631,6 +2723,9 @@ impl SqlEditorWidget {
 
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
                         && (construct.create_object.is_some() || construct.routine_decl_pending);
+                    let starts_compound_trigger_body = starts_create_block
+                        && compound_trigger_state.awaiting_outer_body_start()
+                        && matches!(construct.create_object.as_deref(), Some("TRIGGER"));
 
                     // Handle block start - push to stack and increase indent
                     if should_treat_as_block_start {
@@ -2674,13 +2769,21 @@ impl SqlEditorWidget {
                         // Treat AS/IS in CREATE PACKAGE/PROC/FUNC/TYPE/TRIGGER and package-body routines as declaration section start
                         let is_package_body =
                             matches!(construct.create_object.as_deref(), Some("PACKAGE_BODY"));
-                        if is_package_body {
+                        let is_trigger_body =
+                            matches!(construct.create_object.as_deref(), Some("TRIGGER"));
+                        if starts_compound_trigger_body {
+                            block_stack.push("COMPOUND_TRIGGER".to_string());
+                            compound_trigger_state.enter_outer_body();
+                        } else if is_package_body {
                             block_stack.push("PACKAGE_BODY".to_string());
                         } else {
                             block_stack.push("DECLARE".to_string());
                         }
                         indent_level += 1;
                         in_plsql_block = true;
+                        if is_trigger_body {
+                            trigger_header_state.clear();
+                        }
                         construct.create_object = None;
                         construct.routine_decl_pending = false;
                         newline_with(
@@ -2697,6 +2800,7 @@ impl SqlEditorWidget {
                         if upper == "BEGIN" {
                             trigger_header_state.clear();
                         }
+                        compound_trigger_state.begin_timing_point_body();
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -2971,31 +3075,51 @@ impl SqlEditorWidget {
                             (Some("AS" | "IS"), Some(SqlToken::Word(_)))
                         );
                         if !keep_inline_alias_comment {
-                            let list_extra = if in_select_list
-                                || in_set_clause
-                                || active_list_layout
-                                || column_list_stack.last().copied().unwrap_or(false)
-                                || hint_after_select
-                            {
-                                clause_list_indent(
-                                    indent_level,
-                                    open_cursor_state,
-                                    select_list_layout_state,
-                                    current_clause.as_deref(),
-                                    construct.merge_active,
-                                )
-                                .saturating_sub(base_indent(indent_level, open_cursor_state))
-                            } else {
-                                0
-                            };
-                            newline_with(
-                                &mut out,
-                                base_indent(indent_level, open_cursor_state),
-                                list_extra,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
+                            let keeps_operand_continuation = Self::comment_keeps_operand_continuation(
+                                tokens,
+                                idx,
                             );
+                            if keeps_operand_continuation {
+                                let continuation_indent = line_indent;
+                                newline_with(
+                                    &mut out,
+                                    0,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                inline_comment_continuation_state =
+                                    InlineCommentContinuationState::Operand {
+                                        indent: continuation_indent,
+                                    };
+                            } else {
+                                let list_extra = if in_select_list
+                                    || in_set_clause
+                                    || active_list_layout
+                                    || column_list_stack.last().copied().unwrap_or(false)
+                                    || hint_after_select
+                                {
+                                    clause_list_indent(
+                                        indent_level,
+                                        open_cursor_state,
+                                        select_list_layout_state,
+                                        current_clause.as_deref(),
+                                        construct.merge_active,
+                                    )
+                                    .saturating_sub(base_indent(indent_level, open_cursor_state))
+                                } else {
+                                    0
+                                };
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    list_extra,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            }
                             if hint_after_select {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
                                     indent: base_indent(indent_level, open_cursor_state) + 1,
@@ -3170,6 +3294,7 @@ impl SqlEditorWidget {
                                 column_list_stack.clear();
                                 paren_indent_increase_stack.clear();
                                 select_list_break_state.clear();
+                                compound_trigger_state.clear();
                             }
                             let next_is_inline_line_comment = matches!(
                                 tokens.get(idx + 1),
@@ -5019,6 +5144,41 @@ impl SqlEditorWidget {
                 }
             },
         )
+    }
+
+    fn comment_keeps_operand_continuation(tokens: &[SqlToken], idx: usize) -> bool {
+        tokens[..idx]
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+            .is_some_and(|token| match token {
+                SqlToken::Symbol(symbol) => {
+                    matches!(
+                        symbol.as_str(),
+                        "="
+                            | "<"
+                            | ">"
+                            | "<="
+                            | ">="
+                            | "<>"
+                            | "!="
+                            | "+"
+                            | "-"
+                            | "*"
+                            | "/"
+                            | "%"
+                            | "||"
+                            | "^"
+                            | ":="
+                            | "=>"
+                    )
+                }
+                SqlToken::Word(word) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT"
+                ),
+                _ => false,
+            })
     }
 
     #[cfg(test)]
@@ -8494,6 +8654,169 @@ SELECT 2 FROM dual"
     }
 
     #[test]
+    fn format_sql_basic_compound_trigger_declaration_and_timing_sections_use_stable_base_depth() {
+        let sql = r#"CREATE OR REPLACE TRIGGER trg_employee_compound
+    FOR INSERT OR UPDATE OR DELETE ON employees COMPOUND TRIGGER TYPE emp_id_set_t IS
+    TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    g_emp_ids emp_id_set_t;
+    g_idx PLS_INTEGER := 0;
+    BEFORE STATEMENT IS
+    BEGIN
+        g_emp_ids.
+        DELETE;
+        g_idx := 0;
+        DBMS_OUTPUT.PUT_LINE ('--- Statement Start ---');
+    END BEFORE STATEMENT;
+
+    AFTER EACH ROW IS
+    BEGIN
+        INSERT INTO employee_history (employee_id, action, old_salary, new_salary, change_date)
+        VALUES (NVL (:NEW.employee_id, :OLD.employee_id), 
+            CASE
+                WHEN INSERTING THEN
+                    'INSERT'
+                WHEN UPDATING THEN
+                    'UPDATE'
+                WHEN DELETING THEN
+                    'DELETE'
+            END, :OLD.salary, :NEW.salary, SYSTIMESTAMP);
+    END AFTER EACH ROW;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.trim_start().starts_with(prefix))
+        };
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let before_statement = find_line("BEFORE STATEMENT IS").unwrap_or("");
+        let before_begin = lines
+            .windows(2)
+            .find(|pair| {
+                pair[0].trim_start() == "BEFORE STATEMENT IS" && pair[1].trim_start() == "BEGIN"
+            })
+            .map(|pair| pair[1])
+            .unwrap_or("");
+        let before_body = find_line("g_emp_ids.").unwrap_or("");
+        let after_each_row = find_line("AFTER EACH ROW IS").unwrap_or("");
+        let after_begin = lines
+            .windows(2)
+            .find(|pair| pair[0].trim_start() == "AFTER EACH ROW IS" && pair[1].trim_start() == "BEGIN")
+            .map(|pair| pair[1])
+            .unwrap_or("");
+        let insert_line = find_line("INSERT INTO employee_history").unwrap_or("");
+        let values_line = find_line("VALUES (").unwrap_or("");
+        let end_before = find_line("END BEFORE STATEMENT;").unwrap_or("");
+        let end_after = find_line("END AFTER EACH ROW;").unwrap_or("");
+
+        assert_eq!(
+            leading_spaces(before_statement),
+            4,
+            "compound trigger timing header should stay at outer body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(before_begin),
+            4,
+            "timing section BEGIN should align with its header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(before_body),
+            8,
+            "statements in BEFORE section should be exactly one level deeper than BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(after_each_row),
+            4,
+            "subsequent timing headers should keep the same compound-trigger base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(after_begin),
+            4,
+            "subsequent timing BEGIN should align with its header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(insert_line),
+            8,
+            "DML head inside timing section should stay one level deeper than BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(values_line),
+            8,
+            "DML clause starters inside timing section should reuse the same query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(end_before),
+            4,
+            "END BEFORE STATEMENT should return to timing header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(end_after),
+            4,
+            "END AFTER EACH ROW should return to timing header depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_compound_trigger_single_line_timing_sections_break_on_outer_body_state() {
+        let sql = "CREATE OR REPLACE TRIGGER trg_employee_compound FOR INSERT OR UPDATE OR DELETE ON employees COMPOUND TRIGGER TYPE emp_id_set_t IS TABLE OF NUMBER INDEX BY PLS_INTEGER; g_emp_ids emp_id_set_t; AFTER EACH ROW IS BEGIN INSERT INTO employee_history (employee_id, action) VALUES (:NEW.employee_id, 'INSERT'); END AFTER EACH ROW; END trg_employee_compound;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.trim_start().starts_with(prefix))
+        };
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let after_each_row = find_line("AFTER EACH ROW IS").unwrap_or("");
+        let begin_line = lines
+            .windows(2)
+            .find(|pair| pair[0].trim_start() == "AFTER EACH ROW IS" && pair[1].trim_start() == "BEGIN")
+            .map(|pair| pair[1])
+            .unwrap_or("");
+        let insert_line = find_line("INSERT INTO employee_history").unwrap_or("");
+        let values_line = find_line("VALUES (").unwrap_or("");
+
+        assert_eq!(
+            leading_spaces(after_each_row),
+            4,
+            "single-line timing header should break at the compound trigger outer body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(begin_line),
+            4,
+            "timing BEGIN from single-line input should align with the timing header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(insert_line),
+            8,
+            "single-line timing DML head should stay one level deeper than BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(values_line),
+            8,
+            "single-line timing DML clauses should reuse the same base depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn formats_values_subquery_with_nested_depth() {
         let sql = "SELECT 1 FROM dual WHERE EXISTS (VALUES (1));";
         let formatted = SqlEditorWidget::format_sql_basic(sql);
@@ -9822,6 +10145,22 @@ END;";
             "Comment before OR inside parens should match OR indent, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_condition_operand_after_inline_block_comment_on_condition_depth() {
+        let source = "select 1 from order_item oi where oi.order_id = v.order_id and oi.qty <= /* X: 0 이하 */ 0;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let expected = [
+            "SELECT 1",
+            "FROM order_item oi",
+            "WHERE oi.order_id = v.order_id",
+            "    AND oi.qty <= /* X: 0 이하 */",
+            "    0;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
     }
 }
 

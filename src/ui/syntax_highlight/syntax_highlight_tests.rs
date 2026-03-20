@@ -1301,9 +1301,7 @@ END;";
     let if_start = text.find("IF 1 = 1 THEN").unwrap_or(0);
     let if_end = if_start + "IF".len();
     assert!(
-        styles[if_start..if_end]
-            .chars()
-            .all(|c| c == STYLE_KEYWORD),
+        styles[if_start..if_end].chars().all(|c| c == STYLE_KEYWORD),
         "PL/SQL IF after comment banner inside block should stay keyword"
     );
 }
@@ -1467,6 +1465,80 @@ fn test_plsql_control_keyword_alias_if_before_case_then_is_not_keyword() {
             .get(then_start..then_start + 4)
             .is_some_and(|slice| slice.iter().all(|&c| c == STYLE_KEYWORD as u8)),
         "CASE expression THEN should remain keyword"
+    );
+}
+
+#[test]
+fn test_case_keywords_after_plsql_range_operator_remain_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"BEGIN
+    FOR i IN 1..
+        CASE
+            WHEN v_x = 1 THEN
+                5
+            ELSE
+                10
+        END
+    LOOP
+        NULL;
+    END LOOP;
+END;"#;
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CASE", "WHEN", "ELSE", "END"] {
+        let mut search_start = 0usize;
+        while let Some(relative_start) = text[search_start..].find(keyword) {
+            let start = search_start + relative_start;
+            let end = start + keyword.len();
+            assert!(
+                styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+                "{keyword} at byte offset {start} should remain keyword-highlighted after `..`"
+            );
+            search_start = end;
+        }
+    }
+}
+
+#[test]
+fn test_case_end_before_plsql_range_operator_remains_keyword_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text =
+        "BEGIN\n    FOR i IN CASE WHEN v_x = 1 THEN 5 ELSE 0 END..10 LOOP\n        NULL;\n    END LOOP;\nEND;";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CASE", "WHEN", "ELSE", "END"] {
+        let mut search_start = 0usize;
+        while let Some(relative_start) = text[search_start..].find(keyword) {
+            let start = search_start + relative_start;
+            let end = start + keyword.len();
+            assert!(
+                styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+                "{keyword} at byte offset {start} should remain keyword-highlighted before `..`"
+            );
+            search_start = end;
+        }
+    }
+}
+
+#[test]
+fn test_function_after_plsql_range_operator_remains_function_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"BEGIN
+    FOR i IN 1..
+        TRIM(v_limit)
+    LOOP
+        NULL;
+    END LOOP;
+END;"#;
+    let styles = highlighter.generate_styles(text);
+
+    let trim_start = text.find("TRIM").unwrap_or(0);
+    let trim_end = trim_start + "TRIM".len();
+    assert!(
+        styles[trim_start..trim_end]
+            .chars()
+            .all(|c| c == STYLE_FUNCTION),
+        "function call after `..` should remain function-highlighted"
     );
 }
 
