@@ -1025,18 +1025,8 @@ fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
             idx = idx.saturating_sub(1);
             continue;
         }
-        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
-            idx -= 2;
-            while idx > 0 {
-                let Some(&comment_byte) = bytes.get(idx - 1) else {
-                    break;
-                };
-                idx -= 1;
-                if is_line_terminator(comment_byte) {
-                    saw_line_break = true;
-                    break;
-                }
-            }
+        if let Some(comment_start) = line_comment_start_before(bytes, idx) {
+            idx = comment_start;
             continue;
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
@@ -1134,16 +1124,8 @@ fn prev_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Opti
             idx -= 1;
             continue;
         }
-        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
-            idx -= 2;
-            while idx > 0
-                && bytes
-                    .get(idx - 1)
-                    .copied()
-                    .is_some_and(|byte| !is_line_terminator(byte))
-            {
-                idx -= 1;
-            }
+        if let Some(comment_start) = line_comment_start_before(bytes, idx) {
+            idx = comment_start;
             continue;
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
@@ -1196,16 +1178,8 @@ fn is_open_cursor_for_keyword_context(text: &str, bytes: &[u8], word_start: usiz
             idx = idx.saturating_sub(1);
             continue;
         }
-        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
-            idx -= 2;
-            while idx > 0
-                && bytes
-                    .get(idx - 1)
-                    .copied()
-                    .is_some_and(|byte| !is_line_terminator(byte))
-            {
-                idx -= 1;
-            }
+        if let Some(comment_start) = line_comment_start_before(bytes, idx) {
+            idx = comment_start;
             continue;
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
@@ -1380,16 +1354,8 @@ fn prev_significant_token_kind(
             idx -= 1;
             continue;
         }
-        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
-            idx -= 2;
-            while idx > 0
-                && bytes
-                    .get(idx - 1)
-                    .copied()
-                    .is_some_and(|byte| !is_line_terminator(byte))
-            {
-                idx -= 1;
-            }
+        if let Some(comment_start) = line_comment_start_before(bytes, idx) {
+            idx = comment_start;
             continue;
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
@@ -1780,6 +1746,23 @@ fn is_line_start(bytes: &[u8], idx: usize) -> bool {
 
 fn is_line_terminator(byte: u8) -> bool {
     matches!(byte, b'\n' | b'\r')
+}
+
+fn line_comment_start_before(bytes: &[u8], idx: usize) -> Option<usize> {
+    let mut line_start = idx.min(bytes.len());
+    while line_start > 0 && !is_line_terminator(*bytes.get(line_start - 1)?) {
+        line_start -= 1;
+    }
+
+    let mut scan = line_start;
+    while scan + 1 < idx {
+        if bytes.get(scan) == Some(&b'-') && bytes.get(scan + 1) == Some(&b'-') {
+            return Some(scan);
+        }
+        scan += 1;
+    }
+
+    None
 }
 
 fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContinuation {
