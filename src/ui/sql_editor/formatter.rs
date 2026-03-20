@@ -4392,6 +4392,8 @@ impl SqlEditorWidget {
                 pending_query_head_depth = None;
             }
             if let Some(next_query_head_depth) = layouts[idx].next_query_head_depth {
+                let clause_query_owner_depth = Self::line_has_clause_query_owner(&trimmed_upper)
+                    .then(|| layouts[idx].final_depth.saturating_add(2));
                 let non_direct_opener_keeps_raw_depth =
                     Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                         && !Self::line_has_direct_query_owner(&trimmed_upper)
@@ -4402,7 +4404,10 @@ impl SqlEditorWidget {
                         && (layouts[idx].query_role == AutoFormatQueryRole::None
                             || layouts[idx].final_depth <= next_query_head_depth.saturating_sub(1));
                 let adjusted_next_query_head_depth =
-                    if non_direct_opener_keeps_raw_depth || condition_owner_keeps_raw_depth {
+                    if let Some(owner_depth) = clause_query_owner_depth {
+                        owner_depth
+                    } else if non_direct_opener_keeps_raw_depth || condition_owner_keeps_raw_depth
+                    {
                         next_query_head_depth
                     } else if layouts[idx].final_depth >= layouts[idx].existing_indent {
                         next_query_head_depth.saturating_add(
@@ -10548,6 +10553,48 @@ CROSS APPLY ("
         assert!(
             into_line.starts_with("    "),
             "INSERT ALL INTO should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_package_body_open_cursor_nested_subquery_keeps_expected_query_base_depth() {
+        let input = r#"create package body a as
+    procedure b (c in number) as
+    begin
+        open cv for
+            select 1
+            from e
+            where f in (
+                    select 1
+                    from (
+                            select g
+                            from dual
+                        )
+                );
+    end b;
+end a;"#;
+        let expected = r#"create package body a as
+    procedure b (c in number) as
+    begin
+        open cv for
+            select 1
+            from e
+            where f in (
+                    select 1
+                    from (
+                            select g
+                            from dual
+                        )
+                );
+    end b;
+end a;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        assert_eq!(
+            formatted.trim().to_ascii_lowercase(),
+            expected.trim().to_ascii_lowercase(),
+            "package body OPEN cursor nested subquery should keep expected query base depth (case-insensitive), got:\n{}",
             formatted
         );
     }

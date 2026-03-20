@@ -7028,4 +7028,50 @@ END pkg_test;"#;
         assert_eq!(depths[into_idx], 2);
         assert_eq!(depths[from_idx], 2);
     }
+
+    #[test]
+    fn auto_format_line_contexts_keep_nested_from_subquery_on_parent_query_base_depth() {
+        let sql = r#"create package body a as
+    procedure b (c in number) as
+    begin
+        open cv for
+            select 1
+            from e
+            where f in (
+                    select 1
+                    from (
+                            select g
+                            from dual
+                        )
+                );
+    end b;
+end a;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim() == needle)
+                .unwrap_or(0)
+        };
+        let inner_from_paren_idx = find_line("from (");
+        let inner_select_idx = (0..=inner_from_paren_idx)
+            .rev()
+            .find(|idx| lines[*idx].trim() == "select 1")
+            .unwrap_or(0);
+        let deepest_select_idx = find_line("select g");
+
+        assert_eq!(
+            contexts[inner_from_paren_idx].auto_depth,
+            contexts[inner_select_idx].auto_depth,
+            "FROM ( line inside nested query should stay on the parent query base depth"
+        );
+        assert_eq!(
+            contexts[deepest_select_idx].auto_depth,
+            contexts[inner_from_paren_idx].auto_depth.saturating_add(2),
+            "SELECT under FROM ( should start exactly one child-query level below FROM owner depth"
+        );
+    }
+
 }
