@@ -259,6 +259,35 @@ fn test_comment_highlighting() {
 }
 
 #[test]
+fn test_keyword_after_line_comment_with_trailing_dot_is_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "-- note.\nSELECT * FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let select_start = text.find("SELECT").unwrap_or(0);
+    assert!(styles[select_start..select_start + 6]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
+fn test_keyword_after_line_comment_with_trailing_punctuation_is_highlighted() {
+    let highlighter = SqlHighlighter::new();
+
+    for trailing in [".", ")", ","] {
+        let text = format!("-- trailing{trailing}\nFROM dual");
+        let styles = highlighter.generate_styles(&text);
+        let from_start = text.find("FROM").unwrap_or(0);
+        assert!(
+            styles[from_start..from_start + 4]
+                .chars()
+                .all(|c| c == STYLE_KEYWORD),
+            "FROM should be highlighted after comment ending with `{trailing}`"
+        );
+    }
+}
+
+#[test]
 fn test_prompt_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "PROMPT Enter value for id";
