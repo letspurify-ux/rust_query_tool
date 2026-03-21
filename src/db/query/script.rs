@@ -5213,8 +5213,7 @@ impl QueryExecutor {
                 let Some(size_val) = tokens.get(idx + 1) else {
                     return ToolCommand::Unsupported {
                         raw: raw.to_string(),
-                        message: "SET SERVEROUTPUT SIZE must be a number or UNLIMITED."
-                            .to_string(),
+                        message: "SET SERVEROUTPUT SIZE must be a number or UNLIMITED.".to_string(),
                         is_error: true,
                     };
                 };
@@ -7069,8 +7068,7 @@ WHERE oi.order_id = v.order_id
             "line following an inline-comment operator split should stay marked as query continuation"
         );
         assert_eq!(
-            contexts[operand_idx].query_base_depth,
-            contexts[and_idx].query_base_depth,
+            contexts[operand_idx].query_base_depth, contexts[and_idx].query_base_depth,
             "operator continuation should preserve the active query base depth"
         );
     }
@@ -7382,7 +7380,10 @@ END;"#;
             .rposition(|line| line.trim() == "END;")
             .unwrap_or(0);
 
-        assert_eq!(depths[for_idx], 1, "FOR header should stay at outer BEGIN body depth");
+        assert_eq!(
+            depths[for_idx], 1,
+            "FOR header should stay at outer BEGIN body depth"
+        );
         assert_eq!(
             depths[body_idx],
             depths[for_idx].saturating_add(1),
@@ -7478,8 +7479,7 @@ end a;"#;
         let deepest_select_idx = find_line("select g");
 
         assert_eq!(
-            contexts[inner_from_paren_idx].auto_depth,
-            contexts[inner_select_idx].auto_depth,
+            contexts[inner_from_paren_idx].auto_depth, contexts[inner_select_idx].auto_depth,
             "FROM ( line inside nested query should stay on the parent query base depth"
         );
         assert_eq!(
@@ -7488,5 +7488,4 @@ end a;"#;
             "SELECT under FROM ( should start exactly one child-query level below FROM owner depth"
         );
     }
-
 }

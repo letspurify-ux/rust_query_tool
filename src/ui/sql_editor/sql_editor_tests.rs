@@ -7157,12 +7157,14 @@ END;"#;
         formatted
     );
     assert_eq!(
-        indent(lines[commit_idx]), 4,
+        indent(lines[commit_idx]),
+        4,
         "COMMIT should stay one level deeper than the outer DECLARE/BEGIN block, got:\n{}",
         formatted
     );
     assert_eq!(
-        indent(lines[end_idx]), 0,
+        indent(lines[end_idx]),
+        0,
         "final END should return to depth 0 after mixed CASE/LOOP/UPDATE formatting, got:\n{}",
         formatted
     );

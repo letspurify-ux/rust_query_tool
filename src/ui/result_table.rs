@@ -9083,7 +9083,10 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        assert!(session.is_some(), "edit session should be restored from backup");
+        assert!(
+            session.is_some(),
+            "edit session should be restored from backup"
+        );
         let session = session.unwrap_or_else(|| TableEditSession {
             rowid_col: 0,
             table_name: String::new(),
@@ -9877,7 +9880,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_none());
     }
-
 }
 
 impl Default for ResultTableWidget {

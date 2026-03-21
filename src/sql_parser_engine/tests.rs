@@ -4279,9 +4279,7 @@ fn with_function_declaration_with_end_label_and_trailing_ctes_stays_single_state
     let mut engine = SqlParserEngine::new();
 
     engine.process_line("WITH");
-    engine.process_line(
-        "    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;",
-    );
+    engine.process_line("    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS v_depth NUMBER;");
     engine.process_line("BEGIN");
     engine.process_line("    SELECT MAX (LEVEL)");
     engine.process_line("    INTO v_depth");
