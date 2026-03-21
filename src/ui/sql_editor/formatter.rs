@@ -561,6 +561,16 @@ impl WithCteFormatState {
             }
         )
     }
+
+    fn keeps_top_level_semicolon_inside_with_definitions(self) -> bool {
+        matches!(
+            self,
+            Self::InDefinitions {
+                plsql_state: WithPlsqlFormatState::AwaitingMainQuery,
+                ..
+            }
+        )
+    }
 }
 
 impl OpenCursorFormatState {
@@ -3384,6 +3394,8 @@ impl SqlEditorWidget {
                         }
                         ";" => {
                             with_cte_state.on_separator();
+                            let keep_tight_top_level_spacing = with_cte_state
+                                .keeps_top_level_semicolon_inside_with_definitions();
                             trim_trailing_space(&mut out);
                             out.push(';');
                             current_clause = None;
@@ -3452,7 +3464,7 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                                if indent_level == 0 {
+                                if indent_level == 0 && !keep_tight_top_level_spacing {
                                     out.push('\n');
                                     at_line_start = true;
                                     needs_space = false;
@@ -10806,6 +10818,70 @@ FROM dept_stat;"#;
             leading_spaces(lines[close_idx]),
             leading_spaces(lines[sum_idx]),
             "closing SUM parenthesis should align with SUM header, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_insert_blank_line_after_with_function_terminator_before_cte() {
+        let source = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+            SELECT MAX (LEVEL)
+            INTO v_depth
+            FROM org_tree
+            START WITH parent_id IS NULL
+            CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+aggregated AS (
+    SELECT
+        parent_id,
+        COUNT (*) AS child_count,
+        MAX (DEPTH) AS max_depth,
+        LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+    FROM recursive_tree
+    WHERE DEPTH > 1
+    GROUP BY parent_id
+)
+SELECT
+    rt.*,
+    a.child_count,
+    a.max_depth,
+    a.children
+FROM recursive_tree rt
+LEFT JOIN aggregated a
+    ON rt.node_id = a.parent_id
+ORDER BY rt.PATH;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.contains("END calc_depth;\n\nrecursive_tree"),
+            "WITH FUNCTION terminator should stay attached to the following CTE, got:\n{}",
             formatted
         );
     }

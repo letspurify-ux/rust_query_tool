@@ -6229,7 +6229,7 @@ impl QueryExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutoFormatConditionRole, AutoFormatQueryRole, QueryExecutor};
+    use super::{AutoFormatConditionRole, AutoFormatQueryRole, FormatItem, QueryExecutor};
 
     #[test]
     fn strip_extra_trailing_semicolons_preserves_plsql_end_terminator() {
@@ -6365,6 +6365,79 @@ FROM recursive_tree";
                 && statement.contains("SELECT *"),
             "single-letter CTE should remain attached to WITH, got:\n{}",
             statement
+        );
+    }
+
+    #[test]
+    fn split_items_keep_with_function_and_following_ctes_in_one_statement() {
+        let sql = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+            SELECT MAX (LEVEL)
+            INTO v_depth
+            FROM org_tree
+            START WITH parent_id IS NULL
+            CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+aggregated AS (
+    SELECT
+        parent_id,
+        COUNT (*) AS child_count,
+        MAX (DEPTH) AS max_depth,
+        LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+    FROM recursive_tree
+    WHERE DEPTH > 1
+    GROUP BY parent_id
+)
+SELECT
+    rt.*,
+    a.child_count,
+    a.max_depth,
+    a.children
+FROM recursive_tree rt
+LEFT JOIN aggregated a
+    ON rt.node_id = a.parent_id
+ORDER BY rt.PATH;"#;
+
+        let script_items = QueryExecutor::split_script_items(sql);
+        assert_eq!(
+            script_items.len(),
+            1,
+            "WITH FUNCTION + CTE chain must remain one executable statement, got: {script_items:?}"
+        );
+
+        let format_items = QueryExecutor::split_format_items(sql);
+        let statement_count = format_items
+            .iter()
+            .filter(|item| matches!(item, FormatItem::Statement(_)))
+            .count();
+        assert_eq!(
+            statement_count, 1,
+            "format split must keep WITH FUNCTION + CTE chain together, got: {format_items:?}"
         );
     }
 
