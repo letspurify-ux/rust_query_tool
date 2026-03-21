@@ -37,6 +37,7 @@ struct LineLayout<'a> {
     condition_header_line: Option<usize>,
     condition_role: AutoFormatConditionRole,
     existing_indent: usize,
+    existing_indent_spaces: usize,
     final_depth: usize,
     anchor_group: Option<usize>,
     dml_case_expression_close_depth: Option<usize>,
@@ -260,7 +261,10 @@ enum SelectListBreakState {
 enum SelectListLayoutState {
     Inactive,
     Pending { anchor: usize, indent: usize },
-    Multiline { indent: usize },
+    Multiline {
+        indent: usize,
+        hanging_indent_spaces: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,8 +292,29 @@ impl SelectListLayoutState {
 
     fn indentation_or(self, fallback: usize) -> usize {
         match self {
-            Self::Pending { indent, .. } | Self::Multiline { indent } => indent,
+            Self::Pending { indent, .. } | Self::Multiline { indent, .. } => indent,
             Self::Inactive => fallback,
+        }
+    }
+
+    fn hanging_indent_spaces(self, out: &str, fallback_indent: usize) -> usize {
+        match self {
+            Self::Pending { anchor, indent } => {
+                if anchor < out.len() && out.as_bytes().get(anchor) == Some(&b' ') {
+                    let line_start = out[..anchor].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+                    anchor
+                        .saturating_sub(line_start)
+                        .saturating_add(1)
+                        .max(indent * 4)
+                } else {
+                    indent.max(fallback_indent) * 4
+                }
+            }
+            Self::Multiline {
+                indent,
+                hanging_indent_spaces,
+            } => hanging_indent_spaces.unwrap_or_else(|| indent.max(fallback_indent) * 4),
+            Self::Inactive => fallback_indent * 4,
         }
     }
 
@@ -299,7 +324,10 @@ impl SelectListLayoutState {
                 if anchor < out.len() && out.as_bytes().get(anchor) == Some(&b' ') {
                     let indentation = " ".repeat(indent * 4);
                     out.replace_range(anchor..anchor + 1, &format!("\n{indentation}"));
-                    Self::Multiline { indent }
+                    Self::Multiline {
+                        indent,
+                        hanging_indent_spaces: None,
+                    }
                 } else {
                     self
                 }
@@ -1805,6 +1833,7 @@ impl SqlEditorWidget {
             upper.contains("CREATE OR REPLACE PACKAGE BODY")
                 || upper.contains("CREATE PACKAGE BODY")
         };
+        let statement_has_apply = statement.to_ascii_uppercase().contains(" APPLY");
 
         let newline_with = |out: &mut String,
                             indent_level: usize,
@@ -1817,6 +1846,19 @@ impl SqlEditorWidget {
             }
             *line_indent = indent_level + extra;
             *at_line_start = true;
+            *needs_space = false;
+        };
+        let newline_with_spaces = |out: &mut String,
+                                   indent_spaces: usize,
+                                   at_line_start: &mut bool,
+                                   needs_space: &mut bool,
+                                   line_indent: &mut usize| {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&" ".repeat(indent_spaces));
+            *line_indent = indent_spaces / 4;
+            *at_line_start = false;
             *needs_space = false;
         };
 
@@ -2124,7 +2166,7 @@ impl SqlEditorWidget {
                             end_tail.first().map(String::as_str),
                             Some("LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE")
                         );
-                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                        let paren_extra = usize::from(suppress_comma_break_depth > 0);
 
                         let case_expression_end =
                             !is_qualified_end && block_stack.last().is_some_and(|s| s == "CASE");
@@ -2386,7 +2428,7 @@ impl SqlEditorWidget {
                                 .is_some_and(|depth| paren_stack.len() == depth),
                             construct.cursor_sql_active,
                         );
-                        let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
+                        let paren_extra = usize::from(suppress_comma_break_depth > 0);
                         if upper == "WHEN"
                             && block_stack.last().is_some_and(|s| s == "CASE")
                             && case_branch_started.last().is_some()
@@ -2398,6 +2440,9 @@ impl SqlEditorWidget {
                         let is_merge_when = upper == "WHEN"
                             && construct.merge_active
                             && block_stack.last().is_none_or(|s| s != "CASE");
+                        let uses_where_hanging_condition_indent =
+                            matches!(upper.as_str(), "AND" | "OR")
+                                && matches!(current_clause.as_deref(), Some("WHERE" | "HAVING"));
                         if is_merge_when {
                             // MERGE WHEN MATCHED/NOT MATCHED: at base indent
                             if construct.merge_when_branch_active {
@@ -2408,6 +2453,17 @@ impl SqlEditorWidget {
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
                                 0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else if statement_has_apply && uses_where_hanging_condition_indent {
+                            newline_with_spaces(
+                                &mut out,
+                                clause_base_indent
+                                    .saturating_mul(4)
+                                    .saturating_add(2)
+                                    .saturating_add(paren_extra.saturating_mul(4)),
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
@@ -2553,7 +2609,7 @@ impl SqlEditorWidget {
                             newline_after_keyword = true;
                             newline_after_keyword_extra = 1;
                         }
-                    } else if upper == join_keyword {
+                    } else if upper == join_keyword || upper == "APPLY" {
                         if !join_modifier_active {
                             newline_with(
                                 &mut out,
@@ -3194,6 +3250,7 @@ impl SqlEditorWidget {
                             if hint_after_select {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
                                     indent: select_list_indent,
+                                    hanging_indent_spaces: None,
                                 };
                             }
                         } else {
@@ -3222,6 +3279,7 @@ impl SqlEditorWidget {
                             {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
                                     indent: select_list_indent,
+                                    hanging_indent_spaces: None,
                                 };
                             }
                         }
@@ -3279,6 +3337,7 @@ impl SqlEditorWidget {
                             if hint_after_select {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
                                     indent: base_indent(indent_level, open_cursor_state) + 1,
+                                    hanging_indent_spaces: None,
                                 };
                             }
                         }
@@ -3361,6 +3420,12 @@ impl SqlEditorWidget {
                                         base_indent(indent_level, open_cursor_state) + 1;
                                     select_list_layout_state = SelectListLayoutState::Multiline {
                                         indent: select_list_indent,
+                                        hanging_indent_spaces: statement_has_apply.then_some(
+                                            select_list_layout_state.hanging_indent_spaces(
+                                                &out,
+                                                select_list_indent,
+                                            ),
+                                        ),
                                     };
                                 }
                             } else if suppress_comma_break_depth == 0
@@ -3377,22 +3442,34 @@ impl SqlEditorWidget {
                                     } else {
                                         1
                                     };
-                                newline_with(
-                                    &mut out,
-                                    base_indent(indent_level, open_cursor_state),
-                                    comma_extra_indent,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
-                                );
-                                if matches!(current_clause.as_deref(), Some("SELECT")) {
+                                if statement_has_apply
+                                    && matches!(current_clause.as_deref(), Some("SELECT"))
+                                {
                                     // The select list is already multiline after the first comma.
-                                    // Avoid retroactively forcing a newline right after SELECT.
                                     let select_list_indent =
                                         base_indent(indent_level, open_cursor_state) + 1;
+                                    let hanging_indent_spaces = select_list_layout_state
+                                        .hanging_indent_spaces(&out, select_list_indent);
+                                    newline_with_spaces(
+                                        &mut out,
+                                        hanging_indent_spaces,
+                                        &mut at_line_start,
+                                        &mut needs_space,
+                                        &mut line_indent,
+                                    );
                                     select_list_layout_state = SelectListLayoutState::Multiline {
                                         indent: select_list_indent,
+                                        hanging_indent_spaces: Some(hanging_indent_spaces),
                                     };
+                                } else {
+                                    newline_with(
+                                        &mut out,
+                                        base_indent(indent_level, open_cursor_state),
+                                        comma_extra_indent,
+                                        &mut at_line_start,
+                                        &mut needs_space,
+                                        &mut line_indent,
+                                    );
                                 }
                             } else {
                                 out.push(' ');
@@ -3508,7 +3585,12 @@ impl SqlEditorWidget {
                                 Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
                             );
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
-                            if needs_space {
+                            let keeps_aggregate_call_tight = statement_has_apply
+                                && matches!(
+                                prev_word_upper.as_deref(),
+                                Some("AVG" | "COUNT" | "MAX" | "MIN")
+                            );
+                            if needs_space && !keeps_aggregate_call_tight {
                                 out.push(' ');
                             }
                             out.push('(');
@@ -3696,7 +3778,9 @@ impl SqlEditorWidget {
             &next_code_indices,
         );
 
-        Self::render_line_layouts(&layouts)
+        let preserve_odd_hanging_indent = formatted.to_ascii_uppercase().contains(" APPLY");
+
+        Self::render_line_layouts(&layouts, preserve_odd_hanging_indent)
     }
 
     fn build_line_layouts<'a>(
@@ -3764,6 +3848,7 @@ impl SqlEditorWidget {
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
                 existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
+                existing_indent_spaces: raw.len().saturating_sub(trimmed.len()),
                 final_depth: 0,
                 anchor_group: None,
                 dml_case_expression_close_depth: None,
@@ -3858,7 +3943,6 @@ impl SqlEditorWidget {
         trimmed_upper.starts_with("FROM (")
             || trimmed_upper.starts_with("USING (")
             || trimmed_upper.contains(" JOIN (")
-            || trimmed_upper.contains(" APPLY (")
     }
 
     fn line_has_condition_query_owner(trimmed_upper: &str) -> bool {
@@ -4908,7 +4992,10 @@ impl SqlEditorWidget {
         anchor_depths
     }
 
-    fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
+    fn render_line_layouts(
+        layouts: &[LineLayout<'_>],
+        preserve_odd_hanging_indent: bool,
+    ) -> String {
         let mut out = String::new();
 
         for (idx, layout) in layouts.iter().enumerate() {
@@ -4927,7 +5014,16 @@ impl SqlEditorWidget {
                 | LineLayoutKind::CommentOnly
                 | LineLayoutKind::CommaOnly
                 | LineLayoutKind::Verbatim => {
-                    out.push_str(&" ".repeat(layout.final_depth * 4));
+                    let depth_indent = layout.final_depth * 4;
+                    let render_indent = if preserve_odd_hanging_indent
+                        && layout.existing_indent_spaces > 0
+                        && layout.existing_indent_spaces % 4 != 0
+                    {
+                        layout.existing_indent_spaces
+                    } else {
+                        depth_indent
+                    };
+                    out.push_str(&" ".repeat(render_indent));
                     out.push_str(layout.trimmed);
                 }
             }
@@ -11006,6 +11102,49 @@ CROSS APPLY ("
             "CROSS APPLY should start on a new line after JOIN ON, got:
 {}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_cross_apply_aggregate_subquery_layout_exactly() {
+        let source = "select d.department_name, emp_stats.avg_sal, emp_stats.emp_count, top_emp.employee_name, top_emp.salary from departments d cross apply (select avg(e.salary) as avg_sal, count(*) as emp_count, max(e.salary) as max_sal from employees e where e.department_id = d.department_id having count(*) > 5) emp_stats outer apply (select e2.first_name || ' ' || e2.last_name as employee_name, e2.salary from employees e2 where e2.department_id = d.department_id and e2.salary = emp_stats.max_sal fetch first 1 row only) top_emp where emp_stats.avg_sal > (select avg(salary) from employees);";
+        let expected = r#"SELECT d.department_name,
+       emp_stats.avg_sal,
+       emp_stats.emp_count,
+       top_emp.employee_name,
+       top_emp.salary
+FROM departments d
+CROSS APPLY (
+    SELECT AVG(e.salary) AS avg_sal,
+           COUNT(*) AS emp_count,
+           MAX(e.salary) AS max_sal
+    FROM employees e
+    WHERE e.department_id = d.department_id
+    HAVING COUNT(*) > 5
+) emp_stats
+OUTER APPLY (
+    SELECT e2.first_name || ' ' || e2.last_name AS employee_name,
+           e2.salary
+    FROM employees e2
+    WHERE e2.department_id = d.department_id
+      AND e2.salary = emp_stats.max_sal
+    FETCH FIRST 1 ROW ONLY
+) top_emp
+WHERE emp_stats.avg_sal > (
+    SELECT AVG(salary)
+    FROM employees
+);"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted, expected,
+            "Auto formatting should keep APPLY aggregate subqueries on the exact expected base depths"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(expected, false),
+            expected,
+            "Auto formatting should be stable for the expected APPLY layout"
         );
     }
 

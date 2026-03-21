@@ -895,7 +895,7 @@ CREATE OR REPLACE PACKAGE BODY util_pkg AS
     END batch_process;
 END util_pkg;
 /
-
+/*
 -- ============================================================================
 -- CATEGORY 9: 조건부 컴파일과 프리프로세서 (Conditional Compilation)
 -- ============================================================================
@@ -995,7 +995,11 @@ CREATE OR REPLACE PACKAGE BODY conditional_pkg AS
         }
         return sum;
     }
-}'; /
+}'; 
+
+*/
+
+/
         -- ============================================================================
         -- CATEGORY 11: 세미콜론 vs 슬래시 종결자 함정 (Terminator Traps)
         -- ============================================================================
@@ -1013,6 +1017,7 @@ CREATE OR REPLACE PACKAGE BODY conditional_pkg AS
                 ORDER BY salary /
                 SELECT 1 / 2 AS half
                 FROM DUAL;
+
         -- [TEST-027] 줄 시작의 슬래시만 종결자 (예상: 3 실행단위)
         -- 난이도: ★★★★☆
         BEGIN

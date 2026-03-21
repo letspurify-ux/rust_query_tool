@@ -2136,7 +2136,6 @@ impl QueryExecutor {
             || trimmed_upper.ends_with(" EXISTS (")
             || trimmed_upper.ends_with(" NOT EXISTS (")
             || trimmed_upper.contains(" JOIN (")
-            || trimmed_upper.contains(" APPLY (")
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
