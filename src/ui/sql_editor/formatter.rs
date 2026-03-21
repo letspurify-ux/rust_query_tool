@@ -4369,6 +4369,8 @@ impl SqlEditorWidget {
                     crate::sql_text::starts_with_keyword_token(&cursor_upper, "CURSOR")
                         && (cursor_upper.contains(" IS") || cursor_upper.contains(" AS"))
                 });
+            let previous_line_has_trailing_unclosed_case = last_code_idx
+                .is_some_and(|prev_idx| Self::line_has_trailing_unclosed_case(layouts[prev_idx].trimmed));
             let previous_line_is_case_header = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "CASE")
@@ -5207,6 +5209,22 @@ impl SqlEditorWidget {
                     case_depth: effective_depth,
                     expression_owner_depth: current_line_dml_case_expression_owner_depth,
                 });
+            } else if in_dml_statement
+                && !current_line_starts_case
+                && previous_line_has_trailing_unclosed_case
+                && dml_case_frames.is_empty()
+                && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+            {
+                // CASE opened mid-line on the previous code line (e.g. `SELECT col, CASE`
+                // or `SET col = CASE`).  Retroactively push a frame so that WHEN/ELSE/END
+                // on subsequent lines get the correct minimum depth enforcement.
+                let inferred_case_depth = last_code_idx
+                    .map(|prev_idx| layouts[prev_idx].final_depth)
+                    .unwrap_or(effective_depth.saturating_sub(1));
+                dml_case_frames.push(DmlCaseLayoutFrame {
+                    case_depth: inferred_case_depth,
+                    expression_owner_depth: None,
+                });
             }
             if in_dml_statement
                 && Self::starts_with_case_terminator(&trimmed_upper)
@@ -5871,6 +5889,28 @@ impl SqlEditorWidget {
         }
 
         paren_balance > 0
+    }
+
+    /// Returns `true` when `line` contains a CASE keyword that is not closed
+    /// by a matching END on the same line.  This detects mid-line CASE
+    /// expressions such as `SELECT col, CASE` or `SET col = CASE` so that
+    /// the formatter can open a [`DmlCaseLayoutFrame`] even when the CASE
+    /// keyword does not start the line.
+    fn line_has_trailing_unclosed_case(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        let mut open_cases = 0usize;
+
+        for token in &tokens {
+            if let SqlToken::Word(word) = token {
+                if word.eq_ignore_ascii_case("CASE") {
+                    open_cases += 1;
+                } else if word.eq_ignore_ascii_case("END") && open_cases > 0 {
+                    open_cases -= 1;
+                }
+            }
+        }
+
+        open_cases > 0
     }
 
     fn line_is_cte_definition_header(line: &str) -> bool {
@@ -12655,5 +12695,108 @@ FROM t1;"#;
             "END should align with CASE, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_mid_line_case_after_comma_opens_frame() {
+        // Stage 1 keeps CASE on the same line as the preceding comma item,
+        // so the DmlCaseLayoutFrame must be pushed retroactively.
+        let source = "SELECT col1, CASE\nWHEN col2 = 1 THEN 'a'\nELSE 'b'\nEND AS result\nFROM t1;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN"))
+            .expect("WHEN should exist");
+        let else_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ELSE"))
+            .expect("ELSE should exist");
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END"))
+            .expect("END should exist");
+
+        assert_eq!(
+            leading_spaces(lines[when_idx]),
+            leading_spaces(lines[else_idx]),
+            "ELSE should align with WHEN when CASE opened mid-line, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[when_idx]) > leading_spaces(lines[end_idx]),
+            "WHEN should indent deeper than END when CASE opened mid-line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_mid_line_case_in_update_set_opens_frame() {
+        let source = "UPDATE t1\nSET col1 = CASE\nWHEN col2 = 1 THEN 'a'\nELSE 'b'\nEND;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN"))
+            .expect("WHEN should exist");
+        let else_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ELSE"))
+            .expect("ELSE should exist");
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END"))
+            .expect("END should exist");
+
+        assert_eq!(
+            leading_spaces(lines[when_idx]),
+            leading_spaces(lines[else_idx]),
+            "ELSE should align with WHEN in UPDATE SET CASE, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[when_idx]) > leading_spaces(lines[end_idx]),
+            "WHEN should indent deeper than END in UPDATE SET CASE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn line_has_trailing_unclosed_case_detects_mid_line_case() {
+        assert!(SqlEditorWidget::line_has_trailing_unclosed_case(
+            "SELECT col1, CASE"
+        ));
+        assert!(SqlEditorWidget::line_has_trailing_unclosed_case(
+            "SET col1 = CASE"
+        ));
+        assert!(SqlEditorWidget::line_has_trailing_unclosed_case(
+            "NVL(col, CASE"
+        ));
+    }
+
+    #[test]
+    fn line_has_trailing_unclosed_case_ignores_closed_case() {
+        assert!(!SqlEditorWidget::line_has_trailing_unclosed_case(
+            "CASE WHEN a = 1 THEN 'x' ELSE 'y' END"
+        ));
+        assert!(!SqlEditorWidget::line_has_trailing_unclosed_case(
+            "SELECT CASE WHEN a THEN b END AS c"
+        ));
+    }
+
+    #[test]
+    fn line_has_trailing_unclosed_case_returns_false_for_no_case() {
+        assert!(!SqlEditorWidget::line_has_trailing_unclosed_case(
+            "SELECT col1, col2"
+        ));
+        assert!(!SqlEditorWidget::line_has_trailing_unclosed_case(
+            "WHERE col1 = 1"
+        ));
     }
 }
