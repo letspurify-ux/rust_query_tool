@@ -39,12 +39,19 @@ struct LineLayout<'a> {
     existing_indent: usize,
     final_depth: usize,
     anchor_group: Option<usize>,
+    dml_case_expression_close_depth: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
 struct MultilineClauseLayoutFrame {
     owner_depth: usize,
     nested_paren_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DmlCaseLayoutFrame {
+    case_depth: usize,
+    expression_owner_depth: Option<usize>,
 }
 
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
@@ -3759,6 +3766,7 @@ impl SqlEditorWidget {
                 existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
                 final_depth: 0,
                 anchor_group: None,
+                dml_case_expression_close_depth: None,
             });
         }
 
@@ -3870,7 +3878,8 @@ impl SqlEditorWidget {
         let mut pending_paren_case_closer_indent = false;
         let mut last_code_idx: Option<usize> = None;
         let mut next_anchor_group = 0usize;
-        let mut dml_case_depths: Vec<usize> = Vec::new();
+        let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
+        let mut pending_dml_case_expression_close_depth: Option<usize> = None;
         let mut pending_query_head_depth: Option<usize> = None;
         let mut resolved_query_base_depths: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
@@ -4080,6 +4089,25 @@ impl SqlEditorWidget {
                 Self::line_layout_preceding_comment_or_comma_run_has_comma(layouts, idx);
             let current_line_starts_case =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
+            let current_line_starts_dml_case_expression = in_dml_statement
+                && current_line_starts_case
+                && !previous_line_ends_with_then
+                && !previous_line_is_else
+                && last_code_idx.is_some_and(|prev_idx| {
+                    Self::line_has_unclosed_open_paren_before_inline_comment(
+                        layouts[prev_idx].trimmed,
+                    )
+                });
+            let current_line_dml_case_expression_owner_depth =
+                if current_line_starts_dml_case_expression
+                    && (previous_line_is_dml_clause_starter
+                        || previous_line_ends_with_trailing_comma
+                        || follows_comma_run)
+                {
+                last_code_indent
+            } else {
+                None
+            };
             let current_line_is_condition_keyword =
                 trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ");
             let current_line_starts_multiline_clause =
@@ -4130,6 +4158,7 @@ impl SqlEditorWidget {
             } else {
                 layouts[idx].auto_depth
             };
+            let mut current_line_dml_case_expression_close_depth = None;
             let mut effective_depth = if !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
                 && previous_line_ends_with_then
@@ -4200,6 +4229,18 @@ impl SqlEditorWidget {
                         })
                         .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
                 }
+            } else if in_dml_statement
+                && starts_with_close_paren
+                && pending_dml_case_expression_close_depth.is_some()
+            {
+                let owner_depth = pending_dml_case_expression_close_depth.unwrap_or(parser_depth);
+                current_line_dml_case_expression_close_depth = Some(owner_depth);
+                owner_depth.max(parser_depth)
+            } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth {
+                owner_depth
+                    .saturating_add(1)
+                    .max(existing_indent)
+                    .max(parser_depth)
             } else if uses_analyzer_query_depth {
                 if starts_query_head {
                     pending_query_head_depth.unwrap_or(analyzer_query_depth)
@@ -4434,6 +4475,13 @@ impl SqlEditorWidget {
                 } else {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
                 }
+            } else if in_dml_statement
+                && starts_with_close_paren
+                && previous_line_is_plain_end
+            {
+                last_code_indent
+                    .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                    .unwrap_or(parser_depth)
             } else if in_query_statement
                 && starts_with_close_paren
                 && current_line_query_close_align_depth.is_some()
@@ -4516,11 +4564,12 @@ impl SqlEditorWidget {
                     .unwrap_or(parser_depth.saturating_add(1));
             }
             if in_dml_statement {
-                if let Some(case_depth) = dml_case_depths.last().copied() {
+                if let Some(case_frame) = dml_case_frames.last().copied() {
                     if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
-                        effective_depth = effective_depth.max(case_depth.saturating_add(1));
+                        effective_depth =
+                            effective_depth.max(case_frame.case_depth.saturating_add(1));
                     } else if Self::starts_with_plain_end(&trimmed_upper) {
-                        effective_depth = effective_depth.max(case_depth);
+                        effective_depth = effective_depth.max(case_frame.case_depth);
                     }
                 }
             }
@@ -4612,6 +4661,8 @@ impl SqlEditorWidget {
             }
 
             layouts[idx].final_depth = effective_depth;
+            layouts[idx].dml_case_expression_close_depth =
+                current_line_dml_case_expression_close_depth;
             if let Some(frame) = multiline_clause_frames.last_mut() {
                 if !current_line_starts_multiline_clause {
                     let (open_count, close_count) = Self::line_significant_paren_counts(trimmed);
@@ -4652,10 +4703,19 @@ impl SqlEditorWidget {
 
             let closes_plain_end = Self::starts_with_plain_end(&trimmed_upper);
             if in_dml_statement && current_line_starts_case {
-                dml_case_depths.push(effective_depth);
+                dml_case_frames.push(DmlCaseLayoutFrame {
+                    case_depth: effective_depth,
+                    expression_owner_depth: current_line_dml_case_expression_owner_depth,
+                });
             }
-            if in_dml_statement && closes_plain_end && !dml_case_depths.is_empty() {
-                dml_case_depths.pop();
+            if in_dml_statement && closes_plain_end && !dml_case_frames.is_empty() {
+                if let Some(frame) = dml_case_frames.pop() {
+                    if frame.expression_owner_depth.is_some()
+                        && next_code_trimmed.is_some_and(|next| next.trim_start().starts_with(')'))
+                    {
+                        pending_dml_case_expression_close_depth = frame.expression_owner_depth;
+                    }
+                }
             }
 
             if in_paren_case_expression && closes_plain_end {
@@ -4667,6 +4727,9 @@ impl SqlEditorWidget {
 
             if pending_paren_case_closer_indent && starts_with_close_paren {
                 pending_paren_case_closer_indent = false;
+            }
+            if pending_dml_case_expression_close_depth.is_some() && starts_with_close_paren {
+                pending_dml_case_expression_close_depth = None;
             }
 
             if starts_query_head || pending_query_head_depth.is_some() {
@@ -4736,6 +4799,9 @@ impl SqlEditorWidget {
             let Some(next_idx) = next_code_indices[idx] else {
                 continue;
             };
+            if layouts[idx].dml_case_expression_close_depth.is_some() {
+                continue;
+            }
 
             let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
             let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
@@ -11112,6 +11178,114 @@ CROSS APPLY ("
         assert!(
             into_line.starts_with("    "),
             "INSERT ALL INTO should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_insert_all_case_inside_values_keeps_expression_depth() {
+        let source = r#"INSERT ALL
+    WHEN total_amount > 10000 THEN
+        INTO high_value_orders (order_id, customer_id, amount, order_date)
+        VALUES (oid, cid, total_amount, odate)
+        INTO vip_notifications (customer_id, message, created)
+        VALUES (cid, 'High value order: ' || TO_CHAR (total_amount, 'FM$999,999.00'), SYSDATE)
+    WHEN total_amount BETWEEN 1000 AND 10000 THEN
+        INTO medium_value_orders (order_id, customer_id, amount)
+        VALUES (oid, cid, total_amount)
+    WHEN category = 'ELECTRONICS' THEN
+        INTO electronics_orders (order_id, amount, warranty_end)
+        VALUES (oid, total_amount, ADD_MONTHS (odate,
+    CASE
+        WHEN total_amount > 5000 THEN 24
+            ELSE 12
+    END
+    ))
+    ELSE
+        INTO standard_orders (order_id, customer_id, amount)
+        VALUES (oid, cid, total_amount)
+SELECT o.order_id AS oid,
+    o.customer_id AS cid,
+    o.total_amount,
+    o.order_date AS odate,
+    p.category
+FROM orders o
+JOIN products p
+    ON o.product_id = p.product_id
+WHERE o.order_date >= TRUNC (SYSDATE, 'MM');"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let values_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("VALUES (oid, total_amount, ADD_MONTHS (odate,")
+            })
+            .unwrap_or(0);
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(values_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "WHEN total_amount > 5000 THEN 24")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "ELSE 12")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(end_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "))")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[case_idx]) > leading_spaces(lines[values_idx]),
+            "CASE inside INSERT ALL VALUES should indent deeper than VALUES, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[when_idx]) > leading_spaces(lines[case_idx]),
+            "WHEN inside INSERT ALL VALUES CASE should indent deeper than CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[else_idx]),
+            leading_spaces(lines[when_idx]),
+            "ELSE inside INSERT ALL VALUES CASE should align with WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "END inside INSERT ALL VALUES CASE should align with CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[values_idx]),
+            ")) after INSERT ALL VALUES CASE should realign with VALUES, got:\n{}",
             formatted
         );
     }
