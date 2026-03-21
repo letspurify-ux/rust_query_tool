@@ -6668,6 +6668,54 @@ fn test_set_sqlblanklines_command_parsed() {
 }
 
 #[test]
+fn test_split_script_items_multiline_set_serveroutput_command() {
+    let sql = "SET SERVEROUTPUT\n    ON SIZE UNLIMITED;\nSELECT 1 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(
+            &items[0],
+            ScriptItem::ToolCommand(ToolCommand::SetServerOutput {
+                enabled: true,
+                size: None,
+                unlimited: true
+            })
+        ),
+        "multiline SET SERVEROUTPUT should remain one tool command, got: {:?}",
+        items
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::Statement(stmt) if stmt.eq_ignore_ascii_case("SELECT 1 FROM dual")),
+        "SELECT following multiline SET SERVEROUTPUT should stay a SQL statement, got: {:?}",
+        items
+    );
+}
+
+#[test]
+fn test_split_format_items_multiline_set_serveroutput_command() {
+    let sql = "SET SERVEROUTPUT\n    ON SIZE UNLIMITED;\nSELECT 1 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+
+    assert!(
+        matches!(
+            &items[0],
+            FormatItem::ToolCommand(ToolCommand::SetServerOutput {
+                enabled: true,
+                size: None,
+                unlimited: true
+            })
+        ),
+        "format splitter should keep multiline SET SERVEROUTPUT as one tool command, got: {:?}",
+        items
+    );
+    assert!(
+        matches!(&items[1], FormatItem::Statement(stmt) if stmt.eq_ignore_ascii_case("SELECT 1 FROM dual")),
+        "format splitter should keep trailing SELECT separate after multiline SET command, got: {:?}",
+        items
+    );
+}
+
+#[test]
 fn test_sqlblanklines_off_splits_top_level_statement_on_blank_line() {
     let sql = "SET SQLBLANKLINES OFF\nSELECT 1\n\nFROM dual;";
     let items = QueryExecutor::split_script_items(sql);

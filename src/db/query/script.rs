@@ -4278,6 +4278,12 @@ impl QueryExecutor {
 
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
+            let logical_line = if Self::can_collect_multiline_tool_command(&builder) {
+                Self::collect_multiline_tool_command(line, &mut lines)
+            } else {
+                None
+            };
+            let line = logical_line.as_deref().unwrap_or(line);
             let trimmed = line.trim();
 
             // Blank-line termination
@@ -4511,6 +4517,110 @@ impl QueryExecutor {
         None
     }
 
+    fn can_collect_multiline_tool_command(builder: &SqlParserEngine) -> bool {
+        builder.is_idle()
+            && builder.current_is_empty()
+            && builder.block_depth() == 0
+            && builder.paren_depth() == 0
+    }
+
+    fn collect_multiline_tool_command<'a, I>(
+        first_line: &'a str,
+        lines: &mut std::iter::Peekable<I>,
+    ) -> Option<String>
+    where
+        I: Iterator<Item = &'a str> + Clone,
+    {
+        let trimmed = first_line.trim();
+        let parsed = Self::parse_tool_command(trimmed)?;
+        if !Self::tool_command_can_continue(trimmed, &parsed) {
+            return None;
+        }
+
+        let mut candidate = trimmed.to_string();
+        let mut preview = lines.clone();
+        let mut consumed = 0usize;
+
+        while let Some(next_line) = preview.next() {
+            if !Self::is_tool_command_continuation_line(next_line) {
+                break;
+            }
+
+            candidate.push('\n');
+            candidate.push_str(next_line.trim());
+            consumed = consumed.saturating_add(1);
+
+            let Some(parsed_candidate) = Self::parse_tool_command(&candidate) else {
+                break;
+            };
+
+            if Self::tool_command_can_continue(&candidate, &parsed_candidate) {
+                continue;
+            }
+
+            for _ in 0..consumed {
+                let _ = lines.next();
+            }
+            return Some(candidate);
+        }
+
+        if consumed == 0 {
+            return None;
+        }
+
+        for _ in 0..consumed {
+            let _ = lines.next();
+        }
+        Some(candidate)
+    }
+
+    fn tool_command_can_continue(raw: &str, command: &ToolCommand) -> bool {
+        match command {
+            ToolCommand::Unsupported { message, .. } => {
+                Self::unsupported_tool_command_can_continue(message)
+            }
+            ToolCommand::SetServerOutput {
+                enabled: true,
+                size: None,
+                unlimited: false,
+            } => {
+                let upper = raw.to_ascii_uppercase();
+                upper.contains("SERVEROUTPUT") && upper.contains("SIZE")
+            }
+            ToolCommand::ShowErrors {
+                object_type: None,
+                object_name: None,
+            } => true,
+            ToolCommand::WheneverSqlError { action: None, .. } => true,
+            _ => false,
+        }
+    }
+
+    fn unsupported_tool_command_can_continue(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains(" requires ")
+            || lower.starts_with("requires ")
+            || lower.contains("requires:")
+            || lower.contains("syntax:")
+            || lower.contains("expected:")
+            || lower.contains("cannot be empty")
+            || lower.contains("without script path")
+    }
+
+    fn is_tool_command_continuation_line(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || sql_text::is_sqlplus_comment_line(trimmed)
+            || crate::sql_parser_engine::line_starts_with_consumed_slash_terminator(line)
+            || sql_text::is_auto_terminated_tool_command(trimmed)
+        {
+            return false;
+        }
+
+        sql_text::first_meaningful_word(trimmed)
+            .is_none_or(|word| !sql_text::is_statement_head_keyword(word))
+    }
+
     fn merge_fragmented_standalone_routine_format_items(items: Vec<FormatItem>) -> Vec<FormatItem> {
         let mut merged: Vec<FormatItem> = Vec::with_capacity(items.len());
         let mut index = 0usize;
@@ -4611,7 +4721,14 @@ impl QueryExecutor {
         let mut builder = SqlParserEngine::new();
         let mut sqlblanklines_enabled = true;
 
-        for line in sql.lines() {
+        let mut lines = sql.lines().peekable();
+        while let Some(line) = lines.next() {
+            let logical_line = if Self::can_collect_multiline_tool_command(&builder) {
+                Self::collect_multiline_tool_command(line, &mut lines)
+            } else {
+                None
+            };
+            let line = logical_line.as_deref().unwrap_or(line);
             let trimmed = line.trim();
 
             // Blank-line termination (SET SQLBLANKLINES OFF)
@@ -5087,13 +5204,20 @@ impl QueryExecutor {
         let mut size: Option<u32> = None;
         let mut unlimited = false;
         let mut idx = 3usize;
-        while idx + 1 < tokens.len() {
+        while idx < tokens.len() {
             if tokens[idx].eq_ignore_ascii_case("SIZE") {
-                let size_val = tokens[idx + 1];
+                let Some(size_val) = tokens.get(idx + 1) else {
+                    return ToolCommand::Unsupported {
+                        raw: raw.to_string(),
+                        message: "SET SERVEROUTPUT SIZE must be a number or UNLIMITED."
+                            .to_string(),
+                        is_error: true,
+                    };
+                };
                 if size_val.eq_ignore_ascii_case("UNLIMITED") {
                     unlimited = true;
                 } else {
-                    match size_val.parse::<u32>() {
+                    match (*size_val).parse::<u32>() {
                         Ok(val) => size = Some(val),
                         Err(_) => {
                             return ToolCommand::Unsupported {

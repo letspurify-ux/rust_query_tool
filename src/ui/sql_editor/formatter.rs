@@ -2532,7 +2532,8 @@ impl SqlEditorWidget {
                             );
                         }
                     } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
-                        && (block_stack.iter().any(|s| s == "PACKAGE_BODY")
+                        && (block_stack.last().is_some_and(|s| s == "DECLARE")
+                            || block_stack.iter().any(|s| s == "PACKAGE_BODY")
                             || at_package_body_member_depth)
                     {
                         if !at_line_start {
@@ -4560,6 +4561,13 @@ impl SqlEditorWidget {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
                 }
             } else if in_dml_statement
+                && Self::is_dml_clause_starter(&trimmed_upper)
+                && previous_line_starts_with_close_paren
+            {
+                resolved_query_base_depth
+                    .or(layouts[idx].query_base_depth)
+                    .unwrap_or(parser_depth)
+            } else if in_dml_statement
                 && starts_with_close_paren
                 && previous_line_is_plain_end
             {
@@ -4673,6 +4681,7 @@ impl SqlEditorWidget {
                 effective_depth
             };
             let clause_anchor_depth = if !uses_analyzer_query_depth
+                && !previous_line_starts_with_close_paren
                 && Self::is_dml_clause_starter(&trimmed_upper)
             {
                 Self::previous_dml_clause_starter_depth(layouts, idx, parser_depth).or_else(|| {
@@ -8615,6 +8624,177 @@ PROMPT [DONE] Hardcore SELECT tests finished.";
                 "ORDER BY empno;\n\nPROMPT [DONE] Hardcore SELECT tests finished."
             ),
             "Formatter should separate trailing PROMPT from the SQL statement with a blank line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_reassembles_multiline_sqlplus_set_commands() {
+        let source = "SET SERVEROUTPUT
+    ON SIZE UNLIMITED;
+SET TIMING
+    ON;
+SELECT 1 FROM dual;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = [
+            "SET SERVEROUTPUT ON SIZE UNLIMITED",
+            "",
+            "SET TIMING ON",
+            "",
+            "SELECT 1",
+            "FROM DUAL;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_parenthesized_top_level_set_operators_left_aligned() {
+        let source = r#"(
+    SELECT e.dept_id,
+        'HIGH' AS bucket,
+        COUNT (*) AS cnt
+    FROM qt_fmt_emp e
+    WHERE e.salary >= (
+        SELECT AVG (x.salary)
+        FROM qt_fmt_emp x
+        WHERE x.dept_id = e.dept_id
+    )
+    GROUP BY e.dept_id
+    HAVING COUNT (*) > 0
+)
+    UNION ALL (
+        SELECT e.dept_id,
+            'LOW' AS bucket,
+            COUNT (*) AS cnt
+        FROM qt_fmt_emp e
+        WHERE e.salary < (
+            SELECT AVG (x.salary)
+            FROM qt_fmt_emp x
+            WHERE x.dept_id = e.dept_id
+        )
+        GROUP BY e.dept_id
+        HAVING COUNT (*) > 0
+    )
+    MINUS (
+        SELECT 9999 AS dept_id,
+            'LOW' AS bucket,
+            0 AS cnt
+        FROM DUAL
+    )
+    ORDER BY 1,
+        2;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let union_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("UNION ALL"))
+            .unwrap_or(0);
+        let minus_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MINUS"))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ORDER BY"))
+            .unwrap_or(0);
+        let union_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(union_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT e.dept_id"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let minus_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(minus_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT 9999 AS dept_id"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[union_idx]),
+            0,
+            "UNION ALL after a top-level ')' should return to depth 0, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[minus_idx]),
+            0,
+            "MINUS after a top-level ')' should return to depth 0, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            0,
+            "ORDER BY after parenthesized set operands should stay on depth 0, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[union_select_idx]),
+            4,
+            "SELECT under UNION ALL should remain one level deeper than the set operator, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[minus_select_idx]),
+            4,
+            "SELECT under MINUS should remain one level deeper than the set operator, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_parenthesized_top_level_intersect_left_aligned() {
+        let source = r#"(
+    SELECT dept_id
+    FROM qt_fmt_emp
+)
+    INTERSECT (
+        SELECT dept_id
+        FROM qt_fmt_emp_hist
+    )
+    ORDER BY 1;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let intersect_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("INTERSECT"))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ORDER BY"))
+            .unwrap_or(0);
+        let rhs_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(intersect_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT dept_id"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[intersect_idx]),
+            0,
+            "INTERSECT after a top-level ')' should return to depth 0, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            0,
+            "ORDER BY after parenthesized INTERSECT operands should stay on depth 0, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rhs_select_idx]),
+            4,
+            "SELECT under INTERSECT should remain one level deeper than the set operator, got:\n{}",
             formatted
         );
     }

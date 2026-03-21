@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{QueryExecutor, ScriptItem};
+use crate::db::{FormatItem, QueryExecutor, ScriptItem};
 use crate::ui::syntax_highlight::{
     STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_KEYWORD,
     STYLE_QUOTED_IDENTIFIER, STYLE_Q_QUOTE_STRING, STYLE_STRING,
@@ -790,6 +790,122 @@ fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
 }
 
 #[test]
+fn format_sql_preserves_anonymous_block_with_local_record_bind_helpers_as_single_execution_unit() {
+    let input = r#"DECLARE
+    v_cursor_id INTEGER;
+    v_sql CLOB;
+    v_rows INTEGER;
+    v_desc_tab DBMS_SQL.DESC_TAB;
+    v_col_count INTEGER;
+    v_varchar VARCHAR2 (4000);
+    v_number NUMBER;
+    v_date DATE;
+    TYPE bind_rec_t IS RECORD (NAME VARCHAR2 (30), dtype VARCHAR2 (30), value VARCHAR2 (4000));
+    TYPE bind_tab_t IS TABLE OF bind_rec_t;
+    l_binds bind_tab_t := bind_tab_t ();
+    PROCEDURE add_bind (p_name VARCHAR2, p_type VARCHAR2, p_val VARCHAR2) IS
+    BEGIN
+        l_binds.EXTEND;
+        l_binds (l_binds.COUNT) := bind_rec_t (p_name, p_type, p_val);
+    END;
+
+BEGIN
+    add_bind (':dept_id', 'NUMBER', '50');
+    add_bind (':status', 'VARCHAR2', 'ACTIVE');
+    add_bind (':min_sal', 'NUMBER', '5000');
+    v_sql := 'SELECT employee_id, first_name || '' '' || last_name AS name, ' || 'salary, hire_date ' || 'FROM employees ' || 'WHERE department_id = :dept_id ' || 'AND status = :status ' || 'AND salary >= :min_sal ' || 'ORDER BY salary DESC';
+    v_cursor_id := DBMS_SQL.OPEN_CURSOR;
+    DBMS_SQL.PARSE (v_cursor_id, v_sql, DBMS_SQL.NATIVE);
+    FOR i IN 1..l_binds.COUNT LOOP
+        CASE l_binds (i).dtype
+            WHEN 'NUMBER' THEN
+                DBMS_SQL.BIND_VARIABLE (v_cursor_id, l_binds (i).NAME, TO_NUMBER (l_binds (i).value));
+            WHEN 'VARCHAR2' THEN
+                DBMS_SQL.BIND_VARIABLE (v_cursor_id, l_binds (i).NAME, l_binds (i).value);
+            WHEN 'DATE' THEN
+                DBMS_SQL.BIND_VARIABLE (v_cursor_id, l_binds (i).NAME, TO_DATE (l_binds (i).value, 'YYYY-MM-DD'));
+        END CASE;
+    END LOOP;
+    DBMS_SQL.DESCRIBE_COLUMNS (v_cursor_id, v_col_count, v_desc_tab);
+    FOR i IN 1..v_col_count LOOP
+        CASE v_desc_tab (i).col_type
+            WHEN 1 THEN
+                DBMS_SQL.DEFINE_COLUMN (v_cursor_id, i, v_varchar, 4000);
+            WHEN 2 THEN
+                DBMS_SQL.DEFINE_COLUMN (v_cursor_id, i, v_number);
+            WHEN 12 THEN
+                DBMS_SQL.DEFINE_COLUMN (v_cursor_id, i, v_date);
+        END CASE;
+    END LOOP;
+    v_rows := DBMS_SQL.EXECUTE (v_cursor_id);
+    WHILE DBMS_SQL.FETCH_ROWS (v_cursor_id) > 0 LOOP
+        FOR i IN 1..v_col_count LOOP
+            CASE v_desc_tab (i).col_type
+                WHEN 1 THEN
+                    DBMS_SQL.COLUMN_VALUE (v_cursor_id, i, v_varchar);
+                    DBMS_OUTPUT.PUT (RPAD (NVL (v_varchar, 'NULL'), 30));
+                WHEN 2 THEN
+                    DBMS_SQL.COLUMN_VALUE (v_cursor_id, i, v_number);
+                    DBMS_OUTPUT.PUT (RPAD (TO_CHAR (v_number), 15));
+                WHEN 12 THEN
+                    DBMS_SQL.COLUMN_VALUE (v_cursor_id, i, v_date);
+                    DBMS_OUTPUT.PUT (RPAD (TO_CHAR (v_date, 'YYYY-MM-DD'), 15));
+            END CASE;
+        END LOOP;
+        DBMS_OUTPUT.NEW_LINE;
+    END LOOP;
+    DBMS_SQL.CLOSE_CURSOR (v_cursor_id);
+EXCEPTION
+    WHEN OTHERS THEN
+        IF DBMS_SQL.IS_OPEN (v_cursor_id) THEN
+            DBMS_SQL.CLOSE_CURSOR (v_cursor_id);
+        END IF;
+        RAISE;
+END;"#;
+
+    let original_items = QueryExecutor::split_script_items(input);
+    let format_items = QueryExecutor::split_format_items(input);
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        count_script_statements(&original_items),
+        1,
+        "input should already be one execution unit"
+    );
+    assert_eq!(
+        format_items
+            .iter()
+            .filter(|item| matches!(item, FormatItem::Statement(_)))
+            .count(),
+        1,
+        "format splitter must keep the anonymous block intact before rendering"
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        1,
+        "formatting must preserve the anonymous block as one execution unit, got: {formatted_statements:?}\nformatted:\n{formatted}"
+    );
+    assert!(
+        !formatted.contains("END;\n\nBEGIN"),
+        "formatter must not insert a statement separator between local procedure END and outer BEGIN, got:\n{formatted}"
+    );
+    assert!(
+        formatted_statements
+            .first()
+            .is_some_and(|stmt| stmt.starts_with("DECLARE") && stmt.contains("PROCEDURE add_bind") && stmt.contains("DBMS_SQL.CLOSE_CURSOR")),
+        "formatted statement lost anonymous block structure: {formatted_statements:?}\nformatted:\n{formatted}"
+    );
+}
+
+#[test]
 fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
     let input = load_test_file("oracle_format_final_boss_v2.sql");
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -862,6 +978,32 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for oracle_format_final_boss_v2.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_test_045_execution_unit_inside_oracle_splitter_final_boss_script() {
+    let input = load_test_file("oracle splitter final boss test.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let matched = formatted_statements.iter().find(|stmt| {
+        stmt.starts_with("DECLARE")
+            && stmt.contains("TYPE bind_rec_t IS RECORD")
+            && stmt.contains("PROCEDURE add_bind")
+            && stmt.contains("DBMS_SQL.DESCRIBE_COLUMNS")
+    });
+
+    assert!(
+        matched.is_some(),
+        "formatted splitter should keep TEST-045 DBMS_SQL block as one statement, got: {formatted_statements:?}"
     );
 }
 
