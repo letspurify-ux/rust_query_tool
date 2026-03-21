@@ -5028,7 +5028,7 @@ impl SqlEditorWidget {
                     if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
                         effective_depth =
                             effective_depth.max(case_frame.case_depth.saturating_add(1));
-                    } else if Self::starts_with_plain_end(&trimmed_upper) {
+                    } else if Self::starts_with_case_terminator(&trimmed_upper) {
                         effective_depth = effective_depth.max(case_frame.case_depth);
                     }
                 }
@@ -12489,6 +12489,170 @@ end a;"#;
             formatted.trim().to_ascii_lowercase(),
             expected.trim().to_ascii_lowercase(),
             "package body OPEN cursor nested subquery should keep expected query base depth (case-insensitive), got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_end_case_in_dml_aligns_with_case_keyword() {
+        let source = r#"SELECT
+    col1,
+    CASE
+        WHEN col2 = 1 THEN 'a'
+        ELSE 'b'
+    END CASE AS result
+FROM t1;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .expect("CASE line should exist");
+        let end_case_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END CASE"))
+            .expect("END CASE line should exist");
+
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[end_case_idx]),
+            "END CASE should align with CASE keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_nested_case_end_case_in_dml_preserves_depth() {
+        let source = r#"SELECT
+    CASE
+        WHEN a = 1 THEN
+            CASE
+                WHEN b = 1 THEN 'x'
+                ELSE 'y'
+            END CASE
+        ELSE 'z'
+    END AS result
+FROM t1;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let outer_case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .expect("outer CASE should exist");
+        let inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("inner CASE should exist");
+        let end_case_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END CASE"))
+            .expect("END CASE should exist");
+        let outer_else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(end_case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("ELSE"))
+            .map(|(idx, _)| idx)
+            .expect("outer ELSE should exist");
+
+        assert_eq!(
+            leading_spaces(lines[inner_case_idx]),
+            leading_spaces(lines[end_case_idx]),
+            "END CASE should align with inner CASE, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[inner_case_idx]) > leading_spaces(lines[outer_case_idx]),
+            "Inner CASE should indent deeper than outer CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_else_idx]),
+            leading_spaces(lines[outer_case_idx])
+                .saturating_add(4),
+            "Outer ELSE should indent one level deeper than outer CASE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_case_when_after_clause_starter_opens_frame() {
+        let source = r#"SELECT
+    CASE
+        WHEN col1 = 1 THEN 'a'
+        WHEN col1 = 2 THEN 'b'
+        ELSE 'c'
+    END AS result,
+    col2
+FROM t1;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .expect("CASE should exist");
+        let when1_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN col1 = 1"))
+            .map(|(idx, _)| idx)
+            .expect("first WHEN should exist");
+        let when2_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when1_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN col1 = 2"))
+            .map(|(idx, _)| idx)
+            .expect("second WHEN should exist");
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when2_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("ELSE"))
+            .map(|(idx, _)| idx)
+            .expect("ELSE should exist");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("END"))
+            .map(|(idx, _)| idx)
+            .expect("END should exist");
+
+        assert!(
+            leading_spaces(lines[when1_idx]) > leading_spaces(lines[case_idx]),
+            "WHEN should indent deeper than CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[when1_idx]),
+            leading_spaces(lines[when2_idx]),
+            "All WHEN branches should align, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[when1_idx]),
+            leading_spaces(lines[else_idx]),
+            "ELSE should align with WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "END should align with CASE, got:\n{}",
             formatted
         );
     }
