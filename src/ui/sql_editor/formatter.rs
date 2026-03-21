@@ -55,6 +55,20 @@ struct DmlCaseLayoutFrame {
     expression_owner_depth: Option<usize>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParenLayoutFrameKind {
+    General,
+    Query,
+    MultilineClause,
+}
+
+#[derive(Clone, Copy)]
+struct ParenLayoutFrame {
+    kind: ParenLayoutFrameKind,
+    owner_depth: usize,
+    continuation_depth: usize,
+}
+
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
 const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
@@ -3953,6 +3967,159 @@ impl SqlEditorWidget {
             || trimmed_upper.ends_with(" NOT EXISTS (")
     }
 
+    fn line_starts_query_head(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "WITH")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INSERT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UPDATE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "DELETE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MERGE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CALL")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "VALUES")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "TABLE")
+    }
+
+    fn tokens_continue_expression_after_leading_closes(tokens: &[SqlToken], start_idx: usize) -> bool {
+        tokens
+            .iter()
+            .skip(start_idx)
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+            .is_some_and(|token| match token {
+                SqlToken::Symbol(sym) => {
+                    matches!(
+                        sym.as_str(),
+                        ","
+                            | "+"
+                            | "-"
+                            | "*"
+                            | "/"
+                            | "%"
+                            | "^"
+                            | "="
+                            | "<"
+                            | ">"
+                            | "<="
+                            | ">="
+                            | "<>"
+                            | "!="
+                            | "||"
+                            | "|"
+                    )
+                }
+                SqlToken::Word(word) => matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "AND" | "OR" | "IS" | "IN" | "LIKE" | "BETWEEN" | "NOT"
+                ),
+                _ => false,
+            })
+    }
+
+    fn classify_paren_layout_frame_kind(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        next_code_trimmed: Option<&str>,
+        is_multiline_clause_owner: bool,
+    ) -> ParenLayoutFrameKind {
+        let next_non_comment = tokens
+            .iter()
+            .skip(open_idx.saturating_add(1))
+            .find(|token| !matches!(token, SqlToken::Comment(_)));
+
+        if let Some(SqlToken::Word(word)) = next_non_comment {
+            if Self::line_starts_query_head(&word.to_ascii_uppercase()) {
+                return ParenLayoutFrameKind::Query;
+            }
+        }
+
+        if next_non_comment.is_none() {
+            if next_code_trimmed.is_some_and(|next| Self::line_starts_query_head(&next.to_ascii_uppercase())) {
+                return ParenLayoutFrameKind::Query;
+            }
+            if is_multiline_clause_owner {
+                return ParenLayoutFrameKind::MultilineClause;
+            }
+        }
+
+        ParenLayoutFrameKind::General
+    }
+
+    fn consume_leading_paren_layout_frames(
+        tokens: &[SqlToken],
+        paren_layout_frames: &mut Vec<ParenLayoutFrame>,
+    ) -> (usize, Option<ParenLayoutFrame>, bool) {
+        let mut token_idx = 0usize;
+        let mut saw_leading_close = false;
+        let mut last_popped_general_frame = None;
+
+        loop {
+            match tokens.get(token_idx) {
+                Some(SqlToken::Comment(_)) => {
+                    token_idx = token_idx.saturating_add(1);
+                }
+                Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                    saw_leading_close = true;
+                    if let Some(frame) = paren_layout_frames.pop() {
+                        if frame.kind == ParenLayoutFrameKind::General {
+                            last_popped_general_frame = Some(frame);
+                        }
+                    }
+                    token_idx = token_idx.saturating_add(1);
+                }
+                _ => break,
+            }
+        }
+
+        let continues_expression =
+            saw_leading_close && Self::tokens_continue_expression_after_leading_closes(tokens, token_idx);
+
+        (token_idx, last_popped_general_frame, continues_expression)
+    }
+
+    fn update_paren_layout_frames_for_line(
+        tokens: &[SqlToken],
+        start_idx: usize,
+        next_code_trimmed: Option<&str>,
+        line_depth: usize,
+        is_multiline_clause_owner: bool,
+        is_standalone_open_paren_owner: bool,
+        paren_layout_frames: &mut Vec<ParenLayoutFrame>,
+    ) {
+        for token_idx in start_idx..tokens.len() {
+            match &tokens[token_idx] {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    let kind = Self::classify_paren_layout_frame_kind(
+                        tokens,
+                        token_idx,
+                        next_code_trimmed,
+                        is_multiline_clause_owner,
+                    );
+                    let continuation_depth = match kind {
+                        ParenLayoutFrameKind::General => {
+                            if is_standalone_open_paren_owner {
+                                line_depth
+                            } else {
+                                line_depth.saturating_add(1)
+                            }
+                        }
+                        ParenLayoutFrameKind::Query | ParenLayoutFrameKind::MultilineClause => {
+                            line_depth
+                        }
+                    };
+                    paren_layout_frames.push(ParenLayoutFrame {
+                        kind,
+                        owner_depth: line_depth,
+                        continuation_depth,
+                    });
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    let _ = paren_layout_frames.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn resolve_code_line_layouts(
         layouts: &mut [LineLayout<'_>],
         previous_code_indices: &[Option<usize>],
@@ -3968,6 +4135,7 @@ impl SqlEditorWidget {
         let mut pending_query_head_depth: Option<usize> = None;
         let mut resolved_query_base_depths: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
+        let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -3993,6 +4161,8 @@ impl SqlEditorWidget {
             let previous_line_is_standalone_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_is_standalone_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
             });
+            let current_line_is_standalone_open_paren =
+                Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
             let starts_paren_case_expression =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     && previous_line_ends_with_open_paren;
@@ -4135,6 +4305,7 @@ impl SqlEditorWidget {
                 last_code_idx.is_some_and(|prev_idx| layouts[prev_idx].trimmed.starts_with(')'));
             let next_code_trimmed =
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
+            let line_tokens = Self::tokenize_sql(trimmed);
             let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
@@ -4202,6 +4373,16 @@ impl SqlEditorWidget {
                 .copied()
                 .is_some_and(|frame| starts_with_close_paren && frame.nested_paren_depth == 1);
             let active_multiline_clause = multiline_clause_frames.last().copied();
+            let (
+                paren_frame_scan_start_idx,
+                last_popped_general_paren_frame,
+                leading_close_continues_expression,
+            ) = Self::consume_leading_paren_layout_frames(&line_tokens, &mut paren_layout_frames);
+            let active_general_paren_frame = paren_layout_frames
+                .iter()
+                .rev()
+                .find(|frame| frame.kind == ParenLayoutFrameKind::General)
+                .copied();
             let starts_query_head = layouts[idx].starts_query_frame;
             let use_cursor_parser_depth = in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
@@ -4719,6 +4900,31 @@ impl SqlEditorWidget {
             } else {
                 effective_depth
             };
+            let effective_depth = if leading_close_continues_expression
+                && !current_line_is_parenthesized_condition
+                && !is_paren_case_closer
+            {
+                active_general_paren_frame
+                    .or(last_popped_general_paren_frame)
+                    .map(|frame| effective_depth.max(frame.continuation_depth))
+                    .unwrap_or(effective_depth)
+            } else if starts_with_close_paren
+                && !current_line_is_parenthesized_condition
+                && !is_paren_case_closer
+            {
+                last_popped_general_paren_frame
+                    .map(|frame| effective_depth.max(frame.owner_depth))
+                    .unwrap_or(effective_depth)
+            } else if !starts_with_close_paren
+                && !Self::is_dml_clause_starter(&trimmed_upper)
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+            {
+                active_general_paren_frame
+                    .map(|frame| effective_depth.max(frame.continuation_depth))
+                    .unwrap_or(effective_depth)
+            } else {
+                effective_depth
+            };
 
             if starts_query_head {
                 if let Some(query_base_depth) = layouts[idx].query_base_depth {
@@ -4824,6 +5030,15 @@ impl SqlEditorWidget {
             if pending_dml_case_expression_close_depth.is_some() && starts_with_close_paren {
                 pending_dml_case_expression_close_depth = None;
             }
+            Self::update_paren_layout_frames_for_line(
+                &line_tokens,
+                paren_frame_scan_start_idx,
+                next_code_trimmed,
+                effective_depth,
+                current_line_starts_multiline_clause,
+                current_line_is_standalone_open_paren,
+                &mut paren_layout_frames,
+            );
 
             if starts_query_head || pending_query_head_depth.is_some() {
                 pending_query_head_depth = None;
@@ -4867,6 +5082,7 @@ impl SqlEditorWidget {
                 pending_query_head_depth = None;
                 resolved_query_base_depths.clear();
                 multiline_clause_frames.clear();
+                paren_layout_frames.clear();
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -11325,6 +11541,54 @@ WHERE emp_stats.avg_sal > (
             SqlEditorWidget::format_for_auto_formatting(expected, false),
             expected,
             "Auto formatting should be stable for the expected APPLY layout"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_general_paren_frame_depth_for_close_continuations() {
+        let source = r#"SELECT 'DEPT=' || d.dept_name || ' | EMP=' || e.emp_name || ' | SALES=' || TO_CHAR (NVL (
+    (
+        SELECT SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt)
+        FROM qt_fmt_sales s
+        WHERE s.emp_id = e.emp_id
+    ), 0
+)) || ' | JSON_LEVEL=' || JSON_VALUE (e.json_profile, '$.level' RETURNING VARCHAR2 (30)) || ' | HIER=' || (
+    SELECT MAX (SYS_CONNECT_BY_PATH (x.dept_code, '/'))
+    FROM qt_fmt_dept x
+    START WITH x.dept_id = d.dept_id
+    CONNECT BY PRIOR x.parent_dept_id = x.dept_id
+) AS summary_line
+FROM qt_fmt_emp e
+JOIN qt_fmt_dept d
+    ON d.dept_id = e.dept_id
+ORDER BY e.emp_id;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = r#"SELECT 'DEPT=' || d.dept_name || ' | EMP=' || e.emp_name || ' | SALES=' || TO_CHAR (NVL (
+    (
+        SELECT SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt)
+        FROM qt_fmt_sales s
+        WHERE s.emp_id = e.emp_id
+    ), 0
+    )) || ' | JSON_LEVEL=' || JSON_VALUE (e.json_profile, '$.level' RETURNING VARCHAR2 (30)) || ' | HIER=' || (
+        SELECT MAX (SYS_CONNECT_BY_PATH (x.dept_code, '/'))
+        FROM qt_fmt_dept x
+        START WITH x.dept_id = d.dept_id
+        CONNECT BY PRIOR x.parent_dept_id = x.dept_id
+    ) AS summary_line
+FROM qt_fmt_emp e
+JOIN qt_fmt_dept d
+    ON d.dept_id = e.dept_id
+ORDER BY e.emp_id;"#;
+
+        assert_eq!(
+            formatted, expected,
+            "General parenthesis frames should preserve close-paren continuation depth and nested child-query base depth"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(expected, false),
+            expected,
+            "Auto formatting should stay stable after general parenthesis frame normalization"
         );
     }
 
