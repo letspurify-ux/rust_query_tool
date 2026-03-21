@@ -1545,6 +1545,7 @@ impl QueryExecutor {
                 line,
                 idx,
                 existing_indent.max(context.auto_depth),
+                multiline_clause_frames.last().is_some(),
                 &mut pending_condition_headers,
                 &mut active_condition_frames,
             );
@@ -1704,6 +1705,7 @@ impl QueryExecutor {
         line: &str,
         line_idx: usize,
         line_owner_depth: usize,
+        in_multiline_clause: bool,
         pending_headers: &mut Vec<PendingConditionHeader>,
         active_frames: &mut Vec<ActiveConditionFrame>,
     ) -> ConditionLineAnnotation {
@@ -1856,7 +1858,9 @@ impl QueryExecutor {
                     pending_headers.pop();
                 }
 
-                if is_leading_word {
+                let should_track_header =
+                    is_leading_word && !(in_multiline_clause && word_upper == "FOR");
+                if should_track_header {
                     if let Some(header) = Self::pending_condition_header_for_word(
                         &word_upper,
                         line_idx,
@@ -4538,10 +4542,10 @@ impl QueryExecutor {
         }
 
         let mut candidate = trimmed.to_string();
-        let mut preview = lines.clone();
+        let preview = lines.clone();
         let mut consumed = 0usize;
 
-        while let Some(next_line) = preview.next() {
+        for next_line in preview {
             if !Self::is_tool_command_continuation_line(next_line) {
                 break;
             }
