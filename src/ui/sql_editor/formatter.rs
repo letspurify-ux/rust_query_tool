@@ -11685,6 +11685,65 @@ ORDER BY rt.PATH;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_recursive_cte_union_branch_select_on_cte_body_depth() {
+        let source = r#"WITH r (node_id, parent_id, node_name, lvl, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS lvl,
+        '/' || node_name AS PATH
+    FROM oqt_t_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+        SELECT
+            t.node_id,
+            t.parent_id,
+            t.node_name,
+            r.lvl + 1,
+            r.PATH || '/' || t.node_name
+        FROM oqt_t_tree t
+        JOIN r
+            ON t.parent_id = r.node_id
+)
+SELECT *
+FROM r
+ORDER BY lvl,
+    node_id;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = r#"WITH r (node_id, parent_id, node_name, lvl, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS lvl,
+        '/' || node_name AS PATH
+    FROM oqt_t_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        r.lvl + 1,
+        r.PATH || '/' || t.node_name
+    FROM oqt_t_tree t
+    JOIN r
+        ON t.parent_id = r.node_id
+)
+SELECT *
+FROM r
+ORDER BY lvl,
+    node_id;"#;
+
+        assert_eq!(
+            formatted, expected,
+            "Recursive CTE set-operator branches should keep the branch SELECT on the same CTE body depth"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_collapses_blank_line_before_case_select_item() {
         let source = r#"WITH dept_data AS (
     SELECT
