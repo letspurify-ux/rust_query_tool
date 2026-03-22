@@ -606,6 +606,11 @@ float title_glow(vec2 p) {
     return center * 0.65 + near_glow * 0.18 + far_glow * 0.06;
 }
 
+float title_region_mask(vec2 title_uv) {
+    vec2 edge_fade = 1.0 - smoothstep(vec2(0.34, 0.24), vec2(0.5, 0.5), abs(title_uv - 0.5));
+    return edge_fade.x * edge_fade.y;
+}
+
 // ========================================================
 //  Progress bar — glowing with particle at leading edge
 // ========================================================
@@ -702,20 +707,19 @@ void main() {
     col += star_layer(uv, 240.0, 4.0, 0.95) * mix(star_dim, 1.0, 0.3);
     col += star_layer(uv, 400.0, 6.0, 1.2) * mix(star_dim, 1.0, 0.5);
 
-    // Orbital ring
-    col += orbital_ring(centered, u_time);
-
     // --- Title wordmark texture with sweep reveal ---
     vec2 title_center = vec2(0.0, 0.16);
     vec2 title_size = vec2(1.0571429, 0.2114286);
-    vec2 title_uv = (centered - title_center) / title_size + 0.5;
+    // Keep the title fixed to the screen so it does not inherit the background drift.
+    vec2 title_uv = (screen_centered - title_center) / title_size + 0.5;
+    float title_mask = title_region_mask(title_uv);
     float title_sweep = smoothstep(0.38, 1.65, u_time) * smoothstep(-0.1, 0.18, title_uv.x);
     title_sweep *= 1.0 - smoothstep(0.18, 1.25, title_uv.x - u_time * 0.11);
 
-    float title_fill = title_alpha(centered) * clamp(title_sweep * 1.2, 0.0, 1.0);
+    float title_fill = title_alpha(screen_centered) * clamp(title_sweep * 1.2, 0.0, 1.0) * title_mask;
     float pulse = sin(u_time * 1.1) * 0.08 + 0.92;
     float glow_reveal = smoothstep(0.55, 1.8, u_time);
-    float title_halo = title_glow(centered) * glow_reveal * pulse;
+    float title_halo = title_glow(screen_centered) * glow_reveal * pulse * title_mask;
     float sweep_flash = exp(-pow((title_uv.x - clamp(u_time * 0.18, 0.0, 1.0)) * 7.0, 2.0));
     sweep_flash *= smoothstep(0.45, 1.55, u_time) * (1.0 - smoothstep(1.55, 2.4, u_time));
 
@@ -723,10 +727,6 @@ void main() {
     col += vec3(0.18, 0.34, 0.72) * title_halo * 0.55;
     col += vec3(0.08, 0.18, 0.44) * title_halo * 0.28;
     col += vec3(0.55, 0.74, 1.0) * sweep_flash * title_halo * 0.4;
-
-    // --- Progress bar ---
-    float progress = clamp(u_time / 10.0, 0.0, 1.0);
-    col += progress_bar(uv, progress);
 
     // --- Vignette with chromatic aberration ---
     float vig_dist = length(centered);
