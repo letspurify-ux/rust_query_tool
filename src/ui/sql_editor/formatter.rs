@@ -11798,6 +11798,43 @@ ORDER BY lvl,
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_non_recursive_cte_union_branch_select_on_cte_body_depth() {
+        let source = r#"WITH src AS (
+    SELECT
+        10 AS dept_id,
+        'DEV' AS dept_name
+    FROM DUAL
+    UNION ALL
+        SELECT
+            20 AS dept_id,
+            'OPS' AS dept_name
+        FROM DUAL
+)
+SELECT *
+FROM src;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = r#"WITH src AS (
+    SELECT
+        10 AS dept_id,
+        'DEV' AS dept_name
+    FROM DUAL
+    UNION ALL
+    SELECT
+        20 AS dept_id,
+        'OPS' AS dept_name
+    FROM DUAL
+)
+SELECT *
+FROM src;"#;
+
+        assert_eq!(
+            formatted, expected,
+            "Non-recursive CTE set-operator branches should keep the branch SELECT on the same CTE body depth"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_collapses_blank_line_before_case_select_item() {
         let source = r#"WITH dept_data AS (
     SELECT
@@ -12110,54 +12147,54 @@ ORDER BY u.dept_id,
         100 AS amt
     FROM DUAL
     UNION ALL
-        SELECT
-            10,
-            'ALICE',
-            'Q2',
-            120
-        FROM DUAL
-        UNION ALL
-        SELECT
-            10,
-            'BOB',
-            'Q1',
-            90
-        FROM DUAL
-        UNION ALL
-        SELECT
-            10,
-            'BOB',
-            'Q2',
-            150
-        FROM DUAL
-        UNION ALL
-        SELECT
-            20,
-            'DAVE',
-            'Q1',
-            80
-        FROM DUAL
-        UNION ALL
-        SELECT
-            20,
-            'DAVE',
-            'Q2',
-            110
-        FROM DUAL
-        UNION ALL
-        SELECT
-            20,
-            'ERIN',
-            'Q1',
-            140
-        FROM DUAL
-        UNION ALL
-        SELECT
-            20,
-            'ERIN',
-            'Q2',
-            130
-        FROM DUAL
+    SELECT
+        10,
+        'ALICE',
+        'Q2',
+        120
+    FROM DUAL
+    UNION ALL
+    SELECT
+        10,
+        'BOB',
+        'Q1',
+        90
+    FROM DUAL
+    UNION ALL
+    SELECT
+        10,
+        'BOB',
+        'Q2',
+        150
+    FROM DUAL
+    UNION ALL
+    SELECT
+        20,
+        'DAVE',
+        'Q1',
+        80
+    FROM DUAL
+    UNION ALL
+    SELECT
+        20,
+        'DAVE',
+        'Q2',
+        110
+    FROM DUAL
+    UNION ALL
+    SELECT
+        20,
+        'ERIN',
+        'Q1',
+        140
+    FROM DUAL
+    UNION ALL
+    SELECT
+        20,
+        'ERIN',
+        'Q2',
+        130
+    FROM DUAL
 ),
 p AS (
     SELECT *

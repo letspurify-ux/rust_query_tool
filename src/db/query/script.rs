@@ -123,6 +123,10 @@ impl AutoFormatClauseKind {
         )
     }
 
+    fn is_set_operator(self) -> bool {
+        matches!(self, Self::Union | Self::Intersect | Self::Minus)
+    }
+
     fn ends_into_continuation(self) -> bool {
         matches!(
             self,
@@ -144,7 +148,7 @@ struct QueryBaseDepthFrame {
     query_base_depth: usize,
     start_parser_depth: usize,
     head_kind: Option<AutoFormatClauseKind>,
-    align_same_depth_set_operator_heads: bool,
+    pending_same_depth_set_operator_head: bool,
     into_continuation: bool,
     trailing_comma_continuation: bool,
     multitable_insert_branch_depth: usize,
@@ -1248,7 +1252,6 @@ impl QueryExecutor {
         let mut contexts = Vec::with_capacity(lines.len());
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
         let mut pending_query_base: Option<usize> = None;
-        let mut pending_same_depth_set_operator_head_alignment = false;
         let mut in_block_comment = false;
         let mut non_query_into_continuation_depth: Option<usize> = None;
         let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
@@ -1325,6 +1328,9 @@ impl QueryExecutor {
                 });
 
             if starts_new_query_frame {
+                if let Some(frame) = query_frames.last_mut() {
+                    frame.pending_same_depth_set_operator_head = false;
+                }
                 let parent_base_depth = pending_query_base
                     .take()
                     .or_else(|| active_frame.map(|frame| frame.query_base_depth));
@@ -1339,8 +1345,7 @@ impl QueryExecutor {
                     query_base_depth,
                     start_parser_depth: parser_depth,
                     head_kind: clause_kind,
-                    align_same_depth_set_operator_heads:
-                        pending_same_depth_set_operator_head_alignment,
+                    pending_same_depth_set_operator_head: false,
                     into_continuation: false,
                     trailing_comma_continuation: false,
                     multitable_insert_branch_depth: 0,
@@ -1348,12 +1353,11 @@ impl QueryExecutor {
                     merge_branch_body_depth: None,
                     merge_branch_action: None,
                 });
-                pending_same_depth_set_operator_head_alignment = false;
             } else if let Some(frame) = query_frames.last().copied() {
                 let reuses_active_query_base = clause_kind.is_some_and(|kind| {
                     !kind.is_query_head()
                         || parser_depth == frame.query_base_depth
-                        || (frame.align_same_depth_set_operator_heads
+                        || (frame.pending_same_depth_set_operator_head
                             && parser_depth == frame.start_parser_depth)
                 });
                 let is_merge_using_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
@@ -1476,7 +1480,6 @@ impl QueryExecutor {
 
             if pending_query_base.is_some() && !starts_new_query_frame {
                 pending_query_base = None;
-                pending_same_depth_set_operator_head_alignment = false;
             }
 
             if let Some(frame) = query_frames.last_mut() {
@@ -1486,6 +1489,7 @@ impl QueryExecutor {
                     || parser_depth >= frame.start_parser_depth
                 {
                     if let Some(kind) = clause_kind {
+                        frame.pending_same_depth_set_operator_head = kind.is_set_operator();
                         if kind == AutoFormatClauseKind::Into {
                             frame.into_continuation = true;
                         } else if kind.ends_into_continuation() {
@@ -1571,9 +1575,6 @@ impl QueryExecutor {
             if owns_next_query {
                 context.next_query_head_depth = Some(next_query_head_depth);
                 pending_query_base = Some(base_depth_for_child_query);
-                pending_same_depth_set_operator_head_alignment =
-                    Self::line_is_cte_definition_header(trimmed)
-                        && Self::line_cte_definition_has_column_list(trimmed);
             }
 
             if let Some(frame) = multiline_clause_frames.last_mut() {
@@ -1605,7 +1606,6 @@ impl QueryExecutor {
             if trimmed.ends_with(';') {
                 query_frames.pop();
                 pending_query_base = None;
-                pending_same_depth_set_operator_head_alignment = false;
                 multiline_clause_frames.clear();
                 pending_inline_comment_operand_continuation = None;
             }
@@ -1990,7 +1990,7 @@ impl QueryExecutor {
         };
 
         if parser_depth > frame.query_base_depth
-            && !(frame.align_same_depth_set_operator_heads
+            && !(frame.pending_same_depth_set_operator_head
                 && parser_depth == frame.start_parser_depth)
         {
             return true;
@@ -2174,16 +2174,6 @@ impl QueryExecutor {
         }
 
         upper.contains(" AS (")
-    }
-
-    fn line_cte_definition_has_column_list(line: &str) -> bool {
-        let trimmed = line.trim();
-        let upper = trimmed.to_ascii_uppercase();
-        let Some(as_idx) = upper.find(" AS ") else {
-            return false;
-        };
-        let before_as = trimmed[..as_idx].trim_end();
-        before_as.contains('(') && before_as.contains(')')
     }
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
@@ -6829,6 +6819,62 @@ ORDER BY lvl,
             contexts[recursive_select_idx].query_base_depth,
             contexts[first_select_idx].query_base_depth,
             "Recursive branch SELECT should keep the same query base depth as the first CTE SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_non_recursive_cte_set_operator_select_on_cte_body_base() {
+        let sql = r#"WITH src AS (
+    SELECT
+        10 AS dept_id,
+        'DEV' AS dept_name
+    FROM DUAL
+    UNION ALL
+        SELECT
+            20 AS dept_id,
+            'OPS' AS dept_name
+        FROM DUAL
+)
+SELECT *
+FROM src;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_select_idx = lines
+            .iter()
+            .position(|line| line.trim() == "SELECT")
+            .unwrap_or(0);
+        let union_idx = lines
+            .iter()
+            .position(|line| line.trim() == "UNION ALL")
+            .unwrap_or(0);
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(union_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[union_idx].auto_depth,
+            contexts[first_select_idx].auto_depth,
+            "UNION ALL inside a plain CTE should stay on the same body base depth as the first SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_idx].parser_depth,
+            contexts[first_select_idx].parser_depth,
+            "The second SELECT in a plain CTE compound query should stay on the same parser depth as the first SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_idx].auto_depth,
+            contexts[first_select_idx].auto_depth,
+            "The second SELECT in a plain CTE compound query should reuse the same body base depth instead of becoming a nested child query"
+        );
+        assert_eq!(
+            contexts[second_select_idx].query_base_depth,
+            contexts[first_select_idx].query_base_depth,
+            "The second SELECT in a plain CTE compound query should keep the same query base depth as the first SELECT"
         );
     }
 
