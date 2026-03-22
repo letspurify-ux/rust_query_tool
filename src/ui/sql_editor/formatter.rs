@@ -4812,7 +4812,7 @@ impl SqlEditorWidget {
                     .map(|indent| indent.saturating_add(1).max(parser_depth))
                     .unwrap_or(parser_depth.saturating_add(1))
             } else if in_dml_statement
-                && previous_line_is_case_header
+                && (previous_line_is_case_header || previous_line_has_trailing_unclosed_case)
                 && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
             {
                 last_code_indent
@@ -5303,6 +5303,10 @@ impl SqlEditorWidget {
                 resolved_query_base_depths.clear();
                 multiline_clause_frames.clear();
                 paren_layout_frames.clear();
+                dml_case_frames.clear();
+                paren_case_expression_depth = 0;
+                pending_paren_case_closer_indent = false;
+                pending_dml_case_expression_close_depth = None;
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -5899,14 +5903,31 @@ impl SqlEditorWidget {
     fn line_has_trailing_unclosed_case(line: &str) -> bool {
         let tokens = super::query_text::tokenize_sql(line);
         let mut open_cases = 0usize;
+        let mut prev_was_end = false;
 
         for token in &tokens {
             if let SqlToken::Word(word) = token {
                 if word.eq_ignore_ascii_case("CASE") {
-                    open_cases += 1;
-                } else if word.eq_ignore_ascii_case("END") && open_cases > 0 {
-                    open_cases -= 1;
+                    if prev_was_end {
+                        // `END CASE` — this closes a CASE, not opens one.
+                        if open_cases > 0 {
+                            open_cases -= 1;
+                        }
+                        prev_was_end = false;
+                    } else {
+                        open_cases += 1;
+                    }
+                } else {
+                    if word.eq_ignore_ascii_case("END") {
+                        // Bare END (without CASE qualifier) also closes a CASE.
+                        if open_cases > 0 {
+                            open_cases -= 1;
+                        }
+                    }
+                    prev_was_end = word.eq_ignore_ascii_case("END");
                 }
+            } else {
+                prev_was_end = false;
             }
         }
 
