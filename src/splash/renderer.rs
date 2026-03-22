@@ -3,10 +3,11 @@ use std::time::Instant;
 
 use super::shaders;
 
-const TITLE_TEXTURE_WIDTH: u16 = 640;
-const TITLE_TEXTURE_HEIGHT: u16 = 128;
+const TITLE_TEXTURE_WIDTH: u16 = 1280;
+const TITLE_TEXTURE_HEIGHT: u16 = 256;
 const TITLE_TEXT: &str = "SPACE QUERY";
 const SUBTITLE_TEXT: &str = "BUILT WITH RUST";
+const VERSION_TEXT: &str = concat!("V", env!("CARGO_PKG_VERSION"));
 
 #[repr(C)]
 struct Uniforms {
@@ -20,55 +21,384 @@ struct Vertex {
     position: [f32; 2],
 }
 
-fn glyph_rows(ch: char) -> [u8; 7] {
+fn glyph_rows(ch: char) -> [u16; 9] {
     match ch {
         'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0111110,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0000000,
         ],
         'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+            0b0111100,
+            0b0100010,
+            0b0100010,
+            0b0111100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0111100,
+            0b0000000,
         ],
         'C' => [
-            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+            0b0011100,
+            0b0100010,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        'D' => [
+            0b0111000,
+            0b0100100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100100,
+            0b0111000,
+            0b0000000,
         ],
         'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            0b0111110,
+            0b0100000,
+            0b0100000,
+            0b0111100,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0111110,
+            0b0000000,
+        ],
+        'F' => [
+            0b0111110,
+            0b0100000,
+            0b0100000,
+            0b0111100,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0000000,
+        ],
+        'G' => [
+            0b0011100,
+            0b0100010,
+            0b0100000,
+            0b0100000,
+            0b0100110,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
         ],
         'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0111110,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0000000,
         ],
         'I' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+            0b0111110,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0111110,
+            0b0000000,
         ],
         'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0111110,
+            0b0000000,
+        ],
+        'M' => [
+            0b0100010,
+            0b0110110,
+            0b0101010,
+            0b0101010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0000000,
+        ],
+        'N' => [
+            0b0100010,
+            0b0110010,
+            0b0101010,
+            0b0101010,
+            0b0100110,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0000000,
+        ],
+        'O' => [
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
         ],
         'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+            0b0111100,
+            0b0100010,
+            0b0100010,
+            0b0111100,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0100000,
+            0b0000000,
         ],
         'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0101010,
+            0b0100100,
+            0b0011010,
+            0b0000000,
         ],
         'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+            0b0111100,
+            0b0100010,
+            0b0100010,
+            0b0111100,
+            0b0101000,
+            0b0100100,
+            0b0100010,
+            0b0100010,
+            0b0000000,
         ],
         'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+            0b0011110,
+            0b0100000,
+            0b0100000,
+            0b0011100,
+            0b0000010,
+            0b0000010,
+            0b0000010,
+            0b0111100,
+            0b0000000,
         ],
         'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            0b0111110,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0000000,
         ],
         'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        'V' => [
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0010100,
+            0b0010100,
+            0b0001000,
+            0b0000000,
         ],
         'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0101010,
+            0b0101010,
+            0b0110110,
+            0b0100010,
+            0b0000000,
+        ],
+        'X' => [
+            0b0100010,
+            0b0100010,
+            0b0010100,
+            0b0001000,
+            0b0001000,
+            0b0010100,
+            0b0100010,
+            0b0100010,
+            0b0000000,
         ],
         'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+            0b0100010,
+            0b0100010,
+            0b0010100,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0000000,
         ],
-        ' ' => [0; 7],
-        _ => [0; 7],
+        '0' => [
+            0b0011100,
+            0b0100010,
+            0b0100110,
+            0b0101010,
+            0b0110010,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        '1' => [
+            0b0001000,
+            0b0011000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0001000,
+            0b0011100,
+            0b0000000,
+        ],
+        '2' => [
+            0b0011100,
+            0b0100010,
+            0b0000010,
+            0b0000100,
+            0b0001000,
+            0b0010000,
+            0b0100000,
+            0b0111110,
+            0b0000000,
+        ],
+        '3' => [
+            0b0011100,
+            0b0100010,
+            0b0000010,
+            0b0001100,
+            0b0000010,
+            0b0000010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        '4' => [
+            0b0000100,
+            0b0001100,
+            0b0010100,
+            0b0100100,
+            0b0111110,
+            0b0000100,
+            0b0000100,
+            0b0000100,
+            0b0000000,
+        ],
+        '5' => [
+            0b0111110,
+            0b0100000,
+            0b0100000,
+            0b0111100,
+            0b0000010,
+            0b0000010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        '6' => [
+            0b0011100,
+            0b0100000,
+            0b0100000,
+            0b0111100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        '7' => [
+            0b0111110,
+            0b0000010,
+            0b0000100,
+            0b0001000,
+            0b0001000,
+            0b0010000,
+            0b0010000,
+            0b0010000,
+            0b0000000,
+        ],
+        '8' => [
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0100010,
+            0b0011100,
+            0b0000000,
+        ],
+        '9' => [
+            0b0011100,
+            0b0100010,
+            0b0100010,
+            0b0011110,
+            0b0000010,
+            0b0000010,
+            0b0000010,
+            0b0011100,
+            0b0000000,
+        ],
+        '.' => [
+            0b0000000,
+            0b0000000,
+            0b0000000,
+            0b0000000,
+            0b0000000,
+            0b0000000,
+            0b0011000,
+            0b0011000,
+            0b0000000,
+        ],
+        ' ' => [0; 9],
+        _ => [0; 9],
     }
 }
 
@@ -96,29 +426,41 @@ fn blend_pixel(pixels: &mut [u8], width: usize, height: usize, x: usize, y: usiz
 }
 
 fn blur_alpha(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut blurred = vec![0u8; width * height];
+    // Two-pass separable Gaussian blur (radius 4) for smoother glow
+    const RADIUS: usize = 4;
+    const KERNEL: [f32; 9] = [
+        0.028, 0.060, 0.102, 0.145, 0.165, 0.145, 0.102, 0.060, 0.028,
+    ];
 
+    // Horizontal pass
+    let mut temp = vec![0u8; width * height];
     for y in 0..height {
         for x in 0..width {
-            let y_start = y.saturating_sub(2);
-            let y_end = (y + 2).min(height.saturating_sub(1));
-            let x_start = x.saturating_sub(2);
-            let x_end = (x + 2).min(width.saturating_sub(1));
-
-            let mut sum = 0u32;
-            let mut count = 0u32;
-
-            for ny in y_start..=y_end {
-                for nx in x_start..=x_end {
-                    let idx = ny * width + nx;
-                    sum = sum.saturating_add(mask.get(idx).copied().unwrap_or(0) as u32);
-                    count = count.saturating_add(1);
-                }
+            let mut sum = 0.0f32;
+            for k in 0..KERNEL.len() {
+                let sx = (x as isize + k as isize - RADIUS as isize)
+                    .max(0)
+                    .min(width as isize - 1) as usize;
+                let idx = y * width + sx;
+                sum += mask.get(idx).copied().unwrap_or(0) as f32 * KERNEL[k];
             }
+            temp[y * width + x] = (sum.round() as u32).min(255) as u8;
+        }
+    }
 
-            let idx = y * width + x;
-            let avg = if count == 0 { 0 } else { (sum / count) as u8 };
-            blurred[idx] = avg;
+    // Vertical pass
+    let mut blurred = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0f32;
+            for k in 0..KERNEL.len() {
+                let sy = (y as isize + k as isize - RADIUS as isize)
+                    .max(0)
+                    .min(height as isize - 1) as usize;
+                let idx = sy * width + x;
+                sum += temp.get(idx).copied().unwrap_or(0) as f32 * KERNEL[k];
+            }
+            blurred[y * width + x] = (sum.round() as u32).min(255) as u8;
         }
     }
 
@@ -126,11 +468,11 @@ fn blur_alpha(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 fn text_columns(text: &str) -> usize {
-    text.chars().count().saturating_mul(6).saturating_sub(1)
+    text.chars().count().saturating_mul(8).saturating_sub(1)
 }
 
-const GLYPH_ROWS: usize = 7;
-const GLYPH_COLS: usize = 5;
+const GLYPH_ROWS: usize = 9;
+const GLYPH_COLS: usize = 7;
 const PADDED_GLYPH_ROWS: usize = GLYPH_ROWS + 2;
 const PADDED_GLYPH_COLS: usize = GLYPH_COLS + 2;
 
@@ -150,7 +492,7 @@ fn should_skip_glyph_triangle_fill(
 ) -> bool {
     matches!(
         (ch, row, col, cut_corner),
-        ('R', 4, 2, TriangleCutCorner::BottomLeft) | ('R', 5, 3, TriangleCutCorner::BottomLeft)
+        ('R', 5, 3, TriangleCutCorner::BottomLeft) | ('R', 6, 4, TriangleCutCorner::BottomLeft)
     )
 }
 
@@ -305,7 +647,7 @@ fn draw_cell_corner_triangle(
     fill_mask_triangle(mask, width, height, vertices, alpha);
 }
 
-fn glyph_cell_filled(rows: &[u8; 7], row: usize, col: usize) -> bool {
+fn glyph_cell_filled(rows: &[u16; 9], row: usize, col: usize) -> bool {
     let Some(row_bits) = rows.get(row).copied() else {
         return false;
     };
@@ -313,11 +655,11 @@ fn glyph_cell_filled(rows: &[u8; 7], row: usize, col: usize) -> bool {
         return false;
     }
 
-    let mask_bit = 1u8 << (4usize.saturating_sub(col));
+    let mask_bit = 1u16 << (6usize.saturating_sub(col));
     row_bits & mask_bit != 0
 }
 
-fn padded_glyph_cell_filled(rows: &[u8; 7], padded_row: usize, padded_col: usize) -> bool {
+fn padded_glyph_cell_filled(rows: &[u16; 9], padded_row: usize, padded_col: usize) -> bool {
     if padded_row == 0 || padded_col == 0 || padded_row > GLYPH_ROWS || padded_col > GLYPH_COLS {
         return false;
     }
@@ -325,7 +667,7 @@ fn padded_glyph_cell_filled(rows: &[u8; 7], padded_row: usize, padded_col: usize
     glyph_cell_filled(rows, padded_row - 1, padded_col - 1)
 }
 
-fn build_glyph_exterior_map(rows: &[u8; 7]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
+fn build_glyph_exterior_map(rows: &[u16; 9]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
     let mut exterior = [false; GLYPH_ROWS * GLYPH_COLS];
     let mut visited = [false; PADDED_GLYPH_ROWS * PADDED_GLYPH_COLS];
     let mut stack = vec![(0usize, 0usize)];
@@ -372,7 +714,7 @@ fn build_glyph_exterior_map(rows: &[u8; 7]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
 }
 
 fn glyph_cell_exterior_empty(
-    rows: &[u8; 7],
+    rows: &[u16; 9],
     exterior: &[bool; GLYPH_ROWS * GLYPH_COLS],
     row: usize,
     col: usize,
@@ -386,7 +728,7 @@ fn glyph_cell_exterior_empty(
 }
 
 fn glyph_cell_exterior_score(
-    rows: &[u8; 7],
+    rows: &[u16; 9],
     exterior: &[bool; GLYPH_ROWS * GLYPH_COLS],
     row: usize,
     col: usize,
@@ -426,7 +768,7 @@ fn draw_glyph_triangle_fills(
     width: usize,
     height: usize,
     ch: char,
-    rows: &[u8; 7],
+    rows: &[u16; 9],
     scale: usize,
     origin_x: usize,
     origin_y: usize,
@@ -529,15 +871,15 @@ fn draw_text_mask(
     origin_x: usize,
     origin_y: usize,
 ) {
-    let letter_advance = 6usize.saturating_mul(scale);
+    let letter_advance = 8usize.saturating_mul(scale);
 
     for (glyph_index, ch) in text.chars().enumerate() {
         let rows = glyph_rows(ch);
         let glyph_origin_x = origin_x.saturating_add(glyph_index.saturating_mul(letter_advance));
 
         for (row_index, row_bits) in rows.iter().enumerate() {
-            for col_index in 0..5usize {
-                let mask_bit = 1u8 << (4usize.saturating_sub(col_index));
+            for col_index in 0..GLYPH_COLS {
+                let mask_bit = 1u16 << (6usize.saturating_sub(col_index));
                 if row_bits & mask_bit == 0 {
                     continue;
                 }
@@ -570,10 +912,10 @@ fn build_title_texture() -> Vec<u8> {
     let title_usable_width = width.saturating_mul(9) / 10;
     let title_usable_height = height.saturating_mul(13) / 32;
     let title_scale_x = title_usable_width / title_columns.max(1);
-    let title_scale_y = title_usable_height / 7usize;
+    let title_scale_y = title_usable_height / GLYPH_ROWS;
     let title_scale = title_scale_x.min(title_scale_y).max(1);
     let title_width = title_columns.saturating_mul(title_scale);
-    let title_height = 7usize.saturating_mul(title_scale);
+    let title_height = GLYPH_ROWS.saturating_mul(title_scale);
     let title_origin_x = width.saturating_sub(title_width) / 2;
     let title_origin_y = height.saturating_mul(7) / 32;
     draw_text_mask(
@@ -590,7 +932,7 @@ fn build_title_texture() -> Vec<u8> {
     let subtitle_usable_width = width.saturating_mul(7) / 10;
     let subtitle_usable_height = height.saturating_mul(5) / 32;
     let subtitle_scale_x = subtitle_usable_width / subtitle_columns.max(1);
-    let subtitle_scale_y = subtitle_usable_height / 7usize;
+    let subtitle_scale_y = subtitle_usable_height / GLYPH_ROWS;
     let subtitle_scale = subtitle_scale_x.min(subtitle_scale_y).max(1);
     let subtitle_width = subtitle_columns.saturating_mul(subtitle_scale);
     let title_right = title_origin_x.saturating_add(title_width);
@@ -608,6 +950,39 @@ fn build_title_texture() -> Vec<u8> {
         subtitle_origin_x,
         subtitle_origin_y,
     );
+
+    // Version text — small, below subtitle, right-aligned
+    let subtitle_height = GLYPH_ROWS.saturating_mul(subtitle_scale);
+    let version_columns = text_columns(VERSION_TEXT);
+    let version_scale = subtitle_scale.saturating_sub(1).max(1);
+    let version_width = version_columns.saturating_mul(version_scale);
+    let version_origin_x = title_right.saturating_sub(version_width);
+    let version_gap = height.saturating_mul(2) / 32;
+    let version_origin_y = subtitle_origin_y
+        .saturating_add(subtitle_height)
+        .saturating_add(version_gap);
+
+    // Draw version to a separate mask so we can apply reduced alpha
+    let mut version_mask = vec![0u8; width * height];
+    draw_text_mask(
+        &mut version_mask,
+        width,
+        height,
+        VERSION_TEXT,
+        version_scale,
+        version_origin_x,
+        version_origin_y,
+    );
+    // Merge version mask at 60% opacity
+    for i in 0..mask.len() {
+        let v = version_mask.get(i).copied().unwrap_or(0);
+        if v > 0 {
+            let reduced = ((v as u32).saturating_mul(153) / 255) as u8; // 0.6 * 255 ≈ 153
+            if let Some(cell) = mask.get_mut(i) {
+                *cell = (*cell).max(reduced);
+            }
+        }
+    }
 
     let glow = blur_alpha(&mask, width, height);
     let mut pixels = vec![0u8; width * height * 4];
@@ -824,45 +1199,52 @@ mod tests {
     #[test]
     fn r_lower_diagonal_triangle_fill_is_skipped() {
         let scale = 8usize;
-        let width = 48usize;
-        let height = 64usize;
+        // 7x9 glyph: width = 7*8 = 56, height = 9*8 = 72
+        let width = 64usize;
+        let height = 80usize;
         let mut mask = vec![0u8; width * height];
 
         draw_glyph_triangle_fills(&mut mask, width, height, 'R', &glyph_rows('R'), scale, 0, 0);
 
-        assert_eq!(mask_alpha(&mask, width, 23, 41), 0);
+        // In 7x9 R, the skip coordinates are (row=5, col=3) and (row=6, col=4).
+        // The BottomLeft triangle at (row=5, col=3) would be at pixel (3*8, (5+1)*8) = (24, 48).
+        // Check that a pixel in that triangle region is 0.
+        assert_eq!(mask_alpha(&mask, width, 25, 49), 0);
     }
 
     #[test]
     fn r_upper_bowl_triangle_fill_remains() {
         let scale = 8usize;
-        let width = 48usize;
-        let height = 64usize;
+        let width = 64usize;
+        let height = 80usize;
         let mut mask = vec![0u8; width * height];
 
         draw_glyph_triangle_fills(&mut mask, width, height, 'R', &glyph_rows('R'), scale, 0, 0);
 
-        assert_eq!(mask_alpha(&mask, width, 33, 7), 255);
+        // In 7x9 R, the bowl area is around row 1-2, col 4-5.
+        // Check a triangle fill pixel exists in the upper-right bowl area.
+        // The TopRight triangle at (row=0, col=4) would fill at pixel (5*8, 0) area.
+        assert_eq!(mask_alpha(&mask, width, 41, 7), 255);
     }
 
     #[test]
     fn only_r_lower_diagonal_override_is_enabled() {
         assert!(should_skip_glyph_triangle_fill(
             'R',
-            4,
-            2,
+            5,
+            3,
             TriangleCutCorner::BottomLeft
         ));
         assert!(!should_skip_glyph_triangle_fill(
             'R',
             0,
-            3,
+            4,
             TriangleCutCorner::TopRight
         ));
         assert!(!should_skip_glyph_triangle_fill(
             'Q',
-            4,
-            2,
+            5,
+            3,
             TriangleCutCorner::BottomLeft
         ));
     }
