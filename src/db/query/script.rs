@@ -1557,7 +1557,7 @@ impl QueryExecutor {
             let condition_annotation = Self::annotate_parenthesized_condition_line(
                 line,
                 idx,
-                existing_indent.max(context.auto_depth),
+                context.auto_depth,
                 multiline_clause_frames.last().is_some(),
                 &mut pending_condition_headers,
                 &mut active_condition_frames,
@@ -7229,6 +7229,97 @@ END;"#;
             contexts[select_idx].query_base_depth,
             Some(contexts[for_idx].auto_depth.saturating_add(1)),
             "child query base depth should be anchored from the FOR header"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_case_when_exists_subquery_on_shared_condition_base() {
+        let sql = r#"SELECT
+    (
+        SELECT MAX (b0.bonus_amt)
+        FROM bonus_data b0
+        WHERE b0.emp_id = x.emp_id
+    ) AS latest_bonus,
+    CASE
+        WHEN x.salary > x.dept_avg_salary THEN
+            CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM bonus_data b
+                    WHERE b.emp_id = x.emp_id
+                      AND b.bonus_amt >= 300
+                ) THEN 'TOP_WITH_BONUS'
+                ELSE 'TOP_NO_BIG_BONUS'
+            END
+        ELSE
+            'MID_OTHER'
+    END AS emp_class
+FROM emp_data x;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let exists_when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN EXISTS (")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM bonus_data b")
+            .unwrap_or(0);
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE b.emp_id = x.emp_id")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND b.bonus_amt >= 300")
+            .unwrap_or(0);
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") THEN 'TOP_WITH_BONUS'")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[exists_when_idx].condition_header_line,
+            Some(exists_when_idx),
+            "WHEN EXISTS line should start its own searched CASE condition owner"
+        );
+        assert_eq!(
+            contexts[select_idx].condition_header_line,
+            Some(exists_when_idx),
+            "EXISTS child SELECT should stay attached to the inner WHEN EXISTS owner"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[exists_when_idx].auto_depth.saturating_add(1),
+            "EXISTS child SELECT should inherit the inner WHEN EXISTS base depth"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth, contexts[select_idx].auto_depth,
+            "EXISTS child FROM should stay on the same query base depth as the child SELECT"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, contexts[select_idx].auto_depth,
+            "EXISTS child WHERE should stay on the same query base depth as the child SELECT"
+        );
+        assert_eq!(
+            contexts[and_idx].query_base_depth, contexts[where_idx].query_base_depth,
+            "AND continuation inside EXISTS should preserve the child query base depth"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[where_idx].auto_depth.saturating_add(1),
+            "AND continuation inside EXISTS should be exactly one level deeper than the child WHERE"
+        );
+        assert_eq!(
+            contexts[close_then_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "close-paren THEN line should be tracked as a condition closer"
         );
     }
 

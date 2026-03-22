@@ -3820,9 +3820,7 @@ impl SqlEditorWidget {
             &next_code_indices,
         );
 
-        let preserve_odd_hanging_indent = formatted.to_ascii_uppercase().contains(" APPLY");
-
-        Self::render_line_layouts(&layouts, preserve_odd_hanging_indent)
+        Self::render_line_layouts(&layouts)
     }
 
     fn build_line_layouts<'a>(
@@ -5434,10 +5432,53 @@ impl SqlEditorWidget {
         anchor_depths
     }
 
-    fn render_line_layouts(
-        layouts: &[LineLayout<'_>],
-        preserve_odd_hanging_indent: bool,
-    ) -> String {
+    fn line_preserves_existing_odd_hanging_indent(layouts: &[LineLayout<'_>], idx: usize) -> bool {
+        let Some(layout) = layouts.get(idx) else {
+            return false;
+        };
+        if layout.kind != LineLayoutKind::Code
+            || layout.existing_indent_spaces == 0
+            || layout.existing_indent_spaces % 4 == 0
+        {
+            return false;
+        }
+
+        let depth_indent = layout.final_depth.saturating_mul(4);
+        let trimmed_upper = layout.trimmed.to_ascii_uppercase();
+        let previous_code_idx = (0..idx)
+            .rev()
+            .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
+        let previous_code = previous_code_idx.and_then(|prev_idx| layouts.get(prev_idx));
+
+        let preserves_condition_hanging_indent =
+            (trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR "))
+                && layout.existing_indent_spaces.saturating_add(2) == depth_indent
+                && previous_code.is_some_and(|previous| {
+                    let previous_upper = previous.trimmed.to_ascii_uppercase();
+                    layout.query_base_depth == previous.query_base_depth
+                        && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
+                            || crate::sql_text::starts_with_keyword_token(
+                                &previous_upper,
+                                "HAVING",
+                            )
+                            || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
+                            || previous_upper.starts_with("AND ")
+                            || previous_upper.starts_with("OR "))
+                });
+        if preserves_condition_hanging_indent {
+            return true;
+        }
+
+        layout.existing_indent_spaces == depth_indent.saturating_add(3)
+            && !Self::is_dml_clause_starter(&trimmed_upper)
+            && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+            && previous_code.is_some_and(|previous| {
+                layout.query_base_depth == previous.query_base_depth
+                    && Self::line_ends_with_comma_before_inline_comment(previous.trimmed)
+            })
+    }
+
+    fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
         let mut out = String::new();
 
         for (idx, layout) in layouts.iter().enumerate() {
@@ -5460,9 +5501,9 @@ impl SqlEditorWidget {
                 | LineLayoutKind::CommaOnly
                 | LineLayoutKind::Verbatim => {
                     let depth_indent = layout.final_depth * 4;
-                    let render_indent = if preserve_odd_hanging_indent
-                        && layout.existing_indent_spaces > 0
-                        && layout.existing_indent_spaces % 4 != 0
+                    let render_indent = if Self::line_preserves_existing_odd_hanging_indent(
+                        layouts, idx,
+                    )
                     {
                         layout.existing_indent_spaces
                     } else {
@@ -7334,6 +7375,92 @@ FROM dual;"#;
             indent(lines[when_idx]),
             "close paren THEN line should return to the WHEN header depth, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_normalizes_unrelated_odd_exists_indent_even_with_apply() {
+        let source = r#"SELECT
+    d.department_name,
+    emp_stats.avg_sal,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM bonus_data b
+            WHERE b.emp_id = d.department_id
+      AND b.bonus_amt >= 300
+        ) THEN 'Y'
+        ELSE 'N'
+    END AS has_bonus
+FROM departments d
+CROSS APPLY (
+    SELECT AVG(e.salary) AS avg_sal
+    FROM employees e
+    WHERE e.department_id = d.department_id
+) emp_stats;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let select_list_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "emp_stats.avg_sal,")
+            .expect("formatted output should keep APPLY select-list continuation");
+        let exists_when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN EXISTS (")
+            .expect("formatted output should contain EXISTS WHEN header");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain EXISTS child SELECT");
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE b.emp_id = d.department_id")
+            .expect("formatted output should contain EXISTS child WHERE");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND b.bonus_amt >= 300")
+            .expect("formatted output should contain EXISTS child AND");
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") THEN 'Y'")
+            .expect("formatted output should contain EXISTS close THEN line");
+
+        assert_eq!(
+            indent(lines[select_list_idx]),
+            7,
+            "APPLY-driven top-level select-list hanging indent should still be preserved, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[select_idx]) > indent(lines[exists_when_idx]),
+            "EXISTS child SELECT should stay nested under the WHEN EXISTS header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[where_idx]),
+            indent(lines[select_idx]),
+            "EXISTS child WHERE should reuse the child query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "odd manual AND indent inside EXISTS should be normalized to the computed child-query continuation depth even when APPLY exists elsewhere, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_then_idx]),
+            indent(lines[exists_when_idx]),
+            "EXISTS close-paren THEN line should return to the WHEN EXISTS header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "auto formatting should stay stable after normalizing EXISTS indentation in APPLY statements"
         );
     }
 
