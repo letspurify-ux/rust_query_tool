@@ -707,9 +707,6 @@ void main() {
     col += star_layer(uv, 240.0, 4.0, 0.95) * mix(star_dim, 1.0, 0.3);
     col += star_layer(uv, 400.0, 6.0, 1.2) * mix(star_dim, 1.0, 0.5);
 
-    // Lens flare from planet's star
-    col += lens_flare(centered);
-
     // --- Title wordmark texture with sweep reveal ---
     vec2 title_center = vec2(0.0, 0.16);
     vec2 title_size = vec2(1.0571429, 0.2114286);
