@@ -752,7 +752,8 @@ unsafe fn create_window(
     );
 
     apply_window_shape(hwnd, fullscreen, borderless);
-    ShowWindow(hwnd, SW_SHOW);
+    // ShowWindow is deferred until after the first GL frame is rendered
+    // to prevent a blank/garbage frame from being visible.
     let dc = GetDC(hwnd);
     assert!(!dc.is_null());
 
@@ -987,6 +988,14 @@ where
         SetWindowLongPtrA(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
         #[cfg(target_arch = "x86")]
         SetWindowLong(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
+
+        // Render the first frame before showing the window so no blank/garbage
+        // frame is ever visible. This eliminates the layer conflict where the
+        // OS-composited empty surface flashes before OpenGL content appears.
+        display.event_handler.as_mut().unwrap().update();
+        display.event_handler.as_mut().unwrap().draw();
+        SwapBuffers(display.dc);
+        ShowWindow(wnd, SW_SHOW);
 
         let mut done = false;
         while !(done || crate::native_display().lock().unwrap().quit_ordered) {
