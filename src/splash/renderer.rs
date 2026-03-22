@@ -903,25 +903,51 @@ fn draw_text_mask(
     }
 }
 
+/// Downsample a mask from `(sw, sh)` to `(dw, dh)` by averaging 2×2 blocks.
+fn downsample_mask(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; dw * dh];
+    for dy in 0..dh {
+        let sy = dy * 2;
+        for dx in 0..dw {
+            let sx = dx * 2;
+            let mut sum = 0u32;
+            for oy in 0..2usize {
+                for ox in 0..2usize {
+                    let y = (sy + oy).min(sh.saturating_sub(1));
+                    let x = (sx + ox).min(sw.saturating_sub(1));
+                    sum += src.get(y * sw + x).copied().unwrap_or(0) as u32;
+                }
+            }
+            dst[dy * dw + dx] = (sum / 4) as u8;
+        }
+    }
+    dst
+}
+
 fn build_title_texture() -> Vec<u8> {
     let width = usize::from(TITLE_TEXTURE_WIDTH);
     let height = usize::from(TITLE_TEXTURE_HEIGHT);
-    let mut mask = vec![0u8; width * height];
+
+    // Render at 2× resolution for anti-aliased edges, then downsample.
+    let ss = 2usize;
+    let sw = width * ss;
+    let sh = height * ss;
+    let mut hi_mask = vec![0u8; sw * sh];
 
     let title_columns = text_columns(TITLE_TEXT);
-    let title_usable_width = width.saturating_mul(9) / 10;
-    let title_usable_height = height.saturating_mul(13) / 32;
+    let title_usable_width = sw.saturating_mul(9) / 10;
+    let title_usable_height = sh.saturating_mul(13) / 32;
     let title_scale_x = title_usable_width / title_columns.max(1);
     let title_scale_y = title_usable_height / GLYPH_ROWS;
     let title_scale = title_scale_x.min(title_scale_y).max(1);
     let title_width = title_columns.saturating_mul(title_scale);
     let title_height = GLYPH_ROWS.saturating_mul(title_scale);
-    let title_origin_x = width.saturating_sub(title_width) / 2;
-    let title_origin_y = height.saturating_mul(7) / 32;
+    let title_origin_x = sw.saturating_sub(title_width) / 2;
+    let title_origin_y = sh.saturating_mul(7) / 32;
     draw_text_mask(
-        &mut mask,
-        width,
-        height,
+        &mut hi_mask,
+        sw,
+        sh,
         TITLE_TEXT,
         title_scale,
         title_origin_x,
@@ -929,22 +955,22 @@ fn build_title_texture() -> Vec<u8> {
     );
 
     let subtitle_columns = text_columns(SUBTITLE_TEXT);
-    let subtitle_usable_width = width.saturating_mul(7) / 10;
-    let subtitle_usable_height = height.saturating_mul(5) / 32;
+    let subtitle_usable_width = sw.saturating_mul(7) / 10;
+    let subtitle_usable_height = sh.saturating_mul(5) / 32;
     let subtitle_scale_x = subtitle_usable_width / subtitle_columns.max(1);
     let subtitle_scale_y = subtitle_usable_height / GLYPH_ROWS;
     let subtitle_scale = subtitle_scale_x.min(subtitle_scale_y).max(1);
     let subtitle_width = subtitle_columns.saturating_mul(subtitle_scale);
     let title_right = title_origin_x.saturating_add(title_width);
     let subtitle_origin_x = title_right.saturating_sub(subtitle_width);
-    let subtitle_gap = height.saturating_mul(3) / 32;
+    let subtitle_gap = sh.saturating_mul(3) / 32;
     let subtitle_origin_y = title_origin_y
         .saturating_add(title_height)
         .saturating_add(subtitle_gap);
     draw_text_mask(
-        &mut mask,
-        width,
-        height,
+        &mut hi_mask,
+        sw,
+        sh,
         SUBTITLE_TEXT,
         subtitle_scale,
         subtitle_origin_x,
@@ -957,32 +983,35 @@ fn build_title_texture() -> Vec<u8> {
     let version_scale = subtitle_scale.saturating_sub(1).max(1);
     let version_width = version_columns.saturating_mul(version_scale);
     let version_origin_x = title_right.saturating_sub(version_width);
-    let version_gap = height.saturating_mul(2) / 32;
+    let version_gap = sh.saturating_mul(2) / 32;
     let version_origin_y = subtitle_origin_y
         .saturating_add(subtitle_height)
         .saturating_add(version_gap);
 
-    // Draw version to a separate mask so we can apply reduced alpha
-    let mut version_mask = vec![0u8; width * height];
+    // Draw version to a separate hi-res mask so we can apply reduced alpha
+    let mut version_hi = vec![0u8; sw * sh];
     draw_text_mask(
-        &mut version_mask,
-        width,
-        height,
+        &mut version_hi,
+        sw,
+        sh,
         VERSION_TEXT,
         version_scale,
         version_origin_x,
         version_origin_y,
     );
     // Merge version mask at 60% opacity
-    for i in 0..mask.len() {
-        let v = version_mask.get(i).copied().unwrap_or(0);
+    for i in 0..hi_mask.len() {
+        let v = version_hi.get(i).copied().unwrap_or(0);
         if v > 0 {
-            let reduced = ((v as u32).saturating_mul(153) / 255) as u8; // 0.6 * 255 ≈ 153
-            if let Some(cell) = mask.get_mut(i) {
+            let reduced = ((v as u32).saturating_mul(153) / 255) as u8;
+            if let Some(cell) = hi_mask.get_mut(i) {
                 *cell = (*cell).max(reduced);
             }
         }
     }
+
+    // Downsample 2× → 1× for natural anti-aliasing
+    let mask = downsample_mask(&hi_mask, sw, sh, width, height);
 
     let glow = blur_alpha(&mask, width, height);
     let mut pixels = vec![0u8; width * height * 4];
