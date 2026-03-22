@@ -4439,7 +4439,10 @@ impl SqlEditorWidget {
             });
             let next_line_is_case_branch = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
-                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE")
+                next_upper.starts_with("WHEN ")
+                    || (next_upper.starts_with("ELSE")
+                        && !next_upper.starts_with("ELSIF")
+                        && !next_upper.starts_with("ELSEIF"))
             });
             let next_line_existing_indent =
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].existing_indent);
@@ -5339,7 +5342,10 @@ impl SqlEditorWidget {
             let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
             let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
             let next_is_case_branch =
-                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE");
+                next_upper.starts_with("WHEN ")
+                    || (next_upper.starts_with("ELSE")
+                        && !next_upper.starts_with("ELSIF")
+                        && !next_upper.starts_with("ELSEIF"));
             if Self::starts_with_case_terminator(&previous_upper) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
                 layouts[idx].anchor_group = layouts[next_idx].anchor_group;
