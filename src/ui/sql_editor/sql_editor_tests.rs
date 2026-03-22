@@ -6810,6 +6810,32 @@ fn format_sql_oracle_final_boss_idempotent() {
 }
 
 #[test]
+fn full_auto_formatting_open_with_select_comment_does_not_gain_blank_line() {
+    let input = load_test_file("test_open_with.sql");
+    assert!(
+        !input.is_empty(),
+        "Test file test_open_with.sql should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_for_auto_formatting(&input, false);
+
+    assert!(
+        formatted.contains(
+            "            d.dname,\n            -- [D] 스칼라 서브쿼리 시작"
+        ),
+        "Full auto-formatting should keep the SELECT-list comment attached without an inserted blank line, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains(
+            "            d.dname,\n\n            -- [D] 스칼라 서브쿼리 시작"
+        ),
+        "Full auto-formatting inserted an unexpected blank line before the SELECT-list comment, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn split_format_items_does_not_treat_division_slash_as_terminator() {
     // Division operator `/` on its own line inside parenthesized expression
     // must NOT be treated as a SQL*Plus slash terminator.

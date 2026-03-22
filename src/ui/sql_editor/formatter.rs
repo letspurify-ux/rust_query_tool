@@ -455,6 +455,14 @@ enum CommentAttachment {
     FileHeader,
 }
 
+#[derive(Clone, Copy)]
+struct QueryApplyFrame {
+    start_paren_depth: usize,
+    started_inside_paren: bool,
+    has_apply: bool,
+    in_apply_clause: bool,
+}
+
 impl TriggerHeaderState {
     fn is_active(self) -> bool {
         matches!(self, Self::InHeader)
@@ -746,6 +754,93 @@ impl SqlEditorWidget {
         let rest = rest.trim_start();
 
         rest.is_empty() || rest.starts_with(';')
+    }
+
+    fn query_apply_flags(tokens: &[SqlToken]) -> Vec<bool> {
+        let mut flags = vec![false; tokens.len()];
+        let mut frames: Vec<QueryApplyFrame> = Vec::new();
+        let mut active_frame_ids: Vec<usize> = Vec::new();
+        let mut token_frame_ids: Vec<Option<usize>> = vec![None; tokens.len()];
+        let mut paren_depth = 0usize;
+        let mut apply_paren_pending = false;
+        let mut apply_clause_paren_depths: Vec<usize> = Vec::new();
+
+        for (idx, token) in tokens.iter().enumerate() {
+            token_frame_ids[idx] = active_frame_ids.last().copied();
+
+            match token {
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT") => {
+                    let frame_id = frames.len();
+                    frames.push(QueryApplyFrame {
+                        start_paren_depth: paren_depth,
+                        started_inside_paren: paren_depth > 0,
+                        has_apply: false,
+                        in_apply_clause: apply_clause_paren_depths
+                            .last()
+                            .is_some_and(|depth| *depth == paren_depth),
+                    });
+                    active_frame_ids.push(frame_id);
+                    token_frame_ids[idx] = Some(frame_id);
+                    apply_paren_pending = false;
+                }
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("APPLY") => {
+                    if let Some(frame_id) = active_frame_ids.last().copied() {
+                        if let Some(frame) = frames.get_mut(frame_id) {
+                            frame.has_apply = true;
+                        }
+                    }
+                    apply_paren_pending = true;
+                }
+                SqlToken::Symbol(symbol) if symbol == "(" => {
+                    paren_depth = paren_depth.saturating_add(1);
+                    if apply_paren_pending {
+                        apply_clause_paren_depths.push(paren_depth);
+                        apply_paren_pending = false;
+                    }
+                }
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    apply_paren_pending = false;
+                    paren_depth = paren_depth.saturating_sub(1);
+                    while apply_clause_paren_depths
+                        .last()
+                        .is_some_and(|depth| paren_depth < *depth)
+                    {
+                        apply_clause_paren_depths.pop();
+                    }
+                    while active_frame_ids.last().is_some_and(|frame_id| {
+                        frames.get(*frame_id).is_some_and(|frame| {
+                            frame.started_inside_paren && paren_depth < frame.start_paren_depth
+                        })
+                    }) {
+                        active_frame_ids.pop();
+                    }
+                }
+                SqlToken::Symbol(symbol) if symbol == ";" => {
+                    apply_paren_pending = false;
+                    while active_frame_ids.last().is_some_and(|frame_id| {
+                        frames
+                            .get(*frame_id)
+                            .is_some_and(|frame| !frame.started_inside_paren)
+                    }) {
+                        active_frame_ids.pop();
+                    }
+                }
+                SqlToken::Comment(_) => {}
+                _ => {
+                    apply_paren_pending = false;
+                }
+            }
+        }
+
+        for (idx, frame_id) in token_frame_ids.into_iter().enumerate() {
+            if let Some(frame_id) = frame_id {
+                if let Some(frame) = frames.get(frame_id) {
+                    flags[idx] = frame.has_apply || frame.in_apply_clause;
+                }
+            }
+        }
+
+        flags
     }
 
     pub(super) fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
@@ -1890,6 +1985,7 @@ impl SqlEditorWidget {
                 || upper.contains("CREATE PACKAGE BODY")
         };
         let statement_has_apply = statement.to_ascii_uppercase().contains(" APPLY");
+        let query_apply_flags = Self::query_apply_flags(tokens);
 
         let newline_with = |out: &mut String,
                             indent_level: usize,
@@ -1988,6 +2084,7 @@ impl SqlEditorWidget {
 
         let mut idx = 0;
         while idx < tokens.len() {
+            let current_query_has_apply = query_apply_flags.get(idx).copied().unwrap_or(false);
             if at_line_start && !matches!(tokens[idx], SqlToken::Comment(_)) {
                 if let InlineCommentContinuationState::Operand { indent } =
                     inline_comment_continuation_state
@@ -2508,7 +2605,7 @@ impl SqlEditorWidget {
                                 &mut needs_space,
                                 &mut line_indent,
                             );
-                        } else if statement_has_apply && uses_where_hanging_condition_indent {
+                        } else if current_query_has_apply && uses_where_hanging_condition_indent {
                             newline_with_spaces(
                                 &mut out,
                                 clause_base_indent
@@ -3143,6 +3240,8 @@ impl SqlEditorWidget {
                     let top_level_set_list =
                         in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     let active_list_layout = select_list_layout_state.has_active_indent();
+                    let keeps_next_line_continuation =
+                        Self::comment_keeps_next_line_continuation(tokens, idx);
                     let attachment = Self::classify_comment_attachment(
                         &out,
                         at_line_start,
@@ -3181,6 +3280,7 @@ impl SqlEditorWidget {
                         attachment,
                         CommentAttachment::Next | CommentAttachment::Block
                     ) && has_leading_newline
+                        && !at_line_start
                     {
                         newline_with(
                             &mut out,
@@ -3311,7 +3411,12 @@ impl SqlEditorWidget {
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
                         needs_space = false;
-                        if in_select_list
+                        if keeps_next_line_continuation {
+                            inline_comment_continuation_state =
+                                InlineCommentContinuationState::Operand {
+                                    indent: line_indent,
+                                };
+                        } else if in_select_list
                             || in_set_clause
                             || active_list_layout
                             || column_list_stack.last().copied().unwrap_or(false)
@@ -3341,9 +3446,7 @@ impl SqlEditorWidget {
                             (Some("AS" | "IS"), Some(SqlToken::Word(_)))
                         );
                         if !keep_inline_alias_comment {
-                            let keeps_operand_continuation =
-                                Self::comment_keeps_operand_continuation(tokens, idx);
-                            if keeps_operand_continuation {
+                            if keeps_next_line_continuation {
                                 let continuation_indent = line_indent;
                                 newline_with(
                                     &mut out,
@@ -3470,7 +3573,7 @@ impl SqlEditorWidget {
                                         base_indent(indent_level, open_cursor_state) + 1;
                                     select_list_layout_state = SelectListLayoutState::Multiline {
                                         indent: select_list_indent,
-                                        hanging_indent_spaces: statement_has_apply.then_some(
+                                        hanging_indent_spaces: current_query_has_apply.then_some(
                                             select_list_layout_state
                                                 .hanging_indent_spaces(&out, select_list_indent),
                                         ),
@@ -3490,7 +3593,7 @@ impl SqlEditorWidget {
                                     } else {
                                         1
                                     };
-                                if statement_has_apply
+                                if current_query_has_apply
                                     && matches!(current_clause.as_deref(), Some("SELECT"))
                                 {
                                     // The select list is already multiline after the first comma.
@@ -5995,9 +6098,7 @@ impl SqlEditorWidget {
                 if word.eq_ignore_ascii_case("CASE") {
                     if prev_was_end {
                         // `END CASE` — this closes a CASE, not opens one.
-                        if open_cases > 0 {
-                            open_cases -= 1;
-                        }
+                        open_cases = open_cases.saturating_sub(1);
                         prev_was_end = false;
                     } else {
                         open_cases += 1;
@@ -6005,9 +6106,7 @@ impl SqlEditorWidget {
                 } else {
                     if word.eq_ignore_ascii_case("END") {
                         // Bare END (without CASE qualifier) also closes a CASE.
-                        if open_cases > 0 {
-                            open_cases -= 1;
-                        }
+                        open_cases = open_cases.saturating_sub(1);
                     }
                     prev_was_end = word.eq_ignore_ascii_case("END");
                 }
@@ -6137,38 +6236,112 @@ impl SqlEditorWidget {
         )
     }
 
-    fn comment_keeps_operand_continuation(tokens: &[SqlToken], idx: usize) -> bool {
-        tokens[..idx]
+    fn comment_keeps_next_line_continuation(tokens: &[SqlToken], idx: usize) -> bool {
+        let significant_tokens: Vec<&SqlToken> = tokens[..idx]
             .iter()
-            .rev()
-            .find(|token| !matches!(token, SqlToken::Comment(_)))
-            .is_some_and(|token| match token {
-                SqlToken::Symbol(symbol) => {
-                    matches!(
-                        symbol.as_str(),
-                        "=" | "<"
-                            | ">"
-                            | "<="
-                            | ">="
-                            | "<>"
-                            | "!="
-                            | "+"
-                            | "-"
-                            | "*"
-                            | "/"
-                            | "%"
-                            | "||"
-                            | "^"
-                            | ":="
-                            | "=>"
-                    )
-                }
-                SqlToken::Word(word) => matches!(
-                    word.to_ascii_uppercase().as_str(),
-                    "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT"
-                ),
-                _ => false,
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+
+        let Some(last_token) = significant_tokens.last().copied() else {
+            return false;
+        };
+
+        if matches!(
+            last_token,
+            SqlToken::Symbol(symbol)
+                if matches!(
+                    symbol.as_str(),
+                    "=" | "<"
+                        | ">"
+                        | "<="
+                        | ">="
+                        | "<>"
+                        | "!="
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "/"
+                        | "%"
+                        | "||"
+                        | "^"
+                        | ":="
+                        | "=>"
+                )
+        ) {
+            return true;
+        }
+
+        let SqlToken::Word(last_word) = last_token else {
+            return false;
+        };
+        let last_upper = last_word.to_ascii_uppercase();
+        if matches!(
+            last_upper.as_str(),
+            "AND"
+                | "OR"
+                | "IN"
+                | "IS"
+                | "LIKE"
+                | "BETWEEN"
+                | "NOT"
+                | "EXISTS"
+                | "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "HAVING"
+                | "USING"
+                | "VALUES"
+                | "SET"
+                | "INTO"
+                | "ON"
+                | "JOIN"
+                | "WITH"
+                | "MODEL"
+                | "WINDOW"
+                | "MATCH_RECOGNIZE"
+                | "QUALIFY"
+                | "RETURNING"
+        ) {
+            return true;
+        }
+
+        let significant_words: Vec<&str> = significant_tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
             })
+            .collect();
+
+        if significant_words.len() >= 2 {
+            let previous_upper =
+                significant_words[significant_words.len().saturating_sub(2)].to_ascii_uppercase();
+            if matches!(
+                (previous_upper.as_str(), last_upper.as_str()),
+                ("GROUP", "BY")
+                    | ("ORDER", "BY")
+                    | ("CONNECT", "BY")
+                    | ("PARTITION", "BY")
+                    | ("DIMENSION", "BY")
+                    | ("START", "WITH")
+            ) {
+                return true;
+            }
+
+            if FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper.as_str())
+                && last_upper == "JOIN"
+            {
+                return true;
+            }
+
+            if previous_upper == "SELECT"
+                && matches!(last_upper.as_str(), "DISTINCT" | "UNIQUE" | "ALL")
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     #[cfg(test)]
@@ -8935,6 +9108,60 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             !formatted.contains("; \n/* trailing block */"),
             "Formatter should not leave whitespace before newline-attached block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_insert_space_before_newline_comments_in_select_clause_from_user_case(
+    ) {
+        let source = r#"SELECT
+d.deptno,
+d.dname,
+-- [D] scalar subquery
+(
+/* [E] correlated max */
+SELECT MAX(e2.sal)
+FROM emp e2
+WHERE e2.deptno = d.deptno
+) AS max_sal
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.contains("d.dname,\n\n"),
+            "Formatter inserted an extra blank line before a newline-attached line comment in SELECT, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("(\n\n"),
+            "Formatter inserted an extra blank line before a newline-attached block comment in SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_join_condition_depth_after_inline_block_comment_on_clause() {
+        let source =
+            "select * from paid p join amounts a on /* join key */\na.order_id = p.order_id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("JOIN amounts a\n    ON /* join key */\n    a.order_id = p.order_id;"),
+            "Inline block comment after ON should keep the following join condition on ON-clause depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_join_condition_depth_after_inline_line_comment_on_clause() {
+        let source = "select * from paid p join amounts a on -- join key\na.order_id = p.order_id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("JOIN amounts a\n    ON -- join key\n    a.order_id = p.order_id;"),
+            "Inline line comment after ON should keep the following join condition on ON-clause depth, got:\n{}",
             formatted
         );
     }

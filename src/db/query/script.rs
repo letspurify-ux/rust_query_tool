@@ -70,7 +70,7 @@ struct ActiveConditionFrame {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InlineCommentOperandContinuation {
+struct InlineCommentLineContinuation {
     depth: usize,
     query_base_depth: Option<usize>,
 }
@@ -1257,9 +1257,8 @@ impl QueryExecutor {
         let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
         let mut active_condition_frames: Vec<ActiveConditionFrame> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseDepthFrame> = Vec::new();
-        let mut pending_inline_comment_operand_continuation: Option<
-            InlineCommentOperandContinuation,
-        > = None;
+        let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
+            None;
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1305,8 +1304,8 @@ impl QueryExecutor {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let clause_kind = Self::auto_format_clause_kind(&trimmed_upper);
             let active_frame = query_frames.last().copied();
-            let active_inline_comment_operand_continuation =
-                pending_inline_comment_operand_continuation.take();
+            let active_inline_comment_line_continuation =
+                pending_inline_comment_line_continuation.take();
             let starts_multiline_clause =
                 Self::line_starts_multiline_clause_block(trimmed, &trimmed_upper);
             let closes_multiline_clause = multiline_clause_frames
@@ -1470,7 +1469,7 @@ impl QueryExecutor {
             }
 
             if clause_kind.is_none() {
-                if let Some(continuation) = active_inline_comment_operand_continuation {
+                if let Some(continuation) = active_inline_comment_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth =
@@ -1596,8 +1595,8 @@ impl QueryExecutor {
                 });
             }
 
-            pending_inline_comment_operand_continuation =
-                Self::inline_comment_operand_continuation_for_line(
+            pending_inline_comment_line_continuation =
+                Self::inline_comment_line_continuation_for_line(
                     trimmed,
                     existing_indent.max(context.auto_depth),
                     context.query_base_depth,
@@ -1607,7 +1606,7 @@ impl QueryExecutor {
                 query_frames.pop();
                 pending_query_base = None;
                 multiline_clause_frames.clear();
-                pending_inline_comment_operand_continuation = None;
+                pending_inline_comment_line_continuation = None;
             }
 
             contexts.push(context);
@@ -2180,13 +2179,13 @@ impl QueryExecutor {
         Self::trailing_significant_byte_before_inline_comment(line) == Some(b',')
     }
 
-    fn inline_comment_operand_continuation_for_line(
+    fn inline_comment_line_continuation_for_line(
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
-    ) -> Option<InlineCommentOperandContinuation> {
-        if Self::line_has_inline_block_comment_operand_continuation(line) {
-            Some(InlineCommentOperandContinuation {
+    ) -> Option<InlineCommentLineContinuation> {
+        if Self::line_has_trailing_inline_comment_continuation(line) {
+            Some(InlineCommentLineContinuation {
                 depth,
                 query_base_depth,
             })
@@ -2195,29 +2194,164 @@ impl QueryExecutor {
         }
     }
 
-    fn line_has_inline_block_comment_operand_continuation(line: &str) -> bool {
-        let trimmed = line.trim_end();
-        if !trimmed.ends_with("*/") {
+    fn line_has_trailing_inline_comment_continuation(line: &str) -> bool {
+        let Some(prefix) = Self::trailing_inline_comment_prefix(line) else {
+            return false;
+        };
+        let trimmed_prefix = prefix.trim_end();
+        if trimmed_prefix.is_empty() {
             return false;
         }
 
-        let trailing_operator_keyword = Self::trailing_identifier_before_inline_comment(trimmed)
-            .map(|identifier| identifier.to_ascii_uppercase())
-            .is_some_and(|upper| {
-                matches!(
-                    upper.as_str(),
-                    "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT"
-                )
-            });
-        let trailing_operator_symbol =
-            Self::trailing_significant_byte_before_inline_comment(trimmed).is_some_and(|byte| {
-                matches!(
-                    byte,
-                    b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'^'
-                )
-            });
+        let trailing_operator_symbol = Self::trailing_significant_byte_before_inline_comment(
+            trimmed_prefix,
+        )
+        .is_some_and(|byte| {
+            matches!(
+                byte,
+                b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'^'
+            )
+        });
+        let trailing_word_upper = trimmed_prefix
+            .split_whitespace()
+            .last()
+            .map(|word| word.to_ascii_uppercase());
+        let trailing_operator_keyword = trailing_word_upper.as_deref().is_some_and(|upper| {
+            matches!(
+                upper,
+                "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT" | "EXISTS"
+            )
+        });
 
-        trailing_operator_keyword || trailing_operator_symbol
+        trailing_operator_keyword
+            || trailing_operator_symbol
+            || Self::prefix_ends_with_unfinished_clause_header(trimmed_prefix)
+    }
+
+    fn prefix_ends_with_unfinished_clause_header(prefix: &str) -> bool {
+        let words: Vec<&str> = prefix
+            .split_whitespace()
+            .filter(|word| !word.is_empty())
+            .collect();
+        let Some(last_word) = words.last().copied() else {
+            return false;
+        };
+
+        if matches!(
+            last_word,
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "HAVING"
+                | "USING"
+                | "VALUES"
+                | "SET"
+                | "INTO"
+                | "ON"
+                | "JOIN"
+                | "WITH"
+                | "MODEL"
+                | "WINDOW"
+                | "MATCH_RECOGNIZE"
+                | "QUALIFY"
+                | "RETURNING"
+        ) {
+            return true;
+        }
+
+        if words.len() >= 2 {
+            let previous_word = words[words.len().saturating_sub(2)];
+            if matches!(
+                (previous_word, last_word),
+                ("GROUP", "BY")
+                    | ("ORDER", "BY")
+                    | ("CONNECT", "BY")
+                    | ("PARTITION", "BY")
+                    | ("DIMENSION", "BY")
+                    | ("START", "WITH")
+            ) {
+                return true;
+            }
+
+            if sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_word)
+                && last_word == "JOIN"
+            {
+                return true;
+            }
+
+            if previous_word == "SELECT" && matches!(last_word, "DISTINCT" | "UNIQUE" | "ALL") {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        idx += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    in_double_quote = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            if current == b'\'' {
+                in_single_quote = true;
+                idx += 1;
+                continue;
+            }
+            if current == b'"' {
+                in_double_quote = true;
+                idx += 1;
+                continue;
+            }
+
+            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                return line.get(..idx);
+            }
+
+            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                let comment_start = idx;
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        let comment_end = idx + 2;
+                        let suffix = line.get(comment_end..).unwrap_or_default().trim();
+                        if suffix.is_empty() {
+                            return line.get(..comment_start);
+                        }
+                        return None;
+                    }
+                    idx += 1;
+                }
+                return None;
+            }
+
+            idx += 1;
+        }
+
+        None
     }
 
     fn trailing_identifier_before_inline_comment(line: &str) -> Option<&str> {
@@ -7358,6 +7492,74 @@ WHERE oi.order_id = v.order_id
         assert_eq!(
             contexts[operand_idx].query_base_depth, contexts[and_idx].query_base_depth,
             "operator continuation should preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_join_condition_depth_after_inline_block_comment_on_clause() {
+        let sql = r#"SELECT *
+FROM paid p
+JOIN amounts a
+    ON /* join key */
+    a.order_id = p.order_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON /*"))
+            .unwrap_or(0);
+        let condition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("a.order_id ="))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[condition_idx].auto_depth, contexts[on_idx].auto_depth,
+            "line after inline block comment on ON clause should stay on the ON clause depth"
+        );
+        assert_eq!(
+            contexts[condition_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "line after inline block comment on ON clause should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[condition_idx].query_base_depth, contexts[on_idx].query_base_depth,
+            "ON-clause continuation must preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_join_condition_depth_after_inline_line_comment_on_clause() {
+        let sql = r#"SELECT *
+FROM paid p
+JOIN amounts a
+    ON -- join key
+    a.order_id = p.order_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON --"))
+            .unwrap_or(0);
+        let condition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("a.order_id ="))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[condition_idx].auto_depth, contexts[on_idx].auto_depth,
+            "line after inline line comment on ON clause should stay on the ON clause depth"
+        );
+        assert_eq!(
+            contexts[condition_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "line after inline line comment on ON clause should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[condition_idx].query_base_depth, contexts[on_idx].query_base_depth,
+            "ON-clause line-comment continuation must preserve the active query base depth"
         );
     }
 
