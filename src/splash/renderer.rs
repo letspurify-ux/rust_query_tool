@@ -142,6 +142,18 @@ enum TriangleCutCorner {
     BottomRight,
 }
 
+fn should_skip_glyph_triangle_fill(
+    ch: char,
+    row: usize,
+    col: usize,
+    cut_corner: TriangleCutCorner,
+) -> bool {
+    matches!(
+        (ch, row, col, cut_corner),
+        ('R', 4, 2, TriangleCutCorner::BottomLeft) | ('R', 5, 3, TriangleCutCorner::BottomLeft)
+    )
+}
+
 fn fill_mask_pixel(mask: &mut [u8], width: usize, height: usize, x: usize, y: usize, alpha: u8) {
     if x >= width || y >= height {
         return;
@@ -413,6 +425,7 @@ fn draw_glyph_triangle_fills(
     mask: &mut [u8],
     width: usize,
     height: usize,
+    ch: char,
     rows: &[u8; 7],
     scale: usize,
     origin_x: usize,
@@ -437,27 +450,32 @@ fn draw_glyph_triangle_fills(
                 let bl_exterior = glyph_cell_exterior_empty(rows, &exterior, row + 1, col);
 
                 if tr_exterior && (!bl_exterior || tr_score > bl_score) {
-                    draw_cell_corner_triangle(
-                        mask,
-                        width,
-                        height,
-                        base_x.saturating_add(scale),
-                        base_y,
-                        scale,
-                        TriangleCutCorner::TopRight,
-                        255,
-                    );
+                    if !should_skip_glyph_triangle_fill(ch, row, col, TriangleCutCorner::TopRight) {
+                        draw_cell_corner_triangle(
+                            mask,
+                            width,
+                            height,
+                            base_x.saturating_add(scale),
+                            base_y,
+                            scale,
+                            TriangleCutCorner::TopRight,
+                            255,
+                        );
+                    }
                 } else if bl_exterior && (!tr_exterior || bl_score > tr_score) {
-                    draw_cell_corner_triangle(
-                        mask,
-                        width,
-                        height,
-                        base_x,
-                        base_y.saturating_add(scale),
-                        scale,
-                        TriangleCutCorner::BottomLeft,
-                        255,
-                    );
+                    if !should_skip_glyph_triangle_fill(ch, row, col, TriangleCutCorner::BottomLeft)
+                    {
+                        draw_cell_corner_triangle(
+                            mask,
+                            width,
+                            height,
+                            base_x,
+                            base_y.saturating_add(scale),
+                            scale,
+                            TriangleCutCorner::BottomLeft,
+                            255,
+                        );
+                    }
                 }
             } else if tr && bl && !tl && !br {
                 let tl_score = glyph_cell_exterior_score(rows, &exterior, row, col);
@@ -466,27 +484,36 @@ fn draw_glyph_triangle_fills(
                 let br_exterior = glyph_cell_exterior_empty(rows, &exterior, row + 1, col + 1);
 
                 if tl_exterior && (!br_exterior || tl_score > br_score) {
-                    draw_cell_corner_triangle(
-                        mask,
-                        width,
-                        height,
-                        base_x,
-                        base_y,
-                        scale,
-                        TriangleCutCorner::TopLeft,
-                        255,
-                    );
+                    if !should_skip_glyph_triangle_fill(ch, row, col, TriangleCutCorner::TopLeft) {
+                        draw_cell_corner_triangle(
+                            mask,
+                            width,
+                            height,
+                            base_x,
+                            base_y,
+                            scale,
+                            TriangleCutCorner::TopLeft,
+                            255,
+                        );
+                    }
                 } else if br_exterior && (!tl_exterior || br_score > tl_score) {
-                    draw_cell_corner_triangle(
-                        mask,
-                        width,
-                        height,
-                        base_x.saturating_add(scale),
-                        base_y.saturating_add(scale),
-                        scale,
+                    if !should_skip_glyph_triangle_fill(
+                        ch,
+                        row,
+                        col,
                         TriangleCutCorner::BottomRight,
-                        255,
-                    );
+                    ) {
+                        draw_cell_corner_triangle(
+                            mask,
+                            width,
+                            height,
+                            base_x.saturating_add(scale),
+                            base_y.saturating_add(scale),
+                            scale,
+                            TriangleCutCorner::BottomRight,
+                            255,
+                        );
+                    }
                 }
             }
         }
@@ -521,7 +548,16 @@ fn draw_text_mask(
             }
         }
 
-        draw_glyph_triangle_fills(mask, width, height, &rows, scale, glyph_origin_x, origin_y);
+        draw_glyph_triangle_fills(
+            mask,
+            width,
+            height,
+            ch,
+            &rows,
+            scale,
+            glyph_origin_x,
+            origin_y,
+        );
     }
 }
 
@@ -771,5 +807,63 @@ impl EventHandler for SplashStage {
         if keycode == KeyCode::Escape && self.fade_out_start.is_none() {
             self.fade_out_start = Some(self.elapsed());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        draw_glyph_triangle_fills, glyph_rows, should_skip_glyph_triangle_fill, TriangleCutCorner,
+    };
+
+    fn mask_alpha(mask: &[u8], width: usize, x: usize, y: usize) -> u8 {
+        let idx = y.saturating_mul(width).saturating_add(x);
+        mask.get(idx).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn r_lower_diagonal_triangle_fill_is_skipped() {
+        let scale = 8usize;
+        let width = 48usize;
+        let height = 64usize;
+        let mut mask = vec![0u8; width * height];
+
+        draw_glyph_triangle_fills(&mut mask, width, height, 'R', &glyph_rows('R'), scale, 0, 0);
+
+        assert_eq!(mask_alpha(&mask, width, 23, 41), 0);
+    }
+
+    #[test]
+    fn r_upper_bowl_triangle_fill_remains() {
+        let scale = 8usize;
+        let width = 48usize;
+        let height = 64usize;
+        let mut mask = vec![0u8; width * height];
+
+        draw_glyph_triangle_fills(&mut mask, width, height, 'R', &glyph_rows('R'), scale, 0, 0);
+
+        assert_eq!(mask_alpha(&mask, width, 33, 7), 255);
+    }
+
+    #[test]
+    fn only_r_lower_diagonal_override_is_enabled() {
+        assert!(should_skip_glyph_triangle_fill(
+            'R',
+            4,
+            2,
+            TriangleCutCorner::BottomLeft
+        ));
+        assert!(!should_skip_glyph_triangle_fill(
+            'R',
+            0,
+            3,
+            TriangleCutCorner::TopRight
+        ));
+        assert!(!should_skip_glyph_triangle_fill(
+            'Q',
+            4,
+            2,
+            TriangleCutCorner::BottomLeft
+        ));
     }
 }
