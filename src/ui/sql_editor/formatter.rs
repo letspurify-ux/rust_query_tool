@@ -4252,6 +4252,7 @@ impl SqlEditorWidget {
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
         let mut pending_dml_case_expression_close_depth: Option<usize> = None;
+        let mut pending_case_branch_body_depth: Option<usize> = None;
         let mut pending_query_head_depth: Option<usize> = None;
         let mut pending_query_head_origin: Option<QueryHeadLayoutOrigin> = None;
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
@@ -4267,6 +4268,7 @@ impl SqlEditorWidget {
             let depth = layouts[idx].parser_depth;
             let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
+            let pending_case_branch_body_depth_for_line = pending_case_branch_body_depth;
             let closing_query_frame_count = resolved_query_base_depths
                 .iter()
                 .rev()
@@ -4617,63 +4619,23 @@ impl SqlEditorWidget {
             {
                 last_code_indent.unwrap_or(parser_depth)
             } else if in_dml_statement && previous_line_ends_with_then && !starts_query_head {
-                if current_line_starts_case {
-                    let current_query_base_depth = resolved_query_base_depth
-                        .or(layouts[idx].query_base_depth)
-                        .unwrap_or(0);
-                    if current_query_base_depth >= 2 {
-                        last_code_indent
-                            .map(|indent| {
-                                indent
-                                    .saturating_add(1)
-                                    .max(existing_indent)
-                                    .max(parser_depth)
-                            })
-                            .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
-                    } else {
-                        last_code_indent
-                            .map(|indent| indent.max(existing_indent).max(parser_depth))
-                            .unwrap_or(existing_indent.max(parser_depth))
-                    }
-                } else {
-                    last_code_indent
-                        .map(|indent| {
-                            indent
-                                .saturating_add(1)
-                                .max(existing_indent)
-                                .max(parser_depth)
-                        })
-                        .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
-                }
+                last_code_indent
+                    .map(|indent| {
+                        indent
+                            .saturating_add(1)
+                            .max(existing_indent)
+                            .max(parser_depth)
+                    })
+                    .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
             } else if in_dml_statement && previous_line_is_else {
-                if current_line_starts_case {
-                    let current_query_base_depth = resolved_query_base_depth
-                        .or(layouts[idx].query_base_depth)
-                        .unwrap_or(0);
-                    if current_query_base_depth >= 2 {
-                        last_code_indent
-                            .map(|indent| {
-                                indent
-                                    .saturating_add(1)
-                                    .max(existing_indent)
-                                    .max(parser_depth)
-                            })
-                            .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
-                    } else {
-                        last_code_indent
-                            .map(|indent| indent.max(existing_indent).max(parser_depth))
-                            .unwrap_or(existing_indent.max(parser_depth))
-                    }
-                } else {
-                    last_code_indent
-                        .map(|indent| {
-                            indent
-                                .saturating_add(1)
-                                .max(existing_indent)
-                                .max(parser_depth)
-                        })
-                        .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
-                }
+                last_code_indent
+                    .map(|indent| {
+                        indent
+                            .saturating_add(1)
+                            .max(existing_indent)
+                            .max(parser_depth)
+                    })
+                    .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
             } else if in_dml_statement
                 && starts_with_close_paren
                 && pending_dml_case_expression_close_depth.is_some()
@@ -5053,6 +5015,20 @@ impl SqlEditorWidget {
             } else {
                 effective_depth
             };
+            let effective_depth = if let Some(branch_body_depth) =
+                pending_case_branch_body_depth_for_line
+            {
+                if trimmed_upper.starts_with("WHEN ")
+                    || trimmed_upper.starts_with("ELSE")
+                    || Self::starts_with_case_terminator(&trimmed_upper)
+                {
+                    effective_depth
+                } else {
+                    effective_depth.max(branch_body_depth)
+                }
+            } else {
+                effective_depth
+            };
             let clause_anchor_depth = if !uses_analyzer_query_depth
                 && !previous_line_starts_with_close_paren
                 && Self::is_dml_clause_starter(&trimmed_upper)
@@ -5164,6 +5140,16 @@ impl SqlEditorWidget {
             layouts[idx].final_depth = effective_depth;
             layouts[idx].dml_case_expression_close_depth =
                 current_line_dml_case_expression_close_depth;
+            if pending_case_branch_body_depth_for_line.is_some() {
+                pending_case_branch_body_depth = None;
+            }
+            if in_dml_statement
+                && dml_case_frames.last().is_some()
+                && (Self::line_ends_with_then_before_inline_comment(trimmed)
+                    || trimmed_upper.trim() == "ELSE")
+            {
+                pending_case_branch_body_depth = Some(layouts[idx].final_depth.saturating_add(1));
+            }
             let current_condition_header_depth = if current_line_is_parenthesized_condition_header {
                 Some(effective_depth)
             } else {
@@ -5310,6 +5296,7 @@ impl SqlEditorWidget {
                 paren_case_expression_depth = 0;
                 pending_paren_case_closer_indent = false;
                 pending_dml_case_expression_close_depth = None;
+                pending_case_branch_body_depth = None;
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -12647,6 +12634,54 @@ FROM t1;"#;
             leading_spaces(lines[outer_case_idx])
                 .saturating_add(4),
             "Outer ELSE should indent one level deeper than outer CASE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_nested_case_after_then_uses_branch_body_depth() {
+        let source = r#"SELECT CASE WHEN score > avg_score THEN CASE WHEN bonus >= 300 THEN 'TOP_WITH_BONUS' ELSE 'TOP_NO_BIG_BONUS' END ELSE CASE WHEN grade IN ('A', 'B') THEN 'MID_GOOD_GRADE' ELSE 'MID_OTHER' END END AS emp_class FROM dual;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let outer_when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN score > avg_score THEN"))
+            .expect("outer WHEN should exist");
+        let first_inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("inner CASE after THEN should exist");
+        let outer_else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_inner_case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .expect("outer ELSE should exist");
+        let second_inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_else_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("inner CASE after ELSE should exist");
+
+        assert_eq!(
+            leading_spaces(lines[first_inner_case_idx]),
+            leading_spaces(lines[outer_when_idx]).saturating_add(4),
+            "CASE after THEN should indent one level deeper than the WHEN branch header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[second_inner_case_idx]),
+            leading_spaces(lines[outer_else_idx]).saturating_add(4),
+            "CASE after ELSE should indent one level deeper than the ELSE branch header, got:\n{}",
             formatted
         );
     }

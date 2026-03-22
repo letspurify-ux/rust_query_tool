@@ -6708,6 +6708,64 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_case_after_then_on_branch_body_depth() {
+        let sql = r#"SELECT
+    CASE
+        WHEN score > avg_score THEN
+        CASE
+            WHEN bonus >= 300 THEN 'TOP_WITH_BONUS'
+            ELSE 'TOP_NO_BIG_BONUS'
+        END
+        ELSE
+        CASE
+            WHEN grade IN ('A', 'B') THEN 'MID_GOOD_GRADE'
+            ELSE 'MID_OTHER'
+        END
+    END AS emp_class
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let outer_when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN score > avg_score THEN"))
+            .unwrap_or(0);
+        let first_inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let outer_else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_inner_case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_else_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[first_inner_case_idx].auto_depth,
+            contexts[outer_when_idx].auto_depth.saturating_add(1),
+            "CASE after THEN should inherit one extra branch-body depth"
+        );
+        assert_eq!(
+            contexts[second_inner_case_idx].auto_depth,
+            contexts[outer_else_idx].auto_depth.saturating_add(1),
+            "CASE after ELSE should inherit one extra branch-body depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_recursive_cte_set_operator_select_on_cte_body_base() {
         let sql = r#"WITH r (node_id, parent_id, node_name, lvl, PATH) AS (
     SELECT
