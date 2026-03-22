@@ -55,6 +55,12 @@ struct DmlCaseLayoutFrame {
     expression_owner_depth: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct DmlCaseConditionLayoutFrame {
+    parser_depth: usize,
+    continuation_depth: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueryHeadLayoutOrigin {
     Other,
@@ -4249,6 +4255,7 @@ impl SqlEditorWidget {
         let mut last_code_idx: Option<usize> = None;
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
+        let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
         let mut pending_dml_case_expression_close_depth: Option<usize> = None;
         let mut pending_case_branch_body_depth: Option<usize> = None;
         let mut pending_query_head_depth: Option<usize> = None;
@@ -4369,8 +4376,9 @@ impl SqlEditorWidget {
                     crate::sql_text::starts_with_keyword_token(&cursor_upper, "CURSOR")
                         && (cursor_upper.contains(" IS") || cursor_upper.contains(" AS"))
                 });
-            let previous_line_has_trailing_unclosed_case = last_code_idx
-                .is_some_and(|prev_idx| Self::line_has_trailing_unclosed_case(layouts[prev_idx].trimmed));
+            let previous_line_has_trailing_unclosed_case = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_has_trailing_unclosed_case(layouts[prev_idx].trimmed)
+            });
             let previous_line_is_case_header = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "CASE")
@@ -4522,6 +4530,11 @@ impl SqlEditorWidget {
                 trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ");
             let current_line_is_condition_query_owner =
                 Self::line_has_condition_query_owner(&trimmed_upper);
+            let active_dml_case_condition_frame = dml_case_condition_frames
+                .iter()
+                .rev()
+                .find(|frame| frame.parser_depth == depth)
+                .copied();
             let current_line_starts_multiline_clause =
                 in_dml_statement && Self::line_starts_multiline_clause_block(trimmed);
             let current_line_closes_multiline_clause = multiline_clause_frames
@@ -4998,6 +5011,11 @@ impl SqlEditorWidget {
                     }
                 }
             }
+            if current_line_is_condition_keyword {
+                if let Some(frame) = active_dml_case_condition_frame {
+                    effective_depth = effective_depth.max(frame.continuation_depth);
+                }
+            }
 
             let previous_line_is_select_hint = last_code_idx.is_some_and(|prev_idx| {
                 layouts[prev_idx]
@@ -5013,20 +5031,19 @@ impl SqlEditorWidget {
             } else {
                 effective_depth
             };
-            let effective_depth = if let Some(branch_body_depth) =
-                pending_case_branch_body_depth_for_line
-            {
-                if trimmed_upper.starts_with("WHEN ")
-                    || trimmed_upper.starts_with("ELSE")
-                    || Self::starts_with_case_terminator(&trimmed_upper)
-                {
-                    effective_depth
+            let effective_depth =
+                if let Some(branch_body_depth) = pending_case_branch_body_depth_for_line {
+                    if trimmed_upper.starts_with("WHEN ")
+                        || trimmed_upper.starts_with("ELSE")
+                        || Self::starts_with_case_terminator(&trimmed_upper)
+                    {
+                        effective_depth
+                    } else {
+                        effective_depth.max(branch_body_depth)
+                    }
                 } else {
-                    effective_depth.max(branch_body_depth)
-                }
-            } else {
-                effective_depth
-            };
+                    effective_depth
+                };
             let clause_anchor_depth = if !uses_analyzer_query_depth
                 && !previous_line_starts_with_close_paren
                 && Self::is_dml_clause_starter(&trimmed_upper)
@@ -5224,6 +5241,35 @@ impl SqlEditorWidget {
                         pending_dml_case_expression_close_depth = frame.expression_owner_depth;
                     }
                 }
+                while dml_case_condition_frames
+                    .last()
+                    .is_some_and(|frame| frame.parser_depth >= depth)
+                {
+                    dml_case_condition_frames.pop();
+                }
+            }
+            let line_ends_current_case_condition = dml_case_condition_frames
+                .last()
+                .copied()
+                .is_some_and(|frame| {
+                    Self::line_contains_dml_case_condition_terminator(
+                        &line_tokens,
+                        depth,
+                        frame.parser_depth,
+                    )
+                });
+            if line_ends_current_case_condition {
+                dml_case_condition_frames.pop();
+            }
+            let starts_multiline_dml_case_condition = in_dml_statement
+                && trimmed_upper.starts_with("WHEN ")
+                && dml_case_frames.last().is_some()
+                && !Self::line_contains_dml_case_condition_terminator(&line_tokens, depth, depth);
+            if starts_multiline_dml_case_condition {
+                dml_case_condition_frames.push(DmlCaseConditionLayoutFrame {
+                    parser_depth: depth.saturating_add(1),
+                    continuation_depth: layouts[idx].final_depth.saturating_add(1),
+                });
             }
 
             if in_paren_case_expression && Self::starts_with_case_terminator(&trimmed_upper) {
@@ -5255,13 +5301,23 @@ impl SqlEditorWidget {
                 pending_query_head_origin = None;
             }
             if let Some(next_query_head_depth) = layouts[idx].next_query_head_depth {
-                let structural_query_owner_depth = Self::structural_next_query_head_depth(
-                    &layouts[idx],
-                    &trimmed_upper,
-                    resolved_query_base_depth,
-                    current_condition_header_depth,
-                    resolved_query_origin,
-                );
+                let case_condition_query_owner_depth = if current_line_is_condition_query_owner
+                    && current_line_is_condition_keyword
+                    && active_dml_case_condition_frame.is_some()
+                {
+                    Some(layouts[idx].final_depth.saturating_add(1))
+                } else {
+                    None
+                };
+                let structural_query_owner_depth = case_condition_query_owner_depth.or_else(|| {
+                    Self::structural_next_query_head_depth(
+                        &layouts[idx],
+                        &trimmed_upper,
+                        resolved_query_base_depth,
+                        current_condition_header_depth,
+                        resolved_query_origin,
+                    )
+                });
                 let adjusted_next_query_head_depth =
                     if let Some(owner_depth) = structural_query_owner_depth {
                         owner_depth
@@ -5291,6 +5347,7 @@ impl SqlEditorWidget {
                 multiline_clause_frames.clear();
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
+                dml_case_condition_frames.clear();
                 paren_case_expression_depth = 0;
                 pending_paren_case_closer_indent = false;
                 pending_dml_case_expression_close_depth = None;
@@ -5326,11 +5383,10 @@ impl SqlEditorWidget {
 
             let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
             let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
-            let next_is_case_branch =
-                next_upper.starts_with("WHEN ")
-                    || (next_upper.starts_with("ELSE")
-                        && !next_upper.starts_with("ELSIF")
-                        && !next_upper.starts_with("ELSEIF"));
+            let next_is_case_branch = next_upper.starts_with("WHEN ")
+                || (next_upper.starts_with("ELSE")
+                    && !next_upper.starts_with("ELSIF")
+                    && !next_upper.starts_with("ELSEIF"));
             if Self::starts_with_case_terminator(&previous_upper) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
                 layouts[idx].anchor_group = layouts[next_idx].anchor_group;
@@ -5450,21 +5506,18 @@ impl SqlEditorWidget {
             .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
         let previous_code = previous_code_idx.and_then(|prev_idx| layouts.get(prev_idx));
 
-        let preserves_condition_hanging_indent =
-            (trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR "))
-                && layout.existing_indent_spaces.saturating_add(2) == depth_indent
-                && previous_code.is_some_and(|previous| {
-                    let previous_upper = previous.trimmed.to_ascii_uppercase();
-                    layout.query_base_depth == previous.query_base_depth
-                        && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
-                            || crate::sql_text::starts_with_keyword_token(
-                                &previous_upper,
-                                "HAVING",
-                            )
-                            || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
-                            || previous_upper.starts_with("AND ")
-                            || previous_upper.starts_with("OR "))
-                });
+        let preserves_condition_hanging_indent = (trimmed_upper.starts_with("AND ")
+            || trimmed_upper.starts_with("OR "))
+            && layout.existing_indent_spaces.saturating_add(2) == depth_indent
+            && previous_code.is_some_and(|previous| {
+                let previous_upper = previous.trimmed.to_ascii_uppercase();
+                layout.query_base_depth == previous.query_base_depth
+                    && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
+                        || crate::sql_text::starts_with_keyword_token(&previous_upper, "HAVING")
+                        || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
+                        || previous_upper.starts_with("AND ")
+                        || previous_upper.starts_with("OR "))
+            });
         if preserves_condition_hanging_indent {
             return true;
         }
@@ -5501,14 +5554,12 @@ impl SqlEditorWidget {
                 | LineLayoutKind::CommaOnly
                 | LineLayoutKind::Verbatim => {
                     let depth_indent = layout.final_depth * 4;
-                    let render_indent = if Self::line_preserves_existing_odd_hanging_indent(
-                        layouts, idx,
-                    )
-                    {
-                        layout.existing_indent_spaces
-                    } else {
-                        depth_indent
-                    };
+                    let render_indent =
+                        if Self::line_preserves_existing_odd_hanging_indent(layouts, idx) {
+                            layout.existing_indent_spaces
+                        } else {
+                            depth_indent
+                        };
                     out.push_str(&" ".repeat(render_indent));
                     out.push_str(layout.trimmed);
                 }
@@ -5966,6 +6017,71 @@ impl SqlEditorWidget {
         }
 
         open_cases > 0
+    }
+
+    fn line_contains_dml_case_condition_terminator(
+        tokens: &[SqlToken],
+        initial_paren_depth: usize,
+        target_paren_depth: usize,
+    ) -> bool {
+        let mut paren_depth = initial_paren_depth;
+        let mut open_cases = 0usize;
+        let mut pending_end = false;
+
+        for token in tokens {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+
+                    if pending_end {
+                        if upper.eq("CASE") {
+                            open_cases = open_cases.saturating_sub(1);
+                            pending_end = false;
+                            continue;
+                        }
+                        open_cases = open_cases.saturating_sub(1);
+                        pending_end = false;
+                    }
+
+                    if upper.eq("THEN") && paren_depth == target_paren_depth && open_cases == 0 {
+                        return true;
+                    }
+
+                    if upper.eq("CASE") {
+                        open_cases = open_cases.saturating_add(1);
+                    } else if upper.eq("END") {
+                        pending_end = true;
+                    }
+                }
+                SqlToken::Symbol(symbol) => {
+                    if pending_end {
+                        open_cases = open_cases.saturating_sub(1);
+                        pending_end = false;
+                    }
+
+                    for ch in symbol.chars() {
+                        match ch {
+                            '(' => {
+                                paren_depth = paren_depth.saturating_add(1);
+                            }
+                            ')' => {
+                                paren_depth = paren_depth.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {
+                    if pending_end {
+                        open_cases = open_cases.saturating_sub(1);
+                        pending_end = false;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     fn line_is_cte_definition_header(line: &str) -> bool {
@@ -7375,6 +7491,67 @@ FROM dual;"#;
             indent(lines[when_idx]),
             "close paren THEN line should return to the WHEN header depth, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_searched_case_multiline_when_condition_uses_case_continuation_depth(
+    ) {
+        let source = r#"SELECT
+    CASE
+        WHEN e.salary >= 100000
+        AND EXISTS (
+            SELECT 1
+            FROM qt_fmt_bonus b
+            WHERE b.emp_id = e.emp_id
+        ) THEN 'ELITE'
+        ELSE 'OTHER'
+    END AS deep_case_label
+FROM qt_fmt_emp e;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN e.salary >= 100000")
+            .expect("formatted output should contain searched CASE WHEN header");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND EXISTS (")
+            .expect("formatted output should contain multiline WHEN condition continuation");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain EXISTS child SELECT");
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") THEN 'ELITE'")
+            .expect("formatted output should contain EXISTS close THEN line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[when_idx]).saturating_add(4),
+            "searched CASE condition continuations should be one extra level deeper than WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[and_idx]).saturating_add(4),
+            "EXISTS child SELECT should use the promoted AND-owner base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_then_idx]),
+            indent(lines[and_idx]),
+            "EXISTS close-paren THEN line should return to the promoted AND-owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "auto formatting should stay stable for multiline searched CASE conditions"
         );
     }
 
@@ -12795,8 +12972,7 @@ FROM t1;"#;
         );
         assert_eq!(
             leading_spaces(lines[outer_else_idx]),
-            leading_spaces(lines[outer_case_idx])
-                .saturating_add(4),
+            leading_spaces(lines[outer_case_idx]).saturating_add(4),
             "Outer ELSE should indent one level deeper than outer CASE, got:\n{}",
             formatted
         );
