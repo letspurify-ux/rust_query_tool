@@ -201,7 +201,10 @@ impl WindowsDisplay {
             }
 
             apply_window_shape(self.wnd, self.fullscreen, self.borderless);
-            ShowWindow(self.wnd, SW_SHOW);
+            // ShowWindow removed: SWP_FRAMECHANGED already
+            // triggers a repaint, and the next loop iteration will
+            // draw()+SwapBuffers before the
+            // DWM surface is composited, avoiding a blank frame flash.
         };
     }
 }
@@ -651,7 +654,10 @@ unsafe fn create_window(
 ) -> (HWND, HDC) {
     let mut wndclassw: WNDCLASSW = std::mem::zeroed();
 
-    wndclassw.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    // CS_OWNDC only: CS_HREDRAW/CS_VREDRAW removed to prevent the OS from
+    // generating spurious WM_PAINT on resize that race with GL SwapBuffers.
+    // OpenGL manages its own redraws via WM_TIMER during modal resize.
+    wndclassw.style = CS_OWNDC;
     wndclassw.lpfnWndProc = Some(win32_wndproc);
     wndclassw.hInstance = GetModuleHandleW(NULL as _);
     wndclassw.hCursor = LoadCursorW(NULL as _, IDC_ARROW);
@@ -680,7 +686,9 @@ unsafe fn create_window(
     };
 
     if fullscreen || borderless {
-        win_style = WS_POPUP | WS_SYSMENU | WS_VISIBLE;
+        // WS_VISIBLE intentionally omitted: window is shown explicitly
+        // via ShowWindow after the first GL frame is rendered in run().
+        win_style = WS_POPUP | WS_SYSMENU;
         if fullscreen {
             rect.right = GetSystemMetrics(SM_CXSCREEN);
             rect.bottom = GetSystemMetrics(SM_CYSCREEN);
