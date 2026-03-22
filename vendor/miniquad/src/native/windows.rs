@@ -31,9 +31,6 @@ mod wgl;
 
 use libopengl32::LibOpengl32;
 
-const MIN_BORDERLESS_CORNER_RADIUS: i32 = 18;
-const MAX_BORDERLESS_CORNER_RADIUS: i32 = 36;
-const BORDERLESS_CORNER_RADIUS_DIVISOR: i32 = 14;
 
 pub(crate) struct WindowsDisplay {
     fullscreen: bool,
@@ -252,38 +249,10 @@ unsafe fn update_clip_rect(hwnd: HWND) {
     ClipCursor(&mut rect as *mut _ as _);
 }
 
-fn rounded_corner_radius(width: i32, height: i32) -> i32 {
-    (width.min(height) / BORDERLESS_CORNER_RADIUS_DIVISOR)
-        .max(MIN_BORDERLESS_CORNER_RADIUS)
-        .min(MAX_BORDERLESS_CORNER_RADIUS)
-}
-
-unsafe fn apply_window_shape(hwnd: HWND, fullscreen: bool, borderless: bool) {
-    if fullscreen || !borderless {
-        SetWindowRgn(hwnd, std::ptr::null_mut(), TRUE);
-        return;
-    }
-
-    let mut rect: RECT = std::mem::zeroed();
-    if GetClientRect(hwnd, &mut rect as *mut _ as _) == 0 {
-        return;
-    }
-
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    if width <= 0 || height <= 0 {
-        return;
-    }
-
-    let radius = rounded_corner_radius(width, height);
-    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
-    if region.is_null() {
-        return;
-    }
-
-    if SetWindowRgn(hwnd, region, TRUE) == 0 {
-        DeleteObject(region as *mut _);
-    }
+unsafe fn apply_window_shape(hwnd: HWND, _fullscreen: bool, _borderless: bool) {
+    // Clear any existing window region to avoid GDI region vs DWM compositing
+    // conflicts that cause transparent layer artifacts on Windows.
+    SetWindowRgn(hwnd, std::ptr::null_mut(), TRUE);
 }
 
 unsafe fn key_mods() -> KeyMods {
@@ -687,7 +656,11 @@ unsafe fn create_window(
     wndclassw.hInstance = GetModuleHandleW(NULL as _);
     wndclassw.hCursor = LoadCursorW(NULL as _, IDC_ARROW);
     wndclassw.hIcon = LoadIconW(NULL as _, IDI_WINLOGO);
-    wndclassw.hbrBackground = GetStockObject(BLACK_BRUSH as i32) as HBRUSH;
+    // Use HOLLOW_BRUSH (5) instead of BLACK_BRUSH to prevent the OS from
+    // painting a background layer that conflicts with OpenGL rendering.
+    // Combined with WM_ERASEBKGND returning 1, this ensures no GDI background
+    // painting occurs before or between OpenGL frames.
+    wndclassw.hbrBackground = GetStockObject(5) as HBRUSH;
     let class_name = "MINIQUADAPP\0".encode_utf16().collect::<Vec<u16>>();
     wndclassw.lpszClassName = class_name.as_ptr() as _;
     wndclassw.cbWndExtra = std::mem::size_of::<*mut std::ffi::c_void>() as i32;
