@@ -700,12 +700,22 @@ void main() {
     // Aurora ribbons
     col += aurora(centered, u_time);
 
+    // Planet with atmosphere
+    col += planet(centered);
+
     // Stars (4 layers with parallax drift) — dimmed by foreground dust
     float star_dim = 1.0 - dust_extinction;
     col += star_layer(uv, 60.0, 0.0, 0.45) * star_dim;
     col += star_layer(uv, 120.0, 2.0, 0.7) * star_dim;
     col += star_layer(uv, 240.0, 4.0, 0.95) * mix(star_dim, 1.0, 0.3);
     col += star_layer(uv, 400.0, 6.0, 1.2) * mix(star_dim, 1.0, 0.5);
+
+    // Shooting stars (intermittent)
+    col += shooting_star(uv, 1.0, u_time);
+    col += shooting_star(uv, 3.7, u_time);
+
+    // Lens flare from planet's star
+    col += lens_flare(centered);
 
     // --- Title wordmark texture with sweep reveal ---
     vec2 title_center = vec2(0.0, 0.16);
