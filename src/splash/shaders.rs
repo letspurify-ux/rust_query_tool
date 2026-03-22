@@ -1,17 +1,13 @@
 pub const VERTEX: &str = r#"#version 100
 attribute vec2 position;
-varying highp vec2 uv;
 
 void main() {
-    uv = position * 0.5 + 0.5;
     gl_Position = vec4(position, 0.0, 1.0);
 }
 "#;
 
 pub const FRAGMENT: &str = r#"#version 100
 precision highp float;
-
-varying highp vec2 uv;
 
 uniform float u_time;
 uniform vec2 u_resolution;
@@ -675,6 +671,8 @@ vec3 orbital_ring(vec2 p, float time) {
 // ========================================================
 
 void main() {
+    // Avoid the diagonal seam that can appear on some GL drivers when UVs are interpolated across two fullscreen triangles.
+    vec2 uv = gl_FragCoord.xy / u_resolution;
     vec2 aspect = vec2(u_resolution.x / u_resolution.y, 1.0);
     vec2 screen_centered = (uv - 0.5) * aspect;
     vec2 centered = screen_centered + camera_offset();
