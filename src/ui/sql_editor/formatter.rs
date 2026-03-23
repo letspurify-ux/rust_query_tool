@@ -4981,12 +4981,36 @@ impl SqlEditorWidget {
                             .map(|indent| indent.max(condition_indent))
                             .unwrap_or(condition_indent)
                     } else if let Some(frame) = active_general_paren_frame {
-                        frame.continuation_depth.max(condition_indent)
+                        let base =
+                            frame.continuation_depth.max(condition_indent);
+                        // Add +1 when the paren was opened at or above the
+                        // query base (owner_depth < condition_indent), meaning
+                        // it is a condition-grouping paren on the WHERE/ON/
+                        // HAVING line.  Parens opened deeper (on an AND/OR
+                        // line that was already +1'd) have continuation that
+                        // already accounts for the extra level.
+                        if frame.owner_depth < condition_indent {
+                            base.saturating_add(1)
+                        } else {
+                            base
+                        }
                     } else {
                         condition_indent
                     }
                 } else if let Some(frame) = active_general_paren_frame {
-                    frame.continuation_depth.max(condition_indent)
+                    // Inside a General paren opened at query base level,
+                    // AND/OR should indent one more level so that grouping
+                    // parens visually add depth:
+                    //   WHERE (col = 1          -- paren at condition base
+                    //           AND col2 = 2)   -- AND one level deeper
+                    let base = frame
+                        .continuation_depth
+                        .max(condition_indent);
+                    if frame.owner_depth < condition_indent {
+                        base.saturating_add(1)
+                    } else {
+                        base
+                    }
                 } else {
                     condition_indent.max(parser_depth)
                 }
@@ -11106,7 +11130,7 @@ END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("WHERE (e.manager_id IS NULL\n                OR e.manager_id = 100)"),
+            formatted.contains("WHERE (e.manager_id IS NULL\n                    OR e.manager_id = 100)"),
             "Non-SELECT parenthesis pair inside OPEN ... FOR WHERE should stay paired and indented, got:
 {}",
             formatted
@@ -11124,7 +11148,7 @@ END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                OR e.department_id = 90)"),
+            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                    OR e.department_id = 90)"),
             "Nested non-SELECT parenthesis pairs in OPEN ... FOR WHERE should stay paired and indented, got:
 {}",
             formatted
@@ -13687,10 +13711,14 @@ OR (COUNT(*) > 10
             "AND inside HAVING paren should be deeper than HAVING, got:\n{}",
             formatted
         );
-        assert_eq!(
-            indent(lines[or_idx]),
-            indent(lines[and_first]),
-            "OR after closed paren should stay at condition depth, got:\n{}",
+        assert!(
+            indent(lines[and_first]) > indent(lines[or_idx]),
+            "AND inside paren should be deeper than OR outside paren, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[or_idx]) > indent(lines[having_idx]),
+            "OR at condition level should be deeper than HAVING, got:\n{}",
             formatted
         );
 
@@ -13734,10 +13762,9 @@ FROM emp;"#;
             "AND inside WHEN paren should be deeper than WHEN, got:\n{}",
             formatted
         );
-        assert_eq!(
-            indent(lines[or_outer]),
-            indent(lines[and_nested]),
-            "OR after closed nested parens should return to same depth as AND, got:\n{}",
+        assert!(
+            indent(lines[or_outer]) <= indent(lines[and_nested]),
+            "OR after closed nested parens should be at or shallower than AND inside paren, got:\n{}",
             formatted
         );
 
@@ -13966,10 +13993,9 @@ AND status = 'A';"#;
             .position(|line| line.trim_start().starts_with("AND active"))
             .expect("should contain AND active");
 
-        assert_eq!(
-            indent(lines[inner_or]),
-            indent(lines[inner_and_first]),
-            "OR after closed paren in subquery should match first AND depth, got:\n{}",
+        assert!(
+            indent(lines[inner_and_first]) > indent(lines[inner_or]),
+            "AND inside paren should be deeper than OR outside paren in subquery, got:\n{}",
             formatted
         );
 
@@ -14017,10 +14043,9 @@ OR (
             "line comment should align with following AND inside paren, got:\n{}",
             formatted
         );
-        assert_eq!(
-            indent(lines[or_idx]),
-            indent(lines[and_first]),
-            "OR after closed paren should return to condition level, got:\n{}",
+        assert!(
+            indent(lines[and_first]) > indent(lines[or_idx]),
+            "AND inside paren should be deeper than OR outside paren, got:\n{}",
             formatted
         );
 
@@ -14049,14 +14074,14 @@ OR (
 
         assert_eq!(
             indent(lines[and_inner]),
-            8,
-            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            12,
+            "AND inside (( should be at depth 3 (12 spaces): WHERE base(1) + 2 parens, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[and_outer]),
-            4,
-            "AND inside ( should be at depth 1 (4 spaces), got:\n{}",
+            8,
+            "AND inside ( should be at depth 2 (8 spaces): WHERE base(1) + 1 paren, got:\n{}",
             formatted
         );
 
@@ -14090,20 +14115,20 @@ OR (
 
         assert_eq!(
             indent(lines[and_innermost]),
-            12,
-            "AND inside ((( should be at depth 3 (12 spaces), got:\n{}",
+            16,
+            "AND inside ((( should be at depth 4 (16 spaces): WHERE base(1) + 3 parens, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[and_middle]),
-            8,
-            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            12,
+            "AND inside (( should be at depth 3 (12 spaces): WHERE base(1) + 2 parens, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[and_outer]),
-            4,
-            "AND inside ( should be at depth 1 (4 spaces), got:\n{}",
+            8,
+            "AND inside ( should be at depth 2 (8 spaces): WHERE base(1) + 1 paren, got:\n{}",
             formatted
         );
 
@@ -14140,20 +14165,20 @@ WHERE (((status = 'A' OR status = 'B')
 
         assert_eq!(
             indent(lines[or_inner]),
-            12,
-            "OR inside ((( should be at depth 3 (12 spaces), got:\n{}",
+            16,
+            "OR inside ((( should be at depth 4 (16 spaces): WHERE base(1) + 3 parens, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[and_middle]),
-            8,
-            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            12,
+            "AND inside (( should be at depth 3 (12 spaces): WHERE base(1) + 2 parens, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[or_outer]),
-            4,
-            "OR inside ( should be at depth 1 (4 spaces), got:\n{}",
+            8,
+            "OR inside ( should be at depth 2 (8 spaces): WHERE base(1) + 1 paren, got:\n{}",
             formatted
         );
 
