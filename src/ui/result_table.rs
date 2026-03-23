@@ -239,6 +239,7 @@ struct DragState {
     start_col: i32,
     last_row: i32,
     last_col: i32,
+    base_selection_bounds: Option<(usize, usize, usize, usize)>,
     /// Cached mouse pixel position from last drag event to skip redundant
     /// `get_cell_at_mouse_for_drag` when the pointer hasn't moved.
     last_mouse_x: i32,
@@ -1602,6 +1603,7 @@ impl ResultTableWidget {
                     // Left click - start drag selection
                     if button == app::MouseButton::Left as i32 {
                         let _ = table_for_handle.take_focus();
+                        let shift = app::event_state().contains(Shortcut::Shift);
                         if let Some(col) = Self::get_col_header_at_mouse(&table_for_handle) {
                             if col >= 0 {
                                 let mut state = drag_state_for_handle
@@ -1614,6 +1616,7 @@ impl ResultTableWidget {
                                 state.is_dragging = false;
                                 state.last_row = -1;
                                 state.last_col = -1;
+                                state.base_selection_bounds = None;
                                 return true;
                             }
                         }
@@ -1623,6 +1626,7 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.header_sort_candidate_col = None;
                             state.header_sort_requires_double_click = false;
+                            state.base_selection_bounds = None;
                         }
                         let target_cell = if app::event_clicks() {
                             // On double-click, prefer the already-selected single cell.
@@ -1669,6 +1673,24 @@ impl ResultTableWidget {
                                     return true;
                                 }
                             }
+                            let max_rows = table_for_handle.rows().max(0) as usize;
+                            let max_cols = table_for_handle.cols().max(0) as usize;
+                            let base_selection_bounds = if shift {
+                                Self::normalized_selection_bounds_with_limits(
+                                    table_for_handle.get_selection(),
+                                    max_rows,
+                                    max_cols,
+                                )
+                            } else {
+                                None
+                            };
+                            let next_selection = Self::expanded_selection_bounds_with_cell(
+                                base_selection_bounds,
+                                row,
+                                col,
+                                max_rows,
+                                max_cols,
+                            );
                             let mut state = drag_state_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1677,15 +1699,21 @@ impl ResultTableWidget {
                             state.start_col = col;
                             state.last_row = row;
                             state.last_col = col;
+                            state.base_selection_bounds = base_selection_bounds;
                             let (view_row, view_col) =
                                 Self::drag_viewport_anchor(&table_for_handle);
                             state.last_mouse_x = app::event_x();
                             state.last_mouse_y = app::event_y();
                             state.last_view_row = view_row;
                             state.last_view_col = view_col;
-                            table_for_handle.set_selection(row, col, row, col);
-                            table_for_handle.redraw();
-                            return true;
+                            drop(state);
+
+                            if let Some((row_start, col_start, row_end, col_end)) = next_selection {
+                                table_for_handle
+                                    .set_selection(row_start, col_start, row_end, col_end);
+                                table_for_handle.redraw();
+                                return true;
+                            }
                         }
                     }
                     false
@@ -1767,6 +1795,7 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let start_row = state.start_row;
                             let start_col = state.start_col;
+                            let base_selection_bounds = state.base_selection_bounds;
 
                             state.last_mouse_x = current_mouse_x;
                             state.last_mouse_y = current_mouse_y;
@@ -1781,8 +1810,25 @@ impl ResultTableWidget {
                             state.last_col = col;
                             drop(state);
 
-                            table_for_handle.set_selection(start_row, start_col, row, col);
-                            table_for_handle.redraw();
+                            let max_rows = table_for_handle.rows().max(0) as usize;
+                            let max_cols = table_for_handle.cols().max(0) as usize;
+                            if let Some((row_start, col_start, row_end, col_end)) =
+                                if base_selection_bounds.is_some() {
+                                    Self::expanded_selection_bounds_with_cell(
+                                        base_selection_bounds,
+                                        row,
+                                        col,
+                                        max_rows,
+                                        max_cols,
+                                    )
+                                } else {
+                                    Some((start_row, start_col, row, col))
+                                }
+                            {
+                                table_for_handle
+                                    .set_selection(row_start, col_start, row_end, col_end);
+                                table_for_handle.redraw();
+                            }
                         }
                         return true;
                     }
@@ -1801,6 +1847,7 @@ impl ResultTableWidget {
                             state.is_dragging = false;
                             state.last_row = -1;
                             state.last_col = -1;
+                            state.base_selection_bounds = None;
                             state.last_mouse_x = -1;
                             state.last_mouse_y = -1;
                             state.last_view_row = -1;
@@ -4407,6 +4454,32 @@ impl ResultTableWidget {
         let row = row as usize;
         let col = col as usize;
         row >= row_start && row <= row_end && col >= col_start && col <= col_end
+    }
+
+    fn expanded_selection_bounds_with_cell(
+        base_bounds: Option<(usize, usize, usize, usize)>,
+        row: i32,
+        col: i32,
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if row < 0 || col < 0 || max_rows == 0 || max_cols == 0 {
+            return None;
+        }
+
+        let row = usize::try_from(row).ok()?;
+        let col = usize::try_from(col).ok()?;
+        if row >= max_rows || col >= max_cols {
+            return None;
+        }
+
+        let (row_start, col_start, row_end, col_end) = base_bounds.unwrap_or((row, col, row, col));
+        Some((
+            i32::try_from(row_start.min(row)).ok()?,
+            i32::try_from(col_start.min(col)).ok()?,
+            i32::try_from(row_end.max(row)).ok()?,
+            i32::try_from(col_end.max(col)).ok()?,
+        ))
     }
 
     fn resolve_update_target_cell(
@@ -7599,6 +7672,82 @@ mod row_edit_sql_tests {
             -1,
             0
         ));
+    }
+
+    #[test]
+    fn expanded_selection_bounds_with_cell_extends_existing_bounds_in_all_directions() {
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                6,
+                7,
+                10,
+                10,
+            ),
+            Some((2, 3, 6, 7))
+        );
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                1,
+                2,
+                10,
+                10,
+            ),
+            Some((1, 2, 4, 5))
+        );
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                1,
+                7,
+                10,
+                10,
+            ),
+            Some((1, 3, 4, 7))
+        );
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                6,
+                2,
+                10,
+                10,
+            ),
+            Some((2, 2, 6, 5))
+        );
+    }
+
+    #[test]
+    fn expanded_selection_bounds_with_cell_uses_target_when_base_selection_is_empty() {
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(None, 4, 6, 10, 10),
+            Some((4, 6, 4, 6))
+        );
+    }
+
+    #[test]
+    fn expanded_selection_bounds_with_cell_rejects_out_of_range_target() {
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                -1,
+                2,
+                10,
+                10
+            ),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::expanded_selection_bounds_with_cell(
+                Some((2, 3, 4, 5)),
+                10,
+                2,
+                10,
+                10
+            ),
+            None
+        );
     }
 
     #[test]
