@@ -977,32 +977,137 @@ impl ResultTableWidget {
             .cloned()
     }
 
-    fn should_consume_boundary_arrow(table: &Table, key: Key) -> bool {
+    fn visible_column_bounds(max_cols: usize, hidden_col: Option<usize>) -> Option<(usize, usize)> {
+        if max_cols == 0 {
+            return None;
+        }
+
+        let first_visible = (0..max_cols).find(|col| Some(*col) != hidden_col)?;
+        let last_visible = (0..max_cols).rev().find(|col| Some(*col) != hidden_col)?;
+        Some((first_visible, last_visible))
+    }
+
+    fn nearest_visible_column(
+        max_cols: usize,
+        preferred_col: usize,
+        hidden_col: Option<usize>,
+    ) -> Option<usize> {
+        if max_cols == 0 {
+            return None;
+        }
+
+        let max_col = max_cols.saturating_sub(1);
+        let clamped_col = preferred_col.min(max_col);
+        if Some(clamped_col) != hidden_col {
+            return Some(clamped_col);
+        }
+
+        (0..clamped_col)
+            .rev()
+            .find(|col| Some(*col) != hidden_col)
+            .or_else(|| {
+                (clamped_col.saturating_add(1)..max_cols).find(|col| Some(*col) != hidden_col)
+            })
+    }
+
+    fn selection_bounds_excluding_hidden_column(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (row_start, col_start, row_end, col_end) =
+            Self::normalized_selection_bounds_with_limits(selection, max_rows, max_cols)?;
+        let visible_cols = Self::visible_column_indices_in_range(col_start, col_end, hidden_col);
+        if let (Some(first_visible), Some(last_visible)) =
+            (visible_cols.first(), visible_cols.last())
+        {
+            return Some((row_start, *first_visible, row_end, *last_visible));
+        }
+
+        let fallback_col = Self::nearest_visible_column(max_cols, col_start, hidden_col)?;
+        Some((row_start, fallback_col, row_end, fallback_col))
+    }
+
+    fn clamp_selection_to_visible_columns(table: &mut Table, hidden_col: Option<usize>) -> bool {
+        let max_rows = table.rows().max(0) as usize;
+        let max_cols = table.cols().max(0) as usize;
+        let Some(current_bounds) = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            max_rows,
+            max_cols,
+        ) else {
+            return false;
+        };
+        let Some(next_bounds) = Self::selection_bounds_excluding_hidden_column(
+            table.get_selection(),
+            max_rows,
+            max_cols,
+            hidden_col,
+        ) else {
+            return false;
+        };
+
+        if current_bounds == next_bounds {
+            return false;
+        }
+
+        table.set_selection(
+            next_bounds.0 as i32,
+            next_bounds.1 as i32,
+            next_bounds.2 as i32,
+            next_bounds.3 as i32,
+        );
+        true
+    }
+
+    fn should_consume_boundary_arrow_for_selection(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+        key: Key,
+    ) -> bool {
+        if max_rows == 0 || max_cols == 0 {
+            return true;
+        }
+
+        let Some((row_start, col_start, row_end, col_end)) =
+            Self::selection_bounds_excluding_hidden_column(
+                selection, max_rows, max_cols, hidden_col,
+            )
+        else {
+            return false;
+        };
+        let Some((first_visible_col, last_visible_col)) =
+            Self::visible_column_bounds(max_cols, hidden_col)
+        else {
+            return true;
+        };
+
+        match key {
+            Key::Left => col_start <= first_visible_col,
+            Key::Right => col_end >= last_visible_col,
+            Key::Up => row_start == 0,
+            Key::Down => row_end >= max_rows.saturating_sub(1),
+            _ => false,
+        }
+    }
+
+    fn should_consume_boundary_arrow(table: &Table, key: Key, hidden_col: Option<usize>) -> bool {
         let rows = table.rows();
         let cols = table.cols();
         if rows <= 0 || cols <= 0 {
             return true;
         }
 
-        let (row_top, col_left, row_bot, col_right) = table.get_selection();
-        let row = if row_top >= 0 && row_bot >= 0 {
-            row_top.min(row_bot)
-        } else {
-            return false;
-        };
-        let col = if col_left >= 0 && col_right >= 0 {
-            col_left.min(col_right)
-        } else {
-            return false;
-        };
-
-        match key {
-            Key::Left => col <= 0,
-            Key::Right => col >= cols - 1,
-            Key::Up => row <= 0,
-            Key::Down => row >= rows - 1,
-            _ => false,
-        }
+        Self::should_consume_boundary_arrow_for_selection(
+            table.get_selection(),
+            rows as usize,
+            cols as usize,
+            hidden_col,
+            key,
+        )
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
@@ -1747,7 +1852,21 @@ impl ResultTableWidget {
                     let shift = state.contains(Shortcut::Shift);
 
                     if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down) {
-                        return Self::should_consume_boundary_arrow(&table_for_handle, key);
+                        let hidden_col = *hidden_auto_rowid_col_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if Self::clamp_selection_to_visible_columns(
+                            &mut table_for_handle,
+                            hidden_col,
+                        ) {
+                            table_for_handle.redraw();
+                            return true;
+                        }
+                        return Self::should_consume_boundary_arrow(
+                            &table_for_handle,
+                            key,
+                            hidden_col,
+                        );
                     }
 
                     if ctrl_or_cmd {
@@ -4159,6 +4278,7 @@ impl ResultTableWidget {
         let previous_hidden_col = self.hidden_auto_rowid_col_value();
         if previous_hidden_col == next_hidden_col {
             self.apply_hidden_rowid_column_width();
+            Self::clamp_selection_to_visible_columns(&mut self.table, next_hidden_col);
             self.sync_table_viewport_state();
             return;
         }
@@ -4172,6 +4292,7 @@ impl ResultTableWidget {
             self.recalculate_widths_for_current_font();
         }
         self.apply_hidden_rowid_column_width();
+        Self::clamp_selection_to_visible_columns(&mut self.table, next_hidden_col);
         self.sync_table_viewport_state();
     }
 
@@ -6927,6 +7048,63 @@ mod row_edit_sql_tests {
     fn resolved_selection_bounds_with_limits_clamps_to_current_table_size() {
         let bounds = ResultTableWidget::normalized_selection_bounds_with_limits((2, 3, 8, 9), 3, 4);
         assert_eq!(bounds, Some((2, 3, 2, 3)));
+    }
+
+    #[test]
+    fn visible_column_bounds_skip_hidden_rowid_column() {
+        assert_eq!(
+            ResultTableWidget::visible_column_bounds(4, Some(0)),
+            Some((1, 3))
+        );
+        assert_eq!(ResultTableWidget::visible_column_bounds(1, Some(0)), None);
+    }
+
+    #[test]
+    fn selection_bounds_excluding_hidden_column_moves_single_hidden_cell_to_first_visible() {
+        assert_eq!(
+            ResultTableWidget::selection_bounds_excluding_hidden_column(
+                (0, 0, 0, 0),
+                3,
+                4,
+                Some(0)
+            ),
+            Some((0, 1, 0, 1))
+        );
+    }
+
+    #[test]
+    fn selection_bounds_excluding_hidden_column_trims_hidden_column_from_range() {
+        assert_eq!(
+            ResultTableWidget::selection_bounds_excluding_hidden_column(
+                (1, 0, 1, 3),
+                4,
+                4,
+                Some(0)
+            ),
+            Some((1, 1, 1, 3))
+        );
+    }
+
+    #[test]
+    fn boundary_arrow_uses_first_visible_column_when_rowid_is_hidden() {
+        assert!(
+            ResultTableWidget::should_consume_boundary_arrow_for_selection(
+                (0, 1, 0, 1),
+                3,
+                4,
+                Some(0),
+                Key::Left,
+            )
+        );
+        assert!(
+            !ResultTableWidget::should_consume_boundary_arrow_for_selection(
+                (0, 1, 0, 1),
+                3,
+                4,
+                Some(0),
+                Key::Right,
+            )
+        );
     }
 
     #[test]

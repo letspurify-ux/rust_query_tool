@@ -4632,11 +4632,7 @@ impl SqlEditorWidget {
                 && current_line_starts_case
                 && !previous_line_ends_with_then
                 && !previous_line_is_else
-                && last_code_idx.is_some_and(|prev_idx| {
-                    Self::line_has_unclosed_open_paren_before_inline_comment(
-                        layouts[prev_idx].trimmed,
-                    )
-                });
+                && previous_line_has_unclosed_open_paren;
             let current_line_dml_case_expression_owner_depth =
                 if current_line_starts_dml_case_expression
                     && (previous_line_is_dml_clause_starter
