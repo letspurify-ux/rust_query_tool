@@ -235,6 +235,7 @@ pub struct ResultTableWidget {
 #[derive(Default)]
 struct DragState {
     is_dragging: bool,
+    consume_background_pointer_sequence: bool,
     start_row: i32,
     start_col: i32,
     last_row: i32,
@@ -1614,6 +1615,7 @@ impl ResultTableWidget {
                                 state.header_sort_start_x = app::event_x();
                                 state.header_sort_start_y = app::event_y();
                                 state.is_dragging = false;
+                                state.consume_background_pointer_sequence = false;
                                 state.last_row = -1;
                                 state.last_col = -1;
                                 state.base_selection_bounds = None;
@@ -1626,6 +1628,7 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.header_sort_candidate_col = None;
                             state.header_sort_requires_double_click = false;
+                            state.consume_background_pointer_sequence = false;
                             state.base_selection_bounds = None;
                         }
                         let target_cell = if app::event_clicks() {
@@ -1695,6 +1698,7 @@ impl ResultTableWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.is_dragging = true;
+                            state.consume_background_pointer_sequence = false;
                             state.start_row = row;
                             state.start_col = col;
                             state.last_row = row;
@@ -1715,6 +1719,44 @@ impl ResultTableWidget {
                                 return true;
                             }
                         }
+                        let pointer_in_table_bounds = Self::is_mouse_within_bounds(
+                            app::event_x(),
+                            app::event_y(),
+                            table_for_handle.x(),
+                            table_for_handle.y(),
+                            table_for_handle.w(),
+                            table_for_handle.h(),
+                        );
+                        let row_header_hit = Self::get_row_header_at_mouse(&table_for_handle);
+                        if Self::should_consume_background_pointer_sequence(
+                            pointer_in_table_bounds,
+                            false,
+                            None,
+                            row_header_hit,
+                            None,
+                        ) {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.is_dragging = false;
+                            state.consume_background_pointer_sequence = true;
+                            state.last_row = -1;
+                            state.last_col = -1;
+                            state.base_selection_bounds = None;
+                            state.last_mouse_x = app::event_x();
+                            state.last_mouse_y = app::event_y();
+                            let (view_row, view_col) =
+                                Self::drag_viewport_anchor(&table_for_handle);
+                            state.last_view_row = view_row;
+                            state.last_view_col = view_col;
+                            drop(state);
+
+                            if table_for_handle.try_get_selection().is_some() {
+                                table_for_handle.unset_selection();
+                                table_for_handle.redraw();
+                            }
+                            return true;
+                        }
                     }
                     false
                 }
@@ -1725,6 +1767,7 @@ impl ResultTableWidget {
                         Self::drag_viewport_anchor(&table_for_handle);
                     let (
                         is_dragging,
+                        consume_background_pointer_sequence,
                         skip_drag_hittest,
                         last_resolved_cell,
                         header_sort_candidate,
@@ -1737,6 +1780,7 @@ impl ResultTableWidget {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         (
                             state.is_dragging,
+                            state.consume_background_pointer_sequence,
                             Self::should_skip_drag_hit_test(
                                 state.last_mouse_x,
                                 state.last_mouse_y,
@@ -1782,6 +1826,9 @@ impl ResultTableWidget {
                         } else {
                             return true;
                         }
+                    }
+                    if consume_background_pointer_sequence {
+                        return true;
                     }
                     if is_dragging {
                         if skip_drag_hittest {
@@ -1835,13 +1882,20 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Released => {
-                    let (header_sort_candidate, header_sort_requires_double_click, was_dragging) = {
+                    let (
+                        header_sort_candidate,
+                        header_sort_requires_double_click,
+                        was_dragging,
+                        consumed_background_pointer_sequence,
+                    ) = {
                         let mut state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let header_candidate = state.header_sort_candidate_col.take();
                         let header_is_double_click = state.header_sort_requires_double_click;
                         state.header_sort_requires_double_click = false;
+                        let consumed_background = state.consume_background_pointer_sequence;
+                        state.consume_background_pointer_sequence = false;
                         let dragging = state.is_dragging;
                         if dragging {
                             state.is_dragging = false;
@@ -1853,7 +1907,12 @@ impl ResultTableWidget {
                             state.last_view_row = -1;
                             state.last_view_col = -1;
                         }
-                        (header_candidate, header_is_double_click, dragging)
+                        (
+                            header_candidate,
+                            header_is_double_click,
+                            dragging,
+                            consumed_background,
+                        )
                     };
                     if let Some(col) = header_sort_candidate {
                         if col >= 0
@@ -1885,7 +1944,7 @@ impl ResultTableWidget {
                         }
                         return true;
                     }
-                    if was_dragging {
+                    if was_dragging || consumed_background_pointer_sequence {
                         return true;
                     }
                     false
@@ -2557,6 +2616,20 @@ impl ResultTableWidget {
         mouse_x >= rect_x && mouse_x < right && mouse_y >= rect_y && mouse_y < bottom
     }
 
+    fn should_consume_background_pointer_sequence(
+        pointer_in_table_bounds: bool,
+        on_scrollbar: bool,
+        cell_hit: Option<(i32, i32)>,
+        row_header_hit: Option<i32>,
+        col_header_hit: Option<i32>,
+    ) -> bool {
+        pointer_in_table_bounds
+            && !on_scrollbar
+            && cell_hit.is_none()
+            && row_header_hit.is_none()
+            && col_header_hit.is_none()
+    }
+
     fn parse_clipboard_rows(clipboard_text: &str) -> Vec<Vec<String>> {
         if clipboard_text.is_empty() {
             return Vec::new();
@@ -2982,6 +3055,40 @@ impl ResultTableWidget {
         Some((visible_rows, visible_bottom))
     }
 
+    fn offscreen_skip_count(
+        item_origin: i32,
+        item_extent: i32,
+        viewport_start: i32,
+    ) -> Option<i32> {
+        if item_extent <= 0 {
+            return None;
+        }
+
+        let item_end = item_origin.saturating_add(item_extent);
+        if item_end > viewport_start {
+            return None;
+        }
+
+        let hidden_px = viewport_start.saturating_sub(item_end);
+        Some((hidden_px / item_extent).max(1))
+    }
+
+    fn estimate_uniform_row_candidate(
+        start_row: i32,
+        start_y: i32,
+        row_h: i32,
+        mouse_y: i32,
+        rows: i32,
+    ) -> Option<i32> {
+        if start_row < 0 || row_h <= 0 || rows <= 0 || start_row >= rows {
+            return None;
+        }
+
+        let delta = mouse_y.saturating_sub(start_y);
+        let last_row = rows.saturating_sub(1);
+        Some(start_row.saturating_add(delta / row_h).max(0).min(last_row))
+    }
+
     fn estimate_row_hit(
         table: &Table,
         context: TableContext,
@@ -2995,12 +3102,21 @@ impl ResultTableWidget {
         }
 
         if matches!(context, TableContext::Cell | TableContext::RowHeader) {
-            let data_top = table.y().saturating_add(table.col_header_height());
             if let Some(row_h) = Self::uniform_row_height_near_viewport(table, start_row, rows) {
-                let delta = mouse_y.saturating_sub(data_top);
-                let last_row = rows.saturating_sub(1);
-                let candidate = start_row.saturating_add(delta / row_h).max(0).min(last_row);
-                return Some(candidate);
+                if let Some((_, start_y, _, _)) = table.find_cell(context, start_row, anchor_col) {
+                    if let Some(candidate) = Self::estimate_uniform_row_candidate(
+                        start_row, start_y, row_h, mouse_y, rows,
+                    ) {
+                        let (_, candidate_y, _, candidate_h) =
+                            table.find_cell(context, candidate, anchor_col)?;
+                        if candidate_h > 0
+                            && mouse_y >= candidate_y
+                            && mouse_y < candidate_y.saturating_add(candidate_h)
+                        {
+                            return Some(candidate);
+                        }
+                    }
+                }
             }
         }
 
@@ -3230,9 +3346,7 @@ impl ResultTableWidget {
                     // When row_position is temporarily stale, FLTK can return many
                     // off-screen rows before reaching the visible viewport. Use the
                     // observed row height to skip in larger steps.
-                    if ch > 0 && cy.saturating_add(ch) <= data_top {
-                        let hidden_px = data_top - cy.saturating_add(ch);
-                        let skip = (hidden_px / ch).max(1);
+                    if let Some(skip) = Self::offscreen_skip_count(cy, ch, data_top) {
                         row = row.saturating_add(skip);
                         continue;
                     }
@@ -3281,9 +3395,7 @@ impl ResultTableWidget {
 
                 // Skip multiple off-screen / already-passed columns at once to
                 // avoid O(total_columns) scans during drag-selection.
-                if cw > 0 && cx + cw <= mouse_x {
-                    let gap_px = mouse_x - (cx + cw);
-                    let skip = (gap_px / cw).max(1);
+                if let Some(skip) = Self::offscreen_skip_count(cx, cw, mouse_x) {
                     col = col.saturating_add(skip);
                     continue;
                 }
@@ -3354,6 +3466,10 @@ impl ResultTableWidget {
                 else {
                     break;
                 };
+                if let Some(skip) = Self::offscreen_skip_count(cy, ch, data_top) {
+                    row = row.saturating_add(skip);
+                    continue;
+                }
                 let row_bottom = cy + ch;
                 visible_bottom =
                     Some(visible_bottom.map_or(row_bottom, |prev| prev.max(row_bottom)));
@@ -3390,13 +3506,13 @@ impl ResultTableWidget {
         }
     }
 
-    fn visible_drag_edge_indices(
+    fn visible_drag_bounds(
         table: &Table,
         start_row: i32,
         start_col: i32,
         data_bottom: i32,
         data_right: i32,
-    ) -> Option<(i32, i32)> {
+    ) -> Option<(i32, i32, i32, i32)> {
         if start_row < 0 || start_col < 0 {
             return None;
         }
@@ -3408,13 +3524,28 @@ impl ResultTableWidget {
         }
 
         let data_top = table.y() + table.col_header_height();
+        let data_left = table.x() + table.row_header_width();
         let mut visible_bottom_row = start_row;
+        let mut visible_bottom_px: Option<i32> = None;
         if let Some(row_h) = Self::uniform_row_height_near_viewport(table, start_row, rows) {
-            if let Some((visible_rows, _)) = Self::visible_row_metrics(data_top, data_bottom, row_h)
+            if let Some((_, start_y, _, _)) =
+                table.find_cell(TableContext::Cell, start_row, start_col)
             {
+                let max_visible_rows = ((data_bottom.saturating_sub(start_y))
+                    .saturating_add(row_h)
+                    .saturating_sub(1)
+                    / row_h)
+                    .max(1);
+                let remaining_rows = rows.saturating_sub(start_row).max(1);
+                let visible_rows = max_visible_rows.min(remaining_rows);
                 visible_bottom_row = start_row
                     .saturating_add(visible_rows.saturating_sub(1))
                     .min(rows.saturating_sub(1));
+                visible_bottom_px = Some(
+                    start_y
+                        .saturating_add(visible_rows.saturating_mul(row_h))
+                        .min(data_bottom),
+                );
             }
         } else {
             let mut row = start_row;
@@ -3423,11 +3554,18 @@ impl ResultTableWidget {
                 else {
                     break;
                 };
+                if let Some(skip) = Self::offscreen_skip_count(cy, ch, data_top) {
+                    row = row.saturating_add(skip);
+                    continue;
+                }
                 if ch <= 0 || cy >= data_bottom {
                     break;
                 }
                 visible_bottom_row = row;
-                if cy.saturating_add(ch) >= data_bottom {
+                let row_bottom = cy.saturating_add(ch);
+                visible_bottom_px =
+                    Some(visible_bottom_px.map_or(row_bottom, |prev| prev.max(row_bottom)));
+                if row_bottom >= data_bottom {
                     break;
                 }
                 row += 1;
@@ -3435,22 +3573,34 @@ impl ResultTableWidget {
         }
 
         let mut visible_right_col = start_col;
+        let mut visible_right_px: Option<i32> = None;
         let mut col = start_col;
         while col < cols {
             let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, start_row, col) else {
                 break;
             };
+            if let Some(skip) = Self::offscreen_skip_count(cx, cw, data_left) {
+                col = col.saturating_add(skip);
+                continue;
+            }
             if cx >= data_right {
                 break;
             }
             visible_right_col = col;
-            if cx.saturating_add(cw) >= data_right {
+            let col_right = cx.saturating_add(cw);
+            visible_right_px = Some(visible_right_px.map_or(col_right, |prev| prev.max(col_right)));
+            if col_right >= data_right {
                 break;
             }
             col += 1;
         }
 
-        Some((visible_bottom_row, visible_right_col))
+        match (visible_bottom_px, visible_right_px) {
+            (Some(bottom_px), Some(right_px)) => {
+                Some((visible_bottom_row, visible_right_col, bottom_px, right_px))
+            }
+            _ => None,
+        }
     }
 
     /// Get row index when mouse is over row header area.
@@ -3632,11 +3782,6 @@ impl ResultTableWidget {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
 
-        // Try direct lookup first
-        if let Some((row, col)) = Self::get_cell_at_mouse(table) {
-            return Some((row, col));
-        }
-
         // Calculate boundaries for clamping
         let table_x = table.x();
         let table_y = table.y();
@@ -3656,14 +3801,9 @@ impl ResultTableWidget {
         let start_col = table.col_position().max(0).min(last_col);
         let visible_left_col =
             Self::skip_hidden_columns(table, start_row, start_col, data_left, cols);
-        let (visible_bottom_row, visible_right_col) = Self::visible_drag_edge_indices(
-            table,
-            start_row,
-            visible_left_col,
-            data_bottom,
-            data_right,
-        )
-        .unwrap_or((start_row, visible_left_col));
+        let (visible_bottom_row, visible_right_col, visible_bottom_px, visible_right_px) =
+            Self::visible_drag_bounds(table, start_row, visible_left_col, data_bottom, data_right)
+                .unwrap_or((start_row, visible_left_col, data_bottom, data_right));
         let fallback_row = Self::resolve_drag_hittest_fallback(
             last_resolved_cell.map(|(row, _)| row).unwrap_or(-1),
             start_row,
@@ -3679,13 +3819,13 @@ impl ResultTableWidget {
         let row = if let Some(edge_row) = Self::resolve_drag_outside_index(
             mouse_y,
             data_top,
-            data_bottom,
+            visible_bottom_px,
             start_row,
             visible_bottom_row,
         ) {
             edge_row
         } else {
-            let mut hit_row = Self::estimate_row_hit(
+            let hit_row = Self::estimate_row_hit(
                 table,
                 TableContext::Cell,
                 start_row,
@@ -3693,25 +3833,6 @@ impl ResultTableWidget {
                 mouse_y,
                 rows,
             );
-
-            if hit_row.is_none() {
-                let mut row = Self::fallback_scan_start(start_row, MAX_HITTEST_ROW_BACKTRACK);
-                while row < start_row {
-                    if let Some((_, cy, _, ch)) =
-                        table.find_cell(TableContext::Cell, row, start_col)
-                    {
-                        if mouse_y >= cy && mouse_y < cy.saturating_add(ch) {
-                            hit_row = Some(row);
-                            break;
-                        }
-                        if cy > mouse_y || cy >= data_bottom {
-                            break;
-                        }
-                    }
-                    row += 1;
-                }
-            }
-
             // Keep drag selection stable even when FLTK temporarily fails to
             // resolve a row during fast reverse-direction drags.
             // Reusing the last confirmed drag endpoint avoids flipping the
@@ -3724,7 +3845,7 @@ impl ResultTableWidget {
         let col = if let Some(edge_col) = Self::resolve_drag_outside_index(
             mouse_x,
             data_left,
-            data_right,
+            visible_right_px,
             visible_left_col,
             visible_right_col,
         ) {
@@ -3755,25 +3876,6 @@ impl ResultTableWidget {
                 }
                 col += 1;
             }
-
-            if hit_col.is_none() {
-                col = Self::fallback_scan_start(visible_left_col, MAX_HITTEST_COL_BACKTRACK);
-                while col < visible_left_col {
-                    if let Some((cx, _, cw, _)) =
-                        table.find_cell(TableContext::Cell, col_anchor_row, col)
-                    {
-                        if mouse_x >= cx && mouse_x < cx + cw {
-                            hit_col = Some(col);
-                            break;
-                        }
-                        if cx > mouse_x || cx >= data_right {
-                            break;
-                        }
-                    }
-                    col += 1;
-                }
-            }
-
             // Keep drag selection stable even when hit-testing momentarily
             // misses during right->left drags on wide tables.
             // Reusing the last confirmed drag endpoint avoids snapping the
@@ -7813,6 +7915,52 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn offscreen_skip_count_scales_with_hidden_distance() {
+        assert_eq!(
+            ResultTableWidget::offscreen_skip_count(100, 20, 140),
+            Some(1)
+        );
+        assert_eq!(
+            ResultTableWidget::offscreen_skip_count(100, 20, 180),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn offscreen_skip_count_rejects_visible_or_invalid_extent() {
+        assert_eq!(ResultTableWidget::offscreen_skip_count(130, 20, 140), None);
+        assert_eq!(ResultTableWidget::offscreen_skip_count(100, 0, 140), None);
+    }
+
+    #[test]
+    fn estimate_uniform_row_candidate_uses_actual_visible_row_origin() {
+        assert_eq!(
+            ResultTableWidget::estimate_uniform_row_candidate(10, 102, 20, 121, 100),
+            Some(10)
+        );
+        assert_eq!(
+            ResultTableWidget::estimate_uniform_row_candidate(10, 102, 20, 122, 100),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn estimate_uniform_row_candidate_rejects_invalid_geometry() {
+        assert_eq!(
+            ResultTableWidget::estimate_uniform_row_candidate(10, 102, 0, 121, 100),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::estimate_uniform_row_candidate(10, 102, 20, 121, 0),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::estimate_uniform_row_candidate(100, 102, 20, 121, 100),
+            None
+        );
+    }
+
+    #[test]
     fn is_mouse_within_bounds_includes_top_left_excludes_right_bottom() {
         assert!(ResultTableWidget::is_mouse_within_bounds(
             10, 20, 10, 20, 100, 40
@@ -7833,6 +7981,56 @@ mod row_edit_sql_tests {
         assert!(!ResultTableWidget::is_mouse_within_bounds(
             10, 20, 10, 20, 100, -1
         ));
+    }
+
+    #[test]
+    fn background_pointer_sequence_is_consumed_for_blank_table_area() {
+        assert!(
+            ResultTableWidget::should_consume_background_pointer_sequence(
+                true, false, None, None, None
+            )
+        );
+        assert!(
+            !ResultTableWidget::should_consume_background_pointer_sequence(
+                false, false, None, None, None
+            )
+        );
+        assert!(
+            !ResultTableWidget::should_consume_background_pointer_sequence(
+                true, true, None, None, None
+            )
+        );
+    }
+
+    #[test]
+    fn background_pointer_sequence_is_not_consumed_for_real_table_targets() {
+        assert!(
+            !ResultTableWidget::should_consume_background_pointer_sequence(
+                true,
+                false,
+                Some((4, 7)),
+                None,
+                None
+            )
+        );
+        assert!(
+            !ResultTableWidget::should_consume_background_pointer_sequence(
+                true,
+                false,
+                None,
+                Some(3),
+                None
+            )
+        );
+        assert!(
+            !ResultTableWidget::should_consume_background_pointer_sequence(
+                true,
+                false,
+                None,
+                None,
+                Some(2)
+            )
+        );
     }
 
     #[test]
