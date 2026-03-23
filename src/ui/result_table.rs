@@ -1467,6 +1467,14 @@ impl ResultTableWidget {
             }
             match ev {
                 Event::Push => {
+                    // Let FLTK handle clicks on embedded scrollbar widgets.
+                    if Self::is_mouse_on_table_scrollbar(
+                        &table_for_handle,
+                        app::event_x(),
+                        app::event_y(),
+                    ) {
+                        return false;
+                    }
                     let button = app::event_button();
                     if button == app::MouseButton::Right as i32 {
                         Self::show_context_menu(
@@ -2816,6 +2824,43 @@ impl ResultTableWidget {
         start_x.abs_diff(current_x) > tolerance_px || start_y.abs_diff(current_y) > tolerance_px
     }
 
+    /// Returns `true` when the mouse position falls inside one of the FLTK
+    /// Table's embedded scrollbar child widgets.  Scrollbar children are
+    /// identified by having a width or height equal to the global scrollbar
+    /// size — the internal table-tile child that covers the cell area is
+    /// always much larger.
+    fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
+        let sb_size = app::scrollbar_size();
+        if sb_size <= 0 {
+            return false;
+        }
+        let n = table.children();
+        for i in 0..n {
+            if let Some(child) = table.child(i) {
+                if !child.visible() {
+                    continue;
+                }
+                let cw = child.w();
+                let ch = child.h();
+                // Scrollbars are narrow strips: vertical has w==sb_size,
+                // horizontal has h==sb_size.
+                if cw != sb_size && ch != sb_size {
+                    continue;
+                }
+                let cx = child.x();
+                let cy = child.y();
+                if mouse_x >= cx
+                    && mouse_x < cx + cw
+                    && mouse_y >= cy
+                    && mouse_y < cy + ch
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Get cell at mouse position (returns None if outside cells)
     fn get_cell_at_mouse(table: &Table) -> Option<(i32, i32)> {
         let rows = table.rows();
@@ -2841,6 +2886,14 @@ impl ResultTableWidget {
             || mouse_x >= data_right
             || mouse_y >= data_bottom
         {
+            return None;
+        }
+
+        // Exclude clicks on FLTK Table's embedded scrollbar widgets.
+        // Scrollbars are child widgets of the Table group; if the mouse lands
+        // on a visible scrollbar we must return None so the default handler
+        // can process the scroll action instead of selecting a cell.
+        if Self::is_mouse_on_table_scrollbar(table, mouse_x, mouse_y) {
             return None;
         }
 

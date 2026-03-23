@@ -142,7 +142,9 @@ pub struct AppState {
     pub popups: Arc<Mutex<Vec<Window>>>,
     pub window: Window,
     pub right_tile: Tile,
-    pub query_split_adjusted: Arc<Mutex<bool>>,
+    /// Saved query/result split ratio (0.0–1.0).  `None` means the user has
+    /// not adjusted the split bar yet (use default 40%).
+    pub query_split_ratio: Arc<Mutex<Option<f64>>>,
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
     has_live_connection: bool,
     pending_connection_metadata_refresh: bool,
@@ -1106,7 +1108,7 @@ impl MainWindow {
         let mut right_flex = Flex::default();
         right_flex.set_type(FlexType::Column);
 
-        let query_split_adjusted = Arc::new(Mutex::new(false));
+        let query_split_ratio: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
         let mut right_tile = Tile::new(0, 0, 900, 600, None);
         right_tile.set_frame(FrameType::FlatBox);
         right_tile.set_color(theme::panel_bg());
@@ -1272,7 +1274,7 @@ impl MainWindow {
 
         right_tile.end();
 
-        let query_split_adjusted_for_tile = query_split_adjusted.clone();
+        let query_split_ratio_for_tile = query_split_ratio.clone();
         let mut query_top_group_for_tile = query_top_group.clone();
         let mut query_split_bar_for_tile = query_split_bar.clone();
         let split_drag_active = Arc::new(Mutex::new(false));
@@ -1292,9 +1294,6 @@ impl MainWindow {
                             *split_drag_active_for_tile
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-                            *query_split_adjusted_for_tile
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                             return true;
                         }
                     }
@@ -1305,9 +1304,6 @@ impl MainWindow {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                     {
-                        *query_split_adjusted_for_tile
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                         let right_height = tile.h();
                         if right_height > 0 {
                             let max_query_height =
@@ -1327,6 +1323,11 @@ impl MainWindow {
                                 &mut query_top_group_for_tile,
                                 &mut query_split_bar_for_tile,
                             );
+                            // Store the ratio for proportional resize.
+                            *query_split_ratio_for_tile
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(desired_query_height as f64 / right_height as f64);
                         }
                         return true;
                     }
@@ -1344,6 +1345,15 @@ impl MainWindow {
                             &mut query_top_group_for_tile,
                             &mut query_split_bar_for_tile,
                         );
+                        // Store final ratio after release.
+                        let right_height = tile.h();
+                        if right_height > 0 {
+                            let query_height = query_top_group_for_tile.h();
+                            *query_split_ratio_for_tile
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(query_height as f64 / right_height as f64);
+                        }
                         return true;
                     }
                     false
@@ -1442,7 +1452,7 @@ impl MainWindow {
             popups: Arc::new(Mutex::new(Vec::new())),
             window,
             right_tile: right_tile.clone(),
-            query_split_adjusted,
+            query_split_ratio,
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
             pending_connection_metadata_refresh: false,
@@ -1901,15 +1911,16 @@ impl MainWindow {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
-        if *state
-            .query_split_adjusted
+        let ratio = *state
+            .query_split_ratio
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            Self::clamp_query_split_with(
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(r) = ratio {
+            Self::apply_query_split_ratio(
                 &mut right_tile,
                 &mut query_top_group,
                 &mut query_split_bar,
+                r,
             );
         } else {
             Self::adjust_query_layout_with(
@@ -2026,6 +2037,24 @@ impl MainWindow {
         );
     }
 
+    /// Apply the saved split ratio to compute the query pane height.
+    fn apply_query_split_ratio(
+        right_tile: &mut Tile,
+        query_top_group: &mut Group,
+        query_split_bar: &mut Frame,
+        ratio: f64,
+    ) {
+        let right_height = right_tile.h();
+        if right_height <= 0 {
+            return;
+        }
+        let max_height =
+            (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let desired_height = ((right_height as f64) * ratio).round() as i32;
+        let desired_height = desired_height.clamp(MIN_QUERY_HEIGHT, max_height);
+        Self::apply_query_split_layout(right_tile, query_top_group, query_split_bar, desired_height);
+    }
+
     fn adjust_query_layout_with(
         right_tile: &mut Tile,
         query_top_group: &mut Group,
@@ -2091,15 +2120,16 @@ impl MainWindow {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
-        if *state
-            .query_split_adjusted
+        let ratio = *state
+            .query_split_ratio
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            Self::clamp_query_split_with(
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(r) = ratio {
+            Self::apply_query_split_ratio(
                 &mut right_tile,
                 &mut query_top_group,
                 &mut query_split_bar,
+                r,
             );
         } else {
             Self::adjust_query_layout_with(
