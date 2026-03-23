@@ -4258,6 +4258,10 @@ impl SqlEditorWidget {
         is_standalone_open_paren_owner: bool,
         paren_layout_frames: &mut Vec<ParenLayoutFrame>,
     ) {
+        // Track consecutive General `(` tokens with no intervening
+        // non-comment tokens (e.g. `(((`) so each gets progressive depth.
+        // Reset when a non-paren token appears (e.g. `func (func2 (`).
+        let mut consecutive_general_opens: usize = 0;
         for token_idx in start_idx..tokens.len() {
             match &tokens[token_idx] {
                 SqlToken::Comment(_) => {}
@@ -4269,12 +4273,21 @@ impl SqlEditorWidget {
                         is_multiline_clause_owner,
                         is_condition_query_owner,
                     );
+                    // For truly consecutive General parens like (((,
+                    // each additional ( adds one more depth level.
+                    let base_depth = if kind == ParenLayoutFrameKind::General
+                        && consecutive_general_opens > 0
+                    {
+                        line_depth.saturating_add(consecutive_general_opens)
+                    } else {
+                        line_depth
+                    };
                     let continuation_depth = match kind {
                         ParenLayoutFrameKind::General => {
                             if is_standalone_open_paren_owner {
-                                line_depth
+                                base_depth
                             } else {
-                                line_depth.saturating_add(1)
+                                base_depth.saturating_add(1)
                             }
                         }
                         ParenLayoutFrameKind::Query
@@ -4288,6 +4301,11 @@ impl SqlEditorWidget {
                     } else {
                         line_depth
                     };
+                    if kind == ParenLayoutFrameKind::General {
+                        consecutive_general_opens += 1;
+                    } else {
+                        consecutive_general_opens = 0;
+                    }
                     paren_layout_frames.push(ParenLayoutFrame {
                         kind,
                         owner_depth,
@@ -4298,8 +4316,11 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
                     let _ = paren_layout_frames.pop();
+                    consecutive_general_opens = 0;
                 }
-                _ => {}
+                _ => {
+                    consecutive_general_opens = 0;
+                }
             }
         }
     }
@@ -14007,6 +14028,152 @@ OR (
         assert_eq!(
             reformatted, formatted,
             "formatting should be stable for comments inside nested paren conditions"
+        );
+    }
+
+    #[test]
+    fn double_consecutive_open_parens_get_progressive_depth() {
+        let input = "SELECT * FROM emp WHERE ((col1 = 1 AND col2 = 2) AND col3 = 3);";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_inner = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND col2"))
+            .expect("should contain AND col2");
+        let and_outer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND col3"))
+            .expect("should contain AND col3");
+
+        assert_eq!(
+            indent(lines[and_inner]),
+            8,
+            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_outer]),
+            4,
+            "AND inside ( should be at depth 1 (4 spaces), got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for (( double parens"
+        );
+    }
+
+    #[test]
+    fn triple_consecutive_open_parens_get_progressive_depth() {
+        let input =
+            "SELECT * FROM emp WHERE (((col1 = 1 AND col2 = 2) AND col3 = 3) AND col4 = 4);";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_innermost = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND col2"))
+            .expect("should contain AND col2");
+        let and_middle = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND col3"))
+            .expect("should contain AND col3");
+        let and_outer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND col4"))
+            .expect("should contain AND col4");
+
+        assert_eq!(
+            indent(lines[and_innermost]),
+            12,
+            "AND inside ((( should be at depth 3 (12 spaces), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_middle]),
+            8,
+            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_outer]),
+            4,
+            "AND inside ( should be at depth 1 (4 spaces), got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for ((( triple parens"
+        );
+    }
+
+    #[test]
+    fn triple_consecutive_parens_with_or_get_progressive_depth() {
+        let input = r#"SELECT *
+FROM emp
+WHERE (((status = 'A' OR status = 'B')
+    AND dept_id = 10)
+    OR region = 'WEST');"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let or_inner = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OR status = 'B'"))
+            .expect("should contain OR status = 'B'");
+        let and_middle = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND dept_id"))
+            .expect("should contain AND dept_id");
+        let or_outer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OR region"))
+            .expect("should contain OR region");
+
+        assert_eq!(
+            indent(lines[or_inner]),
+            12,
+            "OR inside ((( should be at depth 3 (12 spaces), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_middle]),
+            8,
+            "AND inside (( should be at depth 2 (8 spaces), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[or_outer]),
+            4,
+            "OR inside ( should be at depth 1 (4 spaces), got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for ((( with OR at various depths"
+        );
+    }
+
+    #[test]
+    fn func_call_parens_do_not_get_progressive_depth() {
+        // func(func2( should NOT get progressive depth — only consecutive ((( should
+        let input = "SELECT TO_CHAR(NVL(col1, 0), 'FM9999') FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "function call nesting should be stable:\n{}",
+            formatted
         );
     }
 }

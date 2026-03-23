@@ -2903,9 +2903,9 @@ fn format_sql_package_body_case_inside_parentheses_keeps_newlines() {
 
     assert!(
         formatted.contains(
-            "v_val := fn_calc ((\n            CASE\n                WHEN v_mode = 1 THEN"
+            "v_val := fn_calc ((\n                CASE\n                WHEN v_mode = 1 THEN"
         ),
-        "CASE expression inside parentheses should still expand to multiline layout, got: {}",
+        "CASE expression inside (( should expand with progressive depth, got: {}",
         formatted
     );
     assert!(
@@ -2935,10 +2935,9 @@ fn format_sql_package_body_type_table_is_not_misdetected_as_create_table() {
     );
     assert!(
         formatted.contains(
-            "BEGIN
-        v_out := fn_calc ((\n            CASE"
+            "BEGIN\n        v_out := fn_calc ((\n                CASE"
         ),
-        "Nested CASE inside function body should remain multiline, got: {}",
+        "Nested CASE inside function body with (( should use progressive depth, got: {}",
         formatted
     );
 }
