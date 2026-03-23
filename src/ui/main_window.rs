@@ -2078,7 +2078,12 @@ impl MainWindow {
             (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
         let desired_height = ((right_height as f64) * ratio).round() as i32;
         let desired_height = desired_height.clamp(MIN_QUERY_HEIGHT, max_height);
-        Self::apply_query_split_layout(right_tile, query_top_group, query_split_bar, desired_height);
+        Self::apply_query_split_layout(
+            right_tile,
+            query_top_group,
+            query_split_bar,
+            desired_height,
+        );
     }
 
     fn adjust_query_layout_with(

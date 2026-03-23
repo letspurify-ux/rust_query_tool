@@ -2934,9 +2934,7 @@ fn format_sql_package_body_type_table_is_not_misdetected_as_create_table() {
         formatted
     );
     assert!(
-        formatted.contains(
-            "BEGIN\n        v_out := fn_calc ((\n                CASE"
-        ),
+        formatted.contains("BEGIN\n        v_out := fn_calc ((\n                CASE"),
         "Nested CASE inside function body with (( should use progressive depth, got: {}",
         formatted
     );

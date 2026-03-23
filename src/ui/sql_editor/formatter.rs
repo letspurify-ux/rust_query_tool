@@ -4970,15 +4970,14 @@ impl SqlEditorWidget {
                             .unwrap_or(condition_indent.max(parser_depth))
                     }
                 } else if previous_line_is_condition_keyword {
-                    let paren_context_stable = current_general_paren_frame_count
-                        == prev_general_paren_frame_count;
+                    let paren_context_stable =
+                        current_general_paren_frame_count == prev_general_paren_frame_count;
                     if paren_context_stable {
                         last_code_indent
                             .map(|indent| indent.max(condition_indent))
                             .unwrap_or(condition_indent)
                     } else if let Some(frame) = active_general_paren_frame {
-                        let base =
-                            frame.continuation_depth.max(condition_indent);
+                        let base = frame.continuation_depth.max(condition_indent);
                         // Add +1 when the paren was opened at or above the
                         // query base (owner_depth < condition_indent), meaning
                         // it is a condition-grouping paren on the WHERE/ON/
@@ -4999,9 +4998,7 @@ impl SqlEditorWidget {
                     // parens visually add depth:
                     //   WHERE (col = 1          -- paren at condition base
                     //           AND col2 = 2)   -- AND one level deeper
-                    let base = frame
-                        .continuation_depth
-                        .max(condition_indent);
+                    let base = frame.continuation_depth.max(condition_indent);
                     if frame.owner_depth < condition_indent {
                         base.saturating_add(1)
                     } else {
@@ -13613,7 +13610,9 @@ WHERE (
             .expect("should contain AND (b or AND (");
         let or_deepest = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("OR (c") || line.trim_start().starts_with("OR ("))
+            .position(|line| {
+                line.trim_start().starts_with("OR (c") || line.trim_start().starts_with("OR (")
+            })
             .expect("should contain OR (c or OR (");
 
         assert!(

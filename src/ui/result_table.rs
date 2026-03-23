@@ -243,6 +243,10 @@ struct DragState {
     /// `get_cell_at_mouse_for_drag` when the pointer hasn't moved.
     last_mouse_x: i32,
     last_mouse_y: i32,
+    /// Cached viewport anchor from last drag event. Drag auto-scroll can move
+    /// the visible rows/cols even while the pointer stays on the same pixel.
+    last_view_row: i32,
+    last_view_col: i32,
     header_sort_candidate_col: Option<i32>,
     header_sort_requires_double_click: bool,
     header_sort_start_x: i32,
@@ -1568,6 +1572,12 @@ impl ResultTableWidget {
                             state.start_col = col;
                             state.last_row = row;
                             state.last_col = col;
+                            let (view_row, view_col) =
+                                Self::drag_viewport_anchor(&table_for_handle);
+                            state.last_mouse_x = app::event_x();
+                            state.last_mouse_y = app::event_y();
+                            state.last_view_row = view_row;
+                            state.last_view_col = view_col;
                             table_for_handle.set_selection(row, col, row, col);
                             table_for_handle.redraw();
                             return true;
@@ -1576,9 +1586,14 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
+                    let current_mouse_x = app::event_x();
+                    let current_mouse_y = app::event_y();
+                    let (current_view_row, current_view_col) =
+                        Self::drag_viewport_anchor(&table_for_handle);
                     let (
                         is_dragging,
-                        mouse_unchanged,
+                        skip_drag_hittest,
+                        last_resolved_cell,
                         header_sort_candidate,
                         header_sort_requires_double_click,
                         header_start_x,
@@ -1587,11 +1602,23 @@ impl ResultTableWidget {
                         let state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let mx = app::event_x();
-                        let my = app::event_y();
                         (
                             state.is_dragging,
-                            state.last_mouse_x == mx && state.last_mouse_y == my,
+                            Self::should_skip_drag_hit_test(
+                                state.last_mouse_x,
+                                state.last_mouse_y,
+                                current_mouse_x,
+                                current_mouse_y,
+                                state.last_view_row,
+                                state.last_view_col,
+                                current_view_row,
+                                current_view_col,
+                            ),
+                            if state.last_row >= 0 && state.last_col >= 0 {
+                                Some((state.last_row, state.last_col))
+                            } else {
+                                None
+                            },
                             state.header_sort_candidate_col,
                             state.header_sort_requires_double_click,
                             state.header_sort_start_x,
@@ -1624,11 +1651,11 @@ impl ResultTableWidget {
                         }
                     }
                     if is_dragging {
-                        if mouse_unchanged {
+                        if skip_drag_hittest {
                             return true;
                         }
                         if let Some((row, col)) =
-                            Self::get_cell_at_mouse_for_drag(&table_for_handle)
+                            Self::get_cell_at_mouse_for_drag(&table_for_handle, last_resolved_cell)
                         {
                             let mut state = drag_state_for_handle
                                 .lock()
@@ -1636,8 +1663,10 @@ impl ResultTableWidget {
                             let start_row = state.start_row;
                             let start_col = state.start_col;
 
-                            state.last_mouse_x = app::event_x();
-                            state.last_mouse_y = app::event_y();
+                            state.last_mouse_x = current_mouse_x;
+                            state.last_mouse_y = current_mouse_y;
+                            state.last_view_row = current_view_row;
+                            state.last_view_col = current_view_col;
 
                             if state.last_row == row && state.last_col == col {
                                 return true;
@@ -1667,6 +1696,10 @@ impl ResultTableWidget {
                             state.is_dragging = false;
                             state.last_row = -1;
                             state.last_col = -1;
+                            state.last_mouse_x = -1;
+                            state.last_mouse_y = -1;
+                            state.last_view_row = -1;
+                            state.last_view_col = -1;
                         }
                         (header_candidate, header_is_double_click, dragging)
                     };
@@ -2748,6 +2781,41 @@ impl ResultTableWidget {
         }
     }
 
+    fn uniform_row_height_near_viewport(table: &Table, start_row: i32, rows: i32) -> Option<i32> {
+        if start_row < 0 || rows <= 0 || start_row >= rows {
+            return None;
+        }
+
+        let row_h = table.row_height(start_row);
+        if row_h <= 0 {
+            return None;
+        }
+
+        let next_row = start_row.saturating_add(1);
+        if next_row < rows {
+            let next_h = table.row_height(next_row);
+            if next_h > 0 && next_h != row_h {
+                return None;
+            }
+        }
+
+        Some(row_h)
+    }
+
+    fn visible_row_metrics(data_top: i32, data_bottom: i32, row_h: i32) -> Option<(i32, i32)> {
+        if row_h <= 0 || data_bottom <= data_top {
+            return None;
+        }
+
+        let visible_height = data_bottom.saturating_sub(data_top);
+        let visible_rows =
+            ((visible_height.saturating_add(row_h).saturating_sub(1)) / row_h).max(1);
+        let visible_bottom = data_top
+            .saturating_add(visible_rows.saturating_mul(row_h))
+            .min(data_bottom);
+        Some((visible_rows, visible_bottom))
+    }
+
     fn estimate_row_hit(
         table: &Table,
         context: TableContext,
@@ -2758,6 +2826,16 @@ impl ResultTableWidget {
     ) -> Option<i32> {
         if start_row < 0 || anchor_col < 0 || rows <= 0 || start_row >= rows {
             return None;
+        }
+
+        if matches!(context, TableContext::Cell | TableContext::RowHeader) {
+            let data_top = table.y().saturating_add(table.col_header_height());
+            if let Some(row_h) = Self::uniform_row_height_near_viewport(table, start_row, rows) {
+                let delta = mouse_y.saturating_sub(data_top);
+                let last_row = rows.saturating_sub(1);
+                let candidate = start_row.saturating_add(delta / row_h).max(0).min(last_row);
+                return Some(candidate);
+            }
         }
 
         let (_, start_y, _, row_h) = table.find_cell(context, start_row, anchor_col)?;
@@ -2824,6 +2902,69 @@ impl ResultTableWidget {
         start_x.abs_diff(current_x) > tolerance_px || start_y.abs_diff(current_y) > tolerance_px
     }
 
+    fn drag_viewport_anchor(table: &Table) -> (i32, i32) {
+        let rows = table.rows();
+        let cols = table.cols();
+
+        let row = if rows > 0 {
+            table.row_position().max(0).min(rows.saturating_sub(1))
+        } else {
+            0
+        };
+        let col = if cols > 0 {
+            table.col_position().max(0).min(cols.saturating_sub(1))
+        } else {
+            0
+        };
+
+        (row, col)
+    }
+
+    fn should_skip_drag_hit_test(
+        last_mouse_x: i32,
+        last_mouse_y: i32,
+        current_mouse_x: i32,
+        current_mouse_y: i32,
+        last_view_row: i32,
+        last_view_col: i32,
+        current_view_row: i32,
+        current_view_col: i32,
+    ) -> bool {
+        last_mouse_x == current_mouse_x
+            && last_mouse_y == current_mouse_y
+            && last_view_row == current_view_row
+            && last_view_col == current_view_col
+    }
+
+    fn resolve_drag_hittest_fallback(
+        last_resolved_index: i32,
+        viewport_anchor: i32,
+        max_index: i32,
+    ) -> i32 {
+        let clamped_anchor = viewport_anchor.max(0).min(max_index);
+        if last_resolved_index >= 0 {
+            last_resolved_index.max(0).min(max_index)
+        } else {
+            clamped_anchor
+        }
+    }
+
+    fn resolve_drag_outside_index(
+        pointer: i32,
+        visible_start_px: i32,
+        visible_end_px: i32,
+        visible_start_index: i32,
+        visible_end_index: i32,
+    ) -> Option<i32> {
+        if pointer < visible_start_px {
+            Some(visible_start_index)
+        } else if pointer >= visible_end_px {
+            Some(visible_end_index)
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` when the mouse position falls inside one of the FLTK
     /// Table's embedded scrollbar widgets (vertical or horizontal).
     fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
@@ -2832,11 +2973,7 @@ impl ResultTableWidget {
         if vsb.visible() {
             let vx = vsb.x();
             let vy = vsb.y();
-            if mouse_x >= vx
-                && mouse_x < vx + vsb.w()
-                && mouse_y >= vy
-                && mouse_y < vy + vsb.h()
-            {
+            if mouse_x >= vx && mouse_x < vx + vsb.w() && mouse_y >= vy && mouse_y < vy + vsb.h() {
                 return true;
             }
         }
@@ -2845,11 +2982,7 @@ impl ResultTableWidget {
         if hsb.visible() {
             let hx = hsb.x();
             let hy = hsb.y();
-            if mouse_x >= hx
-                && mouse_x < hx + hsb.w()
-                && mouse_y >= hy
-                && mouse_y < hy + hsb.h()
-            {
+            if mouse_x >= hx && mouse_x < hx + hsb.w() && mouse_y >= hy && mouse_y < hy + hsb.h() {
                 return true;
             }
         }
@@ -3041,19 +3174,28 @@ impl ResultTableWidget {
 
         let data_bottom = table.y() + table.h();
         let data_right = table.x() + table.w();
+        let data_top = table.y() + table.col_header_height();
 
         let mut visible_bottom: Option<i32> = None;
-        let mut row = start_row;
-        while row < rows {
-            let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) else {
-                break;
-            };
-            let row_bottom = cy + ch;
-            visible_bottom = Some(visible_bottom.map_or(row_bottom, |prev| prev.max(row_bottom)));
-            if row_bottom >= data_bottom {
-                break;
+        if let Some(row_h) = Self::uniform_row_height_near_viewport(table, start_row, rows) {
+            if let Some((_, bottom_px)) = Self::visible_row_metrics(data_top, data_bottom, row_h) {
+                visible_bottom = Some(bottom_px);
             }
-            row += 1;
+        } else {
+            let mut row = start_row;
+            while row < rows {
+                let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col)
+                else {
+                    break;
+                };
+                let row_bottom = cy + ch;
+                visible_bottom =
+                    Some(visible_bottom.map_or(row_bottom, |prev| prev.max(row_bottom)));
+                if row_bottom >= data_bottom {
+                    break;
+                }
+                row += 1;
+            }
         }
 
         let mut visible_right: Option<i32> = None;
@@ -3080,6 +3222,69 @@ impl ResultTableWidget {
             (Some(right), Some(bottom)) => Some((right, bottom)),
             _ => None,
         }
+    }
+
+    fn visible_drag_edge_indices(
+        table: &Table,
+        start_row: i32,
+        start_col: i32,
+        data_bottom: i32,
+        data_right: i32,
+    ) -> Option<(i32, i32)> {
+        if start_row < 0 || start_col < 0 {
+            return None;
+        }
+
+        let rows = table.rows();
+        let cols = table.cols();
+        if rows <= 0 || cols <= 0 || start_row >= rows || start_col >= cols {
+            return None;
+        }
+
+        let data_top = table.y() + table.col_header_height();
+        let mut visible_bottom_row = start_row;
+        if let Some(row_h) = Self::uniform_row_height_near_viewport(table, start_row, rows) {
+            if let Some((visible_rows, _)) = Self::visible_row_metrics(data_top, data_bottom, row_h)
+            {
+                visible_bottom_row = start_row
+                    .saturating_add(visible_rows.saturating_sub(1))
+                    .min(rows.saturating_sub(1));
+            }
+        } else {
+            let mut row = start_row;
+            while row < rows {
+                let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col)
+                else {
+                    break;
+                };
+                if ch <= 0 || cy >= data_bottom {
+                    break;
+                }
+                visible_bottom_row = row;
+                if cy.saturating_add(ch) >= data_bottom {
+                    break;
+                }
+                row += 1;
+            }
+        }
+
+        let mut visible_right_col = start_col;
+        let mut col = start_col;
+        while col < cols {
+            let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, start_row, col) else {
+                break;
+            };
+            if cx >= data_right {
+                break;
+            }
+            visible_right_col = col;
+            if cx.saturating_add(cw) >= data_right {
+                break;
+            }
+            col += 1;
+        }
+
+        Some((visible_bottom_row, visible_right_col))
     }
 
     /// Get row index when mouse is over row header area.
@@ -3247,7 +3452,10 @@ impl ResultTableWidget {
     }
 
     /// Get cell at mouse position for drag (clamps to boundaries)
-    fn get_cell_at_mouse_for_drag(table: &Table) -> Option<(i32, i32)> {
+    fn get_cell_at_mouse_for_drag(
+        table: &Table,
+        last_resolved_cell: Option<(i32, i32)>,
+    ) -> Option<(i32, i32)> {
         let rows = table.rows();
         let cols = table.cols();
 
@@ -3280,12 +3488,36 @@ impl ResultTableWidget {
         let last_col = cols.saturating_sub(1);
         let start_row = table.row_position().max(0).min(last_row);
         let start_col = table.col_position().max(0).min(last_col);
+        let visible_left_col =
+            Self::skip_hidden_columns(table, start_row, start_col, data_left, cols);
+        let (visible_bottom_row, visible_right_col) = Self::visible_drag_edge_indices(
+            table,
+            start_row,
+            visible_left_col,
+            data_bottom,
+            data_right,
+        )
+        .unwrap_or((start_row, visible_left_col));
+        let fallback_row = Self::resolve_drag_hittest_fallback(
+            last_resolved_cell.map(|(row, _)| row).unwrap_or(-1),
+            start_row,
+            last_row,
+        );
+        let fallback_col = Self::resolve_drag_hittest_fallback(
+            last_resolved_cell.map(|(_, col)| col).unwrap_or(-1),
+            start_col,
+            last_col,
+        );
 
         // Clamp row
-        let row = if mouse_y < data_top {
-            0
-        } else if mouse_y >= data_bottom {
-            last_row
+        let row = if let Some(edge_row) = Self::resolve_drag_outside_index(
+            mouse_y,
+            data_top,
+            data_bottom,
+            start_row,
+            visible_bottom_row,
+        ) {
+            edge_row
         } else {
             let mut hit_row = Self::estimate_row_hit(
                 table,
@@ -3316,21 +3548,28 @@ impl ResultTableWidget {
 
             // Keep drag selection stable even when FLTK temporarily fails to
             // resolve a row during fast reverse-direction drags.
-            // Falling back to the viewport anchor avoids jumping to the very
-            // last row, which incorrectly expands selection toward bottom.
-            hit_row.unwrap_or(start_row)
+            // Reusing the last confirmed drag endpoint avoids flipping the
+            // selection toward the current viewport anchor during auto-scroll.
+            hit_row.unwrap_or(fallback_row)
         };
+        let col_anchor_row = row.max(start_row).min(visible_bottom_row.max(start_row));
 
         // Clamp col
-        let col = if mouse_x < data_left {
-            0
-        } else if mouse_x >= data_right {
-            last_col
+        let col = if let Some(edge_col) = Self::resolve_drag_outside_index(
+            mouse_x,
+            data_left,
+            data_right,
+            visible_left_col,
+            visible_right_col,
+        ) {
+            edge_col
         } else {
             let mut hit_col = None;
-            let mut col = Self::skip_hidden_columns(table, row, start_col, data_left, cols);
+            let mut col = visible_left_col;
             while col < cols {
-                if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
+                if let Some((cx, _, cw, _)) =
+                    table.find_cell(TableContext::Cell, col_anchor_row, col)
+                {
                     if mouse_x >= cx && mouse_x < cx + cw {
                         hit_col = Some(col);
                         break;
@@ -3352,9 +3591,11 @@ impl ResultTableWidget {
             }
 
             if hit_col.is_none() {
-                col = Self::fallback_scan_start(start_col, MAX_HITTEST_COL_BACKTRACK);
-                while col < start_col {
-                    if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
+                col = Self::fallback_scan_start(visible_left_col, MAX_HITTEST_COL_BACKTRACK);
+                while col < visible_left_col {
+                    if let Some((cx, _, cw, _)) =
+                        table.find_cell(TableContext::Cell, col_anchor_row, col)
+                    {
                         if mouse_x >= cx && mouse_x < cx + cw {
                             hit_col = Some(col);
                             break;
@@ -3369,9 +3610,9 @@ impl ResultTableWidget {
 
             // Keep drag selection stable even when hit-testing momentarily
             // misses during right->left drags on wide tables.
-            // Using the visible anchor column avoids snapping to the last
-            // column, which can invert the intended selection area.
-            hit_col.unwrap_or(start_col)
+            // Reusing the last confirmed drag endpoint avoids snapping the
+            // selection back toward the current viewport anchor.
+            hit_col.unwrap_or(fallback_col)
         };
 
         Some((row, col))
@@ -7180,6 +7421,68 @@ mod row_edit_sql_tests {
             -1,
             0
         ));
+    }
+
+    #[test]
+    fn should_skip_drag_hit_test_requires_matching_mouse_and_viewport() {
+        assert!(ResultTableWidget::should_skip_drag_hit_test(
+            10, 20, 10, 20, 3, 4, 3, 4
+        ));
+        assert!(!ResultTableWidget::should_skip_drag_hit_test(
+            10, 20, 10, 20, 3, 4, 4, 4
+        ));
+        assert!(!ResultTableWidget::should_skip_drag_hit_test(
+            10, 20, 11, 20, 3, 4, 3, 4
+        ));
+    }
+
+    #[test]
+    fn resolve_drag_hittest_fallback_prefers_last_resolved_cell() {
+        assert_eq!(
+            ResultTableWidget::resolve_drag_hittest_fallback(12, 3, 20),
+            12
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_drag_hittest_fallback(99, 3, 20),
+            20
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_drag_hittest_fallback(-1, 3, 20),
+            3
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_drag_hittest_fallback(-1, -5, 20),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_drag_outside_index_uses_visible_edges() {
+        assert_eq!(
+            ResultTableWidget::resolve_drag_outside_index(5, 10, 40, 100, 140),
+            Some(100)
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_drag_outside_index(40, 10, 40, 100, 140),
+            Some(140)
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_drag_outside_index(25, 10, 40, 100, 140),
+            None
+        );
+    }
+
+    #[test]
+    fn visible_row_metrics_rounds_up_partial_last_row() {
+        assert_eq!(
+            ResultTableWidget::visible_row_metrics(10, 61, 20),
+            Some((3, 61))
+        );
+        assert_eq!(
+            ResultTableWidget::visible_row_metrics(10, 50, 20),
+            Some((2, 50))
+        );
+        assert_eq!(ResultTableWidget::visible_row_metrics(10, 10, 20), None);
     }
 
     #[test]
