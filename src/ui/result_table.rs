@@ -2825,37 +2825,32 @@ impl ResultTableWidget {
     }
 
     /// Returns `true` when the mouse position falls inside one of the FLTK
-    /// Table's embedded scrollbar child widgets.  Scrollbar children are
-    /// identified by having a width or height equal to the global scrollbar
-    /// size — the internal table-tile child that covers the cell area is
-    /// always much larger.
+    /// Table's embedded scrollbar widgets (vertical or horizontal).
     fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
-        let sb_size = app::scrollbar_size();
-        if sb_size <= 0 {
-            return false;
+        // Check vertical scrollbar.
+        let vsb = table.scrollbar();
+        if vsb.visible() {
+            let vx = vsb.x();
+            let vy = vsb.y();
+            if mouse_x >= vx
+                && mouse_x < vx + vsb.w()
+                && mouse_y >= vy
+                && mouse_y < vy + vsb.h()
+            {
+                return true;
+            }
         }
-        let n = table.children();
-        for i in 0..n {
-            if let Some(child) = table.child(i) {
-                if !child.visible() {
-                    continue;
-                }
-                let cw = child.w();
-                let ch = child.h();
-                // Scrollbars are narrow strips: vertical has w==sb_size,
-                // horizontal has h==sb_size.
-                if cw != sb_size && ch != sb_size {
-                    continue;
-                }
-                let cx = child.x();
-                let cy = child.y();
-                if mouse_x >= cx
-                    && mouse_x < cx + cw
-                    && mouse_y >= cy
-                    && mouse_y < cy + ch
-                {
-                    return true;
-                }
+        // Check horizontal scrollbar.
+        let hsb = table.hscrollbar();
+        if hsb.visible() {
+            let hx = hsb.x();
+            let hy = hsb.y();
+            if mouse_x >= hx
+                && mouse_x < hx + hsb.w()
+                && mouse_y >= hy
+                && mouse_y < hy + hsb.h()
+            {
+                return true;
             }
         }
         false
