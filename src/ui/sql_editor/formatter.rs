@@ -4258,10 +4258,6 @@ impl SqlEditorWidget {
         is_standalone_open_paren_owner: bool,
         paren_layout_frames: &mut Vec<ParenLayoutFrame>,
     ) {
-        // Track consecutive General `(` tokens with no intervening
-        // non-comment tokens (e.g. `(((`) so each gets progressive depth.
-        // Reset when a non-paren token appears (e.g. `func (func2 (`).
-        let mut consecutive_general_opens: usize = 0;
         for token_idx in start_idx..tokens.len() {
             match &tokens[token_idx] {
                 SqlToken::Comment(_) => {}
@@ -4273,12 +4269,20 @@ impl SqlEditorWidget {
                         is_multiline_clause_owner,
                         is_condition_query_owner,
                     );
-                    // For truly consecutive General parens like (((,
-                    // each additional ( adds one more depth level.
-                    let base_depth = if kind == ParenLayoutFrameKind::General
-                        && consecutive_general_opens > 0
-                    {
-                        line_depth.saturating_add(consecutive_general_opens)
+                    // Each General `(` derives its depth from the deeper of:
+                    //  - the previous General frame's continuation (for
+                    //    consecutive parens like `(((` on the same line), or
+                    //  - the current line's depth (for parens opened on a
+                    //    deeper line, e.g. `AND (` where AND is already +1'd).
+                    // This lets the frame stack naturally produce progressive
+                    // depth without explicit counting.
+                    let base_depth = if kind == ParenLayoutFrameKind::General {
+                        paren_layout_frames
+                            .iter()
+                            .rev()
+                            .find(|f| f.kind == ParenLayoutFrameKind::General)
+                            .map(|f| f.continuation_depth.max(line_depth))
+                            .unwrap_or(line_depth)
                     } else {
                         line_depth
                     };
@@ -4301,11 +4305,6 @@ impl SqlEditorWidget {
                     } else {
                         line_depth
                     };
-                    if kind == ParenLayoutFrameKind::General {
-                        consecutive_general_opens += 1;
-                    } else {
-                        consecutive_general_opens = 0;
-                    }
                     paren_layout_frames.push(ParenLayoutFrame {
                         kind,
                         owner_depth,
@@ -4316,11 +4315,8 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
                     let _ = paren_layout_frames.pop();
-                    consecutive_general_opens = 0;
                 }
-                _ => {
-                    consecutive_general_opens = 0;
-                }
+                _ => {}
             }
         }
     }
@@ -12579,11 +12575,11 @@ ORDER BY e.emp_id;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
         let expected = r#"SELECT 'DEPT=' || d.dept_name || ' | EMP=' || e.emp_name || ' | SALES=' || TO_CHAR (NVL (
-    (
-        SELECT SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt)
-        FROM qt_fmt_sales s
-        WHERE s.emp_id = e.emp_id
-    ), 0
+        (
+            SELECT SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt)
+            FROM qt_fmt_sales s
+            WHERE s.emp_id = e.emp_id
+        ), 0
     )) || ' | JSON_LEVEL=' || JSON_VALUE (e.json_profile, '$.level' RETURNING VARCHAR2 (30)) || ' | HIER=' || (
         SELECT MAX (SYS_CONNECT_BY_PATH (x.dept_code, '/'))
         FROM qt_fmt_dept x
