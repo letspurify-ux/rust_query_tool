@@ -5167,6 +5167,16 @@ impl SqlEditorWidget {
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
+            let effective_depth = if starts_query_head && previous_line_ends_with_open_paren {
+                // Query heads opened on the next line should inherit any still-open
+                // general paren continuation depth from the owner line, not just the
+                // analyzer's single pending query-base level.
+                active_general_paren_frame
+                    .map(|frame| effective_depth.max(frame.continuation_depth))
+                    .unwrap_or(effective_depth)
+            } else {
+                effective_depth
+            };
             let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
                 effective_depth.max(1)
             } else {
@@ -5233,6 +5243,7 @@ impl SqlEditorWidget {
             let defers_to_condition_close_alignment =
                 condition_close_alignment_active && popped_query_paren_frame.is_none();
             let effective_depth = if leading_close_continues_expression
+                && popped_query_paren_frame.is_none()
                 && !defers_to_condition_close_alignment
                 && !is_paren_case_closer
                 && close_continuation_frame.is_some()
@@ -12592,6 +12603,48 @@ ORDER BY e.emp_id;"#;
             SqlEditorWidget::format_for_auto_formatting(expected, false),
             expected,
             "Auto formatting should stay stable after general parenthesis frame normalization"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth() {
+        let source = r#"SELECT d.dept_id,
+    d.dept_name,
+    JSON_ARRAYAGG (JSON_OBJECT ('empId' VALUE e.emp_id, 'name' VALUE e.emp_name, 'job' VALUE e.job_title, 'salary' VALUE e.salary, 'sales' VALUE (
+        SELECT NVL (SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
+        FROM qt_fmt_sales s
+        WHERE s.emp_id = e.emp_id
+            ), 'meta' VALUE JSON_OBJECT ('grade' VALUE e.grade_no, 'status' VALUE e.status, 'hireDate' VALUE TO_CHAR (e.hire_date, 'YYYY-MM-DD')) RETURNING CLOB) ORDER BY e.salary DESC, e.emp_id RETURNING CLOB) AS dept_emp_json
+FROM qt_fmt_dept d
+LEFT JOIN qt_fmt_emp e
+    ON e.dept_id = d.dept_id
+GROUP BY d.dept_id,
+    d.dept_name
+ORDER BY d.dept_id;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = r#"SELECT d.dept_id,
+    d.dept_name,
+    JSON_ARRAYAGG (JSON_OBJECT ('empId' VALUE e.emp_id, 'name' VALUE e.emp_name, 'job' VALUE e.job_title, 'salary' VALUE e.salary, 'sales' VALUE (
+            SELECT NVL (SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
+            FROM qt_fmt_sales s
+            WHERE s.emp_id = e.emp_id
+        ), 'meta' VALUE JSON_OBJECT ('grade' VALUE e.grade_no, 'status' VALUE e.status, 'hireDate' VALUE TO_CHAR (e.hire_date, 'YYYY-MM-DD')) RETURNING CLOB) ORDER BY e.salary DESC, e.emp_id RETURNING CLOB) AS dept_emp_json
+FROM qt_fmt_dept d
+LEFT JOIN qt_fmt_emp e
+    ON e.dept_id = d.dept_id
+GROUP BY d.dept_id,
+    d.dept_name
+ORDER BY d.dept_id;"#;
+
+        assert_eq!(
+            formatted, expected,
+            "Scalar subquery under JSON_OBJECT VALUE should inherit the active parenthesis frame depth"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(expected, false),
+            expected,
+            "JSON_OBJECT VALUE scalar subquery formatting should remain stable"
         );
     }
 
