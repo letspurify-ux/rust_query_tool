@@ -4366,6 +4366,7 @@ impl SqlEditorWidget {
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
+        let mut prev_general_paren_frame_count: usize = 0;
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -4662,6 +4663,10 @@ impl SqlEditorWidget {
                 .rev()
                 .find(|frame| frame.kind == ParenLayoutFrameKind::General)
                 .copied();
+            let current_general_paren_frame_count = paren_layout_frames
+                .iter()
+                .filter(|frame| frame.kind == ParenLayoutFrameKind::General)
+                .count();
             let paren_case_close_frame_depth = last_popped_general_paren_frame.map(|frame| {
                 let preferred_close_depth = if in_dml_statement
                     || layouts[idx].query_base_depth.is_some()
@@ -4948,20 +4953,19 @@ impl SqlEditorWidget {
                             .unwrap_or(condition_indent.max(parser_depth))
                     }
                 } else if previous_line_is_condition_keyword {
-                    if previous_line_has_unclosed_open_paren {
+                    let paren_context_stable = current_general_paren_frame_count
+                        == prev_general_paren_frame_count;
+                    if paren_context_stable {
                         last_code_indent
-                            .map(|indent| {
-                                indent
-                                    .saturating_add(1)
-                                    .max(condition_indent)
-                                    .max(parser_depth)
-                            })
-                            .unwrap_or(condition_indent.max(parser_depth).saturating_add(1))
+                            .map(|indent| indent.max(condition_indent))
+                            .unwrap_or(condition_indent)
+                    } else if let Some(frame) = active_general_paren_frame {
+                        frame.continuation_depth.max(condition_indent)
                     } else {
-                        last_code_indent
-                            .map(|indent| indent.max(condition_indent).max(parser_depth))
-                            .unwrap_or(condition_indent.max(parser_depth))
+                        condition_indent
                     }
+                } else if let Some(frame) = active_general_paren_frame {
+                    frame.continuation_depth.max(condition_indent)
                 } else {
                     condition_indent.max(parser_depth)
                 }
@@ -5460,6 +5464,7 @@ impl SqlEditorWidget {
                     resolved_query_base_depths.pop();
                 }
             }
+            prev_general_paren_frame_count = current_general_paren_frame_count;
             last_code_idx = Some(idx);
         }
     }
@@ -13427,5 +13432,159 @@ FROM t1;"#;
         assert!(!SqlEditorWidget::line_has_trailing_unclosed_case(
             "WHERE col1 = 1"
         ));
+    }
+
+    #[test]
+    fn nested_paren_and_or_drops_depth_after_close_paren() {
+        let input = r#"SELECT *
+FROM emp
+WHERE (
+    (
+        col1 = 1
+        AND col2 = 2
+    )
+    OR (
+        col3 = 3
+        AND col4 = 4
+    )
+)
+AND (
+    (
+        col5 = 5
+        OR col6 = 6
+    )
+    AND col7 = 7
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_outer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND ((col5"))
+            .expect("should contain outer AND ((col5");
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE"))
+            .expect("should contain WHERE");
+        let condition_base = indent(lines[where_idx]) + 4;
+
+        assert_eq!(
+            indent(lines[and_outer]),
+            condition_base,
+            "top-level AND after closed paren group should return to condition base depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for deeply nested parenthesized conditions"
+        );
+    }
+
+    #[test]
+    fn mixed_nested_paren_and_or_keeps_correct_depths() {
+        let input = r#"SELECT *
+FROM emp
+WHERE status = 'A'
+AND (
+    dept_id = 10
+    OR (
+        dept_id = 20
+        AND role = 'MGR'
+    )
+    OR dept_id = 30
+)
+AND active = 1;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_open = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND (dept_id = 10"))
+            .expect("should contain AND (dept_id = 10");
+        let or_inner = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OR (dept_id = 20"))
+            .expect("should contain OR (dept_id = 20");
+        let or_flat = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OR dept_id = 30"))
+            .expect("should contain OR dept_id = 30");
+        let and_final = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND active"))
+            .expect("should contain AND active");
+
+        assert_eq!(
+            indent(lines[or_inner]),
+            indent(lines[or_flat]),
+            "OR inside same paren group should align, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[or_inner]) > indent(lines[and_open]),
+            "OR inside AND's paren should be deeper than AND, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_final]),
+            indent(lines[and_open]),
+            "AND after closed paren should return to same depth as opening AND, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for mixed nested conditions"
+        );
+    }
+
+    #[test]
+    fn triple_nested_paren_conditions_keep_progressive_depth() {
+        let input = r#"SELECT *
+FROM emp
+WHERE (
+    a = 1
+    AND (
+        b = 2
+        OR (
+            c = 3
+            AND d = 4
+        )
+    )
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_inner = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND (b"))
+            .or_else(|| {
+                lines
+                    .iter()
+                    .position(|line| line.trim_start().starts_with("AND ("))
+            })
+            .expect("should contain AND (b or AND (");
+        let or_deepest = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OR (c") || line.trim_start().starts_with("OR ("))
+            .expect("should contain OR (c or OR (");
+
+        assert!(
+            indent(lines[or_deepest]) > indent(lines[and_inner]),
+            "deeper nested OR should have greater indent than AND, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for triple nested conditions"
+        );
     }
 }
