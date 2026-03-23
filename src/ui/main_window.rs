@@ -1358,6 +1358,32 @@ impl MainWindow {
                     }
                     false
                 }
+                fltk::enums::Event::Resize => {
+                    // Apply the saved split ratio immediately inside the Tile's
+                    // own resize handling so the layout is already correct before
+                    // the next draw.  This avoids the visible flicker that occurs
+                    // when the adjustment is deferred to the window-level handler.
+                    let ratio = *query_split_ratio_for_tile
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(r) = ratio {
+                        MainWindow::apply_query_split_ratio(
+                            tile,
+                            &mut query_top_group_for_tile,
+                            &mut query_split_bar_for_tile,
+                            r,
+                        );
+                    } else {
+                        MainWindow::adjust_query_layout_with(
+                            tile,
+                            &mut query_top_group_for_tile,
+                            &mut query_split_bar_for_tile,
+                        );
+                    }
+                    // Return false so the default Tile resize still runs for
+                    // any children we don't manage here.
+                    false
+                }
                 _ => false,
             }
         });
@@ -2114,30 +2140,6 @@ impl MainWindow {
         }
         query_split_bar.resize(tile_x, tile_y + query_height, right_width, split_bar_height);
         right_tile.redraw();
-    }
-
-    fn adjust_query_layout_on_resize(state: &AppState) {
-        let mut right_tile = state.right_tile.clone();
-        let mut query_top_group = state.query_top_group.clone();
-        let mut query_split_bar = state.query_split_bar.clone();
-        let ratio = *state
-            .query_split_ratio
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(r) = ratio {
-            Self::apply_query_split_ratio(
-                &mut right_tile,
-                &mut query_top_group,
-                &mut query_split_bar,
-                r,
-            );
-        } else {
-            Self::adjust_query_layout_with(
-                &mut right_tile,
-                &mut query_top_group,
-                &mut query_split_bar,
-            );
-        }
     }
 
     fn create_query_editor_tab(state: &mut AppState) -> Option<QueryTabId> {
@@ -3802,12 +3804,6 @@ impl MainWindow {
                     };
                     sql_editor
                         .hide_intellisense_if_outside(app::event_x_root(), app::event_y_root());
-                    false
-                }
-                fltk::enums::Event::Resize => {
-                    if let Ok(s) = state_for_window.try_lock() {
-                        MainWindow::adjust_query_layout_on_resize(&s);
-                    }
                     false
                 }
                 _ => false,
