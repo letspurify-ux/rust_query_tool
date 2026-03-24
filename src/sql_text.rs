@@ -1051,6 +1051,32 @@ pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
     trimmed.starts_with("--") || is_sqlplus_remark_comment_line(trimmed)
 }
 
+/// Counts leading indentation columns, expanding tabs to tab stops.
+pub(crate) fn leading_indent_columns(line: &str, tab_width: usize) -> usize {
+    if tab_width == 0 {
+        return 0;
+    }
+
+    let mut columns = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => columns = columns.saturating_add(1),
+            '\t' => {
+                let remainder = columns % tab_width;
+                let advance = if remainder == 0 {
+                    tab_width
+                } else {
+                    tab_width.saturating_sub(remainder)
+                };
+                columns = columns.saturating_add(advance);
+            }
+            _ if ch.is_whitespace() => columns = columns.saturating_add(1),
+            _ => break,
+        }
+    }
+    columns
+}
+
 /// Updates `in_block_comment` state for a single trimmed line.
 ///
 /// This properly handles lines that contain both `*/` (closing) and `/*` (opening)
@@ -1645,5 +1671,14 @@ mod tests {
                 "missing statement head keyword: {keyword}"
             );
         }
+    }
+
+    #[test]
+    fn leading_indent_columns_expands_tabs_with_tab_stops() {
+        assert_eq!(leading_indent_columns("\tSELECT", 4), 4);
+        assert_eq!(leading_indent_columns(" \tSELECT", 4), 4);
+        assert_eq!(leading_indent_columns("  \tSELECT", 4), 4);
+        assert_eq!(leading_indent_columns("   \tSELECT", 4), 4);
+        assert_eq!(leading_indent_columns("\t\tSELECT", 4), 8);
     }
 }

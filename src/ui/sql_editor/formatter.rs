@@ -3974,6 +3974,7 @@ impl SqlEditorWidget {
                 }
             };
 
+            let existing_indent_spaces = crate::sql_text::leading_indent_columns(raw, 4);
             layouts.push(LineLayout {
                 raw,
                 trimmed,
@@ -3996,8 +3997,8 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
-                existing_indent_spaces: raw.len().saturating_sub(trimmed.len()),
+                existing_indent: existing_indent_spaces / 4,
+                existing_indent_spaces,
                 final_depth: 0,
                 anchor_group: None,
                 dml_case_expression_close_depth: None,
@@ -11795,6 +11796,7 @@ END;";
 
 #[cfg(test)]
 mod format_indent_gap_tests {
+    use crate::db::QueryExecutor;
     use crate::ui::sql_editor::SqlEditorWidget;
 
     // ── CURSOR IS/AS SELECT body indent ──
@@ -14664,6 +14666,33 @@ join b on a.id = b.id and a.x = b.x
             assert!(indent(lines[where_and_idx]) <= indent(lines[where_idx]) + 4,
                 "AND after WHERE should be at WHERE continuation depth, not JOIN ON depth:\n{}", formatted);
         }
+    }
+
+    #[test]
+    fn build_line_layouts_expands_tab_indent_columns_before_depth_conversion() {
+        let source = "SELECT *\n\t  AND 1 = 1;";
+        let contexts = QueryExecutor::auto_format_line_contexts(source);
+        let multiline_string_continuation_lines =
+            SqlEditorWidget::multiline_string_continuation_lines(source, source.lines().count());
+        let layouts = SqlEditorWidget::build_line_layouts(
+            source,
+            &contexts,
+            &multiline_string_continuation_lines,
+        );
+        let and_idx = layouts
+            .iter()
+            .position(|layout| layout.trimmed.starts_with("AND "))
+            .unwrap_or(0);
+        assert_eq!(
+            layouts[and_idx].existing_indent_spaces,
+            6,
+            "tab+space prefix should expand to six columns in layout metadata"
+        );
+        assert_eq!(
+            layouts[and_idx].existing_indent,
+            1,
+            "six-column prefix should map to one logical indent depth"
+        );
     }
 
 }

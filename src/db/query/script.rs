@@ -1263,7 +1263,7 @@ impl QueryExecutor {
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
             let trimmed = line.trim_start();
-            let existing_indent = line.len().saturating_sub(trimmed.len()) / 4;
+            let existing_indent = sql_text::leading_indent_columns(line, 4) / 4;
             let mut context = AutoFormatLineContext {
                 parser_depth,
                 auto_depth: parser_depth,
