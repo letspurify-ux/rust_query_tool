@@ -4948,23 +4948,14 @@ impl SqlEditorWidget {
                         .map(|indent| indent.max(condition_indent))
                         .unwrap_or(condition_indent)
                 } else if previous_line_is_join_condition_clause {
-                    let current_query_base_depth = resolved_query_base_depth
-                        .or(layouts[idx].query_base_depth)
-                        .unwrap_or(0);
-                    if current_query_base_depth >= 2 {
-                        last_code_indent
-                            .map(|indent| {
-                                indent
-                                    .saturating_add(1)
-                                    .max(condition_indent.saturating_add(1))
-                                    .max(parser_depth)
-                            })
-                            .unwrap_or(condition_indent.saturating_add(1).max(parser_depth))
-                    } else {
-                        last_code_indent
-                            .map(|indent| indent.max(condition_indent).max(parser_depth))
-                            .unwrap_or(condition_indent.max(parser_depth))
-                    }
+                    last_code_indent
+                        .map(|indent| {
+                            indent
+                                .saturating_add(1)
+                                .max(condition_indent.saturating_add(1))
+                                .max(parser_depth)
+                        })
+                        .unwrap_or(condition_indent.saturating_add(1).max(parser_depth))
                 } else if previous_line_is_condition_keyword {
                     let paren_context_stable =
                         current_general_paren_frame_count == prev_general_paren_frame_count;
@@ -11408,8 +11399,8 @@ END;";
             "select * from t1 join t2 on t1.id = t2.id\n-- extra condition\nand t1.status = 'A';";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("    -- extra condition\n    AND t1.status"),
-            "Comment before AND in ON clause should match AND indent, got:\n{}",
+            formatted.contains("        -- extra condition\n        AND t1.status"),
+            "Comment before AND in ON clause should be indented deeper than ON, got:\n{}",
             formatted
         );
     }
@@ -14267,4 +14258,187 @@ WHERE (((status = 'A' OR status = 'B')
             formatted
         );
     }
+
+    // ---- JOIN ON indentation: AND/OR after ON should be one level deeper ----
+
+    #[test]
+    fn join_on_and_indented_deeper_than_on() {
+        let input = "select * from a join b on 1 = 1 and 2 = 2;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]) + 4,
+            "AND after ON should be indented one level deeper than ON, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn join_on_multiple_and_or_indented_deeper_than_on() {
+        let input = "select * from a join b on a.id = b.id and a.x = b.x or a.y = b.y;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+        let or_idx = lines.iter().position(|l| l.trim_start().starts_with("OR ")).expect("OR line");
+
+        let on_indent = indent(lines[on_idx]);
+        assert_eq!(
+            indent(lines[and_idx]),
+            on_indent + 4,
+            "AND after ON should be one level deeper, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[or_idx]),
+            indent(lines[and_idx]),
+            "OR should be at same depth as AND, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn join_on_and_deeper_with_multiple_joins() {
+        let input = r#"select *
+from a
+join b on a.id = b.id and a.x = b.x
+join c on b.id = c.id and b.y = c.y;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("ON "))
+            .map(|(i, _)| i)
+            .collect();
+        let and_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("AND "))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(on_lines.len(), 2, "should have two ON lines, got:\n{}", formatted);
+        assert_eq!(and_lines.len(), 2, "should have two AND lines, got:\n{}", formatted);
+
+        for (on_idx, and_idx) in on_lines.iter().zip(and_lines.iter()) {
+            assert_eq!(
+                indent(lines[*and_idx]),
+                indent(lines[*on_idx]) + 4,
+                "AND after ON should be one level deeper for each join, got:\n{}",
+                formatted
+            );
+        }
+    }
+
+    #[test]
+    fn join_on_and_deeper_in_subquery() {
+        let input = r#"select * from (
+select * from a
+join b on a.id = b.id and a.x = b.x
+) sub;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]) + 4,
+            "AND after ON should be one level deeper even in subquery, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn join_on_and_deeper_is_idempotent() {
+        let input = "select * from a join b on 1 = 1 and 2 = 2;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be idempotent for JOIN ON with AND"
+        );
+    }
+
+    #[test]
+    fn left_join_on_and_deeper_than_on() {
+        let input = "select * from a left join b on a.id = b.id and a.x = b.x;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]) + 4,
+            "AND after ON in LEFT JOIN should be one level deeper, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn full_outer_join_on_and_deeper_than_on() {
+        let input = "select * from a full outer join b on a.id = b.id and a.x = b.x;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]) + 4,
+            "AND after ON in FULL OUTER JOIN should be one level deeper, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn join_on_with_where_and_both_correctly_indented() {
+        let input = "select * from a join b on a.id = b.id and a.x = b.x where a.y = 1 and a.z = 2;";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
+        let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).expect("WHERE line");
+        let and_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("AND "))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(and_lines.len(), 2, "should have two AND lines, got:\n{}", formatted);
+
+        // First AND after ON
+        assert_eq!(
+            indent(lines[and_lines[0]]),
+            indent(lines[on_idx]) + 4,
+            "AND after ON should be deeper than ON, got:\n{}",
+            formatted
+        );
+        // Second AND after WHERE - indented as continuation
+        assert!(
+            indent(lines[and_lines[1]]) >= indent(lines[where_idx]),
+            "AND after WHERE should be at or deeper than WHERE depth, got:\n{}",
+            formatted
+        );
+    }
+
 }
