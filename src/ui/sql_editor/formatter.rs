@@ -1206,32 +1206,31 @@ impl SqlEditorWidget {
     }
 
     fn has_order_by_sequence(text: &str) -> bool {
-        let words: Vec<String> = Self::tokenize_sql(text)
-            .into_iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word),
-                _ => None,
-            })
-            .collect();
+        let mut prev1: Option<String> = None;
+        let mut prev2: Option<String> = None;
 
-        if words.len() < 2 {
-            return false;
-        }
+        for token in Self::tokenize_sql(text) {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
 
-        for idx in 0..(words.len() - 1) {
-            if words[idx].eq_ignore_ascii_case("ORDER")
-                && words[idx + 1].eq_ignore_ascii_case("BY")
-            {
-                return true;
+            if let Some(order) = prev1.as_deref() {
+                if order.eq_ignore_ascii_case("ORDER") && word.eq_ignore_ascii_case("BY") {
+                    return true;
+                }
             }
 
-            if idx + 2 < words.len()
-                && words[idx].eq_ignore_ascii_case("ORDER")
-                && words[idx + 1].eq_ignore_ascii_case("SIBLINGS")
-                && words[idx + 2].eq_ignore_ascii_case("BY")
-            {
-                return true;
+            if let (Some(order), Some(siblings)) = (prev2.as_deref(), prev1.as_deref()) {
+                if order.eq_ignore_ascii_case("ORDER")
+                    && siblings.eq_ignore_ascii_case("SIBLINGS")
+                    && word.eq_ignore_ascii_case("BY")
+                {
+                    return true;
+                }
             }
+
+            prev2 = prev1.take();
+            prev1 = Some(word);
         }
 
         false
