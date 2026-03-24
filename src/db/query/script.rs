@@ -7618,6 +7618,71 @@ ORDER BY pvt.deptno;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_from_before_unpivot_on_select_base_depth() {
+        let sql = r#"WITH src AS (
+    SELECT deptno,
+        job,
+        sal
+    FROM emp
+),
+pivoted AS (
+    SELECT *
+    FROM src PIVOT (
+        SUM (sal) AS sum_sal FOR
+        deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
+    )
+)
+SELECT job,
+    dept_tag,
+    sal_amt
+FROM pivoted UNPIVOT (
+    sal_amt
+    FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
+)
+WHERE sal_amt IS NOT NULL
+ORDER BY job,
+    dept_tag;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT job,")
+            .unwrap_or(0);
+        let item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "sal_amt")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM pivoted UNPIVOT"))
+            .unwrap_or(0);
+        let unpivot_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "sal_amt")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[item_idx].auto_depth,
+            contexts[select_idx].auto_depth.saturating_add(1),
+            "select-list item should be one level deeper than the SELECT base"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth, contexts[select_idx].auto_depth,
+            "FROM before UNPIVOT should return to the SELECT base depth instead of staying on the select-list continuation depth"
+        );
+        assert_eq!(
+            contexts[unpivot_value_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "UNPIVOT body should be exactly one level deeper than its FROM owner line"
+        );
+    }
+
+    #[test]
     fn line_block_depths_dedents_all_leading_closing_parens_on_line() {
         let sql = "SELECT *\nFROM (\nSELECT *\nFROM (\nSELECT 1 FROM dual\n))\nWHERE 1 = 1;";
 

@@ -9,8 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const MAIN_THREAD_HIGHLIGHT_MAX_BYTES: usize = usize::MAX;
-const MAIN_THREAD_HIGHLIGHT_MAX_LINES: usize = usize::MAX;
+const MAIN_THREAD_HIGHLIGHT_MAX_BYTES: Option<usize> = None;
+const MAIN_THREAD_HIGHLIGHT_MAX_LINES: Option<usize> = None;
 
 fn load_test_file(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -117,10 +117,11 @@ fn apply_incremental_highlight_for_test(
         {
             break;
         }
-        if current_end >= text_len
-            || bytes_processed >= MAIN_THREAD_HIGHLIGHT_MAX_BYTES
-            || lines_processed >= MAIN_THREAD_HIGHLIGHT_MAX_LINES
-        {
+        let reached_byte_limit =
+            MAIN_THREAD_HIGHLIGHT_MAX_BYTES.is_some_and(|limit| bytes_processed >= limit);
+        let reached_line_limit =
+            MAIN_THREAD_HIGHLIGHT_MAX_LINES.is_some_and(|limit| lines_processed >= limit);
+        if current_end >= text_len || reached_byte_limit || reached_line_limit {
             break;
         }
 
@@ -1010,7 +1011,7 @@ fn format_sql_preserves_test_045_execution_unit_inside_oracle_splitter_final_bos
 #[test]
 fn format_sql_keeps_with_attached_to_single_letter_cte_name() {
     let input = "WITH\n    r\n    AS\n    (\n        SELECT 1 AS id\n        FROM dual\n    )\nSELECT *\nFROM r\n;";
-    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
         formatted.contains("WITH r AS (") || formatted.contains("WITH\n    r\n    AS ("),

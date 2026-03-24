@@ -2042,31 +2042,12 @@ impl SqlEditorWidget {
             open_cursor_state.base_indent(indent_level)
         };
 
-        let clause_indent = |indent_level: usize,
-                             open_cursor_state: OpenCursorFormatState,
-                             keyword: &str,
-                             open_for_select_active: bool,
-                             in_cursor_sql: bool| {
-            let mut base = base_indent(indent_level, open_cursor_state);
-            if open_for_select_active
-                && matches!(
-                    keyword,
-                    "FROM"
-                        | "WHERE"
-                        | "GROUP"
-                        | "ORDER"
-                        | "CONNECT"
-                        | "HAVING"
-                        | "UNION"
-                        | "INTERSECT"
-                        | "MINUS"
-                )
-                && !in_cursor_sql
-            {
-                base = base.saturating_add(1);
-            }
-            base
-        };
+        let clause_indent =
+            |indent_level: usize,
+             open_cursor_state: OpenCursorFormatState,
+             _keyword: &str,
+             _open_for_select_active: bool,
+             _in_cursor_sql: bool| base_indent(indent_level, open_cursor_state);
 
         let list_item_indent =
             |indent_level: usize,
@@ -2546,8 +2527,17 @@ impl SqlEditorWidget {
                             if upper != "SELECT" {
                                 select_list_layout_state.clear();
                             }
-                            if upper == "SELECT" && open_cursor_state.in_select() {
-                                // Keep OPEN ... FOR SELECT inside the cursor SQL context.
+                            if upper == "SELECT"
+                                && open_cursor_state.in_select()
+                                && !matches!(
+                                    with_cte_state,
+                                    WithCteFormatState::InDefinitions { .. }
+                                )
+                            {
+                                // OPEN ... FOR WITH ... SELECT should anchor to the main query
+                                // head after CTE definitions, not to inner SELECTs inside the
+                                // WITH body. Otherwise a later `FOR` in PIVOT/UNPIVOT or
+                                // similar syntax can be misread as a new OPEN ... FOR.
                                 open_cursor_state.set_select_depth(paren_stack.len());
                             }
                             if upper == "WITH" {
@@ -4390,6 +4380,23 @@ impl SqlEditorWidget {
         }
     }
 
+    fn clause_starter_uses_general_paren_continuation(
+        trimmed_upper: &str,
+        starts_query_head: bool,
+        active_general_paren_frame: Option<ParenLayoutFrame>,
+    ) -> bool {
+        if starts_query_head || active_general_paren_frame.is_none() {
+            return false;
+        }
+
+        let starts_clause_keyword = Self::is_dml_clause_starter(trimmed_upper)
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTO");
+        if !starts_clause_keyword {
+            return false;
+        }
+        true
+    }
+
     fn resolve_code_line_layouts(
         layouts: &mut [LineLayout<'_>],
         previous_code_indices: &[Option<usize>],
@@ -5273,6 +5280,12 @@ impl SqlEditorWidget {
                     && previous_line_starts_with_close_paren);
             let defers_to_condition_close_alignment =
                 condition_close_alignment_active && popped_query_paren_frame.is_none();
+            let clause_starter_uses_general_paren_continuation =
+                Self::clause_starter_uses_general_paren_continuation(
+                    &trimmed_upper,
+                    starts_query_head,
+                    active_general_paren_frame,
+                );
             let effective_depth = if leading_close_continues_expression
                 && popped_query_paren_frame.is_none()
                 && !defers_to_condition_close_alignment
@@ -5294,9 +5307,15 @@ impl SqlEditorWidget {
                         .unwrap_or(effective_depth)
                 }
             } else if !starts_with_close_paren
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                && (clause_starter_uses_general_paren_continuation
+                    || (!Self::is_dml_clause_starter(&trimmed_upper)
+                        && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")))
             {
+                // Clause-shaped keywords can appear in expression-level parens
+                // too (for example `OVER (... ORDER BY ...)` or
+                // `OVERLAY (... FROM ... FOR ...)`). When that happens, keep
+                // the general-paren continuation depth instead of snapping back
+                // to the surrounding query clause depth.
                 active_general_paren_frame
                     .map(|frame| effective_depth.max(frame.continuation_depth))
                     .unwrap_or(effective_depth)
@@ -5347,24 +5366,20 @@ impl SqlEditorWidget {
                 let is_join_condition_line =
                     crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ON")
                         || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING");
-                let is_join_clause_line =
-                    QueryExecutor::auto_format_is_join_clause(&trimmed_upper);
+                let is_join_clause_line = QueryExecutor::auto_format_is_join_clause(&trimmed_upper);
                 let is_dml_clause = Self::is_dml_clause_starter(&trimmed_upper)
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
                 if is_join_condition_line
                     && layouts[idx].query_role == AutoFormatQueryRole::Continuation
                 {
-                    join_on_condition_and_depth =
-                        Some((effective_depth.saturating_add(1), depth));
-                } else if current_line_is_condition_keyword
-                    && join_on_condition_and_depth.is_some()
+                    join_on_condition_and_depth = Some((effective_depth.saturating_add(1), depth));
+                } else if current_line_is_condition_keyword && join_on_condition_and_depth.is_some()
                 {
                     // AND/OR continues the join condition block; keep the
                     // tracked depth (don't clear).
                 } else if (is_join_clause_line || is_dml_clause || starts_query_head)
-                    && join_on_condition_and_depth
-                        .is_some_and(|(_, on_depth)| depth <= on_depth)
+                    && join_on_condition_and_depth.is_some_and(|(_, on_depth)| depth <= on_depth)
                 {
                     // Only clear when the new clause is at the same or
                     // lower parser depth — subquery heads inside the ON
@@ -5725,16 +5740,20 @@ impl SqlEditorWidget {
             .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
         let previous_code = previous_code_idx.and_then(|prev_idx| layouts.get(prev_idx));
 
-        let preserves_condition_hanging_indent = Self::starts_with_condition_keyword(&trimmed_upper)
-            && layout.existing_indent_spaces.saturating_add(2) == depth_indent
-            && previous_code.is_some_and(|previous| {
-                let previous_upper = previous.trimmed.to_ascii_uppercase();
-                layout.query_base_depth == previous.query_base_depth
-                    && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
-                        || crate::sql_text::starts_with_keyword_token(&previous_upper, "HAVING")
-                        || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
-                        || Self::starts_with_condition_keyword(&previous_upper))
-            });
+        let preserves_condition_hanging_indent =
+            Self::starts_with_condition_keyword(&trimmed_upper)
+                && layout.existing_indent_spaces.saturating_add(2) == depth_indent
+                && previous_code.is_some_and(|previous| {
+                    let previous_upper = previous.trimmed.to_ascii_uppercase();
+                    layout.query_base_depth == previous.query_base_depth
+                        && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
+                            || crate::sql_text::starts_with_keyword_token(
+                                &previous_upper,
+                                "HAVING",
+                            )
+                            || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
+                            || Self::starts_with_condition_keyword(&previous_upper))
+                });
         if preserves_condition_hanging_indent {
             return true;
         }
@@ -5742,9 +5761,24 @@ impl SqlEditorWidget {
         layout.existing_indent_spaces == depth_indent.saturating_add(3)
             && !Self::is_dml_clause_starter(&trimmed_upper)
             && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-            && previous_code.is_some_and(|previous| {
-                layout.query_base_depth == previous.query_base_depth
-                    && Self::line_ends_with_comma_before_inline_comment(previous.trimmed)
+            && previous_code_idx.is_some_and(|prev_idx| {
+                let Some(previous) = layouts.get(prev_idx) else {
+                    return false;
+                };
+                if layout.query_base_depth != previous.query_base_depth
+                    || !Self::line_ends_with_comma_before_inline_comment(previous.trimmed)
+                {
+                    return false;
+                }
+
+                // Preserve a +3 hanging indent only when that visual alignment
+                // is already established by the anchor line:
+                //  - the previous line is an inline clause/header owner
+                //    (`SELECT first_col,` -> `   second_col,`), or
+                //  - the previous sibling also preserves that same odd hanging indent.
+                previous.final_depth.saturating_add(1) == layout.final_depth
+                    || (previous.existing_indent_spaces == depth_indent.saturating_add(3)
+                        && Self::line_preserves_existing_odd_hanging_indent(layouts, prev_idx))
             })
     }
 
@@ -5805,6 +5839,21 @@ impl SqlEditorWidget {
 
         let previous = &layouts[prev_idx];
         let next = &layouts[next_idx];
+        let next_non_blank_idx = ((idx + 1)..layouts.len())
+            .find(|candidate| layouts[*candidate].kind != LineLayoutKind::Blank);
+        if next_non_blank_idx.is_some_and(|candidate| {
+            matches!(
+                layouts[candidate].kind,
+                LineLayoutKind::CommentOnly | LineLayoutKind::CommaOnly
+            )
+        }) && Self::line_ends_with_comma_before_inline_comment(previous.trimmed)
+            && previous.query_base_depth.is_some()
+            && previous.query_base_depth == next.query_base_depth
+            && previous.final_depth <= next.final_depth
+        {
+            return true;
+        }
+
         let next_upper = next.trimmed.to_ascii_uppercase();
         if !crate::sql_text::starts_with_keyword_token(&next_upper, "CASE") {
             return false;
@@ -7973,7 +8022,12 @@ CROSS APPLY (
                     .trim_end_matches(',')
                     .eq_ignore_ascii_case("first_name")
             })
-            .unwrap_or_else(|| panic!("formatted output should contain first_name, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "formatted output should contain first_name, got:\n{}",
+                    formatted
+                )
+            });
         let last_name_idx = lines
             .iter()
             .position(|line| {
@@ -7981,7 +8035,12 @@ CROSS APPLY (
                     .trim_end_matches(',')
                     .eq_ignore_ascii_case("last_name")
             })
-            .unwrap_or_else(|| panic!("formatted output should contain last_name, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "formatted output should contain last_name, got:\n{}",
+                    formatted
+                )
+            });
 
         assert_eq!(
             indent(lines[first_name_idx]),
@@ -11836,6 +11895,97 @@ END;";
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_window_order_by_under_over_paren_after_comment() {
+        let source = r#"SELECT o.order_id,
+    x.max_price,
+    -- [AU] 분위수 계산
+    NTILE (4) OVER (
+/* AV: 금액 기준 분위 */
+ORDER BY x.total_amt DESC NULLS LAST) AS amt_quartile
+FROM recent_orders o;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let ntile_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("NTILE (4) OVER ("))
+            .unwrap_or(0);
+        let comment_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* AV: 금액 기준 분위 */"))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ORDER BY x.total_amt"))
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[comment_idx]) > indent(lines[ntile_idx]),
+            "window comment line should stay nested under OVER (, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[comment_idx]),
+            indent(lines[order_idx]),
+            "comment and ORDER BY inside OVER (...) should share the same continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_from_under_general_function_paren() {
+        let source = r#"SELECT
+    OVERLAY (
+        name
+        PLACING 'X'
+FROM start_pos
+FOR 1
+    ) AS masked_name
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let overlay_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("OVERLAY ("))
+            .unwrap_or(0);
+        let placing_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PLACING 'X'"))
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM start_pos"))
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR 1"))
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[from_idx]) > indent(lines[overlay_idx]),
+            "FROM inside OVERLAY (...) should stay nested under the function paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[placing_idx]),
+            indent(lines[from_idx]),
+            "clause-shaped keywords inside a general function paren should align with sibling continuation lines, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[from_idx]),
+            indent(lines[for_idx]),
+            "FROM/FOR inside OVERLAY (...) should share one continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_aligns_comment_before_else_in_case_inside_parens() {
         let source = "select func(case when col1 = 1 then 'a'\n-- default\nelse 'b' end) from t1;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -13199,6 +13349,195 @@ ORDER BY u.dept_id,
         );
     }
 
+    #[test]
+    fn format_for_auto_formatting_keeps_from_aligned_before_unpivot_after_multiline_select_list() {
+        let source = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH src AS (
+            SELECT deptno,
+                job,
+                sal
+            FROM emp
+        ),
+        pivoted AS (
+            SELECT *
+            FROM src PIVOT (
+                SUM (sal) AS sum_sal FOR
+                deptno IN (
+                    10 AS D10, 20 AS D20, 30 AS D30)
+            )
+        )
+        SELECT job,
+            dept_tag,
+            sal_amt
+        FROM pivoted UNPIVOT (
+            sal_amt
+            FOR dept_tag IN (
+                D10 AS '10', D20 AS '20', D30 AS '30')
+        )
+        WHERE sal_amt IS NOT NULL
+        ORDER BY job,
+            dept_tag;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert!(
+            formatted.contains(
+                "        SELECT job,\n            dept_tag,\n            sal_amt\n        FROM pivoted UNPIVOT ("
+            ),
+            "FROM before UNPIVOT should realign to the SELECT base depth instead of staying at select-item depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "        SELECT job,\n            dept_tag,\n            sal_amt\n            FROM pivoted UNPIVOT ("
+            ),
+            "FROM before UNPIVOT must not remain indented like a select-list continuation, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_already_aligned_from_before_unpivot_stable() {
+        let expected = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH src AS (
+            SELECT deptno,
+                job,
+                sal
+            FROM emp
+        ),
+        pivoted AS (
+            SELECT *
+            FROM src PIVOT (
+                SUM (sal) AS sum_sal
+                FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
+            )
+        )
+        SELECT job,
+            dept_tag,
+            sal_amt
+        FROM pivoted UNPIVOT (
+            sal_amt
+            FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
+        )
+        WHERE sal_amt IS NOT NULL
+        ORDER BY job,
+            dept_tag;
+END;"#;
+
+        let reformatted = SqlEditorWidget::format_for_auto_formatting(expected, false);
+
+        assert_eq!(
+            reformatted, expected,
+            "already aligned FROM before UNPIVOT should remain stable"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_from_before_unpivot_stable() {
+        let expected = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH src AS (
+            SELECT deptno,
+                job,
+                sal
+            FROM emp
+        ),
+        pivoted AS (
+            SELECT *
+            FROM src PIVOT (
+                SUM (sal) AS sum_sal
+                FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
+            )
+        )
+        SELECT job,
+            dept_tag,
+            sal_amt
+        FROM pivoted UNPIVOT (
+            sal_amt
+            FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
+        )
+        WHERE sal_amt IS NOT NULL
+        ORDER BY job,
+            dept_tag;
+END;"#;
+
+        let indented = SqlEditorWidget::apply_parser_depth_indentation(expected);
+
+        assert_eq!(
+            indented, expected,
+            "parser-depth alignment phase should not over-indent FROM before UNPIVOT"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_json_table_comment_attached_and_select_items_aligned() {
+        let source = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+       OPEN p_rc FOR
+        WITH jdocs AS (
+            SELECT id,
+                payload
+            FROM json_docs
+            WHERE /* AL: 활성 문서만 */
+            active_flag = 1
+        )
+        SELECT jd.id,
+
+            /* AM: JSON 파싱 결과 */
+            jt.order_id,
+               jt.cust_name,
+               jt.tier,
+               it.sku,
+               it.qty,
+               it.price,
+               (it.qty * it.price) AS line_amt
+        FROM jdocs jd
+        CROSS JOIN JSON_TABLE (jd.payload, 
+            /* AN: root path */
+            '$' COLUMNS (
+                -- [AO] 최상위 컬럼
+                order_id NUMBER PATH '$.order_id', cust_name VARCHAR2 (100) PATH '$.customer.name', tier VARCHAR2 (20) PATH '$.customer.tier', NESTED PATH '$.items[*]' COLUMNS (
+                    /* AP: 아이템 컬럼 */
+                    sku VARCHAR2 (30) PATH '$.sku', qty NUMBER PATH '$.qty', price NUMBER PATH '$.price') -- [AQ] nested columns 끝
+            )        -- [AR] outer columns 끝
+        )         jt
+        CROSS APPLY (
+            -- [AS] item alias
+            SELECT jt.sku,
+                jt.qty,
+                jt.price
+            FROM DUAL
+        ) it
+        ORDER BY jd.id,
+            it.sku;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert!(
+            formatted.contains(
+                "        SELECT jd.id,\n            /* AM: JSON 파싱 결과 */\n            jt.order_id,\n            jt.cust_name,\n            jt.tier,"
+            ),
+            "JSON_TABLE select-list comment should stay attached to the preceding SELECT item block and the following items should share one depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SELECT jd.id,\n\n            /* AM: JSON 파싱 결과 */"),
+            "formatter should not insert a blank line before the JSON_TABLE select-list comment, got:\n{}",
+            formatted
+        );
+    }
+
     // ── INSERT ALL INTO indent ──
 
     #[test]
@@ -14437,8 +14776,14 @@ WHERE (((status = 'A' OR status = 'B')
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("AND "))
+            .expect("AND line");
 
         assert_eq!(
             indent(lines[and_idx]),
@@ -14455,9 +14800,18 @@ WHERE (((status = 'A' OR status = 'B')
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
-        let or_idx = lines.iter().position(|l| l.trim_start().starts_with("OR ")).expect("OR line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("AND "))
+            .expect("AND line");
+        let or_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("OR "))
+            .expect("OR line");
 
         let on_indent = indent(lines[on_idx]);
         assert_eq!(
@@ -14488,13 +14842,19 @@ WHERE (((status = 'A' OR status = 'B')
         let and_idx = lines
             .iter()
             .position(|l| {
-                crate::sql_text::starts_with_keyword_token(&l.trim_start().to_ascii_uppercase(), "AND")
+                crate::sql_text::starts_with_keyword_token(
+                    &l.trim_start().to_ascii_uppercase(),
+                    "AND",
+                )
             })
             .expect("AND line");
         let or_idx = lines
             .iter()
             .position(|l| {
-                crate::sql_text::starts_with_keyword_token(&l.trim_start().to_ascii_uppercase(), "OR")
+                crate::sql_text::starts_with_keyword_token(
+                    &l.trim_start().to_ascii_uppercase(),
+                    "OR",
+                )
             })
             .expect("OR line");
 
@@ -14535,8 +14895,18 @@ join c on b.id = c.id and b.y = c.y;"#;
             .map(|(i, _)| i)
             .collect();
 
-        assert_eq!(on_lines.len(), 2, "should have two ON lines, got:\n{}", formatted);
-        assert_eq!(and_lines.len(), 2, "should have two AND lines, got:\n{}", formatted);
+        assert_eq!(
+            on_lines.len(),
+            2,
+            "should have two ON lines, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            and_lines.len(),
+            2,
+            "should have two AND lines, got:\n{}",
+            formatted
+        );
 
         for (on_idx, and_idx) in on_lines.iter().zip(and_lines.iter()) {
             assert_eq!(
@@ -14558,8 +14928,14 @@ join b on a.id = b.id and a.x = b.x
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("AND "))
+            .expect("AND line");
 
         assert_eq!(
             indent(lines[and_idx]),
@@ -14587,8 +14963,14 @@ join b on a.id = b.id and a.x = b.x
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("AND "))
+            .expect("AND line");
 
         assert_eq!(
             indent(lines[and_idx]),
@@ -14605,8 +14987,14 @@ join b on a.id = b.id and a.x = b.x
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).expect("AND line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("AND "))
+            .expect("AND line");
 
         assert_eq!(
             indent(lines[and_idx]),
@@ -14618,20 +15006,32 @@ join b on a.id = b.id and a.x = b.x
 
     #[test]
     fn join_on_with_where_and_both_correctly_indented() {
-        let input = "select * from a join b on a.id = b.id and a.x = b.x where a.y = 1 and a.z = 2;";
+        let input =
+            "select * from a join b on a.id = b.id and a.x = b.x where a.y = 1 and a.z = 2;";
         let formatted = SqlEditorWidget::format_sql_basic(input);
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).expect("ON line");
-        let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).expect("WHERE line");
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let where_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("WHERE "))
+            .expect("WHERE line");
         let and_lines: Vec<usize> = lines
             .iter()
             .enumerate()
             .filter(|(_, l)| l.trim_start().starts_with("AND "))
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(and_lines.len(), 2, "should have two AND lines, got:\n{}", formatted);
+        assert_eq!(
+            and_lines.len(),
+            2,
+            "should have two AND lines, got:\n{}",
+            formatted
+        );
 
         // First AND after ON
         assert_eq!(
@@ -14665,65 +15065,139 @@ join b on a.id = b.id and a.x = b.x
         };
 
         // 1. ON with OR then AND (operator precedence edge case)
-        let formatted = format_check("OR-then-AND",
-            "select * from a join b on a.id = b.id or a.x = b.x and a.y = b.y;");
+        let formatted = format_check(
+            "OR-then-AND",
+            "select * from a join b on a.id = b.id or a.x = b.x and a.y = b.y;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let or_idx = lines.iter().position(|l| l.trim_start().starts_with("OR ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let or_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("OR "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
             let on_ind = indent(lines[on_idx]);
-            assert_eq!(indent(lines[or_idx]), on_ind + 4, "[OR-then-AND] OR should be deeper than ON:\n{}", formatted);
-            assert_eq!(indent(lines[and_idx]), indent(lines[or_idx]), "[OR-then-AND] AND should be same as OR:\n{}", formatted);
+            assert_eq!(
+                indent(lines[or_idx]),
+                on_ind + 4,
+                "[OR-then-AND] OR should be deeper than ON:\n{}",
+                formatted
+            );
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[or_idx]),
+                "[OR-then-AND] AND should be same as OR:\n{}",
+                formatted
+            );
         }
 
         // 2. Many ANDs (3+)
-        let formatted = format_check("Many-ANDs",
-            "select * from a join b on a.id = b.id and a.x = b.x and a.y = b.y and a.z = b.z;");
+        let formatted = format_check(
+            "Many-ANDs",
+            "select * from a join b on a.id = b.id and a.x = b.x and a.y = b.y and a.z = b.z;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_lines: Vec<usize> = lines.iter().enumerate()
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_lines: Vec<usize> = lines
+                .iter()
+                .enumerate()
                 .filter(|(_, l)| l.trim_start().starts_with("AND "))
-                .map(|(i, _)| i).collect();
-            assert_eq!(and_lines.len(), 3, "should have 3 AND lines:\n{}", formatted);
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                and_lines.len(),
+                3,
+                "should have 3 AND lines:\n{}",
+                formatted
+            );
             for &ai in &and_lines {
-                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
-                    "all ANDs should be at same depth (ON + 4):\n{}", formatted);
+                assert_eq!(
+                    indent(lines[ai]),
+                    indent(lines[on_idx]) + 4,
+                    "all ANDs should be at same depth (ON + 4):\n{}",
+                    formatted
+                );
             }
         }
 
         // 3. CROSS JOIN (no ON) then regular JOIN ON AND
-        let formatted = format_check("CROSS-then-JOIN",
-            "select * from a cross join b join c on a.id = c.id and b.id = c.bid;");
+        let formatted = format_check(
+            "CROSS-then-JOIN",
+            "select * from a cross join b join c on a.id = c.id and b.id = c.bid;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON should be deeper even after CROSS JOIN:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON should be deeper even after CROSS JOIN:\n{}",
+                formatted
+            );
         }
 
         // 4. LEFT OUTER JOIN
-        let formatted = format_check("LEFT-OUTER",
-            "select * from a left outer join b on a.id = b.id and a.x = b.x;");
+        let formatted = format_check(
+            "LEFT-OUTER",
+            "select * from a left outer join b on a.id = b.id and a.x = b.x;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON in LEFT OUTER JOIN:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON in LEFT OUTER JOIN:\n{}",
+                formatted
+            );
         }
 
         // 5. USING clause then JOIN ON AND
-        let formatted = format_check("USING-then-JOIN-ON",
-            "select * from a join b using (id) join c on b.name = c.name and b.x = c.x;");
+        let formatted = format_check(
+            "USING-then-JOIN-ON",
+            "select * from a join b using (id) join c on b.name = c.name and b.x = c.x;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON when previous JOIN used USING:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON when previous JOIN used USING:\n{}",
+                formatted
+            );
         }
 
         // 6. Function calls in ON condition
@@ -14731,10 +15205,20 @@ join b on a.id = b.id and a.x = b.x
             "select * from a join b on upper(a.name) = upper(b.name) and nvl(a.id, 0) = nvl(b.id, 0);");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON with function calls:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON with function calls:\n{}",
+                formatted
+            );
         }
 
         // 7. CTE with JOIN ON AND
@@ -14742,10 +15226,20 @@ join b on a.id = b.id and a.x = b.x
             "with cte as (\nselect * from a join b on a.id = b.id and a.x = b.x\n)\nselect * from cte;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON inside CTE:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON inside CTE:\n{}",
+                formatted
+            );
         }
 
         // 8. Already-formatted input (stability)
@@ -14757,10 +15251,20 @@ join b on a.id = b.id and a.x = b.x
             "select * from (\nselect * from (\nselect * from a join b on a.id = b.id and a.x = b.x\n) inner_sub\n) outer_sub;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
-            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
-                "AND after ON in deeply nested subquery:\n{}", formatted);
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
+            assert_eq!(
+                indent(lines[and_idx]),
+                indent(lines[on_idx]) + 4,
+                "AND after ON in deeply nested subquery:\n{}",
+                formatted
+            );
         }
 
         // 10. JOIN ON with subquery in the condition
@@ -14768,27 +15272,52 @@ join b on a.id = b.id and a.x = b.x
             "select * from a join b on a.id = b.id and a.type in (select type from types) and a.x = b.x;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_lines: Vec<usize> = lines.iter().enumerate()
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_lines: Vec<usize> = lines
+                .iter()
+                .enumerate()
                 .filter(|(_, l)| l.trim_start().starts_with("AND "))
-                .map(|(i, _)| i).collect();
-            assert!(and_lines.len() >= 2, "should have at least 2 AND lines:\n{}", formatted);
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                and_lines.len() >= 2,
+                "should have at least 2 AND lines:\n{}",
+                formatted
+            );
             for &ai in &and_lines {
-                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
-                    "AND after ON with subquery in condition:\n{}", formatted);
+                assert_eq!(
+                    indent(lines[ai]),
+                    indent(lines[on_idx]) + 4,
+                    "AND after ON with subquery in condition:\n{}",
+                    formatted
+                );
             }
         }
 
         // 11. WHERE with subquery then AND (should NOT be affected by join fix)
-        let formatted = format_check("WHERE-subquery-AND",
-            "select * from a where a.id in (select id from b) and a.x = 1;");
+        let formatted = format_check(
+            "WHERE-subquery-AND",
+            "select * from a where a.id in (select id from b) and a.x = 1;",
+        );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).unwrap();
-            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            let where_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("WHERE "))
+                .unwrap();
+            let and_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("AND "))
+                .unwrap();
             // WHERE AND should be at or deeper than WHERE level
-            assert!(indent(lines[and_idx]) >= indent(lines[where_idx]),
-                "AND after WHERE with subquery should be at or deeper than WHERE:\n{}", formatted);
+            assert!(
+                indent(lines[and_idx]) >= indent(lines[where_idx]),
+                "AND after WHERE with subquery should be at or deeper than WHERE:\n{}",
+                formatted
+            );
         }
 
         // 12. JOIN ON with EXISTS subquery then AND
@@ -14796,14 +15325,28 @@ join b on a.id = b.id and a.x = b.x
             "select * from a join b on a.id = b.id and exists (select 1 from c where c.id = a.id) and a.x = b.x;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
-            let and_lines: Vec<usize> = lines.iter().enumerate()
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
+            let and_lines: Vec<usize> = lines
+                .iter()
+                .enumerate()
                 .filter(|(_, l)| l.trim_start().starts_with("AND "))
-                .map(|(i, _)| i).collect();
-            assert!(and_lines.len() >= 2, "should have at least 2 AND lines:\n{}", formatted);
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                and_lines.len() >= 2,
+                "should have at least 2 AND lines:\n{}",
+                formatted
+            );
             for &ai in &and_lines {
-                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
-                    "AND after ON with EXISTS subquery:\n{}", formatted);
+                assert_eq!(
+                    indent(lines[ai]),
+                    indent(lines[on_idx]) + 4,
+                    "AND after ON with EXISTS subquery:\n{}",
+                    formatted
+                );
             }
         }
 
@@ -14812,16 +15355,23 @@ join b on a.id = b.id and a.x = b.x
             "select * from a join b on a.id = b.id and a.type in (select type from types) where a.x = 1 and a.y = 2;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).unwrap();
-            let where_and_idx = lines.iter().enumerate()
+            let where_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("WHERE "))
+                .unwrap();
+            let where_and_idx = lines
+                .iter()
+                .enumerate()
                 .filter(|(i, l)| *i > where_idx && l.trim_start().starts_with("AND "))
                 .map(|(i, _)| i)
                 .next()
                 .expect("should have AND after WHERE");
             // WHERE AND should NOT be at join ON AND depth
-            assert!(indent(lines[where_and_idx]) <= indent(lines[where_idx]) + 4,
-                "AND after WHERE should be at WHERE continuation depth, not JOIN ON depth:\n{}", formatted);
+            assert!(
+                indent(lines[where_and_idx]) <= indent(lines[where_idx]) + 4,
+                "AND after WHERE should be at WHERE continuation depth, not JOIN ON depth:\n{}",
+                formatted
+            );
         }
     }
-
 }
