@@ -1715,7 +1715,6 @@ impl ResultTableWidget {
                             if let Some((row_start, col_start, row_end, col_end)) = next_selection {
                                 table_for_handle
                                     .set_selection(row_start, col_start, row_end, col_end);
-                                table_for_handle.redraw();
                                 return true;
                             }
                         }
@@ -1874,7 +1873,6 @@ impl ResultTableWidget {
                             {
                                 table_for_handle
                                     .set_selection(row_start, col_start, row_end, col_end);
-                                table_for_handle.redraw();
                             }
                         }
                         return true;
