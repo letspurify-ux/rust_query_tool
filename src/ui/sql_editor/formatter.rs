@@ -7297,6 +7297,25 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_normalizes_mixed_space_tab_condition_indent_without_odd_hanging_preserve() {
+        let sql =
+            "SELECT col1\nFROM tab_sample\nWHERE col1 = 1\n  \tAND col2 = 2\n  \tOR col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE col1 = 1\n    AND col2 = 2\n    OR col3 = 3;"),
+            "Mixed space+tab condition indentation should normalize to clause depth, got:\n{}",
+            formatted
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting should stay idempotent after normalizing mixed space+tab conditions"
+        );
+    }
+
+    #[test]
     fn nested_case_expression_in_plsql_aligns_else_correctly() {
         let sql = r#"CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
 FUNCTION f_deep(p_grp IN NUMBER, p_n IN NUMBER, p_txt IN VARCHAR2) RETURN NUMBER IS
