@@ -38,6 +38,7 @@ struct LineLayout<'a> {
     condition_role: AutoFormatConditionRole,
     existing_indent: usize,
     existing_indent_spaces: usize,
+    existing_indent_has_tab: bool,
     final_depth: usize,
     anchor_group: Option<usize>,
     dml_case_expression_close_depth: Option<usize>,
@@ -690,6 +691,28 @@ impl OpenCursorFormatState {
 }
 
 impl SqlEditorWidget {
+    fn leading_indent_metrics(line: &str) -> (usize, usize, bool) {
+        let mut indent_columns = 0usize;
+        let mut saw_tab = false;
+
+        for ch in line.chars() {
+            match ch {
+                ' ' => {
+                    indent_columns = indent_columns.saturating_add(1);
+                }
+                '\t' => {
+                    saw_tab = true;
+                    let tab_stop = 4usize;
+                    let to_next_tab_stop = tab_stop - (indent_columns % tab_stop);
+                    indent_columns = indent_columns.saturating_add(to_next_tab_stop);
+                }
+                _ => break,
+            }
+        }
+
+        (indent_columns / 4, indent_columns, saw_tab)
+    }
+
     fn starts_with_end_suffix_terminator(trimmed_upper: &str) -> bool {
         if !crate::sql_text::starts_with_keyword_token(trimmed_upper, "END") {
             return false;
@@ -3944,6 +3967,8 @@ impl SqlEditorWidget {
         for (idx, line) in lines.iter().enumerate() {
             let raw = *line;
             let trimmed = raw.trim_start();
+            let (existing_indent, existing_indent_spaces, existing_indent_has_tab) =
+                Self::leading_indent_metrics(raw);
             let continuation_line = multiline_string_continuation_lines
                 .get(idx)
                 .copied()
@@ -3996,8 +4021,9 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
-                existing_indent_spaces: raw.len().saturating_sub(trimmed.len()),
+                existing_indent,
+                existing_indent_spaces,
+                existing_indent_has_tab,
                 final_depth: 0,
                 anchor_group: None,
                 dml_case_expression_close_depth: None,
@@ -5688,6 +5714,7 @@ impl SqlEditorWidget {
         if layout.kind != LineLayoutKind::Code
             || layout.existing_indent_spaces == 0
             || layout.existing_indent_spaces % 4 == 0
+            || layout.existing_indent_has_tab
         {
             return false;
         }
@@ -7249,6 +7276,24 @@ END;"#;
         let line = "A\tB";
         let rendered = SqlEditorWidget::format_script_output_line(line, false, true);
         assert_eq!(rendered, "A       B");
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_tab_indented_condition_aligned_at_clause_depth() {
+        let sql = "SELECT col1\nFROM tab_sample\nWHERE col1 = 1\n\tAND col2 = 2\n\tOR col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE col1 = 1\n    AND col2 = 2\n    OR col3 = 3;"),
+            "Tab-indented WHERE conditions should normalize to clause depth indentation, got:\n{}",
+            formatted
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting should stay idempotent after normalizing tab-indented conditions"
+        );
     }
 
     #[test]
