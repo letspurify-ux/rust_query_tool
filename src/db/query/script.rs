@@ -1670,7 +1670,7 @@ impl QueryExecutor {
         }
     }
 
-    fn auto_format_is_join_clause(trimmed_upper: &str) -> bool {
+    pub(crate) fn auto_format_is_join_clause(trimmed_upper: &str) -> bool {
         if sql_text::starts_with_keyword_token(trimmed_upper, "JOIN")
             || sql_text::starts_with_keyword_token(trimmed_upper, "APPLY")
         {
