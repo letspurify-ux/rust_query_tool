@@ -4384,6 +4384,13 @@ impl SqlEditorWidget {
         let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
         let mut prev_general_paren_frame_count: usize = 0;
+        // Tracks the AND/OR depth while inside a JOIN ON/USING condition block.
+        // Set when we resolve the indent for ON/USING in a join, cleared on new
+        // clause or JOIN at the same parser depth level.  Used so that AND/OR
+        // after a subquery close paren within the condition keeps the correct
+        // (deeper-than-ON) indent.
+        // Stores (and_depth, parser_depth_of_on_line).
+        let mut join_on_condition_and_depth: Option<(usize, usize)> = None;
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -4944,9 +4951,16 @@ impl SqlEditorWidget {
                     .map(|depth| depth.saturating_add(1))
                     .unwrap_or(parser_depth.saturating_add(1));
                 if previous_line_starts_with_close_paren {
-                    last_code_indent
-                        .map(|indent| indent.max(condition_indent))
-                        .unwrap_or(condition_indent)
+                    if let Some((join_and_depth, _)) = join_on_condition_and_depth {
+                        // Inside a JOIN ON condition block: AND/OR after a
+                        // close paren (e.g. subquery) should stay at the
+                        // same depth as other AND/OR in this ON block.
+                        join_and_depth.max(condition_indent)
+                    } else {
+                        last_code_indent
+                            .map(|indent| indent.max(condition_indent))
+                            .unwrap_or(condition_indent)
+                    }
                 } else if previous_line_is_join_condition_clause {
                     last_code_indent
                         .map(|indent| {
@@ -5298,6 +5312,40 @@ impl SqlEditorWidget {
             layouts[idx].final_depth = effective_depth;
             layouts[idx].dml_case_expression_close_depth =
                 current_line_dml_case_expression_close_depth;
+
+            // Track JOIN ON condition AND depth: set when we see ON/USING
+            // in a join context, or when an AND/OR is processed that
+            // continues a join condition.  Clear on a new clause/JOIN
+            // at the same or lower parser depth (not inside subqueries).
+            {
+                let is_join_condition_line =
+                    crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ON")
+                        || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING");
+                let is_join_clause_line =
+                    QueryExecutor::auto_format_is_join_clause(&trimmed_upper);
+                let is_dml_clause = Self::is_dml_clause_starter(&trimmed_upper)
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
+                if is_join_condition_line
+                    && layouts[idx].query_role == AutoFormatQueryRole::Continuation
+                {
+                    join_on_condition_and_depth =
+                        Some((effective_depth.saturating_add(1), depth));
+                } else if current_line_is_condition_keyword
+                    && join_on_condition_and_depth.is_some()
+                {
+                    // AND/OR continues the join condition block; keep the
+                    // tracked depth (don't clear).
+                } else if (is_join_clause_line || is_dml_clause || starts_query_head)
+                    && join_on_condition_and_depth
+                        .is_some_and(|(_, on_depth)| depth <= on_depth)
+                {
+                    // Only clear when the new clause is at the same or
+                    // lower parser depth — subquery heads inside the ON
+                    // condition should not clear this state.
+                    join_on_condition_and_depth = None;
+                }
+            }
             if pending_case_branch_body_depth_for_line.is_some() {
                 pending_case_branch_body_depth = None;
             }
@@ -5495,6 +5543,7 @@ impl SqlEditorWidget {
                 pending_paren_case_closer_indent = false;
                 pending_dml_case_expression_close_depth = None;
                 pending_case_branch_body_depth = None;
+                join_on_condition_and_depth = None;
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -14439,6 +14488,182 @@ join b on a.id = b.id and a.x = b.x
             "AND after WHERE should be at or deeper than WHERE depth, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn join_on_and_edge_case_survey() {
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        // Helper: format + check idempotent + return formatted
+        let format_check = |label: &str, input: &str| -> String {
+            let formatted = SqlEditorWidget::format_sql_basic(input);
+            let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+            assert_eq!(
+                reformatted, formatted,
+                "[{}] formatting should be idempotent.\nInput:\n{}\nFormatted:\n{}\nReformatted:\n{}",
+                label, input, formatted, reformatted
+            );
+            formatted
+        };
+
+        // 1. ON with OR then AND (operator precedence edge case)
+        let formatted = format_check("OR-then-AND",
+            "select * from a join b on a.id = b.id or a.x = b.x and a.y = b.y;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let or_idx = lines.iter().position(|l| l.trim_start().starts_with("OR ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            let on_ind = indent(lines[on_idx]);
+            assert_eq!(indent(lines[or_idx]), on_ind + 4, "[OR-then-AND] OR should be deeper than ON:\n{}", formatted);
+            assert_eq!(indent(lines[and_idx]), indent(lines[or_idx]), "[OR-then-AND] AND should be same as OR:\n{}", formatted);
+        }
+
+        // 2. Many ANDs (3+)
+        let formatted = format_check("Many-ANDs",
+            "select * from a join b on a.id = b.id and a.x = b.x and a.y = b.y and a.z = b.z;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_lines: Vec<usize> = lines.iter().enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with("AND "))
+                .map(|(i, _)| i).collect();
+            assert_eq!(and_lines.len(), 3, "should have 3 AND lines:\n{}", formatted);
+            for &ai in &and_lines {
+                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
+                    "all ANDs should be at same depth (ON + 4):\n{}", formatted);
+            }
+        }
+
+        // 3. CROSS JOIN (no ON) then regular JOIN ON AND
+        let formatted = format_check("CROSS-then-JOIN",
+            "select * from a cross join b join c on a.id = c.id and b.id = c.bid;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON should be deeper even after CROSS JOIN:\n{}", formatted);
+        }
+
+        // 4. LEFT OUTER JOIN
+        let formatted = format_check("LEFT-OUTER",
+            "select * from a left outer join b on a.id = b.id and a.x = b.x;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON in LEFT OUTER JOIN:\n{}", formatted);
+        }
+
+        // 5. USING clause then JOIN ON AND
+        let formatted = format_check("USING-then-JOIN-ON",
+            "select * from a join b using (id) join c on b.name = c.name and b.x = c.x;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON when previous JOIN used USING:\n{}", formatted);
+        }
+
+        // 6. Function calls in ON condition
+        let formatted = format_check("Function-in-ON",
+            "select * from a join b on upper(a.name) = upper(b.name) and nvl(a.id, 0) = nvl(b.id, 0);");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON with function calls:\n{}", formatted);
+        }
+
+        // 7. CTE with JOIN ON AND
+        let formatted = format_check("CTE-with-JOIN",
+            "with cte as (\nselect * from a join b on a.id = b.id and a.x = b.x\n)\nselect * from cte;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON inside CTE:\n{}", formatted);
+        }
+
+        // 8. Already-formatted input (stability)
+        let _formatted = format_check("Already-formatted",
+            "SELECT *\nFROM a\nJOIN b\n    ON a.id = b.id\n        AND a.x = b.x\n        OR a.y = b.y\nJOIN c\n    ON b.id = c.id\n        AND b.x = c.x;");
+
+        // 9. Deep subquery nesting
+        let formatted = format_check("Deep-subquery",
+            "select * from (\nselect * from (\nselect * from a join b on a.id = b.id and a.x = b.x\n) inner_sub\n) outer_sub;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            assert_eq!(indent(lines[and_idx]), indent(lines[on_idx]) + 4,
+                "AND after ON in deeply nested subquery:\n{}", formatted);
+        }
+
+        // 10. JOIN ON with subquery in the condition
+        let formatted = format_check("Subquery-in-ON",
+            "select * from a join b on a.id = b.id and a.type in (select type from types) and a.x = b.x;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_lines: Vec<usize> = lines.iter().enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with("AND "))
+                .map(|(i, _)| i).collect();
+            assert!(and_lines.len() >= 2, "should have at least 2 AND lines:\n{}", formatted);
+            for &ai in &and_lines {
+                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
+                    "AND after ON with subquery in condition:\n{}", formatted);
+            }
+        }
+
+        // 11. WHERE with subquery then AND (should NOT be affected by join fix)
+        let formatted = format_check("WHERE-subquery-AND",
+            "select * from a where a.id in (select id from b) and a.x = 1;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).unwrap();
+            let and_idx = lines.iter().position(|l| l.trim_start().starts_with("AND ")).unwrap();
+            // WHERE AND should be at or deeper than WHERE level
+            assert!(indent(lines[and_idx]) >= indent(lines[where_idx]),
+                "AND after WHERE with subquery should be at or deeper than WHERE:\n{}", formatted);
+        }
+
+        // 12. JOIN ON with EXISTS subquery then AND
+        let formatted = format_check("EXISTS-in-ON",
+            "select * from a join b on a.id = b.id and exists (select 1 from c where c.id = a.id) and a.x = b.x;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let on_idx = lines.iter().position(|l| l.trim_start().starts_with("ON ")).unwrap();
+            let and_lines: Vec<usize> = lines.iter().enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with("AND "))
+                .map(|(i, _)| i).collect();
+            assert!(and_lines.len() >= 2, "should have at least 2 AND lines:\n{}", formatted);
+            for &ai in &and_lines {
+                assert_eq!(indent(lines[ai]), indent(lines[on_idx]) + 4,
+                    "AND after ON with EXISTS subquery:\n{}", formatted);
+            }
+        }
+
+        // 13. JOIN ON subquery then WHERE (state should be cleared for WHERE)
+        let formatted = format_check("ON-subquery-then-WHERE",
+            "select * from a join b on a.id = b.id and a.type in (select type from types) where a.x = 1 and a.y = 2;");
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let where_idx = lines.iter().position(|l| l.trim_start().starts_with("WHERE ")).unwrap();
+            let where_and_idx = lines.iter().enumerate()
+                .filter(|(i, l)| *i > where_idx && l.trim_start().starts_with("AND "))
+                .map(|(i, _)| i)
+                .next()
+                .expect("should have AND after WHERE");
+            // WHERE AND should NOT be at join ON AND depth
+            assert!(indent(lines[where_and_idx]) <= indent(lines[where_idx]) + 4,
+                "AND after WHERE should be at WHERE continuation depth, not JOIN ON depth:\n{}", formatted);
+        }
     }
 
 }
