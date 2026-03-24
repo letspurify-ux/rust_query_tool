@@ -1351,11 +1351,9 @@ impl ResultTableWidget {
         table.set_row_height_all(Self::row_height_for_font(DEFAULT_FONT_SIZE as u32));
         table.set_rows(0);
         table.set_cols(0);
-        // Ensure the custom handle closure runs BEFORE Fl_Table's native handler.
-        // With the default super_handle_first=true, Fl_Table::handle() always runs
-        // first and sets its own selection on Push/Drag, causing double set_selection
-        // calls per event and visible selection flicker.
-        table.super_handle_first(false);
+        // Keep the default super_handle_first=true so Fl_Table's native handler
+        // runs first. This lets the native Drag handler manage cell selection
+        // (including auto-scroll) while our closure only tracks auxiliary state.
         table.end();
 
         // Capture theme colors once for draw_cell (avoids per-cell function calls)
@@ -1765,15 +1763,9 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
-                    let current_mouse_x = app::event_x();
-                    let current_mouse_y = app::event_y();
-                    let (current_view_row, current_view_col) =
-                        Self::drag_viewport_anchor(&table_for_handle);
                     let (
                         is_dragging,
                         consume_background_pointer_sequence,
-                        skip_drag_hittest,
-                        last_resolved_cell,
                         header_sort_candidate,
                         header_sort_requires_double_click,
                         header_start_x,
@@ -1785,21 +1777,6 @@ impl ResultTableWidget {
                         (
                             state.is_dragging,
                             state.consume_background_pointer_sequence,
-                            Self::should_skip_drag_hit_test(
-                                state.last_mouse_x,
-                                state.last_mouse_y,
-                                current_mouse_x,
-                                current_mouse_y,
-                                state.last_view_row,
-                                state.last_view_col,
-                                current_view_row,
-                                current_view_col,
-                            ),
-                            if state.last_row >= 0 && state.last_col >= 0 {
-                                Some((state.last_row, state.last_col))
-                            } else {
-                                None
-                            },
                             state.header_sort_candidate_col,
                             state.header_sort_requires_double_click,
                             state.header_sort_start_x,
@@ -1835,51 +1812,10 @@ impl ResultTableWidget {
                         return true;
                     }
                     if is_dragging {
-                        if skip_drag_hittest {
-                            return true;
-                        }
-                        if let Some((row, col)) =
-                            Self::get_cell_at_mouse_for_drag(&table_for_handle, last_resolved_cell)
-                        {
-                            let mut state = drag_state_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let start_row = state.start_row;
-                            let start_col = state.start_col;
-                            let base_selection_bounds = state.base_selection_bounds;
-
-                            state.last_mouse_x = current_mouse_x;
-                            state.last_mouse_y = current_mouse_y;
-                            state.last_view_row = current_view_row;
-                            state.last_view_col = current_view_col;
-
-                            if state.last_row == row && state.last_col == col {
-                                return true;
-                            }
-
-                            state.last_row = row;
-                            state.last_col = col;
-                            drop(state);
-
-                            let max_rows = table_for_handle.rows().max(0) as usize;
-                            let max_cols = table_for_handle.cols().max(0) as usize;
-                            if let Some((row_start, col_start, row_end, col_end)) =
-                                if base_selection_bounds.is_some() {
-                                    Self::expanded_selection_bounds_with_cell(
-                                        base_selection_bounds,
-                                        row,
-                                        col,
-                                        max_rows,
-                                        max_cols,
-                                    )
-                                } else {
-                                    Some((start_row, start_col, row, col))
-                                }
-                            {
-                                table_for_handle
-                                    .set_selection(row_start, col_start, row_end, col_end);
-                            }
-                        }
+                        // Native Fl_Table::handle(Drag) already ran (super_handle_first=true)
+                        // and extended the selection from Push origin to the current cell,
+                        // including auto-scroll when the pointer leaves the visible area.
+                        // No custom set_selection needed — just acknowledge the event.
                         return true;
                     }
                     false
