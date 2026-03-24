@@ -1202,8 +1202,39 @@ impl SqlEditorWidget {
 
         let previous_search_window =
             Self::tail_search_window(previous_trimmed, 4096).unwrap_or(previous_trimmed);
-        Self::contains_ascii_case_insensitive(previous_search_window, "ORDER BY")
-            || Self::contains_ascii_case_insensitive(previous_search_window, "ORDER SIBLINGS BY")
+        Self::has_order_by_sequence(previous_search_window)
+    }
+
+    fn has_order_by_sequence(text: &str) -> bool {
+        let words: Vec<String> = Self::tokenize_sql(text)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word),
+                _ => None,
+            })
+            .collect();
+
+        if words.len() < 2 {
+            return false;
+        }
+
+        for idx in 0..(words.len() - 1) {
+            if words[idx].eq_ignore_ascii_case("ORDER")
+                && words[idx + 1].eq_ignore_ascii_case("BY")
+            {
+                return true;
+            }
+
+            if idx + 2 < words.len()
+                && words[idx].eq_ignore_ascii_case("ORDER")
+                && words[idx + 1].eq_ignore_ascii_case("SIBLINGS")
+                && words[idx + 2].eq_ignore_ascii_case("BY")
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn starts_with_ascii_keyword_token_ci(text: &str, keyword: &str) -> bool {
@@ -1219,22 +1250,6 @@ impl SqlEditorWidget {
         !text_bytes
             .get(keyword_bytes.len())
             .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
-    }
-
-    fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-        let haystack_bytes = haystack.as_bytes();
-        let needle_bytes = needle.as_bytes();
-        if needle_bytes.is_empty() {
-            return true;
-        }
-        if haystack_bytes.len() < needle_bytes.len() {
-            return false;
-        }
-
-        haystack_bytes
-            .windows(needle_bytes.len())
-            .rev()
-            .any(|window| window.eq_ignore_ascii_case(needle_bytes))
     }
 
     fn tail_search_window(text: &str, max_bytes: usize) -> Option<&str> {
@@ -7064,6 +7079,30 @@ mod formatter_regression_tests {
             "Comment-preserving select formatting should remain stable, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn order_modifier_fragment_merge_requires_real_order_by_tokens() {
+        assert!(!SqlEditorWidget::should_merge_order_modifier_fragment(
+            "SELECT border by_col FROM dual",
+            "DESC"
+        ));
+        assert!(!SqlEditorWidget::should_merge_order_modifier_fragment(
+            "SELECT order_by_col FROM dual",
+            "NULLS LAST"
+        ));
+    }
+
+    #[test]
+    fn order_modifier_fragment_merge_accepts_order_by_and_siblings_by_tokens() {
+        assert!(SqlEditorWidget::should_merge_order_modifier_fragment(
+            "SELECT c FROM t ORDER BY c",
+            "DESC"
+        ));
+        assert!(SqlEditorWidget::should_merge_order_modifier_fragment(
+            "SELECT c FROM t ORDER SIBLINGS BY c",
+            "NULLS LAST"
+        ));
     }
 
     #[test]
