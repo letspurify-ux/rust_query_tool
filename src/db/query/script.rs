@@ -75,6 +75,12 @@ struct InlineCommentLineContinuation {
     query_base_depth: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineCommentContinuationKind {
+    SameDepth,
+    OneDeeperThanQueryBase,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ConditionLineAnnotation {
     header_line_idx: Option<usize>,
@@ -1415,6 +1421,8 @@ impl QueryExecutor {
                 let is_join_clause = Self::auto_format_is_join_clause(&trimmed_upper);
                 let is_join_condition_clause =
                     Self::auto_format_is_join_condition_clause(&trimmed_upper);
+                let is_query_condition_continuation_clause =
+                    Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper);
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(trimmed)
@@ -1439,7 +1447,7 @@ impl QueryExecutor {
                     context.auto_depth = frame.query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(frame.query_base_depth);
-                } else if is_join_condition_clause {
+                } else if is_join_condition_clause || is_query_condition_continuation_clause {
                     context.auto_depth = frame.query_base_depth.saturating_add(1);
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
@@ -1600,6 +1608,7 @@ impl QueryExecutor {
                     trimmed,
                     existing_indent.max(context.auto_depth),
                     context.query_base_depth,
+                    clause_kind,
                 );
 
             if trimmed.ends_with(';') {
@@ -1690,6 +1699,11 @@ impl QueryExecutor {
     fn auto_format_is_join_condition_clause(trimmed_upper: &str) -> bool {
         sql_text::starts_with_keyword_token(trimmed_upper, "ON")
             || sql_text::starts_with_keyword_token(trimmed_upper, "USING")
+    }
+
+    fn auto_format_is_query_condition_continuation_clause(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "AND")
+            || sql_text::starts_with_keyword_token(trimmed_upper, "OR")
     }
 
     fn pending_condition_header_for_word(
@@ -2183,10 +2197,17 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
+        clause_kind: Option<AutoFormatClauseKind>,
     ) -> Option<InlineCommentLineContinuation> {
-        if Self::line_has_trailing_inline_comment_continuation(line) {
+        if let Some(kind) = Self::trailing_inline_comment_continuation_kind(line, clause_kind) {
+            let continuation_depth = match kind {
+                InlineCommentContinuationKind::SameDepth => depth,
+                InlineCommentContinuationKind::OneDeeperThanQueryBase => {
+                    query_base_depth.unwrap_or(depth).saturating_add(1)
+                }
+            };
             Some(InlineCommentLineContinuation {
-                depth,
+                depth: continuation_depth,
                 query_base_depth,
             })
         } else {
@@ -2194,13 +2215,14 @@ impl QueryExecutor {
         }
     }
 
-    fn line_has_trailing_inline_comment_continuation(line: &str) -> bool {
-        let Some(prefix) = Self::trailing_inline_comment_prefix(line) else {
-            return false;
-        };
+    fn trailing_inline_comment_continuation_kind(
+        line: &str,
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> Option<InlineCommentContinuationKind> {
+        let prefix = Self::trailing_inline_comment_prefix(line)?;
         let trimmed_prefix = prefix.trim_end();
         if trimmed_prefix.is_empty() {
-            return false;
+            return None;
         }
 
         let trailing_operator_symbol = Self::trailing_significant_byte_before_inline_comment(
@@ -2223,9 +2245,51 @@ impl QueryExecutor {
             )
         });
 
-        trailing_operator_keyword
-            || trailing_operator_symbol
-            || Self::prefix_ends_with_unfinished_clause_header(trimmed_prefix)
+        if trailing_operator_keyword || trailing_operator_symbol {
+            return Some(InlineCommentContinuationKind::SameDepth);
+        }
+
+        if Self::prefix_ends_with_unfinished_clause_header(trimmed_prefix) {
+            return Some(
+                Self::unfinished_clause_header_inline_comment_continuation_kind(
+                    trimmed_prefix,
+                    clause_kind,
+                ),
+            );
+        }
+
+        None
+    }
+
+    fn unfinished_clause_header_inline_comment_continuation_kind(
+        trimmed_prefix: &str,
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> InlineCommentContinuationKind {
+        if Self::unfinished_clause_header_uses_list_continuation(trimmed_prefix, clause_kind) {
+            InlineCommentContinuationKind::OneDeeperThanQueryBase
+        } else {
+            InlineCommentContinuationKind::SameDepth
+        }
+    }
+
+    fn unfinished_clause_header_uses_list_continuation(
+        trimmed_prefix: &str,
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> bool {
+        if matches!(
+            clause_kind,
+            Some(
+                AutoFormatClauseKind::Select
+                    | AutoFormatClauseKind::Group
+                    | AutoFormatClauseKind::Order
+                    | AutoFormatClauseKind::Set
+            )
+        ) {
+            return true;
+        }
+
+        let upper = trimmed_prefix.to_ascii_uppercase();
+        sql_text::starts_with_keyword_token(&upper, "RETURNING")
     }
 
     fn prefix_ends_with_unfinished_clause_header(prefix: &str) -> bool {
@@ -7496,6 +7560,86 @@ WHERE oi.order_id = v.order_id
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_operator_continuation_inside_not_exists_subquery() {
+        let sql = r#"SELECT *
+FROM (
+        /* Q: 인라인뷰 시작 */
+        WITH x AS (
+            SELECT
+                p.order_id,
+                p.cust_name,
+                p.order_dt,
+                a.amt
+            FROM paid p
+            JOIN amounts a
+                ON /* R: join key */
+                a.order_id = p.order_id
+            WHERE a.amt > /* S: threshold */
+                50
+        )
+        SELECT
+            x.*,
+            (
+                -- [T] 라인수 서브쿼리
+                SELECT COUNT (*)
+                FROM order_item oi
+                WHERE oi.order_id = x.order_id
+            ) AS line_cnt
+        FROM x
+    ) v
+WHERE EXISTS (
+        /* U: SKU 존재 조건 */
+        SELECT 1
+        FROM order_item oi
+        WHERE oi.order_id = v.order_id
+            AND oi.sku LIKE 'SKU-%' -- [V] SKU 패턴
+    )
+    AND NOT EXISTS (
+        -- [W] 음수 수량 배제
+        SELECT 1
+        FROM order_item oi
+        WHERE oi.order_id = v.order_id
+            AND oi.qty <= /* X: 0 이하 */
+        0
+    )
+ORDER BY v.amt DESC;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND oi.qty <="))
+            .unwrap_or(0);
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "0")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[and_idx]
+                .query_base_depth
+                .unwrap_or(contexts[and_idx].auto_depth)
+                .saturating_add(1),
+            "AND continuation inside NOT EXISTS should be one level deeper than the child query base depth"
+        );
+        assert_eq!(
+            contexts[operand_idx].auto_depth,
+            contexts[and_idx].auto_depth,
+            "operand after inline-comment operator inside NOT EXISTS should keep the active condition depth"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "operand line inside NOT EXISTS should stay marked as query continuation"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_base_depth, contexts[and_idx].query_base_depth,
+            "operand line inside NOT EXISTS should preserve the child query base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_join_condition_depth_after_inline_block_comment_on_clause() {
         let sql = r#"SELECT *
 FROM paid p
@@ -7560,6 +7704,108 @@ JOIN amounts a
         assert_eq!(
             contexts[condition_idx].query_base_depth, contexts[on_idx].query_base_depth,
             "ON-clause line-comment continuation must preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_promote_select_list_after_inline_comment_on_select_header() {
+        let sql = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH /* A: dept 집계 CTE */
+        dept_stats AS (
+            SELECT /* B: dept 집계 */
+            deptno,
+                COUNT(*) AS cnt,
+                AVG(sal) AS avg_sal,
+                SUM (NVL (comm, /* C: NULL→0 */
+                        0)) AS sum_comm
+            FROM emp
+            GROUP BY deptno
+        )
+        SELECT *
+        FROM dept_stats;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WITH /* A: dept 집계 CTE */")
+            .unwrap_or(0);
+        let cte_header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "dept_stats AS (")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT /* B: dept 집계 */")
+            .unwrap_or(0);
+        let deptno_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno,")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cte_header_idx].auto_depth, contexts[with_idx].auto_depth,
+            "CTE name line after inline comment on WITH should stay on the WITH header depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[cte_header_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT should stay one level deeper than the CTE header"
+        );
+        assert_eq!(
+            contexts[deptno_idx].auto_depth,
+            contexts[select_idx].auto_depth.saturating_add(1),
+            "first select-list item after inline comment on SELECT should promote to list depth"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "select-list item after inline SELECT comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_base_depth, contexts[select_idx].query_base_depth,
+            "inline SELECT comment should preserve the active query base depth for the next list item"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_promote_group_by_item_after_inline_comment_on_header() {
+        let sql = r#"SELECT deptno,
+    COUNT(*) AS cnt
+FROM emp
+GROUP BY /* keep */
+deptno;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "GROUP BY /* keep */")
+            .unwrap_or(0);
+        let deptno_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[deptno_idx].auto_depth,
+            contexts[group_by_idx].auto_depth.saturating_add(1),
+            "GROUP BY item after inline header comment should use list-item depth"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "GROUP BY item after inline header comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
+            "GROUP BY inline-header continuation should preserve the query base depth"
         );
     }
 

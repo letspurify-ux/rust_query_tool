@@ -2069,6 +2069,24 @@ impl SqlEditorWidget {
                     .max(base + 1)
             }
         };
+        let active_list_indent = |indent_level: usize,
+                                  open_cursor_state: OpenCursorFormatState,
+                                  select_list_layout_state: SelectListLayoutState,
+                                  current_clause: Option<&str>,
+                                  merge_active: bool,
+                                  in_column_list: bool| {
+            if in_column_list {
+                base_indent(indent_level, open_cursor_state)
+            } else {
+                clause_list_indent(
+                    indent_level,
+                    open_cursor_state,
+                    select_list_layout_state,
+                    current_clause,
+                    merge_active,
+                )
+            }
+        };
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
                 out.push_str(&" ".repeat(line_indent * 4));
@@ -3296,6 +3314,7 @@ impl SqlEditorWidget {
                     ) && has_leading_newline
                         && !at_line_start
                     {
+                        trim_trailing_space(&mut out);
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -3315,12 +3334,14 @@ impl SqlEditorWidget {
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
-                        let current_select_indent = clause_list_indent(
+                        let in_column_list = column_list_stack.last().copied().unwrap_or(false);
+                        let current_list_indent = active_list_indent(
                             indent_level,
                             open_cursor_state,
                             select_list_layout_state,
                             current_clause.as_deref(),
                             construct.merge_active,
+                            in_column_list,
                         );
                         let next_is_comma = matches!(
                             next_non_comment,
@@ -3342,7 +3363,7 @@ impl SqlEditorWidget {
                                     || w.eq_ignore_ascii_case("EXCEPTION")
                         );
                         let in_confirmed_list = in_set_clause
-                            || column_list_stack.last().copied().unwrap_or(false)
+                            || in_column_list
                             || ((in_select_list || active_list_layout)
                                 && select_list_layout_state.is_multiline())
                             || next_is_comma
@@ -3374,7 +3395,7 @@ impl SqlEditorWidget {
                             // handler's paren_extra offset.
                             line_indent = base + 1 + paren_extra;
                         } else if in_confirmed_list {
-                            line_indent = current_select_indent;
+                            line_indent = current_list_indent;
                         } else if line_indent == 0 {
                             line_indent = base;
                         }
@@ -3399,23 +3420,25 @@ impl SqlEditorWidget {
                         if !out.ends_with('\n') {
                             out.push('\n');
                         }
+                        let in_column_list = column_list_stack.last().copied().unwrap_or(false);
                         if in_select_list
                             || in_set_clause
                             || active_list_layout
-                            || column_list_stack.last().copied().unwrap_or(false)
+                            || in_column_list
                             || hint_after_select
                         {
-                            let select_list_indent = clause_list_indent(
+                            let list_indent = active_list_indent(
                                 indent_level,
                                 open_cursor_state,
                                 select_list_layout_state,
                                 current_clause.as_deref(),
                                 construct.merge_active,
+                                in_column_list,
                             );
-                            line_indent = select_list_indent;
+                            line_indent = list_indent;
                             if hint_after_select {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
-                                    indent: select_list_indent,
+                                    indent: list_indent,
                                     hanging_indent_spaces: None,
                                 };
                             }
@@ -3430,28 +3453,32 @@ impl SqlEditorWidget {
                                 InlineCommentContinuationState::Operand {
                                     indent: line_indent,
                                 };
-                        } else if in_select_list
-                            || in_set_clause
-                            || active_list_layout
-                            || column_list_stack.last().copied().unwrap_or(false)
-                            || hint_after_select
-                        {
-                            let select_list_indent = clause_list_indent(
-                                indent_level,
-                                open_cursor_state,
-                                select_list_layout_state,
-                                current_clause.as_deref(),
-                                construct.merge_active,
-                            );
-                            line_indent = select_list_indent;
-                            if (in_select_list || in_set_clause)
-                                && !select_list_layout_state.is_multiline()
-                                && comment_starts_line
+                        } else {
+                            let in_column_list = column_list_stack.last().copied().unwrap_or(false);
+                            if in_select_list
+                                || in_set_clause
+                                || active_list_layout
+                                || in_column_list
+                                || hint_after_select
                             {
-                                select_list_layout_state = SelectListLayoutState::Multiline {
-                                    indent: select_list_indent,
-                                    hanging_indent_spaces: None,
-                                };
+                                let list_indent = active_list_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    select_list_layout_state,
+                                    current_clause.as_deref(),
+                                    construct.merge_active,
+                                    in_column_list,
+                                );
+                                line_indent = list_indent;
+                                if (in_select_list || in_set_clause)
+                                    && !select_list_layout_state.is_multiline()
+                                    && comment_starts_line
+                                {
+                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        indent: list_indent,
+                                        hanging_indent_spaces: None,
+                                    };
+                                }
                             }
                         }
                     } else if is_block_comment && next_is_word_like {
@@ -3475,18 +3502,21 @@ impl SqlEditorWidget {
                                         indent: continuation_indent,
                                     };
                             } else {
+                                let in_column_list =
+                                    column_list_stack.last().copied().unwrap_or(false);
                                 let list_extra = if in_select_list
                                     || in_set_clause
                                     || active_list_layout
-                                    || column_list_stack.last().copied().unwrap_or(false)
+                                    || in_column_list
                                     || hint_after_select
                                 {
-                                    clause_list_indent(
+                                    active_list_indent(
                                         indent_level,
                                         open_cursor_state,
                                         select_list_layout_state,
                                         current_clause.as_deref(),
                                         construct.merge_active,
+                                        in_column_list,
                                     )
                                     .saturating_sub(base_indent(indent_level, open_cursor_state))
                                 } else {
@@ -3520,6 +3550,10 @@ impl SqlEditorWidget {
                                 Some(SqlToken::Comment(comment))
                                     if !comment.starts_with('\n') && comment.contains('\n')
                             );
+                            let next_is_newline_attached_comment = matches!(
+                                tokens.get(idx + 1),
+                                Some(SqlToken::Comment(comment)) if comment.starts_with('\n')
+                            );
                             if statement_has_with_clause
                                 && matches!(current_clause.as_deref(), Some("SELECT"))
                                 && !open_cursor_state.in_select()
@@ -3529,22 +3563,25 @@ impl SqlEditorWidget {
                             }
                             trim_trailing_space(&mut out);
                             if out.ends_with('\n') || at_line_start {
+                                let in_column_list =
+                                    column_list_stack.last().copied().unwrap_or(false);
                                 if line_indent == 0
                                     && (matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
                                         || select_list_layout_state.has_active_indent()
-                                        || column_list_stack.last().copied().unwrap_or(false)
+                                        || in_column_list
                                         || matches!(
                                             tokens.get(idx.saturating_sub(1)),
                                             Some(SqlToken::Comment(comment))
                                                 if comment.trim_start().starts_with("--")
                                         ))
                                 {
-                                    line_indent = clause_list_indent(
+                                    line_indent = active_list_indent(
                                         indent_level,
                                         open_cursor_state,
                                         select_list_layout_state,
                                         current_clause.as_deref(),
                                         construct.merge_active,
+                                        in_column_list,
                                     );
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
@@ -3552,26 +3589,9 @@ impl SqlEditorWidget {
                             out.push(',');
                             between_pending = false;
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
-                            if column_list_stack.last().copied().unwrap_or(false) {
-                                let comma_extra_indent =
-                                    if (matches!(current_clause.as_deref(), Some("SET"))
-                                        && construct.merge_active)
-                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                            && construct.cursor_sql_active)
-                                    {
-                                        0
-                                    } else {
-                                        1
-                                    };
-                                newline_with(
-                                    &mut out,
-                                    base_indent(indent_level, open_cursor_state),
-                                    comma_extra_indent,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
-                                );
-                            } else if is_with_cte_separator {
+                            if column_list_stack.last().copied().unwrap_or(false)
+                                || is_with_cte_separator
+                            {
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
@@ -3637,7 +3657,9 @@ impl SqlEditorWidget {
                                     );
                                 }
                             } else {
-                                out.push(' ');
+                                if !next_is_newline_attached_comment {
+                                    out.push(' ');
+                                }
                                 needs_space = false;
                             }
                         }
@@ -3722,9 +3744,20 @@ impl SqlEditorWidget {
                         }
                         "(" => {
                             with_cte_state.on_open_paren();
-                            if matches!(current_clause.as_deref(), Some("SELECT"))
-                                && matches!(prev_word_upper.as_deref(), Some("SELECT"))
-                            {
+                            let is_query_paren = next_word_is("SELECT")
+                                || next_word_is("WITH")
+                                || next_word_is("INSERT")
+                                || next_word_is("UPDATE")
+                                || next_word_is("DELETE")
+                                || next_word_is("MERGE")
+                                || next_word_is("CALL")
+                                || next_word_is("VALUES")
+                                || next_word_is("TABLE");
+                            if Self::paren_starts_first_clause_list_item(
+                                current_clause.as_deref(),
+                                prev_word_upper.as_deref(),
+                                is_query_paren,
+                            ) {
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
@@ -3736,15 +3769,6 @@ impl SqlEditorWidget {
                             }
 
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
-                            let is_query_paren = next_word_is("SELECT")
-                                || next_word_is("WITH")
-                                || next_word_is("INSERT")
-                                || next_word_is("UPDATE")
-                                || next_word_is("DELETE")
-                                || next_word_is("MERGE")
-                                || next_word_is("CALL")
-                                || next_word_is("VALUES")
-                                || next_word_is("TABLE");
                             let is_multiline_clause_paren = matches!(
                                 prev_word_upper.as_deref(),
                                 Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
@@ -3759,7 +3783,10 @@ impl SqlEditorWidget {
                                 out.push(' ');
                             }
                             out.push('(');
-                            let is_column_list = construct.create_table_paren_expected;
+                            let is_column_list = Self::paren_opens_structured_column_list(
+                                prev_word_upper.as_deref(),
+                                construct.create_table_paren_expected,
+                            );
                             construct.create_table_paren_expected = false;
                             paren_stack.push(is_subquery);
                             if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
@@ -3868,6 +3895,7 @@ impl SqlEditorWidget {
                             {
                                 construct.match_recognize_paren_depth = None;
                             }
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push(')');
                             needs_space = true;
                         }
@@ -4744,6 +4772,7 @@ impl SqlEditorWidget {
                         && !next.starts_with(')')
                 });
             let uses_analyzer_query_depth = layouts[idx].query_role != AutoFormatQueryRole::None
+                && !current_line_is_condition_keyword
                 && !current_line_is_match_recognize_subclause
                 && !previous_line_is_forall_header
                 && !use_cursor_parser_depth;
@@ -6387,6 +6416,21 @@ impl SqlEditorWidget {
             })
     }
 
+    fn paren_starts_first_clause_list_item(
+        current_clause: Option<&str>,
+        prev_word_upper: Option<&str>,
+        is_query_paren: bool,
+    ) -> bool {
+        matches!(
+            (current_clause, prev_word_upper),
+            (Some("SELECT"), Some("SELECT"))
+        ) || (is_query_paren
+            && matches!(
+                (current_clause, prev_word_upper),
+                (Some("GROUP" | "ORDER"), Some("BY"))
+            ))
+    }
+
     fn line_significant_paren_counts(line: &str) -> (usize, usize) {
         super::query_text::tokenize_sql(line).into_iter().fold(
             (0usize, 0usize),
@@ -6605,6 +6649,16 @@ impl SqlEditorWidget {
     fn is_plsql_like_statement(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
         Self::is_plsql_like_tokens(statement, &tokens)
+    }
+
+    fn paren_opens_structured_column_list(
+        prev_word_upper: Option<&str>,
+        create_table_paren_expected: bool,
+    ) -> bool {
+        // Oracle table functions expose nested column definitions through
+        // `... COLUMNS (...)`; those parentheses should format like a column
+        // list instead of a generic function-argument group.
+        create_table_paren_expected || matches!(prev_word_upper, Some("COLUMNS"))
     }
 
     #[cfg(test)]
@@ -11034,6 +11088,45 @@ END;"#;
     }
 
     #[test]
+    fn open_for_with_inline_block_comment_after_select_keeps_first_select_item_depth() {
+        let sql = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH /* A: dept 집계 CTE */
+        dept_stats AS (
+            SELECT /* B: dept 집계 */
+            deptno,
+                COUNT(*) AS cnt,
+                AVG(sal) AS avg_sal,
+                SUM (NVL (comm, /* C: NULL→0 */
+                        0)) AS sum_comm
+            FROM emp
+            GROUP BY deptno
+        )
+        SELECT *
+        FROM dept_stats;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(sql, false);
+
+        assert!(
+            formatted.contains(
+                "WITH /* A: dept 집계 CTE */\n        dept_stats AS (\n            SELECT /* B: dept 집계 */\n                deptno,"
+            ),
+            "inline block comment after SELECT in CTE body should keep the first select item on list depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "SELECT /* B: dept 집계 */\n            deptno,"
+            ),
+            "first select-list item after inline SELECT comment must not stay on the SELECT header depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn plsql_nested_with_clause_does_not_keep_two_level_extra_indent() {
         let sql = r#"BEGIN
     SELECT o.id
@@ -11584,6 +11677,133 @@ END;";
     }
 
     #[test]
+    fn format_sql_basic_keeps_parenthesized_order_by_scalar_subquery_on_list_depth() {
+        let source = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+    OPEN p_rc FOR
+        WITH base AS (
+            SELECT e.empno,
+                e.ename,
+                e.job,
+                e.deptno,
+                e.sal,
+                e.comm,
+                e.mgr
+            FROM emp e
+        ),
+        enriched AS (
+            SELECT b.*,
+                NVL (b.comm, /* AZ: comm NULL→0 */
+                    0) AS eff_comm,
+                CASE
+                    WHEN b.job = 'PRESIDENT' THEN
+                        CASE
+                            WHEN b.sal > /* BB: elite 기준 */
+                            4000 THEN 'ELITE'
+                            ELSE 'SENIOR'
+                        END
+                    WHEN b.job IN (
+                        'MANAGER', 'ANALYST') THEN
+                            CASE
+                                WHEN b.sal >= 3000 THEN 'HIGH'
+                                WHEN b.sal >= /* BD: mid 기준 */
+                            2000 THEN 'MID'
+                                ELSE 'LOW'
+                            END
+                    ELSE
+                        CASE
+                            WHEN NVL (b.comm, /* BE: NULL→0 */
+                                0) > 0 THEN 'COMMISSION'
+                            ELSE 'BASE'
+                        END
+                END AS pay_tier
+            FROM base b
+        )
+        SELECT e.empno,
+            e.ename,
+            e.job,
+            e.deptno,
+            e.sal,
+            e.pay_tier,
+            (
+                SELECT d.dname
+                FROM dept d
+                WHERE d.deptno = e.deptno
+            ) AS dname
+        FROM enriched e
+        ORDER BY
+        (
+            SELECT COUNT(*)
+            FROM emp e2
+            WHERE e2.deptno = e.deptno
+        ) DESC,
+            e.sal DESC NULLS LAST;
+END;
+/"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let order_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER BY")
+            .unwrap_or(0);
+        let open_paren_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_by_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let scalar_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_paren_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT COUNT"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") DESC,"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_sort_key_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_paren_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("e.sal DESC NULLS LAST;"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[open_paren_idx]) > leading_spaces(lines[order_by_idx]),
+            "ORDER BY scalar-subquery sort key should indent deeper than ORDER BY header, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[scalar_select_idx]) > leading_spaces(lines[open_paren_idx]),
+            "Scalar subquery SELECT should indent deeper than its opening paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_paren_idx]),
+            leading_spaces(lines[open_paren_idx]),
+            "Scalar subquery close paren in ORDER BY should align with its opening paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[second_sort_key_idx]),
+            leading_spaces(lines[open_paren_idx]),
+            "Subsequent ORDER BY sort keys should align with the parenthesized sort key, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_indents_comment_in_from_list() {
         let source = "select * from t1\n-- join next table\n,t2\n,t3 where t1.id = t2.id;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -12060,6 +12280,88 @@ FROM emp;"#;
         .join("\n");
 
         assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_inline_comment_operand_depth_inside_not_exists_subquery() {
+        let source = r#"SELECT *
+FROM (
+        /* Q: 인라인뷰 시작 */
+        WITH x AS (
+            SELECT
+                p.order_id,
+                p.cust_name,
+                p.order_dt,
+                a.amt
+            FROM paid p
+            JOIN amounts a
+                ON /* R: join key */
+                a.order_id = p.order_id
+            WHERE a.amt > /* S: threshold */
+                50
+        )
+        SELECT
+            x.*,
+            (
+                -- [T] 라인수 서브쿼리
+                SELECT COUNT (*)
+                FROM order_item oi
+                WHERE oi.order_id = x.order_id
+            ) AS line_cnt
+        FROM x
+    ) v
+WHERE EXISTS (
+        /* U: SKU 존재 조건 */
+        SELECT 1
+        FROM order_item oi
+        WHERE oi.order_id = v.order_id
+            AND oi.sku LIKE 'SKU-%' -- [V] SKU 패턴
+    )
+    AND NOT EXISTS (
+        -- [W] 음수 수량 배제
+        SELECT 1
+        FROM order_item oi
+        WHERE oi.order_id = v.order_id
+            AND oi.qty <= /* X: 0 이하 */
+        0
+    )
+ORDER BY v.amt DESC;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND oi.qty <="))
+            .expect("formatted SQL should contain the NOT EXISTS operand owner line");
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "0")
+            .expect("formatted SQL should contain the split operand line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(operand_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("formatted SQL should contain the NOT EXISTS closing parenthesis");
+
+        assert_eq!(
+            indent(lines[operand_idx]),
+            indent(lines[and_idx]),
+            "operand after inline block comment inside NOT EXISTS should stay at the active condition indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[close_idx]) < indent(lines[operand_idx]),
+            "closing parenthesis after the operand should dedent from the NOT EXISTS condition body, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for NOT EXISTS inline-comment operand continuation"
+        );
     }
 }
 
@@ -13534,6 +13836,60 @@ END;"#;
         assert!(
             !formatted.contains("SELECT jd.id,\n\n            /* AM: JSON 파싱 결과 */"),
             "formatter should not insert a blank line before the JSON_TABLE select-list comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_breaks_json_table_columns_clause_into_aligned_items() {
+        let source = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+    p_rc SYS_REFCURSOR;
+BEGIN
+     OPEN p_rc FOR
+        WITH jdocs AS (
+            SELECT id,
+                payload
+            FROM json_docs
+            WHERE /* AL: 활성 문서만 */
+            active_flag = 1
+        )
+        SELECT jd.id,
+            /* AM: JSON 파싱 결과 */
+            jt.order_id,
+            jt.cust_name,
+            jt.tier,
+            it.sku,
+            it.qty,
+            it.price,
+            (it.qty * it.price) AS line_amt
+        FROM jdocs jd
+        CROSS JOIN JSON_TABLE (jd.payload, 
+            /* AN: root path */
+            '$' COLUMNS (
+                -- [AO] 최상위 컬럼
+                order_id NUMBER PATH '$.order_id', cust_name VARCHAR2 (100) PATH '$.customer.name', tier VARCHAR2 (20) PATH '$.customer.tier', NESTED PATH '$.items[*]' COLUMNS (
+                    /* AP: 아이템 컬럼 */
+                    sku VARCHAR2 (30) PATH '$.sku', qty NUMBER PATH '$.qty', price NUMBER PATH '$.price') -- [AQ] nested columns 끝
+            )        -- [AR] outer columns 끝
+        )         jt
+        CROSS APPLY (
+            -- [AS] item alias
+            SELECT jt.sku,
+                jt.qty,
+                jt.price
+            FROM DUAL
+        ) it
+        ORDER BY jd.id,
+            it.sku;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert!(
+            formatted.contains(
+                "        CROSS JOIN JSON_TABLE (jd.payload,\n            /* AN: root path */\n            '$' COLUMNS (\n                -- [AO] 최상위 컬럼\n                order_id NUMBER PATH '$.order_id',\n                cust_name VARCHAR2 (100) PATH '$.customer.name',\n                tier VARCHAR2 (20) PATH '$.customer.tier',\n                NESTED PATH '$.items[*]' COLUMNS (\n                    /* AP: 아이템 컬럼 */\n                    sku VARCHAR2 (30) PATH '$.sku',\n                    qty NUMBER PATH '$.qty',\n                    price NUMBER PATH '$.price'\n                ) -- [AQ] nested columns 끝\n            ) -- [AR] outer columns 끝\n        ) jt"
+            ),
+            "JSON_TABLE COLUMNS clause should reuse structured column-list layout, got:\n{}",
             formatted
         );
     }
