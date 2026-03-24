@@ -1351,6 +1351,11 @@ impl ResultTableWidget {
         table.set_row_height_all(Self::row_height_for_font(DEFAULT_FONT_SIZE as u32));
         table.set_rows(0);
         table.set_cols(0);
+        // Ensure the custom handle closure runs BEFORE Fl_Table's native handler.
+        // With the default super_handle_first=true, Fl_Table::handle() always runs
+        // first and sets its own selection on Push/Drag, causing double set_selection
+        // calls per event and visible selection flicker.
+        table.super_handle_first(false);
         table.end();
 
         // Capture theme colors once for draw_cell (avoids per-cell function calls)
