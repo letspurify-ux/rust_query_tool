@@ -690,6 +690,30 @@ impl OpenCursorFormatState {
 }
 
 impl SqlEditorWidget {
+    fn leading_indent_columns(line: &str) -> usize {
+        const INDENT_TAB_WIDTH: usize = 4;
+        let mut columns = 0usize;
+
+        for ch in line.chars() {
+            match ch {
+                ' ' => {
+                    columns = columns.saturating_add(1);
+                }
+                '\t' => {
+                    let next_tab_stop =
+                        ((columns / INDENT_TAB_WIDTH).saturating_add(1)) * INDENT_TAB_WIDTH;
+                    columns = next_tab_stop;
+                }
+                _ if ch.is_whitespace() => {
+                    columns = columns.saturating_add(1);
+                }
+                _ => break,
+            }
+        }
+
+        columns
+    }
+
     fn starts_with_end_suffix_terminator(trimmed_upper: &str) -> bool {
         if !crate::sql_text::starts_with_keyword_token(trimmed_upper, "END") {
             return false;
@@ -3974,6 +3998,8 @@ impl SqlEditorWidget {
                 }
             };
 
+            let leading_indent_columns = Self::leading_indent_columns(raw);
+
             layouts.push(LineLayout {
                 raw,
                 trimmed,
@@ -3996,8 +4022,8 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
-                existing_indent_spaces: raw.len().saturating_sub(trimmed.len()),
+                existing_indent: leading_indent_columns / 4,
+                existing_indent_spaces: leading_indent_columns,
                 final_depth: 0,
                 anchor_group: None,
                 dml_case_expression_close_depth: None,
@@ -7901,6 +7927,97 @@ CROSS APPLY (
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "auto formatting should stay stable after normalizing EXISTS indentation in APPLY statements"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_normalizes_mixed_tab_space_hanging_indent_in_exists_condition() {
+        let source = "SELECT\n    d.department_name\nFROM departments d\nWHERE EXISTS (\n    SELECT 1\n    FROM bonus_data b\n    WHERE b.emp_id = d.department_id\n\t     AND b.bonus_amt >= 300\n);";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE b.emp_id = d.department_id")
+            .expect("formatted output should contain EXISTS child WHERE");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND b.bonus_amt >= 300")
+            .expect("formatted output should contain EXISTS child AND");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "mixed tab+space indentation should not be preserved as odd hanging indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_does_not_preserve_tab_derived_odd_select_list_indent() {
+        let source = "SELECT employee_id,\n\t      first_name,\n    last_name\nFROM employees;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let first_name_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .trim_end_matches(',')
+                    .eq_ignore_ascii_case("first_name")
+            })
+            .unwrap_or_else(|| panic!("formatted output should contain first_name, got:\n{}", formatted));
+        let last_name_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .trim_end_matches(',')
+                    .eq_ignore_ascii_case("last_name")
+            })
+            .unwrap_or_else(|| panic!("formatted output should contain last_name, got:\n{}", formatted));
+
+        assert_eq!(
+            indent(lines[first_name_idx]),
+            indent(lines[last_name_idx]),
+            "tab-derived odd indentation in SELECT list should normalize to canonical continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_preserves_visual_odd_hanging_indent_with_tabs() {
+        let source = "SELECT department_id
+FROM departments d
+WHERE EXISTS (
+        SELECT 1
+        FROM bonus_data b
+        WHERE b.emp_id = d.department_id
+\t      AND b.bonus_amt >= 300
+    );";
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND b.bonus_amt >= 300")
+            .expect("formatted output should contain EXISTS child AND");
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE b.emp_id = d.department_id")
+            .expect("formatted output should contain EXISTS child WHERE");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(2),
+            "tab + six spaces should be treated as visual ten-space odd hanging indent in parser-depth layout pass, got:\n{}",
+            formatted
         );
     }
 
