@@ -3406,7 +3406,7 @@ impl SqlEditorWidget {
                                 };
                             }
                         } else {
-                            line_indent = 0;
+                            line_indent = base_indent(indent_level, open_cursor_state);
                         }
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
@@ -14242,6 +14242,28 @@ WHERE (((status = 'A' OR status = 'B')
         assert_eq!(
             reformatted, formatted,
             "function call nesting should be stable:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_open_for_select_after_block_comment_in_package_body() {
+        let sql = "create package body a as\nprocedure b (c in number) as\nbegin\n/* */\nopen cv for\nselect 1\nfrom dual;\nend b;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("OPEN cv FOR\n            SELECT 1\n            FROM DUAL;"),
+            "SELECT after OPEN FOR should be indented exactly 1 level deeper than OPEN, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_open_for_select_after_block_comment_in_begin() {
+        let sql = "begin\n/* */\nopen cv for\nselect 1\nfrom dual;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("OPEN cv FOR\n        SELECT 1\n        FROM DUAL;"),
+            "SELECT after OPEN FOR should be indented exactly 1 level deeper than OPEN, got:\n{}",
             formatted
         );
     }
