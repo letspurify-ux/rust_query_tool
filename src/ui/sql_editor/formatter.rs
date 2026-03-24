@@ -4579,7 +4579,7 @@ impl SqlEditorWidget {
             });
             let previous_line_is_condition_keyword = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                prev_upper.starts_with("AND ") || prev_upper.starts_with("OR ")
+                Self::starts_with_condition_keyword(&prev_upper)
             });
             let previous_line_is_join_condition_clause = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
@@ -4677,7 +4677,7 @@ impl SqlEditorWidget {
                     None
                 };
             let current_line_is_condition_keyword =
-                trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ");
+                Self::starts_with_condition_keyword(&trimmed_upper);
             let current_line_is_condition_query_owner =
                 Self::line_has_condition_query_owner(&trimmed_upper);
             let active_dml_case_condition_frame = dml_case_condition_frames
@@ -5725,8 +5725,7 @@ impl SqlEditorWidget {
             .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
         let previous_code = previous_code_idx.and_then(|prev_idx| layouts.get(prev_idx));
 
-        let preserves_condition_hanging_indent = (trimmed_upper.starts_with("AND ")
-            || trimmed_upper.starts_with("OR "))
+        let preserves_condition_hanging_indent = Self::starts_with_condition_keyword(&trimmed_upper)
             && layout.existing_indent_spaces.saturating_add(2) == depth_indent
             && previous_code.is_some_and(|previous| {
                 let previous_upper = previous.trimmed.to_ascii_uppercase();
@@ -5734,8 +5733,7 @@ impl SqlEditorWidget {
                     && (crate::sql_text::starts_with_keyword_token(&previous_upper, "WHERE")
                         || crate::sql_text::starts_with_keyword_token(&previous_upper, "HAVING")
                         || crate::sql_text::starts_with_keyword_token(&previous_upper, "ON")
-                        || previous_upper.starts_with("AND ")
-                        || previous_upper.starts_with("OR "))
+                        || Self::starts_with_condition_keyword(&previous_upper))
             });
         if preserves_condition_hanging_indent {
             return true;
@@ -5889,6 +5887,11 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+    }
+
+    fn starts_with_condition_keyword(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "AND")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OR")
     }
 
     fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
@@ -14467,6 +14470,44 @@ WHERE (((status = 'A' OR status = 'B')
             indent(lines[or_idx]),
             indent(lines[and_idx]),
             "OR should be at same depth as AND, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn join_on_condition_keywords_without_space_are_aligned_as_conditions() {
+        let input = "select * from a join b on a.id = b.id and(a.flag = 'Y') or(b.flag = 'N');";
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("ON "))
+            .expect("ON line");
+        let and_idx = lines
+            .iter()
+            .position(|l| {
+                crate::sql_text::starts_with_keyword_token(&l.trim_start().to_ascii_uppercase(), "AND")
+            })
+            .expect("AND line");
+        let or_idx = lines
+            .iter()
+            .position(|l| {
+                crate::sql_text::starts_with_keyword_token(&l.trim_start().to_ascii_uppercase(), "OR")
+            })
+            .expect("OR line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]) + 4,
+            "AND(...) should be treated as JOIN condition continuation, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[or_idx]),
+            indent(lines[and_idx]),
+            "OR(...) should align with sibling condition keyword, got:\n{}",
             formatted
         );
     }
