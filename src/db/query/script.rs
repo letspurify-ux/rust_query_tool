@@ -5046,12 +5046,19 @@ impl QueryExecutor {
         let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
         let is_sql_set_clause_context = is_alter_session_set_clause || is_sql_set_statement;
 
+        // ORDER BY modifiers (DESC, ASC, NULLS FIRST/LAST) on their own line
+        // must not be mistaken for SQL*Plus tool commands (e.g. DESC → DESCRIBE).
+        let is_order_by_modifier_line = Self::is_order_by_modifier_line(trimmed)
+            && !builder.current_is_empty()
+            && builder.current_has_order_by_context();
+
         // Tool command appearing after a slash-terminable open statement
         if builder.is_idle()
             && !builder.current_is_empty()
             && builder.paren_depth() == 0
             && builder.can_terminate_on_slash()
             && !is_sql_set_clause_context
+            && !is_order_by_modifier_line
             && Self::parse_tool_command(trimmed).is_some()
         {
             for stmt in builder.force_terminate_and_take_statements() {
@@ -5066,7 +5073,8 @@ impl QueryExecutor {
             builder.current_is_empty(),
             parser_is_top_level,
             is_sql_set_clause_context,
-        ) {
+        ) && !is_order_by_modifier_line
+        {
             if let Some(command) = Self::parse_tool_command(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, items);
