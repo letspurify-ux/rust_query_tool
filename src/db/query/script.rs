@@ -4986,9 +4986,9 @@ impl QueryExecutor {
         }
 
         let is_set_clause = Self::is_set_clause_line(trimmed);
-        let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
+        let is_alter_set_clause = is_set_clause && builder.starts_with_alter_set_context();
         let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
-        let is_sql_set_clause_context = is_alter_session_set_clause || is_sql_set_statement;
+        let is_sql_set_clause_context = is_alter_set_clause || is_sql_set_statement;
 
         // ORDER BY modifiers (DESC, ASC, NULLS FIRST/LAST) on their own line
         // must not be mistaken for SQL*Plus tool commands (e.g. DESC → DESCRIBE).

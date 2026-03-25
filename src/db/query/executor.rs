@@ -1518,6 +1518,10 @@ impl QueryExecutor {
                 self.builder.starts_with_alter_session()
             }
 
+            fn starts_with_alter_set_context(&self) -> bool {
+                self.builder.starts_with_alter_set_context()
+            }
+
             fn line_non_whitespace_start(line: &str, from: usize) -> Option<usize> {
                 if from > line.len() || !line.is_char_boundary(from) {
                     return None;
@@ -1715,7 +1719,7 @@ impl QueryExecutor {
             }
 
             let is_alter_session_set_clause =
-                collector.starts_with_alter_session() && Self::is_set_clause_line(trimmed);
+                collector.starts_with_alter_set_context() && Self::is_set_clause_line(trimmed);
 
             if collector.builder.is_idle()
                 && !collector.builder.current_is_empty()

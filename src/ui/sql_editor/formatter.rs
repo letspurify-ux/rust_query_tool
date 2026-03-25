@@ -17292,4 +17292,283 @@ MATCH_RECOGNIZE (
         );
     }
 
+    // ── Bug analysis test cases: statement split and indent quality ──
+
+    // Bug candidate 1: MATCH_RECOGNIZE DEFINE A AS ... (statement split)
+    #[test]
+    fn format_sql_basic_match_recognize_define_multiline_stays_single_statement() {
+        let source = "SELECT *\nFROM sales\nMATCH_RECOGNIZE (\n  PARTITION BY customer_id\n  ORDER BY sale_date\n  MEASURES CLASSIFIER() AS cls\n  PATTERN (A B+)\n  DEFINE A AS amount < 100,\n         B AS amount >= 100\n);";
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let stmt_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::Statement(_)))
+            .count();
+        let tool_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::ToolCommand(_)))
+            .count();
+        assert_eq!(
+            stmt_count, 1,
+            "MATCH_RECOGNIZE with multiline DEFINE should be one statement, got {} statements and {} tool commands from: {:?}",
+            stmt_count, tool_count, items
+        );
+        assert_eq!(
+            tool_count, 0,
+            "DEFINE inside MATCH_RECOGNIZE must not be parsed as tool command, got: {:?}",
+            items
+        );
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("DEFINE"),
+            "DEFINE should remain in the formatted output, got:\n{}",
+            formatted
+        );
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MATCH_RECOGNIZE DEFINE formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
+    // Bug candidate 2: ALTER SYSTEM SET (statement split)
+    #[test]
+    fn format_sql_basic_alter_system_set_stays_single_statement() {
+        let source = "ALTER SYSTEM\nSET optimizer_mode = ALL_ROWS;";
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let stmt_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::Statement(_)))
+            .count();
+        let tool_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::ToolCommand(_)))
+            .count();
+        assert_eq!(
+            stmt_count, 1,
+            "ALTER SYSTEM SET should be one statement, got {} statements and {} tool commands from: {:?}",
+            stmt_count, tool_count, items
+        );
+        assert_eq!(
+            tool_count, 0,
+            "SET inside ALTER SYSTEM must not be parsed as tool command, got: {:?}",
+            items
+        );
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ALTER SYSTEM"),
+            "ALTER SYSTEM should be in output, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SET"),
+            "SET should be in output, got:\n{}",
+            formatted
+        );
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "ALTER SYSTEM SET formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
+    // Bug candidate 2b: ALTER SYSTEM SET with SQL*Plus-overlapping parameter names
+    #[test]
+    fn split_format_items_alter_system_set_long_not_tool_command() {
+        // "SET LONG 100" would match SQL*Plus SET LONG, but should stay as part of ALTER SYSTEM
+        let source = "ALTER SYSTEM\nSET LONG 100;";
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let stmt_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::Statement(_)))
+            .count();
+        let tool_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::ToolCommand(_)))
+            .count();
+        assert_eq!(
+            stmt_count, 1,
+            "ALTER SYSTEM SET LONG should be one statement, got {} stmts + {} tool cmds: {:?}",
+            stmt_count, tool_count, items
+        );
+        assert_eq!(
+            tool_count, 0,
+            "SET LONG inside ALTER SYSTEM must not be a tool command, got: {:?}",
+            items
+        );
+    }
+
+    // Bug candidate 3: MERGE branch alignment
+    #[test]
+    fn format_sql_basic_merge_using_and_when_branches_alignment() {
+        let source = "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val, t.updated_at = SYSTIMESTAMP WHEN NOT MATCHED THEN INSERT (id, val, updated_at) VALUES (s.id, s.val, SYSTIMESTAMP);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines.iter().copied().find(|l| l.trim_start().starts_with(prefix))
+        };
+
+        // USING should be present and at base depth (same as MERGE)
+        let using_line = find_line("USING");
+        assert!(
+            using_line.is_some(),
+            "USING should appear on its own line, got:\n{}",
+            formatted
+        );
+
+        // Both WHEN branches at same depth
+        let when_matched = find_line("WHEN MATCHED THEN").unwrap_or("");
+        let when_not_matched = find_line("WHEN NOT MATCHED THEN").unwrap_or("");
+        assert!(
+            !when_matched.is_empty() && !when_not_matched.is_empty(),
+            "Both WHEN branches should be present, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(when_matched),
+            leading(when_not_matched),
+            "WHEN MATCHED and WHEN NOT MATCHED should be at same depth, got:\n{}",
+            formatted
+        );
+
+        // UPDATE SET and INSERT should be indented under their WHEN
+        let update_line = find_line("UPDATE SET");
+        let insert_line = find_line("INSERT (");
+        assert!(
+            update_line.is_some() && insert_line.is_some(),
+            "UPDATE SET and INSERT should be present, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading(update_line.unwrap()) > leading(when_matched),
+            "UPDATE SET should be deeper than WHEN MATCHED, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MERGE formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
+    // Bug candidate 4: JOIN ... USING (...) alignment
+    #[test]
+    fn format_sql_basic_join_using_same_depth_as_join_on() {
+        let source = "SELECT * FROM a JOIN b USING (id, tenant_id) LEFT OUTER JOIN c USING (id, tenant_id) JOIN d ON d.id = a.id AND d.tenant_id = a.tenant_id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        // All JOIN keywords should be at the same indent
+        let join_lines: Vec<&&str> = lines.iter().filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("JOIN ") || t.starts_with("LEFT OUTER JOIN ") || t.starts_with("LEFT JOIN ") || t.starts_with("RIGHT JOIN ") || t.starts_with("INNER JOIN ")
+        }).collect();
+
+        assert!(
+            join_lines.len() >= 3,
+            "Should have at least 3 JOIN lines, got {} in:\n{}",
+            join_lines.len(),
+            formatted
+        );
+
+        let first_indent = leading(join_lines[0]);
+        for join_line in &join_lines {
+            assert_eq!(
+                leading(join_line),
+                first_indent,
+                "All JOINs should be at the same indent level, got:\n{}",
+                formatted
+            );
+        }
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "JOIN USING formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
+    // Bug candidate 5: Window function OVER (...) internal alignment
+    #[test]
+    fn format_sql_basic_over_partition_by_internal_indent() {
+        let source = "SELECT deptno, ROW_NUMBER() OVER (PARTITION BY deptno ORDER BY sal DESC, empno) AS rn, SUM(sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run_sal FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        // Basic structural checks: OVER, PARTITION BY, ORDER BY should be present
+        assert!(
+            formatted.contains("OVER"),
+            "OVER should be in output, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("PARTITION BY"),
+            "PARTITION BY should be in output, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Window function OVER formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
+    // Bug candidate 6: MODEL internal subclauses alignment
+    #[test]
+    fn format_sql_basic_model_subclauses_alignment() {
+        let source = "SELECT * FROM sales MODEL PARTITION BY (country) DIMENSION BY (prod_id) MEASURES (amount) RULES UPDATE (amount[ANY] = amount[CV()] * 1.1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines.iter().copied().find(|l| l.trim_start().starts_with(prefix))
+        };
+
+        // MODEL subclauses should each be on their own line
+        let partition_line = find_line("PARTITION BY");
+        let dimension_line = find_line("DIMENSION BY");
+        let measures_line = find_line("MEASURES");
+        let rules_line = find_line("RULES");
+
+        assert!(
+            partition_line.is_some()
+                && dimension_line.is_some()
+                && measures_line.is_some()
+                && rules_line.is_some(),
+            "MODEL subclauses should each appear on their own line, got:\n{}",
+            formatted
+        );
+
+        // All subclauses should be at the same depth (indented under MODEL)
+        let p = leading(partition_line.unwrap());
+        let d = leading(dimension_line.unwrap());
+        let m = leading(measures_line.unwrap());
+        let r = leading(rules_line.unwrap());
+        assert_eq!(p, d, "PARTITION BY and DIMENSION BY should be at same depth, got:\n{}", formatted);
+        assert_eq!(d, m, "DIMENSION BY and MEASURES should be at same depth, got:\n{}", formatted);
+        assert_eq!(m, r, "MEASURES and RULES should be at same depth, got:\n{}", formatted);
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MODEL subclauses formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
+            formatted, formatted_again
+        );
+    }
+
 }
