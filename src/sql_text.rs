@@ -1414,6 +1414,31 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
     last_word: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
     let last_upper = last_word.to_ascii_uppercase();
+
+    // Two-word combinations take priority over single-word matches so that
+    // e.g. (LEFT, JOIN) is classified as OneDeeperThanCurrentLine rather
+    // than falling through to JOIN's single-word OneDeeperThanQueryBase.
+    let previous_upper = previous_word.map(str::to_ascii_uppercase);
+    if let Some(ref previous_upper) = previous_upper {
+        if matches!(
+            (previous_upper.as_str(), last_upper.as_str()),
+            ("GROUP", "BY")
+                | ("ORDER", "BY")
+                | ("PARTITION", "BY")
+                | ("DIMENSION", "BY")
+                | ("START", "WITH")
+                | ("CONNECT", "BY")
+        ) || (FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper.as_str())
+            && last_upper == "JOIN")
+            || (previous_upper == "SELECT"
+                && matches!(last_upper.as_str(), "DISTINCT" | "UNIQUE" | "ALL"))
+            || (matches!(previous_upper.as_str(), "BETWEEN" | "OF")
+                && is_format_temporal_boundary_keyword(last_upper.as_str()))
+        {
+            return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+        }
+    }
+
     if matches_keyword(
         last_upper.as_str(),
         FORMAT_INLINE_COMMENT_HEADER_SAME_DEPTH_KEYWORDS,
@@ -1430,26 +1455,6 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
         last_upper.as_str(),
         FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS,
     ) {
-        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
-    }
-
-    let previous_upper = previous_word.map(str::to_ascii_uppercase);
-    let previous_upper = previous_upper.as_deref()?;
-
-    if matches!(
-        (previous_upper, last_upper.as_str()),
-        ("GROUP", "BY")
-            | ("ORDER", "BY")
-            | ("PARTITION", "BY")
-            | ("DIMENSION", "BY")
-            | ("START", "WITH")
-            | ("CONNECT", "BY")
-    ) || (FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper) && last_upper == "JOIN")
-        || (previous_upper == "SELECT"
-            && matches!(last_upper.as_str(), "DISTINCT" | "UNIQUE" | "ALL"))
-        || (matches!(previous_upper, "BETWEEN" | "OF")
-            && is_format_temporal_boundary_keyword(last_upper.as_str()))
-    {
         return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
