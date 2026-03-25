@@ -115,6 +115,7 @@ struct ConstructState {
     returning_active: bool,
     search_cycle_clause_active: bool,
     match_recognize_paren_depth: Option<usize>,
+    analytic_over_paren_depth: Option<usize>,
     fetch_active: bool,
     bulk_collect_active: bool,
     insert_all_active: bool,
@@ -140,7 +141,13 @@ impl ConstructState {
         trigger_header_state: TriggerHeaderState,
         is_analytic_within_group: bool,
         is_fetch_into_single_target: bool,
+        in_analytic_over_paren: bool,
     ) -> bool {
+        // Inside analytic OVER(): clause keywords are handled by the
+        // analytic_over_paren_depth branch instead.
+        if in_analytic_over_paren {
+            return true;
+        }
         // INSERT INTO stays on same line
         if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT")) {
             return true;
@@ -2480,6 +2487,9 @@ impl SqlEditorWidget {
                             trigger_header_state,
                             is_analytic_within_group,
                             !Self::fetch_into_has_multiple_targets(tokens, idx),
+                            construct.analytic_over_paren_depth.is_some_and(|depth| {
+                                paren_stack.len() >= depth
+                            }),
                         )
                     {
                         // Keep shallow FORALL bodies one level deeper, but do not
@@ -2853,6 +2863,18 @@ impl SqlEditorWidget {
                             && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
                                 || (upper == "ONE" && next_word_is("ROW"))
                                 || (upper == "ALL" && next_word_is("ROWS")))
+                    }) {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if construct.analytic_over_paren_depth.is_some_and(|depth| {
+                        paren_stack.len() >= depth
+                            && (matches!(upper.as_str(), "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"))
                     }) {
                         newline_with(
                             &mut out,
@@ -3807,10 +3829,12 @@ impl SqlEditorWidget {
                             }
 
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            let is_analytic_over_paren =
+                                prev_word_upper.as_deref() == Some("OVER");
                             let is_multiline_clause_paren = matches!(
                                 prev_word_upper.as_deref(),
                                 Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
-                            );
+                            ) || is_analytic_over_paren;
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
                             let keeps_aggregate_call_tight = statement_has_apply
                                 && matches!(
@@ -3829,6 +3853,9 @@ impl SqlEditorWidget {
                             paren_stack.push(is_subquery);
                             if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
                                 construct.match_recognize_paren_depth = Some(paren_stack.len());
+                            }
+                            if is_analytic_over_paren {
+                                construct.analytic_over_paren_depth = Some(paren_stack.len());
                             }
                             paren_clause_restore_stack.push(if is_subquery {
                                 current_clause.clone()
@@ -3932,6 +3959,12 @@ impl SqlEditorWidget {
                                 .is_some_and(|depth| paren_stack.len() < depth)
                             {
                                 construct.match_recognize_paren_depth = None;
+                            }
+                            if construct
+                                .analytic_over_paren_depth
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
+                                construct.analytic_over_paren_depth = None;
                             }
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push(')');
@@ -15936,6 +15969,55 @@ join b on a.id = b.id and a.x = b.x
         assert!(
             formatted.contains("\n    ALL ROWS PER MATCH"),
             "ALL ROWS PER MATCH should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_analytic_over_clause_breaks_subclauses() {
+        let source = "SELECT empno, SUM(sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let expected = r#"SELECT empno,
+    SUM (sal) OVER (
+        PARTITION BY deptno
+        ORDER BY hiredate
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_sal
+FROM emp;"#;
+        assert_eq!(formatted, expected);
+        // Idempotent
+        let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted2, "OVER clause formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_analytic_over_with_range_and_groups() {
+        let source = "SELECT id, AVG(val) OVER (ORDER BY id RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW) AS avg7d, COUNT(*) OVER (PARTITION BY grp ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS cnt3 FROM t;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RANGE BETWEEN"),
+            "RANGE BETWEEN should appear in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n        RANGE BETWEEN"),
+            "RANGE should be on its own indented line inside OVER, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n        GROUPS BETWEEN"),
+            "GROUPS should be on its own indented line inside OVER, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_analytic_over_partition_only() {
+        let source = "SELECT deptno, SUM(sal) OVER (PARTITION BY deptno) AS dept_total FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("OVER (\n        PARTITION BY deptno\n    )"),
+            "Single PARTITION BY in OVER should be on its own line, got:\n{}",
             formatted
         );
     }
