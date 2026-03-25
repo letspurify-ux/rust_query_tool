@@ -11,7 +11,9 @@ use fltk::{
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +75,8 @@ const HEADER_SORT_CLICK_MOVE_TOLERANCE_PX: u32 = 4;
 const SORT_ASC_MARK: &str = "▲";
 const SORT_DESC_MARK: &str = "▼";
 
-pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
+pub type ResultGridSqlExecuteCallback =
+    Arc<Mutex<Option<Box<dyn FnMut(String) -> Result<(), String>>>>>;
 
 fn mutex_load_bool(flag: &Arc<Mutex<bool>>) -> bool {
     match flag.lock() {
@@ -4245,10 +4248,53 @@ impl ResultTableWidget {
         let Some(callback) = callback else {
             return Err("Edit callback is not connected.".to_string());
         };
-        let mut cb = callback
+
+        let cb = {
+            let mut slot = callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.take()
+        };
+        let Some(mut cb) = cb else {
+            return Err("Edit callback is not connected.".to_string());
+        };
+
+        let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(sql)));
+
+        let mut slot = callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (*cb)(sql)
+        if slot.is_none() {
+            *slot = Some(cb);
+        }
+        drop(slot);
+
+        match call_result {
+            Ok(result) => result,
+            Err(payload) => {
+                Self::log_execute_callback_panic(payload.as_ref());
+                Err("Internal error: result-grid execute callback panicked.".to_string())
+            }
+        }
+    }
+
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn log_execute_callback_panic(payload: &(dyn Any + Send)) {
+        let panic_payload = Self::panic_payload_to_string(payload);
+        crate::utils::logging::log_error(
+            "result_table::callback",
+            &format!("result-grid execute callback panicked: {panic_payload}"),
+        );
+        eprintln!("result-grid execute callback panicked: {panic_payload}");
     }
 
     #[allow(dead_code)]
@@ -9120,13 +9166,14 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_sql_for_cb = captured_sql.clone();
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
-            captured_sql_for_cb
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(sql);
-            Ok(())
-        })));
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |sql| {
+                captured_sql_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(sql);
+                Ok(())
+            }))));
         *widget
             .execute_sql_callback
             .lock()
@@ -9200,13 +9247,14 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_sql_for_cb = captured_sql.clone();
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
-            captured_sql_for_cb
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(sql);
-            Ok(())
-        })));
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |sql| {
+                captured_sql_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(sql);
+                Ok(())
+            }))));
         *widget
             .execute_sql_callback
             .lock()
@@ -9280,13 +9328,14 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_sql_for_cb = captured_sql.clone();
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
-            captured_sql_for_cb
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(sql);
-            Ok(())
-        })));
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |sql| {
+                captured_sql_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(sql);
+                Ok(())
+            }))));
         *widget
             .execute_sql_callback
             .lock()
@@ -9318,13 +9367,14 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
     fn try_execute_sql_invokes_registered_callback() {
         let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_sql_for_cb = captured_sql.clone();
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
-            captured_sql_for_cb
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(sql);
-            Ok(())
-        })));
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |sql| {
+                captured_sql_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(sql);
+                Ok(())
+            }))));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(Some(callback)));
         let sql = "DELETE FROM EMP WHERE ROWID = 'AAABBB'".to_string();
@@ -9342,9 +9392,9 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     fn try_execute_sql_propagates_callback_error() {
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(|_sql| {
-            Err("Another query is already running.".to_string())
-        })));
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Some(Box::new(
+            |_sql| Err("Another query is already running.".to_string()),
+        ))));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(Some(callback)));
 
@@ -9353,6 +9403,88 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             "UPDATE EMP SET ENAME='A'".to_string(),
         );
         assert_eq!(result, Err("Another query is already running.".to_string()));
+    }
+
+    #[test]
+    fn try_execute_sql_restores_callback_for_consecutive_calls() {
+        let call_count = Arc::new(Mutex::new(0usize));
+        let call_count_for_cb = call_count.clone();
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |_sql| {
+                let mut count = call_count_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *count += 1;
+                Ok(())
+            }))));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(Some(callback.clone())));
+
+        let first = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME='A'".to_string(),
+        );
+        let second = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME='B'".to_string(),
+        );
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(
+            *call_count
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            2
+        );
+        assert!(callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    fn try_execute_sql_recovers_when_callback_panics() {
+        let call_count = Arc::new(Mutex::new(0usize));
+        let call_count_for_cb = call_count.clone();
+        let callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |_sql| {
+                let mut count = call_count_for_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *count += 1;
+                if *count == 1 {
+                    panic!("simulate result-grid callback panic");
+                }
+                Ok(())
+            }))));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(Some(callback.clone())));
+
+        let first = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME='A'".to_string(),
+        );
+        assert_eq!(
+            first,
+            Err("Internal error: result-grid execute callback panicked.".to_string())
+        );
+        assert!(callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+
+        let second = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME='B'".to_string(),
+        );
+        assert!(second.is_ok());
+        assert_eq!(
+            *call_count
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            2
+        );
     }
 
     #[test]

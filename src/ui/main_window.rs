@@ -1513,7 +1513,7 @@ impl MainWindow {
 
         let weak_state_for_grid_edit = Arc::downgrade(&state);
         let grid_edit_callback: ResultGridSqlExecuteCallback =
-            Arc::new(Mutex::new(Box::new(move |sql: String| {
+            Arc::new(Mutex::new(Some(Box::new(move |sql: String| {
                 let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
                     return Err("Main window is no longer available.".to_string());
                 };
@@ -1534,7 +1534,7 @@ impl MainWindow {
                     return Err("Failed to start query execution for result-grid edit.".to_string());
                 }
                 Ok(())
-            })));
+            }))));
         {
             state
                 .lock()
