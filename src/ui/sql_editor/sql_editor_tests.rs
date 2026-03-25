@@ -4903,7 +4903,11 @@ SELECT f.deptno,
     f.job,
     f.sal,
     f.sal_band, -- window frame with last_value (needs careful frame)
-    LAST_VALUE (f.sal) OVER (PARTITION BY f.deptno ORDER BY f.sal ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS max_sal_via_last_value
+    LAST_VALUE (f.sal) OVER (
+        PARTITION BY f.deptno
+        ORDER BY f.sal
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS max_sal_via_last_value
 FROM filtered f
 ORDER BY f.deptno,
     f.sal DESC,
@@ -4928,16 +4932,42 @@ fn format_sql_window_functions_and_listagg_exact_layout() {
 )
 SELECT
     b.*,
-    RANK () OVER (PARTITION BY deptno ORDER BY sal DESC) AS rnk,
-    DENSE_RANK () OVER (PARTITION BY deptno ORDER BY sal DESC) AS drnk,
-    ROW_NUMBER () OVER (PARTITION BY deptno ORDER BY hiredate, empno) AS rn,
-    SUM (sal) OVER (PARTITION BY deptno) AS sum_sal_dept,
-    AVG (sal) OVER (PARTITION BY deptno) AS avg_sal_dept,
-    PERCENT_RANK () OVER (PARTITION BY deptno ORDER BY sal) AS pct_rank,
-    CUME_DIST () OVER (PARTITION BY deptno ORDER BY sal) AS CUME_DIST, -- running total with frame
-    SUM (sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal, -- windowed listagg
+    RANK () OVER (
+        PARTITION BY deptno
+        ORDER BY sal DESC
+    ) AS rnk,
+    DENSE_RANK () OVER (
+        PARTITION BY deptno
+        ORDER BY sal DESC
+    ) AS drnk,
+    ROW_NUMBER () OVER (
+        PARTITION BY deptno
+        ORDER BY hiredate,
+            empno
+    ) AS rn,
+    SUM (sal) OVER (
+        PARTITION BY deptno
+    ) AS sum_sal_dept,
+    AVG (sal) OVER (
+        PARTITION BY deptno
+    ) AS avg_sal_dept,
+    PERCENT_RANK () OVER (
+        PARTITION BY deptno
+        ORDER BY sal
+    ) AS pct_rank,
+    CUME_DIST () OVER (
+        PARTITION BY deptno
+        ORDER BY sal
+    ) AS CUME_DIST, -- running total with frame
+    SUM (sal) OVER (
+        PARTITION BY deptno
+        ORDER BY hiredate
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_sal, -- windowed listagg
     LISTAGG (ename, ',') WITHIN
-    GROUP (ORDER BY ename) OVER (PARTITION BY deptno) AS names_in_dept
+    GROUP (ORDER BY ename) OVER (
+        PARTITION BY deptno
+    ) AS names_in_dept
 FROM base b
 ORDER BY deptno,
     rnk,

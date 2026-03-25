@@ -115,6 +115,7 @@ struct ConstructState {
     returning_active: bool,
     search_cycle_clause_active: bool,
     match_recognize_paren_depth: Option<usize>,
+    analytic_over_paren_depth: Option<usize>,
     fetch_active: bool,
     bulk_collect_active: bool,
     insert_all_active: bool,
@@ -140,7 +141,13 @@ impl ConstructState {
         trigger_header_state: TriggerHeaderState,
         is_analytic_within_group: bool,
         is_fetch_into_single_target: bool,
+        in_analytic_over_paren: bool,
     ) -> bool {
+        // Inside analytic OVER(): clause keywords are handled by the
+        // analytic_over_paren_depth branch instead.
+        if in_analytic_over_paren {
+            return true;
+        }
         // INSERT INTO stays on same line
         if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT")) {
             return true;
@@ -2451,7 +2458,7 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     } else if trigger_header_state.is_active()
-                        && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD")
+                        && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD" | "REFERENCING")
                     {
                         newline_with(
                             &mut out,
@@ -2480,6 +2487,9 @@ impl SqlEditorWidget {
                             trigger_header_state,
                             is_analytic_within_group,
                             !Self::fetch_into_has_multiple_targets(tokens, idx),
+                            construct.analytic_over_paren_depth.is_some_and(|depth| {
+                                paren_stack.len() >= depth
+                            }),
                         )
                     {
                         // Keep shallow FORALL bodies one level deeper, but do not
@@ -2586,6 +2596,18 @@ impl SqlEditorWidget {
                                 select_list_layout_state,
                             ),
                             0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if trigger_header_state.is_active()
+                        && upper == "WHEN"
+                    {
+                        // Trigger WHEN clause: align with other trigger header keywords
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            1,
                             &mut at_line_start,
                             &mut needs_space,
                             &mut line_indent,
@@ -2803,15 +2825,22 @@ impl SqlEditorWidget {
                         }
                         join_modifier_active = false;
                     } else if join_modifiers.contains(&upper.as_str()) {
-                        if next_word_is("JOIN") || next_word_is("OUTER") || next_word_is("APPLY") {
-                            newline_with(
-                                &mut out,
-                                base_indent(indent_level, open_cursor_state),
-                                0,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
-                            );
+                        let next_leads_to_join = next_word_is("JOIN")
+                            || next_word_is("OUTER")
+                            || next_word_is("APPLY")
+                            || next_word
+                                .is_some_and(|w| join_modifiers.iter().any(|m| w.eq_ignore_ascii_case(m)));
+                        if next_leads_to_join {
+                            if !join_modifier_active {
+                                newline_with(
+                                    &mut out,
+                                    base_indent(indent_level, open_cursor_state),
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            }
                             join_modifier_active = true;
                         }
                     } else if upper == outer_keyword {
@@ -2831,7 +2860,21 @@ impl SqlEditorWidget {
                         construct.search_cycle_clause_active = true;
                     } else if construct.match_recognize_paren_depth.is_some_and(|depth| {
                         paren_stack.len() >= depth
-                            && matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
+                            && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
+                                || (upper == "ONE" && next_word_is("ROW"))
+                                || (upper == "ALL" && next_word_is("ROWS")))
+                    }) {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if construct.analytic_over_paren_depth.is_some_and(|depth| {
+                        paren_stack.len() >= depth
+                            && (matches!(upper.as_str(), "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"))
                     }) {
                         newline_with(
                             &mut out,
@@ -3015,6 +3058,7 @@ impl SqlEditorWidget {
 
                     if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
                         compound_trigger_state.mark_compound_header();
+                        trigger_header_state.clear();
                     }
 
                     if matches!(upper.as_str(), "IS" | "AS" | "BEGIN" | "DECLARE") {
@@ -3127,6 +3171,7 @@ impl SqlEditorWidget {
                     }
 
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
+                        && !trigger_header_state.is_active()
                         && (construct.create_object.is_some()
                             || construct.routine_decl_pending
                             || with_plsql_body_starts_here);
@@ -3630,6 +3675,7 @@ impl SqlEditorWidget {
                             } else if suppress_comma_break_depth == 0
                                 && !construct.execute_immediate_active
                                 && !construct.grant_revoke_active
+                                && !trigger_header_state.is_active()
                             {
                                 let comma_extra_indent =
                                     if (matches!(current_clause.as_deref(), Some("SET"))
@@ -3783,10 +3829,12 @@ impl SqlEditorWidget {
                             }
 
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            let is_analytic_over_paren =
+                                prev_word_upper.as_deref() == Some("OVER");
                             let is_multiline_clause_paren = matches!(
                                 prev_word_upper.as_deref(),
                                 Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
-                            );
+                            ) || is_analytic_over_paren;
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
                             let keeps_aggregate_call_tight = statement_has_apply
                                 && matches!(
@@ -3805,6 +3853,9 @@ impl SqlEditorWidget {
                             paren_stack.push(is_subquery);
                             if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
                                 construct.match_recognize_paren_depth = Some(paren_stack.len());
+                            }
+                            if is_analytic_over_paren {
+                                construct.analytic_over_paren_depth = Some(paren_stack.len());
                             }
                             paren_clause_restore_stack.push(if is_subquery {
                                 current_clause.clone()
@@ -3908,6 +3959,12 @@ impl SqlEditorWidget {
                                 .is_some_and(|depth| paren_stack.len() < depth)
                             {
                                 construct.match_recognize_paren_depth = None;
+                            }
+                            if construct
+                                .analytic_over_paren_depth
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
+                                construct.analytic_over_paren_depth = None;
                             }
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push(')');
@@ -4660,7 +4717,23 @@ impl SqlEditorWidget {
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
                 && !next_line_is_named_plain_end;
+            // Trigger header WHEN (e.g. WHEN (n.sal > 0)) appears at parser_depth 0
+            // but is indented by phase 1 to align with other trigger header clauses.
+            // Detect this by checking if WHEN at depth 0 follows a trigger header line
+            // (previous line has higher existing_indent, indicating trigger header context).
+            let is_trigger_header_when = trimmed_upper.starts_with("WHEN ")
+                && depth == 0
+                && existing_indent > 0
+                && last_code_idx.is_some_and(|prev_idx| {
+                    let prev_trimmed_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                    prev_trimmed_upper.ends_with("ROW")
+                        || prev_trimmed_upper.starts_with("REFERENCING ")
+                        || prev_trimmed_upper.starts_with("FOR EACH ROW")
+                        || (layouts[prev_idx].parser_depth == 0
+                            && layouts[prev_idx].existing_indent > 0)
+                });
             let force_block_depth = !in_dml_statement
+                && !is_trigger_header_when
                 && (trimmed_upper.starts_with("EXCEPTION")
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
@@ -4821,7 +4894,23 @@ impl SqlEditorWidget {
                 layouts[idx].auto_depth
             };
             let mut current_line_dml_case_expression_close_depth = None;
-            let mut effective_depth = if !in_dml_statement
+            // BEGIN after trigger header (WHEN/FOR EACH ROW) should stay at
+            // parser_depth (base indent), not inherit the trigger header's +1 depth.
+            let is_trigger_header_begin = !in_dml_statement
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                && depth == 0
+                && existing_indent == 0
+                && last_code_idx.is_some_and(|prev_idx| {
+                    let prev = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                    layouts[prev_idx].existing_indent > 0
+                        && (prev.ends_with(')')
+                            || prev.ends_with("ROW")
+                            || prev.starts_with("REFERENCING ")
+                            || prev.starts_with("FOR EACH"))
+                });
+            let mut effective_depth = if is_trigger_header_begin {
+                parser_depth
+            } else if !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
                 && previous_line_ends_with_then
             {
@@ -15743,6 +15832,194 @@ join b on a.id = b.id and a.x = b.x
                 formatted
             );
         }
+    }
+
+    // ── NATURAL LEFT/RIGHT JOIN stays on one line ──
+
+    #[test]
+    fn format_sql_natural_left_join_stays_together() {
+        let source = "SELECT * FROM emp e NATURAL LEFT JOIN dept d JOIN bonus b USING (deptno);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("NATURAL LEFT JOIN"),
+            "NATURAL LEFT JOIN should stay on one line, got:\n{}",
+            formatted
+        );
+        // Idempotent
+        let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted2, "NATURAL LEFT JOIN formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_natural_right_join_stays_together() {
+        let source = "SELECT * FROM t1 NATURAL RIGHT JOIN t2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("NATURAL RIGHT JOIN"),
+            "NATURAL RIGHT JOIN should stay on one line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_natural_full_join_stays_together() {
+        let source = "SELECT * FROM t1 NATURAL FULL JOIN t2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("NATURAL FULL JOIN"),
+            "NATURAL FULL JOIN should stay on one line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_natural_inner_join_stays_together() {
+        let source = "SELECT * FROM t1 NATURAL INNER JOIN t2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("NATURAL INNER JOIN"),
+            "NATURAL INNER JOIN should stay on one line, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Trigger REFERENCING / FOR EACH ROW / WHEN ──
+
+    #[test]
+    fn format_sql_trigger_referencing_and_when_alignment() {
+        let source = "CREATE OR REPLACE TRIGGER trg_emp_biu BEFORE INSERT OR UPDATE OF sal, comm ON emp REFERENCING NEW AS n OLD AS o FOR EACH ROW WHEN (n.sal > 0) BEGIN :n.comm := NVL(:n.comm, 0); END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Comma in trigger header should NOT cause a line break
+        assert!(
+            formatted.contains("OF sal, comm ON emp"),
+            "UPDATE OF column list commas should stay inline in trigger header, got:\n{}",
+            formatted
+        );
+        // REFERENCING should start a new line at trigger header indent
+        assert!(
+            formatted.contains("\n    REFERENCING"),
+            "REFERENCING should start a new line at trigger header indent, got:\n{}",
+            formatted
+        );
+        // REFERENCING clause should stay on one line
+        assert!(
+            formatted.contains("REFERENCING NEW AS n OLD AS o"),
+            "REFERENCING NEW AS n OLD AS o should stay on one line, got:\n{}",
+            formatted
+        );
+        // FOR EACH ROW on its own line
+        assert!(
+            formatted.contains("\n    FOR EACH ROW"),
+            "FOR EACH ROW should be on its own line at trigger header indent, got:\n{}",
+            formatted
+        );
+        // WHEN on its own line at trigger header indent
+        assert!(
+            formatted.contains("\n    WHEN (n.sal > 0)"),
+            "WHEN clause should be on its own line at trigger header indent, got:\n{}",
+            formatted
+        );
+        // BEGIN at base indent
+        assert!(
+            formatted.contains("\nBEGIN"),
+            "BEGIN should be at base indent after trigger WHEN, got:\n{}",
+            formatted
+        );
+        // Idempotent
+        let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted2, "Trigger REFERENCING/WHEN formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_trigger_update_of_multi_column_comma_stays_inline() {
+        let source = "CREATE OR REPLACE TRIGGER trg_test AFTER UPDATE OF col1, col2, col3 ON my_table FOR EACH ROW BEGIN NULL; END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("OF col1, col2, col3 ON my_table"),
+            "Multiple columns in trigger UPDATE OF should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── MATCH_RECOGNIZE ONE ROW PER MATCH ──
+
+    #[test]
+    fn format_sql_match_recognize_one_row_per_match_on_own_line() {
+        let source = "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY customer_id ORDER BY sale_date MEASURES FIRST(A.sale_date) AS first_dt, LAST(B.sale_date) AS last_dt ONE ROW PER MATCH PATTERN (A B+) DEFINE A AS amount < 100, B AS amount >= 100);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\n    ONE ROW PER MATCH"),
+            "ONE ROW PER MATCH should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n    PATTERN"),
+            "PATTERN should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+        // Idempotent
+        let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted2, "MATCH_RECOGNIZE ONE ROW PER MATCH formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_match_recognize_all_rows_per_match_on_own_line() {
+        let source = "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY cust_id ORDER BY sale_date MEASURES MATCH_NUMBER() AS mno ALL ROWS PER MATCH PATTERN (A B+) DEFINE A AS amount < 50, B AS amount >= 50);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\n    ALL ROWS PER MATCH"),
+            "ALL ROWS PER MATCH should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_analytic_over_clause_breaks_subclauses() {
+        let source = "SELECT empno, SUM(sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let expected = r#"SELECT empno,
+    SUM (sal) OVER (
+        PARTITION BY deptno
+        ORDER BY hiredate
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_sal
+FROM emp;"#;
+        assert_eq!(formatted, expected);
+        // Idempotent
+        let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted2, "OVER clause formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_analytic_over_with_range_and_groups() {
+        let source = "SELECT id, AVG(val) OVER (ORDER BY id RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW) AS avg7d, COUNT(*) OVER (PARTITION BY grp ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS cnt3 FROM t;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RANGE BETWEEN"),
+            "RANGE BETWEEN should appear in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n        RANGE BETWEEN"),
+            "RANGE should be on its own indented line inside OVER, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n        GROUPS BETWEEN"),
+            "GROUPS should be on its own indented line inside OVER, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_analytic_over_partition_only() {
+        let source = "SELECT deptno, SUM(sal) OVER (PARTITION BY deptno) AS dept_total FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("OVER (\n        PARTITION BY deptno\n    )"),
+            "Single PARTITION BY in OVER should be on its own line, got:\n{}",
+            formatted
+        );
     }
 
 }
