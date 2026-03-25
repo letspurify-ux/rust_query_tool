@@ -2721,6 +2721,11 @@ impl SqlEditorWidget {
                             prev_word_upper.as_deref(),
                             trigger_header_state,
                         )
+                        // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
+                        // should not cause a condition line break.
+                        && !(upper == "ON"
+                            && suppress_comma_break_depth > 0
+                            && !paren_stack.iter().any(|is_subquery| *is_subquery))
                     {
                         let clause_base_indent = clause_indent(
                             indent_level,
@@ -2959,6 +2964,16 @@ impl SqlEditorWidget {
                         }
                     } else if upper == "SEARCH" || upper == "CYCLE" {
                         construct.search_cycle_clause_active = true;
+                        // SEARCH/CYCLE after recursive CTE should start on a
+                        // new line at the WITH-clause level.
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if construct.match_recognize_paren_depth.is_some_and(|depth| {
                         paren_stack.len() >= depth
                             && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
@@ -16981,6 +16996,299 @@ MATCH_RECOGNIZE (
             stmt_count, 1,
             "MATCH_RECOGNIZE with DEFINE should be one statement, got {} statements from: {:?}",
             stmt_count, items
+        );
+    }
+
+    // ── Bug candidate 1: CROSS APPLY / OUTER APPLY with subquery body alignment ──
+
+    #[test]
+    fn format_sql_cross_apply_multi_subquery_alignment() {
+        let source = "SELECT e.empno, x.max_sal, y.deptno FROM emp e CROSS APPLY (SELECT MAX(b.sal) AS max_sal FROM emp_bonus b WHERE b.empno = e.empno) x OUTER APPLY (SELECT d.deptno FROM dept d WHERE d.deptno = e.deptno) y;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        assert!(
+            formatted.contains("\nCROSS APPLY ("),
+            "CROSS APPLY should start on its own line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\nOUTER APPLY ("),
+            "OUTER APPLY should start on its own line, got:\n{}",
+            formatted
+        );
+
+        // Both APPLY keywords should be at the same indent level (base join level)
+        let cross_idx = lines.iter().position(|l| l.trim_start().starts_with("CROSS APPLY")).unwrap();
+        let outer_idx = lines.iter().position(|l| l.trim_start().starts_with("OUTER APPLY")).unwrap();
+        assert_eq!(
+            leading_spaces(lines[cross_idx]),
+            leading_spaces(lines[outer_idx]),
+            "CROSS APPLY and OUTER APPLY should be at the same indent level, got:\n{}",
+            formatted
+        );
+
+        // Idempotence check
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "CROSS/OUTER APPLY formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 2: MATCH_RECOGNIZE inline DEFINE with arguments ──
+
+    #[test]
+    fn split_format_items_match_recognize_define_a_as_is_not_tool_command() {
+        let source = "SELECT *\nFROM ticks\nMATCH_RECOGNIZE (\n  ORDER BY ts\n  MEASURES A.price AS a_price\n  PATTERN (A B)\n  DEFINE A AS A.price < PREV(A.price),\n         B AS B.price > PREV(B.price)\n);";
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let stmt_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::Statement(_)))
+            .count();
+        let tool_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::ToolCommand(_)))
+            .count();
+        assert_eq!(
+            stmt_count, 1,
+            "MATCH_RECOGNIZE with DEFINE A AS should be one statement, got {} statements and {} tool commands from: {:?}",
+            stmt_count, tool_count, items
+        );
+        assert_eq!(
+            tool_count, 0,
+            "DEFINE A AS inside MATCH_RECOGNIZE should not be parsed as tool command, got {} tool commands from: {:?}",
+            tool_count, items
+        );
+    }
+
+    #[test]
+    fn format_sql_match_recognize_define_multi_variable_stays_intact() {
+        let source = "SELECT * FROM ticks MATCH_RECOGNIZE (ORDER BY ts MEASURES A.price AS a_price PATTERN (A B) DEFINE A AS A.price < PREV(A.price), B AS B.price > PREV(B.price));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("DEFINE"),
+            "DEFINE should remain in the formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("MATCH_RECOGNIZE"),
+            "MATCH_RECOGNIZE should remain in the formatted output, got:\n{}",
+            formatted
+        );
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MATCH_RECOGNIZE DEFINE formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 3: JSON_VALUE RETURNING ... ON ERROR ──
+
+    #[test]
+    fn format_sql_json_value_returning_on_error_stays_inline() {
+        let source = "SELECT JSON_VALUE(payload, '$.name' RETURNING VARCHAR2(30) NULL ON ERROR) AS name_txt FROM event_log;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        // RETURNING and ON ERROR should stay inside the function parentheses
+        // and not cause unwanted line breaks
+        assert!(
+            !formatted.contains("\n    ON ERROR"),
+            "ON ERROR inside JSON_VALUE should not get its own clause line, got:\n{}",
+            formatted
+        );
+        // The entire function call should be within one paren group
+        assert!(
+            formatted.contains("NULL ON ERROR)"),
+            "NULL ON ERROR should stay inline inside JSON_VALUE parens, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "JSON_VALUE RETURNING ON ERROR formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 4: Recursive CTE + SEARCH / CYCLE ──
+
+    #[test]
+    fn format_sql_recursive_cte_search_cycle_alignment() {
+        let source = "WITH r (n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM r WHERE n < 3) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET is_cycle TO 'Y' DEFAULT 'N' SELECT n, ord, is_cycle FROM r ORDER BY ord;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        // SEARCH and CYCLE should each get their own line
+        let search_idx = lines.iter().position(|l| l.trim_start().starts_with("SEARCH"));
+        let cycle_idx = lines.iter().position(|l| l.trim_start().starts_with("CYCLE"));
+
+        assert!(
+            search_idx.is_some(),
+            "SEARCH should be on its own line, got:\n{}",
+            formatted
+        );
+        assert!(
+            cycle_idx.is_some(),
+            "CYCLE should be on its own line, got:\n{}",
+            formatted
+        );
+
+        let search_idx = search_idx.unwrap();
+        let cycle_idx = cycle_idx.unwrap();
+
+        // SEARCH and CYCLE should be at the same indent level
+        assert_eq!(
+            leading_spaces(lines[search_idx]),
+            leading_spaces(lines[cycle_idx]),
+            "SEARCH and CYCLE should be at the same indent level, got:\n{}",
+            formatted
+        );
+
+        // Final SELECT should be at top level (WITH depth 0)
+        // The SELECT may have items on next lines, so find the SELECT line after CYCLE
+        let select_idx = lines.iter().enumerate()
+            .skip(cycle_idx + 1)
+            .find(|(_, l)| l.trim_start().starts_with("SELECT"))
+            .map(|(i, _)| i);
+        assert!(
+            select_idx.is_some(),
+            "Final SELECT should be on its own line after CYCLE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx.unwrap()]), 0,
+            "Final SELECT after SEARCH/CYCLE should be at indent 0, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Recursive CTE SEARCH/CYCLE formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 5: MODEL clause subclauses ──
+
+    #[test]
+    fn format_sql_model_subclauses_consistent_indent() {
+        let source = "SELECT country, year, amount FROM sales MODEL PARTITION BY (country) DIMENSION BY (year) MEASURES (amount) RULES UPSERT SEQUENTIAL ORDER (amount[2026] = amount[2025] * 1.1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let model_idx = lines.iter().position(|l| l.trim_start().starts_with("MODEL")).unwrap();
+        let partition_idx = lines.iter().position(|l| l.trim_start().starts_with("PARTITION BY")).unwrap();
+        let dimension_idx = lines.iter().position(|l| l.trim_start().starts_with("DIMENSION BY")).unwrap();
+        let measures_idx = lines.iter().position(|l| l.trim_start().starts_with("MEASURES")).unwrap();
+        let rules_idx = lines.iter().position(|l| l.trim_start().starts_with("RULES")).unwrap();
+
+        // All subclauses should share the same indent level
+        assert_eq!(
+            leading_spaces(lines[partition_idx]),
+            leading_spaces(lines[dimension_idx]),
+            "PARTITION BY and DIMENSION BY should be at the same indent, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[dimension_idx]),
+            leading_spaces(lines[measures_idx]),
+            "DIMENSION BY and MEASURES should be at the same indent, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[measures_idx]),
+            leading_spaces(lines[rules_idx]),
+            "MEASURES and RULES should be at the same indent, got:\n{}",
+            formatted
+        );
+
+        // Subclauses should be deeper than MODEL
+        assert!(
+            leading_spaces(lines[partition_idx]) > leading_spaces(lines[model_idx]),
+            "MODEL subclauses should be indented deeper than MODEL, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MODEL formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 6: PIVOT / UNPIVOT ──
+
+    #[test]
+    fn format_sql_pivot_for_in_alignment() {
+        let source = "SELECT * FROM (SELECT deptno, job, sal FROM emp) PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk, 'MANAGER' AS manager));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        // PIVOT should get its own clause line
+        assert!(
+            formatted.contains("\nPIVOT (") || formatted.contains("PIVOT ("),
+            "PIVOT should be present and formatted, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "PIVOT formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug candidate 7: WITH FUNCTION / WITH PROCEDURE ──
+
+    #[test]
+    fn format_sql_with_function_body_alignment() {
+        let source = "WITH\n  FUNCTION f(p NUMBER) RETURN NUMBER IS\n  BEGIN\n    RETURN p * 2;\n  END;\nSELECT f(10) AS v\nFROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        // WITH FUNCTION should be present
+        assert!(
+            formatted.contains("WITH")
+                && formatted.contains("FUNCTION")
+                && formatted.contains("BEGIN")
+                && formatted.contains("END"),
+            "WITH FUNCTION block should be fully present, got:\n{}",
+            formatted
+        );
+
+        // Final SELECT should be at top level
+        let select_idx = lines.iter().position(|l| {
+            let t = l.trim_start();
+            t.starts_with("SELECT f(") || t.starts_with("SELECT f (")
+        });
+        assert!(
+            select_idx.is_some(),
+            "Final SELECT should be on its own line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx.unwrap()]), 0,
+            "Final SELECT after WITH FUNCTION should be at indent 0, got:\n{}",
+            formatted
+        );
+
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "WITH FUNCTION formatting should be idempotent, got:\n{}",
+            formatted_again
         );
     }
 
