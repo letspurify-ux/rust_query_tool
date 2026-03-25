@@ -3574,6 +3574,8 @@ impl SqlEditorWidget {
                     out.push_str(rendered_comment_body);
 
                     needs_space = true;
+                    let comment_header_continuation_kind =
+                        Self::comment_header_continuation_kind(tokens, idx);
                     if is_multiline_block_comment {
                         at_line_start = true;
                         needs_space = false;
@@ -3626,13 +3628,23 @@ impl SqlEditorWidget {
                                     in_column_list,
                                 )
                             } else {
-                                line_indent.max(
-                                    base_indent(indent_level, open_cursor_state)
-                                        .saturating_add(usize::from(
-                                            current_clause.is_some()
-                                                || suppress_comma_break_depth > 0,
-                                        )),
-                                )
+                                let base = base_indent(indent_level, open_cursor_state);
+                                let min_indent = match comment_header_continuation_kind {
+                                    Some(
+                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
+                                    ) => base,
+                                    Some(
+                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                                    ) => base.saturating_add(1),
+                                    Some(
+                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                                    ) => line_indent.saturating_add(1),
+                                    None => base.saturating_add(usize::from(
+                                        current_clause.is_some()
+                                            || suppress_comma_break_depth > 0,
+                                    )),
+                                };
+                                line_indent.max(min_indent)
                             };
                             inline_comment_continuation_state =
                                 InlineCommentContinuationState::Operand {
@@ -3690,13 +3702,23 @@ impl SqlEditorWidget {
                                         in_column_list,
                                     )
                                 } else {
-                                    line_indent.max(
-                                        base_indent(indent_level, open_cursor_state)
-                                            .saturating_add(usize::from(
-                                                current_clause.is_some()
-                                                    || suppress_comma_break_depth > 0,
-                                            )),
-                                    )
+                                    let base = base_indent(indent_level, open_cursor_state);
+                                    let min_indent = match comment_header_continuation_kind {
+                                        Some(
+                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
+                                        ) => base,
+                                        Some(
+                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                                        ) => base.saturating_add(1),
+                                        Some(
+                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                                        ) => line_indent.saturating_add(1),
+                                        None => base.saturating_add(usize::from(
+                                            current_clause.is_some()
+                                                || suppress_comma_break_depth > 0,
+                                        )),
+                                    };
+                                    line_indent.max(min_indent)
                                 };
                                 newline_with(
                                     &mut out,
@@ -6735,42 +6757,43 @@ impl SqlEditorWidget {
                 _ => None,
             })
             .collect();
+        let previous_word = significant_words
+            .get(significant_words.len().saturating_sub(2))
+            .copied();
+        crate::sql_text::format_inline_comment_header_continuation_kind(previous_word, last_upper.as_str())
+            .is_some()
+    }
 
-        if significant_words.len() >= 2 {
-            let previous_upper =
-                significant_words[significant_words.len().saturating_sub(2)].to_ascii_uppercase();
-            if matches!(
-                (previous_upper.as_str(), last_upper.as_str()),
-                ("GROUP", "BY")
-                    | ("ORDER", "BY")
-                    | ("CONNECT", "BY")
-                    | ("PARTITION", "BY")
-                    | ("DIMENSION", "BY")
-                    | ("START", "WITH")
-            ) {
-                return true;
-            }
-
-            if matches!(previous_upper.as_str(), "BETWEEN" | "OF")
-                && crate::sql_text::is_format_temporal_boundary_keyword(last_upper.as_str())
-            {
-                return true;
-            }
-
-            if FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper.as_str())
-                && last_upper == "JOIN"
-            {
-                return true;
-            }
-
-            if previous_upper == "SELECT"
-                && matches!(last_upper.as_str(), "DISTINCT" | "UNIQUE" | "ALL")
-            {
-                return true;
-            }
+    fn comment_header_continuation_kind(
+        tokens: &[SqlToken],
+        idx: usize,
+    ) -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
+        let significant_tokens: Vec<&SqlToken> = tokens[..idx]
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+            .collect();
+        let SqlToken::Word(last_word) = significant_tokens.last().copied()? else {
+            return None;
+        };
+        let last_upper = last_word.to_ascii_uppercase();
+        if matches!(
+            last_upper.as_str(),
+            "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT" | "EXISTS"
+        ) {
+            return None;
         }
 
-        false
+        let significant_words: Vec<&str> = significant_tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        let previous_word = significant_words
+            .get(significant_words.len().saturating_sub(2))
+            .copied();
+        crate::sql_text::format_inline_comment_header_continuation_kind(previous_word, last_upper.as_str())
     }
 
     #[cfg(test)]
@@ -16486,6 +16509,52 @@ MATCH_RECOGNIZE (
     }
 
     #[test]
+    fn format_sql_basic_limit_comment_continuation_keeps_operand_indent() {
+        let source = "SELECT e.empno FROM emp e ORDER BY e.empno LIMIT -- page size\n10;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let limit_idx = find_line_starting_with(&lines, "LIMIT").expect("LIMIT clause line");
+        let operand_idx = find_line_starting_with(&lines, "10;").expect("LIMIT operand line");
+
+        assert!(
+            lines[limit_idx].contains("-- page size")
+                || lines.iter().any(|line| line.trim_start().starts_with("-- page size")),
+            "LIMIT comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[operand_idx]) > leading_spaces(lines[limit_idx]),
+            "LIMIT operand should stay deeper than the LIMIT clause line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_values_comment_continuation_keeps_tuple_indent() {
+        let source = "INSERT INTO t_log (id, msg)\nVALUES -- tuple payload\n(1, 'x');";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let values_idx = find_line_starting_with(&lines, "VALUES").expect("VALUES clause line");
+        let tuple_idx = find_line_starting_with(&lines, "(1, 'x');").expect("VALUES tuple line");
+
+        assert!(
+            lines[values_idx].contains("-- tuple payload")
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- tuple payload")),
+            "VALUES comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[tuple_idx]) > leading_spaces(lines[values_idx]),
+            "VALUES tuple should stay deeper than the VALUES clause line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_versions_between_comment_continuation_stays_attached_to_from_clause() {
         let source = "SELECT versions_starttime, versions_endtime, employee_id, salary FROM employees VERSIONS BETWEEN TIMESTAMP -- keep temporal boundary\nSYSTIMESTAMP - INTERVAL '7' DAY AND SYSTIMESTAMP WHERE employee_id = 100;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -16555,6 +16624,85 @@ MATCH_RECOGNIZE (
         assert!(
             !formatted.contains("\nUPDATE ("),
             "MODEL RULES UPDATE must not split UPDATE as a top-level clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_match_recognize_measures_comment_continuation_keeps_subclause_indent() {
+        let source = "SELECT *\nFROM sales\nMATCH_RECOGNIZE (\n    MEASURES -- derived columns\n    FIRST(A.sale_date) AS first_dt\n    PATTERN (A+)\n    DEFINE A AS amount < 100\n);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let measures_idx =
+            find_line_starting_with(&lines, "MEASURES").expect("MATCH_RECOGNIZE MEASURES line");
+        let expr_idx = find_line_starting_with(&lines, "FIRST")
+            .expect("MATCH_RECOGNIZE MEASURES body line");
+
+        assert!(
+            lines[measures_idx].contains("-- derived columns")
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- derived columns")),
+            "MEASURES comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[expr_idx]) > leading_spaces(lines[measures_idx]),
+            "MATCH_RECOGNIZE MEASURES body should stay deeper than the header line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_model_measures_or_rules_comment_continuation_keeps_subclause_indent() {
+        let source = "SELECT *\nFROM sales\nMODEL\n    PARTITION BY (deptno)\n    DIMENSION BY (month_key)\n    MEASURES -- model metrics\n    (amt)\n    RULES UPDATE (amt[1] = amt[CV(month_key)] * 1.1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let measures_idx = find_line_starting_with(&lines, "MEASURES").expect("MODEL MEASURES line");
+        let measures_body_idx =
+            find_line_starting_with(&lines, "(amt)").expect("MODEL MEASURES body line");
+
+        assert!(
+            lines[measures_idx].contains("-- model metrics")
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- model metrics")),
+            "MODEL MEASURES comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[measures_body_idx]) > leading_spaces(lines[measures_idx]),
+            "MODEL MEASURES body should stay deeper than the header line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_xmltable_columns_comment_continuation_keeps_column_indent() {
+        let source = "SELECT *\nFROM XMLTABLE(\n    '/rows/row'\n    PASSING x.payload\n    COLUMNS -- projected columns\n    id NUMBER PATH '@id',\n    name VARCHAR2(30) PATH 'name'\n) xt;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let columns_idx = lines
+            .iter()
+            .position(|line| line.contains("COLUMNS -- projected columns"))
+            .unwrap_or_else(|| panic!("XMLTABLE COLUMNS header line, got:\n{}", formatted));
+        let id_idx = find_line_starting_with(&lines, "id NUMBER PATH '@id'")
+            .expect("XMLTABLE first column line");
+
+        assert!(
+            lines[columns_idx].contains("-- projected columns")
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- projected columns")),
+            "XMLTABLE COLUMNS comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[id_idx]) > leading_spaces(lines[columns_idx]),
+            "XMLTABLE column line should stay deeper than the COLUMNS header, got:\n{}",
             formatted
         );
     }

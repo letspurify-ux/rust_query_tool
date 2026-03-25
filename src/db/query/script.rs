@@ -79,6 +79,7 @@ struct InlineCommentLineContinuation {
 enum InlineCommentContinuationKind {
     SameDepth,
     OneDeeperThanQueryBase,
+    OneDeeperThanCurrentDepth,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2205,6 +2206,9 @@ impl QueryExecutor {
                 InlineCommentContinuationKind::OneDeeperThanQueryBase => {
                     query_base_depth.unwrap_or(depth).saturating_add(1)
                 }
+                InlineCommentContinuationKind::OneDeeperThanCurrentDepth => {
+                    depth.saturating_add(1)
+                }
             };
             Some(InlineCommentLineContinuation {
                 depth: continuation_depth,
@@ -2217,7 +2221,7 @@ impl QueryExecutor {
 
     fn trailing_inline_comment_continuation_kind(
         line: &str,
-        clause_kind: Option<AutoFormatClauseKind>,
+        _clause_kind: Option<AutoFormatClauseKind>,
     ) -> Option<InlineCommentContinuationKind> {
         let prefix = Self::trailing_inline_comment_prefix(line)?;
         let trimmed_prefix = prefix.trim_end();
@@ -2251,10 +2255,7 @@ impl QueryExecutor {
 
         if Self::prefix_ends_with_unfinished_clause_header(trimmed_prefix) {
             return Some(
-                Self::unfinished_clause_header_inline_comment_continuation_kind(
-                    trimmed_prefix,
-                    clause_kind,
-                ),
+                Self::unfinished_clause_header_inline_comment_continuation_kind(trimmed_prefix),
             );
         }
 
@@ -2263,92 +2264,35 @@ impl QueryExecutor {
 
     fn unfinished_clause_header_inline_comment_continuation_kind(
         trimmed_prefix: &str,
-        clause_kind: Option<AutoFormatClauseKind>,
     ) -> InlineCommentContinuationKind {
-        if Self::unfinished_clause_header_uses_list_continuation(trimmed_prefix, clause_kind) {
-            InlineCommentContinuationKind::OneDeeperThanQueryBase
-        } else {
-            InlineCommentContinuationKind::SameDepth
+        match Self::trailing_header_comment_continuation_kind(trimmed_prefix) {
+            Some(sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth) => {
+                InlineCommentContinuationKind::SameDepth
+            }
+            Some(sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase) => {
+                InlineCommentContinuationKind::OneDeeperThanQueryBase
+            }
+            Some(sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine) => {
+                InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+            }
+            None => InlineCommentContinuationKind::SameDepth,
         }
-    }
-
-    fn unfinished_clause_header_uses_list_continuation(
-        trimmed_prefix: &str,
-        clause_kind: Option<AutoFormatClauseKind>,
-    ) -> bool {
-        if matches!(
-            clause_kind,
-            Some(
-                AutoFormatClauseKind::Select
-                    | AutoFormatClauseKind::Group
-                    | AutoFormatClauseKind::Order
-                    | AutoFormatClauseKind::Set
-            )
-        ) {
-            return true;
-        }
-
-        let upper = trimmed_prefix.to_ascii_uppercase();
-        sql_text::starts_with_keyword_token(&upper, "RETURNING")
     }
 
     fn prefix_ends_with_unfinished_clause_header(prefix: &str) -> bool {
-        let words: Vec<&str> = prefix
+        Self::trailing_header_comment_continuation_kind(prefix).is_some()
+    }
+
+    fn trailing_header_comment_continuation_kind(
+        trimmed_prefix: &str,
+    ) -> Option<sql_text::FormatInlineCommentHeaderContinuationKind> {
+        let words: Vec<&str> = trimmed_prefix
             .split_whitespace()
             .filter(|word| !word.is_empty())
             .collect();
-        let Some(last_word) = words.last().copied() else {
-            return false;
-        };
-
-        if matches!(
-            last_word,
-            "SELECT"
-                | "FROM"
-                | "WHERE"
-                | "HAVING"
-                | "USING"
-                | "VALUES"
-                | "SET"
-                | "INTO"
-                | "ON"
-                | "JOIN"
-                | "WITH"
-                | "MODEL"
-                | "WINDOW"
-                | "MATCH_RECOGNIZE"
-                | "QUALIFY"
-                | "RETURNING"
-        ) {
-            return true;
-        }
-
-        if words.len() >= 2 {
-            let previous_word = words[words.len().saturating_sub(2)];
-            if matches!(
-                (previous_word, last_word),
-                ("GROUP", "BY")
-                    | ("ORDER", "BY")
-                    | ("CONNECT", "BY")
-                    | ("PARTITION", "BY")
-                    | ("DIMENSION", "BY")
-                    | ("START", "WITH")
-            ) {
-                return true;
-            }
-
-            if sql_text::FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_word)
-                && last_word == "JOIN"
-            {
-                return true;
-            }
-
-            if previous_word == "SELECT" && matches!(last_word, "DISTINCT" | "UNIQUE" | "ALL") {
-                return true;
-            }
-        }
-
-        false
+        let last_word = words.last().copied()?;
+        let previous_word = words.get(words.len().saturating_sub(2)).copied();
+        sql_text::format_inline_comment_header_continuation_kind(previous_word, last_word)
     }
 
     fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
@@ -7814,6 +7758,152 @@ deptno;"#;
         assert_eq!(
             contexts[deptno_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
             "GROUP BY inline-header continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_limit_comment_continuation_uses_operand_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+ORDER BY e.empno
+LIMIT -- page size
+10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let limit_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("LIMIT --"))
+            .unwrap_or(0);
+        let operand_idx = lines.iter().position(|line| line.trim() == "10;").unwrap_or(0);
+
+        assert_eq!(
+            contexts[operand_idx].auto_depth,
+            contexts[limit_idx]
+                .query_base_depth
+                .unwrap_or(contexts[limit_idx].auto_depth)
+                .saturating_add(1),
+            "LIMIT operand after inline header comment should use one deeper continuation depth"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "LIMIT operand after inline header comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_base_depth, contexts[limit_idx].query_base_depth,
+            "LIMIT inline-header continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_values_comment_continuation_uses_list_depth() {
+        let sql = r#"INSERT INTO t_log (id, msg)
+VALUES -- tuple payload
+(1, 'x');"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let values_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("VALUES --"))
+            .unwrap_or(0);
+        let tuple_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("(1, 'x');"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[tuple_idx].auto_depth,
+            contexts[values_idx]
+                .query_base_depth
+                .unwrap_or(contexts[values_idx].auto_depth)
+                .saturating_add(1),
+            "VALUES tuple after inline header comment should use one deeper continuation depth"
+        );
+        assert_eq!(
+            contexts[tuple_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "VALUES tuple after inline header comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[tuple_idx].query_base_depth, contexts[values_idx].query_base_depth,
+            "VALUES inline-header continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_match_recognize_measures_comment_continuation_uses_subclause_depth()
+    {
+        let sql = r#"SELECT *
+FROM sales
+MATCH_RECOGNIZE (
+    MEASURES -- derived columns
+    FIRST(A.sale_date) AS first_dt
+    PATTERN (A+)
+    DEFINE A AS amount < 100
+);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES --"))
+            .unwrap_or(0);
+        let expr_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FIRST(A.sale_date)"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[expr_idx].auto_depth,
+            contexts[measures_idx].auto_depth.saturating_add(1),
+            "MATCH_RECOGNIZE MEASURES body after inline comment should use one level deeper than the header line"
+        );
+        assert_eq!(
+            contexts[expr_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "MATCH_RECOGNIZE MEASURES body after inline comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[expr_idx].query_base_depth, contexts[measures_idx].query_base_depth,
+            "MATCH_RECOGNIZE MEASURES continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_model_rules_comment_continuation_uses_subclause_depth() {
+        let sql = r#"SELECT *
+FROM sales
+MODEL
+    PARTITION BY (deptno)
+    DIMENSION BY (month_key)
+    RULES -- calc rules
+    (amt[1] = amt[CV(month_key)] * 1.1);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RULES --"))
+            .unwrap_or(0);
+        let body_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("(amt[1] ="))
+            .unwrap_or(0);
+
+        assert!(
+            contexts[body_idx].auto_depth >= contexts[rules_idx].auto_depth.saturating_add(1),
+            "MODEL RULES body after inline comment should stay at least one level deeper than the header line"
+        );
+        assert_eq!(
+            contexts[body_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "MODEL RULES body after inline comment should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[body_idx].query_base_depth, contexts[rules_idx].query_base_depth,
+            "MODEL RULES continuation should preserve the query base depth"
         );
     }
 

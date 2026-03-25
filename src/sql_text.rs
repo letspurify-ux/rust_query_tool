@@ -657,6 +657,49 @@ pub(crate) const FORMAT_COMMENT_CONTINUATION_KEYWORDS: &[&str] = &[
     "JOIN",
 ];
 
+/// Clause/subclause headers that should keep the next line at the same depth
+/// after an inline comment split.
+const FORMAT_INLINE_COMMENT_HEADER_SAME_DEPTH_KEYWORDS: &[&str] = &["WITH"];
+
+/// Clause/subclause headers whose body should continue one level deeper than
+/// the owning query base after an inline comment split.
+const FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS: &[&str] = &[
+    "FROM",
+    "WHERE",
+    "HAVING",
+    "USING",
+    "INTO",
+    "ON",
+    "JOIN",
+    "CONNECT",
+    "START",
+    "UNION",
+    "INTERSECT",
+    "MINUS",
+    "EXCEPT",
+    "MODEL",
+    "WINDOW",
+    "MATCH_RECOGNIZE",
+    "QUALIFY",
+];
+
+/// Clause/subclause headers whose body should continue one level deeper than
+/// the current header line after an inline comment split.
+const FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "VALUES",
+    "SET",
+    "RETURNING",
+    "OFFSET",
+    "FETCH",
+    "LIMIT",
+    "MEASURES",
+    "PATTERN",
+    "DEFINE",
+    "RULES",
+    "COLUMNS",
+];
+
 /// `CREATE TABLE ...` suffix keywords used by formatter to split storage clauses.
 pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
     "PCTFREE",
@@ -1357,6 +1400,62 @@ pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
         || matches_keyword(word, FORMAT_COMMENT_CONTINUATION_KEYWORDS)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatInlineCommentHeaderContinuationKind {
+    SameDepth,
+    OneDeeperThanQueryBase,
+    OneDeeperThanCurrentLine,
+}
+
+/// Returns the continuation kind when an inline comment splits a clause or
+/// subclause header and the next line should stay attached to that header.
+pub(crate) fn format_inline_comment_header_continuation_kind(
+    previous_word: Option<&str>,
+    last_word: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    let last_upper = last_word.to_ascii_uppercase();
+    if matches_keyword(
+        last_upper.as_str(),
+        FORMAT_INLINE_COMMENT_HEADER_SAME_DEPTH_KEYWORDS,
+    ) {
+        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
+    }
+    if matches_keyword(
+        last_upper.as_str(),
+        FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS,
+    ) {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase);
+    }
+    if matches_keyword(
+        last_upper.as_str(),
+        FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS,
+    ) {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    let previous_upper = previous_word.map(str::to_ascii_uppercase);
+    let previous_upper = previous_upper.as_deref()?;
+
+    if matches!(
+        (previous_upper, last_upper.as_str()),
+        ("GROUP", "BY")
+            | ("ORDER", "BY")
+            | ("PARTITION", "BY")
+            | ("DIMENSION", "BY")
+            | ("START", "WITH")
+            | ("CONNECT", "BY")
+    ) || (FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper) && last_upper == "JOIN")
+        || (previous_upper == "SELECT"
+            && matches!(last_upper.as_str(), "DISTINCT" | "UNIQUE" | "ALL"))
+        || (matches!(previous_upper, "BETWEEN" | "OF")
+            && is_format_temporal_boundary_keyword(last_upper.as_str()))
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    None
+}
+
 /// Returns true when a token starts a flashback/temporal boundary expression.
 pub(crate) fn is_format_temporal_boundary_keyword(word: &str) -> bool {
     matches!(word.to_ascii_uppercase().as_str(), "TIMESTAMP" | "SCN")
@@ -1486,6 +1585,42 @@ mod tests {
         assert!(is_format_temporal_boundary_keyword("timestamp"));
         assert!(is_format_temporal_boundary_keyword("SCN"));
         assert!(!is_format_temporal_boundary_keyword("DATE"));
+    }
+
+    #[test]
+    fn format_inline_comment_header_continuation_kind_tracks_clause_and_subclause_headers() {
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "WITH"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "LIMIT"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "MEASURES"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "COLUMNS"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("ORDER"), "BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("BETWEEN"), "TIMESTAMP"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("LEFT"), "JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "DUAL"),
+            None
+        );
     }
 
     #[test]
