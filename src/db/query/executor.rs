@@ -1829,6 +1829,25 @@ impl QueryExecutor {
         is_idle && trimmed == ";" && in_create_plsql && block_depth == 0 && !current_is_empty
     }
 
+    /// Returns `true` when `trimmed` (a single input line) consists entirely of
+    /// ORDER BY modifier keywords (DESC, ASC, NULLS FIRST, NULLS LAST) and
+    /// therefore must not be misinterpreted as a SQL*Plus tool command.
+    pub(crate) fn is_order_by_modifier_line(trimmed: &str) -> bool {
+        let stripped = trimmed.trim_end_matches(';').trim();
+        if stripped.is_empty() {
+            return false;
+        }
+        let upper = stripped.to_ascii_uppercase();
+        upper == "DESC"
+            || upper == "ASC"
+            || upper == "NULLS FIRST"
+            || upper == "NULLS LAST"
+            || upper == "DESC NULLS FIRST"
+            || upper == "DESC NULLS LAST"
+            || upper == "ASC NULLS FIRST"
+            || upper == "ASC NULLS LAST"
+    }
+
     pub(crate) fn should_try_tool_command_with_open_statement(
         is_idle: bool,
         current_is_empty: bool,

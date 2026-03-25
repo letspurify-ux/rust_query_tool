@@ -201,6 +201,15 @@ impl SqlParserEngine {
         self.current.trim().is_empty()
     }
 
+    /// Returns `true` when the accumulated statement text contains an
+    /// ORDER BY (or ORDER SIBLINGS BY) clause so that callers can avoid
+    /// misinterpreting trailing ORDER BY modifiers (DESC, ASC, NULLS)
+    /// as SQL*Plus tool commands.
+    pub(crate) fn current_has_order_by_context(&self) -> bool {
+        let upper = self.current.to_ascii_uppercase();
+        upper.contains("ORDER BY") || upper.contains("ORDER SIBLINGS BY")
+    }
+
     pub(crate) fn in_create_plsql(&self) -> bool {
         self.state.in_create_plsql()
     }

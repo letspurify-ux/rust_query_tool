@@ -160,6 +160,10 @@ impl ConstructState {
         if keyword == "WITH" && matches!(prev_word_upper, Some("START")) {
             return true;
         }
+        // FETCH FIRST n ROW[S] WITH TIES stays on same line
+        if keyword == "WITH" && matches!(prev_word_upper, Some("ROW" | "ROWS")) {
+            return true;
+        }
         // ORDER BY after SEQUENTIAL/AUTOMATIC suppressed
         if keyword == "ORDER"
             && (suppress_comma_break_depth > 0
@@ -16018,6 +16022,205 @@ FROM emp;"#;
         assert!(
             formatted.contains("OVER (\n        PARTITION BY deptno\n    )"),
             "Single PARTITION BY in OVER should be on its own line, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: ORDER BY ... DESC split ──
+
+    #[test]
+    fn format_sql_order_by_desc_not_split_as_describe_command() {
+        // DESC on its own line must NOT be misidentified as SQL*Plus DESCRIBE.
+        let source = "SELECT empno, sal\nFROM emp\nORDER BY sal\nDESC;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY sal DESC"),
+            "ORDER BY sal DESC should stay together, got:\n{}",
+            formatted
+        );
+        // Idempotence
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting ORDER BY DESC should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_order_by_desc_with_slash_terminator() {
+        // DESC on its own line with / terminator must not be split off.
+        let source = "SELECT empno, sal\nFROM emp\nORDER BY sal\nDESC\n/";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY sal DESC"),
+            "ORDER BY sal DESC with slash terminator should stay together, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_order_by_desc_nulls_last_multiline() {
+        let source = "SELECT empno, sal\nFROM emp\nORDER BY sal\nDESC\nNULLS LAST;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY sal DESC NULLS LAST"),
+            "ORDER BY sal DESC NULLS LAST should stay together, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: MATCH_RECOGNIZE DEFINE with content ──
+
+    #[test]
+    fn format_sql_match_recognize_define_with_content_not_split() {
+        let source = r#"SELECT *
+FROM ticks
+MATCH_RECOGNIZE (
+    PARTITION BY symbol
+    ORDER BY ts
+    PATTERN (A B+)
+    DEFINE B AS B.price > PREV(B.price)
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // DEFINE must be kept as SQL, not rewritten as SQL*Plus DEFINE assignment
+        assert!(
+            !formatted.contains("DEFINE B = "),
+            "DEFINE should not be rewritten as SQL*Plus DEFINE assignment, got:\n{}",
+            formatted
+        );
+        // The DEFINE line must remain in the statement (formatter may add spaces around parens)
+        assert!(
+            formatted.contains("DEFINE B AS B.price > PREV"),
+            "DEFINE inside MATCH_RECOGNIZE should be kept as SQL, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "MATCH_RECOGNIZE formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug regression: FOR UPDATE ──
+
+    #[test]
+    fn format_sql_for_update_not_split() {
+        let source = "SELECT * FROM emp FOR UPDATE OF sal SKIP LOCKED;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE OF sal SKIP LOCKED"),
+            "FOR UPDATE should stay on one line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("FOR\nUPDATE") && !formatted.contains("FOR\n    UPDATE"),
+            "FOR and UPDATE should not be split across lines, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_for_update_multiline_input() {
+        // Even when input has FOR and UPDATE on separate lines, output should join them.
+        let source = "SELECT *\nFROM emp\nFOR\nUPDATE OF sal SKIP LOCKED;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE"),
+            "FOR UPDATE should be on same line, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: MERGE USING alignment ──
+
+    #[test]
+    fn format_sql_merge_using_gets_clause_break() {
+        let source = "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\nUSING src s"),
+            "USING should start on a new line like a clause keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_join_using_gets_condition_break() {
+        let source = "SELECT e.empno, d.dname FROM emp e JOIN dept d USING (deptno) WHERE e.empno > 0;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\n    USING (deptno)") || formatted.contains("\nUSING (deptno)"),
+            "JOIN USING should get alignment similar to ON, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: CROSS APPLY / OUTER APPLY ──
+
+    #[test]
+    fn format_sql_cross_apply_gets_join_like_break() {
+        let source = "SELECT e.empno, x.cnt FROM emp e CROSS APPLY (SELECT COUNT(*) AS cnt FROM bonus b WHERE b.empno = e.empno) x;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\nCROSS APPLY ("),
+            "CROSS APPLY should start on a new line like a JOIN, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_outer_apply_gets_join_like_break() {
+        let source = "SELECT e.empno, x.cnt FROM emp e OUTER APPLY (SELECT COUNT(*) AS cnt FROM bonus b WHERE b.empno = e.empno) x;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\nOUTER APPLY ("),
+            "OUTER APPLY should start on a new line like a JOIN, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: PIVOT/UNPIVOT alignment ──
+
+    #[test]
+    fn format_sql_pivot_stays_intact() {
+        let source = r#"SELECT * FROM (SELECT deptno, job, sal FROM emp) PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk, 'MANAGER' AS manager));"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // PIVOT block must be present and correctly formatted
+        assert!(
+            formatted.contains("PIVOT ("),
+            "PIVOT keyword and opening paren should be present, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SUM (sal)") || formatted.contains("SUM(sal)"),
+            "PIVOT aggregate should be present, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "PIVOT formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug regression: FETCH FIRST ... WITH TIES ──
+
+    #[test]
+    fn format_sql_fetch_first_with_ties_not_split() {
+        let source = "SELECT * FROM emp ORDER BY sal DESC FETCH FIRST 3 ROWS WITH TIES;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // WITH TIES must not become a separate WITH clause
+        assert!(
+            !formatted.contains("\nWITH TIES"),
+            "WITH TIES should not be split to a new line as a WITH clause, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ROWS WITH TIES"),
+            "WITH TIES should stay on the FETCH line, got:\n{}",
             formatted
         );
     }
