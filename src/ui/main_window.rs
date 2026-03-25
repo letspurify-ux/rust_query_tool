@@ -1606,11 +1606,11 @@ impl MainWindow {
             let Some(state_for_result_close) = weak_state_for_result_close.upgrade() else {
                 return;
             };
-            if state_for_result_close
+            let query_running = state_for_result_close
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_any_query_running()
-            {
+                .is_any_query_running();
+            if query_running {
                 fltk::dialog::alert_default("A query is running. Stop it before closing tabs.");
                 return;
             }
@@ -1631,11 +1631,11 @@ impl MainWindow {
             let Some(state_for_result_clear) = weak_state_for_result_clear.upgrade() else {
                 return;
             };
-            if state_for_result_clear
+            let query_running = state_for_result_clear
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_any_query_running()
-            {
+                .is_any_query_running();
+            if query_running {
                 fltk::dialog::alert_default("A query is running. Stop it before clearing tabs.");
                 return;
             }
@@ -2189,19 +2189,20 @@ impl MainWindow {
     }
 
     fn close_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
-        {
+        let is_running = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(index) = s.find_tab_index(tab_id) else {
                 return false;
             };
-            if s.editor_tabs[index].sql_editor.is_query_running() {
-                fltk::dialog::alert_default(
-                    "A query is running in this tab. Stop it before closing.",
-                );
-                return false;
-            }
+            s.editor_tabs[index].sql_editor.is_query_running()
+        };
+        if is_running {
+            fltk::dialog::alert_default(
+                "A query is running in this tab. Stop it before closing.",
+            );
+            return false;
         }
 
         if !Self::confirm_save_if_dirty(state, tab_id, "closing this tab") {
