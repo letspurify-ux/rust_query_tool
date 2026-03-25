@@ -643,7 +643,7 @@ pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
 
 /// JOIN modifier keywords used by SQL formatter line-break rules.
 pub(crate) const FORMAT_JOIN_MODIFIER_KEYWORDS: &[&str] =
-    &["LEFT", "RIGHT", "FULL", "INNER", "CROSS"];
+    &["LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATURAL"];
 
 /// Condition keywords that should align in multiline SQL formatter output.
 pub(crate) const FORMAT_CONDITION_KEYWORDS: &[&str] = &["ON", "AND", "OR", "WHEN"];

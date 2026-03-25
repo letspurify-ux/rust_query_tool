@@ -2063,7 +2063,7 @@ impl SqlEditorWidget {
                                   merge_active: bool| {
             let base = base_indent(indent_level, open_cursor_state);
             if matches!(current_clause, Some("SET")) && merge_active {
-                base
+                base + 1
             } else {
                 list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
                     .max(base + 1)
@@ -2857,6 +2857,20 @@ impl SqlEditorWidget {
                         );
                     } else if upper == "OPEN" {
                         open_cursor_state = OpenCursorFormatState::AwaitingFor;
+                    } else if upper == "FOR"
+                        && next_word_is("UPDATE")
+                        && !in_plsql_block
+                        && suppress_comma_break_depth == 0
+                    {
+                        // FOR UPDATE gets its own line at clause base indent.
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if (upper == "FOR" || upper == "WHILE")
                         && !(upper == "FOR"
                             && (construct.create_synonym_active
@@ -15730,4 +15744,5 @@ join b on a.id = b.id and a.x = b.x
             );
         }
     }
+
 }
