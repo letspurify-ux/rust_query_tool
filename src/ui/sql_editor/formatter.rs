@@ -551,7 +551,11 @@ impl WithCteFormatState {
                         return;
                     }
 
-                    if upper == "SELECT" && *paren_depth == 0 {
+                    if matches!(
+                        upper.as_str(),
+                        "SELECT" | "UPDATE" | "DELETE" | "INSERT" | "MERGE"
+                    ) && *paren_depth == 0
+                    {
                         *self = Self::None;
                     }
                 }
@@ -16222,6 +16226,143 @@ MATCH_RECOGNIZE (
             formatted.contains("ROWS WITH TIES"),
             "WITH TIES should stay on the FETCH line, got:\n{}",
             formatted
+        );
+    }
+
+    // ── Bug regression: WITH CTE + UPDATE/MERGE/DELETE/INSERT comma indent ──
+
+    #[test]
+    fn format_sql_with_update_cte_keeps_set_indent() {
+        let source = "WITH src AS (\nSELECT 1 AS c1, 2 AS c2 FROM dual\n)\nUPDATE tgt t\nSET t.c1 = (SELECT c1 FROM src),\nt.c2 = (SELECT c2 FROM src),\nt.c3 = 3\nWHERE EXISTS (SELECT 1 FROM src);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // After the CTE, the UPDATE SET commas should indent under SET, not at root depth
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let set_line = lines.iter().find(|l| l.trim_start().starts_with("SET")).unwrap();
+        let c2_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("t.c2"))
+            .unwrap();
+        let c3_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("t.c3"))
+            .unwrap();
+        let set_indent = leading_spaces(set_line);
+        let c2_indent = leading_spaces(c2_line);
+        let c3_indent = leading_spaces(c3_line);
+        assert!(
+            c2_indent > 0,
+            "t.c2 should be indented (not at root depth), got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            c2_indent, c3_indent,
+            "SET list items should have consistent indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            c2_indent >= set_indent,
+            "SET list items should be at or deeper than SET clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_merge_cte_keeps_set_indent() {
+        let source = "WITH src AS (\nSELECT 1 AS id, 2 AS val FROM dual\n)\nMERGE INTO tgt t\nUSING src s\nON (t.id = s.id)\nWHEN MATCHED THEN\nUPDATE SET t.val = s.val, t.extra = 0\nWHEN NOT MATCHED THEN\nINSERT (id, val) VALUES (s.id, s.val);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Commas in UPDATE SET inside MERGE after WITH should not be treated as CTE separators
+        assert!(
+            !formatted.contains("\nt.extra"),
+            "SET list commas in WITH+MERGE should not drop to root indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_delete_cte_keeps_where_indent() {
+        let source = "WITH old AS (\nSELECT id FROM archive WHERE ts < SYSDATE - 30\n)\nDELETE FROM main_tbl\nWHERE id IN (SELECT id FROM old);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // WITH + DELETE: the CTE state must close so WHERE gets proper clause indent
+        assert!(
+            formatted.contains("\nWHERE"),
+            "WHERE should start on its own line, got:\n{}",
+            formatted
+        );
+        // Idempotency check
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "WITH+DELETE formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_with_insert_cte_keeps_values_indent() {
+        let source = "WITH src AS (\nSELECT 1 AS c1, 2 AS c2 FROM dual\n)\nINSERT INTO tgt (c1, c2)\nSELECT c1, c2 FROM src;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // WITH + INSERT ... SELECT: the CTE should close properly
+        assert!(
+            formatted.contains("INSERT INTO tgt"),
+            "INSERT after CTE should have proper layout, got:\n{}",
+            formatted
+        );
+        // Idempotency check
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "WITH+INSERT formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    // ── Bug regression: split_format_items DESC is not DESCRIBE ──
+
+    #[test]
+    fn split_format_items_desc_in_order_by_is_not_describe() {
+        let source = "SELECT e.empno, e.sal\nFROM emp e\nORDER BY\ne.sal\nDESC;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // DESC must remain part of the SELECT statement, not split off as DESCRIBE
+        assert!(
+            formatted.contains("DESC;") || formatted.contains("DESC\n"),
+            "DESC should remain in the statement, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("DESCRIBE"),
+            "DESC in ORDER BY must not be treated as DESCRIBE command, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Bug regression: MATCH_RECOGNIZE DEFINE with arguments ──
+
+    #[test]
+    fn split_format_items_match_recognize_define_with_args_is_sql() {
+        let source = "SELECT *\nFROM ticks\nMATCH_RECOGNIZE (\nPARTITION BY symbol\nORDER BY ts\nPATTERN (A+)\nDEFINE A AS price > PREV(price)\n);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // DEFINE A AS ... inside MATCH_RECOGNIZE must not be mistaken for SQL*Plus DEFINE
+        assert!(
+            formatted.contains("DEFINE"),
+            "DEFINE should remain in the statement, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("MATCH_RECOGNIZE"),
+            "MATCH_RECOGNIZE should be present, got:\n{}",
+            formatted
+        );
+        // Should be a single formatted statement, not split
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let stmt_count = items
+            .iter()
+            .filter(|item| matches!(item, crate::db::FormatItem::Statement(_)))
+            .count();
+        assert_eq!(
+            stmt_count, 1,
+            "MATCH_RECOGNIZE with DEFINE should be one statement, got {} statements from: {:?}",
+            stmt_count, items
         );
     }
 
