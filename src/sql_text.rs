@@ -1134,15 +1134,18 @@ pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_MAIN_QUERY_KEYWORDS)
 }
 
-/// Returns true when a keyword starts an Oracle top-level `WITH FUNCTION/PROCEDURE` declaration.
+/// Returns true when a keyword starts an Oracle top-level `WITH` PL/SQL declaration.
 pub(crate) fn is_with_plsql_declaration_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_PLSQL_DECLARATION_KEYWORDS)
 }
 
 /// Returns true when a top-level `WITH` PL/SQL declaration uses `AS/IS` to
-/// open a routine body that stays active until a matching `END`.
+/// open a declaration body that stays active until a matching `END`.
 pub(crate) fn with_plsql_declaration_starts_routine_body(word: &str) -> bool {
-    matches!(word.to_ascii_uppercase().as_str(), "FUNCTION" | "PROCEDURE")
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "FUNCTION" | "PROCEDURE" | "PACKAGE"
+    )
 }
 
 /// Returns true when a top-level `WITH` token clearly belongs to a non-PL/SQL
@@ -1580,6 +1583,10 @@ mod tests {
     fn parser_and_intellisense_keyword_groups_are_shared() {
         assert!(is_with_plsql_declaration_keyword("FUNCTION"));
         assert!(is_with_plsql_declaration_keyword("procedure"));
+        assert!(is_with_plsql_declaration_keyword("PACKAGE"));
+        assert!(is_with_plsql_declaration_keyword("type"));
+        assert!(with_plsql_declaration_starts_routine_body("PACKAGE"));
+        assert!(!with_plsql_declaration_starts_routine_body("TYPE"));
         assert!(is_external_language_target_keyword("javascript"));
         assert!(is_external_language_target_keyword("mle"));
         assert!(is_external_language_target_keyword("rust"));

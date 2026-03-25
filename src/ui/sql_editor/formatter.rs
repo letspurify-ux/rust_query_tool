@@ -133,7 +133,10 @@ impl ConstructState {
     /// 새 SQL 구문을 추가할 때는 이 메서드에만 규칙을 추가하면 됩니다.
     fn suppresses_clause_break(
         &self,
+        tokens: &[SqlToken],
+        idx: usize,
         keyword: &str,
+        current_clause: Option<&str>,
         prev_word_upper: Option<&str>,
         in_plsql_block: bool,
         suppress_comma_break_depth: usize,
@@ -146,6 +149,16 @@ impl ConstructState {
         // Inside analytic OVER(): clause keywords are handled by the
         // analytic_over_paren_depth branch instead.
         if in_analytic_over_paren {
+            return true;
+        }
+        if SqlEditorWidget::is_inline_clause_phrase(
+            tokens,
+            idx,
+            keyword,
+            current_clause,
+            prev_word_upper,
+            self,
+        ) {
             return true;
         }
         // INSERT INTO stays on same line
@@ -705,6 +718,73 @@ impl OpenCursorFormatState {
 }
 
 impl SqlEditorWidget {
+    fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
+        let mut idx = start_idx;
+        while idx > 0 {
+            idx = idx.saturating_sub(1);
+            match tokens.get(idx) {
+                Some(SqlToken::Comment(_)) => continue,
+                Some(SqlToken::Word(word)) => return Some((word.to_ascii_uppercase(), idx)),
+                _ => return None,
+            }
+        }
+
+        None
+    }
+
+    fn is_log_errors_into_clause(tokens: &[SqlToken], into_idx: usize) -> bool {
+        let Some((prev_word, prev_idx)) = Self::previous_word_upper(tokens, into_idx) else {
+            return false;
+        };
+        if prev_word != "ERRORS" {
+            return false;
+        }
+
+        matches!(
+            Self::previous_word_upper(tokens, prev_idx),
+            Some((word, _)) if word == "LOG"
+        )
+    }
+
+    fn is_multiset_set_operator(tokens: &[SqlToken], idx: usize) -> bool {
+        matches!(
+            Self::previous_word_upper(tokens, idx),
+            Some((prev, _)) if prev == "MULTISET"
+        )
+    }
+
+    fn is_inline_clause_phrase(
+        tokens: &[SqlToken],
+        idx: usize,
+        keyword: &str,
+        current_clause: Option<&str>,
+        prev_word_upper: Option<&str>,
+        construct: &ConstructState,
+    ) -> bool {
+        if construct.forall_pending && keyword == "VALUES" {
+            return true;
+        }
+        if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx) {
+            return true;
+        }
+        if keyword == "LIMIT" && matches!(prev_word_upper, Some("REJECT")) {
+            return true;
+        }
+        if matches!(keyword, "UNION" | "INTERSECT" | "EXCEPT")
+            && Self::is_multiset_set_operator(tokens, idx)
+        {
+            return true;
+        }
+        if current_clause == Some("MODEL")
+            && keyword == "UPDATE"
+            && matches!(prev_word_upper, Some("RULES"))
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn leading_indent_columns(line: &str) -> usize {
         const INDENT_TAB_WIDTH: usize = 4;
         let mut columns = 0usize;
@@ -2487,7 +2567,10 @@ impl SqlEditorWidget {
                         select_list_layout_state.clear();
                     } else if clause_keywords.contains(&upper.as_str())
                         && !construct.suppresses_clause_break(
+                            tokens,
+                            idx,
                             upper.as_str(),
+                            current_clause.as_deref(),
                             prev_word_upper.as_deref(),
                             in_plsql_block,
                             suppress_comma_break_depth,
@@ -2728,7 +2811,7 @@ impl SqlEditorWidget {
                             trigger_header_state.start();
                         }
                         construct.create_pending = false;
-                    } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
+                    } else if sql_text::is_with_plsql_declaration_keyword(upper.as_str())
                         && prev_word_upper.as_deref() == Some("WITH")
                     {
                         if !at_line_start {
@@ -16225,6 +16308,183 @@ MATCH_RECOGNIZE (
         assert!(
             formatted.contains("ROWS WITH TIES"),
             "WITH TIES should stay on the FETCH line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_log_errors_into_and_reject_limit_stay_inline() {
+        let source = "INSERT INTO target_emp (empno, ename) SELECT empno, ename FROM staging_emp LOG ERRORS INTO err$_target_emp ('LOAD1') REJECT LIMIT UNLIMITED;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("LOG ERRORS INTO err$_target_emp ('LOAD1')"),
+            "LOG ERRORS INTO should stay on one clause line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("REJECT LIMIT UNLIMITED"),
+            "REJECT LIMIT should stay on one clause line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nINTO err$_target_emp") && !formatted.contains("\nLIMIT UNLIMITED"),
+            "LOG ERRORS INTO / REJECT LIMIT must not be split by clause keywords, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_model_rules_update_stays_on_rules_line() {
+        let source = "SELECT * FROM sales MODEL PARTITION BY (deptno) DIMENSION BY (month_key) MEASURES (amt) RULES UPDATE (amt[1] = amt[CV(month_key)] * 1.1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\n    RULES UPDATE ("),
+            "MODEL RULES UPDATE should stay in the same subclause header, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nUPDATE ("),
+            "MODEL RULES UPDATE must not split UPDATE as a top-level clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_forall_values_of_stays_in_header() {
+        let source = "DECLARE TYPE idx_tab IS TABLE OF PLS_INTEGER; l_idx idx_tab := idx_tab(1, 3, 5); BEGIN FORALL i IN VALUES OF l_idx INSERT INTO t_log (id, msg) VALUES (i, 'x'); END; /";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FORALL i IN VALUES OF l_idx"),
+            "FORALL header should keep VALUES OF inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("IN\n        VALUES OF") && !formatted.contains("IN\n    VALUES OF"),
+            "VALUES OF must not be split out of the FORALL header, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_multiset_except_stays_inline() {
+        let source = "DECLARE TYPE num_nt IS TABLE OF NUMBER; nt_a num_nt := num_nt(1, 2, 3); nt_b num_nt := num_nt(2, 3); v_diff num_nt; BEGIN v_diff := nt_a MULTISET EXCEPT DISTINCT nt_b; END; /";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("MULTISET EXCEPT DISTINCT nt_b"),
+            "MULTISET EXCEPT should remain an expression operator, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("MULTISET\n") && !formatted.contains("\nEXCEPT DISTINCT nt_b"),
+            "MULTISET EXCEPT must not be treated as a set-operator clause break, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_multiset_union_stays_inline() {
+        let source = "DECLARE TYPE num_nt IS TABLE OF NUMBER; nt_a num_nt := num_nt(1, 2); nt_b num_nt := num_nt(3, 4); v_all num_nt; BEGIN v_all := nt_a MULTISET UNION DISTINCT nt_b; END; /";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("MULTISET UNION DISTINCT nt_b"),
+            "MULTISET UNION should remain an expression operator, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("MULTISET\n") && !formatted.contains("\nUNION DISTINCT nt_b"),
+            "MULTISET UNION must not be treated as a top-level set operator, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_json_object_with_unique_keys_stays_inside_function() {
+        let source = "SELECT JSON_OBJECT('id' VALUE e.empno, 'name' VALUE e.ename WITH UNIQUE KEYS) AS j FROM emp e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITH UNIQUE KEYS"),
+            "JSON_OBJECT WITH UNIQUE KEYS should remain inside the function call, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nWITH UNIQUE KEYS"),
+            "JSON_OBJECT WITH UNIQUE KEYS must not be treated as a new WITH clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_json_query_with_wrapper_stays_inside_function() {
+        let source = "SELECT JSON_QUERY(e.payload, '$.items[*]' WITH WRAPPER) AS items_json FROM emp_json e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITH WRAPPER"),
+            "JSON_QUERY WITH WRAPPER should remain inside the function call, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nWITH WRAPPER"),
+            "JSON_QUERY WITH WRAPPER must not be treated as a new WITH clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_json_transform_set_and_insert_stay_inside_function() {
+        let source = "SELECT JSON_TRANSFORM(e.payload, SET '$.status' = 'DONE', INSERT '$.audit.user' = USER) AS payload2 FROM emp_json e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SET '$.status' = 'DONE'"),
+            "JSON_TRANSFORM SET operation should remain inside the function call, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("INSERT '$.audit.user' = USER"),
+            "JSON_TRANSFORM INSERT operation should remain inside the function call, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nSET '$.status' = 'DONE'\nFROM")
+                && !formatted.contains("\nINSERT '$.audit.user' = USER\nFROM"),
+            "JSON_TRANSFORM operations must not escape the function argument context, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_package_declaration_stays_structured() {
+        let source = "WITH PACKAGE pkg_demo AS FUNCTION f RETURN NUMBER; END pkg_demo; SELECT 1 FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITH\n    PACKAGE pkg_demo AS"),
+            "WITH PACKAGE should start a structured declaration block, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n        FUNCTION f RETURN NUMBER;"),
+            "WITH PACKAGE members should be indented under the declaration, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n    END pkg_demo;\nSELECT 1"),
+            "WITH PACKAGE should close before the main query at the correct depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_type_declaration_stays_attached_to_main_query() {
+        let source = "WITH TYPE t_num IS TABLE OF NUMBER; SELECT * FROM TABLE(t_num(1, 2, 3));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITH\n    TYPE t_num IS TABLE OF NUMBER;\nSELECT *"),
+            "WITH TYPE declaration should stay attached to the main query, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("FROM TABLE (t_num (1, 2, 3))")
+                || formatted.contains("FROM TABLE(t_num(1, 2, 3))"),
+            "Main query after WITH TYPE should remain intact, got:\n{}",
             formatted
         );
     }
