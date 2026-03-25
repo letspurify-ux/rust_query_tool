@@ -3422,26 +3422,29 @@ impl MainWindow {
                     config_snapshot
                 };
                 if let Some(settings) = show_settings_dialog(&config_snapshot) {
-                    let mut s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let save_result = {
-                        let mut config = s
-                            .config
+                        let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        config.editor_font = settings.font.clone();
-                        config.ui_font_size = settings.ui_size;
-                        config.editor_font_size = settings.editor_size;
-                        config.result_font = settings.font;
-                        config.result_font_size = settings.result_size;
-                        config.result_cell_max_chars = settings.result_cell_max_chars;
-                        config.save()
+                        let save_result = {
+                            let mut config = s
+                                .config
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            config.editor_font = settings.font.clone();
+                            config.ui_font_size = settings.ui_size;
+                            config.editor_font_size = settings.editor_size;
+                            config.result_font = settings.font;
+                            config.result_font_size = settings.result_size;
+                            config.result_cell_max_chars = settings.result_cell_max_chars;
+                            config.save()
+                        };
+                        MainWindow::apply_font_settings(&mut s);
+                        save_result
                     };
                     if let Err(err) = save_result {
                         fltk::dialog::alert_default(&format!("Failed to save settings: {}", err));
                     }
-                    MainWindow::apply_font_settings(&mut s);
                 }
                 true
             }
@@ -4023,6 +4026,7 @@ impl MainWindow {
                 let r = file_receiver
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut deferred_alert: Option<String> = None;
                 loop {
                     let Ok(mut s) = state.try_lock() else {
                         deferred_by_borrow_conflict = true;
@@ -4058,7 +4062,7 @@ impl MainWindow {
                                         }
                                     }
                                     Err(err) => {
-                                        fltk::dialog::alert_default(&format!(
+                                        deferred_alert = Some(format!(
                                             "Failed to open SQL file: {}",
                                             err
                                         ));
@@ -4086,7 +4090,7 @@ impl MainWindow {
                                         ));
                                     }
                                     Err(err) => {
-                                        fltk::dialog::alert_default(&format!(
+                                        deferred_alert = Some(format!(
                                             "Failed to export CSV: {}",
                                             err
                                         ));
@@ -4095,6 +4099,10 @@ impl MainWindow {
                             }
 
                             drop(s);
+
+                            if let Some(alert_msg) = deferred_alert.take() {
+                                fltk::dialog::alert_default(&alert_msg);
+                            }
 
                             if let Some(tab_id) = created_tab_for_open {
                                 MainWindow::attach_editor_callbacks(

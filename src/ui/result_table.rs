@@ -2357,6 +2357,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(row_data) = data.get_mut(row_idx) else {
+                drop(data);
                 fltk::dialog::alert_default("Selected row is out of range.");
                 return true;
             };
