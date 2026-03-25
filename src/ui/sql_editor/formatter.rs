@@ -66,6 +66,7 @@ enum QueryHeadLayoutOrigin {
     Other,
     ClauseOwner,
     ConditionOwner,
+    FromItemOwner,
 }
 
 #[derive(Clone, Copy)]
@@ -873,6 +874,15 @@ impl SqlEditorWidget {
         let rest = rest.trim_start();
 
         rest.is_empty() || rest.starts_with(';')
+    }
+
+    fn paren_opens_analytic_layout(
+        current_clause: Option<&str>,
+        prev_word_upper: Option<&str>,
+    ) -> bool {
+        matches!(prev_word_upper, Some("OVER"))
+            || (matches!(current_clause, Some("WINDOW"))
+                && matches!(prev_word_upper, Some("AS")))
     }
 
     fn query_apply_flags(tokens: &[SqlToken]) -> Vec<bool> {
@@ -3599,9 +3609,34 @@ impl SqlEditorWidget {
                         at_line_start = true;
                         needs_space = false;
                         if keeps_next_line_continuation {
+                            let in_column_list =
+                                column_list_stack.last().copied().unwrap_or(false);
+                            let continuation_indent = if in_select_list
+                                || in_set_clause
+                                || active_list_layout
+                                || in_column_list
+                                || hint_after_select
+                            {
+                                active_list_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    select_list_layout_state,
+                                    current_clause.as_deref(),
+                                    construct.merge_active,
+                                    in_column_list,
+                                )
+                            } else {
+                                line_indent.max(
+                                    base_indent(indent_level, open_cursor_state)
+                                        .saturating_add(usize::from(
+                                            current_clause.is_some()
+                                                || suppress_comma_break_depth > 0,
+                                        )),
+                                )
+                            };
                             inline_comment_continuation_state =
                                 InlineCommentContinuationState::Operand {
-                                    indent: line_indent,
+                                    indent: continuation_indent,
                                 };
                         } else {
                             let in_column_list = column_list_stack.last().copied().unwrap_or(false);
@@ -3638,7 +3673,31 @@ impl SqlEditorWidget {
                         );
                         if !keep_inline_alias_comment {
                             if keeps_next_line_continuation {
-                                let continuation_indent = line_indent;
+                                let in_column_list =
+                                    column_list_stack.last().copied().unwrap_or(false);
+                                let continuation_indent = if in_select_list
+                                    || in_set_clause
+                                    || active_list_layout
+                                    || in_column_list
+                                    || hint_after_select
+                                {
+                                    active_list_indent(
+                                        indent_level,
+                                        open_cursor_state,
+                                        select_list_layout_state,
+                                        current_clause.as_deref(),
+                                        construct.merge_active,
+                                        in_column_list,
+                                    )
+                                } else {
+                                    line_indent.max(
+                                        base_indent(indent_level, open_cursor_state)
+                                            .saturating_add(usize::from(
+                                                current_clause.is_some()
+                                                    || suppress_comma_break_depth > 0,
+                                            )),
+                                    )
+                                };
                                 newline_with(
                                     &mut out,
                                     0,
@@ -3895,15 +3954,8 @@ impl SqlEditorWidget {
                         }
                         "(" => {
                             with_cte_state.on_open_paren();
-                            let is_query_paren = next_word_is("SELECT")
-                                || next_word_is("WITH")
-                                || next_word_is("INSERT")
-                                || next_word_is("UPDATE")
-                                || next_word_is("DELETE")
-                                || next_word_is("MERGE")
-                                || next_word_is("CALL")
-                                || next_word_is("VALUES")
-                                || next_word_is("TABLE");
+                            let is_query_paren =
+                                next_word.is_some_and(crate::sql_text::is_subquery_head_keyword);
                             if Self::paren_starts_first_clause_list_item(
                                 current_clause.as_deref(),
                                 prev_word_upper.as_deref(),
@@ -3920,11 +3972,13 @@ impl SqlEditorWidget {
                             }
 
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
-                            let is_analytic_over_paren =
-                                prev_word_upper.as_deref() == Some("OVER");
+                            let is_analytic_over_paren = Self::paren_opens_analytic_layout(
+                                current_clause.as_deref(),
+                                prev_word_upper.as_deref(),
+                            );
                             let is_multiline_clause_paren = matches!(
                                 prev_word_upper.as_deref(),
-                                Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT")
+                                Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT" | "WINDOW")
                             ) || is_analytic_over_paren;
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
                             let keeps_aggregate_call_tight = statement_has_apply
@@ -4295,6 +4349,10 @@ impl SqlEditorWidget {
             || trimmed_upper.contains(" JOIN (")
     }
 
+    fn line_has_from_item_query_owner(trimmed_upper: &str) -> bool {
+        trimmed_upper.starts_with("LATERAL (") || trimmed_upper.contains(" APPLY (")
+    }
+
     fn line_has_condition_query_owner(trimmed_upper: &str) -> bool {
         (trimmed_upper.ends_with(" IN (")
             && !crate::sql_text::starts_with_keyword_token(trimmed_upper, "FOR"))
@@ -4303,15 +4361,8 @@ impl SqlEditorWidget {
     }
 
     fn line_starts_query_head(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_keyword_token(trimmed_upper, "WITH")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INSERT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UPDATE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "DELETE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MERGE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CALL")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "VALUES")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "TABLE")
+        crate::sql_text::first_meaningful_word(trimmed_upper)
+            .is_some_and(crate::sql_text::is_subquery_head_keyword)
     }
 
     fn line_has_inline_comment_after_case_terminator(line: &str) -> bool {
@@ -4324,6 +4375,8 @@ impl SqlEditorWidget {
     fn structural_query_head_origin(trimmed_upper: &str) -> QueryHeadLayoutOrigin {
         if Self::line_has_condition_query_owner(trimmed_upper) {
             QueryHeadLayoutOrigin::ConditionOwner
+        } else if Self::line_has_from_item_query_owner(trimmed_upper) {
+            QueryHeadLayoutOrigin::FromItemOwner
         } else if Self::line_has_clause_query_owner(trimmed_upper) {
             QueryHeadLayoutOrigin::ClauseOwner
         } else {
@@ -4565,6 +4618,8 @@ impl SqlEditorWidget {
             } else {
                 Some(layout.final_depth.saturating_add(2))
             }
+        } else if Self::line_has_from_item_query_owner(trimmed_upper) {
+            Some(layout.final_depth.saturating_add(1))
         } else {
             Some(layout.final_depth.saturating_add(1))
         }
@@ -6145,20 +6200,7 @@ impl SqlEditorWidget {
     }
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WITH")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "VALUES")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SET")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "START")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+        crate::sql_text::starts_with_format_layout_clause(trimmed_upper)
     }
 
     fn starts_with_condition_keyword(trimmed_upper: &str) -> bool {
@@ -6605,6 +6647,7 @@ impl SqlEditorWidget {
                     word.eq_ignore_ascii_case("MATCH_RECOGNIZE")
                         || word.eq_ignore_ascii_case("PIVOT")
                         || word.eq_ignore_ascii_case("UNPIVOT")
+                        || word.eq_ignore_ascii_case("WINDOW")
                 }
                 _ => false,
             })
@@ -6681,33 +6724,7 @@ impl SqlEditorWidget {
             return false;
         };
         let last_upper = last_word.to_ascii_uppercase();
-        if matches!(
-            last_upper.as_str(),
-            "AND"
-                | "OR"
-                | "IN"
-                | "IS"
-                | "LIKE"
-                | "BETWEEN"
-                | "NOT"
-                | "EXISTS"
-                | "SELECT"
-                | "FROM"
-                | "WHERE"
-                | "HAVING"
-                | "USING"
-                | "VALUES"
-                | "SET"
-                | "INTO"
-                | "ON"
-                | "JOIN"
-                | "WITH"
-                | "MODEL"
-                | "WINDOW"
-                | "MATCH_RECOGNIZE"
-                | "QUALIFY"
-                | "RETURNING"
-        ) {
+        if crate::sql_text::is_format_comment_continuation_keyword(last_upper.as_str()) {
             return true;
         }
 
@@ -6731,6 +6748,12 @@ impl SqlEditorWidget {
                     | ("DIMENSION", "BY")
                     | ("START", "WITH")
             ) {
+                return true;
+            }
+
+            if matches!(previous_upper.as_str(), "BETWEEN" | "OF")
+                && crate::sql_text::is_format_temporal_boundary_keyword(last_upper.as_str())
+            {
                 return true;
             }
 
@@ -12563,6 +12586,16 @@ ORDER BY v.amt DESC;"#;
 mod format_indent_gap_tests {
     use crate::ui::sql_editor::SqlEditorWidget;
 
+    fn leading_spaces(line: &str) -> usize {
+        line.len().saturating_sub(line.trim_start().len())
+    }
+
+    fn find_line_starting_with(lines: &[&str], prefix: &str) -> Option<usize> {
+        lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(prefix))
+    }
+
     // ── CURSOR IS/AS SELECT body indent ──
 
     #[test]
@@ -16113,6 +16146,64 @@ FROM emp;"#;
         );
     }
 
+    #[test]
+    fn format_sql_window_clause_and_qualify_keep_clause_depths_stable() {
+        let source = "SELECT e.deptno, e.empno, SUM(e.sal) OVER w_dept AS dept_sum FROM emp e WINDOW w_dept AS (PARTITION BY e.deptno ORDER BY e.sal DESC, e.empno) QUALIFY ROW_NUMBER() OVER w_dept = 1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let window_idx =
+            find_line_starting_with(&lines, "WINDOW w_dept AS (").expect("WINDOW clause line");
+        let partition_idx =
+            find_line_starting_with(&lines, "PARTITION BY e.deptno").expect("WINDOW PARTITION BY");
+        let order_idx =
+            find_line_starting_with(&lines, "ORDER BY e.sal DESC").expect("WINDOW ORDER BY");
+        let qualify_idx =
+            find_line_starting_with(&lines, "QUALIFY ROW_NUMBER").expect("QUALIFY clause line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_idx.saturating_add(1))
+            .find(|(idx, line)| *idx < qualify_idx && line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("WINDOW closing parenthesis");
+
+        assert!(
+            formatted.contains("\nWINDOW w_dept AS ("),
+            "WINDOW clause should start on its own clause line, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[partition_idx]) > leading_spaces(lines[window_idx]),
+            "WINDOW PARTITION BY should be indented under WINDOW, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[partition_idx]),
+            leading_spaces(lines[order_idx]),
+            "WINDOW PARTITION BY / ORDER BY should share the same continuation depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[window_idx]),
+            "WINDOW closing parenthesis should realign with WINDOW clause, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[qualify_idx]),
+            leading_spaces(lines[window_idx]),
+            "QUALIFY should align with top-level clause anchors, got:\n{}",
+            formatted
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "WINDOW / QUALIFY formatting should be idempotent"
+        );
+    }
+
     // ── Bug regression: ORDER BY ... DESC split ──
 
     #[test]
@@ -16268,6 +16359,51 @@ MATCH_RECOGNIZE (
         );
     }
 
+    #[test]
+    fn format_sql_lateral_derived_table_uses_from_item_query_depth() {
+        let source = "SELECT d.deptno, x.max_sal FROM dept d, LATERAL (SELECT MAX(e.sal) AS max_sal FROM emp e WHERE e.deptno = d.deptno) x;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let from_idx = find_line_starting_with(&lines, "FROM dept d,").expect("outer FROM line");
+        let lateral_idx =
+            find_line_starting_with(&lines, "LATERAL (").expect("LATERAL owner line");
+        let select_idx =
+            find_line_starting_with(&lines, "SELECT MAX").expect("LATERAL inner SELECT line");
+        let inner_from_idx =
+            find_line_starting_with(&lines, "FROM emp e").expect("LATERAL inner FROM line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") x"))
+            .map(|(idx, _)| idx)
+            .expect("LATERAL closing line");
+
+        assert!(
+            leading_spaces(lines[lateral_idx]) > leading_spaces(lines[from_idx]),
+            "LATERAL derived table should indent under the FROM item list, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[select_idx]) > leading_spaces(lines[lateral_idx]),
+            "SELECT inside LATERAL should indent deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[inner_from_idx]),
+            "Nested query clauses inside LATERAL should share one query depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[lateral_idx]),
+            "LATERAL closing parenthesis should realign with the owner line, got:\n{}",
+            formatted
+        );
+    }
+
     // ── Bug regression: PIVOT/UNPIVOT alignment ──
 
     #[test]
@@ -16308,6 +16444,80 @@ MATCH_RECOGNIZE (
         assert!(
             formatted.contains("ROWS WITH TIES"),
             "WITH TIES should stay on the FETCH line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_offset_and_fetch_comments_keep_clause_continuation_indent() {
+        let source = "SELECT e.empno, e.ename FROM emp e ORDER BY e.empno OFFSET -- skip first page\n10 ROWS FETCH -- page size\nFIRST 5 ROWS ONLY;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let offset_idx = find_line_starting_with(&lines, "OFFSET").expect("OFFSET clause line");
+        let offset_rows_idx =
+            find_line_starting_with(&lines, "10 ROWS").expect("OFFSET operand line");
+        let fetch_idx = find_line_starting_with(&lines, "FETCH").expect("FETCH clause line");
+        let fetch_rows_idx =
+            find_line_starting_with(&lines, "FIRST 5 ROWS ONLY;").expect("FETCH operand line");
+
+        assert!(
+            lines[offset_idx].contains("-- skip first page")
+                || lines.iter().any(|line| line.trim_start().starts_with("-- skip first page")),
+            "OFFSET comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[offset_rows_idx]) > leading_spaces(lines[offset_idx]),
+            "OFFSET operand should stay deeper than the OFFSET clause line, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines[fetch_idx].contains("-- page size")
+                || lines.iter().any(|line| line.trim_start().starts_with("-- page size")),
+            "FETCH comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[fetch_rows_idx]) > leading_spaces(lines[fetch_idx]),
+            "FETCH operand should stay deeper than the FETCH clause line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_versions_between_comment_continuation_stays_attached_to_from_clause() {
+        let source = "SELECT versions_starttime, versions_endtime, employee_id, salary FROM employees VERSIONS BETWEEN TIMESTAMP -- keep temporal boundary\nSYSTIMESTAMP - INTERVAL '7' DAY AND SYSTIMESTAMP WHERE employee_id = 100;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let from_idx = find_line_starting_with(&lines, "FROM employees VERSIONS BETWEEN TIMESTAMP")
+            .expect("VERSIONS BETWEEN owner line");
+        let boundary_idx = find_line_starting_with(
+            &lines,
+            "SYSTIMESTAMP - INTERVAL '7' DAY AND SYSTIMESTAMP",
+        )
+        .expect("VERSIONS BETWEEN boundary line");
+        let where_idx = find_line_starting_with(&lines, "WHERE employee_id = 100;")
+            .expect("WHERE line after VERSIONS BETWEEN");
+
+        assert!(
+            lines[from_idx].contains("-- keep temporal boundary")
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- keep temporal boundary")),
+            "Temporal clause comment should be preserved in formatted output, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[boundary_idx]) > leading_spaces(lines[from_idx]),
+            "VERSIONS BETWEEN boundary should stay deeper than the FROM owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[where_idx]),
+            leading_spaces(lines[from_idx]),
+            "WHERE should realign with the FROM clause after temporal continuation, got:\n{}",
             formatted
         );
     }

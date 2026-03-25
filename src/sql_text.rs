@@ -612,6 +612,51 @@ pub(crate) const FORMAT_CLAUSE_KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
+/// Formatter clause starters that should remain stable layout anchors during
+/// the secondary indentation pass.
+pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "WITH",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "VALUES",
+    "SET",
+    "CONNECT",
+    "START",
+    "UNION",
+    "INTERSECT",
+    "MINUS",
+    "EXCEPT",
+    "RETURNING",
+    "MODEL",
+    "WINDOW",
+    "MATCH_RECOGNIZE",
+    "QUALIFY",
+    "OFFSET",
+    "FETCH",
+    "LIMIT",
+];
+
+/// Leading keywords that keep the following line on the same continuation
+/// depth when a comment splits the expression or clause body.
+pub(crate) const FORMAT_COMMENT_CONTINUATION_KEYWORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "IN",
+    "IS",
+    "LIKE",
+    "BETWEEN",
+    "NOT",
+    "EXISTS",
+    "USING",
+    "INTO",
+    "ON",
+    "JOIN",
+];
+
 /// `CREATE TABLE ...` suffix keywords used by formatter to split storage clauses.
 pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
     "PCTFREE",
@@ -1297,6 +1342,26 @@ pub(crate) fn is_format_column_constraint_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_COLUMN_CONSTRAINT_KEYWORDS)
 }
 
+/// Returns true when `text_upper` starts with a formatter clause that should
+/// behave as a stable layout anchor in the indentation pass.
+pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
+    FORMAT_LAYOUT_CLAUSE_START_KEYWORDS
+        .iter()
+        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+}
+
+/// Returns true when a leading keyword should preserve the next line as a
+/// continuation after a comment split.
+pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_LAYOUT_CLAUSE_START_KEYWORDS)
+        || matches_keyword(word, FORMAT_COMMENT_CONTINUATION_KEYWORDS)
+}
+
+/// Returns true when a token starts a flashback/temporal boundary expression.
+pub(crate) fn is_format_temporal_boundary_keyword(word: &str) -> bool {
+    matches!(word.to_ascii_uppercase().as_str(), "TIMESTAMP" | "SCN")
+}
+
 /// Returns true when a token is a leading clause keyword for table-function columns.
 pub(crate) fn is_table_function_item_leading_keyword(word: &str) -> bool {
     matches_keyword(word, TABLE_FUNCTION_ITEM_LEADING_KEYWORDS)
@@ -1373,10 +1438,16 @@ mod tests {
         assert!(FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_LAYOUT_CLAUSE_START_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
         assert!(FORMAT_JOIN_MODIFIER_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
         assert!(FORMAT_CONDITION_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_COMMENT_CONTINUATION_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
         assert!(FORMAT_BLOCK_START_KEYWORDS
@@ -1388,6 +1459,33 @@ mod tests {
         assert!(FORMAT_COLUMN_CONSTRAINT_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
+    }
+
+    #[test]
+    fn starts_with_format_layout_clause_tracks_extended_clause_heads() {
+        assert!(starts_with_format_layout_clause("WINDOW w AS ("));
+        assert!(starts_with_format_layout_clause("QUALIFY ROW_NUMBER () = 1"));
+        assert!(starts_with_format_layout_clause("OFFSET 10 ROWS"));
+        assert!(starts_with_format_layout_clause("FETCH FIRST 5 ROWS ONLY"));
+        assert!(starts_with_format_layout_clause("LIMIT 50"));
+    }
+
+    #[test]
+    fn format_comment_continuation_keywords_cover_clause_and_condition_heads() {
+        assert!(is_format_comment_continuation_keyword("WINDOW"));
+        assert!(is_format_comment_continuation_keyword("QUALIFY"));
+        assert!(is_format_comment_continuation_keyword("FETCH"));
+        assert!(is_format_comment_continuation_keyword("LIMIT"));
+        assert!(is_format_comment_continuation_keyword("AND"));
+        assert!(is_format_comment_continuation_keyword("JOIN"));
+        assert!(!is_format_comment_continuation_keyword("DUAL"));
+    }
+
+    #[test]
+    fn format_temporal_boundary_keywords_cover_timestamp_and_scn() {
+        assert!(is_format_temporal_boundary_keyword("timestamp"));
+        assert!(is_format_temporal_boundary_keyword("SCN"));
+        assert!(!is_format_temporal_boundary_keyword("DATE"));
     }
 
     #[test]
