@@ -714,24 +714,6 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
     }
 
     #[test]
-    fn qualifier_before_word_supports_schema_qualified_identifier() {
-        let sql_with_cursor = "SELECT scott.emp.| FROM scott.emp";
-        let cursor = sql_with_cursor.find('|').unwrap_or(0);
-        let sql = sql_with_cursor.replace('|', "");
-        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
-        assert_eq!(qualifier.as_deref(), Some("scott.emp"));
-    }
-
-    #[test]
-    fn qualifier_before_word_supports_quoted_schema_qualified_identifier() {
-        let sql_with_cursor = r#"SELECT "SCOTT"."EMP".| FROM "SCOTT"."EMP""#;
-        let cursor = sql_with_cursor.find('|').unwrap_or(0);
-        let sql = sql_with_cursor.replace('|', "");
-        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
-        assert_eq!(qualifier.as_deref(), Some("SCOTT.EMP"));
-    }
-
-    #[test]
     fn identifier_at_position_supports_unicode_identifier() {
         let sql = "SELECT 사용자 FROM dual";
         let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();

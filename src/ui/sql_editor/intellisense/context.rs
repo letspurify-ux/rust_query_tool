@@ -755,15 +755,57 @@ impl SqlEditorWidget {
         }
         let idx = rel_word_start - 1;
 
+        if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
+            let mut pos = idx as isize - 2;
+            loop {
+                if pos < 0 {
+                    break;
+                }
+                let pos_usize = pos as usize;
+                if bytes[pos_usize] == b'"' {
+                    if pos_usize > 0 && bytes[pos_usize - 1] == b'"' {
+                        // `""` escape sequence inside quoted identifier: skip the pair.
+                        pos -= 2;
+                        continue;
+                    }
+                    let quoted = text.get(pos_usize..idx)?;
+                    let qualifier = Self::strip_identifier_quotes(quoted);
+                    if qualifier.is_empty() {
+                        return None;
+                    }
+                    return Some(qualifier);
+                }
+                pos -= 1;
+            }
+            return None;
+        }
+
         let qualifier_candidate = text.get(..idx)?;
         if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
             return None;
         }
-        let qualifier = Self::parse_qualified_identifier_suffix(qualifier_candidate)?;
-        if qualifier.is_empty() {
+        let mut start_byte = qualifier_candidate.len();
+        for (pos, ch) in qualifier_candidate.char_indices().rev() {
+            if sql_text::is_identifier_char(ch) {
+                start_byte = pos;
+                continue;
+            }
+            break;
+        }
+        if start_byte == qualifier_candidate.len() {
             return None;
         }
-        Some(qualifier)
+        let qualifier = qualifier_candidate.get(start_byte..)?;
+        let qualifier = Self::strip_identifier_quotes(qualifier);
+        let starts_with_valid_ident_char = qualifier
+            .chars()
+            .next()
+            .is_some_and(sql_text::is_identifier_start_char);
+        if qualifier.is_empty() || !starts_with_valid_ident_char {
+            None
+        } else {
+            Some(qualifier)
+        }
     }
 
     fn has_unbalanced_identifier_quotes(text: &str) -> bool {
@@ -785,101 +827,6 @@ impl SqlEditorWidget {
             }
         }
         in_quotes
-    }
-
-    fn parse_qualified_identifier_suffix(text: &str) -> Option<String> {
-        let mut segment_spans: Vec<(usize, usize)> = Vec::new();
-        let mut end = text.len();
-        let (mut seg_start, seg_end) = Self::parse_identifier_segment_back(text, end)?;
-        segment_spans.push((seg_start, seg_end));
-
-        while seg_start > 0 {
-            let dot_idx = seg_start.saturating_sub(1);
-            if text.as_bytes().get(dot_idx) != Some(&b'.') {
-                break;
-            }
-            end = dot_idx;
-            let Some((prev_start, prev_end)) = Self::parse_identifier_segment_back(text, end) else {
-                break;
-            };
-            segment_spans.push((prev_start, prev_end));
-            seg_start = prev_start;
-            if prev_end != end {
-                return None;
-            }
-        }
-
-        segment_spans.reverse();
-        let mut normalized = Vec::with_capacity(segment_spans.len());
-        for (start, end) in segment_spans {
-            let segment = text.get(start..end)?;
-            if segment.trim().is_empty() {
-                return None;
-            }
-            normalized.push(Self::strip_identifier_quotes(segment));
-        }
-
-        if normalized
-            .first()
-            .and_then(|segment| segment.chars().next())
-            .is_none_or(|ch| !sql_text::is_identifier_start_char(ch))
-        {
-            return None;
-        }
-
-        Some(normalized.join("."))
-    }
-
-    fn parse_identifier_segment_back(text: &str, end: usize) -> Option<(usize, usize)> {
-        if end == 0 || end > text.len() || !text.is_char_boundary(end) {
-            return None;
-        }
-
-        let bytes = text.as_bytes();
-        if bytes.get(end.saturating_sub(1)) == Some(&b'"') {
-            let mut pos = end.saturating_sub(2) as isize;
-            loop {
-                if pos < 0 {
-                    return None;
-                }
-                let idx = pos as usize;
-                if bytes.get(idx) == Some(&b'"') {
-                    if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
-                        pos -= 2;
-                        continue;
-                    }
-                    if idx + 1 >= end {
-                        return None;
-                    }
-                    return Some((idx, end));
-                }
-                pos -= 1;
-            }
-        }
-
-        let mut start = end;
-        for (pos, ch) in text.get(..end)?.char_indices().rev() {
-            if sql_text::is_identifier_char(ch) {
-                start = pos;
-            } else {
-                break;
-            }
-        }
-
-        if start == end {
-            return None;
-        }
-
-        let segment = text.get(start..end)?;
-        if segment
-            .chars()
-            .next()
-            .is_none_or(|ch| !sql_text::is_identifier_start_char(ch))
-        {
-            return None;
-        }
-
-        Some((start, end))
     }
 
     fn try_fast_path_intellisense_filter(
