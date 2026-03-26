@@ -394,6 +394,17 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn starts_with_alter_session(&self) -> bool {
+        self.starts_with_alter_keyword("SESSION")
+    }
+
+    /// Returns `true` when the current buffer begins with `ALTER SESSION`
+    /// or `ALTER SYSTEM`.  Both forms accept a `SET` continuation line that
+    /// must not be mistaken for a SQL*Plus `SET` tool command.
+    pub(crate) fn starts_with_alter_set_context(&self) -> bool {
+        self.starts_with_alter_keyword("SESSION") || self.starts_with_alter_keyword("SYSTEM")
+    }
+
+    fn starts_with_alter_keyword(&self, keyword: &str) -> bool {
         let current = self.current.as_str();
         let Some((first, first_end)) = next_meaningful_word(current, 0) else {
             return false;
@@ -407,7 +418,7 @@ impl SqlParserEngine {
             return false;
         };
 
-        second.eq_ignore_ascii_case("SESSION")
+        second.eq_ignore_ascii_case(keyword)
     }
 
 
