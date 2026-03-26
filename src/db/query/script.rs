@@ -112,6 +112,8 @@ enum AutoFormatClauseKind {
     Minus,
     Set,
     Into,
+    Pivot,
+    Unpivot,
 }
 
 impl AutoFormatClauseKind {
@@ -1675,6 +1677,10 @@ impl QueryExecutor {
             Some(AutoFormatClauseKind::Set)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTO") {
             Some(AutoFormatClauseKind::Into)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "PIVOT") {
+            Some(AutoFormatClauseKind::Pivot)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "UNPIVOT") {
+            Some(AutoFormatClauseKind::Unpivot)
         } else {
             None
         }

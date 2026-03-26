@@ -2974,6 +2974,28 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
+                    } else if matches!(upper.as_str(), "PIVOT" | "UNPIVOT")
+                        && suppress_comma_break_depth == 0
+                        && !construct.create_synonym_active
+                    {
+                        // PIVOT/UNPIVOT should start on a new line as a
+                        // clause-level keyword at the same depth as FROM.
+                        newline_with(
+                            &mut out,
+                            clause_indent(
+                                indent_level,
+                                open_cursor_state,
+                                upper.as_str(),
+                                open_cursor_state
+                                    .select_depth()
+                                    .is_some_and(|depth| paren_stack.len() == depth),
+                                construct.cursor_sql_active,
+                            ),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if construct.match_recognize_paren_depth.is_some_and(|depth| {
                         paren_stack.len() >= depth
                             && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
@@ -13698,14 +13720,16 @@ ORDER BY u.dept_id,
 ),
 p AS (
     SELECT *
-    FROM src PIVOT (
+    FROM src
+    PIVOT (
         SUM (amt)
         FOR qtr IN ('Q1' AS q1, 'Q2' AS q2)
     )
 ),
 u AS (
     SELECT *
-    FROM p UNPIVOT (
+    FROM p
+    UNPIVOT (
         amt
         FOR qtr IN (q1 AS 'Q1', q2 AS 'Q2')
     )
@@ -13953,14 +13977,14 @@ END;"#;
 
         assert!(
             formatted.contains(
-                "        SELECT job,\n            dept_tag,\n            sal_amt\n        FROM pivoted UNPIVOT ("
+                "        SELECT job,\n            dept_tag,\n            sal_amt\n        FROM pivoted\n        UNPIVOT ("
             ),
-            "FROM before UNPIVOT should realign to the SELECT base depth instead of staying at select-item depth, got:\n{}",
+            "FROM before UNPIVOT should realign to the SELECT base depth and UNPIVOT should start on its own line, got:\n{}",
             formatted
         );
         assert!(
             !formatted.contains(
-                "        SELECT job,\n            dept_tag,\n            sal_amt\n            FROM pivoted UNPIVOT ("
+                "        SELECT job,\n            dept_tag,\n            sal_amt\n            FROM pivoted"
             ),
             "FROM before UNPIVOT must not remain indented like a select-list continuation, got:\n{}",
             formatted
@@ -13981,7 +14005,8 @@ BEGIN
         ),
         pivoted AS (
             SELECT *
-            FROM src PIVOT (
+            FROM src
+            PIVOT (
                 SUM (sal) AS sum_sal
                 FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
             )
@@ -13989,7 +14014,8 @@ BEGIN
         SELECT job,
             dept_tag,
             sal_amt
-        FROM pivoted UNPIVOT (
+        FROM pivoted
+        UNPIVOT (
             sal_amt
             FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
         )
@@ -14020,7 +14046,8 @@ BEGIN
         ),
         pivoted AS (
             SELECT *
-            FROM src PIVOT (
+            FROM src
+            PIVOT (
                 SUM (sal) AS sum_sal
                 FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30)
             )
@@ -14028,7 +14055,8 @@ BEGIN
         SELECT job,
             dept_tag,
             sal_amt
-        FROM pivoted UNPIVOT (
+        FROM pivoted
+        UNPIVOT (
             sal_amt
             FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30')
         )
@@ -17569,6 +17597,116 @@ MATCH_RECOGNIZE (
             "MODEL subclauses formatting should be idempotent.\nFirst:\n{}\nSecond:\n{}",
             formatted, formatted_again
         );
+    }
+
+    // ── Regression tests: PIVOT/UNPIVOT and related formatting ──
+
+    #[test]
+    fn format_sql_basic_for_update_skip_locked_stays_on_one_line() {
+        let source = "select * from emp e where e.deptno = 10 for update skip locked;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE SKIP LOCKED"),
+            "FOR UPDATE SKIP LOCKED should stay on one line, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "FOR UPDATE SKIP LOCKED formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_for_update_of_nowait_stays_on_one_line() {
+        let source = "select e.empno, e.ename from emp e where e.deptno = 10 for update of e.sal nowait;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE OF e.sal NOWAIT"),
+            "FOR UPDATE OF ... NOWAIT should stay on one line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_merge_using_clause_alignment() {
+        let source = "merge into tgt t using src s on (t.id = s.id) when matched then update set t.val = s.val when not matched then insert (id, val) values (s.id, s.val);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("USING src s"),
+            "USING should appear as a clause, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "MERGE USING formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_recursive_cte_search_cycle_inline() {
+        let source = "with r as (select 1 as id, cast(null as number) as parent_id from dual union all select t.id, t.parent_id from tree t join r on t.parent_id = r.id) search depth first by id set ord cycle id set is_cycle to 'Y' default 'N' select * from r;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\nSEARCH DEPTH FIRST BY id SET ord"),
+            "SEARCH should start on its own line with SET inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\nCYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"),
+            "CYCLE should start on its own line with SET inline, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "SEARCH/CYCLE formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_match_recognize_subclauses_on_own_lines() {
+        let source = "select * from sales match_recognize (partition by customer_id order by sale_dt measures a.sale_dt as start_dt, last(b.sale_dt) as end_dt pattern (a b+) define b as b.amount > prev(b.amount));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert!(lines.iter().any(|l| l.trim().starts_with("MEASURES")), "MEASURES should start on its own line, got:\n{}", formatted);
+        assert!(lines.iter().any(|l| l.trim().starts_with("PATTERN")), "PATTERN should start on its own line, got:\n{}", formatted);
+        assert!(lines.iter().any(|l| l.trim().starts_with("DEFINE")), "DEFINE should start on its own line, got:\n{}", formatted);
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "MATCH_RECOGNIZE formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_pivot_on_own_line() {
+        let source = "select * from sales pivot (sum(amount) as amt for quarter in ('Q1' as q1, 'Q2' as q2));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // PIVOT should be separated from FROM on its own line
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert!(lines.iter().any(|l| l.trim().starts_with("PIVOT")), "PIVOT should start on its own line, got:\n{}", formatted);
+        // FOR inside PIVOT should NOT be treated as PL/SQL loop
+        assert!(
+            formatted.contains("FOR quarter"),
+            "FOR inside PIVOT should keep quarter on same line, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "PIVOT formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_unpivot_on_own_line() {
+        let source = "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        assert!(lines.iter().any(|l| l.trim().starts_with("UNPIVOT")), "UNPIVOT should start on its own line, got:\n{}", formatted);
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "UNPIVOT formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_sql_basic_pivot_in_cte_same_depth_as_from() {
+        let source = "with p as (select * from src pivot (sum(amt) for qtr in ('Q1' as q1, 'Q2' as q2))) select * from p;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // PIVOT should be at same indent level as FROM inside CTE
+        assert!(
+            formatted.contains("    FROM src\n    PIVOT ("),
+            "PIVOT should be at the same indent level as FROM inside CTE, got:\n{}",
+            formatted
+        );
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted, formatted_again, "CTE PIVOT formatting should be idempotent");
     }
 
 }
