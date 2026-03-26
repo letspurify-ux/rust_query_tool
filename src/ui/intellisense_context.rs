@@ -3646,6 +3646,179 @@ pub(crate) fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> 
     variables
 }
 
+/// Extract PL/SQL identifiers that are typically useful for completion:
+/// - procedure/function parameter names
+/// - variables declared in DECLARE / IS / AS declaration sections
+///
+/// `cursor_token_len` limits extraction to tokens before the current cursor.
+pub(crate) fn extract_plsql_local_identifiers(
+    tokens: &[SqlToken],
+    cursor_token_len: usize,
+) -> Vec<String> {
+    let limit = cursor_token_len.min(tokens.len());
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    extract_plsql_parameter_identifiers(&tokens[..limit], &mut results, &mut seen);
+    extract_plsql_declared_variable_identifiers(&tokens[..limit], &mut results, &mut seen);
+
+    results
+}
+
+fn extract_plsql_parameter_identifiers(
+    tokens: &[SqlToken],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let is_routine = matches!(
+            tokens.get(idx),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("PROCEDURE") || word.eq_ignore_ascii_case("FUNCTION")
+        );
+        if !is_routine {
+            idx += 1;
+            continue;
+        }
+
+        let name_idx = next_non_comment_index(tokens, idx.saturating_add(1));
+        if name_idx >= tokens.len() {
+            break;
+        }
+        let args_open_idx = next_non_comment_index(tokens, name_idx.saturating_add(1));
+        if !matches!(tokens.get(args_open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            idx = name_idx.saturating_add(1);
+            continue;
+        }
+
+        let Some((arg_range, _)) = extract_parenthesized_range(tokens, args_open_idx) else {
+            idx = args_open_idx.saturating_add(1);
+            continue;
+        };
+        let arg_tokens = token_range_slice(tokens, arg_range);
+        for group in split_top_level_symbol_groups(arg_tokens, ",") {
+            if let Some(name) = parse_plsql_parameter_name(group.as_slice()) {
+                let upper = name.to_ascii_uppercase();
+                if seen.insert(upper) {
+                    out.push(name);
+                }
+            }
+        }
+
+        idx = arg_range.end.saturating_add(1);
+    }
+}
+
+fn parse_plsql_parameter_name(tokens: &[&SqlToken]) -> Option<String> {
+    for token in tokens {
+        if let SqlToken::Word(word) = token {
+            if is_identifier_word_token(word) {
+                return Some(strip_identifier_quotes(word));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn extract_plsql_declared_variable_identifiers(
+    tokens: &[SqlToken],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut idx = 0usize;
+    let mut in_declaration_section = false;
+    while idx < tokens.len() {
+        let word_upper = match tokens.get(idx) {
+            Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        };
+
+        if let Some(word_upper) = word_upper {
+            if word_upper == "DECLARE" || word_upper == "IS" || word_upper == "AS" {
+                in_declaration_section = true;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if word_upper == "BEGIN" {
+                in_declaration_section = false;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+        }
+
+        if !in_declaration_section {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        let chunk_start = idx;
+        let mut chunk_end = idx;
+        while chunk_end < tokens.len() {
+            if matches!(tokens.get(chunk_end), Some(SqlToken::Symbol(sym)) if sym == ";") {
+                break;
+            }
+            chunk_end += 1;
+        }
+
+        if chunk_end > chunk_start {
+            let chunk = &tokens[chunk_start..chunk_end];
+            if let Some(name) = parse_plsql_declared_identifier(chunk) {
+                let upper = name.to_ascii_uppercase();
+                if seen.insert(upper) {
+                    out.push(name);
+                }
+            }
+        }
+
+        idx = if chunk_end < tokens.len() {
+            chunk_end.saturating_add(1)
+        } else {
+            chunk_end
+        };
+    }
+}
+
+fn parse_plsql_declared_identifier(tokens: &[SqlToken]) -> Option<String> {
+    let first_idx = next_non_comment_index(tokens, 0);
+    let first_word = match tokens.get(first_idx) {
+        Some(SqlToken::Word(word)) => word,
+        _ => return None,
+    };
+
+    let first_upper = first_word.to_ascii_uppercase();
+    if matches!(
+        first_upper.as_str(),
+        "CURSOR"
+            | "TYPE"
+            | "SUBTYPE"
+            | "PROCEDURE"
+            | "FUNCTION"
+            | "PRAGMA"
+            | "EXCEPTION"
+            | "BEGIN"
+            | "END"
+    ) {
+        return None;
+    }
+    if !is_identifier_word_token(first_word) {
+        return None;
+    }
+
+    let second_idx = next_non_comment_index(tokens, first_idx.saturating_add(1));
+    let second_token = tokens.get(second_idx)?;
+    if !matches!(second_token, SqlToken::Word(_) | SqlToken::Symbol(_)) {
+        return None;
+    }
+
+    Some(strip_identifier_quotes(first_word))
+}
+
 fn extract_match_recognize_clause_tokens(tokens: &[SqlToken]) -> Option<&[SqlToken]> {
     let match_idx = find_top_level_word_index(tokens, "MATCH_RECOGNIZE")
         .or_else(|| find_top_level_keyword_pair_index(tokens, "MATCH", "RECOGNIZE"))?;
