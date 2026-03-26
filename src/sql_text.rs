@@ -645,18 +645,7 @@ pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
 /// Leading keywords that keep the following line on the same continuation
 /// depth when a comment splits the expression or clause body.
 pub(crate) const FORMAT_COMMENT_CONTINUATION_KEYWORDS: &[&str] = &[
-    "AND",
-    "OR",
-    "IN",
-    "IS",
-    "LIKE",
-    "BETWEEN",
-    "NOT",
-    "EXISTS",
-    "USING",
-    "INTO",
-    "ON",
-    "JOIN",
+    "AND", "OR", "IN", "IS", "LIKE", "BETWEEN", "NOT", "EXISTS", "USING", "INTO", "ON", "JOIN",
 ];
 
 /// Clause/subclause headers that should keep the next line at the same depth
@@ -1572,7 +1561,9 @@ mod tests {
     #[test]
     fn starts_with_format_layout_clause_tracks_extended_clause_heads() {
         assert!(starts_with_format_layout_clause("WINDOW w AS ("));
-        assert!(starts_with_format_layout_clause("QUALIFY ROW_NUMBER () = 1"));
+        assert!(starts_with_format_layout_clause(
+            "QUALIFY ROW_NUMBER () = 1"
+        ));
         assert!(starts_with_format_layout_clause("OFFSET 10 ROWS"));
         assert!(starts_with_format_layout_clause("FETCH FIRST 5 ROWS ONLY"));
         assert!(starts_with_format_layout_clause("LIMIT 50"));

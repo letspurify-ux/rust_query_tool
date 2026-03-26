@@ -9392,9 +9392,9 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     fn try_execute_sql_propagates_callback_error() {
-        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Some(Box::new(
-            |_sql| Err("Another query is already running.".to_string()),
-        ))));
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Some(Box::new(|_sql| {
+            Err("Another query is already running.".to_string())
+        }))));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(Some(callback)));
 

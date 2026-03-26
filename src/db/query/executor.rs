@@ -1514,10 +1514,6 @@ impl QueryExecutor {
                 self.current_start.is_none()
             }
 
-            fn starts_with_alter_session(&self) -> bool {
-                self.builder.starts_with_alter_session()
-            }
-
             fn starts_with_alter_set_context(&self) -> bool {
                 self.builder.starts_with_alter_set_context()
             }

@@ -1658,6 +1658,209 @@ FROM d
     }
 
     #[test]
+    fn local_symbol_suggestions_include_var_command_before_cursor() {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            "VAR v_rc REFCURSOR;\nBEGIN\n    __CODEX_CURSOR__NULL;\nEND;",
+            &[],
+        );
+
+        assert_has_case_insensitive(&suggestions, "V_RC");
+    }
+
+    #[test]
+    fn local_symbol_suggestions_include_routine_parameters_and_locals() {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"CREATE OR REPLACE PROCEDURE demo_proc (
+    p_empno IN NUMBER,
+    p_name  IN VARCHAR2
+) IS
+    v_total NUMBER := 0;
+    c_status CONSTANT VARCHAR2(1) := 'Y';
+BEGIN
+    __CODEX_CURSOR__NULL;
+END demo_proc;"#,
+            &[],
+        );
+
+        for expected in ["p_empno", "p_name", "v_total", "c_status"] {
+            assert_has_case_insensitive(&suggestions, expected);
+        }
+    }
+
+    #[test]
+    fn local_symbol_suggestions_keep_only_visible_nested_block_symbols() {
+        let inner_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"DECLARE
+    v_outer NUMBER := 1;
+BEGIN
+    DECLARE
+        v_outer VARCHAR2(10) := 'inner';
+        v_inner NUMBER := 2;
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END;
+END;"#,
+            &[],
+        );
+        let outer_name_count = inner_suggestions
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case("v_outer"))
+            .count();
+
+        assert_eq!(outer_name_count, 1);
+        assert_has_case_insensitive(&inner_suggestions, "v_inner");
+
+        let outer_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"DECLARE
+    v_outer NUMBER := 1;
+BEGIN
+    DECLARE
+        v_inner NUMBER := 2;
+    BEGIN
+        NULL;
+    END;
+
+    __CODEX_CURSOR__NULL;
+END;"#,
+            &[],
+        );
+
+        assert_has_case_insensitive(&outer_suggestions, "v_outer");
+        assert!(
+            !outer_suggestions
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("v_inner")),
+            "inner block symbol should not remain visible after END: {:?}",
+            outer_suggestions
+        );
+    }
+
+    #[test]
+    fn local_symbol_suggestions_include_for_loop_record_only_inside_loop() {
+        let loop_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"BEGIN
+    FOR rec IN (SELECT empno FROM emp) LOOP
+        __CODEX_CURSOR__NULL;
+    END LOOP;
+END;"#,
+            &[],
+        );
+
+        assert_has_case_insensitive(&loop_suggestions, "rec");
+
+        let after_loop_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"BEGIN
+    FOR rec IN (SELECT empno FROM emp) LOOP
+        NULL;
+    END LOOP;
+
+    __CODEX_CURSOR__NULL;
+END;"#,
+            &[],
+        );
+
+        assert!(
+            !after_loop_suggestions
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("rec")),
+            "loop record should not remain visible after END LOOP: {:?}",
+            after_loop_suggestions
+        );
+    }
+
+    #[test]
+    fn local_symbol_suggestions_include_package_body_outer_declarations() {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+    g_cache NUMBER := 0;
+
+    PROCEDURE run_demo IS
+        v_local NUMBER := 1;
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END run_demo;
+END demo_pkg;"#,
+            &[],
+        );
+
+        assert_has_case_insensitive(&suggestions, "g_cache");
+        assert_has_case_insensitive(&suggestions, "v_local");
+    }
+
+    #[test]
+    fn local_symbol_suggestions_support_select_into_and_returning_into_targets() {
+        let select_into = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"DECLARE
+    v_empno NUMBER;
+BEGIN
+    SELECT empno INTO __CODEX_CURSOR__ FROM emp WHERE rownum = 1;
+END;"#,
+            &[],
+        );
+        assert_has_case_insensitive(&select_into, "v_empno");
+
+        let returning_into = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"DECLARE
+    v_empno NUMBER;
+BEGIN
+    DELETE FROM emp WHERE empno = 1 RETURNING empno INTO __CODEX_CURSOR__;
+END;"#,
+            &[],
+        );
+        assert_has_case_insensitive(&returning_into, "v_empno");
+    }
+
+    #[test]
+    fn local_symbol_suggestions_merge_session_binds_without_duplicates() {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            "VAR v_text NUMBER;\nBEGIN\n    __CODEX_CURSOR__NULL;\nEND;",
+            &["V_TEXT", "V_SESSION"],
+        );
+        let v_text_count = suggestions
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case("V_TEXT"))
+            .count();
+
+        assert_eq!(v_text_count, 1);
+        assert_has_case_insensitive(&suggestions, "V_SESSION");
+    }
+
+    #[test]
+    fn large_routine_cache_analysis_keeps_far_declarations_visible() {
+        let mut sql = String::from("CREATE OR REPLACE PROCEDURE demo_proc IS\n");
+        sql.push_str("    v_far NUMBER := 1;\n");
+        for idx in 0..10_000 {
+            sql.push_str(&format!("    v_pad_{idx} NUMBER := {idx};\n"));
+        }
+        sql.push_str("BEGIN\n");
+        sql.push_str("    __CODEX_CURSOR__NULL;\n");
+        sql.push_str("END demo_proc;");
+
+        let cursor = sql
+            .find("__CODEX_CURSOR__")
+            .expect("cursor marker should exist");
+        let sql = sql.replacen("__CODEX_CURSOR__", "", 1);
+        let routine_cache = SqlEditorWidget::build_routine_symbol_cache_entry_for_test(&sql, cursor);
+        let expanded = SqlEditorWidget::expanded_statement_window_in_text(&sql, cursor);
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions(
+            "",
+            expanded.cursor_in_statement,
+            &analysis,
+            &[],
+        );
+
+        assert!(
+            sql.len() > INTELLISENSE_STATEMENT_WINDOW as usize,
+            "generated procedure should exceed the default statement window"
+        );
+        assert_has_case_insensitive(&suggestions, "v_far");
+    }
+
+    #[test]
     fn xmltable_alias_qualified_column_suggestions_include_columns_clause_names() {
         let sql_with_cursor = r#"
 SELECT

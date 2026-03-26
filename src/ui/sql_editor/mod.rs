@@ -222,10 +222,57 @@ pub(crate) struct PendingIntellisense {
 }
 
 #[derive(Clone)]
+pub(crate) enum LocalScopeKind {
+    Statement,
+    PackageBody,
+    Routine,
+    DeclareBlock,
+    Loop,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalScope {
+    parent: Option<usize>,
+    start: usize,
+    end: usize,
+    kind: LocalScopeKind,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalSymbolEntry {
+    scope_id: usize,
+    name: String,
+    upper: String,
+    declared_at: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct IntellisenseAnalysis {
+    statement_start: usize,
+    statement_end: usize,
+    context: Arc<crate::ui::intellisense_context::CursorContext>,
+    local_scopes: Arc<[LocalScope]>,
+    local_symbols: Arc<[LocalSymbolEntry]>,
+    text_bind_names: Arc<[String]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RoutineSymbolCacheEntry {
+    buffer_revision: u64,
+    statement_start: usize,
+    statement_end: usize,
+    statement_tokens: Arc<[SqlToken]>,
+    token_spans: Arc<[SqlTokenSpan]>,
+    local_scopes: Arc<[LocalScope]>,
+    local_symbols: Arc<[LocalSymbolEntry]>,
+    text_bind_names: Arc<[String]>,
+}
+
+#[derive(Clone)]
 pub(crate) struct IntellisenseParseCacheEntry {
     buffer_revision: u64,
     cursor_pos: i32,
-    context: Arc<crate::ui::intellisense_context::CursorContext>,
+    analysis: Arc<IntellisenseAnalysis>,
 }
 
 #[derive(Clone)]

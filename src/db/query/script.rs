@@ -2226,9 +2226,7 @@ impl QueryExecutor {
                 InlineCommentContinuationKind::OneDeeperThanQueryBase => {
                     query_base_depth.unwrap_or(depth).saturating_add(1)
                 }
-                InlineCommentContinuationKind::OneDeeperThanCurrentDepth => {
-                    depth.saturating_add(1)
-                }
+                InlineCommentContinuationKind::OneDeeperThanCurrentDepth => depth.saturating_add(1),
             };
             Some(InlineCommentLineContinuation {
                 depth: continuation_depth,
@@ -6911,18 +6909,15 @@ FROM outer_2;"#;
             .unwrap_or(0);
 
         assert_eq!(
-            contexts[inner_cte_two_idx].auto_depth,
-            contexts[inner_with_idx].auto_depth,
+            contexts[inner_cte_two_idx].auto_depth, contexts[inner_with_idx].auto_depth,
             "sibling inner CTE headers should stay on the same nested WITH base depth"
         );
         assert_eq!(
-            contexts[inner_main_select_idx].auto_depth,
-            contexts[inner_with_idx].auto_depth,
+            contexts[inner_main_select_idx].auto_depth, contexts[inner_with_idx].auto_depth,
             "main SELECT after nested WITH CTEs should return to the nested WITH base depth"
         );
         assert_eq!(
-            contexts[inner_main_from_idx].auto_depth,
-            contexts[inner_main_select_idx].auto_depth,
+            contexts[inner_main_from_idx].auto_depth, contexts[inner_main_select_idx].auto_depth,
             "main FROM after nested WITH CTEs should stay on the same query base depth"
         );
     }
@@ -7562,11 +7557,7 @@ FROM emp_data x;"#;
         let where_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter_map(|(idx, line)| {
-                line.trim_start()
-                    .starts_with("WHERE b IN (")
-                    .then_some(idx)
-            })
+            .filter_map(|(idx, line)| line.trim_start().starts_with("WHERE b IN (").then_some(idx))
             .collect();
         let select_indices: Vec<usize> = lines
             .iter()
@@ -7904,7 +7895,10 @@ LIMIT -- page size
             .iter()
             .position(|line| line.trim_start().starts_with("LIMIT --"))
             .unwrap_or(0);
-        let operand_idx = lines.iter().position(|line| line.trim() == "10;").unwrap_or(0);
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "10;")
+            .unwrap_or(0);
 
         assert_eq!(
             contexts[operand_idx].auto_depth,
@@ -7962,8 +7956,8 @@ VALUES -- tuple payload
     }
 
     #[test]
-    fn auto_format_line_contexts_match_recognize_measures_comment_continuation_uses_subclause_depth()
-    {
+    fn auto_format_line_contexts_match_recognize_measures_comment_continuation_uses_subclause_depth(
+    ) {
         let sql = r#"SELECT *
 FROM sales
 MATCH_RECOGNIZE (

@@ -53,6 +53,7 @@ pub(crate) struct IntellisenseRuntimeState {
     completion_range: Arc<Mutex<Option<IntellisenseCompletionRange>>>,
     pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
     parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+    routine_symbol_cache: Arc<Mutex<Vec<RoutineSymbolCacheEntry>>>,
     parse_generation: Arc<AtomicU64>,
     buffer_revision: Arc<AtomicU64>,
     popup_show_in_progress: Arc<AtomicU8>,
@@ -66,6 +67,7 @@ impl IntellisenseRuntimeState {
             completion_range: Arc::new(Mutex::new(None::<IntellisenseCompletionRange>)),
             pending_intellisense: Arc::new(Mutex::new(None::<PendingIntellisense>)),
             parse_cache: Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>)),
+            routine_symbol_cache: Arc::new(Mutex::new(Vec::<RoutineSymbolCacheEntry>::new())),
             parse_generation: Arc::new(AtomicU64::new(0)),
             buffer_revision: Arc::new(AtomicU64::new(0)),
             popup_show_in_progress: Arc::new(AtomicU8::new(
@@ -134,6 +136,36 @@ impl IntellisenseRuntimeState {
 
     pub(crate) fn clear_parse_cache(&self) {
         self.set_parse_cache(None);
+    }
+
+    pub(crate) fn routine_symbol_cache_handle(&self) -> Arc<Mutex<Vec<RoutineSymbolCacheEntry>>> {
+        self.routine_symbol_cache.clone()
+    }
+
+    pub(crate) fn set_routine_symbol_cache(&self, entry: RoutineSymbolCacheEntry) {
+        const MAX_ROUTINE_SYMBOL_CACHE_ENTRIES: usize = 4;
+
+        let mut cache = self
+            .routine_symbol_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain(|current| {
+            !(current.buffer_revision == entry.buffer_revision
+                && current.statement_start == entry.statement_start
+                && current.statement_end == entry.statement_end)
+        });
+        cache.push(entry);
+        if cache.len() > MAX_ROUTINE_SYMBOL_CACHE_ENTRIES {
+            let drain_len = cache.len().saturating_sub(MAX_ROUTINE_SYMBOL_CACHE_ENTRIES);
+            cache.drain(0..drain_len);
+        }
+    }
+
+    pub(crate) fn clear_routine_symbol_cache(&self) {
+        self.routine_symbol_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     pub(crate) fn next_parse_generation(&self) -> u64 {

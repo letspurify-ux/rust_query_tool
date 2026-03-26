@@ -240,6 +240,7 @@ impl SqlEditorWidget {
             intellisense_runtime.next_buffer_revision();
             intellisense_runtime.next_parse_generation();
             intellisense_runtime.clear_parse_cache();
+            intellisense_runtime.clear_routine_symbol_cache();
             widget.handle_buffer_highlight_update(buf, pos, ins, del, deleted_text);
         });
     }
@@ -296,6 +297,7 @@ impl SqlEditorWidget {
         self.style_buffer.set_text("");
         self.intellisense_runtime.clear_ui_tracking();
         self.intellisense_runtime.clear_parse_cache();
+        self.intellisense_runtime.clear_routine_symbol_cache();
         self.history_cursor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

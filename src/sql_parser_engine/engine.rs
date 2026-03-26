@@ -393,6 +393,7 @@ impl SqlParserEngine {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn starts_with_alter_session(&self) -> bool {
         self.starts_with_alter_keyword("SESSION")
     }

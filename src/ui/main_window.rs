@@ -2199,9 +2199,7 @@ impl MainWindow {
             s.editor_tabs[index].sql_editor.is_query_running()
         };
         if is_running {
-            fltk::dialog::alert_default(
-                "A query is running in this tab. Stop it before closing.",
-            );
+            fltk::dialog::alert_default("A query is running in this tab. Stop it before closing.");
             return false;
         }
 
@@ -4062,10 +4060,8 @@ impl MainWindow {
                                         }
                                     }
                                     Err(err) => {
-                                        deferred_alert = Some(format!(
-                                            "Failed to open SQL file: {}",
-                                            err
-                                        ));
+                                        deferred_alert =
+                                            Some(format!("Failed to open SQL file: {}", err));
                                     }
                                 },
                                 FileActionResult::Export {
@@ -4090,10 +4086,8 @@ impl MainWindow {
                                         ));
                                     }
                                     Err(err) => {
-                                        deferred_alert = Some(format!(
-                                            "Failed to export CSV: {}",
-                                            err
-                                        ));
+                                        deferred_alert =
+                                            Some(format!("Failed to export CSV: {}", err));
                                     }
                                 },
                             }

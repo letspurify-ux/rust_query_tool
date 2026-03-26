@@ -2412,6 +2412,19 @@ impl SqlEditorWidget {
                     let mut newline_after_keyword_extra = 0usize;
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
+                    let should_break_condition = condition_keywords.contains(&upper.as_str())
+                        && !(is_between_and
+                            || is_exit_when
+                            || construct.suppresses_condition_break(
+                                upper.as_str(),
+                                prev_word_upper.as_deref(),
+                                trigger_header_state,
+                            )
+                            // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
+                            // should not cause a condition line break.
+                            || (upper == "ON"
+                                && suppress_comma_break_depth > 0
+                                && !paren_stack.iter().any(|frame| frame.is_query_like())));
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
                     let is_compound_trigger_timing_header = compound_trigger_state
@@ -2825,20 +2838,7 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if condition_keywords.contains(&upper.as_str())
-                        && !is_between_and
-                        && !is_exit_when
-                        && !construct.suppresses_condition_break(
-                            upper.as_str(),
-                            prev_word_upper.as_deref(),
-                            trigger_header_state,
-                        )
-                        // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
-                        // should not cause a condition line break.
-                        && !(upper == "ON"
-                            && suppress_comma_break_depth > 0
-                            && !paren_stack.iter().any(|frame| frame.is_query_like()))
-                    {
+                    } else if should_break_condition {
                         let clause_base_indent = clause_indent(
                             indent_level,
                             open_cursor_state,
@@ -3113,18 +3113,12 @@ impl SqlEditorWidget {
                             && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
                                 || (upper == "ONE" && next_word_is("ROW"))
                                 || (upper == "ALL" && next_word_is("ROWS")))
-                    }) {
-                        newline_with(
-                            &mut out,
-                            base_indent(indent_level, open_cursor_state),
-                            0,
-                            &mut at_line_start,
-                            &mut needs_space,
-                            &mut line_indent,
-                        );
-                    } else if construct.analytic_over_paren_depth.is_some_and(|depth| {
+                    }) || construct.analytic_over_paren_depth.is_some_and(|depth| {
                         paren_stack.len() >= depth
-                            && (matches!(upper.as_str(), "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"))
+                            && matches!(
+                                upper.as_str(),
+                                "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"
+                            )
                     }) {
                         newline_with(
                             &mut out,
@@ -4247,10 +4241,8 @@ impl SqlEditorWidget {
                                         &mut line_indent,
                                     );
                                 }
-                            } else {
-                                if paren_frame_kind.suppresses_comma_breaks() {
-                                    suppress_comma_break_depth += 1;
-                                }
+                            } else if paren_frame_kind.suppresses_comma_breaks() {
+                                suppress_comma_break_depth += 1;
                             }
                             needs_space = false;
                         }
@@ -4883,8 +4875,6 @@ impl SqlEditorWidget {
             } else {
                 Some(layout.final_depth.saturating_add(2))
             }
-        } else if Self::line_has_from_item_query_owner(trimmed_upper) {
-            Some(layout.final_depth.saturating_add(1))
         } else {
             Some(layout.final_depth.saturating_add(1))
         }

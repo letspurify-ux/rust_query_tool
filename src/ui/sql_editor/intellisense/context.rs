@@ -478,31 +478,6 @@ impl SqlEditorWidget {
         Self::cursor_position(buffer, editor.insert_position())
     }
 
-    fn statement_window_with_cursor(
-        buffer: &TextBuffer,
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
-        cursor_pos: i32,
-    ) -> (String, usize) {
-        let buffer_len = buffer.length().max(0);
-        if buffer_len == 0 {
-            return (String::new(), 0);
-        }
-        let cursor_pos = cursor_pos.clamp(0, buffer_len);
-        let start_candidate = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
-        let end_candidate = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
-        let (text, start) =
-            Self::bounded_text_window(buffer, text_shadow, start_candidate, end_candidate);
-        if text.is_empty() {
-            return (String::new(), 0);
-        }
-        let mut rel_cursor = (cursor_pos - start).max(0) as usize;
-        if rel_cursor > text.len() {
-            rel_cursor = text.len();
-        }
-        rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
-        (text, rel_cursor)
-    }
-
     #[cfg(test)]
     fn statement_context_in_text(text: &str, cursor_pos: usize) -> String {
         if text.is_empty() {
@@ -609,6 +584,7 @@ impl SqlEditorWidget {
         Self::normalize_intellisense_context(text, text.len()).text
     }
 
+    #[cfg(test)]
     fn normalize_intellisense_context_with_cursor(
         text: &str,
         cursor_byte: usize,

@@ -1,3 +1,9 @@
+#[derive(Clone)]
+struct AsyncIntellisenseParseResult {
+    analysis: IntellisenseAnalysis,
+    routine_cache: RoutineSymbolCacheEntry,
+}
+
 impl SqlEditorWidget {
     pub(super) fn trigger_intellisense(
         editor: &TextEditor,
@@ -27,8 +33,6 @@ impl SqlEditorWidget {
             return;
         }
 
-        let (statement_window_text, cursor_in_window) =
-            Self::statement_window_with_cursor(buffer, text_shadow, cursor_pos);
         let snapshot = Arc::new(IntellisenseTriggerSnapshot {
             request_generation,
             buffer_revision,
@@ -37,17 +41,15 @@ impl SqlEditorWidget {
             prefix,
             word_start,
             qualifier,
-            statement_window_text,
-            cursor_in_window,
         });
 
         let cached_context = runtime.parse_cache().and_then(|entry| {
             (entry.buffer_revision == snapshot.buffer_revision
                 && entry.cursor_pos == snapshot.cursor_pos)
-                .then_some(entry.context.clone())
+                .then_some(entry.analysis.clone())
         });
 
-        if let Some(context) = cached_context {
+        if let Some(analysis) = cached_context {
             Self::apply_intellisense_with_context(
                 editor,
                 intellisense_data,
@@ -56,7 +58,7 @@ impl SqlEditorWidget {
                 connection,
                 runtime,
                 snapshot.as_ref(),
-                context.as_ref(),
+                analysis.as_ref(),
             );
             return;
         }
@@ -70,7 +72,6 @@ impl SqlEditorWidget {
 
         Self::queue_async_intellisense_parse(
             editor,
-            buffer,
             text_shadow,
             intellisense_data,
             intellisense_popup,
@@ -81,6 +82,7 @@ impl SqlEditorWidget {
         );
     }
 
+    #[cfg(test)]
     fn analyze_statement_context(
         statement_text: &str,
         cursor_in_statement: usize,
@@ -92,30 +94,6 @@ impl SqlEditorWidget {
             .map(|span| span.token)
             .collect();
         intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
-    }
-
-    fn analyze_statement_window_context(
-        statement_window_text: &str,
-        cursor_in_window: usize,
-    ) -> intellisense_context::CursorContext {
-        if statement_window_text.is_empty() {
-            return Self::analyze_statement_context("", 0);
-        }
-
-        let cursor_in_window =
-            Self::clamp_to_char_boundary_local(statement_window_text, cursor_in_window);
-        let (stmt_start, stmt_end) =
-            Self::statement_bounds_in_text(statement_window_text, cursor_in_window);
-        let statement = statement_window_text.get(stmt_start..stmt_end).unwrap_or("");
-        let cursor_in_statement_raw = cursor_in_window
-            .saturating_sub(stmt_start)
-            .min(statement.len());
-        let (statement_text, cursor_in_statement) =
-            Self::normalize_intellisense_context_with_cursor(
-                statement,
-                cursor_in_statement_raw,
-            );
-        Self::analyze_statement_context(&statement_text, cursor_in_statement)
     }
 
     fn is_intellisense_snapshot_current(
@@ -270,7 +248,6 @@ impl SqlEditorWidget {
 
     fn queue_async_intellisense_parse(
         editor: &TextEditor,
-        buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
@@ -280,17 +257,49 @@ impl SqlEditorWidget {
         snapshot: Arc<IntellisenseTriggerSnapshot>,
     ) {
         let (parse_sender, parse_receiver) =
-            mpsc::channel::<Result<intellisense_context::CursorContext, String>>();
+            mpsc::channel::<Result<AsyncIntellisenseParseResult, String>>();
         let parse_receiver = Arc::new(Mutex::new(parse_receiver));
         let snapshot_for_thread = snapshot.clone();
+        let text_shadow_for_thread = text_shadow.clone();
+        let routine_symbol_cache_for_thread = runtime.routine_symbol_cache_handle();
         let spawn_result = thread::Builder::new()
             .name("intellisense-parse-worker".to_string())
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    Self::analyze_statement_window_context(
-                        &snapshot_for_thread.statement_window_text,
-                        snapshot_for_thread.cursor_in_window,
-                    )
+                    let (expanded_statement, text_bind_names) =
+                        Self::expanded_statement_window_and_text_binds_from_shadow(
+                            &text_shadow_for_thread,
+                            snapshot_for_thread.cursor_pos_usize,
+                        );
+                    let routine_cache = {
+                        let cache = routine_symbol_cache_for_thread
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        cache
+                            .iter()
+                            .find(|entry| {
+                                entry.buffer_revision == snapshot_for_thread.buffer_revision
+                                    && entry.statement_start == expanded_statement.statement_start
+                                    && entry.statement_end == expanded_statement.statement_end
+                            })
+                            .cloned()
+                    }
+                    .unwrap_or_else(|| {
+                            Self::build_routine_symbol_cache_entry(
+                                snapshot_for_thread.buffer_revision,
+                                &expanded_statement,
+                                text_bind_names,
+                            )
+                    });
+                    let analysis = Self::build_intellisense_analysis_from_routine_cache(
+                        &routine_cache,
+                        expanded_statement.cursor_in_statement,
+                    );
+
+                    AsyncIntellisenseParseResult {
+                        analysis,
+                        routine_cache,
+                    }
                 }));
 
                 match result {
@@ -323,8 +332,6 @@ impl SqlEditorWidget {
         }
 
         let editor_for_poll = editor.clone();
-        let buffer_for_poll = buffer.clone();
-        let text_shadow_for_poll = text_shadow.clone();
         let intellisense_data_for_poll = intellisense_data.clone();
         let intellisense_popup_for_poll = intellisense_popup.clone();
         let column_sender_for_poll = column_sender.clone();
@@ -333,8 +340,6 @@ impl SqlEditorWidget {
         app::add_timeout3(0.0, move |_| {
             Self::poll_async_intellisense_parse(
                 editor_for_poll.clone(),
-                buffer_for_poll.clone(),
-                text_shadow_for_poll.clone(),
                 intellisense_data_for_poll.clone(),
                 intellisense_popup_for_poll.clone(),
                 column_sender_for_poll.clone(),
@@ -348,17 +353,13 @@ impl SqlEditorWidget {
 
     fn poll_async_intellisense_parse(
         editor: TextEditor,
-        buffer: TextBuffer,
-        text_shadow: Arc<Mutex<HighlightShadowState>>,
         intellisense_data: Arc<Mutex<IntellisenseData>>,
         intellisense_popup: Arc<Mutex<IntellisensePopup>>,
         column_sender: mpsc::Sender<ColumnLoadUpdate>,
         connection: SharedConnection,
         runtime: Arc<IntellisenseRuntimeState>,
         snapshot: Arc<IntellisenseTriggerSnapshot>,
-        parse_receiver: Arc<
-            Mutex<mpsc::Receiver<Result<intellisense_context::CursorContext, String>>>,
-        >,
+        parse_receiver: Arc<Mutex<mpsc::Receiver<Result<AsyncIntellisenseParseResult, String>>>>,
     ) {
         if editor.was_deleted() {
             return;
@@ -385,11 +386,12 @@ impl SqlEditorWidget {
                 {
                     return;
                 }
-                let parsed = Arc::new(parsed);
+                runtime.set_routine_symbol_cache(parsed.routine_cache.clone());
+                let parsed = Arc::new(parsed.analysis);
                 runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
                     buffer_revision: snapshot.buffer_revision,
                     cursor_pos: snapshot.cursor_pos,
-                    context: parsed.clone(),
+                    analysis: parsed.clone(),
                 }));
 
                 Self::apply_intellisense_with_context(
@@ -422,8 +424,6 @@ impl SqlEditorWidget {
                 app::add_timeout3(INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS, move |_| {
                     Self::poll_async_intellisense_parse(
                         editor.clone(),
-                        buffer.clone(),
-                        text_shadow.clone(),
                         intellisense_data.clone(),
                         intellisense_popup.clone(),
                         column_sender.clone(),
@@ -456,18 +456,43 @@ impl SqlEditorWidget {
         connection: &SharedConnection,
         runtime: &Arc<IntellisenseRuntimeState>,
         snapshot: &IntellisenseTriggerSnapshot,
-        deep_ctx: &intellisense_context::CursorContext,
+        analysis: &IntellisenseAnalysis,
     ) {
+        let deep_ctx = analysis.context.as_ref();
         let qualifier = snapshot.qualifier.as_deref();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+        let cursor_in_statement = snapshot
+            .cursor_pos_usize
+            .saturating_sub(analysis.statement_start)
+            .min(analysis.statement_end.saturating_sub(analysis.statement_start));
+        let session_bind_names = if qualifier.is_none() && !matches!(context, SqlContext::TableName)
+        {
+            Self::session_bind_names(connection)
+        } else {
+            Vec::new()
+        };
+        let local_suggestions = if qualifier.is_none() && !matches!(context, SqlContext::TableName)
+        {
+            Self::collect_local_symbol_suggestions(
+                &snapshot.prefix,
+                cursor_in_statement,
+                analysis,
+                &session_bind_names,
+            )
+        } else {
+            Vec::new()
+        };
 
         let column_tables = Self::resolve_column_tables_for_context(qualifier, deep_ctx);
         let include_columns = qualifier.is_some()
             || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
 
         let allow_empty_prefix =
-            qualifier.is_some() || include_columns || matches!(context, SqlContext::TableName);
+            qualifier.is_some()
+                || include_columns
+                || matches!(context, SqlContext::TableName)
+                || !local_suggestions.is_empty();
         if snapshot.prefix.is_empty() && !allow_empty_prefix {
             // Context no longer allows completion for empty prefix, so hide
             // stale popup state immediately.
@@ -632,6 +657,11 @@ impl SqlEditorWidget {
             matches!(context, SqlContext::TableName),
             qualifier.is_some(),
         );
+        let suggestions = if !local_suggestions.is_empty() {
+            Self::prepend_local_symbol_suggestions(suggestions, local_suggestions)
+        } else {
+            suggestions
+        };
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
         if should_refresh_when_columns_ready {

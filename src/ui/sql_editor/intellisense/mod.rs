@@ -64,8 +64,6 @@ struct IntellisenseTriggerSnapshot {
     prefix: String,
     word_start: usize,
     qualifier: Option<String>,
-    statement_window_text: String,
-    cursor_in_window: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +137,7 @@ impl SqlEditorWidget {
 
 include!("helpers.rs");
 include!("runtime.rs");
+include!("local_symbols.rs");
 include!("completion.rs");
 include!("context.rs");
 include!("popup.rs");
