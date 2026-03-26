@@ -3660,57 +3660,72 @@ pub(crate) fn extract_plsql_local_identifiers(
         return Vec::new();
     }
 
+    const MAX_PLSQL_IDENTIFIER_LOOKBACK_TOKENS: usize = 8192;
+    let scan_start = limit.saturating_sub(MAX_PLSQL_IDENTIFIER_LOOKBACK_TOKENS);
+    let scan_tokens = &tokens[scan_start..limit];
+    if !scan_tokens.iter().any(|token| {
+        matches!(
+            token,
+            SqlToken::Word(word)
+                if word.eq_ignore_ascii_case("DECLARE")
+                    || word.eq_ignore_ascii_case("BEGIN")
+                    || word.eq_ignore_ascii_case("PROCEDURE")
+                    || word.eq_ignore_ascii_case("FUNCTION")
+                    || word.eq_ignore_ascii_case("IS")
+                    || word.eq_ignore_ascii_case("AS")
+        )
+    }) {
+        return Vec::new();
+    }
+
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    extract_plsql_parameter_identifiers(&tokens[..limit], &mut results, &mut seen);
-    extract_plsql_declared_variable_identifiers(&tokens[..limit], &mut results, &mut seen);
+    extract_nearest_plsql_parameter_identifiers(scan_tokens, &mut results, &mut seen);
+    extract_nearest_plsql_declared_variable_identifiers(scan_tokens, &mut results, &mut seen);
 
     results
 }
 
-fn extract_plsql_parameter_identifiers(
+fn extract_nearest_plsql_parameter_identifiers(
     tokens: &[SqlToken],
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) {
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let is_routine = matches!(
+    let mut routine_idx = None;
+    for idx in (0..tokens.len()).rev() {
+        if matches!(
             tokens.get(idx),
             Some(SqlToken::Word(word))
                 if word.eq_ignore_ascii_case("PROCEDURE") || word.eq_ignore_ascii_case("FUNCTION")
-        );
-        if !is_routine {
-            idx += 1;
-            continue;
-        }
-
-        let name_idx = next_non_comment_index(tokens, idx.saturating_add(1));
-        if name_idx >= tokens.len() {
+        ) {
+            routine_idx = Some(idx);
             break;
         }
-        let args_open_idx = next_non_comment_index(tokens, name_idx.saturating_add(1));
-        if !matches!(tokens.get(args_open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-            idx = name_idx.saturating_add(1);
-            continue;
-        }
+    }
+    let Some(routine_idx) = routine_idx else {
+        return;
+    };
 
-        let Some((arg_range, _)) = extract_parenthesized_range(tokens, args_open_idx) else {
-            idx = args_open_idx.saturating_add(1);
-            continue;
-        };
-        let arg_tokens = token_range_slice(tokens, arg_range);
-        for group in split_top_level_symbol_groups(arg_tokens, ",") {
-            if let Some(name) = parse_plsql_parameter_name(group.as_slice()) {
-                let upper = name.to_ascii_uppercase();
-                if seen.insert(upper) {
-                    out.push(name);
-                }
+    let name_idx = next_non_comment_index(tokens, routine_idx.saturating_add(1));
+    if name_idx >= tokens.len() {
+        return;
+    }
+    let args_open_idx = next_non_comment_index(tokens, name_idx.saturating_add(1));
+    if !matches!(tokens.get(args_open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        return;
+    }
+    let Some((arg_range, _)) = extract_parenthesized_range(tokens, args_open_idx) else {
+        return;
+    };
+    let arg_tokens = token_range_slice(tokens, arg_range);
+    for group in split_top_level_symbol_groups(arg_tokens, ",") {
+        if let Some(name) = parse_plsql_parameter_name(group.as_slice()) {
+            let upper = name.to_ascii_uppercase();
+            if seen.insert(upper) {
+                out.push(name);
             }
         }
-
-        idx = arg_range.end.saturating_add(1);
     }
 }
 
@@ -3726,40 +3741,57 @@ fn parse_plsql_parameter_name(tokens: &[&SqlToken]) -> Option<String> {
     None
 }
 
-fn extract_plsql_declared_variable_identifiers(
+fn extract_nearest_plsql_declared_variable_identifiers(
     tokens: &[SqlToken],
     out: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) {
-    let mut idx = 0usize;
-    let mut in_declaration_section = false;
-    while idx < tokens.len() {
-        let word_upper = match tokens.get(idx) {
-            Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
-            _ => None,
+    let begin_idx = (0..tokens.len()).rev().find(|idx| {
+        matches!(
+            tokens.get(*idx),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("BEGIN")
+        )
+    });
+    let Some(begin_idx) = begin_idx else {
+        return;
+    };
+
+    let declaration_idx = (0..begin_idx).rev().find(|idx| {
+        let Some(SqlToken::Word(word)) = tokens.get(*idx) else {
+            return false;
         };
-
-        if let Some(word_upper) = word_upper {
-            if word_upper == "DECLARE" || word_upper == "IS" || word_upper == "AS" {
-                in_declaration_section = true;
-                idx = idx.saturating_add(1);
-                continue;
-            }
-            if word_upper == "BEGIN" {
-                in_declaration_section = false;
-                idx = idx.saturating_add(1);
-                continue;
-            }
+        if word.eq_ignore_ascii_case("DECLARE") {
+            return true;
         }
+        if !(word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS")) {
+            return false;
+        }
+        let lookback_start = idx.saturating_sub(64);
+        (lookback_start..*idx).rev().any(|scan_idx| {
+            matches!(
+                tokens.get(scan_idx),
+                Some(SqlToken::Word(candidate))
+                    if candidate.eq_ignore_ascii_case("PROCEDURE")
+                        || candidate.eq_ignore_ascii_case("FUNCTION")
+            )
+        })
+    });
+    let Some(declaration_idx) = declaration_idx else {
+        return;
+    };
 
-        if !in_declaration_section {
+    let mut idx = declaration_idx.saturating_add(1);
+    while idx < begin_idx {
+        let is_comment = matches!(tokens.get(idx), Some(SqlToken::Comment(_)));
+        let is_semicolon = matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ";");
+        if is_comment || is_semicolon {
             idx = idx.saturating_add(1);
             continue;
         }
 
         let chunk_start = idx;
         let mut chunk_end = idx;
-        while chunk_end < tokens.len() {
+        while chunk_end < begin_idx {
             if matches!(tokens.get(chunk_end), Some(SqlToken::Symbol(sym)) if sym == ";") {
                 break;
             }
@@ -3776,7 +3808,7 @@ fn extract_plsql_declared_variable_identifiers(
             }
         }
 
-        idx = if chunk_end < tokens.len() {
+        idx = if chunk_end < begin_idx {
             chunk_end.saturating_add(1)
         } else {
             chunk_end
