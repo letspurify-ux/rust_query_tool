@@ -634,6 +634,8 @@ pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
     "MODEL",
     "WINDOW",
     "MATCH_RECOGNIZE",
+    "PIVOT",
+    "UNPIVOT",
     "QUALIFY",
     "OFFSET",
     "FETCH",
@@ -680,6 +682,8 @@ const FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS: &[&str] = &[
     "MODEL",
     "WINDOW",
     "MATCH_RECOGNIZE",
+    "PIVOT",
+    "UNPIVOT",
     "QUALIFY",
 ];
 
