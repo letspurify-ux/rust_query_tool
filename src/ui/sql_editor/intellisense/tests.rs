@@ -1893,6 +1893,29 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
+    fn leading_indent_prefix_returns_leading_spaces_and_tabs_only() {
+        assert_eq!(
+            SqlEditorWidget::leading_indent_prefix("    select * from dual"),
+            "    "
+        );
+        assert_eq!(
+            SqlEditorWidget::leading_indent_prefix("\t\tselect * from dual"),
+            "\t\t"
+        );
+        assert_eq!(
+            SqlEditorWidget::leading_indent_prefix("  \t  select"),
+            "  \t  "
+        );
+    }
+
+    #[test]
+    fn leading_indent_prefix_stops_at_first_non_indent_byte() {
+        assert_eq!(SqlEditorWidget::leading_indent_prefix("select"), "");
+        assert_eq!(SqlEditorWidget::leading_indent_prefix("  -- comment"), "  ");
+        assert_eq!(SqlEditorWidget::leading_indent_prefix("  가나다"), "  ");
+    }
+
+    #[test]
     fn non_whitespace_char_before_cursor_in_text_detects_semicolon_before_cursor_marker() {
         let sql_with_cursor = "select * from help;|";
         let cursor = sql_with_cursor

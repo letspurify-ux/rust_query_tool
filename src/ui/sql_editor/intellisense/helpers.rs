@@ -385,6 +385,54 @@ impl SqlEditorWidget {
         has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
     }
 
+    fn handle_enter_auto_indent(
+        editor: &mut TextEditor,
+        buffer: &mut TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+    ) -> bool {
+        let selection = buffer.selection_position().map(|(start, end)| {
+            let (start_pos, _) = Self::cursor_position(buffer, start);
+            let (end_pos, _) = Self::cursor_position(buffer, end);
+            if start_pos <= end_pos {
+                (start_pos, end_pos)
+            } else {
+                (end_pos, start_pos)
+            }
+        });
+        let (insert_pos, _) = Self::editor_cursor_position(editor, buffer);
+        let anchor = selection
+            .map(|(start, _)| start)
+            .unwrap_or(insert_pos)
+            .max(0);
+        let line_start = text_buffer_access::line_start(buffer, Some(text_shadow), anchor).max(0);
+        let line_text = text_buffer_access::text_range(buffer, Some(text_shadow), line_start, anchor);
+        let indent = Self::leading_indent_prefix(&line_text);
+        let inserted = format!("\n{indent}");
+
+        if let Some((start, end)) = selection {
+            if start != end {
+                buffer.replace(start, end, &inserted);
+                editor.set_insert_position(start + inserted.len() as i32);
+                editor.show_insert_position();
+                return true;
+            }
+        }
+
+        buffer.insert(insert_pos, &inserted);
+        editor.set_insert_position(insert_pos + inserted.len() as i32);
+        editor.show_insert_position();
+        true
+    }
+
+    fn leading_indent_prefix(line_text: &str) -> &str {
+        let indent_len = line_text
+            .as_bytes()
+            .iter()
+            .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+            .count();
+        line_text.get(..indent_len).unwrap_or("")
+    }
+
     #[cfg(test)]
     pub(super) fn take_keyup_debounce_timeout_handle(
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,

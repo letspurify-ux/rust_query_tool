@@ -420,6 +420,26 @@ impl SqlEditorWidget {
                         }
                     }
 
+                    if !alt && matches!(key, Key::Enter | Key::KPEnter) {
+                        let handled = Self::handle_enter_auto_indent(
+                            ed,
+                            &mut buffer_for_handle,
+                            &text_shadow_for_handle,
+                        );
+                        if handled {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                            Self::invalidate_keyup_debounce_with_parse_generation(
+                                &intellisense_runtime_for_handle,
+                                true,
+                            );
+                            return true;
+                        }
+                    }
+
                     // F4 - Quick Describe (handle on KeyDown for immediate response)
                     if key == Key::F4 {
                         widget_for_shortcuts.quick_describe_at_cursor();
