@@ -7403,3 +7403,37 @@ LEFT JOIN emp e
         "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
     );
 }
+
+#[test]
+fn format_sql_auto_formatting_keeps_nested_in_subquery_select_indentation() {
+    let input = r#"select 1
+from a
+where b in (
+        select 1
+        from a
+        where b in (
+                select 1
+                from a
+            )
+            and 2
+    );"#;
+
+    let expected = r#"SELECT 1
+FROM a
+WHERE b IN (
+        SELECT 1
+        FROM a
+        WHERE b IN (
+                SELECT 1
+                FROM a
+            )
+            AND 2
+    );"#;
+
+    let formatted = SqlEditorWidget::format_for_auto_formatting(input, false);
+    assert_eq!(
+        formatted, expected,
+        "nested IN subquery indentation must stay stable, got:\n{}",
+        formatted
+    );
+}

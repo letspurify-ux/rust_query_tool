@@ -7591,12 +7591,12 @@ END;"#;
             formatted
         );
         assert!(
-            formatted.contains("WHERE t2.id IN (\n                SELECT t3.id"),
+            formatted.contains("WHERE t2.id IN (\n                    SELECT t3.id"),
             "second nested subquery should stay indented under IN, got:\n{}",
             formatted
         );
         assert!(
-            formatted.contains("WHERE t3.flag = 'Y'\n            )"),
+            formatted.contains("WHERE t3.flag = 'Y'\n                )"),
             "closing parenthesis should dedent one level from deepest query body, got:\n{}",
             formatted
         );
