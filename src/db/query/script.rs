@@ -1365,6 +1365,9 @@ impl QueryExecutor {
                 let reuses_active_query_base = clause_kind.is_some_and(|kind| {
                     !kind.is_query_head()
                         || parser_depth == frame.query_base_depth
+                        || (frame.head_kind == Some(AutoFormatClauseKind::With)
+                            && kind != AutoFormatClauseKind::With
+                            && parser_depth == frame.start_parser_depth)
                         || (frame.pending_same_depth_set_operator_head
                             && parser_depth == frame.start_parser_depth)
                 });
@@ -2008,6 +2011,13 @@ impl QueryExecutor {
         let Some(frame) = active_frame else {
             return true;
         };
+
+        if frame.head_kind == Some(AutoFormatClauseKind::With)
+            && head_kind != AutoFormatClauseKind::With
+            && parser_depth == frame.start_parser_depth
+        {
+            return false;
+        }
 
         if parser_depth > frame.query_base_depth
             && !(frame.pending_same_depth_set_operator_head
@@ -6854,6 +6864,66 @@ END;"#;
             contexts[cte_select_idx].auto_depth,
             contexts[with_idx].auto_depth.saturating_add(1),
             "CTE body SELECT should be one level deeper than the WITH base"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_nested_with_main_query_on_with_base_after_multiple_ctes() {
+        let sql = r#"WITH outer_1 AS (
+    WITH inner_1 AS (
+        SELECT 1 AS id
+        FROM dual
+    ),
+    inner_2 AS (
+        SELECT id
+        FROM inner_1
+    )
+    SELECT id
+    FROM inner_2
+),
+outer_2 AS (
+    SELECT id
+    FROM outer_1
+)
+SELECT id
+FROM outer_2;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let inner_with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH inner_1 AS ("))
+            .unwrap_or(0);
+        let inner_cte_two_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("inner_2 AS ("))
+            .unwrap_or(0);
+        let inner_main_select_idx = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.trim_start() == "SELECT id").then_some(idx))
+            .nth(2)
+            .unwrap_or(0);
+        let inner_main_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM inner_2")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[inner_cte_two_idx].auto_depth,
+            contexts[inner_with_idx].auto_depth,
+            "sibling inner CTE headers should stay on the same nested WITH base depth"
+        );
+        assert_eq!(
+            contexts[inner_main_select_idx].auto_depth,
+            contexts[inner_with_idx].auto_depth,
+            "main SELECT after nested WITH CTEs should return to the nested WITH base depth"
+        );
+        assert_eq!(
+            contexts[inner_main_from_idx].auto_depth,
+            contexts[inner_main_select_idx].auto_depth,
+            "main FROM after nested WITH CTEs should stay on the same query base depth"
         );
     }
 
