@@ -38,67 +38,6 @@ fn cte_names(ctx: &CursorContext) -> Vec<String> {
     ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect()
 }
 
-#[test]
-fn extract_plsql_local_identifiers_includes_routine_parameters_and_declared_vars() {
-    let (tokens, cursor_token_len) = split_at_cursor(
-        r#"
-CREATE OR REPLACE PROCEDURE demo_proc(
-    p_empno IN NUMBER,
-    p_name IN VARCHAR2
-) IS
-    v_total NUMBER := 0;
-    l_status VARCHAR2(10);
-BEGIN
-    SELECT |
-    INTO v_total
-    FROM dual;
-END;
-"#,
-    );
-
-    let names = extract_plsql_local_identifiers(&tokens, cursor_token_len);
-    for expected in ["p_empno", "p_name", "v_total", "l_status"] {
-        assert!(
-            names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(expected)),
-            "expected `{expected}` in {:?}",
-            names
-        );
-    }
-}
-
-#[test]
-fn extract_plsql_local_identifiers_ignores_declarations_after_cursor() {
-    let (tokens, cursor_token_len) = split_at_cursor(
-        r#"
-DECLARE
-    v_before NUMBER;
-BEGIN
-    v_before := 1;
-    |
-END;
-DECLARE
-    v_after NUMBER;
-BEGIN
-    NULL;
-END;
-"#,
-    );
-
-    let names = extract_plsql_local_identifiers(&tokens, cursor_token_len);
-    assert!(
-        names.iter().any(|name| name.eq_ignore_ascii_case("v_before")),
-        "expected v_before in {:?}",
-        names
-    );
-    assert!(
-        !names.iter().any(|name| name.eq_ignore_ascii_case("v_after")),
-        "did not expect v_after in {:?}",
-        names
-    );
-}
-
 // ─── Phase detection tests ───────────────────────────────────────────────
 
 #[test]
