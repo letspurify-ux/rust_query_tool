@@ -624,16 +624,6 @@ impl SqlEditorWidget {
                 derived_columns,
             );
         }
-        let plsql_identifiers = intellisense_context::extract_plsql_local_identifiers(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len,
-        );
-        suggestions = Self::merge_suggestions_with_local_identifiers(
-            suggestions,
-            &snapshot.prefix,
-            plsql_identifiers,
-            qualifier.is_none(),
-        );
         let context_alias_suggestions =
             Self::collect_context_alias_suggestions(&snapshot.prefix, deep_ctx);
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
@@ -1008,34 +998,6 @@ impl SqlEditorWidget {
             }
         }
 
-        base.truncate(MAX_MERGED_SUGGESTIONS);
-        base
-    }
-
-    fn merge_suggestions_with_local_identifiers(
-        mut base: Vec<String>,
-        prefix: &str,
-        identifiers: Vec<String>,
-        allow_merge: bool,
-    ) -> Vec<String> {
-        if !allow_merge || identifiers.is_empty() {
-            base.truncate(MAX_MERGED_SUGGESTIONS);
-            return base;
-        }
-
-        let prefix_upper = prefix.to_ascii_uppercase();
-        let mut seen: HashSet<String> = base.iter().map(|item| item.to_ascii_uppercase()).collect();
-        for identifier in identifiers {
-            let upper = identifier.to_ascii_uppercase();
-            if !prefix_upper.is_empty()
-                && (!upper.starts_with(prefix_upper.as_str()) || upper == prefix_upper)
-            {
-                continue;
-            }
-            if seen.insert(upper) {
-                base.push(identifier);
-            }
-        }
         base.truncate(MAX_MERGED_SUGGESTIONS);
         base
     }
