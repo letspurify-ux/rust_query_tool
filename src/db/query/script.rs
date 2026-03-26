@@ -1576,10 +1576,10 @@ impl QueryExecutor {
             context.condition_header_depth = condition_annotation.header_depth;
             context.condition_role = condition_annotation.role;
 
+            let base_depth_for_child_query =
+                Self::pending_query_owner_base_depth(existing_indent, context, &trimmed_upper);
             let next_query_head_depth =
                 Self::next_query_head_depth(existing_indent, context, &trimmed_upper);
-            let base_depth_for_child_query =
-                Self::pending_query_owner_base_depth(existing_indent, context);
             let owns_next_query = Self::line_owns_next_query(&trimmed_upper)
                 || Self::line_ends_with_open_paren_before_inline_comment(trimmed);
             if owns_next_query {
@@ -2139,14 +2139,26 @@ impl QueryExecutor {
     fn pending_query_owner_base_depth(
         existing_indent: usize,
         context: AutoFormatLineContext,
+        trimmed_upper: &str,
     ) -> usize {
+        let normalized = trimmed_upper.trim_end();
         if context.condition_role != AutoFormatConditionRole::None {
             if let Some(header_depth) = context.condition_header_depth {
                 return header_depth;
             }
         }
 
-        existing_indent.max(context.auto_depth)
+        let visual_owner_base = existing_indent.max(context.auto_depth);
+        let is_visually_promoted_owner = context
+            .query_base_depth
+            .is_some_and(|depth| visual_owner_base > depth);
+        if !is_visually_promoted_owner
+            && Self::line_requires_child_query_owner_promotion(normalized)
+        {
+            visual_owner_base.saturating_add(1)
+        } else {
+            visual_owner_base
+        }
     }
 
     fn next_query_head_depth(
@@ -2154,28 +2166,20 @@ impl QueryExecutor {
         context: AutoFormatLineContext,
         trimmed_upper: &str,
     ) -> usize {
-        let visual_owner_base = Self::pending_query_owner_base_depth(existing_indent, context);
-        let is_visually_promoted_owner = context
-            .query_base_depth
-            .is_some_and(|depth| visual_owner_base > depth);
-        let effective_owner_depth =
-            if !is_visually_promoted_owner && Self::line_has_direct_query_owner(trimmed_upper) {
-                visual_owner_base.saturating_add(1)
-            } else {
-                visual_owner_base
-            };
-
-        effective_owner_depth.saturating_add(1)
+        Self::pending_query_owner_base_depth(existing_indent, context, trimmed_upper)
+            .saturating_add(1)
     }
 
-    fn line_has_direct_query_owner(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("FROM (")
-            || trimmed_upper.starts_with("USING (")
-            || (trimmed_upper.ends_with(" IN (")
-                && !sql_text::starts_with_keyword_token(trimmed_upper, "FOR"))
-            || trimmed_upper.ends_with(" EXISTS (")
-            || trimmed_upper.ends_with(" NOT EXISTS (")
-            || trimmed_upper.contains(" JOIN (")
+    fn line_requires_child_query_owner_promotion(trimmed_upper: &str) -> bool {
+        let normalized = trimmed_upper.trim_end();
+        let Some(stripped_open_paren) = normalized.strip_suffix('(').map(str::trim_end) else {
+            return false;
+        };
+
+        (stripped_open_paren.ends_with(" IN")
+            && !sql_text::starts_with_keyword_token(stripped_open_paren, "FOR"))
+            || stripped_open_paren.ends_with(" EXISTS")
+            || stripped_open_paren.ends_with(" NOT EXISTS")
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
@@ -7480,6 +7484,55 @@ FROM emp_data x;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_nested_in_child_query_depth_with_trailing_owner_spaces() {
+        let sql = "SELECT 1\nFROM a\nWHERE b IN (   \n    SELECT 1\n    FROM a\n    WHERE b IN (   \n        SELECT 1\n        FROM a\n    )\n    AND 2\n);";
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let where_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| {
+                line.trim_start()
+                    .starts_with("WHERE b IN (")
+                    .then_some(idx)
+            })
+            .collect();
+        let select_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.trim_start() == "SELECT 1").then_some(idx))
+            .collect();
+
+        let outer_where_idx = where_indices.first().copied().unwrap_or(0);
+        let inner_where_idx = where_indices.get(1).copied().unwrap_or(0);
+        let second_select_idx = select_indices.get(1).copied().unwrap_or(0);
+        let third_select_idx = select_indices.get(2).copied().unwrap_or(0);
+        let outer_where_upper = lines[outer_where_idx].trim_start().to_ascii_uppercase();
+        let inner_where_upper = lines[inner_where_idx].trim_start().to_ascii_uppercase();
+
+        assert!(
+            QueryExecutor::line_requires_child_query_owner_promotion(&outer_where_upper),
+            "outer WHERE IN should be recognized as a direct child-query owner"
+        );
+        assert!(
+            QueryExecutor::line_requires_child_query_owner_promotion(&inner_where_upper),
+            "inner WHERE IN should be recognized as a direct child-query owner"
+        );
+
+        assert_eq!(
+            contexts[second_select_idx].auto_depth,
+            contexts[outer_where_idx].auto_depth.saturating_add(2),
+            "outer WHERE IN owner with trailing spaces must still promote child SELECT depth"
+        );
+        assert_eq!(
+            contexts[third_select_idx].auto_depth,
+            contexts[inner_where_idx].auto_depth.saturating_add(2),
+            "nested WHERE IN owner with trailing spaces must still promote grandchild SELECT depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_operator_continuation_after_inline_block_comment() {
         let sql = r#"SELECT 1
 FROM order_item oi
@@ -8389,8 +8442,8 @@ end a;"#;
         );
         assert_eq!(
             contexts[deepest_select_idx].auto_depth,
-            contexts[inner_from_paren_idx].auto_depth.saturating_add(2),
-            "SELECT under FROM ( should start exactly one child-query level below FROM owner depth"
+            contexts[inner_from_paren_idx].auto_depth.saturating_add(1),
+            "SELECT under FROM ( should stay exactly one child-query level below FROM owner depth"
         );
     }
 }
