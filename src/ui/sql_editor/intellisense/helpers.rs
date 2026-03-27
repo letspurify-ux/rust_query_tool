@@ -122,10 +122,43 @@ impl SqlEditorWidget {
         let mut last_significant_word: Option<String> = None;
         let mut second_last_significant_word: Option<String> = None;
         let mut statement_kind = IntoStatementKind::Unknown;
+        let mut into_target_active = false;
+
+        let terminates_into_target = |upper: &str| {
+            matches!(
+                upper,
+                "SELECT"
+                    | "FROM"
+                    | "WHERE"
+                    | "GROUP"
+                    | "HAVING"
+                    | "ORDER"
+                    | "CONNECT"
+                    | "START"
+                    | "UNION"
+                    | "INTERSECT"
+                    | "MINUS"
+                    | "EXCEPT"
+                    | "SET"
+                    | "VALUES"
+                    | "USING"
+                    | "WHEN"
+                    | "ON"
+            )
+        };
 
         for token in &tokens[..cursor_token_len] {
             match token {
                 SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == ";" && depth == 0 => {
+                    // INTO target detection should be scoped to the current statement.
+                    // Reset top-level state at statement terminators so a previous
+                    // SELECT ... INTO does not affect the next statement.
+                    last_significant_word = None;
+                    second_last_significant_word = None;
+                    statement_kind = IntoStatementKind::Unknown;
+                    into_target_active = false;
+                }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     depth = depth.saturating_add(1);
                 }
@@ -136,6 +169,9 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Word(word) if depth == 0 => {
                     let upper = word.to_ascii_uppercase();
+                    if into_target_active && terminates_into_target(upper.as_str()) {
+                        into_target_active = false;
+                    }
                     match upper.as_str() {
                         "SELECT" => statement_kind = IntoStatementKind::Select,
                         "INSERT" => statement_kind = IntoStatementKind::Insert,
@@ -156,7 +192,7 @@ impl SqlEditorWidget {
                         let is_returning_into =
                             matches!(last_significant_word.as_deref(), Some("RETURNING"));
                         if is_select_into || is_bulk_collect_into || is_returning_into {
-                            return true;
+                            into_target_active = true;
                         }
                     }
 
@@ -167,7 +203,7 @@ impl SqlEditorWidget {
             }
         }
 
-        false
+        into_target_active
     }
 
     fn merge_insert_target_table(

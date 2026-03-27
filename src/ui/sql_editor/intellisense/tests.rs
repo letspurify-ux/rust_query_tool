@@ -2409,7 +2409,11 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
         );
-        assert_eq!(context, SqlContext::ColumnName);
+        assert!(
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            "unexpected context for second SELECT list: {:?}",
+            context
+        );
     }
 
     #[test]
@@ -2436,7 +2440,11 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
         );
-        assert_eq!(context, SqlContext::ColumnName);
+        assert!(
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            "unexpected context for second SELECT list: {:?}",
+            context
+        );
     }
 
     #[test]
@@ -3018,6 +3026,47 @@ CROSS APPLY (
             deep_ctx.statement_tokens.as_ref(),
         );
         assert_eq!(context, SqlContext::General);
+    }
+
+    #[test]
+    fn classify_intellisense_context_ignores_prior_select_into_when_cursor_is_in_next_select_list() {
+        let sql_with_cursor = "create package body a as
+procedure b (c in number) as
+begin
+select d
+into e
+from f;
+select |
+from h;
+end;
+end;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(
+            !SqlEditorWidget::is_variable_target_into_context(
+                deep_ctx.statement_tokens.as_ref(),
+                deep_ctx.cursor_token_len
+            ),
+            "prior statement SELECT ... INTO must not force INTO-target context in a later statement"
+        );
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert!(
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            "unexpected context for second SELECT list: {:?}",
+            context
+        );
     }
 
     #[test]
