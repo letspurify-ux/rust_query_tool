@@ -731,57 +731,94 @@ impl SqlEditorWidget {
         }
         let idx = rel_word_start - 1;
 
-        if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
-            let mut pos = idx as isize - 2;
-            loop {
-                if pos < 0 {
-                    break;
-                }
+        let qualifier_candidate = text.get(..idx)?;
+        if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
+            return None;
+        }
+
+        let mut segments = Vec::new();
+        let mut segment_end = idx;
+
+        loop {
+            let (segment, segment_start) =
+                Self::parse_qualifier_segment_before_dot(text, segment_end)?;
+            if segment.is_empty() {
+                return None;
+            }
+            segments.push(segment);
+
+            if segment_start == 0 {
+                break;
+            }
+            if bytes.get(segment_start - 1) != Some(&b'.') {
+                break;
+            }
+            segment_end = segment_start - 1;
+            if segment_end == 0 {
+                return None;
+            }
+        }
+
+        if segments.is_empty() {
+            return None;
+        }
+
+        segments.reverse();
+        Some(segments.join("."))
+    }
+
+    fn parse_qualifier_segment_before_dot(
+        text: &str,
+        segment_end: usize,
+    ) -> Option<(String, usize)> {
+        if segment_end == 0 {
+            return None;
+        }
+
+        let bytes = text.as_bytes();
+        if bytes.get(segment_end - 1) == Some(&b'"') {
+            let mut pos = segment_end as isize - 2;
+            while pos >= 0 {
                 let pos_usize = pos as usize;
-                if bytes[pos_usize] == b'"' {
-                    if pos_usize > 0 && bytes[pos_usize - 1] == b'"' {
-                        // `""` escape sequence inside quoted identifier: skip the pair.
+                if bytes.get(pos_usize) == Some(&b'"') {
+                    if pos_usize > 0 && bytes.get(pos_usize - 1) == Some(&b'"') {
                         pos -= 2;
                         continue;
                     }
-                    let quoted = text.get(pos_usize..idx)?;
+                    let quoted = text.get(pos_usize..segment_end)?;
                     let qualifier = Self::strip_identifier_quotes(quoted);
                     if qualifier.is_empty() {
                         return None;
                     }
-                    return Some(qualifier);
+                    return Some((qualifier, pos_usize));
                 }
                 pos -= 1;
             }
             return None;
         }
 
-        let qualifier_candidate = text.get(..idx)?;
-        if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
-            return None;
-        }
-        let mut start_byte = qualifier_candidate.len();
-        for (pos, ch) in qualifier_candidate.char_indices().rev() {
+        let mut start = segment_end;
+        for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
             if sql_text::is_identifier_char(ch) {
-                start_byte = pos;
-                continue;
+                start = pos;
+            } else {
+                break;
             }
-            break;
         }
-        if start_byte == qualifier_candidate.len() {
+        if start == segment_end {
             return None;
         }
-        let qualifier = qualifier_candidate.get(start_byte..)?;
-        let qualifier = Self::strip_identifier_quotes(qualifier);
-        let starts_with_valid_ident_char = qualifier
+
+        let segment = text.get(start..segment_end)?;
+        let starts_with_valid_ident_char = segment
             .chars()
             .next()
             .is_some_and(sql_text::is_identifier_start_char);
-        if qualifier.is_empty() || !starts_with_valid_ident_char {
-            None
-        } else {
-            Some(qualifier)
+        if !starts_with_valid_ident_char {
+            return None;
         }
+
+        Some((segment.to_string(), start))
     }
 
     fn has_unbalanced_identifier_quotes(text: &str) -> bool {

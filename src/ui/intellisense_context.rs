@@ -4824,6 +4824,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
                         // unless the first is AS (already handled above)
                         meaningful.len() > 1
                     }
+                    SqlToken::String(_) => true,
                     SqlToken::Symbol(s) if s == "." => false, // qualifier.column, not alias
                     _ => false,
                 };
