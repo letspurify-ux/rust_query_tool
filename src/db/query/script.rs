@@ -164,6 +164,7 @@ struct QueryBaseDepthFrame {
     is_multitable_insert: bool,
     merge_branch_body_depth: Option<usize>,
     merge_branch_action: Option<MergeBranchAction>,
+    pending_for_update_clause_update_line: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1360,6 +1361,7 @@ impl QueryExecutor {
                     is_multitable_insert: Self::line_is_multitable_insert_header(&trimmed_upper),
                     merge_branch_body_depth: None,
                     merge_branch_action: None,
+                    pending_for_update_clause_update_line: false,
                 });
             } else if let Some(frame) = query_frames.last().copied() {
                 let reuses_active_query_base = clause_kind.is_some_and(|kind| {
@@ -1429,6 +1431,11 @@ impl QueryExecutor {
                     Self::auto_format_is_join_condition_clause(&trimmed_upper);
                 let is_query_condition_continuation_clause =
                     Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper);
+                let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
+                    && Self::auto_format_is_for_update_clause(&trimmed_upper);
+                let is_for_update_update_continuation = frame
+                    .pending_for_update_clause_update_line
+                    && clause_kind == Some(AutoFormatClauseKind::Update);
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(trimmed)
@@ -1450,6 +1457,10 @@ impl QueryExecutor {
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(merge_branch_body_depth);
                 } else if is_join_clause {
+                    context.auto_depth = frame.query_base_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if is_for_update_clause || is_for_update_update_continuation {
                     context.auto_depth = frame.query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(frame.query_base_depth);
@@ -1536,6 +1547,19 @@ impl QueryExecutor {
                                     .saturating_add(1)
                             });
                             frame.merge_branch_action = Some(action);
+                        }
+                    }
+                    if frame.head_kind == Some(AutoFormatClauseKind::Select) {
+                        if Self::auto_format_is_for_update_split_header(&trimmed_upper) {
+                            frame.pending_for_update_clause_update_line = true;
+                        } else if frame.pending_for_update_clause_update_line
+                            && clause_kind == Some(AutoFormatClauseKind::Update)
+                        {
+                            frame.pending_for_update_clause_update_line = false;
+                        } else if !trimmed.starts_with("--")
+                            && !sql_text::is_sqlplus_comment_line(trimmed)
+                        {
+                            frame.pending_for_update_clause_update_line = false;
                         }
                     }
                 }
@@ -1714,6 +1738,19 @@ impl QueryExecutor {
     fn auto_format_is_query_condition_continuation_clause(trimmed_upper: &str) -> bool {
         sql_text::starts_with_keyword_token(trimmed_upper, "AND")
             || sql_text::starts_with_keyword_token(trimmed_upper, "OR")
+    }
+
+    fn auto_format_is_for_update_clause(trimmed_upper: &str) -> bool {
+        Self::auto_format_is_for_update_split_header(trimmed_upper)
+            || (sql_text::starts_with_keyword_token(trimmed_upper, "FOR")
+                && trimmed_upper.contains(" UPDATE"))
+    }
+
+    fn auto_format_is_for_update_split_header(trimmed_upper: &str) -> bool {
+        sql_text::starts_with_keyword_token(trimmed_upper, "FOR")
+            && !trimmed_upper.contains(" LOOP")
+            && !trimmed_upper.contains(" IN ")
+            && !trimmed_upper.contains(" UPDATE")
     }
 
     fn pending_condition_header_for_word(
@@ -5144,6 +5181,9 @@ impl QueryExecutor {
                 // MATCH_RECOGNIZE DEFINE clause marker: keep it as SQL text.
                 return None;
             }
+            if Self::looks_like_match_recognize_define_clause(rest) {
+                return None;
+            }
             return Some(Self::parse_define_assign_command(trimmed));
         }
 
@@ -6535,6 +6575,17 @@ impl QueryExecutor {
         let end = value[start + 1..].find(')')? + start + 1;
         value[start + 1..end].trim().parse::<u8>().ok()
     }
+
+    fn looks_like_match_recognize_define_clause(rest: &str) -> bool {
+        let mut words = rest.split_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        let Some(second) = words.next() else {
+            return false;
+        };
+        second.eq_ignore_ascii_case("AS") && !first.contains('=')
+    }
 }
 
 #[cfg(test)]
@@ -6651,6 +6702,14 @@ FROM recursive_tree";
         assert!(
             QueryExecutor::parse_tool_command("START WITH").is_none(),
             "hierarchical START WITH header must remain SQL"
+        );
+    }
+
+    #[test]
+    fn parse_tool_command_match_recognize_define_clause_is_not_script_define() {
+        assert!(
+            QueryExecutor::parse_tool_command("DEFINE DOWN AS price < PREV(price)").is_none(),
+            "MATCH_RECOGNIZE DEFINE clause must remain SQL instead of SQL*Plus DEFINE command"
         );
     }
 
@@ -7216,6 +7275,40 @@ WHEN NOT MATCHED THEN
         assert_eq!(
             contexts[values_idx].auto_depth, contexts[insert_idx].auto_depth,
             "VALUES should stay on the INSERT branch depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_for_update_on_select_base_depth() {
+        let sql = r#"SELECT e.empno,
+       e.sal
+FROM emp e
+FOR
+UPDATE OF e.sal NOWAIT;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM "))
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FOR")
+            .unwrap_or(0);
+        let update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("UPDATE OF"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[for_idx].auto_depth, contexts[from_idx].auto_depth,
+            "FOR header in SELECT FOR UPDATE should stay on query base depth"
+        );
+        assert_eq!(
+            contexts[update_idx].auto_depth, contexts[from_idx].auto_depth,
+            "split UPDATE line in SELECT FOR UPDATE should stay on query base depth"
         );
     }
 
