@@ -893,12 +893,13 @@ impl SqlEditorWidget {
         let name_word = Self::token_word(&tokens[name_idx].token)?;
         let _ = Self::local_identifier_from_word(name_word)?;
 
-        let mut scan_idx = name_idx + 1;
+        let mut scan_idx = Self::next_meaningful_token_idx(tokens, name_idx + 1).unwrap_or(tokens.len());
         let mut parameter_names = Vec::new();
-        if Self::token_symbol_at(tokens, scan_idx, "(") {
+        if scan_idx < tokens.len() && Self::token_symbol_at(tokens, scan_idx, "(") {
             let (close_idx, names) = Self::extract_parameter_names(tokens, scan_idx)?;
             parameter_names = names;
-            scan_idx = close_idx.saturating_add(1);
+            scan_idx =
+                Self::next_meaningful_token_idx(tokens, close_idx.saturating_add(1)).unwrap_or(tokens.len());
         }
 
         let mut paren_depth = 0usize;
