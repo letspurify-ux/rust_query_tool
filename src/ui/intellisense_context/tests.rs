@@ -6736,3 +6736,124 @@ fn grammar_quoted_identifier_variant_3() {
     let cols = extract_select_list_columns(&tokenize(r#"SELECT "Dept"."Code" FROM "Dept""#));
     assert!(cols.contains(&"Code".to_string()), "cols: {:?}", cols);
 }
+
+#[test]
+fn oracle_json_table_alias_collects_function_columns() {
+    let ctx = analyze(
+        r#"
+SELECT jt.|
+FROM orders o
+CROSS APPLY JSON_TABLE(
+  o.payload,
+  '$.items[*]'
+  COLUMNS (
+    item_id NUMBER PATH '$.id',
+    item_nm VARCHAR2(100) PATH '$.name'
+  )
+) jt
+"#,
+    );
+
+    let tables = resolve_qualifier_tables("jt", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["jt".to_string()]);
+    let jt = ctx
+        .subqueries
+        .iter()
+        .find(|subquery| subquery.alias.eq_ignore_ascii_case("jt"))
+        .expect("JSON_TABLE alias should be collected as virtual relation");
+    let body_tokens = token_range_slice(ctx.statement_tokens.as_ref(), jt.body_range);
+    let columns = extract_table_function_columns(body_tokens);
+    assert!(
+        columns.iter().any(|col| col.eq_ignore_ascii_case("item_id")),
+        "expected item_id from JSON_TABLE COLUMNS clause, got {:?}",
+        columns
+    );
+    assert!(
+        columns.iter().any(|col| col.eq_ignore_ascii_case("item_nm")),
+        "expected item_nm from JSON_TABLE COLUMNS clause, got {:?}",
+        columns
+    );
+}
+
+#[test]
+fn oracle_table_function_alias_is_collected() {
+    let ctx = analyze("SELECT t.| FROM TABLE(pkg_get_rows(:p_id)) t");
+    let tables = resolve_qualifier_tables("t", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["pkg_get_rows".to_string()]);
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("pkg_get_rows")
+                && table.alias.as_deref() == Some("t")
+        ),
+        "TABLE(...) alias should still be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn oracle_dblink_table_alias_is_collected() {
+    let ctx = analyze("SELECT e.| FROM employees@hr_link e");
+    let tables = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["employees@hr_link".to_string()]);
+}
+
+#[test]
+fn oracle_as_of_clause_preserves_alias_after_modifier() {
+    let ctx = analyze("SELECT e.| FROM employees AS OF SCN 12345 e");
+    let tables = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["employees".to_string()]);
+}
+
+#[test]
+fn oracle_partition_clause_preserves_alias_after_modifier() {
+    let ctx = analyze("SELECT s.| FROM sales PARTITION (p_202501) s");
+    let tables = resolve_qualifier_tables("s", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["sales".to_string()]);
+}
+
+#[test]
+fn oracle_versions_clause_preserves_alias_after_modifier() {
+    let ctx = analyze("SELECT e.| FROM employees VERSIONS BETWEEN SCN MINVALUE AND MAXVALUE e");
+    let tables = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["employees".to_string()]);
+}
+
+#[test]
+fn full_dotted_qualifier_resolves_to_exact_relation_before_alias_suffix_match() {
+    let ctx = analyze(
+        "SELECT schema_a.emp.| FROM schema_a.emp JOIN dept emp ON schema_a.emp.deptno = emp.deptno",
+    );
+    let tables = resolve_qualifier_tables("schema_a.emp", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["schema_a.emp".to_string()]);
+}
+
+#[test]
+fn extract_select_list_columns_supports_three_part_identifier_projection() {
+    let tokens = tokenize("WITH q AS (SELECT hr.employees.employee_id FROM hr.employees) SELECT * FROM q");
+    let ctes = parse_ctes(&tokens);
+    let q = ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("q"))
+        .expect("CTE q should be parsed");
+    let body_tokens = token_range_slice(&tokens, q.body_range);
+    let cols = extract_select_list_columns(body_tokens);
+    assert!(
+        cols.contains(&"employee_id".to_string()),
+        "three-part identifier projection should map to terminal column name: {:?}",
+        cols
+    );
+}
+
+#[test]
+fn extract_select_list_columns_supports_three_part_identifier_in_inline_view() {
+    let cols =
+        extract_select_list_columns(&tokenize("SELECT hr.employees.employee_id FROM hr.employees"));
+    assert!(
+        cols.contains(&"employee_id".to_string()),
+        "inline view projection should also keep terminal column name: {:?}",
+        cols
+    );
+}

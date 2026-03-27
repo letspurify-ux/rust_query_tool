@@ -3255,7 +3255,18 @@ fn is_relation_alias_breaker(word: &str) -> bool {
     is_join_keyword(word)
         || is_table_stop_keyword(word)
         || matches!(word, "SEARCH" | "CYCLE")
-        || matches!(word, "ON" | "SELECT" | "FROM" | "INTO" | "IN")
+        || matches!(
+            word,
+            "ON"
+                | "SELECT"
+                | "FROM"
+                | "INTO"
+                | "IN"
+                | "OF"
+                | "PARTITION"
+                | "SUBPARTITION"
+                | "VERSIONS"
+        )
 }
 
 /// Collect top-level tables visible within a standalone statement.
@@ -4845,18 +4856,9 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
         }
     }
 
-    // Case 4: Qualified column `qualifier.column`
-    if meaningful.len() == 3 {
-        if let (SqlToken::Word(_), SqlToken::Symbol(dot), SqlToken::Word(col)) =
-            (meaningful[0], meaningful[1], meaningful[2])
-        {
-            if dot == "." {
-                if !is_identifier_word_token(col) {
-                    return None;
-                }
-                return Some(strip_identifier_quotes(col));
-            }
-        }
+    // Case 4: Qualified column path `a.b` or deeper paths like `a.b.c`.
+    if let Some(column) = parse_simple_identifier_path_output_column(&meaningful) {
+        return Some(column);
     }
 
     // Expression without alias — cannot determine column name
