@@ -714,6 +714,24 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
     }
 
     #[test]
+    fn qualifier_before_word_supports_multi_part_qualifier_chain() {
+        let sql_with_cursor = "SELECT schema_a.emp.| FROM schema_a.emp";
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("schema_a.emp"));
+    }
+
+    #[test]
+    fn qualifier_before_word_supports_multi_part_qualifier_chain_with_quotes() {
+        let sql_with_cursor = r#"SELECT "schema A"."Emp Table".| FROM "schema A"."Emp Table""#;
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("schema A.Emp Table"));
+    }
+
+    #[test]
     fn identifier_at_position_supports_unicode_identifier() {
         let sql = "SELECT 사용자 FROM dual";
         let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
@@ -2888,6 +2906,114 @@ CROSS APPLY (
             deep_ctx.statement_tokens.as_ref(),
         );
         assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_select_into_target_as_general_context() {
+        let sql_with_cursor = "BEGIN SELECT empno INTO | FROM emp WHERE rownum = 1; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(SqlEditorWidget::is_variable_target_into_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::General);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_bulk_collect_into_target_as_general_context() {
+        let sql_with_cursor = "BEGIN SELECT empno BULK COLLECT INTO | FROM emp; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(SqlEditorWidget::is_variable_target_into_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::General);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_insert_returning_expression_as_column_context() {
+        let sql_with_cursor = "INSERT INTO emp (empno, ename) VALUES (1, 'ICE') RETURNING | INTO :v_empno";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(
+            deep_ctx.phase.is_column_context(),
+            "RETURNING list should be column context, got {:?}",
+            deep_ctx.phase
+        );
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_merge_insert_column_list_prefers_merge_target() {
+        let sql_with_cursor =
+            "MERGE INTO target_table t USING source_table s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["target_table".to_string()]);
+    }
+
+    #[test]
+    fn extract_select_list_columns_supports_literal_implicit_alias_in_cte() {
+        let sql = "SELECT 'Y' flag FROM dual";
+        let token_spans = super::query_text::tokenize_sql_spanned(sql);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let columns = intellisense_context::extract_select_list_columns(&full_tokens);
+
+        assert!(
+            columns.iter().any(|col| col.eq_ignore_ascii_case("flag")),
+            "expected implicit literal alias in columns: {:?}",
+            columns
+        );
     }
 
     #[test]

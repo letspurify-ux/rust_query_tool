@@ -106,6 +106,147 @@ impl SqlEditorWidget {
             .any(|cte| Self::is_cursor_inside_cte_explicit_column_list(deep_ctx, cte))
     }
 
+    fn is_variable_target_into_context(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum IntoStatementKind {
+            Unknown,
+            Select,
+            Insert,
+            Update,
+            Delete,
+            Merge,
+        }
+
+        let cursor_token_len = cursor_token_len.min(tokens.len());
+        let mut depth = 0usize;
+        let mut last_significant_word: Option<String> = None;
+        let mut second_last_significant_word: Option<String> = None;
+        let mut statement_kind = IntoStatementKind::Unknown;
+
+        for token in &tokens[..cursor_token_len] {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "SELECT" => statement_kind = IntoStatementKind::Select,
+                        "INSERT" => statement_kind = IntoStatementKind::Insert,
+                        "UPDATE" => statement_kind = IntoStatementKind::Update,
+                        "DELETE" => statement_kind = IntoStatementKind::Delete,
+                        "MERGE" => statement_kind = IntoStatementKind::Merge,
+                        _ => {}
+                    }
+                    if upper == "INTO" {
+                        let is_select_into = matches!(statement_kind, IntoStatementKind::Select);
+                        let is_bulk_collect_into = matches!(
+                            (
+                                second_last_significant_word.as_deref(),
+                                last_significant_word.as_deref(),
+                            ),
+                            (Some("BULK"), Some("COLLECT"))
+                        );
+                        let is_returning_into =
+                            matches!(last_significant_word.as_deref(), Some("RETURNING"));
+                        if is_select_into || is_bulk_collect_into || is_returning_into {
+                            return true;
+                        }
+                    }
+
+                    second_last_significant_word = last_significant_word.take();
+                    last_significant_word = Some(upper);
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn merge_insert_target_table(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<String> {
+        if !Self::is_merge_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len,
+        ) {
+            return None;
+        }
+
+        deep_ctx
+            .tables_in_scope
+            .iter()
+            .find(|table| table.depth == 0 && !table.is_cte)
+            .map(|table| table.name.clone())
+    }
+
+    fn is_merge_insert_column_list_context(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+        let cursor_token_len = cursor_token_len.min(tokens.len());
+        let mut depth = 0usize;
+        let mut in_merge_statement = false;
+        let mut saw_then = false;
+        let mut saw_insert = false;
+        let mut insert_column_list_depth: Option<usize> = None;
+
+        for token in &tokens[..cursor_token_len] {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if saw_insert && depth == 0 {
+                        insert_column_list_depth = Some(depth + 1);
+                    }
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    if depth > 0 {
+                        if insert_column_list_depth == Some(depth) {
+                            insert_column_list_depth = None;
+                        }
+                        depth -= 1;
+                    }
+                }
+                SqlToken::Word(word) if depth == 0 => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "MERGE" {
+                        in_merge_statement = true;
+                        saw_then = false;
+                        saw_insert = false;
+                        insert_column_list_depth = None;
+                        continue;
+                    }
+                    if !in_merge_statement {
+                        continue;
+                    }
+
+                    match upper.as_str() {
+                        "THEN" => {
+                            saw_then = true;
+                        }
+                        "INSERT" if saw_then => {
+                            saw_insert = true;
+                            saw_then = false;
+                        }
+                        "VALUES" if saw_insert => {
+                            saw_insert = false;
+                            insert_column_list_depth = None;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        insert_column_list_depth.is_some()
+    }
+
     fn collect_cte_virtual_columns_for_completion(
         deep_ctx: &intellisense_context::CursorContext,
         cte: &intellisense_context::CteDefinition,
@@ -182,12 +323,19 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         tokens: &[SqlToken],
     ) -> SqlContext {
-        let insert_column_list_context =
-            matches!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause)
-                && Self::is_insert_column_list_context(tokens, deep_ctx.cursor_token_len);
+        let insert_column_list_context = Self::is_insert_column_list_context(
+            tokens,
+            deep_ctx.cursor_token_len,
+        );
+        let variable_target_into_context =
+            Self::is_variable_target_into_context(tokens, deep_ctx.cursor_token_len);
         let with_cte_column_list_context = Self::is_with_cte_column_list_context(deep_ctx);
 
-        if deep_ctx.phase.is_table_context() && !insert_column_list_context {
+        if variable_target_into_context {
+            SqlContext::General
+        } else if deep_ctx.phase.is_table_context()
+            && !insert_column_list_context
+        {
             SqlContext::TableName
         } else if deep_ctx.phase.is_column_context()
             || matches!(deep_ctx.phase, intellisense_context::SqlPhase::PivotClause)

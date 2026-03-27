@@ -980,6 +980,9 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         let Some(qualifier) = qualifier else {
+            if let Some(target_table) = Self::merge_insert_target_table(deep_ctx) {
+                return vec![target_table];
+            }
             return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
         };
 
