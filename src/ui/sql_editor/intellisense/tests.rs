@@ -2319,7 +2319,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
         assert!(SqlEditorWidget::is_insert_column_list_context(
             deep_ctx.statement_tokens.as_ref(),
             deep_ctx.cursor_token_len
@@ -2346,7 +2346,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
         assert!(SqlEditorWidget::is_insert_column_list_context(
             deep_ctx.statement_tokens.as_ref(),
             deep_ctx.cursor_token_len
@@ -2373,7 +2373,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
         assert!(SqlEditorWidget::is_insert_column_list_context(
             deep_ctx.statement_tokens.as_ref(),
             deep_ctx.cursor_token_len

@@ -2317,8 +2317,8 @@ fn delete_with_alias_qualifier_resolution() {
 #[test]
 fn insert_column_list_context_after_target_table() {
     let ctx = analyze("INSERT INTO employees (|) VALUES (1)");
-    assert_eq!(ctx.phase, SqlPhase::IntoClause);
-    assert!(ctx.phase.is_table_context());
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
 
     let names = table_names(&ctx);
     assert!(
@@ -2395,6 +2395,41 @@ fn insert_all_collects_all_targets() {
     let names = table_names(&ctx);
     assert!(names.contains(&"EMP_A".to_string()), "tables: {:?}", names);
     assert!(names.contains(&"EMP_B".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn insert_all_second_into_column_list_is_column_context() {
+    let ctx = analyze(
+        "INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (|) VALUES (2) SELECT 1 FROM dual",
+    );
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn merge_not_matched_insert_column_list_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO emp t USING src s ON (t.empno = s.empno) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.empno)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn dblink_table_reference_keeps_alias_in_scope() {
+    let ctx = analyze("SELECT e.| FROM scott.emp@hr_link e WHERE e.empno = 10");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("SCOTT.EMP@HR_LINK")
+                && table.alias.as_deref() == Some("e")),
+        "db link table reference should keep alias visibility: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
