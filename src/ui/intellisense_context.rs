@@ -718,6 +718,29 @@ fn close_parenthesis_scope(
     }
 }
 
+fn is_insert_target_column_list_open_paren(
+    tokens: &[SqlToken],
+    open_paren_idx: usize,
+    current_phase: SqlPhase,
+    statement_kind: StatementKind,
+) -> bool {
+    if !matches!(current_phase, SqlPhase::IntoClause)
+        || !matches!(statement_kind, StatementKind::Insert)
+    {
+        return false;
+    }
+
+    let Some((prev_token, _)) = prev_non_comment_token(tokens, open_paren_idx) else {
+        return false;
+    };
+
+    match prev_token {
+        SqlToken::Word(word) => is_identifier_word_token(word),
+        SqlToken::Symbol(sym) => sym == ")",
+        _ => false,
+    }
+}
+
 fn begin_set_operator_operand_scope(
     scope_stack: &mut [usize],
     next_scope_id: &mut usize,
@@ -866,6 +889,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
+                let parent_statement_kind = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.statement_kind)
+                    .unwrap_or(StatementKind::Unknown);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 parser_state.push_open_paren('(');
                 depth = parser_state.paren_depth();
@@ -875,7 +902,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         parent_phase,
                         SqlPhase::ValuesClause | SqlPhase::IntoClause | SqlPhase::PivotClause
                     ) {
-                    parent_phase
+                    if is_insert_target_column_list_open_paren(
+                        tokens,
+                        idx,
+                        parent_phase,
+                        parent_statement_kind,
+                    ) {
+                        SqlPhase::SetClause
+                    } else {
+                        parent_phase
+                    }
                 } else {
                     SqlPhase::Initial
                 };
@@ -1160,14 +1196,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             last_word.as_deref(),
                         );
-                        if is_expression_context {
-                            // Inside expressions, INSERT can be a valid identifier/token.
-                            relation_state.clear();
-                        } else if is_merge_action_keyword {
+                        if is_merge_action_keyword {
                             // `MERGE ... WHEN ... THEN INSERT (...) VALUES (...)` reuses
                             // INSERT as an action keyword (no target table). Keep it in
                             // expression/column context instead of table-target context.
                             depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
+                        } else if is_expression_context {
+                            // Inside expressions, INSERT can be a valid identifier/token.
                             relation_state.clear();
                         } else {
                             depth_frames[depth].statement_kind = StatementKind::Insert;
