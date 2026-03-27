@@ -14,8 +14,22 @@ use crate::ui::sql_editor::SqlToken;
 pub enum SqlPhase {
     Initial,
     WithClause,
+    CteColumnList,
+    ConflictTargetList,
+    JoinUsingColumnList,
+    RecursiveCteColumnList,
+    RecursiveCteGeneratedColumnName,
     SelectList,
     IntoClause,
+    DmlSetTargetList,
+    InsertColumnList,
+    MergeInsertColumnList,
+    DmlReturningList,
+    SelectIntoTarget,
+    FetchIntoTarget,
+    ExecuteIntoTarget,
+    ReturningIntoTarget,
+    UsingBindList,
     FromClause,
     JoinCondition,
     WhereClause,
@@ -23,6 +37,7 @@ pub enum SqlPhase {
     HavingClause,
     OrderByClause,
     SetClause,
+    LockingColumnList,
     ConnectByClause,
     StartWithClause,
     MatchRecognizeClause,
@@ -38,13 +53,22 @@ impl SqlPhase {
     pub fn is_column_context(&self) -> bool {
         matches!(
             self,
-            SqlPhase::SelectList
+            SqlPhase::CteColumnList
+                | SqlPhase::ConflictTargetList
+                | SqlPhase::JoinUsingColumnList
+                | SqlPhase::RecursiveCteColumnList
+                | SqlPhase::DmlSetTargetList
+                | SqlPhase::InsertColumnList
+                | SqlPhase::MergeInsertColumnList
+                | SqlPhase::DmlReturningList
+                | SqlPhase::SelectList
                 | SqlPhase::WhereClause
                 | SqlPhase::JoinCondition
                 | SqlPhase::GroupByClause
                 | SqlPhase::HavingClause
                 | SqlPhase::OrderByClause
                 | SqlPhase::SetClause
+                | SqlPhase::LockingColumnList
                 | SqlPhase::ValuesClause
                 | SqlPhase::ConnectByClause
                 | SqlPhase::StartWithClause
@@ -63,6 +87,20 @@ impl SqlPhase {
                 | SqlPhase::DeleteTarget
                 | SqlPhase::MergeTarget
         )
+    }
+
+    pub fn is_variable_context(&self) -> bool {
+        matches!(
+            self,
+            SqlPhase::SelectIntoTarget
+                | SqlPhase::FetchIntoTarget
+                | SqlPhase::ExecuteIntoTarget
+                | SqlPhase::ReturningIntoTarget
+        )
+    }
+
+    pub fn is_bind_context(&self) -> bool {
+        matches!(self, SqlPhase::UsingBindList)
     }
 }
 
@@ -132,6 +170,8 @@ pub struct CursorContext {
     pub ctes: Vec<CteDefinition>,
     /// Subquery aliases with their body tokens for column inference
     pub subqueries: Vec<SubqueryDefinition>,
+    /// Preferred relation scope for unqualified column suggestions at cursor.
+    pub focused_tables: Vec<String>,
     /// The qualifier before cursor (e.g., "t" in "t.col")
     pub qualifier: Option<String>,
     /// Resolved table names for the qualifier
@@ -174,24 +214,26 @@ impl CteState {
     }
 }
 
-/// FROM/INTO/JOIN relation parsing state machine.
+/// Current completion expectation derived from clause semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelationParseState {
-    Idle,
-    ExpectTable,
+enum Expectation {
+    None,
+    Table,
+    Variable,
+    BindValue,
 }
 
-impl RelationParseState {
+impl Expectation {
     fn expect_table(&mut self) {
-        *self = Self::ExpectTable;
+        *self = Self::Table;
     }
 
     fn clear(&mut self) {
-        *self = Self::Idle;
+        *self = Self::None;
     }
 
     fn is_expect_table(self) -> bool {
-        matches!(self, Self::ExpectTable)
+        matches!(self, Self::Table)
     }
 }
 
@@ -228,6 +270,23 @@ pub(crate) fn analyze_cursor_context(
             });
         }
     }
+    if let Some(excluded_target_table) = parse_result.excluded_target_table.as_ref() {
+        let already = tables_in_scope.iter().any(|table| {
+            table.name.eq_ignore_ascii_case(excluded_target_table)
+                && table
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case("EXCLUDED"))
+        });
+        if !already {
+            tables_in_scope.push(ScopedTableRef {
+                name: excluded_target_table.clone(),
+                alias: Some("EXCLUDED".to_string()),
+                depth: parse_result.depth,
+                is_cte: false,
+            });
+        }
+    }
 
     CursorContext {
         statement_tokens,
@@ -237,6 +296,7 @@ pub(crate) fn analyze_cursor_context(
         tables_in_scope,
         ctes,
         subqueries: table_analysis.subqueries,
+        focused_tables: parse_result.focused_tables,
         qualifier: None,
         qualifier_tables: Vec::new(),
     }
@@ -491,6 +551,24 @@ fn is_log_errors_into_clause(tokens: &[SqlToken], into_idx: usize) -> bool {
     )
 }
 
+fn is_log_errors_table_target(tokens: &[SqlToken], table_idx: usize) -> bool {
+    let Some((prev_word, prev_idx)) = prev_word_upper(tokens, table_idx) else {
+        return false;
+    };
+    if prev_word != "INTO" {
+        return false;
+    }
+
+    let Some((second_prev_word, second_prev_idx)) = prev_word_upper(tokens, prev_idx) else {
+        return false;
+    };
+    if second_prev_word != "ERRORS" {
+        return false;
+    }
+
+    prev_word_upper(tokens, second_prev_idx).is_some_and(|(third_prev_word, _)| third_prev_word == "LOG")
+}
+
 fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
         return false;
@@ -568,6 +646,11 @@ fn locking_for_clause_has_of_target(tokens: &[SqlToken], start_idx: usize) -> bo
     )
 }
 
+fn is_recursive_cte_search_by_keyword(tokens: &[SqlToken], by_idx: usize) -> bool {
+    previous_word_chain_matches(tokens, by_idx, &["FIRST", "DEPTH", "SEARCH"])
+        || previous_word_chain_matches(tokens, by_idx, &["FIRST", "BREADTH", "SEARCH"])
+}
+
 fn is_read_consistency_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
         return false;
@@ -634,6 +717,8 @@ struct CursorScanResult {
     visible_scope_chain: Vec<usize>,
     parsed_tables: Vec<ParsedTableEntry>,
     parsed_subqueries: Vec<ParsedSubqueryEntry>,
+    focused_tables: Vec<String>,
+    excluded_target_table: Option<String>,
 }
 
 /// Build visible scope chain from current scope to root.
@@ -652,20 +737,104 @@ fn build_visible_scope_chain(
     visible_scope_chain
 }
 
+fn nearest_target_table(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<String> {
+    depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find_map(|frame| frame.current_target_table.clone())
+}
+
+fn nearest_cte_name(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<String> {
+    depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find_map(|frame| frame.current_cte_name.clone())
+}
+
+fn nearest_join_using_tables(depth_frames: &[ParserDepthFrame], depth: usize) -> Vec<String> {
+    depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find(|frame| !frame.join_using_tables.is_empty())
+        .map(|frame| frame.join_using_tables.clone())
+        .unwrap_or_default()
+}
+
+fn nearest_excluded_target_table(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<String> {
+    depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find_map(|frame| {
+            frame
+                .postgres_conflict_update_active
+                .then(|| frame.current_target_table.clone())
+                .flatten()
+        })
+}
+
+fn current_scope_relation_tables(
+    parsed_tables: &[ParsedTableEntry],
+    scope_stack: &[usize],
+) -> Vec<String> {
+    let current_scope_id = *scope_stack.last().unwrap_or(&0);
+    let mut tables = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in parsed_tables {
+        if entry.scope_id != current_scope_id {
+            continue;
+        }
+
+        let normalized = entry.table.name.to_ascii_uppercase();
+        if seen.insert(normalized) {
+            tables.push(entry.table.name.clone());
+        }
+    }
+
+    tables
+}
+
 fn snapshot_cursor_state(
     depth: usize,
     query_depth: usize,
+    parsed_tables: &[ParsedTableEntry],
     depth_frames: &[ParserDepthFrame],
     scope_stack: &[usize],
     visible_parent: &HashMap<usize, Option<usize>>,
-) -> (SqlPhase, usize, Vec<usize>) {
+) -> (SqlPhase, usize, Vec<usize>, Vec<String>, Option<String>) {
+    let phase = depth_frames
+        .get(depth)
+        .map(|frame| frame.phase)
+        .unwrap_or(SqlPhase::Initial);
+    let focused_tables = match phase {
+        SqlPhase::ConflictTargetList
+        | SqlPhase::DmlSetTargetList
+        | SqlPhase::InsertColumnList
+        | SqlPhase::MergeInsertColumnList
+        | SqlPhase::DmlReturningList => nearest_target_table(depth_frames, depth)
+            .into_iter()
+            .collect(),
+        SqlPhase::JoinUsingColumnList => nearest_join_using_tables(depth_frames, depth),
+        SqlPhase::CteColumnList | SqlPhase::RecursiveCteColumnList => {
+            nearest_cte_name(depth_frames, depth).into_iter().collect()
+        }
+        SqlPhase::LockingColumnList => current_scope_relation_tables(parsed_tables, scope_stack),
+        _ => Vec::new(),
+    };
+    let excluded_target_table = if matches!(
+        phase,
+        SqlPhase::DmlReturningList | SqlPhase::ReturningIntoTarget
+    ) {
+        None
+    } else {
+        nearest_excluded_target_table(depth_frames, depth)
+    };
     (
-        depth_frames
-            .get(depth)
-            .map(|frame| frame.phase)
-            .unwrap_or(SqlPhase::Initial),
+        phase,
         query_depth,
         build_visible_scope_chain(scope_stack, visible_parent),
+        focused_tables,
+        excluded_target_table,
     )
 }
 
@@ -674,6 +843,13 @@ struct ParserDepthFrame {
     phase: SqlPhase,
     is_query_scope: bool,
     statement_kind: StatementKind,
+    open_cursor_active: bool,
+    current_target_table: Option<String>,
+    current_cte_name: Option<String>,
+    dml_set_active: bool,
+    recent_relation_tables: Vec<String>,
+    join_using_tables: Vec<String>,
+    postgres_conflict_update_active: bool,
     paren_func: Option<String>,
     function_from_state: FunctionFromState,
     returning_clause_active: bool,
@@ -683,11 +859,11 @@ struct ParserDepthFrame {
 
 fn reset_relation_lookbehind(
     relation_modifier_state: &mut RelationModifierState,
-    relation_state: &mut RelationParseState,
+    expectation: &mut Expectation,
     last_word: &mut Option<String>,
 ) {
     relation_modifier_state.clear();
-    relation_state.clear();
+    expectation.clear();
     *last_word = None;
 }
 
@@ -718,26 +894,69 @@ fn close_parenthesis_scope(
     }
 }
 
-fn is_insert_target_column_list_open_paren(
+fn phase_on_open_paren(
     tokens: &[SqlToken],
     open_paren_idx: usize,
     current_phase: SqlPhase,
     statement_kind: StatementKind,
-) -> bool {
-    if !matches!(current_phase, SqlPhase::IntoClause)
-        || !matches!(statement_kind, StatementKind::Insert)
+) -> Option<SqlPhase> {
+    if matches!(current_phase, SqlPhase::JoinCondition)
+        && previous_word_chain_matches(tokens, open_paren_idx, &["USING"])
     {
-        return false;
+        return Some(SqlPhase::JoinUsingColumnList);
     }
 
-    let Some((prev_token, _)) = prev_non_comment_token(tokens, open_paren_idx) else {
-        return false;
-    };
+    if matches!(statement_kind, StatementKind::Insert)
+        && previous_word_chain_matches(tokens, open_paren_idx, &["CONFLICT", "ON"])
+    {
+        return Some(SqlPhase::ConflictTargetList);
+    }
 
-    match prev_token {
-        SqlToken::Word(word) => is_identifier_word_token(word),
-        SqlToken::Symbol(sym) => sym == ")",
-        _ => false,
+    if matches!(current_phase, SqlPhase::IntoClause)
+        && matches!(statement_kind, StatementKind::Insert)
+    {
+        let Some((prev_token, _)) = prev_non_comment_token(tokens, open_paren_idx) else {
+            return None;
+        };
+
+        return match prev_token {
+            SqlToken::Word(word) if is_identifier_word_token(word) => {
+                Some(SqlPhase::InsertColumnList)
+            }
+            SqlToken::Symbol(sym) if sym == ")" => Some(SqlPhase::InsertColumnList),
+            _ => None,
+        };
+    }
+
+    if matches!(statement_kind, StatementKind::Merge)
+        && matches!(current_phase, SqlPhase::SetClause)
+    {
+        return prev_word_upper(tokens, open_paren_idx).and_then(|(prev_word, _)| {
+            if prev_word == "INSERT" {
+                Some(SqlPhase::MergeInsertColumnList)
+            } else {
+                None
+            }
+        });
+    }
+
+    None
+}
+
+fn push_recent_relation_table(frame: &mut ParserDepthFrame, table_name: &str) {
+    if frame
+        .recent_relation_tables
+        .last()
+        .is_some_and(|recent| recent.eq_ignore_ascii_case(table_name))
+    {
+        return;
+    }
+
+    frame.recent_relation_tables.push(table_name.to_string());
+    if frame.recent_relation_tables.len() > 2 {
+        frame
+            .recent_relation_tables
+            .drain(0..frame.recent_relation_tables.len().saturating_sub(2));
     }
 }
 
@@ -764,6 +983,9 @@ enum StatementKind {
     Update,
     Delete,
     Merge,
+    Fetch,
+    ExecuteImmediate,
+    OpenCursor,
     Rename,
     Lock,
 }
@@ -815,12 +1037,150 @@ impl RelationModifierState {
     }
 }
 
+fn is_row_limiting_fetch_clause(tokens: &[SqlToken], fetch_idx: usize) -> bool {
+    matches!(
+        next_word_upper(tokens, fetch_idx + 1),
+        Some((next_keyword, _)) if matches!(next_keyword.as_str(), "FIRST" | "NEXT")
+    )
+}
+
+fn transition_on_fetch_keyword(
+    tokens: &[SqlToken],
+    idx: usize,
+    current_phase: SqlPhase,
+) -> Option<(SqlPhase, StatementKind, Expectation)> {
+    if is_row_limiting_fetch_clause(tokens, idx) {
+        return Some((
+            SqlPhase::OrderByClause,
+            StatementKind::Unknown,
+            Expectation::None,
+        ));
+    }
+
+    if current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause) {
+        return None;
+    }
+
+    Some((
+        SqlPhase::Initial,
+        StatementKind::Fetch,
+        Expectation::None,
+    ))
+}
+
+fn transition_on_into_keyword(
+    tokens: &[SqlToken],
+    idx: usize,
+    current_phase: SqlPhase,
+    current_statement_kind: StatementKind,
+    in_returning_clause: bool,
+) -> Option<(SqlPhase, Expectation)> {
+    let is_log_errors_target = matches!(
+        current_statement_kind,
+        StatementKind::Insert | StatementKind::Update | StatementKind::Delete | StatementKind::Merge
+    ) && is_log_errors_into_clause(tokens, idx);
+
+    if is_log_errors_target {
+        return Some((SqlPhase::IntoClause, Expectation::Table));
+    }
+
+    if in_returning_clause {
+        return Some((SqlPhase::ReturningIntoTarget, Expectation::Variable));
+    }
+
+    if matches!(current_statement_kind, StatementKind::Fetch) {
+        return Some((SqlPhase::FetchIntoTarget, Expectation::Variable));
+    }
+
+    if matches!(current_statement_kind, StatementKind::ExecuteImmediate) {
+        return Some((SqlPhase::ExecuteIntoTarget, Expectation::Variable));
+    }
+
+    if matches!(current_phase, SqlPhase::IntoClause) {
+        return Some((SqlPhase::IntoClause, Expectation::Table));
+    }
+
+    let should_expect_table_target = matches!(
+        current_statement_kind,
+        StatementKind::Insert | StatementKind::Delete
+    ) && matches!(
+        current_phase,
+        SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
+    );
+    let should_expect_merge_target = matches!(current_phase, SqlPhase::MergeTarget);
+    let should_expect_set_clause_target =
+        matches!(current_phase, SqlPhase::SetClause)
+            && matches!(
+                current_statement_kind,
+                StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+            );
+
+    if should_expect_table_target
+        || should_expect_merge_target
+        || should_expect_set_clause_target
+    {
+        return Some((SqlPhase::IntoClause, Expectation::Table));
+    }
+
+    if matches!(current_phase, SqlPhase::SelectList) {
+        return Some((SqlPhase::SelectIntoTarget, Expectation::Variable));
+    }
+
+    None
+}
+
+fn transition_on_using_keyword(
+    current_phase: SqlPhase,
+    current_statement_kind: StatementKind,
+    open_cursor_active: bool,
+) -> Option<(SqlPhase, Expectation)> {
+    if matches!(current_statement_kind, StatementKind::ExecuteImmediate) {
+        return Some((SqlPhase::UsingBindList, Expectation::BindValue));
+    }
+
+    if matches!(current_statement_kind, StatementKind::Merge | StatementKind::Delete) {
+        return Some((SqlPhase::FromClause, Expectation::Table));
+    }
+
+    if matches!(current_phase, SqlPhase::FromClause) {
+        return Some((SqlPhase::JoinCondition, Expectation::None));
+    }
+
+    if open_cursor_active {
+        return Some((SqlPhase::UsingBindList, Expectation::BindValue));
+    }
+
+    None
+}
+
+fn should_start_execute_immediate(
+    tokens: &[SqlToken],
+    idx: usize,
+    current_phase: SqlPhase,
+) -> bool {
+    if current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause) {
+        return false;
+    }
+
+    matches!(
+        next_word_upper(tokens, idx + 1),
+        Some((next_keyword, _)) if next_keyword == "IMMEDIATE"
+    )
+}
+
 impl Default for ParserDepthFrame {
     fn default() -> Self {
         Self {
             phase: SqlPhase::Initial,
             is_query_scope: false,
             statement_kind: StatementKind::Unknown,
+            open_cursor_active: false,
+            current_target_table: None,
+            current_cte_name: None,
+            dml_set_active: false,
+            recent_relation_tables: Vec::new(),
+            join_using_tables: Vec::new(),
+            postgres_conflict_update_active: false,
             paren_func: None,
             function_from_state: FunctionFromState::NotApplicable,
             returning_clause_active: false,
@@ -840,7 +1200,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut query_depth: usize = 0;
     let mut depth_frames: Vec<ParserDepthFrame> = vec![ParserDepthFrame::default()];
     let mut last_word: Option<String> = None;
-    let mut relation_state = RelationParseState::Idle;
+    let mut relation_state = Expectation::None;
     let mut all_tables: Vec<ParsedTableEntry> = Vec::new();
     let mut all_subqueries: Vec<ParsedSubqueryEntry> = Vec::new();
     let mut subquery_tracks: Vec<(usize, usize)> = Vec::new(); // (depth, start_idx)
@@ -853,7 +1213,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut relation_modifier_state = RelationModifierState::None;
     let mut cte_state = CteState::Inactive;
 
-    let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>)> = None;
+    let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>, Vec<String>, Option<String>)> =
+        None;
     let mut idx = 0;
 
     let mark_query_scope =
@@ -875,6 +1236,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             cursor_snapshot = Some(snapshot_cursor_state(
                 depth,
                 query_depth,
+                &all_tables,
                 &depth_frames,
                 &scope_stack,
                 &visible_parent,
@@ -893,25 +1255,44 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.statement_kind)
                     .unwrap_or(StatementKind::Unknown);
+                let parent_target_table = depth_frames
+                    .get(depth)
+                    .and_then(|frame| frame.current_target_table.clone());
+                let parent_cte_name = depth_frames
+                    .get(depth)
+                    .and_then(|frame| frame.current_cte_name.clone());
+                let parent_recent_relation_tables = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.recent_relation_tables.clone())
+                    .unwrap_or_default();
+                let parent_join_using_tables = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.join_using_tables.clone())
+                    .unwrap_or_default();
+                let parent_postgres_conflict_update_active = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.postgres_conflict_update_active)
+                    .unwrap_or(false);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 parser_state.push_open_paren('(');
                 depth = parser_state.paren_depth();
 
-                let inherited_phase = if parent_phase.is_column_context()
+                let inherited_phase = if matches!(cte_state, CteState::AfterName) {
+                    SqlPhase::CteColumnList
+                } else if let Some(target_column_list_phase) = phase_on_open_paren(
+                    tokens,
+                    idx,
+                    parent_phase,
+                    parent_statement_kind,
+                ) {
+                    target_column_list_phase
+                } else if parent_phase.is_column_context()
                     || matches!(
                         parent_phase,
                         SqlPhase::ValuesClause | SqlPhase::IntoClause | SqlPhase::PivotClause
-                    ) {
-                    if is_insert_target_column_list_open_paren(
-                        tokens,
-                        idx,
-                        parent_phase,
-                        parent_statement_kind,
-                    ) {
-                        SqlPhase::SetClause
-                    } else {
-                        parent_phase
-                    }
+                    )
+                {
+                    parent_phase
                 } else {
                     SqlPhase::Initial
                 };
@@ -921,6 +1302,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if let Some(frame) = depth_frames.get_mut(depth) {
                     frame.phase = inherited_phase;
                     frame.is_query_scope = false;
+                    frame.statement_kind = parent_statement_kind;
+                    frame.open_cursor_active = false;
+                    frame.current_target_table = parent_target_table;
+                    frame.current_cte_name = parent_cte_name;
+                    frame.dml_set_active = false;
+                    frame.recent_relation_tables = parent_recent_relation_tables;
+                    frame.join_using_tables = parent_join_using_tables;
+                    frame.postgres_conflict_update_active =
+                        parent_postgres_conflict_update_active;
                     // Record the function name that preceded this '(' so we can
                     // distinguish function-internal FROM from SQL FROM clauses.
                     frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
@@ -984,6 +1374,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             end: idx,
                         };
                         if let Some((alias, next_idx)) = parse_subquery_alias(tokens, idx + 1) {
+                            let relation_name_for_tracking = alias.clone();
                             all_subqueries.push(ParsedSubqueryEntry {
                                 subquery: SubqueryDefinition {
                                     alias: alias.clone(),
@@ -1014,10 +1405,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 &mut relation_state,
                                 &mut last_word,
                             );
+                            if depth_frames
+                                .get(depth)
+                                .is_some_and(|frame| matches!(frame.phase, SqlPhase::FromClause))
+                            {
+                                if let Some(frame) = depth_frames.get_mut(depth) {
+                                    push_recent_relation_table(frame, &relation_name_for_tracking);
+                                }
+                            }
                             continue;
                         }
 
                         let generated_name = anonymous_subquery_name(start_idx, depth);
+                        let generated_name_for_tracking = generated_name.clone();
                         all_subqueries.push(ParsedSubqueryEntry {
                             subquery: SubqueryDefinition {
                                 alias: generated_name.clone(),
@@ -1035,6 +1435,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             },
                             scope_id: parent_scope_id,
                         });
+                        if depth_frames
+                            .get(depth.saturating_sub(1))
+                            .is_some_and(|frame| matches!(frame.phase, SqlPhase::FromClause))
+                        {
+                            if let Some(frame) = depth_frames.get_mut(depth.saturating_sub(1)) {
+                                push_recent_relation_table(frame, &generated_name_for_tracking);
+                            }
+                        }
                     }
                 }
 
@@ -1070,6 +1478,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
+                let dml_set_active = depth_frames
+                    .get(depth)
+                    .is_some_and(|frame| frame.dml_set_active);
                 if matches!(
                     current_phase,
                     SqlPhase::FromClause
@@ -1079,6 +1490,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 ) {
                     depth_frames[depth].phase = SqlPhase::FromClause;
                     relation_state.expect_table();
+                } else if dml_set_active && matches!(current_phase, SqlPhase::SetClause) {
+                    depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
                 }
                 if matches!(cte_state, CteState::Inactive)
                     && depth_frames
@@ -1086,6 +1499,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         .is_some_and(|frame| matches!(frame.phase, SqlPhase::WithClause))
                 {
                     cte_state = CteState::ExpectName;
+                }
+                idx += 1;
+                continue;
+            }
+            SqlToken::Symbol(sym) if sym == "=" => {
+                if depth_frames
+                    .get(depth)
+                    .is_some_and(|frame| frame.dml_set_active)
+                    && depth_frames
+                        .get(depth)
+                        .is_some_and(|frame| matches!(frame.phase, SqlPhase::DmlSetTargetList))
+                {
+                    depth_frames[depth].phase = SqlPhase::SetClause;
                 }
                 idx += 1;
                 continue;
@@ -1129,6 +1555,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             cte_state = CteState::Inactive;
                         } else {
                             cte_state = CteState::AfterName;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.current_cte_name = Some(word.clone());
+                            }
                         }
                         idx += 1;
                         continue;
@@ -1138,6 +1567,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::Inactive;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.current_cte_name = None;
+                            }
                             continue;
                         }
                         idx += 1;
@@ -1148,6 +1580,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::Inactive;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.current_cte_name = None;
+                            }
                             continue;
                         }
                         idx += 1;
@@ -1185,6 +1620,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 match upper.as_str() {
                     "INSERT" => {
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -1207,12 +1643,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         } else {
                             depth_frames[depth].statement_kind = StatementKind::Insert;
+                            depth_frames[depth].current_target_table = None;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.clear();
                         }
                     }
                     "REPLACE" => {
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].current_target_table = None;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
                         if is_expression_context {
@@ -1223,12 +1662,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // completion purposes: expect a target relation right after
                             // REPLACE, even when INTO is omitted.
                             depth_frames[depth].phase = SqlPhase::IntoClause;
-                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            depth_frames[depth].statement_kind = StatementKind::Insert;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.expect_table();
                         }
                     }
                     "LOCK" => {
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
                         if is_expression_context {
@@ -1240,18 +1680,54 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
+                    "OPEN" => {
+                        depth_frames[depth].postgres_conflict_update_active = false;
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            depth_frames[depth].statement_kind = StatementKind::OpenCursor;
+                            depth_frames[depth].open_cursor_active = false;
+                            depth_frames[depth].returning_clause_active = false;
+                            relation_state.clear();
+                        }
+                    }
+                    "EXECUTE" if should_start_execute_immediate(tokens, idx, current_phase) => {
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].statement_kind = StatementKind::ExecuteImmediate;
+                        depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
+                        relation_state.clear();
+                    }
                     "WITH"
                         if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
                     {
                         depth_frames[depth].phase = SqlPhase::WithClause;
+                        depth_frames[depth].current_cte_name = None;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         cte_state = CteState::ExpectName;
                         relation_state.clear();
                     }
                     "SELECT" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        let preserve_insert_statement_kind = depth == 0
+                            && matches!(current_statement_kind, StatementKind::Insert)
+                            && depth_frames
+                                .get(depth)
+                                .and_then(|frame| frame.current_target_table.as_ref())
+                                .is_some();
                         depth_frames[depth].phase = SqlPhase::SelectList;
-                        depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        if !preserve_insert_statement_kind {
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        }
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }
@@ -1275,6 +1751,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::FromClause;
+                            depth_frames[depth].recent_relation_tables.clear();
+                            depth_frames[depth].join_using_tables.clear();
                             relation_state.expect_table();
                         }
                     }
@@ -1287,39 +1765,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.returning_clause_active)
                             .unwrap_or(false);
-                        let should_expect_table_target = matches!(
-                            current_statement_kind,
-                            StatementKind::Insert | StatementKind::Delete
-                        ) && matches!(
+                        if let Some((phase, expectation)) = transition_on_into_keyword(
+                            tokens,
+                            idx,
                             current_phase,
-                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
-                        );
-                        let should_expect_merge_target =
-                            matches!(current_phase, SqlPhase::MergeTarget);
-                        let should_expect_set_clause_target =
-                            matches!(current_phase, SqlPhase::SetClause)
-                                && matches!(
-                                    current_statement_kind,
-                                    StatementKind::Insert
-                                        | StatementKind::Update
-                                        | StatementKind::Delete
-                                )
-                                && !in_returning_clause;
-                        let is_log_errors_target = matches!(
                             current_statement_kind,
-                            StatementKind::Insert
-                                | StatementKind::Update
-                                | StatementKind::Delete
-                                | StatementKind::Merge
-                        ) && is_log_errors_into_clause(tokens, idx);
-
-                        if should_expect_table_target
-                            || should_expect_merge_target
-                            || should_expect_set_clause_target
-                            || is_log_errors_target
-                        {
-                            depth_frames[depth].phase = SqlPhase::IntoClause;
-                            relation_state.expect_table();
+                            in_returning_clause,
+                        ) {
+                            depth_frames[depth].phase = phase;
+                            relation_state = expectation;
                         } else {
                             relation_state.clear();
                         }
@@ -1355,15 +1809,27 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        if matches!(current_phase, SqlPhase::MergeTarget | SqlPhase::IntoClause)
-                            || matches!(current_statement_kind, StatementKind::Delete)
+                        let open_cursor_active = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.open_cursor_active)
+                            .unwrap_or(false);
+                        if let Some((phase, expectation)) =
+                            transition_on_using_keyword(
+                                current_phase,
+                                current_statement_kind,
+                                open_cursor_active,
+                            )
                         {
-                            depth_frames[depth].phase = SqlPhase::FromClause;
-                            relation_state.expect_table();
-                        } else if matches!(current_phase, SqlPhase::FromClause) {
-                            // JOIN ... USING (...) is a join-condition context, not a relation target.
-                            depth_frames[depth].phase = SqlPhase::JoinCondition;
-                            relation_state.clear();
+                            depth_frames[depth].phase = phase;
+                            if matches!(phase, SqlPhase::JoinCondition)
+                                && matches!(current_phase, SqlPhase::FromClause)
+                            {
+                                depth_frames[depth].join_using_tables =
+                                    depth_frames[depth].recent_relation_tables.clone();
+                            } else {
+                                depth_frames[depth].join_using_tables.clear();
+                            }
+                            relation_state = expectation;
                         }
                     }
                     "TABLE"
@@ -1423,17 +1889,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_modifier_state.mark_lateral_like();
                         }
                         depth_frames[depth].phase = SqlPhase::FromClause;
+                        depth_frames[depth].join_using_tables.clear();
                         relation_state.expect_table();
                     }
                     "STRAIGHT_JOIN" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
                             depth_frames[depth].phase = SqlPhase::FromClause;
+                            depth_frames[depth].join_using_tables.clear();
                             relation_state.expect_table();
                         }
                     }
                     "ON" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
                             depth_frames[depth].phase = SqlPhase::JoinCondition;
+                            depth_frames[depth].join_using_tables.clear();
                         } else if is_create_on_table_target(tokens, idx) {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
@@ -1469,13 +1938,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "FOR" => {
-                        if is_locking_for_clause(tokens, idx + 1) {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::OpenCursor) {
+                            depth_frames[depth].open_cursor_active = true;
+                        } else if is_locking_for_clause(tokens, idx + 1) {
                             depth_frames[depth].locking_clause_active = true;
                             // Locking clauses (`FOR UPDATE [OF ...]`, `FOR SHARE [OF ...]`,
                             // `FOR NO KEY UPDATE [OF ...]`, `FOR KEY SHARE [OF ...]`)
                             // can accept column references after `OF`.
                             if locking_for_clause_has_of_target(tokens, idx + 1) {
-                                depth_frames[depth].phase = SqlPhase::SetClause;
+                                depth_frames[depth].phase = SqlPhase::LockingColumnList;
                             } else {
                                 depth_frames[depth].phase = SqlPhase::OrderByClause;
                             }
@@ -1547,11 +2022,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::WhereClause;
                         relation_state.clear();
                     }
-                    "LIMIT" | "OFFSET" | "FETCH" => {
+                    "LIMIT" | "OFFSET" => {
                         // Pagination clauses are post-FROM boundaries; they must not keep
                         // relation-target parsing active even when ORDER BY is omitted.
                         depth_frames[depth].phase = SqlPhase::OrderByClause;
                         relation_state.clear();
+                    }
+                    "FETCH" => {
+                        if let Some((phase, statement_kind, expectation)) =
+                            transition_on_fetch_keyword(tokens, idx, current_phase)
+                        {
+                            depth_frames[depth].phase = phase;
+                            depth_frames[depth].statement_kind = statement_kind;
+                            relation_state = expectation;
+                        } else {
+                            relation_state.clear();
+                        }
                     }
                     "REJECT" | "CASCADE" | "RESTRICT" | "PURGE" | "REUSE" | "STORAGE" => {
                         if matches!(current_phase, SqlPhase::IntoClause)
@@ -1574,16 +2060,34 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // `... SET <ordering_or_cycle_col>` where SET is not
                             // DML assignment syntax.
                             depth_frames[depth].phase = SqlPhase::ConnectByClause;
-                        } else if matches!(
-                            current_phase,
-                            SqlPhase::WithClause | SqlPhase::OrderByClause
-                        ) && matches!(cte_state, CteState::Inactive)
+                            depth_frames[depth].dml_set_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
+                        } else if matches!(current_phase, SqlPhase::RecursiveCteColumnList)
+                            && matches!(cte_state, CteState::Inactive)
                         {
-                            // Recursive CTE SEARCH/CYCLE clauses use `... BY ... SET ...`
-                            // where SET is not a DML SET clause.
-                            depth_frames[depth].phase = SqlPhase::WithClause;
+                            // Recursive CTE SEARCH/CYCLE clauses use `... SET <generated_col>`
+                            // where SET introduces a generated output column name, not a DML
+                            // target list or expression context.
+                            depth_frames[depth].phase =
+                                SqlPhase::RecursiveCteGeneratedColumnName;
+                            depth_frames[depth].dml_set_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
                         } else {
-                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            let current_statement_kind = depth_frames
+                                .get(depth)
+                                .map(|frame| frame.statement_kind)
+                                .unwrap_or(StatementKind::Unknown);
+                            if matches!(
+                                current_statement_kind,
+                                StatementKind::Insert | StatementKind::Update | StatementKind::Merge
+                            ) {
+                                depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
+                                depth_frames[depth].dml_set_active = true;
+                            } else {
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                                depth_frames[depth].dml_set_active = false;
+                                depth_frames[depth].postgres_conflict_update_active = false;
+                            }
                         }
                         relation_state.clear();
                     }
@@ -1593,14 +2097,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .is_some_and(|frame| frame.hierarchical_clause_active);
                         if hierarchical_clause_active {
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        } else if matches!(current_phase, SqlPhase::WithClause)
+                            && matches!(cte_state, CteState::Inactive)
+                            && is_recursive_cte_search_by_keyword(tokens, idx)
+                        {
+                            depth_frames[depth].phase = SqlPhase::RecursiveCteColumnList;
                         }
                         relation_state.clear();
                     }
                     "SEARCH" | "CYCLE" => {
                         if matches!(current_phase, SqlPhase::WithClause) {
-                            // Oracle recursive CTE clauses (`SEARCH ... BY ...`,
-                            // `CYCLE ... SET ...`) expect column expressions.
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            // Recursive CTE SEARCH/CYCLE clauses operate on the recursive CTE
+                            // output instead of the full visible scope. SEARCH becomes column
+                            // context at BY; CYCLE becomes column context immediately.
+                            depth_frames[depth].phase = if upper == "CYCLE" {
+                                SqlPhase::RecursiveCteColumnList
+                            } else {
+                                SqlPhase::WithClause
+                            };
                         } else if matches!(current_phase, SqlPhase::ConnectByClause) {
                             // Oracle hierarchical query clauses (`... SEARCH ...`,
                             // `... CYCLE ...`) appear after CONNECT BY and should
@@ -1625,7 +2139,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                         if is_dml_returning_context {
                             // DML RETURNING lists target columns/expressions.
-                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            depth_frames[depth].phase = SqlPhase::DmlReturningList;
                             depth_frames[depth].returning_clause_active = true;
                             depth_frames[depth].locking_clause_active = false;
                         }
@@ -1659,14 +2173,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if is_lock_mode_update_keyword {
                             // Oracle `LOCK TABLE ... IN [ROW] SHARE UPDATE MODE` uses
                             // UPDATE as a lock-mode keyword, not a new DML statement.
+                            depth_frames[depth].postgres_conflict_update_active = false;
                             relation_state.clear();
                         } else if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
-                                depth_frames[depth].phase = SqlPhase::SetClause;
+                                depth_frames[depth].phase = SqlPhase::LockingColumnList;
                             } else {
                                 depth_frames[depth].phase = SqlPhase::OrderByClause;
                             }
+                            depth_frames[depth].postgres_conflict_update_active = false;
                             relation_state.clear();
                         } else if is_merge_action_keyword
                             || is_mysql_conflict_update
@@ -1675,16 +2191,31 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].locking_clause_active = false;
                             // `... ON DUPLICATE KEY UPDATE ...` and
                             // `... ON CONFLICT ... DO UPDATE ...` use UPDATE as an action keyword.
-                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            if is_mysql_conflict_update {
+                                depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
+                                depth_frames[depth].dml_set_active = true;
+                                depth_frames[depth].postgres_conflict_update_active = false;
+                            } else if is_postgres_conflict_update {
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                                depth_frames[depth].dml_set_active = false;
+                                depth_frames[depth].postgres_conflict_update_active = true;
+                            } else {
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                                depth_frames[depth].dml_set_active = false;
+                                depth_frames[depth].postgres_conflict_update_active = false;
+                            }
                             relation_state.clear();
                         } else if is_expression_context {
                             depth_frames[depth].locking_clause_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
                             // Inside expressions, UPDATE can be a valid identifier/token.
                             relation_state.clear();
                         } else {
                             depth_frames[depth].locking_clause_active = false;
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
                             depth_frames[depth].statement_kind = StatementKind::Update;
+                            depth_frames[depth].current_target_table = None;
+                            depth_frames[depth].postgres_conflict_update_active = false;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.expect_table();
                         }
@@ -1692,6 +2223,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "DELETE" => {
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].locking_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -1720,6 +2252,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         } else {
                             depth_frames[depth].phase = SqlPhase::DeleteTarget;
                             depth_frames[depth].statement_kind = StatementKind::Delete;
+                            depth_frames[depth].current_target_table = None;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.expect_table();
                         }
@@ -1727,12 +2260,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "MERGE" => {
                         depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].locking_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
                         depth_frames[depth].statement_kind = StatementKind::Merge;
+                        depth_frames[depth].current_target_table = None;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }
                     "RENAME" => {
+                        depth_frames[depth].postgres_conflict_update_active = false;
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
                         if is_expression_context {
@@ -1821,6 +2357,25 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if relation_state.is_expect_table() {
                             if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
                             {
+                                let current_statement_kind = depth_frames
+                                    .get(depth)
+                                    .map(|frame| frame.statement_kind)
+                                    .unwrap_or(StatementKind::Unknown);
+                                let should_record_target_table = matches!(
+                                    current_phase,
+                                    SqlPhase::UpdateTarget
+                                        | SqlPhase::DeleteTarget
+                                        | SqlPhase::MergeTarget
+                                ) || (matches!(current_phase, SqlPhase::IntoClause)
+                                    && matches!(
+                                        current_statement_kind,
+                                        StatementKind::Insert | StatementKind::Merge
+                                    )
+                                    && !is_log_errors_table_target(tokens, idx));
+                                if should_record_target_table {
+                                    depth_frames[depth].current_target_table =
+                                        Some(table_name.clone());
+                                }
                                 let relation_name_hint = relation_function_name_hint(&table_name);
                                 let has_immediate_argument_list = matches!(
                                     tokens.get(next_idx),
@@ -1861,6 +2416,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     table_name.clone()
                                 };
+                                let relation_tracking_name = table_scope_name.clone();
                                 if let (Some(alias_name), Some(body_range), Some(function_name)) = (
                                     alias.as_ref(),
                                     relation_arg_range,
@@ -1886,6 +2442,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     },
                                     scope_id,
                                 });
+                                if matches!(current_phase, SqlPhase::FromClause) {
+                                    push_recent_relation_table(
+                                        &mut depth_frames[depth],
+                                        &relation_tracking_name,
+                                    );
+                                }
                                 if let Some(SqlToken::Symbol(sym)) = tokens.get(after_alias) {
                                     if sym == "," {
                                         relation_modifier_state.clear();
@@ -1931,13 +2493,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         cursor_snapshot = Some(snapshot_cursor_state(
             depth,
             query_depth,
+            &all_tables,
             &depth_frames,
             &scope_stack,
             &visible_parent,
         ));
     }
-    let (phase, cursor_query_depth, cursor_visible_scope_chain) =
-        cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize]));
+    let (phase, cursor_query_depth, cursor_visible_scope_chain, focused_tables, excluded_target_table) =
+        cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize], Vec::new(), None));
 
     CursorScanResult {
         phase,
@@ -1945,6 +2508,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         visible_scope_chain: cursor_visible_scope_chain,
         parsed_tables: all_tables,
         parsed_subqueries: all_subqueries,
+        focused_tables,
+        excluded_target_table,
     }
 }
 

@@ -2399,11 +2399,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
-        assert!(SqlEditorWidget::is_insert_column_list_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::InsertColumnList
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -2430,11 +2429,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
-        assert!(SqlEditorWidget::is_insert_column_list_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::InsertColumnList
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -2461,11 +2459,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
-        assert!(SqlEditorWidget::is_insert_column_list_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::InsertColumnList
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -2487,10 +2484,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let split_idx = token_spans.partition_point(|span| span.end <= cursor);
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
 
-        assert!(
-            !SqlEditorWidget::is_insert_column_list_context(&full_tokens, split_idx),
-            "subquery parentheses after INSERT ... SELECT should not be treated as target column-list context"
-        );
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
     }
 
     #[test]
@@ -2506,7 +2501,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(SqlEditorWidget::is_with_cte_column_list_context(&deep_ctx));
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::CteColumnList);
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -2858,10 +2853,6 @@ CROSS APPLY (
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
-        assert!(!SqlEditorWidget::is_insert_column_list_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -2911,10 +2902,9 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(
-            deep_ctx.phase.is_column_context(),
-            "phase should be column-oriented in MERGE insert action: {:?}",
-            deep_ctx.phase
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::MergeInsertColumnList
         );
 
         let context = SqlEditorWidget::classify_intellisense_context(
@@ -2938,10 +2928,32 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(
-            deep_ctx.phase.is_column_context(),
-            "phase: {:?}",
-            deep_ctx.phase
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_merge_update_set_target_as_column_context() {
+        let sql_with_cursor =
+            "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::DmlSetTargetList
         );
 
         let context = SqlEditorWidget::classify_intellisense_context(
@@ -2979,7 +2991,7 @@ CROSS APPLY (
     }
 
     #[test]
-    fn classify_intellisense_context_treats_select_into_target_as_general_context() {
+    fn classify_intellisense_context_treats_select_into_target_as_variable_context() {
         let sql_with_cursor = "BEGIN SELECT empno INTO | FROM emp WHERE rownum = 1; END;";
         let cursor = sql_with_cursor
             .find('|')
@@ -2991,20 +3003,17 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(SqlEditorWidget::is_variable_target_into_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectIntoTarget);
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
         );
-        assert_eq!(context, SqlContext::General);
+        assert_eq!(context, SqlContext::VariableName);
     }
 
     #[test]
-    fn classify_intellisense_context_treats_bulk_collect_into_target_as_general_context() {
+    fn classify_intellisense_context_treats_bulk_collect_into_target_as_variable_context() {
         let sql_with_cursor = "BEGIN SELECT empno BULK COLLECT INTO | FROM emp; END;";
         let cursor = sql_with_cursor
             .find('|')
@@ -3016,16 +3025,13 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(SqlEditorWidget::is_variable_target_into_context(
-            deep_ctx.statement_tokens.as_ref(),
-            deep_ctx.cursor_token_len
-        ));
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectIntoTarget);
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
         );
-        assert_eq!(context, SqlContext::General);
+        assert_eq!(context, SqlContext::VariableName);
     }
 
     #[test]
@@ -3050,14 +3056,6 @@ end;";
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(
-            !SqlEditorWidget::is_variable_target_into_context(
-                deep_ctx.statement_tokens.as_ref(),
-                deep_ctx.cursor_token_len
-            ),
-            "prior statement SELECT ... INTO must not force INTO-target context in a later statement"
-        );
-
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
@@ -3067,6 +3065,98 @@ end;";
             "unexpected context for second SELECT list: {:?}",
             context
         );
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_returning_into_target_as_variable_context() {
+        let sql_with_cursor = "UPDATE emp SET sal = sal + 1 RETURNING empno INTO |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::ReturningIntoTarget
+        );
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::VariableName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_fetch_into_target_as_variable_context() {
+        let sql_with_cursor = "BEGIN FETCH cur_emp INTO |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::FetchIntoTarget);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::VariableName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_execute_immediate_using_as_bind_context() {
+        let sql_with_cursor = "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' INTO l_cnt USING |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::UsingBindList);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::BindValue);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_open_for_using_as_bind_context() {
+        let sql_with_cursor =
+            "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::UsingBindList);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::BindValue);
     }
 
     #[test]
@@ -3099,6 +3189,356 @@ end;";
     fn resolve_column_tables_for_merge_insert_column_list_prefers_merge_target() {
         let sql_with_cursor =
             "MERGE INTO target_table t USING source_table s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["target_table".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_insert_all_second_column_list_prefers_current_target() {
+        let sql_with_cursor =
+            "INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (|) VALUES (2) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["emp_b".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_insert_first_branch_column_list_prefers_current_target() {
+        let sql_with_cursor = "INSERT FIRST WHEN 1 = 1 THEN INTO emp_a (id) VALUES (1) \
+             WHEN 2 = 2 THEN INTO emp_b (|) VALUES (2) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["emp_b".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_replace_column_list_prefers_target() {
+        let sql_with_cursor = "REPLACE INTO audit_emp (|) VALUES (1)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_on_conflict_target_prefers_insert_target() {
+        let sql_with_cursor =
+            "INSERT INTO audit_emp (emp_id, emp_name) VALUES (1, 'ICE') ON CONFLICT (|) DO UPDATE SET emp_name = EXCLUDED.emp_name";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_on_conflict_excluded_qualifier_maps_to_target() {
+        let sql_with_cursor =
+            "INSERT INTO audit_emp (emp_id, emp_name) VALUES (1, 'ICE') ON CONFLICT (emp_id) DO UPDATE SET emp_name = EXCLUDED.|";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables =
+            SqlEditorWidget::resolve_column_tables_for_context(Some("EXCLUDED"), &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_insert_returning_prefers_insert_target() {
+        let sql_with_cursor = "INSERT INTO audit_emp (emp_id) \
+             SELECT e.empno FROM employees e RETURNING | INTO :v_emp_id";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_update_set_prefers_update_target() {
+        let sql_with_cursor = "UPDATE audit_emp a SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_merge_update_set_prefers_merge_target() {
+        let sql_with_cursor = "MERGE INTO target_table t USING source_table s ON (t.id = s.id) \
+             WHEN MATCHED THEN UPDATE SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["target_table".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_join_using_prefers_current_join_operands() {
+        let sql_with_cursor = "SELECT * FROM offices o JOIN employees e ON o.office_id = e.office_id \
+             JOIN departments d USING (|)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(
+            tables,
+            vec!["employees".to_string(), "departments".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_column_tables_for_join_using_rejects_qualified_name() {
+        let sql_with_cursor = "SELECT * FROM employees e JOIN departments d USING (e.|)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("e"), &deep_ctx);
+        assert!(tables.is_empty(), "tables: {:?}", tables);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_recursive_cte_search_by_prefers_recursive_cte() {
+        let sql_with_cursor =
+            "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+             SEARCH DEPTH FIRST BY | SET ord SELECT * FROM t";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_recursive_cte_cycle_prefers_recursive_cte() {
+        let sql_with_cursor =
+            "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+             CYCLE | SET ord TO 1 DEFAULT 0 SELECT * FROM t";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_locking_of_prefers_current_query_scope() {
+        let sql_with_cursor =
+            "SELECT * FROM parent p WHERE EXISTS (SELECT 1 FROM child c WHERE c.parent_id = p.id FOR UPDATE OF |)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["child".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_merge_update_set_filters_non_target_qualifier() {
+        let sql_with_cursor = "MERGE INTO target_table t USING source_table s ON (t.id = s.id) \
+             WHEN MATCHED THEN UPDATE SET s.| = 1";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("s"), &deep_ctx);
+        assert!(tables.is_empty(), "tables: {:?}", tables);
+    }
+
+    #[test]
+    fn collect_common_column_suggestions_for_join_using_intersects_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table(
+            "EMPLOYEES",
+            vec![
+                "EMPNO".to_string(),
+                "DEPTNO".to_string(),
+                "LOCATION_ID".to_string(),
+            ],
+        );
+        data.set_columns_for_table(
+            "DEPARTMENTS",
+            vec![
+                "DEPTNO".to_string(),
+                "DNAME".to_string(),
+                "LOCATION_ID".to_string(),
+            ],
+        );
+
+        let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+            "",
+            &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+            &data,
+        );
+
+        assert_has_case_insensitive(&suggestions, "DEPTNO");
+        assert_has_case_insensitive(&suggestions, "LOCATION_ID");
+        assert!(
+            !suggestions.iter().any(|s| s.eq_ignore_ascii_case("EMPNO")),
+            "suggestions: {:?}",
+            suggestions
+        );
+        assert!(
+            !suggestions.iter().any(|s| s.eq_ignore_ascii_case("DNAME")),
+            "suggestions: {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn resolve_column_tables_for_cte_explicit_column_list_prefers_current_cte() {
+        let sql_with_cursor = "WITH r (|) AS (SELECT node_id FROM oqt_t_tree) SELECT * FROM r";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["r".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_insert_returning_after_log_errors_prefers_insert_target() {
+        let sql_with_cursor = "INSERT INTO audit_emp (emp_id) \
+             SELECT e.empno FROM employees e \
+             LOG ERRORS INTO err$_audit_emp REJECT LIMIT UNLIMITED \
+             RETURNING | INTO :v_emp_id";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let tables = SqlEditorWidget::resolve_column_tables_for_context(None, &deep_ctx);
+        assert_eq!(tables, vec!["audit_emp".to_string()]);
+    }
+
+    #[test]
+    fn resolve_column_tables_for_merge_returning_prefers_merge_target() {
+        let sql_with_cursor = "MERGE INTO target_table t USING source_table s ON (t.id = s.id) \
+             WHEN MATCHED THEN UPDATE SET t.val = s.val RETURNING | INTO :v_id";
         let cursor = sql_with_cursor
             .find('|')
             .expect("cursor marker should exist");

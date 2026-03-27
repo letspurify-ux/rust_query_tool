@@ -38,6 +38,10 @@ fn cte_names(ctx: &CursorContext) -> Vec<String> {
     ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect()
 }
 
+fn has_name(names: &[String], wanted: &str) -> bool {
+    names.iter().any(|name| name.eq_ignore_ascii_case(wanted))
+}
+
 // ─── Phase detection tests ───────────────────────────────────────────────
 
 #[test]
@@ -140,8 +144,12 @@ fn phase_join_on_clause() {
 #[test]
 fn phase_join_using_clause() {
     let ctx = analyze("SELECT * FROM employees e JOIN departments d USING (|)");
-    assert_eq!(ctx.phase, SqlPhase::JoinCondition);
+    assert_eq!(ctx.phase, SqlPhase::JoinUsingColumnList);
     assert!(ctx.phase.is_column_context());
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["employees".to_string(), "departments".to_string()]
+    );
 
     let names = table_names(&ctx);
     assert!(
@@ -153,6 +161,19 @@ fn phase_join_using_clause() {
         names.contains(&"DEPARTMENTS".to_string()),
         "tables: {:?}",
         names
+    );
+}
+
+#[test]
+fn phase_join_using_clause_focuses_current_join_operands() {
+    let ctx = analyze(
+        "SELECT * FROM offices o JOIN employees e ON o.office_id = e.office_id \
+         JOIN departments d USING (|)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::JoinUsingColumnList);
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["employees".to_string(), "departments".to_string()]
     );
 }
 
@@ -600,8 +621,9 @@ fn table_collection_argument_scope_can_resolve_left_relation_columns() {
 #[test]
 fn phase_for_update_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["emp".to_string()]);
 
     let aliases: Vec<String> = ctx
         .tables_in_scope
@@ -618,21 +640,21 @@ fn phase_for_update_of_is_column_context() {
 #[test]
 fn phase_for_share_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR SHARE OF |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_no_key_update_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR NO KEY UPDATE OF |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_key_share_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR KEY SHARE OF |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
@@ -675,35 +697,35 @@ fn phase_for_update_of_skip_is_not_column_context() {
 #[test]
 fn phase_for_update_of_identifier_named_skip_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF skip |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_update_of_qualified_identifier_named_skip_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp e FOR UPDATE OF e.skip |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_update_of_qualified_identifier_named_wait_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp e FOR UPDATE OF e.wait |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_update_of_qualified_identifier_named_nowait_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp e FOR UPDATE OF e.nowait |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_for_update_of_additional_identifier_named_skip_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno, skip |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
@@ -728,8 +750,17 @@ fn phase_for_share_of_skip_is_not_column_context() {
 #[test]
 fn phase_for_share_of_identifier_named_skip_stays_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR SHARE OF skip |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_update_of_focuses_current_query_tables() {
+    let ctx = analyze(
+        "SELECT * FROM parent p WHERE EXISTS (SELECT 1 FROM child c WHERE c.parent_id = p.id FOR UPDATE OF |)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
+    assert_eq!(ctx.focused_tables, vec!["child".to_string()]);
 }
 
 #[test]
@@ -933,24 +964,46 @@ fn phase_fetch_clause_is_not_table_context() {
 #[test]
 fn phase_update_set() {
     let ctx = analyze("UPDATE t SET |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
     assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
 }
 
 #[test]
 fn phase_mysql_on_duplicate_key_update_is_column_context() {
     let ctx = analyze("INSERT INTO t (id, val) VALUES (1, 2) ON DUPLICATE KEY UPDATE |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
     assert!(ctx.phase.is_column_context());
     assert!(!ctx.phase.is_table_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
 }
 
 #[test]
 fn phase_postgres_on_conflict_do_update_is_column_context() {
     let ctx = analyze("INSERT INTO t (id, val) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
     assert!(ctx.phase.is_column_context());
     assert!(!ctx.phase.is_table_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
+}
+
+#[test]
+fn phase_postgres_on_conflict_target_list_prefers_insert_target() {
+    let ctx = analyze(
+        "INSERT INTO t (id, val) VALUES (1, 2) ON CONFLICT (|) DO UPDATE SET val = EXCLUDED.val",
+    );
+    assert_eq!(ctx.phase, SqlPhase::ConflictTargetList);
+    assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
+}
+
+#[test]
+fn postgres_excluded_qualifier_resolves_to_insert_target() {
+    let ctx = analyze(
+        "INSERT INTO t (id, val) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.|",
+    );
+    let tables = resolve_qualifier_tables("EXCLUDED", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["t".to_string()]);
 }
 
 #[test]
@@ -993,6 +1046,13 @@ fn phase_replace_into_is_table_context() {
     let ctx = analyze("REPLACE INTO |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
     assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_replace_into_column_list_is_column_context() {
+    let ctx = analyze("REPLACE INTO t (|) VALUES (1)");
+    assert_eq!(ctx.phase, SqlPhase::InsertColumnList);
+    assert!(ctx.phase.is_column_context());
 }
 
 #[test]
@@ -1236,56 +1296,61 @@ fn pivot_clause_is_column_context_for_aggregate_and_for_expression() {
 #[test]
 fn phase_insert_returning_is_column_context() {
     let ctx = analyze("INSERT INTO t (a) VALUES (1) RETURNING |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_update_returning_is_column_context() {
     let ctx = analyze("UPDATE t SET a = 1 RETURNING |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_delete_returning_is_column_context() {
     let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
     assert!(ctx.phase.is_column_context());
 }
 
 #[test]
 fn phase_insert_returning_into_does_not_switch_to_table_context() {
     let ctx = analyze("INSERT INTO t (a) VALUES (1) RETURNING a INTO |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::ReturningIntoTarget);
+    assert!(ctx.phase.is_variable_context());
     assert!(!ctx.phase.is_table_context());
 }
 
 #[test]
 fn phase_update_returning_into_does_not_switch_to_table_context() {
     let ctx = analyze("UPDATE t SET a = 1 RETURNING a INTO |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::ReturningIntoTarget);
+    assert!(ctx.phase.is_variable_context());
     assert!(!ctx.phase.is_table_context());
 }
 
 #[test]
 fn phase_delete_returning_into_does_not_switch_to_table_context() {
     let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING a INTO |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::ReturningIntoTarget);
+    assert!(ctx.phase.is_variable_context());
     assert!(!ctx.phase.is_table_context());
 }
 
 #[test]
 fn phase_delete_returning_bulk_collect_into_does_not_switch_to_table_context() {
     let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING a BULK COLLECT INTO |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::ReturningIntoTarget);
+    assert!(ctx.phase.is_variable_context());
     assert!(!ctx.phase.is_table_context());
 }
 
 #[test]
 fn phase_select_into_is_not_table_context() {
     let ctx = analyze("SELECT deptno INTO | FROM emp");
-    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert_eq!(ctx.phase, SqlPhase::SelectIntoTarget);
+    assert!(ctx.phase.is_variable_context());
     assert!(!ctx.phase.is_table_context());
 }
 
@@ -1294,7 +1359,52 @@ fn phase_merge_returning_into_is_not_table_context() {
     let ctx = analyze(
         "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val RETURNING t.id INTO |",
     );
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::ReturningIntoTarget);
+    assert!(ctx.phase.is_variable_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_fetch_into_is_variable_context() {
+    let ctx = analyze("BEGIN FETCH c INTO |; END;");
+    assert_eq!(ctx.phase, SqlPhase::FetchIntoTarget);
+    assert!(ctx.phase.is_variable_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_execute_immediate_into_is_variable_context() {
+    let ctx = analyze("BEGIN EXECUTE IMMEDIATE 'select count(*) from emp' INTO |; END;");
+    assert_eq!(ctx.phase, SqlPhase::ExecuteIntoTarget);
+    assert!(ctx.phase.is_variable_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_execute_immediate_using_is_bind_context() {
+    let ctx = analyze(
+        "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' INTO l_cnt USING |; END;",
+    );
+    assert_eq!(ctx.phase, SqlPhase::UsingBindList);
+    assert!(ctx.phase.is_bind_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_open_for_select_using_is_bind_context() {
+    let ctx = analyze(
+        "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING |; END;",
+    );
+    assert_eq!(ctx.phase, SqlPhase::UsingBindList);
+    assert!(ctx.phase.is_bind_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_open_for_dynamic_sql_using_is_bind_context() {
+    let ctx = analyze("BEGIN OPEN c FOR l_sql USING |; END;");
+    assert_eq!(ctx.phase, SqlPhase::UsingBindList);
+    assert!(ctx.phase.is_bind_context());
     assert!(!ctx.phase.is_table_context());
 }
 
@@ -1863,6 +1973,14 @@ fn cte_with_explicit_columns() {
 }
 
 #[test]
+fn cte_explicit_column_list_is_column_context() {
+    let ctx = analyze("WITH cte(x, |) AS (SELECT 1, 2 FROM dual) SELECT * FROM cte");
+    assert_eq!(ctx.phase, SqlPhase::CteColumnList);
+    assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["cte".to_string()]);
+}
+
+#[test]
 fn cte_cursor_in_main_query_where() {
     let ctx = analyze("WITH temp AS (SELECT id, name FROM users) SELECT * FROM temp WHERE |");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
@@ -2266,9 +2384,10 @@ fn trailing_semicolon_preserves_cte_alias_resolution() {
 #[test]
 fn update_target_table() {
     let ctx = analyze("UPDATE employees SET |");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
     let names = table_names(&ctx);
     assert!(names.contains(&"EMPLOYEES".to_string()));
+    assert_eq!(ctx.focused_tables, vec!["employees".to_string()]);
 }
 
 #[test]
@@ -2280,7 +2399,7 @@ fn update_with_where() {
 #[test]
 fn update_with_alias_qualifier_resolution() {
     let ctx = analyze("UPDATE employees e SET e.| = 1000");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
 
     let names = table_names(&ctx);
     assert!(
@@ -2291,6 +2410,13 @@ fn update_with_alias_qualifier_resolution() {
 
     let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
     assert_eq!(resolved, vec!["employees"]);
+}
+
+#[test]
+fn update_set_expression_after_equals_returns_expression_phase() {
+    let ctx = analyze("UPDATE employees SET salary = |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.focused_tables.is_empty());
 }
 
 // ─── DELETE statement tests ──────────────────────────────────────────────
@@ -2317,7 +2443,7 @@ fn delete_with_alias_qualifier_resolution() {
 #[test]
 fn insert_column_list_context_after_target_table() {
     let ctx = analyze("INSERT INTO employees (|) VALUES (1)");
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::InsertColumnList);
     assert!(ctx.phase.is_column_context());
 
     let names = table_names(&ctx);
@@ -2374,7 +2500,7 @@ fn insert_subquery_depth_returns_to_zero_after_closing_values_subquery() {
     let ctx =
         analyze("INSERT INTO employees (id) VALUES ((SELECT 1 FROM dual)) RETURNING | INTO :id");
     assert_eq!(ctx.depth, 0);
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
     assert!(ctx.phase.is_column_context());
 }
 
@@ -2398,11 +2524,67 @@ fn insert_all_collects_all_targets() {
 }
 
 #[test]
+fn select_into_does_not_leak_into_next_select_in_package_body() {
+    let ctx = analyze(
+        r#"create package body a as
+procedure b (c in number) as
+begin
+    select d
+    into e
+    from f;
+    select |
+    from h;
+end;
+end;"#,
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(has_name(&names, "h"), "tables: {:?}", names);
+    assert!(!has_name(&names, "e"), "tables: {:?}", names);
+    assert!(!has_name(&names, "f"), "tables: {:?}", names);
+}
+
+#[test]
+fn select_into_target_is_not_collected_as_table() {
+    let ctx = analyze(
+        r#"begin
+    select d
+    into e
+    from f
+    where |;
+end;"#,
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(has_name(&names, "f"), "tables: {:?}", names);
+    assert!(!has_name(&names, "e"), "tables: {:?}", names);
+}
+
+#[test]
+fn bulk_collect_into_target_is_not_collected_as_table() {
+    let ctx = analyze(
+        r#"begin
+    select empno
+    bulk collect into l_empnos
+    from emp
+    where |;
+end;"#,
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(has_name(&names, "emp"), "tables: {:?}", names);
+    assert!(!has_name(&names, "l_empnos"), "tables: {:?}", names);
+}
+
+#[test]
 fn insert_all_second_into_column_list_is_column_context() {
     let ctx = analyze(
         "INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (|) VALUES (2) SELECT 1 FROM dual",
     );
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::InsertColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
@@ -2411,7 +2593,7 @@ fn merge_not_matched_insert_column_list_is_column_context() {
     let ctx = analyze(
         "MERGE INTO emp t USING src s ON (t.empno = s.empno) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.empno)",
     );
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::MergeInsertColumnList);
     assert!(ctx.phase.is_column_context());
 }
 
@@ -4646,6 +4828,15 @@ fn merge_using_subquery_depth_returns_to_zero_after_close() {
 }
 
 #[test]
+fn merge_update_set_target_list_prefers_target_phase() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
+    assert_eq!(ctx.focused_tables, vec!["target".to_string()]);
+}
+
+#[test]
 fn merge_when_not_matched_insert_column_list_is_column_context() {
     let ctx = analyze(
         "MERGE INTO target t USING source s ON (t.id = s.id) \
@@ -4719,7 +4910,7 @@ fn phase_merge_insert_log_errors_reject_limit_then_returning_is_set_clause() {
          LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED RETURNING |",
     );
 
-    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
     assert!(ctx.phase.is_column_context());
     assert!(!ctx.phase.is_table_context());
 }
@@ -4939,16 +5130,28 @@ fn recursive_cte_search_by_is_column_context() {
     let ctx = analyze(
         "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) SEARCH DEPTH FIRST BY | SET ord SELECT * FROM t",
     );
-    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert_eq!(ctx.phase, SqlPhase::RecursiveCteColumnList);
     assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
 }
 
 #[test]
-fn recursive_cte_cycle_set_does_not_switch_to_dml_set_clause() {
+fn recursive_cte_cycle_column_list_is_column_context() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) CYCLE | SET ord TO 1 DEFAULT 0 SELECT * FROM t",
+    );
+    assert_eq!(ctx.phase, SqlPhase::RecursiveCteColumnList);
+    assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["t".to_string()]);
+}
+
+#[test]
+fn recursive_cte_cycle_set_uses_generated_column_name_phase() {
     let ctx = analyze(
         "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) CYCLE n SET | TO 1 DEFAULT 0 SELECT * FROM t",
     );
-    assert_eq!(ctx.phase, SqlPhase::WithClause);
+    assert_eq!(ctx.phase, SqlPhase::RecursiveCteGeneratedColumnName);
+    assert!(!ctx.phase.is_column_context());
 }
 
 #[test]

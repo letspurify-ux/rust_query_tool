@@ -1382,20 +1382,27 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         .collect::<Vec<_>>();
     let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-    let in_with_cte_explicit_column_list = ctx.ctes.iter().any(|cte| {
-        cte.explicit_column_range.is_some_and(|range| {
-            ctx.cursor_token_len >= range.start && ctx.cursor_token_len <= range.end
-        })
-    });
-
     match ctx.phase {
         SqlPhase::FromClause
         | SqlPhase::IntoClause
         | SqlPhase::UpdateTarget
         | SqlPhase::DeleteTarget
         | SqlPhase::MergeTarget => SqlContext::TableName,
+        SqlPhase::SelectIntoTarget
+        | SqlPhase::FetchIntoTarget
+        | SqlPhase::ExecuteIntoTarget
+        | SqlPhase::ReturningIntoTarget => SqlContext::VariableName,
+        SqlPhase::UsingBindList => SqlContext::BindValue,
         SqlPhase::SelectList => SqlContext::ColumnOrAll,
-        _ if in_with_cte_explicit_column_list => SqlContext::ColumnName,
+        SqlPhase::CteColumnList
+        | SqlPhase::ConflictTargetList
+        | SqlPhase::JoinUsingColumnList
+        | SqlPhase::RecursiveCteColumnList
+        | SqlPhase::DmlSetTargetList
+        | SqlPhase::InsertColumnList
+        | SqlPhase::MergeInsertColumnList
+        | SqlPhase::DmlReturningList
+        | SqlPhase::LockingColumnList => SqlContext::ColumnName,
         SqlPhase::WhereClause
         | SqlPhase::JoinCondition
         | SqlPhase::GroupByClause
@@ -1419,6 +1426,8 @@ pub enum SqlContext {
     TableName,
     ColumnName,
     ColumnOrAll,
+    VariableName,
+    BindValue,
 }
 
 #[cfg(test)]
@@ -1561,8 +1570,152 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn detect_sql_context_update_set_target_is_column_name() {
+        let sql_with_cursor = "UPDATE emp SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_merge_update_set_target_is_column_name() {
+        let sql_with_cursor =
+            "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_select_into_target_is_variable_name() {
+        let sql_with_cursor = "BEGIN SELECT empno INTO | FROM emp; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::VariableName);
+    }
+
+    #[test]
+    fn detect_sql_context_returning_into_target_is_variable_name() {
+        let sql_with_cursor = "UPDATE emp SET sal = sal + 1 RETURNING empno INTO |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::VariableName);
+    }
+
+    #[test]
+    fn detect_sql_context_fetch_into_target_is_variable_name() {
+        let sql_with_cursor = "BEGIN FETCH c_emp INTO |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::VariableName);
+    }
+
+    #[test]
+    fn detect_sql_context_execute_immediate_using_is_bind_value() {
+        let sql_with_cursor =
+            "BEGIN EXECUTE IMMEDIATE 'select count(*) from emp where deptno = :1' INTO l_cnt USING |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::BindValue);
+    }
+
+    #[test]
+    fn detect_sql_context_open_for_using_is_bind_value() {
+        let sql_with_cursor = "BEGIN OPEN c FOR l_sql USING |; END;";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::BindValue);
+    }
+
+    #[test]
     fn detect_sql_context_join_using_clause_is_column_name() {
         let sql_with_cursor = "SELECT * FROM employees e JOIN departments d USING (|)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_on_conflict_target_list_is_column_name() {
+        let sql_with_cursor =
+            "INSERT INTO t (id, val) VALUES (1, 2) ON CONFLICT (|) DO UPDATE SET val = EXCLUDED.val";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_recursive_cte_search_by_is_column_name() {
+        let sql_with_cursor =
+            "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) SEARCH DEPTH FIRST BY | SET ord SELECT * FROM t";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_for_update_of_is_column_name() {
+        let sql_with_cursor = "SELECT * FROM emp FOR UPDATE OF |";
         let cursor = sql_with_cursor
             .find('|')
             .expect("expected cursor marker in SQL");

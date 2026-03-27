@@ -462,17 +462,23 @@ impl SqlEditorWidget {
         let qualifier = snapshot.qualifier.as_deref();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+        let restrict_to_relation_columns =
+            Self::restricts_to_relation_column_names(deep_ctx.phase);
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
             .min(analysis.statement_end.saturating_sub(analysis.statement_start));
-        let session_bind_names = if qualifier.is_none() && !matches!(context, SqlContext::TableName)
+        let session_bind_names = if qualifier.is_none()
+            && !matches!(context, SqlContext::TableName)
+            && !restrict_to_relation_columns
         {
             Self::session_bind_names(connection)
         } else {
             Vec::new()
         };
-        let local_suggestions = if qualifier.is_none() && !matches!(context, SqlContext::TableName)
+        let local_suggestions = if qualifier.is_none()
+            && !matches!(context, SqlContext::TableName)
+            && !restrict_to_relation_columns
         {
             Self::collect_local_symbol_suggestions(
                 &snapshot.prefix,
@@ -629,8 +635,18 @@ impl SqlEditorWidget {
             } else {
                 None
             };
-            if qualifier.is_some() {
+            if qualifier.is_none()
+                && matches!(deep_ctx.phase, intellisense_context::SqlPhase::JoinUsingColumnList)
+            {
+                Self::collect_common_column_suggestions(
+                    &snapshot.prefix,
+                    &column_tables,
+                    &data,
+                )
+            } else if qualifier.is_some() {
                 data.get_column_suggestions(&snapshot.prefix, column_scope)
+            } else if matches!(context, SqlContext::VariableName | SqlContext::BindValue) {
+                Vec::new()
             } else {
                 data.get_suggestions(
                     &snapshot.prefix,
@@ -641,7 +657,7 @@ impl SqlEditorWidget {
                 )
             }
         };
-        if include_columns && qualifier.is_none() {
+        if include_columns && qualifier.is_none() && !restrict_to_relation_columns {
             let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
             suggestions = Self::merge_suggestions_with_derived_columns(
                 suggestions,
@@ -649,8 +665,15 @@ impl SqlEditorWidget {
                 derived_columns,
             );
         }
-        let context_alias_suggestions =
-            Self::collect_context_alias_suggestions(&snapshot.prefix, deep_ctx);
+        let context_alias_suggestions = if matches!(
+            context,
+            SqlContext::VariableName | SqlContext::BindValue
+        ) || restrict_to_relation_columns
+        {
+            Vec::new()
+        } else {
+            Self::collect_context_alias_suggestions(&snapshot.prefix, deep_ctx)
+        };
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_alias_suggestions,
@@ -965,6 +988,62 @@ impl SqlEditorWidget {
         columns
     }
 
+    fn restricts_to_relation_column_names(phase: intellisense_context::SqlPhase) -> bool {
+        matches!(
+            phase,
+            intellisense_context::SqlPhase::CteColumnList
+                | intellisense_context::SqlPhase::ConflictTargetList
+                | intellisense_context::SqlPhase::JoinUsingColumnList
+                | intellisense_context::SqlPhase::RecursiveCteColumnList
+                | intellisense_context::SqlPhase::DmlSetTargetList
+                | intellisense_context::SqlPhase::InsertColumnList
+                | intellisense_context::SqlPhase::MergeInsertColumnList
+                | intellisense_context::SqlPhase::DmlReturningList
+                | intellisense_context::SqlPhase::LockingColumnList
+        )
+    }
+
+    fn collect_common_column_suggestions(
+        prefix: &str,
+        column_tables: &[String],
+        data: &IntellisenseData,
+    ) -> Vec<String> {
+        if column_tables.len() < 2 {
+            return Vec::new();
+        }
+
+        let mut iter = column_tables.iter();
+        let Some(first_table) = iter.next() else {
+            return Vec::new();
+        };
+        let mut common_columns = data.get_columns_for_table(first_table);
+        if common_columns.is_empty() {
+            return Vec::new();
+        }
+
+        for table in iter {
+            let table_columns = data.get_columns_for_table(table);
+            if table_columns.is_empty() {
+                return Vec::new();
+            }
+            let allowed: HashSet<String> = table_columns
+                .into_iter()
+                .map(|column| column.to_ascii_uppercase())
+                .collect();
+            common_columns.retain(|column| allowed.contains(&column.to_ascii_uppercase()));
+        }
+
+        let prefix_upper = prefix.to_ascii_uppercase();
+        common_columns.retain(|column| {
+            let upper = column.to_ascii_uppercase();
+            prefix_upper.is_empty()
+                || (upper.starts_with(prefix_upper.as_str()) && upper != prefix_upper)
+        });
+        Self::dedup_column_names_case_insensitive(&mut common_columns);
+        common_columns.truncate(MAX_MERGED_SUGGESTIONS);
+        common_columns
+    }
+
     fn find_virtual_columns_case_insensitive<'a>(
         virtual_table_columns: &'a HashMap<String, Vec<String>>,
         table: &str,
@@ -979,18 +1058,45 @@ impl SqlEditorWidget {
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
+        let focused_tables = (!deep_ctx.focused_tables.is_empty()).then_some(&deep_ctx.focused_tables);
+        if qualifier.is_some()
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::JoinUsingColumnList
+            )
+        {
+            return Vec::new();
+        }
         let Some(qualifier) = qualifier else {
-            if let Some(target_table) = Self::merge_insert_target_table(deep_ctx) {
-                return vec![target_table];
+            if let Some(focused_tables) = focused_tables {
+                return focused_tables.to_vec();
             }
             return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
         };
 
         let resolved =
             intellisense_context::resolve_qualifier_tables(qualifier, &deep_ctx.tables_in_scope);
+        if let Some(focused_tables) = focused_tables {
+            let filtered: Vec<String> = resolved
+                .iter()
+                .filter(|name| {
+                    focused_tables
+                        .iter()
+                        .any(|focused| focused.eq_ignore_ascii_case(name))
+                })
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
+            }
+        }
         let unresolved_direct = resolved.len() == 1 && resolved[0].eq_ignore_ascii_case(qualifier);
         if !unresolved_direct {
-            return resolved;
+            return if focused_tables.is_some() {
+                Vec::new()
+            } else {
+                resolved
+            };
         }
 
         let pattern_vars = intellisense_context::extract_match_recognize_pattern_variables(
