@@ -6966,6 +6966,59 @@ fn format_sql_keeps_multiline_start_with_clause_as_sql() {
 }
 
 #[test]
+fn format_sql_keeps_match_recognize_define_clause_as_sql() {
+    let input = "SELECT *\nFROM ticks\nMATCH_RECOGNIZE (\n  PARTITION BY symbol\n  ORDER BY ts\n  PATTERN (STRT DOWN+)\n  DEFINE\n    DOWN AS price < PREV(price)\n)\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let tool_define_count = formatted_items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(crate::db::ToolCommand::Define { .. })))
+        .count();
+
+    assert_eq!(
+        tool_define_count, 0,
+        "MATCH_RECOGNIZE DEFINE clause must not be converted to SQL*Plus DEFINE command, got:\n{formatted}"
+    );
+    assert!(
+        formatted.contains("DEFINE\n")
+            || formatted.contains("DEFINE DOWN AS")
+            || formatted.contains("DEFINE\n    DOWN AS"),
+        "MATCH_RECOGNIZE DEFINE clause text should remain in SQL statement, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn format_sql_keeps_split_for_update_lines_on_same_clause_depth() {
+    let input = "SELECT e.empno,\n       e.sal\nFROM emp e\nFOR\nUPDATE OF e.sal NOWAIT\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FROM emp e"))
+        .unwrap_or(0);
+    let for_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "FOR")
+        .unwrap_or(0);
+    let update_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("UPDATE OF e.sal NOWAIT"))
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[for_idx]),
+        indent(lines[from_idx]),
+        "FOR in split SELECT FOR UPDATE should align with SELECT clause depth, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[update_idx]),
+        indent(lines[from_idx]),
+        "UPDATE in split SELECT FOR UPDATE should align with SELECT clause depth, got:\n{formatted}"
+    );
+}
+
+#[test]
 fn format_sql_keeps_desc_sort_modifier_attached_after_with_function_cte_query() {
     let input = "WITH\n    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS\n    BEGIN\n        RETURN p_txt;\n    END fmt_mask,\n    base_emp AS (\n        SELECT\n            e.empno,\n            e.ename,\n            ROW_NUMBER () OVER (\n                PARTITION BY e.deptno\n                ORDER BY e.sal DESC, e.empno\n            ) AS rn\n        FROM emp e\n    )\nSELECT\n    b.empno,\n    b.ename\nFROM base_emp b\nORDER BY\n    b.empno,\n    CASE\n        WHEN b.rn = 1 THEN 1\n        ELSE 2\n    END,\n    b.ename DESC,\n    b.empno\n;";
     let formatted = SqlEditorWidget::format_sql_basic(input);
