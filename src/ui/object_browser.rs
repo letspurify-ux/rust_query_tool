@@ -994,15 +994,25 @@ impl ObjectBrowserWidget {
     }
 
     fn get_insert_text(item: &TreeItem) -> Option<String> {
-        match Self::get_item_info(item) {
-            Some(ObjectItem::Simple { object_name, .. }) => Some(object_name),
-            Some(ObjectItem::PackageRoutine {
-                package_name,
-                routine_name,
-                ..
-            }) => Some(format!("{}.{}", package_name, routine_name)),
-            None => None,
-        }
+        Self::get_item_info(item)
+            .as_ref()
+            .map(copy_text_for_object_item)
+    }
+
+    fn copy_text_for_selected_item(item: &TreeItem) -> Option<String> {
+        Self::get_item_info(item)
+            .as_ref()
+            .map(copy_text_for_object_item)
+            .or_else(|| {
+                item.label().and_then(|label| {
+                    let trimmed = label.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+            })
     }
 
     fn build_simple_procedure_script(qualified_name: &str) -> String {
@@ -2358,7 +2368,36 @@ impl ObjectBrowserWidget {
     pub fn get_selected_item(&self) -> Option<String> {
         self.tree
             .first_selected_item()
-            .and_then(|item| item.label())
+            .and_then(|item| Self::copy_text_for_selected_item(&item))
+    }
+
+    pub fn has_focus(&self) -> bool {
+        widget_has_focus(&self.flex)
+    }
+
+    pub fn copy_focused_selection_to_clipboard(&self) -> bool {
+        if widget_has_focus(&self.filter_input) {
+            let mut filter_input = self.filter_input.clone();
+            return filter_input.copy().is_ok();
+        }
+
+        if !widget_has_focus(&self.tree) {
+            return false;
+        }
+
+        let Some(item) = self.tree.first_selected_item() else {
+            return false;
+        };
+        let Some(text) = Self::copy_text_for_selected_item(&item) else {
+            return false;
+        };
+
+        app::copy(&text);
+        Self::emit_status_callback(
+            &self.status_callback,
+            &format!("Copied '{}' to clipboard", text),
+        );
+        true
     }
 }
 
@@ -2383,5 +2422,40 @@ impl Drop for ObjectBrowserWidget {
             .status_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+fn widget_has_focus<W: WidgetExt>(widget: &W) -> bool {
+    if let Some(focus) = app::focus() {
+        return focus.as_widget_ptr() == widget.as_widget_ptr() || focus.inside(widget);
+    }
+
+    false
+}
+
+fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
+    match item_info {
+        ObjectItem::Simple { object_name, .. } => object_name.clone(),
+        ObjectItem::PackageRoutine {
+            package_name,
+            routine_name,
+            ..
+        } => format!("{}.{}", package_name, routine_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_text_for_object_item, ObjectItem};
+
+    #[test]
+    fn copy_text_for_package_routine_uses_qualified_name() {
+        let item = ObjectItem::PackageRoutine {
+            package_name: "DEMO_PKG".to_string(),
+            routine_name: "RUN_JOB".to_string(),
+            routine_type: "PROCEDURE".to_string(),
+        };
+
+        assert_eq!(copy_text_for_object_item(&item), "DEMO_PKG.RUN_JOB");
     }
 }

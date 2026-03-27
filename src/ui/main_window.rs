@@ -3029,6 +3029,7 @@ impl MainWindow {
                 } else {
                     false
                 };
+                let focus_in_object_browser = s.object_browser.has_focus();
 
                 if focus_in_results {
                     let cell_count = s.result_tabs.copy();
@@ -3046,6 +3047,18 @@ impl MainWindow {
                         s.status_bar
                             .set_label(&format_status("No cells selected to copy", &conn_info));
                     }
+                } else if focus_in_object_browser {
+                    if !s.object_browser.copy_focused_selection_to_clipboard() {
+                        let conn_info = s
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        s.status_bar.set_label(&format_status(
+                            "No object browser item selected to copy",
+                            &conn_info,
+                        ));
+                    }
                 } else {
                     s.sql_editor.get_editor().copy();
                 }
@@ -3062,6 +3075,7 @@ impl MainWindow {
                 } else {
                     false
                 };
+                let focus_in_object_browser = s.object_browser.has_focus();
 
                 if focus_in_results {
                     s.result_tabs.copy_with_headers();
@@ -3072,6 +3086,18 @@ impl MainWindow {
                         .clone();
                     s.status_bar
                         .set_label(&format_status("Copied selection with headers", &conn_info));
+                } else if focus_in_object_browser {
+                    if !s.object_browser.copy_focused_selection_to_clipboard() {
+                        let conn_info = s
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        s.status_bar.set_label(&format_status(
+                            "No object browser item selected to copy",
+                            &conn_info,
+                        ));
+                    }
                 } else {
                     s.sql_editor.get_editor().copy();
                 }
