@@ -1456,11 +1456,10 @@ impl QueryExecutor {
                     context.auto_depth = merge_branch_body_depth.saturating_add(1);
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(merge_branch_body_depth);
-                } else if is_join_clause {
-                    context.auto_depth = frame.query_base_depth;
-                    context.query_role = AutoFormatQueryRole::Base;
-                    context.query_base_depth = Some(frame.query_base_depth);
-                } else if is_for_update_clause || is_for_update_update_continuation {
+                } else if is_join_clause
+                    || is_for_update_clause
+                    || is_for_update_update_continuation
+                {
                     context.auto_depth = frame.query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(frame.query_base_depth);
@@ -1552,12 +1551,10 @@ impl QueryExecutor {
                     if frame.head_kind == Some(AutoFormatClauseKind::Select) {
                         if Self::auto_format_is_for_update_split_header(&trimmed_upper) {
                             frame.pending_for_update_clause_update_line = true;
-                        } else if frame.pending_for_update_clause_update_line
-                            && clause_kind == Some(AutoFormatClauseKind::Update)
-                        {
-                            frame.pending_for_update_clause_update_line = false;
-                        } else if !trimmed.starts_with("--")
-                            && !sql_text::is_sqlplus_comment_line(trimmed)
+                        } else if (frame.pending_for_update_clause_update_line
+                            && clause_kind == Some(AutoFormatClauseKind::Update))
+                            || (!trimmed.starts_with("--")
+                                && !sql_text::is_sqlplus_comment_line(trimmed))
                         {
                             frame.pending_for_update_clause_update_line = false;
                         }

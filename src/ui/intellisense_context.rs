@@ -915,9 +915,7 @@ fn phase_on_open_paren(
     if matches!(current_phase, SqlPhase::IntoClause)
         && matches!(statement_kind, StatementKind::Insert)
     {
-        let Some((prev_token, _)) = prev_non_comment_token(tokens, open_paren_idx) else {
-            return None;
-        };
+        let (prev_token, _) = prev_non_comment_token(tokens, open_paren_idx)?;
 
         return match prev_token {
             SqlToken::Word(word) if is_identifier_word_token(word) => {
