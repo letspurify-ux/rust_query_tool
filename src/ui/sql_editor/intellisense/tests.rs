@@ -1806,6 +1806,68 @@ END demo_pkg;"#,
     }
 
     #[test]
+    fn local_symbol_suggestions_include_package_body_routine_in_out_parameters() {
+        let procedure_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+    PROCEDURE upsert_emp(
+        p_empno   IN NUMBER,
+        p_ename   IN OUT VARCHAR2,
+        p_message OUT VARCHAR2
+    ) IS
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END upsert_emp;
+END demo_pkg;"#,
+            &[],
+        );
+
+        for expected in ["p_empno", "p_ename", "p_message"] {
+            assert_has_case_insensitive(&procedure_suggestions, expected);
+        }
+
+        let function_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+    FUNCTION calc_bonus(
+        p_base    IN NUMBER,
+        p_percent IN OUT NUMBER,
+        p_error   OUT VARCHAR2
+    ) RETURN NUMBER IS
+    BEGIN
+        __CODEX_CURSOR__NULL;
+        RETURN p_base;
+    END calc_bonus;
+END demo_pkg;"#,
+            &[],
+        );
+
+        for expected in ["p_base", "p_percent", "p_error"] {
+            assert_has_case_insensitive(&function_suggestions, expected);
+        }
+    }
+
+    #[test]
+    fn local_symbol_suggestions_include_package_body_parameters_when_comment_separates_name_and_paren(
+    ) {
+        let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+            r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+    PROCEDURE run_demo
+    -- keep implementation note
+    (
+        p_input  IN NUMBER,
+        p_output OUT VARCHAR2
+    ) IS
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END run_demo;
+END demo_pkg;"#,
+            &[],
+        );
+
+        assert_has_case_insensitive(&suggestions, "p_input");
+        assert_has_case_insensitive(&suggestions, "p_output");
+    }
+
+    #[test]
     fn local_symbol_suggestions_support_select_into_and_returning_into_targets() {
         let select_into = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
             r#"DECLARE
