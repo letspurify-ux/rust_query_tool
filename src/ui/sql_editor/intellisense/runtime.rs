@@ -19,20 +19,20 @@ impl SqlEditorWidget {
         let column_sender_for_insert = column_sender.clone();
         let connection_for_insert = connection.clone();
         let text_shadow_for_insert = text_shadow.clone();
+        let preferred_insert_position_for_insert = self.preferred_insert_position.clone();
         {
             let mut popup = intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             popup.set_selected_callback(move |selected| {
-                    let (cursor_pos, cursor_pos_usize) =
-                        Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
-                    let context_text = Self::normalize_intellisense_context_text(
-                    &Self::context_before_cursor(
+                let (cursor_pos, cursor_pos_usize) =
+                    Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
+                let context_text =
+                    Self::normalize_intellisense_context_text(&Self::context_before_cursor(
                         &buffer_for_insert,
                         &text_shadow_for_insert,
                         cursor_pos,
-                    ),
-                    );
+                    ));
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
                     let should_prefetch = {
@@ -54,8 +54,11 @@ impl SqlEditorWidget {
                 let (start, end) = if let Some(range) = range {
                     (range.start(), range.end())
                 } else {
-                    let (word, start, _end) =
-                        Self::word_at_cursor(&buffer_for_insert, &text_shadow_for_insert, cursor_pos);
+                    let (word, start, _end) = Self::word_at_cursor(
+                        &buffer_for_insert,
+                        &text_shadow_for_insert,
+                        cursor_pos,
+                    );
                     if word.is_empty() {
                         (cursor_pos_usize, cursor_pos_usize)
                     } else {
@@ -71,9 +74,12 @@ impl SqlEditorWidget {
                     editor_for_insert
                         .set_insert_position((cursor_pos_usize + selected.len()) as i32);
                 }
-                Self::finalize_completion_after_selection(
-                    &intellisense_runtime_for_insert,
+                Self::sync_preferred_insert_position_from_editor(
+                    &preferred_insert_position_for_insert,
+                    &editor_for_insert,
+                    &buffer_for_insert,
                 );
+                Self::finalize_completion_after_selection(&intellisense_runtime_for_insert);
             });
         }
 
@@ -92,6 +98,7 @@ impl SqlEditorWidget {
         let replace_callback_for_handle = self.replace_callback.clone();
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
+        let preferred_insert_position_for_handle = self.preferred_insert_position.clone();
 
         editor.handle(move |ed, ev| {
             match ev {
@@ -115,25 +122,52 @@ impl SqlEditorWidget {
                         DndDropState::AwaitingPaste;
                     true
                 }
+                Event::Enter | Event::Move | Event::Drag | Event::Released => {
+                    let pos = ed.xy_to_position(
+                        fltk::app::event_x(),
+                        fltk::app::event_y(),
+                        PositionType::Cursor,
+                    );
+                    if pos >= 0 {
+                        Self::remember_preferred_insert_position(
+                            &preferred_insert_position_for_handle,
+                            &buffer_for_handle,
+                            pos,
+                        );
+                    } else {
+                        Self::sync_preferred_insert_position_from_editor(
+                            &preferred_insert_position_for_handle,
+                            ed,
+                            &buffer_for_handle,
+                        );
+                    }
+                    false
+                }
                 Event::Push => {
+                    let clicked_pos = ed.xy_to_position(
+                        fltk::app::event_x(),
+                        fltk::app::event_y(),
+                        PositionType::Cursor,
+                    );
+                    if clicked_pos >= 0 {
+                        Self::remember_preferred_insert_position(
+                            &preferred_insert_position_for_handle,
+                            &buffer_for_handle,
+                            clicked_pos,
+                        );
+                    }
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
                         || state.contains(fltk::enums::Shortcut::Command);
                     if ctrl_or_cmd && fltk::app::event_button() == 1 {
-                        let pos = ed.xy_to_position(
-                            fltk::app::event_x(),
-                            fltk::app::event_y(),
-                            PositionType::Cursor,
-                        );
+                        let pos = clicked_pos;
                         if pos >= 0 {
                             let (pos, _) = Self::cursor_position(&buffer_for_handle, pos);
-                            if let Some((_, start, end)) =
-                                Self::identifier_at_position(
-                                    &buffer_for_handle,
-                                    &text_shadow_for_handle,
-                                    pos,
-                                )
-                            {
+                            if let Some((_, start, end)) = Self::identifier_at_position(
+                                &buffer_for_handle,
+                                &text_shadow_for_handle,
+                                pos,
+                            ) {
                                 buffer_for_handle.select(start, end);
                                 ed.set_insert_position(end);
                             } else {
@@ -141,6 +175,11 @@ impl SqlEditorWidget {
                                 ed.set_insert_position(pos);
                             }
                             ed.show_insert_position();
+                            Self::sync_preferred_insert_position_from_editor(
+                                &preferred_insert_position_for_handle,
+                                ed,
+                                &buffer_for_handle,
+                            );
                             widget_for_shortcuts.quick_describe_at_cursor();
                             return true;
                         }
@@ -310,7 +349,6 @@ impl SqlEditorWidget {
                                     Self::finalize_completion_after_selection(
                                         &intellisense_runtime_for_handle,
                                     );
-
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
                                     *enter_keyup_suppression_for_handle
@@ -493,6 +531,11 @@ impl SqlEditorWidget {
                     if !ed.active() || (!ed.has_focus() && !popup_visible) {
                         return false;
                     }
+                    Self::sync_preferred_insert_position_from_editor(
+                        &preferred_insert_position_for_handle,
+                        ed,
+                        &buffer_for_handle,
+                    );
                     // KeyUp fires AFTER the character is inserted into the buffer.
                     // Filter/show intellisense here.
                     let key = fltk::app::event_key();
@@ -574,6 +617,11 @@ impl SqlEditorWidget {
                         if let NavigationKeyupState::RestoreCursor { anchor } = *nav_state {
                             ed.set_insert_position(anchor);
                             ed.show_insert_position();
+                            Self::sync_preferred_insert_position_from_editor(
+                                &preferred_insert_position_for_handle,
+                                ed,
+                                &buffer_for_handle,
+                            );
                             *nav_state = NavigationKeyupState::Idle;
                             return true;
                         }
@@ -701,12 +749,11 @@ impl SqlEditorWidget {
                         }
                     } else if let Some(ch) = typed_char {
                         if Self::should_force_full_analysis(ch) {
-                            let qualifier =
-                                Self::qualifier_before_word(
-                                    &buffer_for_handle,
-                                    &text_shadow_for_handle,
-                                    word_start,
-                                );
+                            let qualifier = Self::qualifier_before_word(
+                                &buffer_for_handle,
+                                &text_shadow_for_handle,
+                                word_start,
+                            );
                             if Self::should_auto_trigger_intellisense_for_forced_char(
                                 &word,
                                 qualifier.as_deref(),
@@ -994,6 +1041,4 @@ impl SqlEditorWidget {
         String::from_utf8(out)
             .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
     }
-
-
 }

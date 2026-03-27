@@ -4,7 +4,7 @@ use fltk::{
     enums::{FrameType, Shortcut},
     menu::{MenuBar, MenuFlag},
     prelude::*,
-    text::{TextBuffer, TextDisplay},
+    text::{TextBuffer, TextDisplay, WrapMode},
     window::Window,
 };
 
@@ -37,6 +37,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     display.set_text_color(theme::text_primary());
     display.set_text_font(configured_editor_profile().normal);
     display.set_text_size(configured_ui_font_size());
+    display.wrap_mode(WrapMode::AtBounds, 0);
 
     let mut buffer = TextBuffer::default();
     buffer.set_text(content);
@@ -68,6 +69,43 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
 
     // Explicitly destroy top-level dialog widgets to release native resources.
     Window::delete(dialog);
+}
+
+fn build_about_dialog_content() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let build_profile = if cfg!(debug_assertions) {
+        "Debug"
+    } else {
+        "Release"
+    };
+    let splash_status = if cfg!(feature = "no-splash") {
+        "Disabled"
+    } else {
+        "Enabled"
+    };
+    let platform = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    format!(
+        "SPACE Query\n\
+Version {version}\n\
+\n\
+Desktop Oracle SQL client built with Rust and FLTK.\n\
+\n\
+Highlights\n\
+- Multi-tab SQL editor with execution history and result/message tabs\n\
+- Oracle object browser, syntax highlighting, and IntelliSense\n\
+- Explain Plan, DBMS Output, and SQL*Plus-style script execution\n\
+- Saved connections, OS keyring password storage, and application log viewer\n\
+\n\
+Runtime\n\
+- Build: {build_profile}\n\
+- Platform: {platform}\n\
+- Splash screen: {splash_status}\n\
+\n\
+Notes\n\
+- Oracle Instant Client is required for database connectivity.\n\
+- See Help > Keyboard Shortcuts for editor and execution shortcuts."
+    )
 }
 
 impl MenuBarBuilder {
@@ -377,7 +415,8 @@ impl MenuBarBuilder {
 
         // Help menu
         menu.add("&Help/&About", Shortcut::None, MenuFlag::Normal, |_| {
-            show_info_dialog("About", "SPACE Query\n\nBuilt with Rust and FLTK", 420, 240);
+            let content = build_about_dialog_content();
+            show_info_dialog("About", &content, 640, 420);
         });
         menu.add(
             "&Help/&Keyboard Shortcuts",

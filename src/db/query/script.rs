@@ -1433,8 +1433,7 @@ impl QueryExecutor {
                     Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper);
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
                     && Self::auto_format_is_for_update_clause(&trimmed_upper);
-                let is_for_update_update_continuation = frame
-                    .pending_for_update_clause_update_line
+                let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)

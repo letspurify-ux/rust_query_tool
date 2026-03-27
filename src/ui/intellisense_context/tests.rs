@@ -1392,9 +1392,7 @@ fn phase_execute_immediate_using_is_bind_context() {
 
 #[test]
 fn phase_open_for_select_using_is_bind_context() {
-    let ctx = analyze(
-        "BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING |; END;",
-    );
+    let ctx = analyze("BEGIN OPEN c FOR SELECT empno FROM emp WHERE deptno = :1 USING |; END;");
     assert_eq!(ctx.phase, SqlPhase::UsingBindList);
     assert!(ctx.phase.is_bind_context());
     assert!(!ctx.phase.is_table_context());
@@ -6967,12 +6965,16 @@ CROSS APPLY JSON_TABLE(
     let body_tokens = token_range_slice(ctx.statement_tokens.as_ref(), jt.body_range);
     let columns = extract_table_function_columns(body_tokens);
     assert!(
-        columns.iter().any(|col| col.eq_ignore_ascii_case("item_id")),
+        columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case("item_id")),
         "expected item_id from JSON_TABLE COLUMNS clause, got {:?}",
         columns
     );
     assert!(
-        columns.iter().any(|col| col.eq_ignore_ascii_case("item_nm")),
+        columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case("item_nm")),
         "expected item_nm from JSON_TABLE COLUMNS clause, got {:?}",
         columns
     );
@@ -6984,10 +6986,10 @@ fn oracle_table_function_alias_is_collected() {
     let tables = resolve_qualifier_tables("t", &ctx.tables_in_scope);
     assert_eq!(tables, vec!["pkg_get_rows".to_string()]);
     assert!(
-        ctx.tables_in_scope.iter().any(
-            |table| table.name.eq_ignore_ascii_case("pkg_get_rows")
-                && table.alias.as_deref() == Some("t")
-        ),
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("pkg_get_rows")
+                && table.alias.as_deref() == Some("t")),
         "TABLE(...) alias should still be collected: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -7035,7 +7037,8 @@ fn full_dotted_qualifier_resolves_to_exact_relation_before_alias_suffix_match() 
 
 #[test]
 fn extract_select_list_columns_supports_three_part_identifier_projection() {
-    let tokens = tokenize("WITH q AS (SELECT hr.employees.employee_id FROM hr.employees) SELECT * FROM q");
+    let tokens =
+        tokenize("WITH q AS (SELECT hr.employees.employee_id FROM hr.employees) SELECT * FROM q");
     let ctes = parse_ctes(&tokens);
     let q = ctes
         .iter()
@@ -7052,8 +7055,9 @@ fn extract_select_list_columns_supports_three_part_identifier_projection() {
 
 #[test]
 fn extract_select_list_columns_supports_three_part_identifier_in_inline_view() {
-    let cols =
-        extract_select_list_columns(&tokenize("SELECT hr.employees.employee_id FROM hr.employees"));
+    let cols = extract_select_list_columns(&tokenize(
+        "SELECT hr.employees.employee_id FROM hr.employees",
+    ));
     assert!(
         cols.contains(&"employee_id".to_string()),
         "inline view projection should also keep terminal column name: {:?}",

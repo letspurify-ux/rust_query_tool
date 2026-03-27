@@ -139,6 +139,23 @@ fn store_mutex_bool(flag: &Arc<Mutex<bool>>, value: bool) {
     }
 }
 
+fn load_mutex_i32_option(slot: &Arc<Mutex<Option<i32>>>) -> Option<i32> {
+    match slot.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn store_mutex_i32_option(slot: &Arc<Mutex<Option<i32>>>, value: Option<i32>) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+        }
+    }
+}
+
 fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
     match query_running.lock() {
         Ok(mut guard) => {
@@ -328,6 +345,7 @@ pub struct SqlEditorWidget {
     applying_history_navigation: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
+    preferred_insert_position: Arc<Mutex<Option<i32>>>,
 }
 impl SqlEditorWidget {
     fn is_main_window_visible() -> bool {
@@ -417,6 +435,31 @@ impl SqlEditorWidget {
         let (_, cursor_pos) = Self::editor_cursor_position(&self.editor, &self.buffer);
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
         query_text::statement_at_cursor(&sql, cursor_pos)
+    }
+
+    fn remember_preferred_insert_position(
+        slot: &Arc<Mutex<Option<i32>>>,
+        buffer: &TextBuffer,
+        pos: i32,
+    ) {
+        let (pos, _) = Self::cursor_position(buffer, pos);
+        store_mutex_i32_option(slot, Some(pos));
+    }
+
+    fn sync_preferred_insert_position_from_editor(
+        slot: &Arc<Mutex<Option<i32>>>,
+        editor: &TextEditor,
+        buffer: &TextBuffer,
+    ) {
+        let (pos, _) = Self::editor_cursor_position(editor, buffer);
+        Self::remember_preferred_insert_position(slot, buffer, pos);
+    }
+
+    fn preferred_insert_position_for_external_insert(&self) -> i32 {
+        let fallback = self.editor.insert_position();
+        let candidate = load_mutex_i32_option(&self.preferred_insert_position).unwrap_or(fallback);
+        let (pos, _) = Self::cursor_position(&self.buffer, candidate);
+        pos
     }
 
     fn normalize_statement_for_single_execution(statement: &str) -> String {
@@ -588,6 +631,7 @@ impl SqlEditorWidget {
         let applying_history_navigation = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
+        let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
 
         let mut widget = Self {
             group,
@@ -619,6 +663,7 @@ impl SqlEditorWidget {
             applying_history_navigation,
             undo_redo_state,
             last_explain_plan,
+            preferred_insert_position,
         };
 
         widget.setup_intellisense();
@@ -1489,6 +1534,20 @@ impl SqlEditorWidget {
 
     pub fn get_editor(&self) -> TextEditor {
         self.editor.clone()
+    }
+
+    pub fn insert_text_at_preferred_position(&mut self, text: &str) {
+        let insert_pos = self.preferred_insert_position_for_external_insert();
+        let (_, insert_pos_usize) = Self::cursor_position(&self.buffer, insert_pos);
+        self.buffer.insert(insert_pos, text);
+        let new_pos = insert_pos_usize.saturating_add(text.len());
+        self.editor.set_insert_position(new_pos as i32);
+        self.editor.show_insert_position();
+        Self::remember_preferred_insert_position(
+            &self.preferred_insert_position,
+            &self.buffer,
+            new_pos as i32,
+        );
     }
 
     pub fn select_block_in_direction(&mut self, direction: i32) {

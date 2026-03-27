@@ -112,11 +112,17 @@ impl ParenFormatFrameKind {
     }
 
     fn opens_indented(self) -> bool {
-        matches!(self, Self::WrappedLayout | Self::ColumnList | Self::QueryLike)
+        matches!(
+            self,
+            Self::WrappedLayout | Self::ColumnList | Self::QueryLike
+        )
     }
 
     fn closes_indented(self) -> bool {
-        matches!(self, Self::WrappedLayout | Self::ColumnList | Self::QueryLike)
+        matches!(
+            self,
+            Self::WrappedLayout | Self::ColumnList | Self::QueryLike
+        )
     }
 
     fn counts_for_paren_extra(self) -> bool {
@@ -187,8 +193,10 @@ impl ParenFormatFrame {
         if self.pending_multiline_child_continuation {
             self.pending_multiline_child_continuation = false;
         }
-        self.post_multiline_child_tail_token_count =
-            self.post_multiline_child_tail_token_count.saturating_add(1).min(2);
+        self.post_multiline_child_tail_token_count = self
+            .post_multiline_child_tail_token_count
+            .saturating_add(1)
+            .min(2);
     }
 
     fn has_pending_multiline_child_continuation(self) -> bool {
@@ -712,8 +720,8 @@ impl WithCteFormatState {
             let _ = self.frames.pop();
         }
 
-        let starts_cte_definitions = upper == "WITH"
-            && !matches!(prev_word_upper, Some("START" | "ROW" | "ROWS"));
+        let starts_cte_definitions =
+            upper == "WITH" && !matches!(prev_word_upper, Some("START" | "ROW" | "ROWS"));
         if starts_cte_definitions {
             self.frames.push(WithCteFrame {
                 paren_depth: 0,
@@ -984,8 +992,7 @@ impl SqlEditorWidget {
         prev_word_upper: Option<&str>,
     ) -> bool {
         matches!(prev_word_upper, Some("OVER"))
-            || (matches!(current_clause, Some("WINDOW"))
-                && matches!(prev_word_upper, Some("AS")))
+            || (matches!(current_clause, Some("WINDOW")) && matches!(prev_word_upper, Some("AS")))
     }
 
     fn query_apply_flags(tokens: &[SqlToken]) -> Vec<bool> {
@@ -2684,7 +2691,10 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     } else if trigger_header_state.is_active()
-                        && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD" | "REFERENCING")
+                        && matches!(
+                            upper.as_str(),
+                            "BEFORE" | "AFTER" | "INSTEAD" | "REFERENCING"
+                        )
                     {
                         newline_with(
                             &mut out,
@@ -2716,9 +2726,9 @@ impl SqlEditorWidget {
                             trigger_header_state,
                             is_analytic_within_group,
                             !Self::fetch_into_has_multiple_targets(tokens, idx),
-                            construct.analytic_over_paren_depth.is_some_and(|depth| {
-                                paren_stack.len() >= depth
-                            }),
+                            construct
+                                .analytic_over_paren_depth
+                                .is_some_and(|depth| paren_stack.len() >= depth),
                         )
                     {
                         // Keep shallow FORALL bodies one level deeper, but do not
@@ -2826,9 +2836,7 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if trigger_header_state.is_active()
-                        && upper == "WHEN"
-                    {
+                    } else if trigger_header_state.is_active() && upper == "WHEN" {
                         // Trigger WHEN clause: align with other trigger header keywords
                         newline_with(
                             &mut out,
@@ -3046,8 +3054,9 @@ impl SqlEditorWidget {
                         let next_leads_to_join = next_word_is("JOIN")
                             || next_word_is("OUTER")
                             || next_word_is("APPLY")
-                            || next_word
-                                .is_some_and(|w| join_modifiers.iter().any(|m| w.eq_ignore_ascii_case(m)));
+                            || next_word.is_some_and(|w| {
+                                join_modifiers.iter().any(|m| w.eq_ignore_ascii_case(m))
+                            });
                         if next_leads_to_join {
                             if !join_modifier_active {
                                 newline_with(
@@ -3637,8 +3646,9 @@ impl SqlEditorWidget {
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
                         let paren_extra = Self::paren_extra_depth(&paren_stack);
-                        let in_column_list =
-                            paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                        let in_column_list = paren_stack
+                            .last()
+                            .is_some_and(|frame| frame.is_column_list());
                         let current_list_indent = active_list_indent(
                             indent_level,
                             open_cursor_state,
@@ -3726,8 +3736,9 @@ impl SqlEditorWidget {
                         if !out.ends_with('\n') {
                             out.push('\n');
                         }
-                        let in_column_list =
-                            paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                        let in_column_list = paren_stack
+                            .last()
+                            .is_some_and(|frame| frame.is_column_list());
                         if in_select_list
                             || in_set_clause
                             || active_list_layout
@@ -3756,8 +3767,9 @@ impl SqlEditorWidget {
                         at_line_start = true;
                         needs_space = false;
                         if keeps_next_line_continuation {
-                            let in_column_list =
-                                paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                            let in_column_list = paren_stack
+                                .last()
+                                .is_some_and(|frame| frame.is_column_list());
                             let continuation_indent = if in_select_list
                                 || in_set_clause
                                 || active_list_layout
@@ -3796,8 +3808,9 @@ impl SqlEditorWidget {
                                     indent: continuation_indent,
                                 };
                         } else {
-                            let in_column_list =
-                                paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                            let in_column_list = paren_stack
+                                .last()
+                                .is_some_and(|frame| frame.is_column_list());
                             if in_select_list
                                 || in_set_clause
                                 || active_list_layout
@@ -3831,8 +3844,9 @@ impl SqlEditorWidget {
                         );
                         if !keep_inline_alias_comment {
                             if keeps_next_line_continuation {
-                                let in_column_list =
-                                    paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                                let in_column_list = paren_stack
+                                    .last()
+                                    .is_some_and(|frame| frame.is_column_list());
                                 let continuation_indent = if in_select_list
                                     || in_set_clause
                                     || active_list_layout
@@ -3879,8 +3893,9 @@ impl SqlEditorWidget {
                                         indent: continuation_indent,
                                     };
                             } else {
-                                let in_column_list =
-                                    paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                                let in_column_list = paren_stack
+                                    .last()
+                                    .is_some_and(|frame| frame.is_column_list());
                                 let list_extra = if in_select_list
                                     || in_set_clause
                                     || active_list_layout
@@ -3940,8 +3955,9 @@ impl SqlEditorWidget {
                             }
                             trim_trailing_space(&mut out);
                             if out.ends_with('\n') || at_line_start {
-                                let in_column_list =
-                                    paren_stack.last().is_some_and(|frame| frame.is_column_list());
+                                let in_column_list = paren_stack
+                                    .last()
+                                    .is_some_and(|frame| frame.is_column_list());
                                 if line_indent == 0
                                     && (matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
                                         || select_list_layout_state.has_active_indent()
@@ -3966,7 +3982,9 @@ impl SqlEditorWidget {
                             out.push(',');
                             between_pending = false;
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
-                            if paren_stack.last().is_some_and(|frame| frame.is_column_list())
+                            if paren_stack
+                                .last()
+                                .is_some_and(|frame| frame.is_column_list())
                                 || is_with_cte_separator
                             {
                                 newline_with(
@@ -3991,9 +4009,8 @@ impl SqlEditorWidget {
                                     };
                                 }
                             } else {
-                                let follows_multiline_child_close = paren_stack
-                                    .last()
-                                    .is_some_and(|frame| {
+                                let follows_multiline_child_close =
+                                    paren_stack.last().is_some_and(|frame| {
                                         frame.has_pending_multiline_child_continuation()
                                     });
                                 let allows_compact_close_continuation_comma_break =
@@ -4008,45 +4025,46 @@ impl SqlEditorWidget {
                                     && !construct.grant_revoke_active
                                     && !trigger_header_state.is_active()
                                 {
-                                let comma_extra_indent =
-                                    if (matches!(current_clause.as_deref(), Some("SET"))
-                                        && construct.merge_active)
-                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                            && construct.cursor_sql_active)
+                                    let comma_extra_indent =
+                                        if (matches!(current_clause.as_deref(), Some("SET"))
+                                            && construct.merge_active)
+                                            || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                                && construct.cursor_sql_active)
+                                        {
+                                            0
+                                        } else {
+                                            1
+                                        };
+                                    if current_query_has_apply
+                                        && matches!(current_clause.as_deref(), Some("SELECT"))
                                     {
-                                        0
+                                        // The select list is already multiline after the first comma.
+                                        let select_list_indent =
+                                            base_indent(indent_level, open_cursor_state) + 1;
+                                        let hanging_indent_spaces = select_list_layout_state
+                                            .hanging_indent_spaces(&out, select_list_indent);
+                                        newline_with_spaces(
+                                            &mut out,
+                                            hanging_indent_spaces,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
+                                        select_list_layout_state =
+                                            SelectListLayoutState::Multiline {
+                                                indent: select_list_indent,
+                                                hanging_indent_spaces: Some(hanging_indent_spaces),
+                                            };
                                     } else {
-                                        1
-                                    };
-                                if current_query_has_apply
-                                    && matches!(current_clause.as_deref(), Some("SELECT"))
-                                {
-                                    // The select list is already multiline after the first comma.
-                                    let select_list_indent =
-                                        base_indent(indent_level, open_cursor_state) + 1;
-                                    let hanging_indent_spaces = select_list_layout_state
-                                        .hanging_indent_spaces(&out, select_list_indent);
-                                    newline_with_spaces(
-                                        &mut out,
-                                        hanging_indent_spaces,
-                                        &mut at_line_start,
-                                        &mut needs_space,
-                                        &mut line_indent,
-                                    );
-                                    select_list_layout_state = SelectListLayoutState::Multiline {
-                                        indent: select_list_indent,
-                                        hanging_indent_spaces: Some(hanging_indent_spaces),
-                                    };
-                                } else {
-                                    newline_with(
-                                        &mut out,
-                                        base_indent(indent_level, open_cursor_state),
-                                        comma_extra_indent,
-                                        &mut at_line_start,
-                                        &mut needs_space,
-                                        &mut line_indent,
-                                    );
-                                }
+                                        newline_with(
+                                            &mut out,
+                                            base_indent(indent_level, open_cursor_state),
+                                            comma_extra_indent,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
+                                    }
                                 } else {
                                     if !next_is_newline_attached_comment {
                                         out.push(' ');
@@ -4249,19 +4267,15 @@ impl SqlEditorWidget {
                         ")" => {
                             with_cte_state.on_close_paren();
                             trim_trailing_space(&mut out);
-                            let paren_frame_kind =
-                                paren_stack
-                                    .pop()
-                                    .unwrap_or(ParenFormatFrame::new(
-                                        ParenFormatFrameKind::Compact,
-                                        0,
-                                    ));
+                            let paren_frame_kind = paren_stack
+                                .pop()
+                                .unwrap_or(ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0));
                             let restore_clause = paren_clause_restore_stack.pop().unwrap_or(None);
-                            let close_case_paren_on_newline =
-                                !paren_frame_kind.closes_indented() && out.trim_end().ends_with("END");
-                            let close_compact_continuation_on_newline =
-                                !paren_frame_kind.closes_indented()
-                                    && paren_frame_kind.has_simple_multiline_child_tail();
+                            let close_case_paren_on_newline = !paren_frame_kind.closes_indented()
+                                && out.trim_end().ends_with("END");
+                            let close_compact_continuation_on_newline = !paren_frame_kind
+                                .closes_indented()
+                                && paren_frame_kind.has_simple_multiline_child_tail();
                             if paren_frame_kind.suppresses_comma_breaks() {
                                 suppress_comma_break_depth =
                                     suppress_comma_break_depth.saturating_sub(1);
@@ -6958,8 +6972,7 @@ impl SqlEditorWidget {
             None => true,
             Some(SqlToken::Symbol(symbol)) => matches!(
                 symbol.as_str(),
-                "("
-                    | ","
+                "(" | ","
                     | "="
                     | ":="
                     | "+"
@@ -6976,7 +6989,9 @@ impl SqlEditorWidget {
                     | "!="
                     | "=>"
             ),
-            Some(SqlToken::Word(word)) => sql_text::is_oracle_sql_keyword(&word.to_ascii_uppercase()),
+            Some(SqlToken::Word(word)) => {
+                sql_text::is_oracle_sql_keyword(&word.to_ascii_uppercase())
+            }
             _ => false,
         }
     }
@@ -7080,8 +7095,11 @@ impl SqlEditorWidget {
         let previous_word = significant_words
             .get(significant_words.len().saturating_sub(2))
             .copied();
-        crate::sql_text::format_inline_comment_header_continuation_kind(previous_word, last_upper.as_str())
-            .is_some()
+        crate::sql_text::format_inline_comment_header_continuation_kind(
+            previous_word,
+            last_upper.as_str(),
+        )
+        .is_some()
     }
 
     fn comment_header_continuation_kind(
@@ -7113,7 +7131,10 @@ impl SqlEditorWidget {
         let previous_word = significant_words
             .get(significant_words.len().saturating_sub(2))
             .copied();
-        crate::sql_text::format_inline_comment_header_continuation_kind(previous_word, last_upper.as_str())
+        crate::sql_text::format_inline_comment_header_continuation_kind(
+            previous_word,
+            last_upper.as_str(),
+        )
     }
 
     #[cfg(test)]
@@ -16320,7 +16341,10 @@ join b on a.id = b.id and a.x = b.x
         );
         // Idempotent
         let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted2, "NATURAL LEFT JOIN formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted2,
+            "NATURAL LEFT JOIN formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -16400,7 +16424,10 @@ join b on a.id = b.id and a.x = b.x
         );
         // Idempotent
         let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted2, "Trigger REFERENCING/WHEN formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted2,
+            "Trigger REFERENCING/WHEN formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -16432,7 +16459,10 @@ join b on a.id = b.id and a.x = b.x
         );
         // Idempotent
         let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted2, "MATCH_RECOGNIZE ONE ROW PER MATCH formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted2,
+            "MATCH_RECOGNIZE ONE ROW PER MATCH formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -16460,7 +16490,10 @@ FROM emp;"#;
         assert_eq!(formatted, expected);
         // Idempotent
         let formatted2 = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted2, "OVER clause formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted2,
+            "OVER clause formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -16675,7 +16708,8 @@ MATCH_RECOGNIZE (
 
     #[test]
     fn format_sql_join_using_gets_condition_break() {
-        let source = "SELECT e.empno, d.dname FROM emp e JOIN dept d USING (deptno) WHERE e.empno > 0;";
+        let source =
+            "SELECT e.empno, d.dname FROM emp e JOIN dept d USING (deptno) WHERE e.empno > 0;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted.contains("\n    USING (deptno)") || formatted.contains("\nUSING (deptno)"),
@@ -16715,8 +16749,7 @@ MATCH_RECOGNIZE (
         let lines: Vec<&str> = formatted.lines().collect();
 
         let from_idx = find_line_starting_with(&lines, "FROM dept d,").expect("outer FROM line");
-        let lateral_idx =
-            find_line_starting_with(&lines, "LATERAL (").expect("LATERAL owner line");
+        let lateral_idx = find_line_starting_with(&lines, "LATERAL (").expect("LATERAL owner line");
         let select_idx =
             find_line_starting_with(&lines, "SELECT MAX").expect("LATERAL inner SELECT line");
         let inner_from_idx =
@@ -16812,7 +16845,9 @@ MATCH_RECOGNIZE (
 
         assert!(
             lines[offset_idx].contains("-- skip first page")
-                || lines.iter().any(|line| line.trim_start().starts_with("-- skip first page")),
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- skip first page")),
             "OFFSET comment should be preserved in formatted output, got:\n{}",
             formatted
         );
@@ -16823,7 +16858,9 @@ MATCH_RECOGNIZE (
         );
         assert!(
             lines[fetch_idx].contains("-- page size")
-                || lines.iter().any(|line| line.trim_start().starts_with("-- page size")),
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- page size")),
             "FETCH comment should be preserved in formatted output, got:\n{}",
             formatted
         );
@@ -16845,7 +16882,9 @@ MATCH_RECOGNIZE (
 
         assert!(
             lines[limit_idx].contains("-- page size")
-                || lines.iter().any(|line| line.trim_start().starts_with("-- page size")),
+                || lines
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("-- page size")),
             "LIMIT comment should be preserved in formatted output, got:\n{}",
             formatted
         );
@@ -16888,11 +16927,9 @@ MATCH_RECOGNIZE (
 
         let from_idx = find_line_starting_with(&lines, "FROM employees VERSIONS BETWEEN TIMESTAMP")
             .expect("VERSIONS BETWEEN owner line");
-        let boundary_idx = find_line_starting_with(
-            &lines,
-            "SYSTIMESTAMP - INTERVAL '7' DAY AND SYSTIMESTAMP",
-        )
-        .expect("VERSIONS BETWEEN boundary line");
+        let boundary_idx =
+            find_line_starting_with(&lines, "SYSTIMESTAMP - INTERVAL '7' DAY AND SYSTIMESTAMP")
+                .expect("VERSIONS BETWEEN boundary line");
         let where_idx = find_line_starting_with(&lines, "WHERE employee_id = 100;")
             .expect("WHERE line after VERSIONS BETWEEN");
 
@@ -16932,7 +16969,8 @@ MATCH_RECOGNIZE (
             formatted
         );
         assert!(
-            !formatted.contains("\nINTO err$_target_emp") && !formatted.contains("\nLIMIT UNLIMITED"),
+            !formatted.contains("\nINTO err$_target_emp")
+                && !formatted.contains("\nLIMIT UNLIMITED"),
             "LOG ERRORS INTO / REJECT LIMIT must not be split by clause keywords, got:\n{}",
             formatted
         );
@@ -16962,8 +17000,8 @@ MATCH_RECOGNIZE (
 
         let measures_idx =
             find_line_starting_with(&lines, "MEASURES").expect("MATCH_RECOGNIZE MEASURES line");
-        let expr_idx = find_line_starting_with(&lines, "FIRST")
-            .expect("MATCH_RECOGNIZE MEASURES body line");
+        let expr_idx =
+            find_line_starting_with(&lines, "FIRST").expect("MATCH_RECOGNIZE MEASURES body line");
 
         assert!(
             lines[measures_idx].contains("-- derived columns")
@@ -16986,7 +17024,8 @@ MATCH_RECOGNIZE (
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
 
-        let measures_idx = find_line_starting_with(&lines, "MEASURES").expect("MODEL MEASURES line");
+        let measures_idx =
+            find_line_starting_with(&lines, "MEASURES").expect("MODEL MEASURES line");
         let measures_body_idx =
             find_line_starting_with(&lines, "(amt)").expect("MODEL MEASURES body line");
 
@@ -17043,7 +17082,8 @@ MATCH_RECOGNIZE (
             formatted
         );
         assert!(
-            !formatted.contains("IN\n        VALUES OF") && !formatted.contains("IN\n    VALUES OF"),
+            !formatted.contains("IN\n        VALUES OF")
+                && !formatted.contains("IN\n    VALUES OF"),
             "VALUES OF must not be split out of the FORALL header, got:\n{}",
             formatted
         );
@@ -17137,7 +17177,8 @@ MATCH_RECOGNIZE (
 
     #[test]
     fn format_sql_with_package_declaration_stays_structured() {
-        let source = "WITH PACKAGE pkg_demo AS FUNCTION f RETURN NUMBER; END pkg_demo; SELECT 1 FROM dual;";
+        let source =
+            "WITH PACKAGE pkg_demo AS FUNCTION f RETURN NUMBER; END pkg_demo; SELECT 1 FROM dual;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted.contains("WITH\n    PACKAGE pkg_demo AS"),
@@ -17182,7 +17223,10 @@ MATCH_RECOGNIZE (
         // After the CTE, the UPDATE SET commas should indent under SET, not at root depth
         let lines: Vec<&str> = formatted.lines().collect();
         let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
-        let set_line = lines.iter().find(|l| l.trim_start().starts_with("SET")).unwrap();
+        let set_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("SET"))
+            .unwrap();
         let c2_line = lines
             .iter()
             .find(|l| l.trim_start().starts_with("t.c2"))
@@ -17330,8 +17374,14 @@ MATCH_RECOGNIZE (
         );
 
         // Both APPLY keywords should be at the same indent level (base join level)
-        let cross_idx = lines.iter().position(|l| l.trim_start().starts_with("CROSS APPLY")).unwrap();
-        let outer_idx = lines.iter().position(|l| l.trim_start().starts_with("OUTER APPLY")).unwrap();
+        let cross_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("CROSS APPLY"))
+            .unwrap();
+        let outer_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("OUTER APPLY"))
+            .unwrap();
         assert_eq!(
             leading_spaces(lines[cross_idx]),
             leading_spaces(lines[outer_idx]),
@@ -17436,8 +17486,12 @@ MATCH_RECOGNIZE (
         let lines: Vec<&str> = formatted.lines().collect();
 
         // SEARCH and CYCLE should each get their own line
-        let search_idx = lines.iter().position(|l| l.trim_start().starts_with("SEARCH"));
-        let cycle_idx = lines.iter().position(|l| l.trim_start().starts_with("CYCLE"));
+        let search_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("SEARCH"));
+        let cycle_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("CYCLE"));
 
         assert!(
             search_idx.is_some(),
@@ -17463,7 +17517,9 @@ MATCH_RECOGNIZE (
 
         // Final SELECT should be at top level (WITH depth 0)
         // The SELECT may have items on next lines, so find the SELECT line after CYCLE
-        let select_idx = lines.iter().enumerate()
+        let select_idx = lines
+            .iter()
+            .enumerate()
             .skip(cycle_idx + 1)
             .find(|(_, l)| l.trim_start().starts_with("SELECT"))
             .map(|(i, _)| i);
@@ -17473,7 +17529,8 @@ MATCH_RECOGNIZE (
             formatted
         );
         assert_eq!(
-            leading_spaces(lines[select_idx.unwrap()]), 0,
+            leading_spaces(lines[select_idx.unwrap()]),
+            0,
             "Final SELECT after SEARCH/CYCLE should be at indent 0, got:\n{}",
             formatted
         );
@@ -17495,11 +17552,26 @@ MATCH_RECOGNIZE (
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
 
-        let model_idx = lines.iter().position(|l| l.trim_start().starts_with("MODEL")).unwrap();
-        let partition_idx = lines.iter().position(|l| l.trim_start().starts_with("PARTITION BY")).unwrap();
-        let dimension_idx = lines.iter().position(|l| l.trim_start().starts_with("DIMENSION BY")).unwrap();
-        let measures_idx = lines.iter().position(|l| l.trim_start().starts_with("MEASURES")).unwrap();
-        let rules_idx = lines.iter().position(|l| l.trim_start().starts_with("RULES")).unwrap();
+        let model_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("MODEL"))
+            .unwrap();
+        let partition_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("PARTITION BY"))
+            .unwrap();
+        let dimension_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("DIMENSION BY"))
+            .unwrap();
+        let measures_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("MEASURES"))
+            .unwrap();
+        let rules_idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("RULES"))
+            .unwrap();
 
         // All subclauses should share the same indent level
         assert_eq!(
@@ -17589,7 +17661,8 @@ MATCH_RECOGNIZE (
             formatted
         );
         assert_eq!(
-            leading_spaces(lines[select_idx.unwrap()]), 0,
+            leading_spaces(lines[select_idx.unwrap()]),
+            0,
             "Final SELECT after WITH FUNCTION should be at indent 0, got:\n{}",
             formatted
         );
@@ -17722,7 +17795,10 @@ MATCH_RECOGNIZE (
         let lines: Vec<&str> = formatted.lines().collect();
         let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let find_line = |prefix: &str| -> Option<&str> {
-            lines.iter().copied().find(|l| l.trim_start().starts_with(prefix))
+            lines
+                .iter()
+                .copied()
+                .find(|l| l.trim_start().starts_with(prefix))
         };
 
         // USING should be present and at base depth (same as MERGE)
@@ -17780,10 +17856,17 @@ MATCH_RECOGNIZE (
         let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
         // All JOIN keywords should be at the same indent
-        let join_lines: Vec<&&str> = lines.iter().filter(|l| {
-            let t = l.trim_start();
-            t.starts_with("JOIN ") || t.starts_with("LEFT OUTER JOIN ") || t.starts_with("LEFT JOIN ") || t.starts_with("RIGHT JOIN ") || t.starts_with("INNER JOIN ")
-        }).collect();
+        let join_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("JOIN ")
+                    || t.starts_with("LEFT OUTER JOIN ")
+                    || t.starts_with("LEFT JOIN ")
+                    || t.starts_with("RIGHT JOIN ")
+                    || t.starts_with("INNER JOIN ")
+            })
+            .collect();
 
         assert!(
             join_lines.len() >= 3,
@@ -17846,7 +17929,10 @@ MATCH_RECOGNIZE (
         let lines: Vec<&str> = formatted.lines().collect();
         let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let find_line = |prefix: &str| -> Option<&str> {
-            lines.iter().copied().find(|l| l.trim_start().starts_with(prefix))
+            lines
+                .iter()
+                .copied()
+                .find(|l| l.trim_start().starts_with(prefix))
         };
 
         // MODEL subclauses should each be on their own line
@@ -17869,9 +17955,21 @@ MATCH_RECOGNIZE (
         let d = leading(dimension_line.unwrap());
         let m = leading(measures_line.unwrap());
         let r = leading(rules_line.unwrap());
-        assert_eq!(p, d, "PARTITION BY and DIMENSION BY should be at same depth, got:\n{}", formatted);
-        assert_eq!(d, m, "DIMENSION BY and MEASURES should be at same depth, got:\n{}", formatted);
-        assert_eq!(m, r, "MEASURES and RULES should be at same depth, got:\n{}", formatted);
+        assert_eq!(
+            p, d,
+            "PARTITION BY and DIMENSION BY should be at same depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            d, m,
+            "DIMENSION BY and MEASURES should be at same depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            m, r,
+            "MEASURES and RULES should be at same depth, got:\n{}",
+            formatted
+        );
 
         // Idempotence
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
@@ -17894,12 +17992,16 @@ MATCH_RECOGNIZE (
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "FOR UPDATE SKIP LOCKED formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "FOR UPDATE SKIP LOCKED formatting should be idempotent"
+        );
     }
 
     #[test]
     fn format_sql_basic_for_update_of_nowait_stays_on_one_line() {
-        let source = "select e.empno, e.ename from emp e where e.deptno = 10 for update of e.sal nowait;";
+        let source =
+            "select e.empno, e.ename from emp e where e.deptno = 10 for update of e.sal nowait;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted.contains("FOR UPDATE OF e.sal NOWAIT"),
@@ -17918,7 +18020,10 @@ MATCH_RECOGNIZE (
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "MERGE USING formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "MERGE USING formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -17936,7 +18041,10 @@ MATCH_RECOGNIZE (
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "SEARCH/CYCLE formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "SEARCH/CYCLE formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -17944,11 +18052,26 @@ MATCH_RECOGNIZE (
         let source = "select * from sales match_recognize (partition by customer_id order by sale_dt measures a.sale_dt as start_dt, last(b.sale_dt) as end_dt pattern (a b+) define b as b.amount > prev(b.amount));";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
-        assert!(lines.iter().any(|l| l.trim().starts_with("MEASURES")), "MEASURES should start on its own line, got:\n{}", formatted);
-        assert!(lines.iter().any(|l| l.trim().starts_with("PATTERN")), "PATTERN should start on its own line, got:\n{}", formatted);
-        assert!(lines.iter().any(|l| l.trim().starts_with("DEFINE")), "DEFINE should start on its own line, got:\n{}", formatted);
+        assert!(
+            lines.iter().any(|l| l.trim().starts_with("MEASURES")),
+            "MEASURES should start on its own line, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines.iter().any(|l| l.trim().starts_with("PATTERN")),
+            "PATTERN should start on its own line, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines.iter().any(|l| l.trim().starts_with("DEFINE")),
+            "DEFINE should start on its own line, got:\n{}",
+            formatted
+        );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "MATCH_RECOGNIZE formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "MATCH_RECOGNIZE formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -17957,7 +18080,11 @@ MATCH_RECOGNIZE (
         let formatted = SqlEditorWidget::format_sql_basic(source);
         // PIVOT should be separated from FROM on its own line
         let lines: Vec<&str> = formatted.lines().collect();
-        assert!(lines.iter().any(|l| l.trim().starts_with("PIVOT")), "PIVOT should start on its own line, got:\n{}", formatted);
+        assert!(
+            lines.iter().any(|l| l.trim().starts_with("PIVOT")),
+            "PIVOT should start on its own line, got:\n{}",
+            formatted
+        );
         // FOR inside PIVOT should NOT be treated as PL/SQL loop
         assert!(
             formatted.contains("FOR quarter"),
@@ -17965,7 +18092,10 @@ MATCH_RECOGNIZE (
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "PIVOT formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "PIVOT formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -17973,9 +18103,16 @@ MATCH_RECOGNIZE (
         let source = "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
-        assert!(lines.iter().any(|l| l.trim().starts_with("UNPIVOT")), "UNPIVOT should start on its own line, got:\n{}", formatted);
+        assert!(
+            lines.iter().any(|l| l.trim().starts_with("UNPIVOT")),
+            "UNPIVOT should start on its own line, got:\n{}",
+            formatted
+        );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "UNPIVOT formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "UNPIVOT formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -17989,7 +18126,10 @@ MATCH_RECOGNIZE (
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(formatted, formatted_again, "CTE PIVOT formatting should be idempotent");
+        assert_eq!(
+            formatted, formatted_again,
+            "CTE PIVOT formatting should be idempotent"
+        );
     }
 
     #[test]
@@ -18136,5 +18276,4 @@ MATCH_RECOGNIZE (
         assert_eq!(formatted, expected);
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), expected);
     }
-
 }

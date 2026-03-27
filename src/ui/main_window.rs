@@ -3746,10 +3746,7 @@ impl MainWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match action {
                     SqlAction::Insert(text) => {
-                        let mut editor = s.sql_editor.get_editor();
-                        let insert_pos = editor.insert_position();
-                        s.sql_buffer.insert(insert_pos, &text);
-                        editor.set_insert_position(insert_pos + text.len() as i32);
+                        s.sql_editor.insert_text_at_preferred_position(&text);
                     }
                     SqlAction::OpenInNewTab(sql) => {
                         if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {

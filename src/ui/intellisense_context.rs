@@ -566,7 +566,8 @@ fn is_log_errors_table_target(tokens: &[SqlToken], table_idx: usize) -> bool {
         return false;
     }
 
-    prev_word_upper(tokens, second_prev_idx).is_some_and(|(third_prev_word, _)| third_prev_word == "LOG")
+    prev_word_upper(tokens, second_prev_idx)
+        .is_some_and(|(third_prev_word, _)| third_prev_word == "LOG")
 }
 
 fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
@@ -760,7 +761,10 @@ fn nearest_join_using_tables(depth_frames: &[ParserDepthFrame], depth: usize) ->
         .unwrap_or_default()
 }
 
-fn nearest_excluded_target_table(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<String> {
+fn nearest_excluded_target_table(
+    depth_frames: &[ParserDepthFrame],
+    depth: usize,
+) -> Option<String> {
     depth_frames[..=depth.min(depth_frames.len().saturating_sub(1))]
         .iter()
         .rev()
@@ -1059,11 +1063,7 @@ fn transition_on_fetch_keyword(
         return None;
     }
 
-    Some((
-        SqlPhase::Initial,
-        StatementKind::Fetch,
-        Expectation::None,
-    ))
+    Some((SqlPhase::Initial, StatementKind::Fetch, Expectation::None))
 }
 
 fn transition_on_into_keyword(
@@ -1075,7 +1075,10 @@ fn transition_on_into_keyword(
 ) -> Option<(SqlPhase, Expectation)> {
     let is_log_errors_target = matches!(
         current_statement_kind,
-        StatementKind::Insert | StatementKind::Update | StatementKind::Delete | StatementKind::Merge
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
     ) && is_log_errors_into_clause(tokens, idx);
 
     if is_log_errors_target {
@@ -1106,17 +1109,13 @@ fn transition_on_into_keyword(
         SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
     );
     let should_expect_merge_target = matches!(current_phase, SqlPhase::MergeTarget);
-    let should_expect_set_clause_target =
-        matches!(current_phase, SqlPhase::SetClause)
-            && matches!(
-                current_statement_kind,
-                StatementKind::Insert | StatementKind::Update | StatementKind::Delete
-            );
+    let should_expect_set_clause_target = matches!(current_phase, SqlPhase::SetClause)
+        && matches!(
+            current_statement_kind,
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+        );
 
-    if should_expect_table_target
-        || should_expect_merge_target
-        || should_expect_set_clause_target
-    {
+    if should_expect_table_target || should_expect_merge_target || should_expect_set_clause_target {
         return Some((SqlPhase::IntoClause, Expectation::Table));
     }
 
@@ -1136,7 +1135,10 @@ fn transition_on_using_keyword(
         return Some((SqlPhase::UsingBindList, Expectation::BindValue));
     }
 
-    if matches!(current_statement_kind, StatementKind::Merge | StatementKind::Delete) {
+    if matches!(
+        current_statement_kind,
+        StatementKind::Merge | StatementKind::Delete
+    ) {
         return Some((SqlPhase::FromClause, Expectation::Table));
     }
 
@@ -1277,12 +1279,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 let inherited_phase = if matches!(cte_state, CteState::AfterName) {
                     SqlPhase::CteColumnList
-                } else if let Some(target_column_list_phase) = phase_on_open_paren(
-                    tokens,
-                    idx,
-                    parent_phase,
-                    parent_statement_kind,
-                ) {
+                } else if let Some(target_column_list_phase) =
+                    phase_on_open_paren(tokens, idx, parent_phase, parent_statement_kind)
+                {
                     target_column_list_phase
                 } else if parent_phase.is_column_context()
                     || matches!(
@@ -1307,8 +1306,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     frame.dml_set_active = false;
                     frame.recent_relation_tables = parent_recent_relation_tables;
                     frame.join_using_tables = parent_join_using_tables;
-                    frame.postgres_conflict_update_active =
-                        parent_postgres_conflict_update_active;
+                    frame.postgres_conflict_update_active = parent_postgres_conflict_update_active;
                     // Record the function name that preceded this '(' so we can
                     // distinguish function-internal FROM from SQL FROM clauses.
                     frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
@@ -1811,13 +1809,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.open_cursor_active)
                             .unwrap_or(false);
-                        if let Some((phase, expectation)) =
-                            transition_on_using_keyword(
-                                current_phase,
-                                current_statement_kind,
-                                open_cursor_active,
-                            )
-                        {
+                        if let Some((phase, expectation)) = transition_on_using_keyword(
+                            current_phase,
+                            current_statement_kind,
+                            open_cursor_active,
+                        ) {
                             depth_frames[depth].phase = phase;
                             if matches!(phase, SqlPhase::JoinCondition)
                                 && matches!(current_phase, SqlPhase::FromClause)
@@ -2066,8 +2062,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // Recursive CTE SEARCH/CYCLE clauses use `... SET <generated_col>`
                             // where SET introduces a generated output column name, not a DML
                             // target list or expression context.
-                            depth_frames[depth].phase =
-                                SqlPhase::RecursiveCteGeneratedColumnName;
+                            depth_frames[depth].phase = SqlPhase::RecursiveCteGeneratedColumnName;
                             depth_frames[depth].dml_set_active = false;
                             depth_frames[depth].postgres_conflict_update_active = false;
                         } else {
@@ -2077,7 +2072,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 .unwrap_or(StatementKind::Unknown);
                             if matches!(
                                 current_statement_kind,
-                                StatementKind::Insert | StatementKind::Update | StatementKind::Merge
+                                StatementKind::Insert
+                                    | StatementKind::Update
+                                    | StatementKind::Merge
                             ) {
                                 depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
                                 depth_frames[depth].dml_set_active = true;
@@ -2359,17 +2356,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     .get(depth)
                                     .map(|frame| frame.statement_kind)
                                     .unwrap_or(StatementKind::Unknown);
-                                let should_record_target_table = matches!(
-                                    current_phase,
-                                    SqlPhase::UpdateTarget
-                                        | SqlPhase::DeleteTarget
-                                        | SqlPhase::MergeTarget
-                                ) || (matches!(current_phase, SqlPhase::IntoClause)
-                                    && matches!(
-                                        current_statement_kind,
-                                        StatementKind::Insert | StatementKind::Merge
-                                    )
-                                    && !is_log_errors_table_target(tokens, idx));
+                                let should_record_target_table =
+                                    matches!(
+                                        current_phase,
+                                        SqlPhase::UpdateTarget
+                                            | SqlPhase::DeleteTarget
+                                            | SqlPhase::MergeTarget
+                                    ) || (matches!(current_phase, SqlPhase::IntoClause)
+                                        && matches!(
+                                            current_statement_kind,
+                                            StatementKind::Insert | StatementKind::Merge
+                                        )
+                                        && !is_log_errors_table_target(tokens, idx));
                                 if should_record_target_table {
                                     depth_frames[depth].current_target_table =
                                         Some(table_name.clone());
@@ -2497,8 +2495,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             &visible_parent,
         ));
     }
-    let (phase, cursor_query_depth, cursor_visible_scope_chain, focused_tables, excluded_target_table) =
-        cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize], Vec::new(), None));
+    let (
+        phase,
+        cursor_query_depth,
+        cursor_visible_scope_chain,
+        focused_tables,
+        excluded_target_table,
+    ) = cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize], Vec::new(), None));
 
     CursorScanResult {
         phase,
@@ -3820,8 +3823,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
         || matches!(word, "SEARCH" | "CYCLE")
         || matches!(
             word,
-            "ON"
-                | "SELECT"
+            "ON" | "SELECT"
                 | "FROM"
                 | "INTO"
                 | "IN"
