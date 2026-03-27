@@ -94,6 +94,7 @@ Desktop Oracle SQL client built with Rust and FLTK.\n\
 Highlights\n\
 - Multi-tab SQL editor with execution history and result/message tabs\n\
 - Oracle object browser, syntax highlighting, and IntelliSense\n\
+- Automatic SQL formatting for Oracle SQL and PL/SQL scripts\n\
 - Explain Plan, DBMS Output, and SQL*Plus-style script execution\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
 \n\
