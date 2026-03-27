@@ -15,6 +15,7 @@ use std::thread;
 
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
+use crate::ui::syntax_highlight::{encode_fltk_style_bytes, set_text_buffer_raw_bytes};
 use crate::ui::theme;
 use crate::ui::{configured_editor_profile, configured_ui_font_size};
 use crate::utils::config::{QueryHistory, QueryHistoryEntry};
@@ -238,6 +239,18 @@ fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
         line_number = line_number.saturating_add(1);
     }
     styles
+}
+
+fn set_preview_style_buffer(
+    style_buffer: &mut TextBuffer,
+    sql: &str,
+    logical_styles: &str,
+) -> bool {
+    let Some(encoded) = encode_fltk_style_bytes(sql, logical_styles) else {
+        return false;
+    };
+    set_text_buffer_raw_bytes(style_buffer, &encoded);
+    true
 }
 
 fn matches_history_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
@@ -585,7 +598,13 @@ impl QueryHistoryDialog {
                         if let Some(entry) = entry_index.and_then(|idx| queries.get(idx)) {
                             preview_buffer.set_text(&entry.sql);
                             let styles = build_preview_styles(&entry.sql, entry.error_line);
-                            preview_style_buffer.set_text(&styles);
+                            if !set_preview_style_buffer(
+                                &mut preview_style_buffer,
+                                &entry.sql,
+                                &styles,
+                            ) {
+                                set_text_buffer_raw_bytes(&mut preview_style_buffer, &[]);
+                            }
                             if entry.success {
                                 error_buffer.set_text("");
                                 error_display.hide();
@@ -614,7 +633,7 @@ impl QueryHistoryDialog {
                             failed_only_check.value(),
                         );
                         preview_buffer.set_text("");
-                        preview_style_buffer.set_text("");
+                        set_text_buffer_raw_bytes(&mut preview_style_buffer, &[]);
                         error_buffer.set_text("");
                         error_display.hide();
                         error_label.hide();
@@ -673,7 +692,7 @@ impl QueryHistoryDialog {
                                         failed_only_check.value(),
                                     );
                                     preview_buffer.set_text("");
-                                    preview_style_buffer.set_text("");
+                                    set_text_buffer_raw_bytes(&mut preview_style_buffer, &[]);
                                     error_buffer.set_text("");
                                     error_display.hide();
                                     error_label.hide();
@@ -905,9 +924,11 @@ fn populate_history_browser(
 #[cfg(test)]
 mod query_history_tests {
     use super::{
-        contains_lower, history_entry_matches_filter, materialize_history_entry, parse_error_line,
-        truncate_sql, PendingHistoryEntry, QueryHistoryEntry,
+        build_preview_styles, contains_lower, history_entry_matches_filter,
+        materialize_history_entry, parse_error_line, truncate_sql, PendingHistoryEntry,
+        QueryHistoryEntry,
     };
+    use crate::ui::syntax_highlight::encode_fltk_style_bytes;
 
     #[test]
     fn truncate_sql_preserves_original_whitespace() {
@@ -947,6 +968,22 @@ ORA-06512: at line 27";
         let message = "client command line 8 received
 server location at line 12";
         assert_eq!(parse_error_line(message), Some(12));
+    }
+
+    #[test]
+    fn preview_style_encoding_preserves_multibyte_byte_length() {
+        let sql = "SELECT '한글'\nFROM dual";
+        let logical_styles = build_preview_styles(sql, Some(1));
+        let encoded = encode_fltk_style_bytes(sql, &logical_styles).unwrap_or_default();
+
+        assert_eq!(logical_styles.len(), sql.len());
+        assert_eq!(encoded.len(), sql.len());
+        assert_eq!(
+            encoded.get(8).copied(),
+            logical_styles.as_bytes().get(8).copied()
+        );
+        assert_eq!(encoded.get(9).copied(), Some(0));
+        assert_eq!(encoded.get(10).copied(), Some(0));
     }
 
     #[test]

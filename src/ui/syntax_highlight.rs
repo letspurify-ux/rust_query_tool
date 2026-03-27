@@ -1,4 +1,7 @@
-use fltk::{enums::Color, text::StyleTableEntry};
+use fltk::{
+    enums::Color,
+    text::{StyleTableEntry, TextBuffer},
+};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -1947,6 +1950,61 @@ fn skip_trivia_and_comments(bytes: &[u8], mut idx: usize) -> usize {
     idx
 }
 
+pub(crate) fn encode_fltk_style_bytes(text: &str, logical_styles: &str) -> Option<Vec<u8>> {
+    if text.len() != logical_styles.len() {
+        return None;
+    }
+
+    let logical_bytes = logical_styles.as_bytes();
+    let mut encoded = Vec::with_capacity(text.len());
+    for (start, ch) in text.char_indices() {
+        let style = logical_bytes.get(start).copied()?;
+        encoded.push(style);
+        let continuation_len = ch.len_utf8().saturating_sub(1);
+        encoded.extend(std::iter::repeat_n(0, continuation_len));
+    }
+    Some(encoded)
+}
+
+pub(crate) fn encode_repeated_fltk_style_bytes(text: &str, style: char) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(text.len());
+    for (_, ch) in text.char_indices() {
+        encoded.push(style as u8);
+        let continuation_len = ch.len_utf8().saturating_sub(1);
+        encoded.extend(std::iter::repeat_n(0, continuation_len));
+    }
+    encoded
+}
+
+pub(crate) fn replace_text_buffer_with_raw_bytes(
+    buffer: &mut TextBuffer,
+    start: i32,
+    end: i32,
+    bytes: &[u8],
+) {
+    let buffer_len = buffer.length().max(0);
+    let start = start.clamp(0, buffer_len);
+    let end = end.clamp(start, buffer_len);
+    if end > start {
+        buffer.remove(start, end);
+    }
+    if bytes.is_empty() {
+        return;
+    }
+
+    let mut temp = TextBuffer::default();
+    temp.append2(bytes);
+    let temp_len = temp.length().max(0);
+    if temp_len > 0 {
+        buffer.copy_from(&temp, 0, temp_len, start);
+    }
+}
+
+pub(crate) fn set_text_buffer_raw_bytes(buffer: &mut TextBuffer, bytes: &[u8]) {
+    let end = buffer.length().max(0);
+    replace_text_buffer_with_raw_bytes(buffer, 0, end, bytes);
+}
+
 fn is_path_keyword_usage(bytes: &[u8], word_end: usize) -> bool {
     let look_ahead = skip_trivia_and_comments(bytes, word_end);
     match bytes.get(look_ahead) {
@@ -1961,13 +2019,13 @@ fn is_path_keyword_usage(bytes: &[u8], word_end: usize) -> bool {
 }
 
 fn style_bytes_to_string(styles: Vec<u8>) -> String {
-    // Styles use ASCII tags ('A'..'K'), so UTF-8 validation is unnecessary.
+    // Styles use ASCII tags ('A'..'N'), so UTF-8 validation is unnecessary.
     // In debug builds, verify the invariant so programming errors surface immediately.
     debug_assert!(
         styles.iter().all(|&b| b.is_ascii()),
         "style bytes must be valid ASCII"
     );
-    // SAFETY: All style bytes are ASCII character codes ('A'..'K') which are
+    // SAFETY: All style bytes are ASCII character codes ('A'..'N') which are
     // valid single-byte UTF-8 code points.
     unsafe { String::from_utf8_unchecked(styles) }
 }
