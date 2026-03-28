@@ -3,8 +3,9 @@ use crate::db::{
     ScriptItem, ToolCommand,
 };
 use crate::sql_text::{
-    self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
-    FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
+    self, FormatIndentedParenOwnerKind, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS,
+    FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS, FORMAT_CONDITION_KEYWORDS,
+    FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
 use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
@@ -61,6 +62,113 @@ struct DmlCaseConditionLayoutFrame {
     continuation_depth: usize,
 }
 
+#[derive(Default)]
+struct CaseLayoutState {
+    parenthesized_case_frames: Vec<ParenthesizedCaseFrame>,
+    pending_paren_case_closers: Vec<()>,
+    pending_dml_case_expression_close_depths: Vec<usize>,
+    pending_branch_body_depths: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ParenthesizedCaseFrame {
+    depth: usize,
+    closes_parenthesized_expression: bool,
+    indent_branches: bool,
+}
+
+impl CaseLayoutState {
+    fn in_parenthesized_case_expression(&self) -> bool {
+        !self.parenthesized_case_frames.is_empty()
+    }
+
+    fn note_parenthesized_case_frame_depth(
+        &mut self,
+        depth: usize,
+        closes_parenthesized_expression: bool,
+        indent_branches: bool,
+    ) {
+        self.parenthesized_case_frames.push(ParenthesizedCaseFrame {
+            depth,
+            closes_parenthesized_expression,
+            indent_branches,
+        });
+    }
+
+    fn active_parenthesized_case_frame(&self) -> Option<ParenthesizedCaseFrame> {
+        self.parenthesized_case_frames.last().copied()
+    }
+
+    fn note_parenthesized_case_terminator(&mut self, line_tokens: &[SqlToken]) {
+        let Some(frame) = self.parenthesized_case_frames.pop() else {
+            return;
+        };
+        if frame.closes_parenthesized_expression
+            && !Self::line_closes_case_paren_inline(line_tokens)
+        {
+            self.pending_paren_case_closers.push(());
+        }
+    }
+
+    fn has_pending_paren_case_closer(&self) -> bool {
+        !self.pending_paren_case_closers.is_empty()
+    }
+
+    fn consume_pending_paren_case_closer(&mut self) {
+        let _ = self.pending_paren_case_closers.pop();
+    }
+
+    fn pending_dml_case_expression_close_depth(&self) -> Option<usize> {
+        self.pending_dml_case_expression_close_depths
+            .last()
+            .copied()
+    }
+
+    fn note_pending_dml_case_expression_close_depth(&mut self, depth: usize) {
+        self.pending_dml_case_expression_close_depths.push(depth);
+    }
+
+    fn consume_pending_dml_case_expression_close_depth(&mut self) {
+        let _ = self.pending_dml_case_expression_close_depths.pop();
+    }
+
+    fn pending_branch_body_depth(&self) -> Option<usize> {
+        self.pending_branch_body_depths.last().copied()
+    }
+
+    fn note_pending_branch_body_depth(&mut self, depth: usize) {
+        self.pending_branch_body_depths.push(depth);
+    }
+
+    fn consume_pending_branch_body_depth(&mut self) {
+        let _ = self.pending_branch_body_depths.pop();
+    }
+
+    fn clear(&mut self) {
+        self.parenthesized_case_frames.clear();
+        self.pending_paren_case_closers.clear();
+        self.pending_dml_case_expression_close_depths.clear();
+        self.pending_branch_body_depths.clear();
+    }
+
+    fn line_closes_case_paren_inline(tokens: &[SqlToken]) -> bool {
+        let mut saw_end = false;
+
+        for token in tokens {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) if !saw_end && word.eq_ignore_ascii_case("END") => {
+                    saw_end = true;
+                }
+                SqlToken::Symbol(sym) if saw_end && sym == ")" => return true,
+                _ => {}
+            }
+        }
+
+        false
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueryHeadLayoutOrigin {
     Other,
@@ -75,6 +183,12 @@ struct ResolvedQueryBaseLayoutFrame {
     resolved_base_depth: usize,
     start_parser_depth: usize,
     close_align_depth: usize,
+    origin: QueryHeadLayoutOrigin,
+}
+
+#[derive(Clone, Copy)]
+struct PendingQueryHeadLayoutFrame {
+    depth: usize,
     origin: QueryHeadLayoutOrigin,
 }
 
@@ -214,6 +328,135 @@ impl ParenFormatFrame {
     }
 }
 
+#[derive(Clone)]
+struct QueryLikeParenRestoreState {
+    clause: Option<String>,
+    select_list_layout_state: SelectListLayoutState,
+    statement_has_with_clause: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct FormatScope {
+    paren_depth: usize,
+    block_depth: usize,
+}
+
+impl FormatScope {
+    fn new(paren_depth: usize, block_depth: usize) -> Self {
+        Self {
+            paren_depth,
+            block_depth,
+        }
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.paren_depth <= other.paren_depth && self.block_depth <= other.block_depth
+    }
+}
+
+#[derive(Default)]
+struct ScopedFlag {
+    scopes: Vec<FormatScope>,
+}
+
+impl ScopedFlag {
+    fn activate(&mut self, scope: FormatScope) {
+        if self
+            .scopes
+            .last()
+            .is_some_and(|active_scope| *active_scope == scope)
+        {
+            return;
+        }
+        self.scopes.push(scope);
+    }
+
+    fn deactivate(&mut self) {
+        let _ = self.scopes.pop();
+    }
+
+    fn deactivate_at_or_above_paren_depth(&mut self, paren_depth: usize) {
+        while self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.paren_depth >= paren_depth)
+        {
+            self.scopes.pop();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.scopes.clear();
+    }
+
+    fn is_active(&self) -> bool {
+        !self.scopes.is_empty()
+    }
+
+    fn is_active_at_paren_depth(&self, paren_depth: usize) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|scope| scope.paren_depth == paren_depth)
+    }
+
+    fn sync_scope(&mut self, current_scope: FormatScope) {
+        while self
+            .scopes
+            .last()
+            .is_some_and(|scope| !scope.contains(current_scope))
+        {
+            self.scopes.pop();
+        }
+    }
+}
+
+struct ScopedValueFrame<T> {
+    scope: FormatScope,
+    value: T,
+}
+
+#[derive(Default)]
+struct ScopedValue<T> {
+    frames: Vec<ScopedValueFrame<T>>,
+}
+
+impl<T> ScopedValue<T> {
+    fn replace(&mut self, scope: FormatScope, value: T) {
+        if let Some(frame) = self.frames.last_mut() {
+            if frame.scope == scope {
+                frame.value = value;
+                return;
+            }
+        }
+
+        self.frames.push(ScopedValueFrame { scope, value });
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn is_some(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    fn sync_scope(&mut self, current_scope: FormatScope) {
+        while self
+            .frames
+            .last()
+            .is_some_and(|frame| !frame.scope.contains(current_scope))
+        {
+            self.frames.pop();
+        }
+    }
+}
+
+impl ScopedValue<String> {
+    fn as_deref(&self) -> Option<&str> {
+        self.frames.last().map(|frame| frame.value.as_str())
+    }
+}
+
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
 const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
@@ -222,34 +465,109 @@ const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 /// 절(clause) 키워드의 줄바꿈 억제 여부를 한 곳에서 판단합니다.
 #[derive(Default)]
 struct ConstructState {
-    create_pending: bool,
-    create_object: Option<String>,
-    routine_decl_pending: bool,
-    create_table_paren_expected: bool,
-    create_index_pending: bool,
-    create_sequence_active: bool,
-    create_synonym_active: bool,
-    grant_revoke_active: bool,
-    comment_on_active: bool,
-    merge_active: bool,
-    merge_when_branch_active: bool,
-    returning_active: bool,
-    search_cycle_clause_active: bool,
-    match_recognize_paren_depth: Option<usize>,
-    analytic_over_paren_depth: Option<usize>,
-    fetch_active: bool,
-    bulk_collect_active: bool,
-    insert_all_active: bool,
-    referential_action_pending: bool,
-    referential_on_active: bool,
-    execute_immediate_active: bool,
-    cursor_decl_pending: bool,
-    cursor_sql_active: bool,
-    forall_pending: bool,
-    forall_body_active: bool,
+    create_pending: ScopedFlag,
+    create_object: ScopedValue<String>,
+    routine_decl_pending: ScopedFlag,
+    create_table_paren_expected: ScopedFlag,
+    create_index_pending: ScopedFlag,
+    create_sequence_active: ScopedFlag,
+    create_synonym_active: ScopedFlag,
+    grant_revoke_active: ScopedFlag,
+    comment_on_active: ScopedFlag,
+    model_active: ScopedFlag,
+    model_reference_pending: ScopedFlag,
+    merge_active: ScopedFlag,
+    merge_when_branch_active: ScopedFlag,
+    returning_active: ScopedFlag,
+    search_cycle_clause_active: ScopedFlag,
+    match_recognize_paren_depths: Vec<usize>,
+    analytic_over_paren_depths: Vec<usize>,
+    keep_paren_depths: Vec<usize>,
+    fetch_active: ScopedFlag,
+    bulk_collect_active: ScopedFlag,
+    insert_all_active: ScopedFlag,
+    referential_action_pending: ScopedFlag,
+    referential_on_active: ScopedFlag,
+    execute_immediate_active: ScopedFlag,
+    cursor_decl_pending: ScopedFlag,
+    cursor_sql_active: ScopedFlag,
+    forall_pending: ScopedFlag,
+    forall_body_active: ScopedFlag,
 }
 
 impl ConstructState {
+    fn sync_scope(&mut self, current_scope: FormatScope) {
+        self.create_pending.sync_scope(current_scope);
+        self.create_object.sync_scope(current_scope);
+        self.routine_decl_pending.sync_scope(current_scope);
+        self.create_table_paren_expected.sync_scope(current_scope);
+        self.create_index_pending.sync_scope(current_scope);
+        self.create_sequence_active.sync_scope(current_scope);
+        self.create_synonym_active.sync_scope(current_scope);
+        self.grant_revoke_active.sync_scope(current_scope);
+        self.comment_on_active.sync_scope(current_scope);
+        self.model_active.sync_scope(current_scope);
+        self.model_reference_pending.sync_scope(current_scope);
+        self.merge_active.sync_scope(current_scope);
+        self.merge_when_branch_active.sync_scope(current_scope);
+        self.returning_active.sync_scope(current_scope);
+        self.search_cycle_clause_active.sync_scope(current_scope);
+        self.fetch_active.sync_scope(current_scope);
+        self.bulk_collect_active.sync_scope(current_scope);
+        self.insert_all_active.sync_scope(current_scope);
+        self.referential_action_pending.sync_scope(current_scope);
+        self.referential_on_active.sync_scope(current_scope);
+        self.execute_immediate_active.sync_scope(current_scope);
+        self.cursor_decl_pending.sync_scope(current_scope);
+        self.cursor_sql_active.sync_scope(current_scope);
+        self.forall_pending.sync_scope(current_scope);
+        self.forall_body_active.sync_scope(current_scope);
+    }
+
+    fn in_match_recognize_paren(&self, paren_depth: usize) -> bool {
+        self.match_recognize_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth >= *depth)
+    }
+
+    fn in_analytic_over_paren(&self, paren_depth: usize) -> bool {
+        self.analytic_over_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth >= *depth)
+    }
+
+    fn in_keep_paren(&self, paren_depth: usize) -> bool {
+        self.keep_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth >= *depth)
+    }
+
+    fn pop_closed_paren_scopes(&mut self, paren_depth: usize) {
+        while self
+            .match_recognize_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth < *depth)
+        {
+            self.match_recognize_paren_depths.pop();
+        }
+
+        while self
+            .analytic_over_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth < *depth)
+        {
+            self.analytic_over_paren_depths.pop();
+        }
+
+        while self
+            .keep_paren_depths
+            .last()
+            .is_some_and(|depth| paren_depth < *depth)
+        {
+            self.keep_paren_depths.pop();
+        }
+    }
+
     /// clause 키워드(SELECT, FROM, WHERE 등)의 줄바꿈을 억제해야 하는지 판단합니다.
     /// 새 SQL 구문을 추가할 때는 이 메서드에만 규칙을 추가하면 됩니다.
     fn suppresses_clause_break(
@@ -257,27 +575,31 @@ impl ConstructState {
         tokens: &[SqlToken],
         idx: usize,
         keyword: &str,
-        current_clause: Option<&str>,
         prev_word_upper: Option<&str>,
         in_plsql_block: bool,
         suppress_comma_break_depth: usize,
         has_subquery_in_paren_stack: bool,
-        trigger_header_state: TriggerHeaderState,
+        current_scope: FormatScope,
+        trigger_header_state: &TriggerHeaderState,
         is_analytic_within_group: bool,
         is_fetch_into_single_target: bool,
         in_analytic_over_paren: bool,
+        in_keep_paren: bool,
     ) -> bool {
         // Inside analytic OVER(): clause keywords are handled by the
-        // analytic_over_paren_depth branch instead.
+        // analytic_over_paren_depths branch instead.
         if in_analytic_over_paren {
+            return true;
+        }
+        if in_keep_paren && keyword == "ORDER" {
             return true;
         }
         if SqlEditorWidget::is_inline_clause_phrase(
             tokens,
             idx,
             keyword,
-            current_clause,
             prev_word_upper,
+            current_scope,
             self,
         ) {
             return true;
@@ -314,19 +636,19 @@ impl ConstructState {
             return true;
         }
         // RETURNING INTO
-        if self.returning_active && keyword == "INTO" {
+        if self.returning_active.is_active() && keyword == "INTO" {
             return true;
         }
         // FETCH INTO (single target)
-        if self.fetch_active && keyword == "INTO" && is_fetch_into_single_target {
+        if self.fetch_active.is_active() && keyword == "INTO" && is_fetch_into_single_target {
             return true;
         }
         // BULK COLLECT INTO
-        if self.bulk_collect_active && keyword == "INTO" {
+        if self.bulk_collect_active.is_active() && keyword == "INTO" {
             return true;
         }
         // GRANT/REVOKE privilege keywords
-        if self.grant_revoke_active
+        if self.grant_revoke_active.is_active()
             && matches!(
                 keyword,
                 "SELECT"
@@ -347,27 +669,29 @@ impl ConstructState {
             return true;
         }
         // GRANT/REVOKE ON
-        if self.grant_revoke_active && keyword == "ON" {
+        if self.grant_revoke_active.is_active() && keyword == "ON" {
             return true;
         }
         // CREATE SEQUENCE: suppress START/CONNECT
-        if self.create_sequence_active && matches!(keyword, "START" | "CONNECT") {
+        if self.create_sequence_active.is_active() && matches!(keyword, "START" | "CONNECT") {
             return true;
         }
         // FETCH: suppress LIMIT/BULK
-        if self.fetch_active && matches!(keyword, "LIMIT" | "BULK") {
+        if self.fetch_active.is_active() && matches!(keyword, "LIMIT" | "BULK") {
             return true;
         }
         // EXECUTE IMMEDIATE: suppress INTO/USING
-        if self.execute_immediate_active && matches!(keyword, "INTO" | "USING") {
+        if self.execute_immediate_active.is_active() && matches!(keyword, "INTO" | "USING") {
             return true;
         }
         // MERGE WHEN ... THEN UPDATE/INSERT: suppress SET/VALUES/INTO
-        if self.merge_when_branch_active && matches!(keyword, "SET" | "VALUES" | "INTO") {
+        if self.merge_when_branch_active.is_active() && matches!(keyword, "SET" | "VALUES" | "INTO")
+        {
             return true;
         }
         // Referential action: suppress DELETE/UPDATE/SET after ON DELETE/UPDATE
-        if self.referential_on_active && matches!(keyword, "DELETE" | "UPDATE" | "SET") {
+        if self.referential_on_active.is_active() && matches!(keyword, "DELETE" | "UPDATE" | "SET")
+        {
             return true;
         }
         // Non-subquery paren context: suppress FROM/RETURNING
@@ -378,7 +702,11 @@ impl ConstructState {
             return true;
         }
         // SEARCH/CYCLE ... SET
-        if self.search_cycle_clause_active && keyword == "SET" {
+        if self
+            .search_cycle_clause_active
+            .is_active_at_paren_depth(current_scope.paren_depth)
+            && keyword == "SET"
+        {
             return true;
         }
         // Analytic WITHIN GROUP
@@ -393,7 +721,7 @@ impl ConstructState {
         &self,
         keyword: &str,
         prev_word_upper: Option<&str>,
-        trigger_header_state: TriggerHeaderState,
+        trigger_header_state: &TriggerHeaderState,
     ) -> bool {
         // OR in CREATE OR REPLACE
         if keyword == "OR" && matches!(prev_word_upper, Some("CREATE")) {
@@ -404,20 +732,25 @@ impl ConstructState {
             return true;
         }
         // CREATE INDEX ON
-        if keyword == "ON" && self.create_index_pending {
+        if keyword == "ON" && self.create_index_pending.is_active() {
             return true;
         }
         // COMMENT ON
-        if keyword == "ON" && self.comment_on_active {
+        if keyword == "ON" && self.comment_on_active.is_active() {
+            return true;
+        }
+        // MODEL REFERENCE name ON
+        if keyword == "ON" && self.model_reference_pending.is_active() {
             return true;
         }
         // GRANT/REVOKE ON
-        if self.grant_revoke_active && keyword == "ON" {
+        if self.grant_revoke_active.is_active() && keyword == "ON" {
             return true;
         }
         // ON after REFERENCES (referential constraint)
         if keyword == "ON"
-            && (matches!(prev_word_upper, Some("REFERENCES")) || self.referential_action_pending)
+            && (matches!(prev_word_upper, Some("REFERENCES"))
+                || self.referential_action_pending.is_active())
         {
             return true;
         }
@@ -557,7 +890,7 @@ impl ExitConditionState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct WithCteFrame {
     paren_depth: usize,
     plsql_state: WithPlsqlFormatState,
@@ -569,29 +902,72 @@ struct WithCteFormatState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+struct WithPlsqlPendingDeclaration {
+    starts_body: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WithPlsqlBodyFrameKind {
+    Routine,
+    Block,
+    Case,
+    If,
+    Loop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WithPlsqlBodyFrame {
+    kind: WithPlsqlBodyFrameKind,
+    awaiting_begin: bool,
+}
+
+impl WithPlsqlBodyFrame {
+    fn routine() -> Self {
+        Self {
+            kind: WithPlsqlBodyFrameKind::Routine,
+            awaiting_begin: true,
+        }
+    }
+
+    fn nested(kind: WithPlsqlBodyFrameKind) -> Self {
+        Self {
+            kind,
+            awaiting_begin: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum WithPlsqlFormatState {
     None,
     Collecting {
-        block_depth: usize,
-        starts_routine_body: bool,
-        pending_routine_begin: bool,
+        active_body_frames: Vec<WithPlsqlBodyFrame>,
+        pending_routine_declaration: Option<WithPlsqlPendingDeclaration>,
         pending_end: bool,
     },
     AwaitingMainQuery,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TriggerHeaderState {
-    None,
-    InHeader,
+#[derive(Default)]
+struct TriggerHeaderState {
+    scopes: Vec<FormatScope>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CompoundTriggerState {
-    None,
+enum CompoundTriggerPhase {
     AwaitingOuterBodyStart,
     InOuterBody,
     AwaitingTimingPointBodyStart,
+}
+
+struct CompoundTriggerFrame {
+    scope: FormatScope,
+    phase: CompoundTriggerPhase,
+}
+
+#[derive(Default)]
+struct CompoundTriggerState {
+    frames: Vec<CompoundTriggerFrame>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -611,52 +987,117 @@ struct QueryApplyFrame {
 }
 
 impl TriggerHeaderState {
-    fn is_active(self) -> bool {
-        matches!(self, Self::InHeader)
+    fn sync_scope(&mut self, current_scope: FormatScope) {
+        while self
+            .scopes
+            .last()
+            .is_some_and(|scope| !scope.contains(current_scope))
+        {
+            self.scopes.pop();
+        }
     }
 
-    fn start(&mut self) {
-        *self = Self::InHeader;
+    fn is_active(&self) -> bool {
+        !self.scopes.is_empty()
+    }
+
+    fn start(&mut self, scope: FormatScope) {
+        self.scopes.push(scope);
     }
 
     fn clear(&mut self) {
-        *self = Self::None;
+        self.scopes.clear();
     }
 }
 
 impl CompoundTriggerState {
-    fn awaiting_outer_body_start(self) -> bool {
-        matches!(self, Self::AwaitingOuterBodyStart)
+    fn sync_scope(&mut self, current_scope: FormatScope) {
+        while self
+            .frames
+            .last()
+            .is_some_and(|frame| !frame.scope.contains(current_scope))
+        {
+            self.frames.pop();
+        }
     }
 
-    fn mark_compound_header(&mut self) {
-        *self = Self::AwaitingOuterBodyStart;
+    fn awaiting_outer_body_start(&self) -> bool {
+        self.frames.last().is_some_and(|frame| {
+            matches!(frame.phase, CompoundTriggerPhase::AwaitingOuterBodyStart)
+        })
+    }
+
+    fn mark_compound_header(&mut self, scope: FormatScope) {
+        self.frames.push(CompoundTriggerFrame {
+            scope,
+            phase: CompoundTriggerPhase::AwaitingOuterBodyStart,
+        });
     }
 
     fn enter_outer_body(&mut self) {
-        *self = Self::InOuterBody;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.phase = CompoundTriggerPhase::InOuterBody;
+        }
     }
 
-    fn is_in_outer_body(self) -> bool {
-        matches!(self, Self::InOuterBody | Self::AwaitingTimingPointBodyStart)
+    fn is_in_outer_body(&self) -> bool {
+        self.frames.last().is_some_and(|frame| {
+            matches!(
+                frame.phase,
+                CompoundTriggerPhase::InOuterBody
+                    | CompoundTriggerPhase::AwaitingTimingPointBodyStart
+            )
+        })
     }
 
     fn start_timing_point(&mut self) {
-        *self = Self::AwaitingTimingPointBodyStart;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.phase = CompoundTriggerPhase::AwaitingTimingPointBodyStart;
+        }
     }
 
     fn begin_timing_point_body(&mut self) {
-        if matches!(self, Self::AwaitingTimingPointBodyStart) {
-            *self = Self::InOuterBody;
+        if let Some(frame) = self.frames.last_mut() {
+            if matches!(
+                frame.phase,
+                CompoundTriggerPhase::AwaitingTimingPointBodyStart
+            ) {
+                frame.phase = CompoundTriggerPhase::InOuterBody;
+            }
         }
     }
 
     fn clear(&mut self) {
-        *self = Self::None;
+        self.frames.clear();
     }
 }
 
 impl WithCteFormatState {
+    fn pop_with_plsql_body_frame(
+        active_body_frames: &mut Vec<WithPlsqlBodyFrame>,
+        expected_kind: Option<WithPlsqlBodyFrameKind>,
+    ) {
+        if let Some(expected_kind) = expected_kind {
+            if active_body_frames
+                .last()
+                .is_some_and(|frame| frame.kind == expected_kind)
+            {
+                let _ = active_body_frames.pop();
+                return;
+            }
+
+            if let Some(frame_idx) = active_body_frames
+                .iter()
+                .rposition(|frame| frame.kind == expected_kind)
+            {
+                active_body_frames.remove(frame_idx);
+                return;
+            }
+        }
+
+        let _ = active_body_frames.pop();
+    }
+
     fn on_word(&mut self, keyword: &str, prev_word_upper: Option<&str>) {
         let upper = keyword.to_ascii_uppercase();
         let mut close_current_frame = false;
@@ -668,10 +1109,12 @@ impl WithCteFormatState {
                         && sql_text::is_with_plsql_declaration_keyword(upper.as_str())
                     {
                         frame.plsql_state = WithPlsqlFormatState::Collecting {
-                            block_depth: 0,
-                            starts_routine_body:
-                                sql_text::with_plsql_declaration_starts_routine_body(upper.as_str()),
-                            pending_routine_begin: false,
+                            active_body_frames: Vec::new(),
+                            pending_routine_declaration: Some(WithPlsqlPendingDeclaration {
+                                starts_body: sql_text::with_plsql_declaration_starts_routine_body(
+                                    upper.as_str(),
+                                ),
+                            }),
                             pending_end: false,
                         };
                     } else if frame.paren_depth == 0
@@ -684,33 +1127,92 @@ impl WithCteFormatState {
                     }
                 }
                 WithPlsqlFormatState::Collecting {
-                    block_depth,
-                    starts_routine_body,
-                    pending_routine_begin,
+                    active_body_frames,
+                    pending_routine_declaration,
                     pending_end,
                 } => {
-                    if matches!(upper.as_str(), "AS" | "IS")
-                        && *starts_routine_body
-                        && *block_depth == 0
-                    {
-                        *block_depth = 1;
-                        *pending_routine_begin = true;
-                    } else if upper == "BEGIN" && *pending_routine_begin && *block_depth == 1 {
-                        *pending_routine_begin = false;
-                    } else if matches!(upper.as_str(), "BEGIN" | "DECLARE" | "CASE" | "IF" | "LOOP")
-                    {
-                        if *pending_end && *block_depth > 0 {
-                            *block_depth = block_depth.saturating_sub(1);
-                            *pending_end = false;
-                        }
-                        *block_depth = block_depth.saturating_add(1);
-                    } else if upper == "END" {
-                        *pending_end = true;
-                    } else if *pending_end && !matches!(upper.as_str(), "CASE" | "IF" | "LOOP") {
-                        if *block_depth > 0 {
-                            *block_depth = block_depth.saturating_sub(1);
+                    let mut consumed_end_qualifier = false;
+                    if *pending_end {
+                        match upper.as_str() {
+                            "CASE" => {
+                                Self::pop_with_plsql_body_frame(
+                                    active_body_frames,
+                                    Some(WithPlsqlBodyFrameKind::Case),
+                                );
+                                consumed_end_qualifier = true;
+                            }
+                            "IF" => {
+                                Self::pop_with_plsql_body_frame(
+                                    active_body_frames,
+                                    Some(WithPlsqlBodyFrameKind::If),
+                                );
+                                consumed_end_qualifier = true;
+                            }
+                            "LOOP" => {
+                                Self::pop_with_plsql_body_frame(
+                                    active_body_frames,
+                                    Some(WithPlsqlBodyFrameKind::Loop),
+                                );
+                                consumed_end_qualifier = true;
+                            }
+                            _ => {
+                                Self::pop_with_plsql_body_frame(active_body_frames, None);
+                            }
                         }
                         *pending_end = false;
+                    }
+
+                    if !consumed_end_qualifier {
+                        if frame.paren_depth == 0
+                            && sql_text::is_with_plsql_declaration_keyword(upper.as_str())
+                        {
+                            *pending_routine_declaration = Some(WithPlsqlPendingDeclaration {
+                                starts_body: sql_text::with_plsql_declaration_starts_routine_body(
+                                    upper.as_str(),
+                                ),
+                            });
+                        } else if matches!(upper.as_str(), "AS" | "IS")
+                            && pending_routine_declaration
+                                .is_some_and(|declaration| declaration.starts_body)
+                        {
+                            active_body_frames.push(WithPlsqlBodyFrame::routine());
+                            *pending_routine_declaration = None;
+                        } else if upper == "BEGIN" {
+                            if let Some(frame) = active_body_frames.last_mut() {
+                                if frame.kind == WithPlsqlBodyFrameKind::Routine
+                                    && frame.awaiting_begin
+                                {
+                                    frame.awaiting_begin = false;
+                                } else {
+                                    active_body_frames.push(WithPlsqlBodyFrame::nested(
+                                        WithPlsqlBodyFrameKind::Block,
+                                    ));
+                                }
+                            }
+                        } else if upper == "DECLARE" {
+                            if !active_body_frames.is_empty() {
+                                active_body_frames.push(WithPlsqlBodyFrame::nested(
+                                    WithPlsqlBodyFrameKind::Block,
+                                ));
+                            }
+                        } else if upper == "CASE" {
+                            if !active_body_frames.is_empty() {
+                                active_body_frames
+                                    .push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::Case));
+                            }
+                        } else if upper == "IF" {
+                            if !active_body_frames.is_empty() {
+                                active_body_frames
+                                    .push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::If));
+                            }
+                        } else if upper == "LOOP" {
+                            if !active_body_frames.is_empty() {
+                                active_body_frames
+                                    .push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::Loop));
+                            }
+                        } else if upper == "END" && !active_body_frames.is_empty() {
+                            *pending_end = true;
+                        }
                     }
                 }
             }
@@ -745,17 +1247,21 @@ impl WithCteFormatState {
     fn on_separator(&mut self) {
         if let Some(frame) = self.frames.last_mut() {
             if let WithPlsqlFormatState::Collecting {
-                block_depth,
+                active_body_frames,
+                pending_routine_declaration,
                 pending_end,
-                ..
             } = &mut frame.plsql_state
             {
-                if *pending_end && *block_depth > 0 {
-                    *block_depth = block_depth.saturating_sub(1);
+                if *pending_end {
+                    Self::pop_with_plsql_body_frame(active_body_frames, None);
                     *pending_end = false;
                 }
+                if frame.paren_depth > 0 {
+                    return;
+                }
+                *pending_routine_declaration = None;
 
-                if *block_depth == 0 {
+                if active_body_frames.is_empty() {
                     frame.plsql_state = WithPlsqlFormatState::AwaitingMainQuery;
                 }
             }
@@ -777,8 +1283,9 @@ impl WithCteFormatState {
             matches!(
                 frame.plsql_state,
                 WithPlsqlFormatState::Collecting {
-                    block_depth: 0,
-                    starts_routine_body: true,
+                    pending_routine_declaration: Some(WithPlsqlPendingDeclaration {
+                        starts_body: true
+                    }),
                     ..
                 }
             )
@@ -869,11 +1376,11 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         idx: usize,
         keyword: &str,
-        current_clause: Option<&str>,
         prev_word_upper: Option<&str>,
+        current_scope: FormatScope,
         construct: &ConstructState,
     ) -> bool {
-        if construct.forall_pending && keyword == "VALUES" {
+        if construct.forall_pending.is_active() && keyword == "VALUES" {
             return true;
         }
         if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx) {
@@ -887,7 +1394,9 @@ impl SqlEditorWidget {
         {
             return true;
         }
-        if current_clause == Some("MODEL")
+        if construct
+            .model_active
+            .is_active_at_paren_depth(current_scope.paren_depth)
             && keyword == "UPDATE"
             && matches!(prev_word_upper, Some("RULES"))
         {
@@ -2192,14 +2701,13 @@ impl SqlEditorWidget {
         let mut indent_level = 0usize;
         let mut suppress_comma_break_depth = 0usize;
         let mut paren_stack: Vec<ParenFormatFrame> = Vec::new();
-        let mut paren_clause_restore_stack: Vec<Option<String>> = Vec::new();
+        let mut paren_clause_restore_stack: Vec<Option<QueryLikeParenRestoreState>> = Vec::new();
         let mut block_stack: Vec<String> = Vec::new(); // Track which block keywords started blocks
         let mut at_line_start = true;
         let mut needs_space = false;
         let mut line_indent = 0usize;
         let mut join_modifier_active = false;
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
-        let mut in_plsql_block = false; // Track if we're in PL/SQL block (for CASE handling)
         let mut prev_word_upper: Option<String> = None;
         let mut construct = ConstructState::default();
         let mut current_clause: Option<String> = None;
@@ -2207,14 +2715,15 @@ impl SqlEditorWidget {
         let mut open_cursor_state = OpenCursorFormatState::None;
         let mut open_for_select_stack: Vec<OpenCursorFormatState> = Vec::new();
         let mut case_branch_started: Vec<bool> = Vec::new();
-        let mut between_pending = false;
+        let mut between_paren_depths: Vec<usize> = Vec::new();
         let mut select_list_layout_state = SelectListLayoutState::Inactive;
         let mut select_list_break_state = select_list_break_state_on_start;
         let mut exit_condition_state = ExitConditionState::None;
         let mut with_cte_state = WithCteFormatState::default();
         let mut statement_has_with_clause = false;
-        let mut trigger_header_state = TriggerHeaderState::None;
-        let mut compound_trigger_state = CompoundTriggerState::None;
+        let mut trigger_header_state = TriggerHeaderState::default();
+        let mut compound_trigger_state = CompoundTriggerState::default();
+        let mut plsql_context_state = ScopedFlag::default();
         let mut inline_comment_continuation_state = InlineCommentContinuationState::None;
         let is_package_body_statement = {
             let upper = statement.to_ascii_uppercase();
@@ -2320,6 +2829,18 @@ impl SqlEditorWidget {
 
         let mut idx = 0;
         while idx < tokens.len() {
+            let current_scope = FormatScope::new(paren_stack.len(), block_stack.len());
+            while between_paren_depths
+                .last()
+                .is_some_and(|depth| *depth > current_scope.paren_depth)
+            {
+                between_paren_depths.pop();
+            }
+            construct.sync_scope(current_scope);
+            trigger_header_state.sync_scope(current_scope);
+            compound_trigger_state.sync_scope(current_scope);
+            plsql_context_state.sync_scope(current_scope);
+            let in_plsql_block = plsql_context_state.is_active();
             let current_query_has_apply = query_apply_flags.get(idx).copied().unwrap_or(false);
             if at_line_start && !matches!(tokens[idx], SqlToken::Comment(_)) {
                 if let InlineCommentContinuationState::Operand { indent } =
@@ -2417,6 +2938,8 @@ impl SqlEditorWidget {
                         && !is_analytic_within_group;
                     let mut newline_after_keyword = false;
                     let mut newline_after_keyword_extra = 0usize;
+                    let between_pending =
+                        between_paren_depths.last().copied() == Some(current_scope.paren_depth);
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
                     let should_break_condition = condition_keywords.contains(&upper.as_str())
@@ -2425,7 +2948,7 @@ impl SqlEditorWidget {
                             || construct.suppresses_condition_break(
                                 upper.as_str(),
                                 prev_word_upper.as_deref(),
-                                trigger_header_state,
+                                &trigger_header_state,
                             )
                             // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
                             // should not cause a condition line break.
@@ -2442,7 +2965,8 @@ impl SqlEditorWidget {
                                 matches!(word.to_ascii_uppercase().as_str(), "STATEMENT" | "EACH")
                             })
                             || (upper == "INSTEAD" && next_word_is("OF")));
-                    let is_create_index_on = upper == "ON" && construct.create_index_pending;
+                    let is_create_index_on =
+                        upper == "ON" && construct.create_index_pending.is_active();
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
@@ -2708,7 +3232,7 @@ impl SqlEditorWidget {
                         && matches!(prev_word_upper.as_deref(), Some("BEFORE" | "AFTER" | "OF"))
                     {
                         // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
-                    } else if construct.merge_when_branch_active && upper == "SET" {
+                    } else if construct.merge_when_branch_active.is_active() && upper == "SET" {
                         // MERGE UPDATE SET keeps SET inline with UPDATE, but we still need
                         // SET clause context so following list comments/commas align correctly.
                         current_clause = Some(upper.clone());
@@ -2718,31 +3242,35 @@ impl SqlEditorWidget {
                             tokens,
                             idx,
                             upper.as_str(),
-                            current_clause.as_deref(),
                             prev_word_upper.as_deref(),
                             in_plsql_block,
                             suppress_comma_break_depth,
                             paren_stack.iter().any(|frame| frame.is_query_like()),
-                            trigger_header_state,
+                            current_scope,
+                            &trigger_header_state,
                             is_analytic_within_group,
                             !Self::fetch_into_has_multiple_targets(tokens, idx),
-                            construct
-                                .analytic_over_paren_depth
-                                .is_some_and(|depth| paren_stack.len() >= depth),
+                            construct.in_analytic_over_paren(paren_stack.len()),
+                            construct.in_keep_paren(paren_stack.len()),
                         )
                     {
                         // Keep shallow FORALL bodies one level deeper, but do not
                         // keep drifting nested package-body DML further right.
-                        if construct.forall_pending
+                        if construct.forall_pending.is_active()
                             && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
                         {
                             let forall_body_extra = usize::from(indent_level <= 1);
                             indent_level += forall_body_extra;
-                            construct.forall_pending = false;
-                            construct.forall_body_active = forall_body_extra > 0;
+                            construct.forall_pending.deactivate();
+                            if forall_body_extra > 0 {
+                                construct.forall_body_active.activate(current_scope);
+                            }
                         }
                         if !is_within_group {
-                            let insert_all_extra = if construct.insert_all_active
+                            let insert_all_active_in_scope = construct
+                                .insert_all_active
+                                .is_active_at_paren_depth(current_scope.paren_depth);
+                            let insert_all_extra = if insert_all_active_in_scope
                                 && matches!(upper.as_str(), "INTO" | "VALUES")
                             {
                                 2
@@ -2750,10 +3278,10 @@ impl SqlEditorWidget {
                                 0
                             };
                             // INSERT ALL: stop at SELECT (the trailing query)
-                            if construct.insert_all_active && upper == "SELECT" {
-                                construct.insert_all_active = false;
+                            if insert_all_active_in_scope && upper == "SELECT" {
+                                construct.insert_all_active.deactivate();
                             }
-                            let cursor_clause_dedent = construct.cursor_sql_active
+                            let cursor_clause_dedent = construct.cursor_sql_active.is_active()
                                 && !paren_stack.iter().any(|frame| frame.is_query_like())
                                 && matches!(
                                     upper.as_str(),
@@ -2781,7 +3309,7 @@ impl SqlEditorWidget {
                                     open_cursor_state
                                         .select_depth()
                                         .is_some_and(|depth| paren_stack.len() == depth),
-                                    construct.cursor_sql_active,
+                                    construct.cursor_sql_active.is_active(),
                                 ),
                                 insert_all_extra,
                                 &mut at_line_start,
@@ -2790,6 +3318,14 @@ impl SqlEditorWidget {
                             );
                         }
                         if !is_within_group {
+                            if upper != "MODEL" {
+                                construct
+                                    .model_active
+                                    .deactivate_at_or_above_paren_depth(current_scope.paren_depth);
+                                construct
+                                    .model_reference_pending
+                                    .deactivate_at_or_above_paren_depth(current_scope.paren_depth);
+                            }
                             current_clause = Some(upper.clone());
                             if upper != "SELECT" {
                                 select_list_layout_state.clear();
@@ -2807,6 +3343,13 @@ impl SqlEditorWidget {
                             if upper == "WITH" {
                                 statement_has_with_clause = true;
                             }
+                            if upper == "MODEL"
+                                && !construct
+                                    .model_active
+                                    .is_active_at_paren_depth(current_scope.paren_depth)
+                            {
+                                construct.model_active.activate(current_scope);
+                            }
                             if matches!(
                                 upper.as_str(),
                                 "SELECT"
@@ -2815,12 +3358,16 @@ impl SqlEditorWidget {
                                     | "GROUP"
                                     | "HAVING"
                                     | "ORDER"
+                                    | "UPDATE"
+                                    | "DELETE"
+                                    | "INSERT"
+                                    | "MERGE"
                                     | "UNION"
                                     | "INTERSECT"
                                     | "MINUS"
                                     | "EXCEPT"
                             ) {
-                                construct.search_cycle_clause_active = false;
+                                construct.search_cycle_clause_active.deactivate();
                             }
                         }
                     } else if is_analytic_within_group {
@@ -2854,7 +3401,7 @@ impl SqlEditorWidget {
                             open_cursor_state
                                 .select_depth()
                                 .is_some_and(|depth| paren_stack.len() == depth),
-                            construct.cursor_sql_active,
+                            construct.cursor_sql_active.is_active(),
                         );
                         let paren_extra = Self::paren_extra_depth(&paren_stack);
                         if upper == "WHEN"
@@ -2866,16 +3413,16 @@ impl SqlEditorWidget {
                             }
                         }
                         let is_merge_when = upper == "WHEN"
-                            && construct.merge_active
+                            && construct.merge_active.is_active()
                             && block_stack.last().is_none_or(|s| s != "CASE");
                         let uses_where_hanging_condition_indent =
                             matches!(upper.as_str(), "AND" | "OR")
                                 && matches!(current_clause.as_deref(), Some("WHERE" | "HAVING"));
                         if is_merge_when {
                             // MERGE WHEN MATCHED/NOT MATCHED: at base indent
-                            if construct.merge_when_branch_active {
+                            if construct.merge_when_branch_active.is_active() {
                                 indent_level = indent_level.saturating_sub(1);
-                                construct.merge_when_branch_active = false;
+                                construct.merge_when_branch_active.deactivate();
                             }
                             newline_with(
                                 &mut out,
@@ -2906,46 +3453,58 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         }
+                    } else if construct.model_reference_pending.is_active() && upper == "ON" {
+                        construct.model_reference_pending.deactivate();
                     } else if upper == "CREATE" {
-                        construct.create_pending = true;
-                        construct.create_object = None;
-                    } else if construct.create_pending && (upper == "OR" || upper == "REPLACE") {
+                        construct.create_pending.activate(current_scope);
+                        construct.create_object.clear();
+                    } else if construct.create_pending.is_active()
+                        && (upper == "OR" || upper == "REPLACE")
+                    {
                         // part of CREATE OR REPLACE
-                    } else if construct.create_pending && upper == "PACKAGE" {
+                    } else if construct.create_pending.is_active() && upper == "PACKAGE" {
                         if next_word_is("BODY") {
-                            construct.create_object = Some("PACKAGE_BODY".to_string());
+                            construct
+                                .create_object
+                                .replace(current_scope, "PACKAGE_BODY".to_string());
                         } else {
-                            construct.create_object = Some("PACKAGE".to_string());
+                            construct
+                                .create_object
+                                .replace(current_scope, "PACKAGE".to_string());
                         }
-                        construct.create_pending = false;
-                    } else if construct.create_pending && upper == "TABLE" {
-                        construct.create_table_paren_expected = true;
-                        construct.create_pending = false;
-                    } else if construct.create_pending
+                        construct.create_pending.deactivate();
+                    } else if construct.create_pending.is_active() && upper == "TABLE" {
+                        construct
+                            .create_table_paren_expected
+                            .activate(current_scope);
+                        construct.create_pending.deactivate();
+                    } else if construct.create_pending.is_active()
                         && matches!(upper.as_str(), "INDEX" | "UNIQUE")
                     {
                         if upper == "INDEX" {
-                            construct.create_index_pending = true;
-                            construct.create_pending = false;
+                            construct.create_index_pending.activate(current_scope);
+                            construct.create_pending.deactivate();
                         }
                         // UNIQUE stays in construct.create_pending to catch UNIQUE INDEX
-                    } else if construct.create_pending && upper == "SEQUENCE" {
-                        construct.create_sequence_active = true;
-                        construct.create_pending = false;
-                    } else if construct.create_pending && upper == "SYNONYM" {
-                        construct.create_synonym_active = true;
-                        construct.create_pending = false;
-                    } else if construct.create_pending
+                    } else if construct.create_pending.is_active() && upper == "SEQUENCE" {
+                        construct.create_sequence_active.activate(current_scope);
+                        construct.create_pending.deactivate();
+                    } else if construct.create_pending.is_active() && upper == "SYNONYM" {
+                        construct.create_synonym_active.activate(current_scope);
+                        construct.create_pending.deactivate();
+                    } else if construct.create_pending.is_active()
                         && matches!(
                             upper.as_str(),
                             "PROCEDURE" | "FUNCTION" | "TYPE" | "TRIGGER"
                         )
                     {
-                        construct.create_object = Some(upper.clone());
+                        construct
+                            .create_object
+                            .replace(current_scope, upper.clone());
                         if upper == "TRIGGER" {
-                            trigger_header_state.start();
+                            trigger_header_state.start(current_scope);
                         }
-                        construct.create_pending = false;
+                        construct.create_pending.deactivate();
                     } else if sql_text::is_with_plsql_declaration_keyword(upper.as_str())
                         && prev_word_upper.as_deref() == Some("WITH")
                     {
@@ -2974,7 +3533,7 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         }
-                        construct.routine_decl_pending = true;
+                        construct.routine_decl_pending.activate(current_scope);
                     } else if upper == "ELSE" || upper == "ELSIF" {
                         // ELSE/ELSIF in IF block: same level as IF
                         let in_if_block = block_stack.last().is_some_and(|s| s == "IF");
@@ -3020,11 +3579,12 @@ impl SqlEditorWidget {
                             newline_after_keyword_extra = 1;
                         }
                     } else if upper == "THEN" {
-                        if construct.merge_active && block_stack.last().is_none_or(|s| s != "CASE")
+                        if construct.merge_active.is_active()
+                            && block_stack.last().is_none_or(|s| s != "CASE")
                         {
                             // MERGE WHEN MATCHED THEN / WHEN NOT MATCHED THEN
                             indent_level += 1;
-                            construct.merge_when_branch_active = true;
+                            construct.merge_when_branch_active.activate(current_scope);
                             newline_after_keyword = true;
                         } else if in_plsql_block
                             && !matches!(current_clause.as_deref(), Some("SELECT"))
@@ -3084,7 +3644,7 @@ impl SqlEditorWidget {
                             join_modifier_active = true;
                         }
                     } else if upper == "SEARCH" || upper == "CYCLE" {
-                        construct.search_cycle_clause_active = true;
+                        construct.search_cycle_clause_active.activate(current_scope);
                         // SEARCH/CYCLE after recursive CTE should start on a
                         // new line at the WITH-clause level.
                         newline_with(
@@ -3097,7 +3657,7 @@ impl SqlEditorWidget {
                         );
                     } else if matches!(upper.as_str(), "PIVOT" | "UNPIVOT")
                         && suppress_comma_break_depth == 0
-                        && !construct.create_synonym_active
+                        && !construct.create_synonym_active.is_active()
                     {
                         // PIVOT/UNPIVOT should start on a new line as a
                         // clause-level keyword at the same depth as FROM.
@@ -3110,25 +3670,24 @@ impl SqlEditorWidget {
                                 open_cursor_state
                                     .select_depth()
                                     .is_some_and(|depth| paren_stack.len() == depth),
-                                construct.cursor_sql_active,
+                                construct.cursor_sql_active.is_active(),
                             ),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if construct.match_recognize_paren_depth.is_some_and(|depth| {
-                        paren_stack.len() >= depth
-                            && (matches!(upper.as_str(), "MEASURES" | "PATTERN" | "DEFINE")
-                                || (upper == "ONE" && next_word_is("ROW"))
-                                || (upper == "ALL" && next_word_is("ROWS")))
-                    }) || construct.analytic_over_paren_depth.is_some_and(|depth| {
-                        paren_stack.len() >= depth
+                    } else if (construct.in_match_recognize_paren(paren_stack.len())
+                        && Self::is_match_recognize_stage1_subclause_start(
+                            upper.as_str(),
+                            next_word,
+                        ))
+                        || (construct.in_analytic_over_paren(paren_stack.len())
                             && matches!(
                                 upper.as_str(),
                                 "PARTITION" | "ORDER" | "ROWS" | "RANGE" | "GROUPS"
-                            )
-                    }) {
+                            ))
+                    {
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -3137,12 +3696,16 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if matches!(current_clause.as_deref(), Some("MODEL"))
-                        && matches!(
-                            upper.as_str(),
-                            "PARTITION" | "DIMENSION" | "MEASURES" | "RULES"
-                        )
+                    } else if construct
+                        .model_active
+                        .is_active_at_paren_depth(current_scope.paren_depth)
+                        && Self::is_model_subclause_start_keyword(upper.as_str())
                     {
+                        if upper == "REFERENCE" {
+                            construct.model_reference_pending.activate(current_scope);
+                        } else {
+                            construct.model_reference_pending.deactivate();
+                        }
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -3169,7 +3732,7 @@ impl SqlEditorWidget {
                         );
                     } else if (upper == "FOR" || upper == "WHILE")
                         && !(upper == "FOR"
-                            && (construct.create_synonym_active
+                            && (construct.create_synonym_active.is_active()
                                 || suppress_comma_break_depth > 0
                                 || (next_word_is("UPDATE") && !in_plsql_block)))
                     {
@@ -3310,7 +3873,7 @@ impl SqlEditorWidget {
                     }
 
                     if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
-                        compound_trigger_state.mark_compound_header();
+                        compound_trigger_state.mark_compound_header(current_scope);
                         trigger_header_state.clear();
                     }
 
@@ -3318,45 +3881,47 @@ impl SqlEditorWidget {
                         compound_trigger_state.begin_timing_point_body();
                     }
 
-                    if construct.create_table_paren_expected
+                    if construct.create_table_paren_expected.is_active()
                         && upper == "AS"
                         && (next_word_is("SELECT")
                             || next_word_is("WITH")
                             || next_word_is("VALUES"))
                     {
-                        construct.create_table_paren_expected = false;
+                        construct.create_table_paren_expected.deactivate();
                     }
 
                     // CURSOR ... IS/AS → indent the SQL body
                     if upper == "CURSOR" && in_plsql_block {
-                        construct.cursor_decl_pending = true;
+                        construct.cursor_decl_pending.activate(current_scope);
                     }
-                    if matches!(upper.as_str(), "IS" | "AS") && construct.cursor_decl_pending {
-                        construct.cursor_decl_pending = false;
-                        construct.cursor_sql_active = true;
+                    if matches!(upper.as_str(), "IS" | "AS")
+                        && construct.cursor_decl_pending.is_active()
+                    {
+                        construct.cursor_decl_pending.deactivate();
+                        construct.cursor_sql_active.activate(current_scope);
                         indent_level += 1;
                         newline_after_keyword = true;
                     }
 
                     // FORALL → indent the DML body
                     if upper == "FORALL" && in_plsql_block {
-                        construct.forall_pending = true;
+                        construct.forall_pending.activate(current_scope);
                     }
 
                     // EXECUTE IMMEDIATE tracking
                     if upper == "EXECUTE" && next_word_is("IMMEDIATE") {
-                        construct.execute_immediate_active = true;
+                        construct.execute_immediate_active.activate(current_scope);
                     }
 
                     // REFERENCES → suppress ON DELETE/UPDATE (referential actions)
                     if upper == "REFERENCES" {
-                        construct.referential_action_pending = true;
+                        construct.referential_action_pending.activate(current_scope);
                     }
-                    if construct.referential_action_pending && upper == "ON" {
-                        construct.referential_action_pending = false;
-                        construct.referential_on_active = true;
+                    if construct.referential_action_pending.is_active() && upper == "ON" {
+                        construct.referential_action_pending.deactivate();
+                        construct.referential_on_active.activate(current_scope);
                     }
-                    if construct.referential_on_active
+                    if construct.referential_on_active.is_active()
                         && !matches!(
                             upper.as_str(),
                             "ON" | "DELETE"
@@ -3369,64 +3934,69 @@ impl SqlEditorWidget {
                                 | "NULL"
                         )
                     {
-                        construct.referential_on_active = false;
+                        construct.referential_on_active.deactivate();
                     }
 
                     // COMMENT ON tracking
                     if upper == "COMMENT" && next_word_is("ON") {
-                        construct.comment_on_active = true;
+                        construct.comment_on_active.activate(current_scope);
                     }
-                    if construct.comment_on_active && upper == "ON" {
-                        construct.comment_on_active = false; // one-shot: suppress ON, then done
+                    if construct.comment_on_active.is_active() && upper == "ON" {
+                        construct.comment_on_active.deactivate(); // one-shot: suppress ON, then done
                     }
 
                     // GRANT/REVOKE tracking
                     if matches!(upper.as_str(), "GRANT" | "REVOKE") && indent_level == 0 {
-                        construct.grant_revoke_active = true;
+                        construct.grant_revoke_active.activate(current_scope);
                     }
                     // GRANT/REVOKE ends at ON (for privilege grants) or TO/FROM
-                    if construct.grant_revoke_active && matches!(upper.as_str(), "TO" | "FROM") {
-                        construct.grant_revoke_active = false;
+                    if construct.grant_revoke_active.is_active()
+                        && matches!(upper.as_str(), "TO" | "FROM")
+                    {
+                        construct.grant_revoke_active.deactivate();
                     }
 
                     // RETURNING → suppress next INTO
                     if upper == "RETURNING" {
-                        construct.returning_active = true;
+                        construct.returning_active.activate(current_scope);
                     }
-                    if construct.returning_active && upper == "INTO" {
-                        construct.returning_active = false;
+                    if construct.returning_active.is_active() && upper == "INTO" {
+                        construct.returning_active.deactivate();
                     }
 
                     // FETCH cursor → suppress INTO/LIMIT/BULK (PL/SQL FETCH, not SQL FETCH FIRST)
                     if upper == "FETCH" && in_plsql_block {
-                        construct.fetch_active = true;
+                        construct.fetch_active.activate(current_scope);
                     }
 
                     // BULK COLLECT → suppress next INTO
                     if upper == "BULK" && next_word_is("COLLECT") {
-                        construct.bulk_collect_active = true;
+                        construct.bulk_collect_active.activate(current_scope);
                     }
-                    if construct.bulk_collect_active && upper == "INTO" {
-                        construct.bulk_collect_active = false;
+                    if construct.bulk_collect_active.is_active() && upper == "INTO" {
+                        construct.bulk_collect_active.deactivate();
                     }
 
                     // MERGE tracking
                     if upper == "MERGE" && matches!(current_clause.as_deref(), None | Some("MERGE"))
                     {
-                        construct.merge_active = true;
+                        construct.merge_active.activate(current_scope);
                     }
 
                     // INSERT ALL/FIRST tracking
                     if matches!(upper.as_str(), "ALL" | "FIRST")
                         && matches!(prev_word_upper.as_deref(), Some("INSERT"))
+                        && !construct
+                            .insert_all_active
+                            .is_active_at_paren_depth(current_scope.paren_depth)
                     {
-                        construct.insert_all_active = true;
+                        construct.insert_all_active.activate(current_scope);
                     }
 
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
                         && !trigger_header_state.is_active()
                         && (construct.create_object.is_some()
-                            || construct.routine_decl_pending
+                            || construct.routine_decl_pending.is_active()
                             || with_plsql_body_starts_here);
                     let starts_compound_trigger_body = starts_create_block
                         && compound_trigger_state.awaiting_outer_body_start()
@@ -3437,7 +4007,8 @@ impl SqlEditorWidget {
                         block_stack.push(upper.clone());
                         indent_level += 1;
                         if upper == "DECLARE" || upper == "IF" {
-                            in_plsql_block = true;
+                            plsql_context_state
+                                .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
                         }
                     } else if upper == "BEGIN" {
                         let inside_declare = block_stack
@@ -3456,20 +4027,28 @@ impl SqlEditorWidget {
                             block_stack.push("BEGIN".to_string());
                             indent_level += 1;
                         }
-                        in_plsql_block = true;
+                        plsql_context_state
+                            .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
                     } else if upper == "LOOP" {
                         block_stack.push("LOOP".to_string());
                         indent_level += 1;
+                        plsql_context_state
+                            .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
                     } else if upper == "REPEAT" {
                         block_stack.push("REPEAT".to_string());
                         indent_level += 1;
-                        in_plsql_block = true;
+                        plsql_context_state
+                            .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
                     } else if upper == "CASE" {
                         block_stack.push("CASE".to_string());
                         if in_plsql_block && current_clause.is_none() {
                             case_branch_started.push(false);
                         }
                         indent_level += 1;
+                        if current_clause.is_none() {
+                            plsql_context_state
+                                .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
+                        }
                     } else if starts_create_block {
                         // Treat AS/IS in CREATE PACKAGE/PROC/FUNC/TYPE/TRIGGER and package-body routines as declaration section start
                         let is_package_body =
@@ -3485,12 +4064,13 @@ impl SqlEditorWidget {
                             block_stack.push("DECLARE".to_string());
                         }
                         indent_level += 1;
-                        in_plsql_block = true;
+                        plsql_context_state
+                            .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
                         if is_trigger_body {
                             trigger_header_state.clear();
                         }
-                        construct.create_object = None;
-                        construct.routine_decl_pending = false;
+                        construct.create_object.clear();
+                        construct.routine_decl_pending.deactivate();
                         newline_with(
                             &mut out,
                             indent_level,
@@ -3528,12 +4108,12 @@ impl SqlEditorWidget {
                     }
 
                     if upper == "BETWEEN" {
-                        between_pending = true;
+                        between_paren_depths.push(current_scope.paren_depth);
                     } else if upper == "AND" && between_pending {
-                        between_pending = false;
+                        between_paren_depths.pop();
                     }
                     if is_create_index_on {
-                        construct.create_index_pending = false;
+                        construct.create_index_pending.deactivate();
                     }
                     exit_condition_state.on_keyword(upper.as_str());
 
@@ -3654,7 +4234,7 @@ impl SqlEditorWidget {
                             open_cursor_state,
                             select_list_layout_state,
                             current_clause.as_deref(),
-                            construct.merge_active,
+                            construct.merge_active.is_active(),
                             in_column_list,
                         );
                         let next_is_comma = matches!(
@@ -3665,7 +4245,9 @@ impl SqlEditorWidget {
                             if let Some(SqlToken::Word(w)) = next_non_comment {
                                 let upper = w.to_ascii_uppercase();
                                 condition_keywords.contains(&upper.as_str())
-                                    && !(upper == "AND" && between_pending)
+                                    && !(upper == "AND"
+                                        && between_paren_depths.last().copied()
+                                            == Some(current_scope.paren_depth))
                             } else {
                                 false
                             };
@@ -3750,7 +4332,7 @@ impl SqlEditorWidget {
                                 open_cursor_state,
                                 select_list_layout_state,
                                 current_clause.as_deref(),
-                                construct.merge_active,
+                                construct.merge_active.is_active(),
                                 in_column_list,
                             );
                             line_indent = list_indent;
@@ -3781,7 +4363,7 @@ impl SqlEditorWidget {
                                     open_cursor_state,
                                     select_list_layout_state,
                                     current_clause.as_deref(),
-                                    construct.merge_active,
+                                    construct.merge_active.is_active(),
                                     in_column_list,
                                 )
                             } else {
@@ -3822,7 +4404,7 @@ impl SqlEditorWidget {
                                     open_cursor_state,
                                     select_list_layout_state,
                                     current_clause.as_deref(),
-                                    construct.merge_active,
+                                    construct.merge_active.is_active(),
                                     in_column_list,
                                 );
                                 line_indent = list_indent;
@@ -3858,7 +4440,7 @@ impl SqlEditorWidget {
                                         open_cursor_state,
                                         select_list_layout_state,
                                         current_clause.as_deref(),
-                                        construct.merge_active,
+                                        construct.merge_active.is_active(),
                                         in_column_list,
                                     )
                                 } else {
@@ -3907,7 +4489,7 @@ impl SqlEditorWidget {
                                         open_cursor_state,
                                         select_list_layout_state,
                                         current_clause.as_deref(),
-                                        construct.merge_active,
+                                        construct.merge_active.is_active(),
                                         in_column_list,
                                     )
                                     .saturating_sub(base_indent(indent_level, open_cursor_state))
@@ -3973,14 +4555,19 @@ impl SqlEditorWidget {
                                         open_cursor_state,
                                         select_list_layout_state,
                                         current_clause.as_deref(),
-                                        construct.merge_active,
+                                        construct.merge_active.is_active(),
                                         in_column_list,
                                     );
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
                             }
                             out.push(',');
-                            between_pending = false;
+                            while between_paren_depths
+                                .last()
+                                .is_some_and(|depth| *depth >= current_scope.paren_depth)
+                            {
+                                between_paren_depths.pop();
+                            }
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
                             if paren_stack
                                 .last()
@@ -4018,18 +4605,18 @@ impl SqlEditorWidget {
                                         && follows_multiline_child_close
                                         && (select_list_layout_state.is_multiline()
                                             || open_cursor_state.in_select()
-                                            || construct.cursor_sql_active);
+                                            || construct.cursor_sql_active.is_active());
                                 if (suppress_comma_break_depth == 0
                                     || allows_compact_close_continuation_comma_break)
-                                    && !construct.execute_immediate_active
-                                    && !construct.grant_revoke_active
+                                    && !construct.execute_immediate_active.is_active()
+                                    && !construct.grant_revoke_active.is_active()
                                     && !trigger_header_state.is_active()
                                 {
                                     let comma_extra_indent =
                                         if (matches!(current_clause.as_deref(), Some("SET"))
-                                            && construct.merge_active)
+                                            && construct.merge_active.is_active())
                                             || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                                && construct.cursor_sql_active)
+                                                && construct.cursor_sql_active.is_active())
                                         {
                                             0
                                         } else {
@@ -4083,34 +4670,36 @@ impl SqlEditorWidget {
                             select_list_layout_state.clear();
                             open_cursor_state = OpenCursorFormatState::None;
                             open_for_select_stack.clear();
-                            between_pending = false;
+                            between_paren_depths.clear();
                             trigger_header_state.clear();
                             exit_condition_state.clear();
-                            construct.execute_immediate_active = false;
-                            construct.cursor_decl_pending = false;
-                            construct.create_index_pending = false;
-                            construct.create_sequence_active = false;
-                            construct.create_synonym_active = false;
-                            construct.grant_revoke_active = false;
-                            construct.comment_on_active = false;
-                            construct.returning_active = false;
-                            construct.fetch_active = false;
-                            construct.bulk_collect_active = false;
-                            construct.insert_all_active = false;
-                            construct.referential_action_pending = false;
-                            construct.referential_on_active = false;
-                            if construct.merge_when_branch_active {
+                            construct.execute_immediate_active.clear();
+                            construct.cursor_decl_pending.clear();
+                            construct.create_index_pending.clear();
+                            construct.create_sequence_active.clear();
+                            construct.create_synonym_active.clear();
+                            construct.grant_revoke_active.clear();
+                            construct.comment_on_active.clear();
+                            construct.model_active.clear();
+                            construct.model_reference_pending.clear();
+                            construct.returning_active.clear();
+                            construct.fetch_active.clear();
+                            construct.bulk_collect_active.clear();
+                            construct.insert_all_active.clear();
+                            construct.referential_action_pending.clear();
+                            construct.referential_on_active.clear();
+                            if construct.merge_when_branch_active.is_active() {
                                 indent_level = indent_level.saturating_sub(1);
-                                construct.merge_when_branch_active = false;
+                                construct.merge_when_branch_active.clear();
                             }
-                            construct.merge_active = false;
-                            if construct.cursor_sql_active {
+                            construct.merge_active.clear();
+                            if construct.cursor_sql_active.is_active() {
                                 indent_level = indent_level.saturating_sub(1);
-                                construct.cursor_sql_active = false;
+                                construct.cursor_sql_active.clear();
                             }
-                            if construct.forall_body_active {
+                            if construct.forall_body_active.is_active() {
                                 indent_level = indent_level.saturating_sub(1);
-                                construct.forall_body_active = false;
+                                construct.forall_body_active.clear();
                             }
                             if pending_package_member_separator
                                 && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
@@ -4118,12 +4707,13 @@ impl SqlEditorWidget {
                                 out.push_str("\n\n");
                             }
                             pending_package_member_separator = false;
-                            construct.routine_decl_pending = false;
+                            construct.routine_decl_pending.clear();
                             let should_reset_paren_tracking =
                                 indent_level == 0 || block_stack.is_empty();
                             if should_reset_paren_tracking {
                                 suppress_comma_break_depth = 0;
                                 paren_stack.clear();
+                                construct.pop_closed_paren_scopes(0);
                                 paren_clause_restore_stack.clear();
                                 select_list_break_state.clear();
                                 compound_trigger_state.clear();
@@ -4163,6 +4753,7 @@ impl SqlEditorWidget {
                                 current_clause.as_deref(),
                                 prev_word_upper.as_deref(),
                             );
+                            let is_keep_paren = matches!(prev_word_upper.as_deref(), Some("KEEP"));
                             let is_multiline_clause_paren = matches!(
                                 prev_word_upper.as_deref(),
                                 Some("MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT" | "WINDOW")
@@ -4170,7 +4761,7 @@ impl SqlEditorWidget {
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
                             let is_column_list = Self::paren_opens_structured_column_list(
                                 prev_word_upper.as_deref(),
-                                construct.create_table_paren_expected,
+                                construct.create_table_paren_expected.is_active(),
                             );
                             let paren_frame_kind = if is_subquery {
                                 ParenFormatFrameKind::QueryLike
@@ -4219,16 +4810,25 @@ impl SqlEditorWidget {
                                 out.push(' ');
                             }
                             out.push('(');
-                            construct.create_table_paren_expected = false;
+                            construct.create_table_paren_expected.deactivate();
                             paren_stack.push(ParenFormatFrame::new(paren_frame_kind, line_indent));
                             if matches!(prev_word_upper.as_deref(), Some("MATCH_RECOGNIZE")) {
-                                construct.match_recognize_paren_depth = Some(paren_stack.len());
+                                construct
+                                    .match_recognize_paren_depths
+                                    .push(paren_stack.len());
                             }
                             if is_analytic_over_paren {
-                                construct.analytic_over_paren_depth = Some(paren_stack.len());
+                                construct.analytic_over_paren_depths.push(paren_stack.len());
+                            }
+                            if is_keep_paren {
+                                construct.keep_paren_depths.push(paren_stack.len());
                             }
                             paren_clause_restore_stack.push(if paren_frame_kind.is_query_like() {
-                                current_clause.clone()
+                                Some(QueryLikeParenRestoreState {
+                                    clause: current_clause.clone(),
+                                    select_list_layout_state,
+                                    statement_has_with_clause,
+                                })
                             } else {
                                 None
                             });
@@ -4270,7 +4870,7 @@ impl SqlEditorWidget {
                             let paren_frame_kind = paren_stack
                                 .pop()
                                 .unwrap_or(ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0));
-                            let restore_clause = paren_clause_restore_stack.pop().unwrap_or(None);
+                            let restore_state = paren_clause_restore_stack.pop().unwrap_or(None);
                             let close_case_paren_on_newline = !paren_frame_kind.closes_indented()
                                 && out.trim_end().ends_with("END");
                             let close_compact_continuation_on_newline = !paren_frame_kind
@@ -4343,21 +4943,16 @@ impl SqlEditorWidget {
                                     .pop()
                                     .unwrap_or(OpenCursorFormatState::None);
                             }
-                            if paren_frame_kind.is_query_like() {
-                                current_clause = restore_clause;
-                            }
-                            if construct
-                                .match_recognize_paren_depth
-                                .is_some_and(|depth| paren_stack.len() < depth)
+                            if let Some(restore_state) = paren_frame_kind
+                                .is_query_like()
+                                .then_some(restore_state)
+                                .flatten()
                             {
-                                construct.match_recognize_paren_depth = None;
+                                current_clause = restore_state.clause;
+                                select_list_layout_state = restore_state.select_list_layout_state;
+                                statement_has_with_clause = restore_state.statement_has_with_clause;
                             }
-                            if construct
-                                .analytic_over_paren_depth
-                                .is_some_and(|depth| paren_stack.len() < depth)
-                            {
-                                construct.analytic_over_paren_depth = None;
-                            }
+                            construct.pop_closed_paren_scopes(paren_stack.len());
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push(')');
                             if let Some(parent_frame) = paren_stack.last_mut() {
@@ -4624,6 +5219,16 @@ impl SqlEditorWidget {
             && (trimmed.contains("--") || trimmed.contains("/*"))
     }
 
+    fn line_is_structural_case_branch_body(
+        trimmed: &str,
+        trimmed_upper: &str,
+        starts_query_head: bool,
+    ) -> bool {
+        starts_query_head
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CASE")
+            || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
+    }
+
     fn structural_query_head_origin(trimmed_upper: &str) -> QueryHeadLayoutOrigin {
         if Self::line_has_condition_query_owner(trimmed_upper) {
             QueryHeadLayoutOrigin::ConditionOwner
@@ -4767,6 +5372,7 @@ impl SqlEditorWidget {
         is_multiline_clause_owner: bool,
         is_condition_query_owner: bool,
         is_standalone_open_paren_owner: bool,
+        standalone_open_case_child_is_progressive: bool,
         previous_line_ends_with_open_paren: bool,
         paren_layout_frames: &mut Vec<ParenLayoutFrame>,
     ) {
@@ -4781,8 +5387,8 @@ impl SqlEditorWidget {
                 let next_upper = next.to_ascii_uppercase();
                 standalone_open_has_nested_wrapper_child
                     || Self::line_starts_query_head(&next_upper)
-                    || (crate::sql_text::starts_with_keyword_token(&next_upper, "CASE")
-                        && has_parent_general_frame)
+                    || ((has_parent_general_frame || standalone_open_case_child_is_progressive)
+                        && crate::sql_text::starts_with_keyword_token(&next_upper, "CASE"))
             });
 
         for token_idx in start_idx..tokens.len() {
@@ -4830,7 +5436,8 @@ impl SqlEditorWidget {
                     let keeps_parent_owner_depth = kind == ParenLayoutFrameKind::General
                         && is_standalone_open_paren_owner
                         && !previous_line_ends_with_open_paren
-                        && !standalone_open_has_progressive_child;
+                        && (!standalone_open_has_progressive_child
+                            || standalone_open_case_child_is_progressive);
                     let owner_depth = if keeps_parent_owner_depth {
                         line_depth.saturating_sub(1)
                     } else {
@@ -4917,16 +5524,12 @@ impl SqlEditorWidget {
         next_code_indices: &[Option<usize>],
     ) {
         let mut in_dml_statement = false;
-        let mut paren_case_expression_depth = 0usize;
-        let mut pending_paren_case_closer_indent = false;
+        let mut case_layout_state = CaseLayoutState::default();
         let mut last_code_idx: Option<usize> = None;
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
         let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
-        let mut pending_dml_case_expression_close_depth: Option<usize> = None;
-        let mut pending_case_branch_body_depth: Option<usize> = None;
-        let mut pending_query_head_depth: Option<usize> = None;
-        let mut pending_query_head_origin: Option<QueryHeadLayoutOrigin> = None;
+        let mut pending_query_head_frames: Vec<PendingQueryHeadLayoutFrame> = Vec::new();
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
         let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
@@ -4936,8 +5539,9 @@ impl SqlEditorWidget {
         // clause or JOIN at the same parser depth level.  Used so that AND/OR
         // after a subquery close paren within the condition keeps the correct
         // (deeper-than-ON) indent.
-        // Stores (and_depth, parser_depth_of_on_line).
-        let mut join_on_condition_and_depth: Option<(usize, usize)> = None;
+        // Stores (and_depth, parser_depth_of_on_line) for nested JOIN ON/USING
+        // blocks, with the innermost active context at the end.
+        let mut join_on_condition_and_depth: Vec<(usize, usize)> = Vec::new();
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -4948,7 +5552,19 @@ impl SqlEditorWidget {
             let depth = layouts[idx].parser_depth;
             let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            let pending_case_branch_body_depth_for_line = pending_case_branch_body_depth;
+            let active_pending_query_head = pending_query_head_frames.last().copied();
+
+            while join_on_condition_and_depth
+                .last()
+                .is_some_and(|(_, on_depth)| *on_depth > depth)
+            {
+                join_on_condition_and_depth.pop();
+            }
+
+            let pending_case_branch_body_depth_for_line =
+                case_layout_state.pending_branch_body_depth();
+            let pending_dml_case_expression_close_depth_for_line =
+                case_layout_state.pending_dml_case_expression_close_depth();
             let closing_query_frame_count = resolved_query_base_depths
                 .iter()
                 .rev()
@@ -4966,13 +5582,25 @@ impl SqlEditorWidget {
             });
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
+            let previous_line_ends_with_then_for_standalone_case =
+                last_code_idx.is_some_and(|prev_idx| {
+                    Self::line_ends_with_then_before_inline_comment(layouts[prev_idx].trimmed)
+                });
+            let previous_line_is_else_for_standalone_case = last_code_idx.is_some_and(|prev_idx| {
+                layouts[prev_idx]
+                    .trimmed
+                    .to_ascii_uppercase()
+                    .trim()
+                    .eq("ELSE")
+            });
+            let standalone_open_case_child_is_progressive = current_line_is_standalone_open_paren
+                && (previous_line_ends_with_then_for_standalone_case
+                    || previous_line_is_else_for_standalone_case);
             let starts_paren_case_expression =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     && previous_line_ends_with_open_paren;
-            if starts_paren_case_expression {
-                paren_case_expression_depth += 1;
-            }
-            let in_paren_case_expression = paren_case_expression_depth > 0;
+            let in_paren_case_expression = case_layout_state.in_parenthesized_case_expression()
+                || starts_paren_case_expression;
             let starts_dml = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
@@ -5188,7 +5816,7 @@ impl SqlEditorWidget {
                                 )
                                 || crate::sql_text::starts_with_keyword_token(&header_upper, "FOR")
                         });
-            let is_paren_case_closer = pending_paren_case_closer_indent
+            let is_paren_case_closer = case_layout_state.has_pending_paren_case_closer()
                 && starts_with_close_paren
                 && !current_line_is_control_condition_close;
             let paren_case_base_depth = parser_depth;
@@ -5222,8 +5850,14 @@ impl SqlEditorWidget {
                 .rev()
                 .find(|frame| frame.parser_depth == depth)
                 .copied();
+            let active_parenthesized_case_frame = (!in_dml_statement)
+                .then(|| case_layout_state.active_parenthesized_case_frame())
+                .flatten();
+            let current_line_multiline_clause_owner_kind = in_dml_statement
+                .then(|| Self::line_multiline_clause_owner_kind(trimmed))
+                .flatten();
             let current_line_starts_multiline_clause =
-                in_dml_statement && Self::line_starts_multiline_clause_block(trimmed);
+                current_line_multiline_clause_owner_kind.is_some();
             let current_line_closes_multiline_clause = multiline_clause_frames
                 .last()
                 .copied()
@@ -5373,9 +6007,10 @@ impl SqlEditorWidget {
                     .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
             } else if in_dml_statement
                 && starts_with_close_paren
-                && pending_dml_case_expression_close_depth.is_some()
+                && pending_dml_case_expression_close_depth_for_line.is_some()
             {
-                let owner_depth = pending_dml_case_expression_close_depth.unwrap_or(parser_depth);
+                let owner_depth =
+                    pending_dml_case_expression_close_depth_for_line.unwrap_or(parser_depth);
                 current_line_dml_case_expression_close_depth = Some(owner_depth);
                 owner_depth.max(parser_depth)
             } else if starts_with_close_paren && is_paren_case_closer {
@@ -5391,7 +6026,9 @@ impl SqlEditorWidget {
                     .max(parser_depth)
             } else if uses_analyzer_query_depth {
                 if starts_query_head {
-                    pending_query_head_depth.unwrap_or(analyzer_query_depth)
+                    active_pending_query_head
+                        .map(|frame| frame.depth)
+                        .unwrap_or(analyzer_query_depth)
                 } else {
                     analyzer_query_depth
                 }
@@ -5547,7 +6184,7 @@ impl SqlEditorWidget {
                     .map(|depth| depth.saturating_add(1))
                     .unwrap_or(parser_depth.saturating_add(1));
                 if previous_line_starts_with_close_paren {
-                    if let Some((join_and_depth, _)) = join_on_condition_and_depth {
+                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
                         // Inside a JOIN ON condition block: AND/OR after a
                         // close paren (e.g. subquery) should stay at the
                         // same depth as other AND/OR in this ON block.
@@ -5753,6 +6390,15 @@ impl SqlEditorWidget {
                     }
                 }
             }
+            if let Some(case_frame) = active_parenthesized_case_frame {
+                if case_frame.indent_branches
+                    && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+                {
+                    effective_depth = effective_depth.max(case_frame.depth.saturating_add(1));
+                } else if Self::starts_with_case_terminator(&trimmed_upper) {
+                    effective_depth = effective_depth.max(case_frame.depth);
+                }
+            }
             if current_line_is_condition_keyword {
                 if let Some(frame) = active_dml_case_condition_frame {
                     effective_depth = effective_depth.max(frame.continuation_depth);
@@ -5790,8 +6436,14 @@ impl SqlEditorWidget {
                         || Self::starts_with_case_terminator(&trimmed_upper)
                     {
                         effective_depth
-                    } else {
+                    } else if Self::line_is_structural_case_branch_body(
+                        trimmed,
+                        &trimmed_upper,
+                        starts_query_head,
+                    ) {
                         effective_depth.max(branch_body_depth)
+                    } else {
+                        effective_depth
                     }
                 } else {
                     effective_depth
@@ -5890,9 +6542,10 @@ impl SqlEditorWidget {
                     let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
                     let resolved_base_depth = effective_depth.saturating_sub(extra_depth);
                     let close_align_depth = resolved_base_depth.saturating_sub(1);
-                    let query_head_origin =
-                        pending_query_head_origin.unwrap_or(QueryHeadLayoutOrigin::Other);
-                    let should_store_resolved_query_base = pending_query_head_depth.is_some()
+                    let query_head_origin = active_pending_query_head
+                        .map(|frame| frame.origin)
+                        .unwrap_or(QueryHeadLayoutOrigin::Other);
+                    let should_store_resolved_query_base = active_pending_query_head.is_some()
                         || resolved_base_depth != query_base_depth;
                     if should_store_resolved_query_base {
                         if let Some(frame) = resolved_query_base_depths
@@ -5921,6 +6574,34 @@ impl SqlEditorWidget {
             layouts[idx].dml_case_expression_close_depth =
                 current_line_dml_case_expression_close_depth;
 
+            let starts_nested_parenthesized_case = !in_dml_statement
+                && current_line_starts_case
+                && !starts_paren_case_expression
+                && active_parenthesized_case_frame.is_some()
+                && (previous_line_ends_with_then || previous_line_is_else);
+            let starts_parenthesized_case_after_branch_wrapper = starts_paren_case_expression
+                && previous_line_is_standalone_open_paren
+                && last_code_idx
+                    .and_then(|prev_idx| previous_code_indices.get(prev_idx).copied().flatten())
+                    .is_some_and(|owner_idx| {
+                        Self::line_ends_with_then_before_inline_comment(layouts[owner_idx].trimmed)
+                            || layouts[owner_idx]
+                                .trimmed
+                                .to_ascii_uppercase()
+                                .trim()
+                                .eq("ELSE")
+                    });
+            if (starts_paren_case_expression || starts_nested_parenthesized_case)
+                && !in_dml_statement
+            {
+                case_layout_state.note_parenthesized_case_frame_depth(
+                    effective_depth,
+                    starts_paren_case_expression,
+                    starts_nested_parenthesized_case
+                        || starts_parenthesized_case_after_branch_wrapper,
+                );
+            }
+
             // Track JOIN ON condition AND depth: set when we see ON/USING
             // in a join context, or when an AND/OR is processed that
             // continues a join condition.  Clear on a new clause/JOIN
@@ -5936,29 +6617,50 @@ impl SqlEditorWidget {
                 if is_join_condition_line
                     && layouts[idx].query_role == AutoFormatQueryRole::Continuation
                 {
-                    join_on_condition_and_depth = Some((effective_depth.saturating_add(1), depth));
-                } else if current_line_is_condition_keyword && join_on_condition_and_depth.is_some()
+                    while join_on_condition_and_depth
+                        .last()
+                        .is_some_and(|(_, on_depth)| *on_depth >= depth)
+                    {
+                        join_on_condition_and_depth.pop();
+                    }
+                    join_on_condition_and_depth.push((effective_depth.saturating_add(1), depth));
+                } else if current_line_is_condition_keyword
+                    && !join_on_condition_and_depth.is_empty()
                 {
                     // AND/OR continues the join condition block; keep the
                     // tracked depth (don't clear).
                 } else if (is_join_clause_line || is_dml_clause || starts_query_head)
-                    && join_on_condition_and_depth.is_some_and(|(_, on_depth)| depth <= on_depth)
+                    && join_on_condition_and_depth
+                        .last()
+                        .is_some_and(|(_, on_depth)| depth <= *on_depth)
                 {
                     // Only clear when the new clause is at the same or
                     // lower parser depth — subquery heads inside the ON
                     // condition should not clear this state.
-                    join_on_condition_and_depth = None;
+                    while join_on_condition_and_depth
+                        .last()
+                        .is_some_and(|(_, on_depth)| depth <= *on_depth)
+                    {
+                        join_on_condition_and_depth.pop();
+                    }
                 }
             }
             if pending_case_branch_body_depth_for_line.is_some() {
-                pending_case_branch_body_depth = None;
+                case_layout_state.consume_pending_branch_body_depth();
             }
             if in_dml_statement
                 && dml_case_frames.last().is_some()
                 && (Self::line_ends_with_then_before_inline_comment(trimmed)
                     || trimmed_upper.trim() == "ELSE")
             {
-                pending_case_branch_body_depth = Some(layouts[idx].final_depth.saturating_add(1));
+                case_layout_state
+                    .note_pending_branch_body_depth(layouts[idx].final_depth.saturating_add(1));
+            } else if active_parenthesized_case_frame.is_some()
+                && (Self::line_ends_with_then_before_inline_comment(trimmed)
+                    || trimmed_upper.trim() == "ELSE")
+            {
+                case_layout_state
+                    .note_pending_branch_body_depth(layouts[idx].final_depth.saturating_add(1));
             }
             let current_condition_header_depth = if current_line_is_parenthesized_condition_header {
                 Some(effective_depth)
@@ -5978,10 +6680,12 @@ impl SqlEditorWidget {
                 multiline_clause_frames.pop();
             }
             if current_line_starts_multiline_clause {
-                multiline_clause_frames.push(MultilineClauseLayoutFrame {
-                    owner_depth: effective_depth,
-                    nested_paren_depth: 1,
-                });
+                if current_line_multiline_clause_owner_kind.is_some() {
+                    multiline_clause_frames.push(MultilineClauseLayoutFrame {
+                        owner_depth: effective_depth,
+                        nested_paren_depth: 1,
+                    });
+                }
             }
             let anchor_group = if !in_dml_statement
                 && previous_line_ends_with_trailing_comma
@@ -6033,7 +6737,10 @@ impl SqlEditorWidget {
                     if frame.expression_owner_depth.is_some()
                         && next_code_trimmed.is_some_and(|next| next.trim_start().starts_with(')'))
                     {
-                        pending_dml_case_expression_close_depth = frame.expression_owner_depth;
+                        if let Some(owner_depth) = frame.expression_owner_depth {
+                            case_layout_state
+                                .note_pending_dml_case_expression_close_depth(owner_depth);
+                        }
                     }
                 }
                 while dml_case_condition_frames
@@ -6068,17 +6775,18 @@ impl SqlEditorWidget {
             }
 
             if in_paren_case_expression && Self::starts_with_case_terminator(&trimmed_upper) {
-                paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
-                if paren_case_expression_depth == 0 {
-                    pending_paren_case_closer_indent = true;
-                }
+                case_layout_state.note_parenthesized_case_terminator(&line_tokens);
             }
 
-            if pending_paren_case_closer_indent && starts_with_close_paren {
-                pending_paren_case_closer_indent = false;
+            if case_layout_state.has_pending_paren_case_closer() && starts_with_close_paren {
+                case_layout_state.consume_pending_paren_case_closer();
             }
-            if pending_dml_case_expression_close_depth.is_some() && starts_with_close_paren {
-                pending_dml_case_expression_close_depth = None;
+            if case_layout_state
+                .pending_dml_case_expression_close_depth()
+                .is_some()
+                && starts_with_close_paren
+            {
+                case_layout_state.consume_pending_dml_case_expression_close_depth();
             }
             Self::update_paren_layout_frames_for_line(
                 &line_tokens,
@@ -6088,13 +6796,13 @@ impl SqlEditorWidget {
                 current_line_starts_multiline_clause,
                 current_line_is_condition_query_owner,
                 current_line_is_standalone_open_paren,
+                standalone_open_case_child_is_progressive,
                 previous_line_ends_with_open_paren,
                 &mut paren_layout_frames,
             );
 
-            if starts_query_head || pending_query_head_depth.is_some() {
-                pending_query_head_depth = None;
-                pending_query_head_origin = None;
+            if starts_query_head {
+                pending_query_head_frames.clear();
             }
             if let Some(next_query_head_depth) = layouts[idx].next_query_head_depth {
                 let case_condition_query_owner_depth = if current_line_is_condition_query_owner
@@ -6130,25 +6838,24 @@ impl SqlEditorWidget {
                                 .saturating_sub(layouts[idx].final_depth),
                         )
                     };
-                pending_query_head_depth = Some(adjusted_next_query_head_depth);
-                pending_query_head_origin =
-                    Some(Self::structural_query_head_origin(&trimmed_upper));
+                pending_query_head_frames.push(PendingQueryHeadLayoutFrame {
+                    depth: adjusted_next_query_head_depth,
+                    origin: Self::structural_query_head_origin(&trimmed_upper),
+                });
+            } else if !starts_query_head && !pending_query_head_frames.is_empty() {
+                pending_query_head_frames.clear();
             }
 
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
-                pending_query_head_depth = None;
-                pending_query_head_origin = None;
+                pending_query_head_frames.clear();
                 resolved_query_base_depths.clear();
                 multiline_clause_frames.clear();
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
                 dml_case_condition_frames.clear();
-                paren_case_expression_depth = 0;
-                pending_paren_case_closer_indent = false;
-                pending_dml_case_expression_close_depth = None;
-                pending_case_branch_body_depth = None;
-                join_on_condition_and_depth = None;
+                case_layout_state.clear();
+                join_on_condition_and_depth.clear();
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -6489,6 +7196,21 @@ impl SqlEditorWidget {
         crate::sql_text::starts_with_format_layout_clause(trimmed_upper)
     }
 
+    fn is_match_recognize_stage1_subclause_start(keyword: &str, next_word: Option<&str>) -> bool {
+        matches!(keyword, "MEASURES" | "PATTERN" | "DEFINE" | "SUBSET")
+            || (keyword == "ONE" && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW")))
+            || (keyword == "ALL" && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROWS")))
+            || (keyword == "AFTER"
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("MATCH")))
+    }
+
+    fn is_model_subclause_start_keyword(keyword: &str) -> bool {
+        matches!(
+            keyword,
+            "PARTITION" | "DIMENSION" | "MEASURES" | "REFERENCE" | "RULES"
+        )
+    }
+
     fn starts_with_condition_keyword(trimmed_upper: &str) -> bool {
         crate::sql_text::starts_with_keyword_token(trimmed_upper, "AND")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OR")
@@ -6513,6 +7235,7 @@ impl SqlEditorWidget {
             || trimmed_upper.starts_with("ONE ROW PER MATCH")
             || trimmed_upper.starts_with("ALL ROWS PER MATCH")
             || trimmed_upper.starts_with("AFTER MATCH SKIP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SUBSET")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "PATTERN")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "DEFINE")
     }
@@ -6921,22 +7644,12 @@ impl SqlEditorWidget {
         crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
     }
 
-    fn line_starts_multiline_clause_block(line: &str) -> bool {
+    fn line_multiline_clause_owner_kind(line: &str) -> Option<FormatIndentedParenOwnerKind> {
         if !Self::line_ends_with_open_paren_before_inline_comment(line) {
-            return false;
+            return None;
         }
 
-        super::query_text::tokenize_sql(line)
-            .into_iter()
-            .any(|token| match token {
-                SqlToken::Word(word) => {
-                    word.eq_ignore_ascii_case("MATCH_RECOGNIZE")
-                        || word.eq_ignore_ascii_case("PIVOT")
-                        || word.eq_ignore_ascii_case("UNPIVOT")
-                        || word.eq_ignore_ascii_case("WINDOW")
-                }
-                _ => false,
-            })
+        crate::sql_text::format_indented_paren_owner_kind(line)
     }
 
     fn paren_starts_first_clause_list_item(
@@ -7694,6 +8407,95 @@ impl SqlEditorWidget {
 
     pub(super) fn escape_sql_literal(value: &str) -> String {
         value.replace('\'', "''")
+    }
+}
+
+#[cfg(test)]
+mod formatter_scope_state_tests {
+    use super::{FormatScope, ScopedFlag, ScopedValue, SqlEditorWidget};
+
+    #[test]
+    fn scoped_flag_same_scope_activation_is_idempotent() {
+        let mut flag = ScopedFlag::default();
+        let scope = FormatScope::new(0, 0);
+
+        flag.activate(scope);
+        flag.activate(scope);
+        flag.deactivate();
+
+        assert!(
+            !flag.is_active(),
+            "same-scope activation should not require multiple deactivations"
+        );
+    }
+
+    #[test]
+    fn scoped_value_restores_outer_scope_after_inner_scope_exits() {
+        let mut value = ScopedValue::default();
+        let outer_scope = FormatScope::new(0, 0);
+        let inner_scope = FormatScope::new(1, 0);
+
+        value.replace(outer_scope, "OUTER".to_string());
+        value.replace(inner_scope, "INNER".to_string());
+        assert_eq!(value.as_deref(), Some("INNER"));
+
+        value.sync_scope(outer_scope);
+
+        assert_eq!(
+            value.as_deref(),
+            Some("OUTER"),
+            "scoped values should restore the outer frame after the inner scope closes"
+        );
+    }
+
+    #[test]
+    fn format_sql_search_cycle_scope_does_not_leak_into_following_update_set_clause() {
+        let source = "WITH r (id, parent_id) AS (SELECT 1, 0 FROM dual UNION ALL SELECT id + 1, parent_id FROM r WHERE id < 2) SEARCH DEPTH FIRST BY id SET ord CYCLE id SET is_cycle TO 'Y' DEFAULT 'N' UPDATE demo SET status = 'DONE' WHERE id IN (SELECT id FROM r);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("UPDATE demo"))
+            .unwrap_or_else(|| panic!("UPDATE line, got:\n{}", formatted));
+        let set_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SET status = 'DONE'"))
+            .unwrap_or_else(|| panic!("SET line, got:\n{}", formatted));
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE id IN ("))
+            .unwrap_or_else(|| panic!("WHERE line, got:\n{}", formatted));
+
+        assert_eq!(
+            leading_spaces(lines[update_idx]),
+            0,
+            "UPDATE after SEARCH/CYCLE should return to top-level depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            0,
+            "SET after SEARCH/CYCLE should open a real UPDATE SET clause instead of inheriting recursive CTE SET suppression, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[where_idx]),
+            0,
+            "WHERE after UPDATE SET should stay aligned with the UPDATE clause, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SEARCH DEPTH FIRST BY id SET ord"),
+            "SEARCH clause should keep its inline SET payload, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("CYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"),
+            "CYCLE clause should keep its inline SET payload, got:\n{}",
+            formatted
+        );
     }
 }
 
@@ -12736,6 +13538,75 @@ FROM recent_orders o;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_outer_analytic_over_depth_after_nested_over() {
+        let source = r#"SELECT
+    SUM (sal) OVER (
+        PARTITION BY deptno
+        ORDER BY (
+            SELECT MAX (inner_val) OVER (
+                PARTITION BY grp
+                ORDER BY inner_val
+            )
+            FROM dual
+        )
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_sal
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let over_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SUM (sal) OVER ("))
+            .unwrap_or(0);
+        let outer_partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY deptno"))
+            .unwrap_or(0);
+        let inner_partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY grp"))
+            .unwrap_or(0);
+        let rows_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("ROWS BETWEEN UNBOUNDED PRECEDING")
+            })
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") AS running_sal"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[outer_partition_idx]),
+            indent(lines[over_idx]).saturating_add(4),
+            "outer OVER subclauses should stay one level deeper than the OVER owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rows_idx]),
+            indent(lines[outer_partition_idx]),
+            "ROWS BETWEEN should return to the outer OVER subclause depth after nested OVER closes, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_partition_idx]) > indent(lines[outer_partition_idx]),
+            "nested OVER subclauses should stay deeper than the outer OVER subclauses, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[over_idx]),
+            "analytic OVER close should realign with the OVER owner line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_from_under_general_function_paren() {
         let source = r#"SELECT
     OVERLAY (
@@ -13357,6 +14228,22 @@ mod format_indent_gap_tests {
     }
 
     #[test]
+    fn format_sql_basic_keeps_keep_dense_rank_order_by_inline() {
+        let source = "select deptno, max(sal) keep (dense_rank last order by sal, empno) as top_sal from emp group by deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("KEEP (DENSE_RANK LAST ORDER BY sal, empno)"),
+            "KEEP (DENSE_RANK ... ORDER BY ...) should stay inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nORDER BY sal"),
+            "KEEP internal ORDER BY must not be broken like a clause, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_keeps_sum_case_indented_inside_with_plsql_cte() {
         let source = r#"WITH
     FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS
@@ -13852,6 +14739,38 @@ ORDER BY d.dept_id;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_nested_condition_and_wrapper_query_owner_chain_uses_stack_depth()
+    {
+        let source =
+            "SELECT CASE WHEN EXISTS ((SELECT 1 FROM dual)) THEN 'Y' ELSE 'N' END AS flag FROM dual;";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = [
+            "SELECT",
+            "    CASE",
+            "        WHEN EXISTS (",
+            "            (",
+            "                SELECT 1",
+            "                FROM DUAL",
+            "            )",
+            "        ) THEN 'Y'",
+            "        ELSE 'N'",
+            "    END AS flag",
+            "FROM DUAL;",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            formatted, expected,
+            "nested EXISTS + wrapper query-owner chain should consume pending query-head depth in stack order"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            expected,
+            "nested EXISTS + wrapper query-owner chain formatting should remain stable"
+        );
+    }
+
+    #[test]
     fn format_for_auto_formatting_keeps_cte_close_depth_after_pivot_and_unpivot_blocks() {
         let source = r#"WITH src AS (
     SELECT
@@ -14174,6 +15093,49 @@ ORDER BY u.dept_id,
     }
 
     #[test]
+    fn format_sql_basic_keeps_outer_match_recognize_subclauses_after_nested_match_recognize() {
+        let source = "select * from sales match_recognize (partition by cust_id order by sale_date measures (select count(*) from (select * from sales match_recognize (partition by cust_id order by sale_date measures match_number() as inner_no one row per match pattern (a) define a as amount > 0)) nested_rows) as inner_cnt all rows per match pattern (a b+) define a as amount < 50, b as amount >= 50);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let outer_all_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("ALL ROWS PER MATCH"))
+            .expect("outer ALL ROWS PER MATCH line");
+        let outer_pattern_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("PATTERN ("))
+            .expect("outer PATTERN line");
+        let outer_define_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("DEFINE "))
+            .expect("outer DEFINE line");
+        let inner_one_row_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ONE ROW PER MATCH"))
+            .expect("inner ONE ROW PER MATCH line");
+
+        assert_eq!(
+            indent(lines[outer_pattern_idx]),
+            indent(lines[outer_all_idx]),
+            "Outer PATTERN should keep the outer MATCH_RECOGNIZE subclause depth after nested MATCH_RECOGNIZE closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_define_idx]),
+            indent(lines[outer_all_idx]),
+            "Outer DEFINE should keep the outer MATCH_RECOGNIZE subclause depth after nested MATCH_RECOGNIZE closes, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_one_row_idx]) > indent(lines[outer_all_idx]),
+            "Nested MATCH_RECOGNIZE subclauses should stay deeper than the outer MATCH_RECOGNIZE subclauses, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_breaks_model_subclauses() {
         let source = "select * from sales model partition by (year_key, channel_code) dimension by (month_key) measures (base_amt, proj_amt) rules sequential order (proj_amt[any] = base_amt[cv(month_key)]);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -14491,6 +15453,29 @@ END;"#;
         );
     }
 
+    #[test]
+    fn apply_parser_depth_indentation_keeps_nested_json_table_columns_stack_stable() {
+        let expected = r#"SELECT jt.order_id,
+    jt.sku
+FROM JSON_TABLE(
+    payload,
+    '$' COLUMNS (
+        order_id NUMBER PATH '$.order_id',
+        NESTED PATH '$.items[*]' COLUMNS (
+            sku VARCHAR2 (30) PATH '$.sku',
+            qty NUMBER PATH '$.qty'
+        )
+    )
+) jt;"#;
+
+        let indented = SqlEditorWidget::apply_parser_depth_indentation(expected);
+
+        assert_eq!(
+            indented, expected,
+            "secondary indentation should keep nested table-function COLUMNS blocks on their own owner stack"
+        );
+    }
+
     // ── INSERT ALL INTO indent ──
 
     #[test]
@@ -14795,6 +15780,183 @@ FROM t1;"#;
             "CASE after ELSE should indent one level deeper than the ELSE branch header, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_nested_parenthesized_case_condition_keeps_each_close_paren_on_its_owner() {
+        let source = r#"BEGIN
+    IF (
+        CASE
+            WHEN flag = 'Y' THEN (
+                CASE
+                    WHEN nested_flag = 'Y' THEN 1
+                    ELSE 0
+                END
+            )
+            ELSE 0
+        END
+    ) = 1 THEN
+        NULL;
+    END IF;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx = find_line_starting_with(&lines, "IF (").expect("IF line");
+        let outer_when_idx =
+            find_line_starting_with(&lines, "WHEN flag = 'Y' THEN").expect("outer WHEN line");
+        let inner_case_idx = find_line_starting_with(&lines, "CASE")
+            .and_then(|idx| (idx > if_idx).then_some(idx + 1))
+            .and_then(|start| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .find(|(_, line)| line.trim_start() == "CASE")
+                    .map(|(idx, _)| idx)
+            })
+            .expect("inner CASE line");
+        let inner_when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN nested_flag = 'Y' THEN"))
+            .map(|(idx, _)| idx)
+            .expect("inner WHEN line");
+        let inner_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_when_idx + 1)
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("inner close paren line");
+        let outer_close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") = 1 THEN"))
+            .expect("outer close paren line");
+
+        assert!(
+            leading_spaces(lines[inner_case_idx]) > leading_spaces(lines[outer_when_idx]),
+            "inner CASE should indent deeper than the outer WHEN owner, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[inner_when_idx]) > leading_spaces(lines[inner_case_idx]),
+            "inner WHEN should indent deeper than the nested CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[inner_close_idx]),
+            leading_spaces(lines[outer_when_idx]),
+            "inner close paren should realign to the outer WHEN owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_close_idx]),
+            leading_spaces(lines[if_idx]),
+            "outer close paren should realign to the IF owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_nested_parenthesized_dml_case_branches_keep_stack_scoped_indents() {
+        let source = r#"SELECT CASE
+WHEN a = 1 THEN (
+CASE
+WHEN b = 2 THEN (
+CASE
+WHEN c = 3 THEN 1
+ELSE 0
+END
+)
+ELSE 2
+END
+)
+ELSE 3
+END AS result
+FROM dual;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let outer_when_idx =
+            find_line_starting_with(&lines, "WHEN a = 1 THEN").expect("outer WHEN line");
+        let first_open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_when_idx + 1)
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .expect("first open paren line");
+        let middle_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_open_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("middle CASE line");
+        let inner_when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(middle_case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN b = 2 THEN"))
+            .map(|(idx, _)| idx)
+            .expect("inner WHEN line");
+        let second_open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_when_idx + 1)
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .expect("second open paren line");
+        let deepest_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_open_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("deepest CASE line");
+        let inner_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(deepest_case_idx + 1)
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("inner close paren line");
+        let outer_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_close_idx + 1)
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("outer close paren line");
+
+        assert!(
+            leading_spaces(lines[middle_case_idx]) > leading_spaces(lines[first_open_idx]),
+            "CASE after the first standalone paren should indent deeper than the wrapper line, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[deepest_case_idx]) > leading_spaces(lines[second_open_idx]),
+            "deepest CASE should indent deeper than the nested wrapper line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[inner_close_idx]),
+            leading_spaces(lines[inner_when_idx]),
+            "inner close paren should realign to its WHEN owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_close_idx]),
+            leading_spaces(lines[outer_when_idx]),
+            "outer close paren should realign to the outer WHEN owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
 
     #[test]
@@ -16303,6 +17465,50 @@ join b on a.id = b.id and a.x = b.x
             }
         }
 
+        // 12b. JOIN ON with nested JOIN ON inside subquery then outer AND
+        let formatted = format_check(
+            "Nested-JOIN-in-ON",
+            "select * from a join b on a.id = b.id and exists (select 1 from c join d on c.id = d.c_id and d.flag = 'Y' where c.id = a.id) and a.x = b.x;",
+        );
+        {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+            let outer_on_idx = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("ON a.id = b.id"))
+                .expect("outer ON line");
+            let inner_on_idx = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("ON c.id = d.c_id"))
+                .expect("inner ON line");
+            let inner_and_idx = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("AND d.flag = 'Y'"))
+                .expect("inner AND line");
+            let outer_and_idx = lines
+                .iter()
+                .rposition(|line| line.trim_start().starts_with("AND a.x = b.x"))
+                .expect("outer AND line");
+
+            assert_eq!(
+                indent(lines[outer_and_idx]),
+                indent(lines[outer_on_idx]) + 4,
+                "Outer AND after nested JOIN ON subquery should return to the outer ON depth, got:\n{}",
+                formatted
+            );
+            assert_eq!(
+                indent(lines[inner_and_idx]),
+                indent(lines[inner_on_idx]) + 4,
+                "Inner AND inside nested JOIN ON should stay aligned to the inner ON depth, got:\n{}",
+                formatted
+            );
+            assert!(
+                indent(lines[inner_and_idx]) > indent(lines[outer_and_idx]),
+                "Nested JOIN ON continuation should remain deeper than the outer JOIN ON continuation, got:\n{}",
+                formatted
+            );
+        }
+
         // 13. JOIN ON subquery then WHERE (state should be cleared for WHERE)
         let formatted = format_check("ON-subquery-then-WHERE",
             "select * from a join b on a.id = b.id and a.type in (select type from types) where a.x = 1 and a.y = 2;");
@@ -16477,6 +17683,34 @@ join b on a.id = b.id and a.x = b.x
     }
 
     #[test]
+    fn format_sql_match_recognize_after_match_skip_and_subset_on_own_lines() {
+        let source = "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY cust_id ORDER BY sale_date MEASURES MATCH_NUMBER() AS mno AFTER MATCH SKIP TO NEXT ROW SUBSET ab = (A, B) PATTERN (A B+) DEFINE A AS amount < 50, B AS amount >= 50);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains(
+                "MATCH_NUMBER () AS mno
+    AFTER MATCH SKIP TO NEXT ROW"
+            ),
+            "AFTER MATCH SKIP should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(
+                "AFTER MATCH SKIP TO NEXT ROW
+    SUBSET ab = (A, B)
+    PATTERN"
+            ),
+            "SUBSET should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic(&formatted),
+            formatted,
+            "MATCH_RECOGNIZE AFTER MATCH SKIP/SUBSET formatting should be idempotent"
+        );
+    }
+
+    #[test]
     fn format_sql_analytic_over_clause_breaks_subclauses() {
         let source = "SELECT empno, SUM(sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal FROM emp;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -16524,6 +17758,39 @@ FROM emp;"#;
         assert!(
             formatted.contains("OVER (\n        PARTITION BY deptno\n    )"),
             "Single PARTITION BY in OVER should be on its own line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_analytic_over_restores_outer_window_depth_after_nested_over() {
+        let source = "SELECT SUM(sal) OVER (PARTITION BY deptno ORDER BY (SELECT MAX(inner_val) OVER (PARTITION BY grp ORDER BY inner_val) FROM dual) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let outer_partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY deptno"))
+            .expect("outer PARTITION BY line");
+        let inner_partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY grp"))
+            .expect("inner PARTITION BY line");
+        let outer_rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ROWS BETWEEN"))
+            .expect("outer ROWS BETWEEN line");
+
+        assert_eq!(
+            indent(lines[outer_rows_idx]),
+            indent(lines[outer_partition_idx]),
+            "Outer ROWS BETWEEN should stay aligned with the outer OVER subclauses after nested OVER closes, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_partition_idx]) > indent(lines[outer_partition_idx]),
+            "Nested OVER subclauses should stay deeper than the outer OVER subclauses, got:\n{}",
             formatted
         );
     }
@@ -17544,6 +18811,73 @@ MATCH_RECOGNIZE (
         );
     }
 
+    #[test]
+    fn format_sql_nested_recursive_cte_search_cycle_scopes_outer_and_inner_clauses() {
+        let source = "WITH outer_r (id, parent_id) AS (SELECT id, parent_id FROM (WITH inner_r (id) AS (SELECT 1 FROM dual UNION ALL SELECT id + 1 FROM inner_r WHERE id < 2) SEARCH DEPTH FIRST BY id SET inner_ord CYCLE id SET inner_cycle TO 'Y' DEFAULT 'N' SELECT id, 0 AS parent_id FROM inner_r) nested_src UNION ALL SELECT id + 1, parent_id FROM outer_r WHERE id < 3) SEARCH DEPTH FIRST BY id SET outer_ord CYCLE id SET outer_cycle TO 'Y' DEFAULT 'N' SELECT id, outer_ord, outer_cycle FROM outer_r ORDER BY outer_ord;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let inner_search_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("SEARCH DEPTH FIRST BY id SET inner_ord")
+            })
+            .expect("inner SEARCH line");
+        let inner_cycle_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("CYCLE id SET inner_cycle TO 'Y' DEFAULT 'N'")
+            })
+            .expect("inner CYCLE line");
+        let outer_search_idx = lines
+            .iter()
+            .rposition(|line| {
+                line.trim_start()
+                    .starts_with("SEARCH DEPTH FIRST BY id SET outer_ord")
+            })
+            .expect("outer SEARCH line");
+        let outer_cycle_idx = lines
+            .iter()
+            .rposition(|line| {
+                line.trim_start()
+                    .starts_with("CYCLE id SET outer_cycle TO 'Y' DEFAULT 'N'")
+            })
+            .expect("outer CYCLE line");
+        let outer_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_cycle_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT"))
+            .map(|(idx, _)| idx)
+            .expect("outer SELECT line");
+
+        assert_eq!(
+            leading_spaces(lines[inner_search_idx]),
+            leading_spaces(lines[inner_cycle_idx]),
+            "Inner SEARCH/CYCLE should stay aligned to the inner recursive WITH depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_search_idx]),
+            leading_spaces(lines[outer_cycle_idx]),
+            "Outer SEARCH/CYCLE should stay aligned to the outer recursive WITH depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[inner_search_idx]) > leading_spaces(lines[outer_search_idx]),
+            "Nested SEARCH/CYCLE should remain deeper than the outer recursive WITH clauses, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_select_idx]),
+            0,
+            "Outer main SELECT should return to top-level depth after nested SEARCH/CYCLE clauses, got:\n{}",
+            formatted
+        );
+    }
+
     // ── Bug candidate 5: MODEL clause subclauses ──
 
     #[test]
@@ -17672,6 +19006,179 @@ MATCH_RECOGNIZE (
         assert_eq!(
             formatted, formatted_again,
             "WITH FUNCTION formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_with_function_body_does_not_leak_plsql_context_into_for_update() {
+        let source = "WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT d.dummy FROM dual d FOR UPDATE OF d.dummy NOWAIT;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT d.dummy"))
+            .expect("main SELECT line");
+        let for_update_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("FOR UPDATE OF d.dummy NOWAIT")
+            })
+            .expect("FOR UPDATE line");
+
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            0,
+            "Main SELECT after WITH FUNCTION should return to top-level depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[for_update_idx]),
+            0,
+            "FOR UPDATE after WITH FUNCTION should stay at SQL clause depth instead of inheriting PL/SQL block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("FOR UPDATE OF d.dummy NOWAIT"),
+            "FOR UPDATE OF ... NOWAIT should stay inline after WITH FUNCTION, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_function_local_function_body_stays_attached_to_main_query() {
+        let source = "WITH\n  FUNCTION outer_f RETURN NUMBER IS\n    FUNCTION inner_f RETURN NUMBER IS\n    BEGIN\n      RETURN 1;\n    END inner_f;\n  BEGIN\n    RETURN inner_f();\n  END outer_f;\nSELECT outer_f() AS v FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let end_inner_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END inner_f;"))
+            .expect("local function END line");
+        let outer_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(end_inner_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("outer function BEGIN line");
+        let end_outer_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END outer_f;"))
+            .expect("outer function END line");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT outer_f"))
+            .expect("main SELECT line");
+
+        assert!(
+            end_inner_idx < outer_begin_idx && outer_begin_idx < end_outer_idx,
+            "nested local function END must not close the outer WITH FUNCTION body early, got:\n{}",
+            formatted
+        );
+        assert!(
+            end_outer_idx < select_idx,
+            "main SELECT must stay after the outer WITH FUNCTION END, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[outer_begin_idx]),
+            4,
+            "outer function BEGIN should remain one level under WITH, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            0,
+            "main SELECT after nested local function should return to top-level depth, got:\n{}",
+            formatted
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "nested local function formatting should be idempotent, got:\n{}",
+            formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_with_function_multi_parameter_header_stays_attached_to_main_query() {
+        let source = "WITH FUNCTION add_two (p_left NUMBER, p_right NUMBER) RETURN NUMBER IS BEGIN RETURN p_left + p_right; END; SELECT add_two(1, 2) AS v FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT add_two"))
+            .expect("main SELECT line");
+
+        assert!(
+            formatted.contains("FUNCTION add_two")
+                && formatted.contains("p_left NUMBER")
+                && formatted.contains("p_right NUMBER"),
+            "WITH FUNCTION header with multi-parameter list should stay intact, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            lines[select_idx]
+                .len()
+                .saturating_sub(lines[select_idx].trim_start().len()),
+            0,
+            "main SELECT after multi-parameter WITH FUNCTION should return to top-level depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_with_package_member_function_body_stays_attached_to_main_query() {
+        let source = "WITH\n  PACKAGE pkg_demo AS\n    FUNCTION f RETURN NUMBER IS\n    BEGIN\n      RETURN 1;\n    END f;\n  END pkg_demo;\nSELECT pkg_demo.f() AS v FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let end_member_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END f;"))
+            .expect("member function END line");
+        let end_package_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END pkg_demo;"))
+            .expect("package END line");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT pkg_demo.f"))
+            .expect("main SELECT line");
+
+        assert!(
+            end_member_idx < end_package_idx,
+            "member routine END must stay inside the WITH PACKAGE body, got:\n{}",
+            formatted
+        );
+        assert!(
+            end_package_idx < select_idx,
+            "main SELECT must stay after END pkg_demo, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_package_idx]),
+            4,
+            "END pkg_demo should stay indented under WITH, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            0,
+            "main SELECT after WITH PACKAGE member body should return to top-level depth, got:\n{}",
+            formatted
+        );
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "WITH PACKAGE member-body formatting should be idempotent, got:\n{}",
             formatted_again
         );
     }
@@ -18275,5 +19782,208 @@ MATCH_RECOGNIZE (
 
         assert_eq!(formatted, expected);
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), expected);
+    }
+
+    #[test]
+    fn format_sql_basic_nested_with_scalar_subquery_restores_outer_select_list_depth() {
+        let source = "SELECT e.empno, (WITH dept_name_q AS (SELECT d.dname FROM dept d WHERE d.deptno = e.deptno) SELECT dname FROM dept_name_q) AS dept_name, e.sal FROM emp e;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let expected = [
+            "SELECT e.empno,",
+            "    (",
+            "        WITH dept_name_q AS (",
+            "            SELECT d.dname",
+            "            FROM dept d",
+            "            WHERE d.deptno = e.deptno",
+            "        )",
+            "        SELECT dname",
+            "        FROM dept_name_q",
+            "    ) AS dept_name,",
+            "    e.sal",
+            "FROM emp e;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), expected);
+    }
+
+    #[test]
+    fn format_sql_basic_insert_all_nested_subquery_keeps_outer_into_scope() {
+        let source =
+            "INSERT ALL INTO t1 (id) VALUES ((SELECT 1 FROM dual)) INTO t2 (id) VALUES (2) SELECT 1 FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let into_1_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("INTO t1"))
+            .unwrap_or(0);
+        let into_2_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("INTO t2"))
+            .unwrap_or(0);
+        let select_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.trim_start().starts_with("SELECT 1").then_some(idx))
+            .collect();
+
+        assert_eq!(
+            leading_spaces(lines[into_1_idx]),
+            leading_spaces(lines[into_2_idx]),
+            "Nested SELECT inside INSERT ALL VALUES must not terminate the outer INTO scope, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[into_1_idx]) > 0,
+            "INSERT ALL INTO lines should stay indented under INSERT ALL, got:\n{}",
+            formatted
+        );
+        assert!(
+            select_indices.len() >= 2,
+            "Expected both nested and final SELECT lines, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[select_indices[0]]) > leading_spaces(lines[into_1_idx]),
+            "Nested SELECT inside INSERT ALL VALUES should stay deeper than INTO, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[*select_indices.last().unwrap_or(&0)]),
+            0,
+            "Final SELECT after INSERT ALL branches should return to top-level depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_nested_between_keeps_outer_between_and_inline() {
+        let source = "SELECT * FROM orders WHERE total_amount BETWEEN CASE WHEN discount BETWEEN 1 AND 2 THEN 10 ELSE 20 END AND 100 AND status = 'OPEN';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        assert!(
+            lines.iter().all(|line| !line.trim_start().starts_with("AND 100")),
+            "Outer BETWEEN terminator AND should not be treated as a new condition line after nested BETWEEN, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.trim_start().starts_with("AND status = 'OPEN';") }),
+            "The real condition AND after BETWEEN should still start its own line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("discount BETWEEN 1 AND 2"),
+            "Nested BETWEEN expression should remain intact, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_model_nested_subquery_restores_outer_model_scope() {
+        let source = "SELECT deptno, amount FROM sales MODEL PARTITION BY (deptno) DIMENSION BY (month_key) MEASURES ((SELECT limit_amt FROM limits l WHERE l.deptno = sales.deptno) cap, amount) RULES UPDATE (amount[ANY] = cap[CV()] * 1.1) ORDER BY deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES ("))
+            .unwrap_or(0);
+        let inner_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(measures_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT limit_amt"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RULES UPDATE ("))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ORDER BY deptno;"))
+            .unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[inner_select_idx]) > leading_spaces(lines[measures_idx]),
+            "Nested SELECT inside MODEL MEASURES should stay deeper than the MEASURES header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[rules_idx]),
+            leading_spaces(lines[measures_idx]),
+            "RULES should realign to the outer MODEL subclause depth after nested subquery closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[order_idx]),
+            0,
+            "ORDER BY after MODEL should return to the top-level clause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_model_reference_nested_subquery_restores_outer_model_scope() {
+        let source = "SELECT deptno, amount FROM sales MODEL REFERENCE ref_limits ON (SELECT limit_amt FROM limits l WHERE l.deptno = sales.deptno) DIMENSION BY (month_key) MEASURES (amount) RULES UPDATE (amount[ANY] = amount[CV()] + 1) ORDER BY deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("REFERENCE ref_limits ON ("))
+            .unwrap_or(0);
+        let inner_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(reference_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT limit_amt"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("DIMENSION BY (month_key)"))
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RULES UPDATE ("))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ORDER BY deptno;"))
+            .unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[inner_select_idx]) > leading_spaces(lines[reference_idx]),
+            "Nested SELECT inside MODEL REFERENCE ON should stay deeper than the REFERENCE header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[dimension_idx]),
+            leading_spaces(lines[reference_idx]),
+            "DIMENSION BY should realign to the MODEL REFERENCE owner depth after nested subquery closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[rules_idx]),
+            leading_spaces(lines[reference_idx]),
+            "RULES should stay aligned with MODEL REFERENCE subclauses, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[order_idx]),
+            0,
+            "ORDER BY after MODEL REFERENCE should return to the top-level clause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
 }

@@ -687,6 +687,8 @@ const FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS: &[&str] = &[
     "FETCH",
     "LIMIT",
     "MEASURES",
+    "REFERENCE",
+    "SUBSET",
     "PATTERN",
     "DEFINE",
     "RULES",
@@ -1386,6 +1388,300 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
         .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatIndentedParenOwnerKind {
+    AnalyticOver,
+    ModelSubclause,
+    Window,
+    MatchRecognize,
+    Pivot,
+    Unpivot,
+    StructuredColumns,
+}
+
+/// Returns true when `text_upper` starts with a MODEL subclause whose body is
+/// owned by a trailing parenthesized block.
+pub(crate) fn starts_with_format_model_subclause(text_upper: &str) -> bool {
+    text_upper.starts_with("PARTITION BY")
+        || text_upper.starts_with("DIMENSION BY")
+        || starts_with_keyword_token(text_upper, "MEASURES")
+        || starts_with_keyword_token(text_upper, "REFERENCE")
+        || starts_with_keyword_token(text_upper, "RULES")
+}
+
+fn line_contains_keyword_token(line: &str, keyword: &str) -> bool {
+    let bytes = line.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_block_comment = false;
+    let mut q_quote_end: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'-') {
+            break;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if is_identifier_start_byte(current) {
+            let start = idx;
+            idx = idx.saturating_add(1);
+            while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+                idx = idx.saturating_add(1);
+            }
+
+            let span = idx.saturating_sub(start);
+            if span == keyword_bytes.len()
+                && bytes
+                    .get(start..idx)
+                    .is_some_and(|token| token.eq_ignore_ascii_case(keyword_bytes))
+            {
+                return true;
+            }
+            continue;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    false
+}
+
+fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
+    let bytes = line.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_block_comment = false;
+    let mut q_quote_end: Option<u8> = None;
+    let mut last_identifier_range: Option<(usize, usize)> = None;
+    let mut last_significant_byte: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'-') {
+            break;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if is_identifier_start_byte(current) {
+            let start = idx;
+            idx = idx.saturating_add(1);
+            while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+                idx = idx.saturating_add(1);
+            }
+
+            last_identifier_range = Some((start, idx));
+            last_significant_byte = Some(b'a');
+            continue;
+        }
+
+        last_significant_byte = Some(current);
+        idx = idx.saturating_add(1);
+    }
+
+    if last_significant_byte != Some(b'(') {
+        return false;
+    }
+
+    last_identifier_range
+        .and_then(|(start, end)| line.get(start..end))
+        .is_some_and(|token| token.as_bytes().eq_ignore_ascii_case(keyword_bytes))
+}
+
+/// Returns the structured formatter block kind when a line owns a multiline
+/// parenthesized body that should be tracked on a dedicated indentation stack.
+pub(crate) fn format_indented_paren_owner_kind(line: &str) -> Option<FormatIndentedParenOwnerKind> {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
+    if line_ends_with_keyword_open_paren(line, "OVER") {
+        Some(FormatIndentedParenOwnerKind::AnalyticOver)
+    } else if starts_with_format_model_subclause(&trimmed_upper) {
+        Some(FormatIndentedParenOwnerKind::ModelSubclause)
+    } else if starts_with_keyword_token(&trimmed_upper, "WINDOW") {
+        Some(FormatIndentedParenOwnerKind::Window)
+    } else if line_contains_keyword_token(line, "MATCH_RECOGNIZE") {
+        Some(FormatIndentedParenOwnerKind::MatchRecognize)
+    } else if line_contains_keyword_token(line, "PIVOT") {
+        Some(FormatIndentedParenOwnerKind::Pivot)
+    } else if line_contains_keyword_token(line, "UNPIVOT") {
+        Some(FormatIndentedParenOwnerKind::Unpivot)
+    } else if line_contains_keyword_token(line, "COLUMNS") {
+        Some(FormatIndentedParenOwnerKind::StructuredColumns)
+    } else {
+        None
+    }
+}
+
 /// Returns true when a leading keyword should preserve the next line as a
 /// continuation after a comment split.
 pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
@@ -1419,6 +1715,9 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
                 | ("ORDER", "BY")
                 | ("PARTITION", "BY")
                 | ("DIMENSION", "BY")
+                | ("AFTER", "MATCH")
+                | ("MATCH", "SKIP")
+                | ("SKIP", "TO")
                 | ("START", "WITH")
                 | ("CONNECT", "BY")
         ) || (FORMAT_JOIN_MODIFIER_KEYWORDS.contains(&previous_upper.as_str())
@@ -1602,11 +1901,23 @@ mod tests {
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "REFERENCE"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "SUBSET"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
             format_inline_comment_header_continuation_kind(None, "COLUMNS"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(Some("ORDER"), "BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("MATCH"), "SKIP"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
@@ -1619,6 +1930,22 @@ mod tests {
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(None, "DUAL"),
+            None
+        );
+    }
+
+    #[test]
+    fn format_indented_paren_owner_kind_detects_analytic_over_without_matching_overlay() {
+        assert_eq!(
+            format_indented_paren_owner_kind("SUM (sal) OVER ( -- analytic window"),
+            Some(FormatIndentedParenOwnerKind::AnalyticOver)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("REFERENCE ref_limits ON ( -- model reference"),
+            Some(FormatIndentedParenOwnerKind::ModelSubclause)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("OVERLAY (name PLACING 'X' FROM 1 FOR 1)"),
             None
         );
     }
