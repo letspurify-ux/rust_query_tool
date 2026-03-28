@@ -642,6 +642,8 @@ pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
     "LIMIT",
 ];
 
+pub(crate) const FORMAT_SET_OPERATOR_KEYWORDS: &[&str] = &["UNION", "INTERSECT", "MINUS", "EXCEPT"];
+
 /// Leading keywords that keep the following line on the same continuation
 /// depth when a comment splits the expression or clause body.
 pub(crate) const FORMAT_COMMENT_CONTINUATION_KEYWORDS: &[&str] = &[
@@ -1389,6 +1391,40 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatSetOperatorKind {
+    Union,
+    Intersect,
+    Minus,
+    Except,
+}
+
+impl FormatSetOperatorKind {
+    pub(crate) fn from_clause_start(text_upper: &str) -> Option<Self> {
+        if starts_with_keyword_token(text_upper, "UNION") {
+            Some(Self::Union)
+        } else if starts_with_keyword_token(text_upper, "INTERSECT") {
+            Some(Self::Intersect)
+        } else if starts_with_keyword_token(text_upper, "MINUS") {
+            Some(Self::Minus)
+        } else if starts_with_keyword_token(text_upper, "EXCEPT") {
+            Some(Self::Except)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn is_format_set_operator_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_SET_OPERATOR_KEYWORDS)
+}
+
+pub(crate) fn starts_with_format_set_operator(text_upper: &str) -> bool {
+    FORMAT_SET_OPERATOR_KEYWORDS
+        .iter()
+        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FormatQueryOwnerKind {
     Clause,
     FromItem,
@@ -1438,7 +1474,180 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     StructuredColumns,
 }
 
+const FORMAT_ANALYTIC_OVER_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["PARTITION", "BY"],
+    &["ORDER", "BY"],
+    &["ROWS"],
+    &["RANGE"],
+    &["GROUPS"],
+    &["EXCLUDE"],
+];
+
+const FORMAT_MODEL_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["PARTITION", "BY"],
+    &["DIMENSION", "BY"],
+    &["MEASURES"],
+    &["REFERENCE"],
+    &["RULES"],
+    &["IGNORE", "NAV"],
+    &["KEEP", "NAV"],
+    &["UNIQUE", "DIMENSION"],
+    &["UNIQUE", "SINGLE", "REFERENCE"],
+    &["RETURN", "UPDATED", "ROWS"],
+];
+
+const FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["PARTITION", "BY"],
+    &["ORDER", "BY"],
+    &["MEASURES"],
+    &["ONE", "ROW", "PER"],
+    &["ALL", "ROWS", "PER"],
+    &["WITH", "UNMATCHED", "ROWS"],
+    &["WITHOUT", "UNMATCHED", "ROWS"],
+    &["SHOW", "EMPTY", "MATCHES"],
+    &["OMIT", "EMPTY", "MATCHES"],
+    &["AFTER", "MATCH", "SKIP"],
+    &["SUBSET"],
+    &["PATTERN"],
+    &["DEFINE"],
+];
+
+const FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR"]];
+
+const FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["NESTED"]];
+
+fn strip_keyword_token_prefix<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = text.trim_start();
+    starts_with_keyword_token(trimmed, keyword)
+        .then(|| trimmed.get(keyword.len()..))
+        .flatten()
+}
+
+fn starts_with_keyword_sequence(text_upper: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+
+    let mut remaining = text_upper.trim_start();
+    for keyword in sequence {
+        let Some(next) = strip_keyword_token_prefix(remaining, keyword) else {
+            return false;
+        };
+        remaining = next.trim_start();
+    }
+
+    true
+}
+
+fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> bool {
+    sequences
+        .iter()
+        .any(|sequence| starts_with_keyword_sequence(text_upper, sequence))
+}
+
+fn leading_words_match_keyword_sequence(
+    first_word: &str,
+    second_word: Option<&str>,
+    third_word: Option<&str>,
+    sequence: &[&str],
+) -> bool {
+    match sequence {
+        [first] => first_word.eq_ignore_ascii_case(first),
+        [first, second] => {
+            first_word.eq_ignore_ascii_case(first)
+                && second_word.is_some_and(|word| word.eq_ignore_ascii_case(second))
+        }
+        [first, second, third] => {
+            first_word.eq_ignore_ascii_case(first)
+                && second_word.is_some_and(|word| word.eq_ignore_ascii_case(second))
+                && third_word.is_some_and(|word| word.eq_ignore_ascii_case(third))
+        }
+        _ => false,
+    }
+}
+
 impl FormatIndentedParenOwnerKind {
+    fn body_header_sequences(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::AnalyticOver | Self::Window => FORMAT_ANALYTIC_OVER_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::ModelSubclause => FORMAT_MODEL_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::MatchRecognize => FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::Pivot | Self::Unpivot => FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::StructuredColumns => FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES,
+        }
+    }
+
+    pub(crate) fn starts_body_header(self, text_upper: &str) -> bool {
+        starts_with_any_keyword_sequence(text_upper, self.body_header_sequences())
+    }
+
+    fn starts_contextual_body_header(
+        self,
+        text_upper: &str,
+        previous_line_upper: Option<&str>,
+    ) -> bool {
+        if self.starts_body_header(text_upper) {
+            return true;
+        }
+
+        match self {
+            Self::Pivot | Self::Unpivot => {
+                starts_with_keyword_token(text_upper, "IN")
+                    && previous_line_upper.is_some_and(|previous| {
+                        starts_with_keyword_token(previous.trim_start(), "FOR")
+                    })
+            }
+            Self::AnalyticOver
+            | Self::ModelSubclause
+            | Self::Window
+            | Self::MatchRecognize
+            | Self::StructuredColumns => false,
+        }
+    }
+
+    pub(crate) fn starts_body_header_words(
+        self,
+        first_word: &str,
+        second_word: Option<&str>,
+        third_word: Option<&str>,
+    ) -> bool {
+        self.body_header_sequences().iter().any(|sequence| {
+            leading_words_match_keyword_sequence(first_word, second_word, third_word, sequence)
+        })
+    }
+
+    fn phase1_excluded_body_header_sequences(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::MatchRecognize => &[&["PARTITION", "BY"], &["ORDER", "BY"]],
+            Self::AnalyticOver
+            | Self::ModelSubclause
+            | Self::Window
+            | Self::Pivot
+            | Self::Unpivot
+            | Self::StructuredColumns => &[],
+        }
+    }
+
+    pub(crate) fn starts_phase1_body_header_words(
+        self,
+        first_word: &str,
+        second_word: Option<&str>,
+        third_word: Option<&str>,
+    ) -> bool {
+        self.starts_body_header_words(first_word, second_word, third_word)
+            && !self
+                .phase1_excluded_body_header_sequences()
+                .iter()
+                .any(|sequence| {
+                    leading_words_match_keyword_sequence(
+                        first_word,
+                        second_word,
+                        third_word,
+                        sequence,
+                    )
+                })
+    }
+
     /// Returns the normalized owner depth that formatter phase 2 should use
     /// before pushing the multiline owner stack for this kind.
     pub(crate) fn formatter_owner_depth(
@@ -1470,18 +1679,11 @@ impl FormatIndentedParenOwnerKind {
     pub(crate) fn formatter_body_header_depth(
         self,
         text_upper: &str,
+        previous_line_upper: Option<&str>,
         owner_depth: usize,
     ) -> Option<usize> {
-        let aligns_to_body_depth = match self {
-            Self::AnalyticOver => starts_with_format_analytic_over_subclause(text_upper),
-            Self::ModelSubclause => starts_with_format_model_subclause(text_upper),
-            Self::Window => starts_with_format_window_subclause(text_upper),
-            Self::MatchRecognize => starts_with_format_match_recognize_subclause(text_upper),
-            Self::Pivot | Self::Unpivot => starts_with_keyword_token(text_upper, "FOR"),
-            Self::StructuredColumns => starts_with_keyword_token(text_upper, "NESTED"),
-        };
-
-        aligns_to_body_depth.then(|| self.body_depth(owner_depth))
+        self.starts_contextual_body_header(text_upper, previous_line_upper)
+            .then(|| self.body_depth(owner_depth))
     }
 }
 
@@ -1505,10 +1707,7 @@ pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOw
         return Some(FormatQueryOwnerKind::Clause);
     }
 
-    let starts_set_operator = starts_with_keyword_token(&trimmed_upper, "UNION")
-        || starts_with_keyword_token(&trimmed_upper, "INTERSECT")
-        || starts_with_keyword_token(&trimmed_upper, "MINUS")
-        || starts_with_keyword_token(&trimmed_upper, "EXCEPT");
+    let starts_set_operator = starts_with_format_set_operator(&trimmed_upper);
     if !starts_with_keyword_token(&trimmed_upper, "FOR")
         && !starts_set_operator
         && (line_ends_with_keyword(line, "IN")
@@ -1535,45 +1734,11 @@ pub(crate) fn format_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind
 /// Returns true when `text_upper` starts with a MODEL subclause whose body is
 /// owned by a trailing parenthesized block.
 pub(crate) fn starts_with_format_model_subclause(text_upper: &str) -> bool {
-    text_upper.starts_with("PARTITION BY")
-        || text_upper.starts_with("DIMENSION BY")
-        || starts_with_keyword_token(text_upper, "MEASURES")
-        || starts_with_keyword_token(text_upper, "REFERENCE")
-        || starts_with_keyword_token(text_upper, "RULES")
-}
-
-fn starts_with_format_analytic_over_subclause(text_upper: &str) -> bool {
-    text_upper.starts_with("PARTITION BY")
-        || text_upper.starts_with("ORDER BY")
-        || starts_with_keyword_token(text_upper, "ROWS")
-        || starts_with_keyword_token(text_upper, "RANGE")
-        || starts_with_keyword_token(text_upper, "GROUPS")
-        || starts_with_keyword_token(text_upper, "EXCLUDE")
-}
-
-fn starts_with_format_window_subclause(text_upper: &str) -> bool {
-    text_upper.starts_with("PARTITION BY")
-        || text_upper.starts_with("ORDER BY")
-        || starts_with_keyword_token(text_upper, "ROWS")
-        || starts_with_keyword_token(text_upper, "RANGE")
-        || starts_with_keyword_token(text_upper, "GROUPS")
-        || starts_with_keyword_token(text_upper, "EXCLUDE")
+    FormatIndentedParenOwnerKind::ModelSubclause.starts_body_header(text_upper)
 }
 
 pub(crate) fn starts_with_format_match_recognize_subclause(text_upper: &str) -> bool {
-    text_upper.starts_with("PARTITION BY")
-        || text_upper.starts_with("ORDER BY")
-        || starts_with_keyword_token(text_upper, "MEASURES")
-        || text_upper.starts_with("ONE ROW PER MATCH")
-        || text_upper.starts_with("ALL ROWS PER MATCH")
-        || text_upper.starts_with("WITH UNMATCHED ROWS")
-        || text_upper.starts_with("WITHOUT UNMATCHED ROWS")
-        || text_upper.starts_with("SHOW EMPTY MATCHES")
-        || text_upper.starts_with("OMIT EMPTY MATCHES")
-        || text_upper.starts_with("AFTER MATCH SKIP")
-        || starts_with_keyword_token(text_upper, "SUBSET")
-        || starts_with_keyword_token(text_upper, "PATTERN")
-        || starts_with_keyword_token(text_upper, "DEFINE")
+    FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header(text_upper)
 }
 
 /// Returns the structured formatter owner kind when `line` ends on the owner
@@ -1989,6 +2154,22 @@ mod tests {
     }
 
     #[test]
+    fn format_set_operator_helper_covers_except_and_other_set_operators() {
+        assert!(is_format_set_operator_keyword("except"));
+        assert_eq!(
+            FormatSetOperatorKind::from_clause_start("EXCEPT DISTINCT"),
+            Some(FormatSetOperatorKind::Except)
+        );
+        assert_eq!(
+            FormatSetOperatorKind::from_clause_start("UNION ALL"),
+            Some(FormatSetOperatorKind::Union)
+        );
+        assert_eq!(FormatSetOperatorKind::from_clause_start("ORDER BY"), None);
+        assert!(starts_with_format_set_operator("INTERSECT"));
+        assert!(!starts_with_format_set_operator("WHERE col IN"));
+    }
+
+    #[test]
     fn format_comment_continuation_keywords_cover_clause_and_condition_heads() {
         assert!(is_format_comment_continuation_keyword("WINDOW"));
         assert!(is_format_comment_continuation_keyword("QUALIFY"));
@@ -2116,16 +2297,13 @@ mod tests {
 
     #[test]
     fn format_window_and_match_recognize_subclause_helpers_cover_extended_body_headers() {
-        assert!(starts_with_format_window_subclause(
-            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
-        ));
-        assert!(starts_with_format_window_subclause(
-            "RANGE BETWEEN 1 PRECEDING AND CURRENT ROW"
-        ));
-        assert!(starts_with_format_window_subclause(
-            "GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING"
-        ));
-        assert!(starts_with_format_window_subclause("EXCLUDE CURRENT ROW"));
+        assert!(FormatIndentedParenOwnerKind::Window
+            .starts_body_header("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"));
+        assert!(FormatIndentedParenOwnerKind::Window
+            .starts_body_header("RANGE BETWEEN 1 PRECEDING AND CURRENT ROW"));
+        assert!(FormatIndentedParenOwnerKind::Window
+            .starts_body_header("GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING"));
+        assert!(FormatIndentedParenOwnerKind::Window.starts_body_header("EXCLUDE CURRENT ROW"));
         assert!(starts_with_format_match_recognize_subclause(
             "WITH UNMATCHED ROWS"
         ));
@@ -2138,6 +2316,113 @@ mod tests {
         assert!(starts_with_format_match_recognize_subclause(
             "OMIT EMPTY MATCHES"
         ));
+    }
+
+    #[test]
+    fn format_match_recognize_body_header_words_cover_clause_and_output_modifier_sequences() {
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header_words(
+                "PARTITION",
+                Some("BY"),
+                None,
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header_words(
+                "ORDER",
+                Some("BY"),
+                None,
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header_words(
+                "WITH",
+                Some("UNMATCHED"),
+                Some("ROWS"),
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header_words(
+                "AFTER",
+                Some("MATCH"),
+                Some("SKIP"),
+            )
+        );
+        assert!(
+            !FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header_words(
+                "ORDER",
+                Some("SIBLINGS"),
+                Some("BY"),
+            )
+        );
+        assert!(
+            !FormatIndentedParenOwnerKind::MatchRecognize.starts_phase1_body_header_words(
+                "PARTITION",
+                Some("BY"),
+                None,
+            )
+        );
+        assert!(
+            !FormatIndentedParenOwnerKind::MatchRecognize.starts_phase1_body_header_words(
+                "ORDER",
+                Some("BY"),
+                None,
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_phase1_body_header_words(
+                "WITH",
+                Some("UNMATCHED"),
+                Some("ROWS"),
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::MatchRecognize.starts_phase1_body_header_words(
+                "AFTER",
+                Some("MATCH"),
+                Some("SKIP"),
+            )
+        );
+    }
+
+    #[test]
+    fn format_model_subclause_helper_covers_extended_body_headers() {
+        assert!(starts_with_format_model_subclause("IGNORE NAV"));
+        assert!(starts_with_format_model_subclause("KEEP NAV"));
+        assert!(starts_with_format_model_subclause("UNIQUE DIMENSION"));
+        assert!(starts_with_format_model_subclause(
+            "UNIQUE SINGLE REFERENCE"
+        ));
+        assert!(starts_with_format_model_subclause("RETURN UPDATED ROWS"));
+    }
+
+    #[test]
+    fn format_pivot_unpivot_formatter_body_headers_treat_split_in_as_owner_relative_only_after_for()
+    {
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Pivot.formatter_body_header_depth(
+                "IN (",
+                Some("FOR deptno"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Unpivot.formatter_body_header_depth(
+                "IN (",
+                Some("FOR dept_tag"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Pivot.formatter_body_header_depth(
+                "IN (",
+                Some("WHEN deptno"),
+                2,
+            ),
+            None
+        );
     }
 
     #[test]

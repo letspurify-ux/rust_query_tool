@@ -110,6 +110,7 @@ enum AutoFormatClauseKind {
     Union,
     Intersect,
     Minus,
+    Except,
     Set,
     Into,
     Pivot,
@@ -133,7 +134,10 @@ impl AutoFormatClauseKind {
     }
 
     fn is_set_operator(self) -> bool {
-        matches!(self, Self::Union | Self::Intersect | Self::Minus)
+        matches!(
+            self,
+            Self::Union | Self::Intersect | Self::Minus | Self::Except
+        )
     }
 
     fn ends_into_continuation(self) -> bool {
@@ -148,6 +152,7 @@ impl AutoFormatClauseKind {
                 | Self::Union
                 | Self::Intersect
                 | Self::Minus
+                | Self::Except
         )
     }
 }
@@ -1837,12 +1842,15 @@ impl QueryExecutor {
             Some(AutoFormatClauseKind::Connect)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "START") {
             Some(AutoFormatClauseKind::Start)
-        } else if sql_text::starts_with_keyword_token(trimmed_upper, "UNION") {
-            Some(AutoFormatClauseKind::Union)
-        } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT") {
-            Some(AutoFormatClauseKind::Intersect)
-        } else if sql_text::starts_with_keyword_token(trimmed_upper, "MINUS") {
-            Some(AutoFormatClauseKind::Minus)
+        } else if let Some(set_operator) =
+            sql_text::FormatSetOperatorKind::from_clause_start(trimmed_upper)
+        {
+            Some(match set_operator {
+                sql_text::FormatSetOperatorKind::Union => AutoFormatClauseKind::Union,
+                sql_text::FormatSetOperatorKind::Intersect => AutoFormatClauseKind::Intersect,
+                sql_text::FormatSetOperatorKind::Minus => AutoFormatClauseKind::Minus,
+                sql_text::FormatSetOperatorKind::Except => AutoFormatClauseKind::Except,
+            })
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "SET") {
             Some(AutoFormatClauseKind::Set)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTO") {
@@ -3391,10 +3399,9 @@ impl QueryExecutor {
 
     /// Check if the effective SQL has a top-level set operator (UNION, INTERSECT, MINUS, EXCEPT).
     fn has_top_level_set_operator(sql: &str) -> bool {
-        Self::has_top_level_identifier_keyword(sql, "UNION")
-            || Self::has_top_level_identifier_keyword(sql, "INTERSECT")
-            || Self::has_top_level_identifier_keyword(sql, "MINUS")
-            || Self::has_top_level_identifier_keyword(sql, "EXCEPT")
+        sql_text::FORMAT_SET_OPERATOR_KEYWORDS
+            .iter()
+            .any(|keyword| Self::has_top_level_identifier_keyword(sql, keyword))
     }
 
     /// Check if the effective SQL has a top-level CONNECT BY clause.
@@ -3626,38 +3633,35 @@ impl QueryExecutor {
     /// Check if a word is a keyword that terminates FROM clause table references.
     #[allow(dead_code)]
     fn is_from_stop_keyword(word_upper: &str) -> bool {
-        matches!(
-            word_upper,
-            "WHERE"
-                | "ORDER"
-                | "GROUP"
-                | "HAVING"
-                | "FETCH"
-                | "OFFSET"
-                | "FOR"
-                | "UNION"
-                | "INTERSECT"
-                | "MINUS"
-                | "EXCEPT"
-                | "CONNECT"
-                | "START"
-                | "PIVOT"
-                | "UNPIVOT"
-                | "MODEL"
-                | "RETURNING"
-                | "JOIN"
-                | "INNER"
-                | "LEFT"
-                | "RIGHT"
-                | "FULL"
-                | "CROSS"
-                | "NATURAL"
-                | "ON"
-                | "USING"
-                | "PARTITION"
-                | "SAMPLE"
-                | "LATERAL"
-        )
+        sql_text::is_format_set_operator_keyword(word_upper)
+            || matches!(
+                word_upper,
+                "WHERE"
+                    | "ORDER"
+                    | "GROUP"
+                    | "HAVING"
+                    | "FETCH"
+                    | "OFFSET"
+                    | "FOR"
+                    | "CONNECT"
+                    | "START"
+                    | "PIVOT"
+                    | "UNPIVOT"
+                    | "MODEL"
+                    | "RETURNING"
+                    | "JOIN"
+                    | "INNER"
+                    | "LEFT"
+                    | "RIGHT"
+                    | "FULL"
+                    | "CROSS"
+                    | "NATURAL"
+                    | "ON"
+                    | "USING"
+                    | "PARTITION"
+                    | "SAMPLE"
+                    | "LATERAL"
+            )
     }
 
     fn find_leading_wildcard_in_select_list(select_body: &str) -> Option<(usize, usize)> {
@@ -7316,6 +7320,114 @@ FROM src;"#;
             contexts[second_select_idx].query_base_depth,
             contexts[first_select_idx].query_base_depth,
             "The second SELECT in a plain CTE compound query should keep the same query base depth as the first SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_non_recursive_cte_except_select_on_cte_body_base() {
+        let sql = r#"WITH src AS (
+    SELECT
+        dept_id
+    FROM current_emp
+    EXCEPT
+    SELECT
+        dept_id
+    FROM former_emp
+)
+SELECT *
+FROM src;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_select_idx = lines
+            .iter()
+            .position(|line| line.trim() == "SELECT")
+            .unwrap_or(0);
+        let except_idx = lines
+            .iter()
+            .position(|line| line.trim() == "EXCEPT")
+            .unwrap_or(0);
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(except_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[except_idx].auto_depth, contexts[first_select_idx].auto_depth,
+            "EXCEPT inside a plain CTE should stay on the same body base depth as the first SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_idx].parser_depth,
+            contexts[first_select_idx].parser_depth,
+            "The second SELECT after EXCEPT in a plain CTE should stay on the same parser depth as the first SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_idx].auto_depth,
+            contexts[first_select_idx].auto_depth,
+            "The second SELECT after EXCEPT in a plain CTE should reuse the same body base depth instead of becoming a nested child query"
+        );
+        assert_eq!(
+            contexts[second_select_idx].query_base_depth,
+            contexts[first_select_idx].query_base_depth,
+            "The second SELECT after EXCEPT in a plain CTE should keep the same query base depth as the first SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_nested_except_branch_select_on_condition_query_base() {
+        let sql = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+    SELECT d.deptno
+    FROM dual
+    EXCEPT
+    SELECT e.deptno
+    FROM emp e
+);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_select_idx = lines
+            .iter()
+            .position(|line| line.trim() == "SELECT d.deptno")
+            .unwrap_or(0);
+        let except_idx = lines
+            .iter()
+            .position(|line| line.trim() == "EXCEPT")
+            .unwrap_or(0);
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(except_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "SELECT e.deptno")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert!(
+            contexts[first_select_idx].auto_depth > contexts[first_select_idx].parser_depth,
+            "nested EXISTS child SELECT should already be offset from parser depth so the regression is observable"
+        );
+        assert_eq!(
+            contexts[except_idx].auto_depth, contexts[first_select_idx].auto_depth,
+            "EXCEPT inside a nested EXISTS query should stay on the child query base depth"
+        );
+        assert_eq!(
+            contexts[second_select_idx].parser_depth,
+            contexts[first_select_idx].parser_depth,
+            "second SELECT after nested EXCEPT should remain on the same structural parser depth as the first child SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_idx].auto_depth,
+            contexts[first_select_idx].auto_depth,
+            "second SELECT after nested EXCEPT should reuse the child query base depth instead of falling back to raw parser depth"
+        );
+        assert_eq!(
+            contexts[second_select_idx].query_base_depth,
+            contexts[first_select_idx].query_base_depth,
+            "nested EXCEPT branches should share the same query base depth"
         );
     }
 
