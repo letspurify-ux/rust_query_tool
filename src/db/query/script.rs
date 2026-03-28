@@ -170,6 +170,7 @@ struct QueryBaseDepthFrame {
 
 #[derive(Clone, Copy, Debug)]
 struct MultilineClauseDepthFrame {
+    kind: sql_text::FormatIndentedParenOwnerKind,
     owner_depth: usize,
     nested_paren_depth: usize,
 }
@@ -1658,8 +1659,10 @@ impl QueryExecutor {
 
             if let Some(frame) = model_clause_frames.last().copied() {
                 if sql_text::starts_with_format_model_subclause(&trimmed_upper) {
-                    let model_subclause_depth =
-                        existing_indent.max(frame.owner_depth.saturating_add(1));
+                    let model_subclause_depth = existing_indent.max(
+                        sql_text::FormatIndentedParenOwnerKind::ModelSubclause
+                            .body_depth(frame.owner_depth),
+                    );
                     context.auto_depth = context.auto_depth.max(model_subclause_depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = context.query_base_depth.or(Some(frame.owner_depth));
@@ -1670,8 +1673,9 @@ impl QueryExecutor {
                 if closes_multiline_clause {
                     context.auto_depth = frame.owner_depth;
                 } else {
-                    context.auto_depth =
-                        context.auto_depth.max(frame.owner_depth.saturating_add(1));
+                    context.auto_depth = context
+                        .auto_depth
+                        .max(frame.kind.body_depth(frame.owner_depth));
                 }
             }
             if starts_multiline_clause {
@@ -1741,8 +1745,9 @@ impl QueryExecutor {
                 multiline_clause_frames.pop();
             }
             if starts_multiline_clause {
-                if multiline_clause_owner_kind.is_some() {
+                if let Some(kind) = multiline_clause_owner_kind {
                     multiline_clause_frames.push(MultilineClauseDepthFrame {
+                        kind,
                         owner_depth: pending_multiline_clause_for_line
                             .map(|frame| frame.owner_depth)
                             .unwrap_or_else(|| existing_indent.max(context.auto_depth)),
@@ -8622,6 +8627,158 @@ MODEL
     }
 
     #[test]
+    fn auto_format_line_contexts_split_model_reference_on_uses_reference_relative_child_query_depth(
+    ) {
+        let sql = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits ON
+        (
+            SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno
+        )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "REFERENCE ref_limits ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(reference_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT limit_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "split MODEL REFERENCE opener should stay aligned with the REFERENCE owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[reference_idx].auto_depth.saturating_add(1),
+            "split MODEL REFERENCE child SELECT should be one level deeper than the REFERENCE owner"
+        );
+        assert_eq!(
+            contexts[select_idx].query_base_depth,
+            Some(contexts[reference_idx].auto_depth.saturating_add(1)),
+            "split MODEL REFERENCE child SELECT should derive its query base one level below the REFERENCE owner"
+        );
+        assert_eq!(
+            contexts[dimension_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "DIMENSION BY after split MODEL REFERENCE should return to the REFERENCE subclause depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_match_recognize_owner_stack_across_standalone_open_paren(
+    ) {
+        let sql = r#"SELECT *
+FROM (
+    SELECT *
+    FROM sales
+    MATCH_RECOGNIZE
+    (
+        PARTITION BY cust_id
+        ORDER BY sale_date
+        MEASURES MATCH_NUMBER () AS mno
+        PATTERN (A B+)
+        DEFINE A AS amount < 50,
+               B AS amount >= 50
+    )
+    WHERE amount > 0
+) ranked
+WHERE ranked.mno > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let match_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "MATCH_RECOGNIZE")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(match_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PARTITION BY cust_id")
+            .unwrap_or(0);
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES MATCH_NUMBER"))
+            .unwrap_or(0);
+        let pattern_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PATTERN (A B+)"))
+            .unwrap_or(0);
+        let define_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("DEFINE A AS amount < 50"))
+            .unwrap_or(0);
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE amount > 0")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE ranked.mno > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[match_idx].auto_depth,
+            "standalone open paren after MATCH_RECOGNIZE should stay on the owner depth"
+        );
+        assert_eq!(
+            contexts[partition_idx].auto_depth,
+            contexts[match_idx].auto_depth.saturating_add(1),
+            "MATCH_RECOGNIZE body should stay one level deeper than the split owner line"
+        );
+        assert_eq!(
+            contexts[measures_idx].auto_depth, contexts[partition_idx].auto_depth,
+            "MATCH_RECOGNIZE MEASURES should stay aligned with sibling body headers"
+        );
+        assert_eq!(
+            contexts[pattern_idx].auto_depth, contexts[partition_idx].auto_depth,
+            "MATCH_RECOGNIZE PATTERN should stay aligned with sibling body headers"
+        );
+        assert_eq!(
+            contexts[define_idx].auto_depth, contexts[partition_idx].auto_depth,
+            "MATCH_RECOGNIZE DEFINE should stay aligned with sibling body headers"
+        );
+        assert_eq!(
+            contexts[inner_where_idx].auto_depth, contexts[match_idx].auto_depth,
+            "WHERE after split MATCH_RECOGNIZE should realign with the nested query base"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, 0,
+            "outer WHERE should return to the top-level query depth after the nested MATCH_RECOGNIZE query closes"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_pivot_body_one_level_deeper_than_owner_line() {
         let sql = r#"SELECT pvt.deptno,
     pvt."CLERK" AS clerk_cnt,
@@ -8737,6 +8894,130 @@ ORDER BY job,
             contexts[unpivot_value_idx].auto_depth,
             contexts[from_idx].auto_depth.saturating_add(1),
             "UNPIVOT body should be exactly one level deeper than its FROM owner line"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_pivot_xml_owner_stack_across_standalone_open_paren() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT *
+    FROM src
+    PIVOT XML
+    (
+        SUM (amt) AS total_amt
+        FOR deptno IN (10 AS D10, 20 AS D20)
+    )
+) pvt
+WHERE pvt.total_amt_D10 IS NOT NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PIVOT XML")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(pivot_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sum_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SUM (amt) AS total_amt")
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR deptno IN"))
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE pvt.total_amt_D10 IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[pivot_idx].auto_depth,
+            "split PIVOT XML opener should stay aligned with the modified owner line"
+        );
+        assert_eq!(
+            contexts[sum_idx].auto_depth,
+            contexts[pivot_idx].auto_depth.saturating_add(1),
+            "PIVOT XML body should stay one level deeper than the modified owner line"
+        );
+        assert_eq!(
+            contexts[for_idx].auto_depth, contexts[sum_idx].auto_depth,
+            "PIVOT XML FOR line should stay aligned with the aggregate line"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, 0,
+            "outer WHERE should return to the top-level query depth after nested PIVOT XML closes"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_unpivot_include_nulls_owner_stack_across_standalone_open_paren(
+    ) {
+        let sql = r#"SELECT *
+FROM (
+    SELECT job,
+        dept_tag,
+        sal_amt
+    FROM pivoted
+    UNPIVOT INCLUDE NULLS
+    (
+        sal_amt
+        FOR dept_tag IN (D10 AS '10', D20 AS '20')
+    )
+) depivoted
+WHERE depivoted.sal_amt IS NOT NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let unpivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNPIVOT INCLUDE NULLS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(unpivot_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "sal_amt")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR dept_tag IN"))
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE depivoted.sal_amt IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[unpivot_idx].auto_depth,
+            "split UNPIVOT INCLUDE NULLS opener should stay aligned with the modified owner line"
+        );
+        assert_eq!(
+            contexts[value_idx].auto_depth,
+            contexts[unpivot_idx].auto_depth.saturating_add(1),
+            "UNPIVOT INCLUDE NULLS body should stay one level deeper than the modified owner line"
+        );
+        assert_eq!(
+            contexts[for_idx].auto_depth, contexts[value_idx].auto_depth,
+            "UNPIVOT INCLUDE NULLS FOR line should stay aligned with the body line"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, 0,
+            "outer WHERE should return to the top-level query depth after nested UNPIVOT INCLUDE NULLS closes"
         );
     }
 

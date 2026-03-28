@@ -1438,11 +1438,64 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     StructuredColumns,
 }
 
+impl FormatIndentedParenOwnerKind {
+    /// Returns the normalized owner depth that formatter phase 2 should use
+    /// before pushing the multiline owner stack for this kind.
+    pub(crate) fn formatter_owner_depth(
+        self,
+        fallback_depth: usize,
+        query_base_depth: Option<usize>,
+        general_paren_continuation_depth: Option<usize>,
+    ) -> usize {
+        match self {
+            Self::Window | Self::MatchRecognize | Self::Pivot | Self::Unpivot => {
+                query_base_depth.unwrap_or(fallback_depth)
+            }
+            Self::ModelSubclause => query_base_depth
+                .map(|depth| depth.saturating_add(1))
+                .unwrap_or(fallback_depth),
+            Self::AnalyticOver | Self::StructuredColumns => {
+                general_paren_continuation_depth.unwrap_or(fallback_depth)
+            }
+        }
+    }
+
+    /// Returns the standard body depth relative to a multiline owner line.
+    pub(crate) fn body_depth(self, owner_depth: usize) -> usize {
+        owner_depth.saturating_add(1)
+    }
+
+    /// Returns the owner-relative depth for structural body headers that must
+    /// snap back to the active owner's body depth after nested expressions.
+    pub(crate) fn formatter_body_header_depth(
+        self,
+        text_upper: &str,
+        owner_depth: usize,
+    ) -> Option<usize> {
+        let aligns_to_body_depth = match self {
+            Self::AnalyticOver => starts_with_format_analytic_over_subclause(text_upper),
+            Self::ModelSubclause => starts_with_format_model_subclause(text_upper),
+            Self::Window => starts_with_format_window_subclause(text_upper),
+            Self::MatchRecognize => starts_with_format_match_recognize_subclause(text_upper),
+            Self::Pivot | Self::Unpivot => starts_with_keyword_token(text_upper, "FOR"),
+            Self::StructuredColumns => starts_with_keyword_token(text_upper, "NESTED"),
+        };
+
+        aligns_to_body_depth.then(|| self.body_depth(owner_depth))
+    }
+}
+
 /// Returns the formatter query-owner kind when `line` ends on the owner header
 /// token itself and the opening parenthesis starts on a later line.
 pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
     if line_ends_with_keyword(line, "LATERAL") || line_ends_with_keyword(line, "APPLY") {
         return Some(FormatQueryOwnerKind::FromItem);
+    }
+
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    if starts_with_keyword_token(&trimmed_upper, "REFERENCE") && line_ends_with_keyword(line, "ON")
+    {
+        return Some(FormatQueryOwnerKind::Clause);
     }
 
     if line_ends_with_keyword(line, "FROM")
@@ -1452,7 +1505,6 @@ pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOw
         return Some(FormatQueryOwnerKind::Clause);
     }
 
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
     let starts_set_operator = starts_with_keyword_token(&trimmed_upper, "UNION")
         || starts_with_keyword_token(&trimmed_upper, "INTERSECT")
         || starts_with_keyword_token(&trimmed_upper, "MINUS")
@@ -1490,6 +1542,40 @@ pub(crate) fn starts_with_format_model_subclause(text_upper: &str) -> bool {
         || starts_with_keyword_token(text_upper, "RULES")
 }
 
+fn starts_with_format_analytic_over_subclause(text_upper: &str) -> bool {
+    text_upper.starts_with("PARTITION BY")
+        || text_upper.starts_with("ORDER BY")
+        || starts_with_keyword_token(text_upper, "ROWS")
+        || starts_with_keyword_token(text_upper, "RANGE")
+        || starts_with_keyword_token(text_upper, "GROUPS")
+        || starts_with_keyword_token(text_upper, "EXCLUDE")
+}
+
+fn starts_with_format_window_subclause(text_upper: &str) -> bool {
+    text_upper.starts_with("PARTITION BY")
+        || text_upper.starts_with("ORDER BY")
+        || starts_with_keyword_token(text_upper, "ROWS")
+        || starts_with_keyword_token(text_upper, "RANGE")
+        || starts_with_keyword_token(text_upper, "GROUPS")
+        || starts_with_keyword_token(text_upper, "EXCLUDE")
+}
+
+pub(crate) fn starts_with_format_match_recognize_subclause(text_upper: &str) -> bool {
+    text_upper.starts_with("PARTITION BY")
+        || text_upper.starts_with("ORDER BY")
+        || starts_with_keyword_token(text_upper, "MEASURES")
+        || text_upper.starts_with("ONE ROW PER MATCH")
+        || text_upper.starts_with("ALL ROWS PER MATCH")
+        || text_upper.starts_with("WITH UNMATCHED ROWS")
+        || text_upper.starts_with("WITHOUT UNMATCHED ROWS")
+        || text_upper.starts_with("SHOW EMPTY MATCHES")
+        || text_upper.starts_with("OMIT EMPTY MATCHES")
+        || text_upper.starts_with("AFTER MATCH SKIP")
+        || starts_with_keyword_token(text_upper, "SUBSET")
+        || starts_with_keyword_token(text_upper, "PATTERN")
+        || starts_with_keyword_token(text_upper, "DEFINE")
+}
+
 /// Returns the structured formatter owner kind when `line` ends on the owner
 /// header token itself and the parenthesized body starts on a later line.
 pub(crate) fn format_indented_paren_owner_header_kind(
@@ -1507,9 +1593,9 @@ pub(crate) fn format_indented_paren_owner_header_kind(
         Some(FormatIndentedParenOwnerKind::Window)
     } else if line_ends_with_keyword(line, "MATCH_RECOGNIZE") {
         Some(FormatIndentedParenOwnerKind::MatchRecognize)
-    } else if line_ends_with_keyword(line, "PIVOT") {
+    } else if line_ends_with_pivot_owner(line) {
         Some(FormatIndentedParenOwnerKind::Pivot)
-    } else if line_ends_with_keyword(line, "UNPIVOT") {
+    } else if line_ends_with_unpivot_owner(line) {
         Some(FormatIndentedParenOwnerKind::Unpivot)
     } else if line_ends_with_keyword(line, "COLUMNS") {
         Some(FormatIndentedParenOwnerKind::StructuredColumns)
@@ -1518,254 +1604,18 @@ pub(crate) fn format_indented_paren_owner_header_kind(
     }
 }
 
-fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
+fn line_trailing_identifiers_before_inline_comment<'a>(
+    line: &'a str,
+    max_identifiers: usize,
+) -> (Option<u8>, Vec<&'a str>) {
     let bytes = line.as_bytes();
-    let keyword_bytes = keyword.as_bytes();
     let mut idx = 0usize;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut in_block_comment = false;
     let mut q_quote_end: Option<u8> = None;
-    let mut last_identifier_range: Option<(usize, usize)> = None;
-
-    while idx < bytes.len() {
-        let current = bytes[idx];
-        let next = bytes.get(idx.saturating_add(1)).copied();
-
-        if in_block_comment {
-            if current == b'*' && next == Some(b'/') {
-                in_block_comment = false;
-                idx = idx.saturating_add(2);
-                continue;
-            }
-            idx = idx.saturating_add(1);
-            continue;
-        }
-
-        if let Some(closing) = q_quote_end {
-            if current == closing && next == Some(b'\'') {
-                q_quote_end = None;
-                idx = idx.saturating_add(2);
-                continue;
-            }
-            idx = idx.saturating_add(1);
-            continue;
-        }
-
-        if in_single_quote {
-            if current == b'\'' {
-                if next == Some(b'\'') {
-                    idx = idx.saturating_add(2);
-                    continue;
-                }
-                in_single_quote = false;
-            }
-            idx = idx.saturating_add(1);
-            continue;
-        }
-
-        if in_double_quote {
-            if current == b'"' {
-                if next == Some(b'"') {
-                    idx = idx.saturating_add(2);
-                    continue;
-                }
-                in_double_quote = false;
-            }
-            idx = idx.saturating_add(1);
-            continue;
-        }
-
-        if current == b'-' && next == Some(b'-') {
-            break;
-        }
-        if current == b'/' && next == Some(b'*') {
-            in_block_comment = true;
-            idx = idx.saturating_add(2);
-            continue;
-        }
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
-        }
-        if current == b'\'' {
-            in_single_quote = true;
-            idx = idx.saturating_add(1);
-            continue;
-        }
-        if current == b'"' {
-            in_double_quote = true;
-            idx = idx.saturating_add(1);
-            continue;
-        }
-        if current.is_ascii_whitespace() {
-            idx = idx.saturating_add(1);
-            continue;
-        }
-
-        if is_identifier_start_byte(current) {
-            let start = idx;
-            idx = idx.saturating_add(1);
-            while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
-                idx = idx.saturating_add(1);
-            }
-
-            last_identifier_range = Some((start, idx));
-            continue;
-        }
-
-        idx = idx.saturating_add(1);
-    }
-
-    last_identifier_range
-        .and_then(|(start, end)| line.get(start..end))
-        .is_some_and(|token| token.as_bytes().eq_ignore_ascii_case(keyword_bytes))
-}
-
-fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
-    if keyword.is_empty() {
-        let bytes = line.as_bytes();
-        let mut idx = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_block_comment = false;
-        let mut q_quote_end: Option<u8> = None;
-        let mut last_significant_byte: Option<u8> = None;
-
-        while idx < bytes.len() {
-            let current = bytes[idx];
-            let next = bytes.get(idx.saturating_add(1)).copied();
-
-            if in_block_comment {
-                if current == b'*' && next == Some(b'/') {
-                    in_block_comment = false;
-                    idx = idx.saturating_add(2);
-                    continue;
-                }
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            if let Some(closing) = q_quote_end {
-                if current == closing && next == Some(b'\'') {
-                    q_quote_end = None;
-                    idx = idx.saturating_add(2);
-                    continue;
-                }
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            if in_single_quote {
-                if current == b'\'' {
-                    if next == Some(b'\'') {
-                        idx = idx.saturating_add(2);
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            if in_double_quote {
-                if current == b'"' {
-                    if next == Some(b'"') {
-                        idx = idx.saturating_add(2);
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            if current == b'-' && next == Some(b'-') {
-                break;
-            }
-            if current == b'/' && next == Some(b'*') {
-                in_block_comment = true;
-                idx = idx.saturating_add(2);
-                continue;
-            }
-            if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-                if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                    if is_valid_q_quote_delimiter_byte(delimiter) {
-                        q_quote_end = Some(q_quote_closing_byte(delimiter));
-                        idx = idx.saturating_add(3);
-                        continue;
-                    }
-                }
-            }
-            if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-                && matches!(next, Some(b'q' | b'Q'))
-                && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-            {
-                if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                    if is_valid_q_quote_delimiter_byte(delimiter) {
-                        q_quote_end = Some(q_quote_closing_byte(delimiter));
-                        idx = idx.saturating_add(4);
-                        continue;
-                    }
-                }
-            }
-            if current == b'\'' {
-                in_single_quote = true;
-                idx = idx.saturating_add(1);
-                continue;
-            }
-            if current == b'"' {
-                in_double_quote = true;
-                idx = idx.saturating_add(1);
-                continue;
-            }
-            if current.is_ascii_whitespace() {
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            if is_identifier_start_byte(current) {
-                idx = idx.saturating_add(1);
-                while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
-                    idx = idx.saturating_add(1);
-                }
-                last_significant_byte = Some(b'a');
-                continue;
-            }
-
-            last_significant_byte = Some(current);
-            idx = idx.saturating_add(1);
-        }
-
-        return last_significant_byte == Some(b'(');
-    }
-
-    let bytes = line.as_bytes();
-    let keyword_bytes = keyword.as_bytes();
-    let mut idx = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_block_comment = false;
-    let mut q_quote_end: Option<u8> = None;
-    let mut last_identifier_range: Option<(usize, usize)> = None;
     let mut last_significant_byte: Option<u8> = None;
+    let mut trailing_identifiers = Vec::with_capacity(max_identifiers);
 
     while idx < bytes.len() {
         let current = bytes[idx];
@@ -1866,8 +1716,15 @@ fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
                 idx = idx.saturating_add(1);
             }
 
-            last_identifier_range = Some((start, idx));
             last_significant_byte = Some(b'a');
+            if max_identifiers > 0 {
+                if trailing_identifiers.len() == max_identifiers {
+                    trailing_identifiers.remove(0);
+                }
+                if let Some(token) = line.get(start..idx) {
+                    trailing_identifiers.push(token);
+                }
+            }
             continue;
         }
 
@@ -1875,13 +1732,62 @@ fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
         idx = idx.saturating_add(1);
     }
 
+    (last_significant_byte, trailing_identifiers)
+}
+
+fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return true;
+    }
+
+    let (_, trailing_identifiers) =
+        line_trailing_identifiers_before_inline_comment(line, sequence.len());
+    trailing_identifiers.len() == sequence.len()
+        && trailing_identifiers
+            .iter()
+            .zip(sequence.iter())
+            .all(|(token, expected)| token.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
+}
+
+fn line_ends_with_identifier_sequence_open_paren(line: &str, sequence: &[&str]) -> bool {
+    let (last_significant_byte, trailing_identifiers) =
+        line_trailing_identifiers_before_inline_comment(line, sequence.len());
     if last_significant_byte != Some(b'(') {
         return false;
     }
 
-    last_identifier_range
-        .and_then(|(start, end)| line.get(start..end))
-        .is_some_and(|token| token.as_bytes().eq_ignore_ascii_case(keyword_bytes))
+    if sequence.is_empty() {
+        return true;
+    }
+
+    trailing_identifiers.len() == sequence.len()
+        && trailing_identifiers
+            .iter()
+            .zip(sequence.iter())
+            .all(|(token, expected)| token.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
+}
+
+fn line_ends_with_pivot_owner(line: &str) -> bool {
+    line_ends_with_identifier_sequence(line, &["PIVOT"])
+        || line_ends_with_identifier_sequence(line, &["PIVOT", "XML"])
+}
+
+fn line_ends_with_unpivot_owner(line: &str) -> bool {
+    line_ends_with_identifier_sequence(line, &["UNPIVOT"])
+        || line_ends_with_identifier_sequence(line, &["UNPIVOT", "INCLUDE", "NULLS"])
+        || line_ends_with_identifier_sequence(line, &["UNPIVOT", "EXCLUDE", "NULLS"])
+}
+
+fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
+    line_ends_with_identifier_sequence(line, &[keyword])
+}
+
+fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return line_ends_with_identifier_sequence_open_paren(line, &[]);
+    }
+
+    line_ends_with_identifier_sequence_open_paren(line, &[keyword])
 }
 
 /// Returns the structured formatter block kind when a line owns a multiline
@@ -2189,6 +2095,52 @@ mod tests {
     }
 
     #[test]
+    fn format_indented_paren_owner_kind_covers_modified_pivot_unpivot_owners() {
+        assert_eq!(
+            format_indented_paren_owner_kind("FROM src PIVOT XML ( -- xml pivot"),
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("PIVOT XML"),
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("FROM src UNPIVOT INCLUDE NULLS ( -- include nulls"),
+            Some(FormatIndentedParenOwnerKind::Unpivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("UNPIVOT EXCLUDE NULLS"),
+            Some(FormatIndentedParenOwnerKind::Unpivot)
+        );
+    }
+
+    #[test]
+    fn format_window_and_match_recognize_subclause_helpers_cover_extended_body_headers() {
+        assert!(starts_with_format_window_subclause(
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+        ));
+        assert!(starts_with_format_window_subclause(
+            "RANGE BETWEEN 1 PRECEDING AND CURRENT ROW"
+        ));
+        assert!(starts_with_format_window_subclause(
+            "GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING"
+        ));
+        assert!(starts_with_format_window_subclause("EXCLUDE CURRENT ROW"));
+        assert!(starts_with_format_match_recognize_subclause(
+            "WITH UNMATCHED ROWS"
+        ));
+        assert!(starts_with_format_match_recognize_subclause(
+            "WITHOUT UNMATCHED ROWS"
+        ));
+        assert!(starts_with_format_match_recognize_subclause(
+            "SHOW EMPTY MATCHES"
+        ));
+        assert!(starts_with_format_match_recognize_subclause(
+            "OMIT EMPTY MATCHES"
+        ));
+    }
+
+    #[test]
     fn format_indented_paren_owner_header_kind_covers_split_owner_heads() {
         assert_eq!(
             format_indented_paren_owner_header_kind("SUM (sal) OVER"),
@@ -2247,6 +2199,10 @@ mod tests {
             Some(FormatQueryOwnerKind::Clause)
         );
         assert_eq!(
+            format_query_owner_kind("REFERENCE ref_limits ON ("),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
             format_query_owner_kind("WHERE col IN ("),
             Some(FormatQueryOwnerKind::Condition)
         );
@@ -2287,6 +2243,10 @@ mod tests {
         assert_eq!(
             format_query_owner_header_kind("CROSS APPLY"),
             Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("REFERENCE ref_limits ON"),
+            Some(FormatQueryOwnerKind::Clause)
         );
         assert_eq!(
             format_query_owner_header_kind("WHERE EXISTS"),
