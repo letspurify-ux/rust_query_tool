@@ -1389,6 +1389,45 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatQueryOwnerKind {
+    Clause,
+    FromItem,
+    Condition,
+}
+
+impl FormatQueryOwnerKind {
+    /// Returns the analyzer owner-base depth that should feed the next nested
+    /// query head after this owner line.
+    pub(crate) fn auto_format_child_query_owner_base_depth(
+        self,
+        visual_owner_depth: usize,
+        query_base_depth: Option<usize>,
+    ) -> usize {
+        match self {
+            Self::Condition => query_base_depth
+                .map(|depth| visual_owner_depth.max(depth.saturating_add(1)))
+                .unwrap_or(visual_owner_depth.saturating_add(1)),
+            Self::Clause | Self::FromItem => visual_owner_depth,
+        }
+    }
+
+    /// Returns the structural formatter depth for the next nested query head
+    /// relative to this owner line and the surrounding resolved query base.
+    pub(crate) fn formatter_child_query_head_depth(
+        self,
+        visual_owner_depth: usize,
+        query_base_depth: Option<usize>,
+    ) -> usize {
+        match self {
+            Self::Clause | Self::Condition => query_base_depth
+                .map(|depth| depth.saturating_add(2))
+                .unwrap_or(visual_owner_depth.saturating_add(1)),
+            Self::FromItem => visual_owner_depth.saturating_add(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FormatIndentedParenOwnerKind {
     AnalyticOver,
     ModelSubclause,
@@ -1397,6 +1436,48 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     Pivot,
     Unpivot,
     StructuredColumns,
+}
+
+/// Returns the formatter query-owner kind when `line` ends on the owner header
+/// token itself and the opening parenthesis starts on a later line.
+pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
+    if line_ends_with_keyword(line, "LATERAL") || line_ends_with_keyword(line, "APPLY") {
+        return Some(FormatQueryOwnerKind::FromItem);
+    }
+
+    if line_ends_with_keyword(line, "FROM")
+        || line_ends_with_keyword(line, "USING")
+        || line_ends_with_keyword(line, "JOIN")
+    {
+        return Some(FormatQueryOwnerKind::Clause);
+    }
+
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    let starts_set_operator = starts_with_keyword_token(&trimmed_upper, "UNION")
+        || starts_with_keyword_token(&trimmed_upper, "INTERSECT")
+        || starts_with_keyword_token(&trimmed_upper, "MINUS")
+        || starts_with_keyword_token(&trimmed_upper, "EXCEPT");
+    if !starts_with_keyword_token(&trimmed_upper, "FOR")
+        && !starts_set_operator
+        && (line_ends_with_keyword(line, "IN")
+            || line_ends_with_keyword(line, "EXISTS")
+            || line_ends_with_keyword(line, "ANY")
+            || line_ends_with_keyword(line, "SOME")
+            || line_ends_with_keyword(line, "ALL"))
+    {
+        return Some(FormatQueryOwnerKind::Condition);
+    }
+
+    None
+}
+
+/// Returns the formatter query-owner kind when `line` owns a nested query body
+/// through a trailing parenthesized group and should therefore participate in
+/// the query-owner indentation stack.
+pub(crate) fn format_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind> {
+    line_ends_with_open_paren_before_inline_comment(line)
+        .then(|| format_query_owner_header_kind(line))
+        .flatten()
 }
 
 /// Returns true when `text_upper` starts with a MODEL subclause whose body is
@@ -1409,7 +1490,35 @@ pub(crate) fn starts_with_format_model_subclause(text_upper: &str) -> bool {
         || starts_with_keyword_token(text_upper, "RULES")
 }
 
-fn line_contains_keyword_token(line: &str, keyword: &str) -> bool {
+/// Returns the structured formatter owner kind when `line` ends on the owner
+/// header token itself and the parenthesized body starts on a later line.
+pub(crate) fn format_indented_paren_owner_header_kind(
+    line: &str,
+) -> Option<FormatIndentedParenOwnerKind> {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
+    if line_ends_with_keyword(line, "OVER") {
+        Some(FormatIndentedParenOwnerKind::AnalyticOver)
+    } else if starts_with_format_model_subclause(&trimmed_upper) {
+        Some(FormatIndentedParenOwnerKind::ModelSubclause)
+    } else if starts_with_keyword_token(&trimmed_upper, "WINDOW")
+        && line_ends_with_keyword(line, "AS")
+    {
+        Some(FormatIndentedParenOwnerKind::Window)
+    } else if line_ends_with_keyword(line, "MATCH_RECOGNIZE") {
+        Some(FormatIndentedParenOwnerKind::MatchRecognize)
+    } else if line_ends_with_keyword(line, "PIVOT") {
+        Some(FormatIndentedParenOwnerKind::Pivot)
+    } else if line_ends_with_keyword(line, "UNPIVOT") {
+        Some(FormatIndentedParenOwnerKind::Unpivot)
+    } else if line_ends_with_keyword(line, "COLUMNS") {
+        Some(FormatIndentedParenOwnerKind::StructuredColumns)
+    } else {
+        None
+    }
+}
+
+fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
     let bytes = line.as_bytes();
     let keyword_bytes = keyword.as_bytes();
     let mut idx = 0usize;
@@ -1417,6 +1526,7 @@ fn line_contains_keyword_token(line: &str, keyword: &str) -> bool {
     let mut in_double_quote = false;
     let mut in_block_comment = false;
     let mut q_quote_end: Option<u8> = None;
+    let mut last_identifier_range: Option<(usize, usize)> = None;
 
     while idx < bytes.len() {
         let current = bytes[idx];
@@ -1505,6 +1615,10 @@ fn line_contains_keyword_token(line: &str, keyword: &str) -> bool {
             idx = idx.saturating_add(1);
             continue;
         }
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
 
         if is_identifier_start_byte(current) {
             let start = idx;
@@ -1513,24 +1627,136 @@ fn line_contains_keyword_token(line: &str, keyword: &str) -> bool {
                 idx = idx.saturating_add(1);
             }
 
-            let span = idx.saturating_sub(start);
-            if span == keyword_bytes.len()
-                && bytes
-                    .get(start..idx)
-                    .is_some_and(|token| token.eq_ignore_ascii_case(keyword_bytes))
-            {
-                return true;
-            }
+            last_identifier_range = Some((start, idx));
             continue;
         }
 
         idx = idx.saturating_add(1);
     }
 
-    false
+    last_identifier_range
+        .and_then(|(start, end)| line.get(start..end))
+        .is_some_and(|token| token.as_bytes().eq_ignore_ascii_case(keyword_bytes))
 }
 
 fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_block_comment = false;
+        let mut q_quote_end: Option<u8> = None;
+        let mut last_significant_byte: Option<u8> = None;
+
+        while idx < bytes.len() {
+            let current = bytes[idx];
+            let next = bytes.get(idx.saturating_add(1)).copied();
+
+            if in_block_comment {
+                if current == b'*' && next == Some(b'/') {
+                    in_block_comment = false;
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+
+            if let Some(closing) = q_quote_end {
+                if current == closing && next == Some(b'\'') {
+                    q_quote_end = None;
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+
+            if in_single_quote {
+                if current == b'\'' {
+                    if next == Some(b'\'') {
+                        idx = idx.saturating_add(2);
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+
+            if in_double_quote {
+                if current == b'"' {
+                    if next == Some(b'"') {
+                        idx = idx.saturating_add(2);
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+
+            if current == b'-' && next == Some(b'-') {
+                break;
+            }
+            if current == b'/' && next == Some(b'*') {
+                in_block_comment = true;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+                if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                    if is_valid_q_quote_delimiter_byte(delimiter) {
+                        q_quote_end = Some(q_quote_closing_byte(delimiter));
+                        idx = idx.saturating_add(3);
+                        continue;
+                    }
+                }
+            }
+            if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+                && matches!(next, Some(b'q' | b'Q'))
+                && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+            {
+                if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                    if is_valid_q_quote_delimiter_byte(delimiter) {
+                        q_quote_end = Some(q_quote_closing_byte(delimiter));
+                        idx = idx.saturating_add(4);
+                        continue;
+                    }
+                }
+            }
+            if current == b'\'' {
+                in_single_quote = true;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if current == b'"' {
+                in_double_quote = true;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if current.is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+
+            if is_identifier_start_byte(current) {
+                idx = idx.saturating_add(1);
+                while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+                    idx = idx.saturating_add(1);
+                }
+                last_significant_byte = Some(b'a');
+                continue;
+            }
+
+            last_significant_byte = Some(current);
+            idx = idx.saturating_add(1);
+        }
+
+        return last_significant_byte == Some(b'(');
+    }
+
     let bytes = line.as_bytes();
     let keyword_bytes = keyword.as_bytes();
     let mut idx = 0usize;
@@ -1661,25 +1887,13 @@ fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
 /// Returns the structured formatter block kind when a line owns a multiline
 /// parenthesized body that should be tracked on a dedicated indentation stack.
 pub(crate) fn format_indented_paren_owner_kind(line: &str) -> Option<FormatIndentedParenOwnerKind> {
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    line_ends_with_open_paren_before_inline_comment(line)
+        .then(|| format_indented_paren_owner_header_kind(line))
+        .flatten()
+}
 
-    if line_ends_with_keyword_open_paren(line, "OVER") {
-        Some(FormatIndentedParenOwnerKind::AnalyticOver)
-    } else if starts_with_format_model_subclause(&trimmed_upper) {
-        Some(FormatIndentedParenOwnerKind::ModelSubclause)
-    } else if starts_with_keyword_token(&trimmed_upper, "WINDOW") {
-        Some(FormatIndentedParenOwnerKind::Window)
-    } else if line_contains_keyword_token(line, "MATCH_RECOGNIZE") {
-        Some(FormatIndentedParenOwnerKind::MatchRecognize)
-    } else if line_contains_keyword_token(line, "PIVOT") {
-        Some(FormatIndentedParenOwnerKind::Pivot)
-    } else if line_contains_keyword_token(line, "UNPIVOT") {
-        Some(FormatIndentedParenOwnerKind::Unpivot)
-    } else if line_contains_keyword_token(line, "COLUMNS") {
-        Some(FormatIndentedParenOwnerKind::StructuredColumns)
-    } else {
-        None
-    }
+fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
+    line_ends_with_keyword_open_paren(line, "")
 }
 
 /// Returns true when a leading keyword should preserve the next line as a
@@ -1947,6 +2161,174 @@ mod tests {
         assert_eq!(
             format_indented_paren_owner_kind("OVERLAY (name PLACING 'X' FROM 1 FOR 1)"),
             None
+        );
+    }
+
+    #[test]
+    fn format_indented_paren_owner_kind_covers_stack_managed_multiline_owners() {
+        assert_eq!(
+            format_indented_paren_owner_kind("WINDOW w_dept AS ( -- named window"),
+            Some(FormatIndentedParenOwnerKind::Window)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("MATCH_RECOGNIZE ( -- pattern input"),
+            Some(FormatIndentedParenOwnerKind::MatchRecognize)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("FROM src PIVOT ( -- rotate rows"),
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("FROM src UNPIVOT ( -- rotate cols"),
+            Some(FormatIndentedParenOwnerKind::Unpivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind("NESTED PATH '$.items[*]' COLUMNS ( -- nested"),
+            Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        );
+    }
+
+    #[test]
+    fn format_indented_paren_owner_header_kind_covers_split_owner_heads() {
+        assert_eq!(
+            format_indented_paren_owner_header_kind("SUM (sal) OVER"),
+            Some(FormatIndentedParenOwnerKind::AnalyticOver)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("WINDOW w_dept AS"),
+            Some(FormatIndentedParenOwnerKind::Window)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("MATCH_RECOGNIZE"),
+            Some(FormatIndentedParenOwnerKind::MatchRecognize)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("FROM src PIVOT"),
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("RULES UPDATE"),
+            Some(FormatIndentedParenOwnerKind::ModelSubclause)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("NESTED PATH '$.items[*]' COLUMNS"),
+            Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        );
+    }
+
+    #[test]
+    fn format_query_owner_kind_covers_nested_query_owner_heads() {
+        assert_eq!(
+            format_query_owner_kind("FROM ("),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_kind("LEFT OUTER JOIN ("),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_kind("USING ("),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_kind("LATERAL ("),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_kind("CROSS APPLY ("),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_kind("OUTER APPLY ("),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_kind("MERGE INTO dst d USING ("),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE col IN ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE EXISTS ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE NOT EXISTS ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE score = ANY ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE score < SOME ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_kind("WHERE score > ALL ("),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(format_query_owner_kind("FOR rec IN ("), None);
+        assert_eq!(format_query_owner_kind("FOR qtr IN ("), None);
+    }
+
+    #[test]
+    fn format_query_owner_header_kind_covers_split_owner_heads() {
+        assert_eq!(
+            format_query_owner_header_kind("FROM"),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("LEFT OUTER JOIN"),
+            Some(FormatQueryOwnerKind::Clause)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("CROSS APPLY"),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("WHERE EXISTS"),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("WHERE score < SOME"),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(format_query_owner_header_kind("FOR rec IN"), None);
+        assert_eq!(format_query_owner_header_kind("UNION ALL"), None);
+    }
+
+    #[test]
+    fn format_query_owner_kind_depth_rules_keep_nested_heads_relative_to_owner_context() {
+        assert_eq!(
+            FormatQueryOwnerKind::Clause.auto_format_child_query_owner_base_depth(2, Some(2)),
+            2
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::FromItem.auto_format_child_query_owner_base_depth(3, Some(2)),
+            3
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Condition.auto_format_child_query_owner_base_depth(2, Some(2)),
+            3
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Condition.auto_format_child_query_owner_base_depth(3, Some(2)),
+            3
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Clause.formatter_child_query_head_depth(2, Some(2)),
+            4
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::FromItem.formatter_child_query_head_depth(3, Some(2)),
+            4
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(2, Some(2)),
+            4
         );
     }
 
