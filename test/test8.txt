@@ -108,26 +108,25 @@ CREATE TABLE oqt_t_log (
     created_at DATE           DEFAULT SYSDATE
 );
 
-CREATE SEQUENCE oqt_seq_test
-START WITH 1 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE oqt_seq_test START WITH 1 INCREMENT BY 1 NOCACHE;
 
-CREATE SEQUENCE oqt_seq_log
-START WITH 1 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE oqt_seq_log START WITH 1 INCREMENT BY 1 NOCACHE;
 
 PROMPT [3] object type (nested tokens in string)
 
 CREATE OR REPLACE TYPE oqt_obj AS
-    OBJECT (id NUMBER, txt VARCHAR2 (2000), MEMBER FUNCTION peek RETURN VARCHAR2);
+    OBJECT (id NUMBER, txt VARCHAR2 (2000), MEMBER
+        FUNCTION peek RETURN VARCHAR2);
 /
 
 SHOW ERRORS TYPE oqt_obj
 
 CREATE OR REPLACE TYPE BODY oqt_obj AS
-    MEMBER FUNCTION peek RETURN VARCHAR2 IS
+    MEMBER
+    FUNCTION peek RETURN VARCHAR2 IS
     BEGIN
         RETURN 'peek:' || SUBSTR (txt, 1, 40) || q'[ | tokens: END; / ; /* */ -- ]';
     END;
-
 END;
 /
 
@@ -295,7 +294,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
                                         ELSE
                                         i
                                     END
-                                );
+                                    );
                             END LOOP;
                     END CASE;
                 ELSE
@@ -309,16 +308,14 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
         log_msg ('RUN', 'obj', v_depth, v_obj.peek);
         -- 동적 SQL with bind
         v_sql := 'INSERT INTO oqt_t_test(id, grp, n, txt) VALUES (oqt_seq_test.NEXTVAL, :g, :n, :t)';
-        EXECUTE IMMEDIATE v_sql USING p_grp,
-            p_n,
-            (p_txt || ' |flag=' || v_flag || ' |deep=' || f_deep (p_grp, p_n, p_txt) || q'[ |q-quote: END; / ; /* */ -- ]');
+        EXECUTE IMMEDIATE v_sql USING p_grp, p_n, (p_txt || ' |flag=' || v_flag || ' |deep=' || f_deep (p_grp, p_n, p_txt) || q'[ |q-quote: END; / ; /* */ -- ]');
         -- SAVEPOINT + 예외 처리 분기
         SAVEPOINT sp1;
         BEGIN
             -- 일부러 0으로 나누기 유발(조건부) -> 예외 테스트
             IF p_n = 0 THEN
                 v_sum := v_sum / p_n;
-                -- ZERO_DIVIDE
+            -- ZERO_DIVIDE
             END IF;
         EXCEPTION
             WHEN ZERO_DIVIDE THEN
@@ -373,10 +370,10 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
                 t.n,
                 CASE
                     WHEN t.grp = 0 THEN
-                    CASE
-                        WHEN t.n > 10 THEN 'G0_BIG'
-                        ELSE 'G0_SMALL'
-                    END
+                        CASE
+                            WHEN t.n > 10 THEN 'G0_BIG'
+                            ELSE 'G0_SMALL'
+                        END
                     WHEN t.grp IN (1, 2) THEN 'G12'
                     ELSE 'GOTHER'
                 END AS bucket,
@@ -428,7 +425,7 @@ BEGIN
     oqt_mega_pkg.run_torture (:v_grp, :v_n, :v_txt);
     oqt_mega_pkg.run_torture (0, 11, 'txt has END; and / and ; inside');
     oqt_mega_pkg.run_torture (1, 0, 'n=0 triggers ZERO_DIVIDE branch (caught)');
-    -- 예외 블록 테스트
+-- 예외 블록 테스트
 END;
 /
 
@@ -461,13 +458,16 @@ FROM oqt_t_test
 GROUP BY grp
 ORDER BY grp;
 
-SELECT log_id,
-    tag,
+SELECT LOG_ID,
+    TAG,
     step,
     DEPTH,
-    SUBSTR (msg, 1, 120) AS msg
-FROM oqt_t_log
-ORDER BY log_id
+    SUBSTR (MSG, 1, 120) AS msg
+FROM OQT_T_LOG
+ORDER BY LOG_ID
 FETCH FIRST 40 ROWS ONLY;
 
 PROMPT [DONE]
+
+-- 
+select * from EMP;

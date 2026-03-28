@@ -1489,11 +1489,33 @@ const FORMAT_MODEL_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
     &["MEASURES"],
     &["REFERENCE"],
     &["RULES"],
+    &["UPDATE"],
+    &["UPSERT"],
+    &["UPSERT", "ALL"],
+    &["AUTOMATIC", "ORDER"],
+    &["SEQUENTIAL", "ORDER"],
+    &["ITERATE"],
+    &["UNTIL"],
     &["IGNORE", "NAV"],
     &["KEEP", "NAV"],
     &["UNIQUE", "DIMENSION"],
     &["UNIQUE", "SINGLE", "REFERENCE"],
+    &["RETURN", "ALL", "ROWS"],
     &["RETURN", "UPDATED", "ROWS"],
+];
+
+// MODEL rule modifiers may already be attached to a preceding `RULES` line.
+// Phase 2 still needs to recognize them as owner-relative headers when users
+// split them manually, but phase 1 should not aggressively force a new break
+// between `RULES` and its modifiers.
+const FORMAT_MODEL_PHASE1_EXCLUDED_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["UPDATE"],
+    &["UPSERT"],
+    &["UPSERT", "ALL"],
+    &["AUTOMATIC", "ORDER"],
+    &["SEQUENTIAL", "ORDER"],
+    &["ITERATE"],
+    &["UNTIL"],
 ];
 
 const FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
@@ -1619,8 +1641,8 @@ impl FormatIndentedParenOwnerKind {
     fn phase1_excluded_body_header_sequences(self) -> &'static [&'static [&'static str]] {
         match self {
             Self::MatchRecognize => &[&["PARTITION", "BY"], &["ORDER", "BY"]],
+            Self::ModelSubclause => FORMAT_MODEL_PHASE1_EXCLUDED_SUBCLAUSE_KEYWORD_SEQUENCES,
             Self::AnalyticOver
-            | Self::ModelSubclause
             | Self::Window
             | Self::Pivot
             | Self::Unpivot
@@ -1967,6 +1989,151 @@ fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
     line_ends_with_keyword_open_paren(line, "")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SignificantParenEvent {
+    Open,
+    Close,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SignificantParenProfile {
+    pub(crate) events: Vec<SignificantParenEvent>,
+    pub(crate) leading_close_count: usize,
+}
+
+/// Returns the ordered sequence of significant `(` / `)` tokens that appear on
+/// `line`, excluding content inside comments or quoted literals. The profile
+/// also tracks how many close-paren events occur before any other significant
+/// token so indentation code can consume nested owner stacks in the same order
+/// as the visible leading `)` sequence.
+pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut profile = SignificantParenProfile::default();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_block_comment = false;
+    let mut q_quote_end: Option<u8> = None;
+    let mut still_in_leading_close_run = true;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'-') {
+            break;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    still_in_leading_close_run = false;
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    still_in_leading_close_run = false;
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            still_in_leading_close_run = false;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            still_in_leading_close_run = false;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        match current {
+            b'(' => {
+                still_in_leading_close_run = false;
+                profile.events.push(SignificantParenEvent::Open);
+            }
+            b')' => {
+                if still_in_leading_close_run {
+                    profile.leading_close_count = profile.leading_close_count.saturating_add(1);
+                }
+                profile.events.push(SignificantParenEvent::Close);
+            }
+            _ => {
+                still_in_leading_close_run = false;
+            }
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    profile
+}
+
 /// Returns true when a leading keyword should preserve the next line as a
 /// continuation after a comment split.
 pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
@@ -2167,6 +2334,40 @@ mod tests {
         assert_eq!(FormatSetOperatorKind::from_clause_start("ORDER BY"), None);
         assert!(starts_with_format_set_operator("INTERSECT"));
         assert!(!starts_with_format_set_operator("WHERE col IN"));
+    }
+
+    #[test]
+    fn significant_paren_profile_tracks_event_order_and_leading_closes() {
+        let profile = significant_paren_profile(") ) PARTITION BY (expr + (1))");
+
+        assert_eq!(profile.leading_close_count, 2);
+        assert_eq!(
+            profile.events,
+            vec![
+                SignificantParenEvent::Close,
+                SignificantParenEvent::Close,
+                SignificantParenEvent::Open,
+                SignificantParenEvent::Open,
+                SignificantParenEvent::Close,
+                SignificantParenEvent::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn significant_paren_profile_ignores_comments_and_q_quotes() {
+        let profile =
+            significant_paren_profile("/* ) */ ) q'[ignored ( )]' /* ( */ (col) -- trailing )");
+
+        assert_eq!(profile.leading_close_count, 1);
+        assert_eq!(
+            profile.events,
+            vec![
+                SignificantParenEvent::Close,
+                SignificantParenEvent::Open,
+                SignificantParenEvent::Close,
+            ]
+        );
     }
 
     #[test]
@@ -2387,13 +2588,59 @@ mod tests {
 
     #[test]
     fn format_model_subclause_helper_covers_extended_body_headers() {
+        assert!(starts_with_format_model_subclause("UPDATE"));
+        assert!(starts_with_format_model_subclause("UPSERT"));
         assert!(starts_with_format_model_subclause("IGNORE NAV"));
         assert!(starts_with_format_model_subclause("KEEP NAV"));
+        assert!(starts_with_format_model_subclause("UPSERT ALL"));
+        assert!(starts_with_format_model_subclause("AUTOMATIC ORDER"));
+        assert!(starts_with_format_model_subclause("SEQUENTIAL ORDER"));
+        assert!(starts_with_format_model_subclause("ITERATE (3)"));
+        assert!(starts_with_format_model_subclause("UNTIL ("));
         assert!(starts_with_format_model_subclause("UNIQUE DIMENSION"));
         assert!(starts_with_format_model_subclause(
             "UNIQUE SINGLE REFERENCE"
         ));
+        assert!(starts_with_format_model_subclause("RETURN ALL ROWS"));
         assert!(starts_with_format_model_subclause("RETURN UPDATED ROWS"));
+    }
+
+    #[test]
+    fn format_model_subclause_phase1_breaks_keep_rules_headers_but_not_rules_modifiers() {
+        assert!(
+            FormatIndentedParenOwnerKind::ModelSubclause.starts_phase1_body_header_words(
+                "IGNORE",
+                Some("NAV"),
+                None,
+            )
+        );
+        assert!(
+            FormatIndentedParenOwnerKind::ModelSubclause.starts_phase1_body_header_words(
+                "RETURN",
+                Some("UPDATED"),
+                Some("ROWS"),
+            )
+        );
+        assert!(!FormatIndentedParenOwnerKind::ModelSubclause
+            .starts_phase1_body_header_words("UPDATE", None, None,));
+        assert!(
+            !FormatIndentedParenOwnerKind::ModelSubclause.starts_phase1_body_header_words(
+                "UPSERT",
+                Some("ALL"),
+                None,
+            )
+        );
+        assert!(
+            !FormatIndentedParenOwnerKind::ModelSubclause.starts_phase1_body_header_words(
+                "SEQUENTIAL",
+                Some("ORDER"),
+                None,
+            )
+        );
+        assert!(!FormatIndentedParenOwnerKind::ModelSubclause
+            .starts_phase1_body_header_words("ITERATE", None, None,));
+        assert!(!FormatIndentedParenOwnerKind::ModelSubclause
+            .starts_phase1_body_header_words("UNTIL", None, None,));
     }
 
     #[test]

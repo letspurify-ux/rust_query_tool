@@ -256,24 +256,38 @@
     #[test]
     fn test8_log_query_order_by_statement_isolated_from_previous_summary_query() {
         let script = load_intellisense_test_file("test8.txt");
-        let marked = script.replacen(
-            "ORDER BY log_id",
-            "ORDER BY __CODEX_CURSOR__log_id",
-            1,
-        );
+        let order_by_prefix = "ORDER BY ";
+        let order_by_target = "ORDER BY LOG_ID";
+        let marked = script
+            .to_ascii_uppercase()
+            .find(order_by_target)
+            .map(|target_start| {
+                let insert_at = target_start.saturating_add(order_by_prefix.len());
+                let mut marked = String::with_capacity(
+                    script
+                        .len()
+                        .saturating_add("__CODEX_CURSOR__".len()),
+                );
+                marked.push_str(&script[..insert_at]);
+                marked.push_str("__CODEX_CURSOR__");
+                marked.push_str(&script[insert_at..]);
+                marked
+            })
+            .unwrap_or_else(|| script.clone());
         assert_ne!(marked, script, "expected log query ORDER BY target in test8.txt");
         let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+        let statement_upper = statement.to_ascii_uppercase();
 
         assert!(
-            statement.contains("FROM oqt_t_log"),
+            statement_upper.contains("FROM OQT_T_LOG"),
             "log query should include oqt_t_log, got:\n{statement}"
         );
         assert!(
-            statement.contains("FETCH FIRST 40 ROWS ONLY"),
+            statement_upper.contains("FETCH FIRST 40 ROWS ONLY"),
             "log query should preserve trailing FETCH clause, got:\n{statement}"
         );
         assert!(
-            !statement.contains("FROM oqt_t_test"),
+            !statement_upper.contains("FROM OQT_T_TEST"),
             "log query should not leak previous summary query:\n{statement}"
         );
         assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);

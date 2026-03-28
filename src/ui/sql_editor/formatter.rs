@@ -45,42 +45,52 @@ struct LineLayout<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct MultilineClauseLayoutFrame {
-    kind: FormatIndentedParenOwnerKind,
-    owner_depth: usize,
-    nested_paren_depth: usize,
-}
-
-impl MultilineClauseLayoutFrame {
-    fn is_match_recognize(self) -> bool {
-        self.kind == FormatIndentedParenOwnerKind::MatchRecognize
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ModelClauseLayoutFrame {
-    owner_depth: usize,
-    start_parser_depth: usize,
+enum OwnerRelativeLayoutFrameKind {
+    ModelClause {
+        start_parser_depth: usize,
+    },
+    MultilineClause {
+        kind: FormatIndentedParenOwnerKind,
+        nested_paren_depth: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
-enum OwnerRelativeLayoutFrame {
-    ModelClause(ModelClauseLayoutFrame),
-    MultilineClause(MultilineClauseLayoutFrame),
+struct OwnerRelativeLayoutFrame {
+    owner_depth: usize,
+    kind: OwnerRelativeLayoutFrameKind,
 }
 
 impl OwnerRelativeLayoutFrame {
-    fn owner_depth(self) -> usize {
-        match self {
-            Self::ModelClause(frame) => frame.owner_depth,
-            Self::MultilineClause(frame) => frame.owner_depth,
+    fn model_clause(owner_depth: usize, start_parser_depth: usize) -> Self {
+        Self {
+            owner_depth,
+            kind: OwnerRelativeLayoutFrameKind::ModelClause { start_parser_depth },
         }
     }
 
+    fn multiline_clause(kind: FormatIndentedParenOwnerKind, owner_depth: usize) -> Self {
+        Self {
+            owner_depth,
+            kind: OwnerRelativeLayoutFrameKind::MultilineClause {
+                kind,
+                nested_paren_depth: 1,
+            },
+        }
+    }
+
+    fn owner_depth(self) -> usize {
+        self.owner_depth
+    }
+
     fn body_depth(self) -> usize {
-        match self {
-            Self::ModelClause(frame) => frame.owner_depth.saturating_add(1),
-            Self::MultilineClause(frame) => frame.kind.body_depth(frame.owner_depth),
+        match self.kind {
+            OwnerRelativeLayoutFrameKind::ModelClause { .. } => {
+                FormatIndentedParenOwnerKind::ModelSubclause.body_depth(self.owner_depth)
+            }
+            OwnerRelativeLayoutFrameKind::MultilineClause { kind, .. } => {
+                kind.body_depth(self.owner_depth)
+            }
         }
     }
 
@@ -89,26 +99,60 @@ impl OwnerRelativeLayoutFrame {
         text_upper: &str,
         previous_line_upper: Option<&str>,
     ) -> Option<usize> {
-        match self {
-            Self::ModelClause(_) => {
-                sql_text::starts_with_format_model_subclause(text_upper).then(|| self.body_depth())
+        match self.kind {
+            OwnerRelativeLayoutFrameKind::ModelClause { .. } => {
+                FormatIndentedParenOwnerKind::ModelSubclause.formatter_body_header_depth(
+                    text_upper,
+                    previous_line_upper,
+                    self.owner_depth,
+                )
             }
-            Self::MultilineClause(frame) => frame.kind.formatter_body_header_depth(
-                text_upper,
-                previous_line_upper,
-                frame.owner_depth,
-            ),
+            OwnerRelativeLayoutFrameKind::MultilineClause { kind, .. } => {
+                kind.formatter_body_header_depth(text_upper, previous_line_upper, self.owner_depth)
+            }
         }
     }
 
     fn enforces_body_floor(self) -> bool {
-        matches!(self, Self::MultilineClause(_))
+        matches!(
+            self.kind,
+            OwnerRelativeLayoutFrameKind::MultilineClause { .. }
+        )
     }
 
     fn is_match_recognize(self) -> bool {
         matches!(
-            self,
-            Self::MultilineClause(frame) if frame.is_match_recognize()
+            self.kind,
+            OwnerRelativeLayoutFrameKind::MultilineClause {
+                kind: FormatIndentedParenOwnerKind::MatchRecognize,
+                ..
+            }
+        )
+    }
+
+    fn note_multiline_paren_event(&mut self, event: sql_text::SignificantParenEvent) {
+        if let OwnerRelativeLayoutFrameKind::MultilineClause {
+            nested_paren_depth, ..
+        } = &mut self.kind
+        {
+            match event {
+                sql_text::SignificantParenEvent::Open => {
+                    *nested_paren_depth = nested_paren_depth.saturating_add(1);
+                }
+                sql_text::SignificantParenEvent::Close => {
+                    *nested_paren_depth = nested_paren_depth.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn is_closed_multiline_clause(self) -> bool {
+        matches!(
+            self.kind,
+            OwnerRelativeLayoutFrameKind::MultilineClause {
+                nested_paren_depth: 0,
+                ..
+            }
         )
     }
 }
@@ -5562,20 +5606,93 @@ impl SqlEditorWidget {
         true
     }
 
+    fn pop_expired_owner_relative_layout_frames(
+        owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
+        depth: usize,
+        trimmed_upper: &str,
+    ) {
+        while owner_relative_frames
+            .last()
+            .is_some_and(|frame| match frame.kind {
+                OwnerRelativeLayoutFrameKind::ModelClause { start_parser_depth } => {
+                    depth < start_parser_depth
+                        || (depth <= start_parser_depth
+                            && Self::is_dml_clause_starter(trimmed_upper)
+                            && !crate::sql_text::starts_with_keyword_token(trimmed_upper, "MODEL")
+                            && !crate::sql_text::starts_with_format_model_subclause(trimmed_upper))
+                }
+                OwnerRelativeLayoutFrameKind::MultilineClause { .. } => false,
+            })
+        {
+            owner_relative_frames.pop();
+        }
+    }
+
     fn active_owner_relative_layout_frame(
-        model_clause_frames: &[ModelClauseLayoutFrame],
-        multiline_clause_frames: &[MultilineClauseLayoutFrame],
+        owner_relative_frames: &[OwnerRelativeLayoutFrame],
     ) -> Option<OwnerRelativeLayoutFrame> {
-        multiline_clause_frames
+        owner_relative_frames.last().copied()
+    }
+
+    fn pop_closed_multiline_owner_relative_layout_frames(
+        owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
+    ) -> Option<usize> {
+        let mut last_closed_owner_depth = None;
+
+        while owner_relative_frames
             .last()
             .copied()
-            .map(OwnerRelativeLayoutFrame::MultilineClause)
-            .or_else(|| {
-                model_clause_frames
-                    .last()
-                    .copied()
-                    .map(OwnerRelativeLayoutFrame::ModelClause)
-            })
+            .is_some_and(OwnerRelativeLayoutFrame::is_closed_multiline_clause)
+        {
+            if let Some(frame) = owner_relative_frames.pop() {
+                last_closed_owner_depth = Some(frame.owner_depth());
+            }
+        }
+
+        last_closed_owner_depth
+    }
+
+    fn apply_multiline_owner_relative_paren_event(
+        owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
+        event: sql_text::SignificantParenEvent,
+    ) -> Option<usize> {
+        owner_relative_frames
+            .iter_mut()
+            .for_each(|frame| frame.note_multiline_paren_event(event));
+
+        if event == sql_text::SignificantParenEvent::Close {
+            Self::pop_closed_multiline_owner_relative_layout_frames(owner_relative_frames)
+        } else {
+            None
+        }
+    }
+
+    fn apply_multiline_owner_relative_paren_profile(
+        owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
+        paren_profile: &sql_text::SignificantParenProfile,
+    ) {
+        for event in &paren_profile.events {
+            let _ = Self::apply_multiline_owner_relative_paren_event(owner_relative_frames, *event);
+        }
+    }
+
+    fn leading_multiline_clause_close_owner_depth(
+        owner_relative_frames: &[OwnerRelativeLayoutFrame],
+        paren_profile: &sql_text::SignificantParenProfile,
+    ) -> Option<usize> {
+        let mut simulated_frames = owner_relative_frames.to_vec();
+        let mut last_closed_owner_depth = None;
+
+        for _ in 0..paren_profile.leading_close_count {
+            if let Some(owner_depth) = Self::apply_multiline_owner_relative_paren_event(
+                &mut simulated_frames,
+                sql_text::SignificantParenEvent::Close,
+            ) {
+                last_closed_owner_depth = Some(owner_depth);
+            }
+        }
+
+        last_closed_owner_depth
     }
 
     fn normalize_indented_owner_relative_depth(
@@ -5628,8 +5745,7 @@ impl SqlEditorWidget {
         let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
         let mut pending_query_head_frames: Vec<PendingQueryHeadLayoutFrame> = Vec::new();
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
-        let mut model_clause_frames: Vec<ModelClauseLayoutFrame> = Vec::new();
-        let mut multiline_clause_frames: Vec<MultilineClauseLayoutFrame> = Vec::new();
+        let mut owner_relative_frames: Vec<OwnerRelativeLayoutFrame> = Vec::new();
         let mut pending_multiline_clause_owner: Option<PendingMultilineClauseOwnerLayoutFrame> =
             None;
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
@@ -5654,14 +5770,11 @@ impl SqlEditorWidget {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
 
-            while model_clause_frames.last().is_some_and(|frame| {
-                depth < frame.start_parser_depth
-                    || (depth <= frame.start_parser_depth
-                        && Self::is_dml_clause_starter(&trimmed_upper)
-                        && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MODEL"))
-            }) {
-                model_clause_frames.pop();
-            }
+            Self::pop_expired_owner_relative_layout_frames(
+                &mut owner_relative_frames,
+                depth,
+                &trimmed_upper,
+            );
 
             while join_on_condition_and_depth
                 .last()
@@ -5950,6 +6063,7 @@ impl SqlEditorWidget {
                 .then(|| case_layout_state.active_parenthesized_case_frame())
                 .flatten();
             let in_query_statement = in_dml_statement || layouts[idx].query_base_depth.is_some();
+            let multiline_clause_paren_profile = sql_text::significant_paren_profile(trimmed);
             let current_line_multiline_clause_owner_kind = in_query_statement
                 .then(|| Self::line_multiline_clause_owner_kind(trimmed))
                 .flatten();
@@ -5957,14 +6071,13 @@ impl SqlEditorWidget {
                 .or(pending_multiline_clause_for_line.map(|frame| frame.kind));
             let current_line_starts_multiline_clause =
                 current_line_multiline_clause_owner_kind.is_some();
-            let current_line_closes_multiline_clause = multiline_clause_frames
-                .last()
-                .copied()
-                .is_some_and(|frame| starts_with_close_paren && frame.nested_paren_depth == 1);
-            let active_owner_relative_frame = Self::active_owner_relative_layout_frame(
-                &model_clause_frames,
-                &multiline_clause_frames,
-            );
+            let current_line_closes_multiline_clause_owner_depth =
+                Self::leading_multiline_clause_close_owner_depth(
+                    &owner_relative_frames,
+                    &multiline_clause_paren_profile,
+                );
+            let active_owner_relative_frame =
+                Self::active_owner_relative_layout_frame(&owner_relative_frames);
             let (
                 paren_frame_scan_start_idx,
                 last_popped_non_multiline_paren_frame,
@@ -6604,16 +6717,15 @@ impl SqlEditorWidget {
             let effective_depth = pending_multiline_clause_for_line
                 .map(|frame| frame.owner_depth)
                 .unwrap_or(effective_depth);
-            let effective_depth = active_owner_relative_frame
-                .filter(|frame| frame.enforces_body_floor())
-                .map(|frame| {
-                    if current_line_closes_multiline_clause {
-                        frame.owner_depth()
-                    } else {
-                        effective_depth.max(frame.body_depth())
-                    }
-                })
-                .unwrap_or(effective_depth);
+            let effective_depth =
+                if let Some(owner_depth) = current_line_closes_multiline_clause_owner_depth {
+                    owner_depth
+                } else {
+                    active_owner_relative_frame
+                        .filter(|frame| frame.enforces_body_floor())
+                        .map(|frame| effective_depth.max(frame.body_depth()))
+                        .unwrap_or(effective_depth)
+                };
             let close_continuation_frame =
                 active_general_paren_frame.or(last_popped_general_paren_frame);
             let condition_close_alignment_active = current_line_is_parenthesized_condition_close
@@ -6641,7 +6753,9 @@ impl SqlEditorWidget {
                 && !defers_to_condition_close_alignment
                 && !is_paren_case_closer
             {
-                if let Some(frame) = popped_query_paren_frame {
+                if let Some(owner_depth) = current_line_closes_multiline_clause_owner_depth {
+                    owner_depth
+                } else if let Some(frame) = popped_query_paren_frame {
                     current_line_query_close_align_depth.unwrap_or(frame.owner_depth)
                 } else {
                     last_popped_non_multiline_paren_frame
@@ -6789,34 +6903,25 @@ impl SqlEditorWidget {
             } else {
                 parenthesized_condition_header_depth
             };
-            if let Some(frame) = multiline_clause_frames.last_mut() {
-                if !current_line_starts_multiline_clause {
-                    let (open_count, close_count) = Self::line_significant_paren_counts(trimmed);
-                    frame.nested_paren_depth = frame
-                        .nested_paren_depth
-                        .saturating_add(open_count)
-                        .saturating_sub(close_count);
-                }
-            }
-            if current_line_closes_multiline_clause {
-                multiline_clause_frames.pop();
-            }
+            Self::apply_multiline_owner_relative_paren_profile(
+                &mut owner_relative_frames,
+                &multiline_clause_paren_profile,
+            );
             if current_line_starts_multiline_clause {
                 if let Some(kind) = current_line_multiline_clause_owner_kind {
-                    multiline_clause_frames.push(MultilineClauseLayoutFrame {
+                    owner_relative_frames.push(OwnerRelativeLayoutFrame::multiline_clause(
                         kind,
-                        owner_depth: pending_multiline_clause_for_line
+                        pending_multiline_clause_for_line
                             .map(|frame| frame.owner_depth)
                             .unwrap_or(effective_depth),
-                        nested_paren_depth: 1,
-                    });
+                    ));
                 }
             }
             if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MODEL") {
-                model_clause_frames.push(ModelClauseLayoutFrame {
-                    owner_depth: effective_depth,
-                    start_parser_depth: depth,
-                });
+                owner_relative_frames.push(OwnerRelativeLayoutFrame::model_clause(
+                    effective_depth,
+                    depth,
+                ));
             }
             let anchor_group = if !in_dml_statement
                 && previous_line_ends_with_trailing_comma
@@ -6992,8 +7097,7 @@ impl SqlEditorWidget {
                 in_dml_statement = false;
                 pending_query_head_frames.clear();
                 resolved_query_base_depths.clear();
-                model_clause_frames.clear();
-                multiline_clause_frames.clear();
+                owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
@@ -7885,23 +7989,6 @@ impl SqlEditorWidget {
         }
 
         false
-    }
-
-    fn line_significant_paren_counts(line: &str) -> (usize, usize) {
-        super::query_text::tokenize_sql(line).into_iter().fold(
-            (0usize, 0usize),
-            |(open_count, close_count), token| {
-                if let SqlToken::Symbol(symbol) = token {
-                    match symbol.as_str() {
-                        "(" => (open_count.saturating_add(1), close_count),
-                        ")" => (open_count, close_count.saturating_add(1)),
-                        _ => (open_count, close_count),
-                    }
-                } else {
-                    (open_count, close_count)
-                }
-            },
-        )
     }
 
     fn comment_keeps_next_line_continuation(tokens: &[SqlToken], idx: usize) -> bool {
@@ -21237,6 +21324,248 @@ WHERE modeled.amount > 0;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_normalizes_extended_model_rule_modifiers_relative_to_active_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        PARTITION BY (deptno)
+        DIMENSION BY (month_key)
+        MEASURES (
+            (SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno) cap,
+            amount
+        )
+RETURN ALL ROWS
+RULES
+UPSERT ALL
+AUTOMATIC ORDER
+ITERATE (3)
+UNTIL (
+    SELECT 1
+    FROM dual
+)
+(
+    amount[ANY] = cap[CV()] + 1
+)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES ("))
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RULES")
+            .unwrap_or(0);
+        let return_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RETURN ALL ROWS")
+            .unwrap_or(0);
+        let upsert_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPSERT ALL")
+            .unwrap_or(0);
+        let automatic_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AUTOMATIC ORDER")
+            .unwrap_or(0);
+        let iterate_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ITERATE (3)")
+            .unwrap_or(0);
+        let until_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNTIL (")
+            .unwrap_or(0);
+        let inner_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE modeled.amount > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[return_idx]),
+            indent(lines[measures_idx]),
+            "RETURN ALL ROWS should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rules_idx]),
+            indent(lines[measures_idx]),
+            "RULES should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[upsert_idx]),
+            indent(lines[rules_idx]),
+            "UPSERT ALL should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[automatic_idx]),
+            indent(lines[rules_idx]),
+            "AUTOMATIC ORDER should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[iterate_idx]),
+            indent(lines[rules_idx]),
+            "ITERATE should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[until_idx]),
+            indent(lines[rules_idx]),
+            "UNTIL should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_select_idx]) > indent(lines[until_idx]),
+            "nested SELECT inside MODEL UNTIL should stay deeper than the UNTIL owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested MODEL query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_update_and_sequential_model_rule_modifiers_relative_to_active_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        PARTITION BY (deptno)
+        DIMENSION BY (month_key)
+        MEASURES (
+            (SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno) cap,
+            amount
+        )
+RETURN UPDATED ROWS
+RULES
+UPDATE
+SEQUENTIAL ORDER
+ITERATE (3)
+UNTIL (
+    SELECT 1
+    FROM dual
+)
+(
+    amount[ANY] = cap[CV()] + 1
+)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES ("))
+            .unwrap_or(0);
+        let return_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RETURN UPDATED ROWS")
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RULES")
+            .unwrap_or(0);
+        let update_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPDATE")
+            .unwrap_or(0);
+        let sequential_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SEQUENTIAL ORDER")
+            .unwrap_or(0);
+        let iterate_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ITERATE (3)")
+            .unwrap_or(0);
+        let until_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNTIL (")
+            .unwrap_or(0);
+        let inner_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE modeled.amount > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[return_idx]),
+            indent(lines[measures_idx]),
+            "RETURN UPDATED ROWS should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rules_idx]),
+            indent(lines[measures_idx]),
+            "RULES should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[update_idx]),
+            indent(lines[rules_idx]),
+            "UPDATE should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sequential_idx]),
+            indent(lines[rules_idx]),
+            "SEQUENTIAL ORDER should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[iterate_idx]),
+            indent(lines[rules_idx]),
+            "ITERATE should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[until_idx]),
+            indent(lines[rules_idx]),
+            "UNTIL should stay aligned with the MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_select_idx]) > indent(lines[until_idx]),
+            "nested SELECT inside MODEL UNTIL should stay deeper than the UNTIL owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested MODEL query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_normalizes_nested_match_recognize_subclause_depth_relative_to_owner(
     ) {
         let source = r#"SELECT *
@@ -22112,6 +22441,163 @@ FROM emp;"#;
         assert!(
             indent(lines[inner_partition_idx]) > indent(lines[outer_partition_idx]),
             "nested OVER subclauses should stay deeper than the outer OVER subclauses, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_pops_nested_multiline_owner_frames_when_close_parens_share_line(
+    ) {
+        let source = r#"SELECT
+    SUM (sal) OVER (
+        PARTITION BY (
+            SELECT deptno
+            FROM dual
+        ))
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let over_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SUM (sal) OVER ("))
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "))")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[over_idx]),
+            "shared-line closes should align with the outer multiline owner instead of leaving an inner owner frame active, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[from_idx]),
+            0,
+            "FROM after a shared-line nested close should return to the query base instead of inheriting a stale multiline owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_nested_model_inside_over_uses_innermost_owner_relative_stack()
+    {
+        let source = r#"SELECT
+    SUM (sal) OVER (
+        PARTITION BY deptno
+        ORDER BY (
+            SELECT amount
+            FROM sales
+            MODEL
+                PARTITION BY (deptno)
+                DIMENSION BY (month_key)
+                RETURN ALL ROWS
+                RULES
+                UPSERT ALL
+                AUTOMATIC ORDER
+                ITERATE (3)
+                UNTIL (
+                    SELECT 1
+                    FROM dual
+                )
+                (
+                    amount[ANY] = amount[CV()] + 1
+                )
+        )
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_sal
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let partition_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.trim_start().starts_with("PARTITION BY").then_some(idx))
+            .collect();
+        let outer_partition_idx = partition_indices.first().copied().unwrap_or(0);
+        let inner_partition_idx = partition_indices.get(1).copied().unwrap_or(0);
+        let return_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RETURN ALL ROWS")
+            .unwrap_or(0);
+        let upsert_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPSERT ALL")
+            .unwrap_or(0);
+        let automatic_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AUTOMATIC ORDER")
+            .unwrap_or(0);
+        let iterate_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ITERATE (3)")
+            .unwrap_or(0);
+        let until_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNTIL (")
+            .unwrap_or(0);
+        let until_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ROWS BETWEEN"))
+            .unwrap_or(0);
+
+        assert!(
+            indent(lines[inner_partition_idx]) > indent(lines[outer_partition_idx]),
+            "inner MODEL subclauses inside OVER should stay deeper than the outer OVER body, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[return_idx]),
+            indent(lines[inner_partition_idx]),
+            "RETURN ALL ROWS should stay on the inner MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[upsert_idx]),
+            indent(lines[inner_partition_idx]),
+            "UPSERT ALL should stay on the inner MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[automatic_idx]),
+            indent(lines[inner_partition_idx]),
+            "AUTOMATIC ORDER should stay on the inner MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[iterate_idx]),
+            indent(lines[inner_partition_idx]),
+            "ITERATE should stay on the inner MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[until_idx]),
+            indent(lines[inner_partition_idx]),
+            "UNTIL should stay on the inner MODEL owner-relative subclause depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[until_select_idx]) > indent(lines[until_idx]),
+            "nested SELECT inside MODEL UNTIL should stay deeper than the UNTIL owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rows_idx]),
+            indent(lines[outer_partition_idx]),
+            "outer OVER frame clauses should realign to the outer owner-relative depth after the inner MODEL closes, got:\n{}",
             formatted
         );
     }
