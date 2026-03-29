@@ -302,6 +302,11 @@ struct PendingQueryOwnerOpenAlignLayoutFrame {
 }
 
 #[derive(Clone, Copy)]
+struct PendingOperatorLayoutFrame {
+    owner_depth: usize,
+}
+
+#[derive(Clone, Copy)]
 struct PendingMultilineClauseOwnerLayoutFrame {
     kind: FormatIndentedParenOwnerKind,
     owner_depth: usize,
@@ -5439,16 +5444,6 @@ impl SqlEditorWidget {
             && (trimmed.contains("--") || trimmed.contains("/*"))
     }
 
-    fn line_is_structural_case_branch_body(
-        trimmed: &str,
-        trimmed_upper: &str,
-        starts_query_head: bool,
-    ) -> bool {
-        starts_query_head
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CASE")
-            || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
-    }
-
     fn tokens_continue_expression_after_leading_closes(
         tokens: &[SqlToken],
         start_idx: usize,
@@ -5800,6 +5795,57 @@ impl SqlEditorWidget {
             .unwrap_or(effective_depth)
     }
 
+    fn continuation_operator_owner_depth(
+        line: &str,
+        line_depth: usize,
+        resolved_query_base_depth: Option<usize>,
+        query_base_depth: Option<usize>,
+        next_code_trimmed: Option<&str>,
+        next_next_code_trimmed: Option<&str>,
+    ) -> usize {
+        if next_code_trimmed.is_some_and(|next| {
+            Self::line_starts_structural_operator_rhs(next, next_next_code_trimmed)
+        }) {
+            return line_depth;
+        }
+
+        let query_base_depth = resolved_query_base_depth.or(query_base_depth);
+
+        sql_text::format_leading_header_continuation_kind(line)
+            .map(|kind| match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => line_depth,
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    query_base_depth.unwrap_or(line_depth).saturating_add(1)
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    line_depth.saturating_add(1)
+                }
+            })
+            .unwrap_or(line_depth)
+    }
+
+    fn line_starts_structural_operator_rhs(
+        line: &str,
+        next_code_trimmed: Option<&str>,
+    ) -> bool {
+        if crate::sql_text::format_query_owner_header_kind(line).is_some()
+            || crate::sql_text::format_query_owner_pending_header_kind(line).is_some()
+        {
+            return true;
+        }
+
+        if !Self::line_is_standalone_open_paren_before_inline_comment(line) {
+            return false;
+        }
+
+        next_code_trimmed.is_some_and(|next| {
+            let next_upper = next.to_ascii_uppercase();
+            crate::sql_text::SUBQUERY_HEAD_KEYWORDS
+                .iter()
+                .any(|keyword| crate::sql_text::starts_with_keyword_token(&next_upper, keyword))
+        })
+    }
+
     fn pop_expired_owner_relative_layout_frames(
         owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
         depth: usize,
@@ -5964,10 +6010,12 @@ impl SqlEditorWidget {
         let mut last_code_idx: Option<usize> = None;
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
+        let mut plsql_case_frames: Vec<usize> = Vec::new();
         let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
         let mut pending_query_head_frames: Vec<PendingQueryHeadLayoutFrame> = Vec::new();
         let mut pending_query_owner_open_align: Option<PendingQueryOwnerOpenAlignLayoutFrame> =
             None;
+        let mut pending_operator_layout_frames: Vec<PendingOperatorLayoutFrame> = Vec::new();
         let mut pending_plsql_child_query_owner: Option<PendingPlsqlChildQueryOwnerLayoutFrame> =
             None;
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
@@ -5999,6 +6047,7 @@ impl SqlEditorWidget {
             let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
+            let pending_operator_for_line = pending_operator_layout_frames.last().copied();
 
             Self::pop_expired_owner_relative_layout_frames(
                 &mut owner_relative_frames,
@@ -6096,9 +6145,6 @@ impl SqlEditorWidget {
                             layouts[prev_idx].trimmed,
                         ) || layouts[prev_idx].trimmed.trim_end().ends_with(','))
                 });
-            let previous_line_ends_with_assignment = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_ends_with_assignment_before_inline_comment(layouts[prev_idx].trimmed)
-            });
             let previous_line_ends_with_then = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_then_before_inline_comment(layouts[prev_idx].trimmed)
             });
@@ -6179,6 +6225,9 @@ impl SqlEditorWidget {
                 last_code_idx.is_some_and(|prev_idx| layouts[prev_idx].trimmed.starts_with(')'));
             let next_code_trimmed =
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
+            let next_next_code_trimmed = next_code_indices[idx]
+                .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten())
+                .map(|next_idx| layouts[next_idx].trimmed);
             let line_tokens = Self::tokenize_sql(trimmed);
             let current_query_owner_kind = crate::sql_text::format_query_owner_kind(trimmed);
             let split_query_owner_lookahead_kind =
@@ -6460,11 +6509,6 @@ impl SqlEditorWidget {
                 last_code_indent
                     .map(|indent| indent.saturating_add(1).max(parser_depth))
                     .unwrap_or(parser_depth.saturating_add(1))
-            } else if !in_dml_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
-                && previous_line_ends_with_assignment
-            {
-                last_code_indent.unwrap_or(parser_depth)
             } else if in_dml_statement
                 && previous_line_ends_with_then
                 && current_line_starts_case
@@ -6883,6 +6927,12 @@ impl SqlEditorWidget {
                         effective_depth = effective_depth.max(case_frame.case_depth);
                     }
                 }
+            } else if let Some(case_depth) = plsql_case_frames.last().copied() {
+                if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                    effective_depth = effective_depth.max(case_depth.saturating_add(1));
+                } else if Self::starts_with_case_terminator(&trimmed_upper) {
+                    effective_depth = effective_depth.max(case_depth);
+                }
             }
             if let Some(case_frame) = active_parenthesized_case_frame {
                 if case_frame.indent_branches
@@ -6930,14 +6980,8 @@ impl SqlEditorWidget {
                         || Self::starts_with_case_terminator(&trimmed_upper)
                     {
                         effective_depth
-                    } else if Self::line_is_structural_case_branch_body(
-                        trimmed,
-                        &trimmed_upper,
-                        starts_query_head,
-                    ) {
-                        effective_depth.max(branch_body_depth)
                     } else {
-                        effective_depth
+                        effective_depth.max(branch_body_depth)
                     }
                 } else {
                     effective_depth
@@ -7108,7 +7152,7 @@ impl SqlEditorWidget {
                     && sql_text::starts_with_format_model_multiline_owner_tail(
                         &owner_relative_detection_upper,
                     );
-            let effective_depth = {
+            let mut effective_depth = {
                 let mut effective_depth = effective_depth;
                 if let (Some(frame), Some(nested_paren_depth_after_line)) = (
                     pending_plsql_child_query_owner_for_line,
@@ -7187,6 +7231,9 @@ impl SqlEditorWidget {
                 }
                 effective_depth
             };
+            if let Some(frame) = pending_operator_for_line {
+                effective_depth = effective_depth.max(frame.owner_depth.saturating_add(1));
+            }
             if starts_query_head {
                 if let Some(query_base_depth) = layouts[idx].query_base_depth {
                     let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
@@ -7300,6 +7347,13 @@ impl SqlEditorWidget {
             {
                 case_layout_state
                     .note_pending_branch_body_depth(layouts[idx].final_depth.saturating_add(1));
+            } else if !in_dml_statement
+                && plsql_case_frames.last().is_some()
+                && (Self::line_ends_with_then_before_inline_comment(trimmed)
+                    || trimmed_upper.trim() == "ELSE")
+            {
+                case_layout_state
+                    .note_pending_branch_body_depth(layouts[idx].final_depth.saturating_add(1));
             } else if active_parenthesized_case_frame.is_some()
                 && (Self::line_ends_with_then_before_inline_comment(trimmed)
                     || trimmed_upper.trim() == "ELSE")
@@ -7361,6 +7415,8 @@ impl SqlEditorWidget {
                     case_depth: effective_depth,
                     expression_owner_depth: current_line_dml_case_expression_owner_depth,
                 });
+            } else if !in_dml_statement && current_line_starts_case {
+                plsql_case_frames.push(effective_depth);
             } else if in_dml_statement
                 && !current_line_starts_case
                 && previous_line_has_trailing_unclosed_case
@@ -7398,6 +7454,8 @@ impl SqlEditorWidget {
                 {
                     dml_case_condition_frames.pop();
                 }
+            } else if !in_dml_statement && Self::starts_with_case_terminator(&trimmed_upper) {
+                let _ = plsql_case_frames.pop();
             }
             let line_ends_current_case_condition = dml_case_condition_frames
                 .last()
@@ -7600,12 +7658,28 @@ impl SqlEditorWidget {
                     }
                 })
             };
+            if pending_operator_for_line.is_some() && !pending_operator_layout_frames.is_empty() {
+                pending_operator_layout_frames.pop();
+            }
+            if Self::line_ends_with_continuation_operator_before_inline_comment(trimmed) {
+                pending_operator_layout_frames.push(PendingOperatorLayoutFrame {
+                    owner_depth: Self::continuation_operator_owner_depth(
+                        trimmed,
+                        layouts[idx].final_depth,
+                        resolved_query_base_depth,
+                        layouts[idx].query_base_depth,
+                        next_code_trimmed,
+                        next_next_code_trimmed,
+                    ),
+                });
+            }
 
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
                 pending_query_head_frames.clear();
                 resolved_query_base_depths.clear();
                 pending_query_owner_open_align = None;
+                pending_operator_layout_frames.clear();
                 pending_plsql_child_query_owner = None;
                 owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
@@ -7613,6 +7687,7 @@ impl SqlEditorWidget {
                 pending_partial_query_owner = None;
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
+                plsql_case_frames.clear();
                 dml_case_condition_frames.clear();
                 case_layout_state.clear();
                 join_on_condition_and_depth.clear();
@@ -8209,19 +8284,28 @@ impl SqlEditorWidget {
         )
     }
 
-    fn line_ends_with_assignment_before_inline_comment(line: &str) -> bool {
+    fn line_ends_with_continuation_operator_before_inline_comment(line: &str) -> bool {
         let tokens = super::query_text::tokenize_sql(line);
-        for token in tokens.iter().rev() {
-            match token {
-                SqlToken::Comment(_) => continue,
-                SqlToken::Symbol(sym) => {
-                    return sym.trim_end().ends_with(":=");
-                }
-                _ => return false,
-            }
-        }
+        let mut non_comment_tokens = tokens
+            .iter()
+            .rev()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)));
+        let Some(SqlToken::Symbol(sym)) = non_comment_tokens.next() else {
+            return false;
+        };
+        let operator = sym.trim_end();
+        let previous_token = non_comment_tokens.next();
 
-        false
+        match operator {
+            ":=" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "+" | "-" | "||" => true,
+            "*" => !matches!(
+                previous_token,
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SELECT")
+            ),
+            "/" => previous_token.is_some(),
+            "%" | "^" | "|" => true,
+            _ => false,
+        }
     }
 
     fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
@@ -9649,18 +9733,91 @@ BEGIN
 END;
 END oqt_mega_pkg;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        // ELSE after inner CASE END should align with outer WHEN
-        assert!(
-            formatted.contains("END\n            ELSE\n                CASE"),
-            "ELSE should align with outer WHEN after inner CASE END, got:\n{}",
+        let assignment_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("v :="))
+            .expect("assignment line");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(assignment_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("CASE line");
+        let outer_when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN p_grp < 0 THEN"))
+            .map(|(idx, _)| idx)
+            .expect("outer WHEN line");
+        let inner_when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_when_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN p_n > 10 THEN"))
+            .map(|(idx, _)| idx)
+            .expect("inner WHEN line");
+        let inner_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END")
+            .map(|(idx, _)| idx)
+            .expect("inner END line");
+        let outer_else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_end_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .expect("outer ELSE line");
+        let outer_else_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_else_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("outer ELSE CASE line");
+        let outer_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_else_case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("outer END line");
+
+        assert_eq!(
+            indent(lines[case_idx]),
+            indent(lines[assignment_idx]).saturating_add(4),
+            "CASE after := should indent one level deeper than the assignment owner, got:\n{}",
             formatted
         );
-
-        // Outer END should close the outer CASE properly
-        assert!(
-            formatted.contains("END\n        END;"),
-            "Outer CASE END should be properly indented, got:\n{}",
+        assert_eq!(
+            indent(lines[outer_when_idx]),
+            indent(lines[case_idx]).saturating_add(4),
+            "outer WHEN should indent one level deeper than CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_else_idx]),
+            indent(lines[outer_when_idx]),
+            "outer ELSE should align with outer WHEN after nested CASE closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_else_case_idx]),
+            indent(lines[outer_else_idx]).saturating_add(4),
+            "CASE inside outer ELSE should indent one level deeper than ELSE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_end_idx]),
+            indent(lines[case_idx]),
+            "outer CASE END should align with the CASE header, got:\n{}",
             formatted
         );
 
@@ -9758,17 +9915,266 @@ BEGIN
 END fmt_pkg_extreme;"#;
 
         let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let assignment_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("g_last_mode :="))
+            .expect("assignment line");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(assignment_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("CASE line");
 
         assert!(
-            formatted.contains(
-                "END calc_mode;\nBEGIN\n    g_last_mode :=\n    CASE"
-            ),
+            formatted.contains("END calc_mode;\nBEGIN\n    g_last_mode :="),
             "package body initializer BEGIN should not remain indented under declarations, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[case_idx]),
+            indent(lines[assignment_idx]).saturating_add(4),
+            "initializer CASE should indent one level deeper than the := owner, got:\n{}",
             formatted
         );
         assert!(
             !formatted.contains("END calc_mode;\n\n    BEGIN\n        g_last_mode :="),
             "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_multiline_assignment_uses_owner_frame_depth() {
+        let source = r#"BEGIN
+  v_txt :=
+  (
+    p_txt
+  );
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let assignment_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("v_txt :="))
+            .expect("assignment line");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(assignment_idx + 1)
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .expect("open paren line");
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[assignment_idx]).saturating_add(4),
+            "line after := should use the assignment owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_multiline_operators_use_owner_frame_depth() {
+        let source = r#"UPDATE qt_fmt_emp e
+SET e.updated_at =
+CASE
+WHEN EXISTS (
+SELECT 1
+FROM qt_fmt_bonus b
+WHERE b.emp_id = e.emp_id
+AND b.amount >
+(
+SELECT AVG (b2.amount)
+FROM qt_fmt_bonus b2
+WHERE b2.bonus_year <=
+2024
+)
+) THEN SYSTIMESTAMP
+ELSE NVL (e.updated_at, SYSTIMESTAMP)
+END,
+e.job_title =
+CASE
+WHEN e.status_cd =
+'ACTIVE' THEN e.job_title || ' / Core'
+ELSE e.job_title
+END
+WHERE e.emp_id =
+1;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let updated_at_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SET e.updated_at ="))
+            .expect("updated_at assignment line");
+        let updated_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(updated_at_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("updated_at CASE line");
+        let amount_gt_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND b.amount >"))
+            .expect("> operator line");
+        let subquery_open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(amount_gt_idx + 1)
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .expect("subquery open line");
+        let bonus_year_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE b2.bonus_year <="))
+            .expect("<= operator line");
+        let bonus_year_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(bonus_year_idx + 1)
+            .find(|(_, line)| line.trim_start() == "2024")
+            .map(|(idx, _)| idx)
+            .expect("<= value line");
+        let job_title_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("e.job_title ="))
+            .expect("job_title assignment line");
+        let job_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(job_title_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("job_title CASE line");
+        let status_eq_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN e.status_cd ="))
+            .expect("status = line");
+        let status_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(status_eq_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("'ACTIVE' THEN"))
+            .map(|(idx, _)| idx)
+            .expect("status value line");
+        let where_eq_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE e.emp_id ="))
+            .expect("WHERE = line");
+        let where_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(where_eq_idx + 1)
+            .find(|(_, line)| line.trim_start() == "1;")
+            .map(|(idx, _)| idx)
+            .expect("WHERE value line");
+
+        assert_eq!(
+            indent(lines[updated_case_idx]),
+            indent(lines[updated_at_idx]).saturating_add(8),
+            "CASE after = on the first SET item should indent relative to the semantic list-item owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[updated_case_idx]),
+            indent(lines[job_case_idx]),
+            "first SET item CASE should use the same semantic owner depth as later SET list items, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[subquery_open_idx]),
+            indent(lines[amount_gt_idx]).saturating_add(4),
+            "line after > should indent one level deeper than the operator owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[bonus_year_value_idx]),
+            indent(lines[bonus_year_idx]).saturating_add(8),
+            "line after <= on an inline WHERE header should indent relative to the semantic condition owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[job_case_idx]),
+            indent(lines[job_title_idx]).saturating_add(4),
+            "second CASE after = should indent one level deeper than its list-item owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[status_value_idx]),
+            indent(lines[status_eq_idx]).saturating_add(4),
+            "line after = inside CASE condition should indent one level deeper than the operator owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[where_value_idx]),
+            indent(lines[where_eq_idx]).saturating_add(8),
+            "line after = on an inline WHERE header should indent relative to the semantic condition owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_inline_where_header_operator_matches_and_item_depth() {
+        let source = r#"SELECT *
+FROM qt_fmt_emp e
+WHERE e.emp_id =
+1
+AND e.status_cd =
+'ACTIVE';"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE e.emp_id ="))
+            .expect("WHERE = line");
+        let where_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(where_idx + 1)
+            .find(|(_, line)| line.trim_start() == "1")
+            .map(|(idx, _)| idx)
+            .expect("WHERE value line");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND e.status_cd ="))
+            .expect("AND = line");
+        let and_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(and_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'ACTIVE';")
+            .map(|(idx, _)| idx)
+            .expect("AND value line");
+
+        assert_eq!(
+            indent(lines[where_value_idx]),
+            indent(lines[and_value_idx]),
+            "inline WHERE header operand should align with later AND item operands, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[where_value_idx]),
+            indent(lines[where_idx]).saturating_add(8),
+            "inline WHERE header operand should indent one level below the semantic condition owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_value_idx]),
+            indent(lines[and_idx]).saturating_add(4),
+            "AND item operand should remain one level deeper than the AND line, got:\n{}",
             formatted
         );
     }
@@ -10559,14 +10965,61 @@ END;"#;
   );
 END;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("CASE v_mode"))
+            .expect("CASE line");
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN 1 THEN"))
+            .map(|(idx, _)| idx)
+            .expect("WHEN line");
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .expect("ELSE line");
+        let else_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_idx + 1)
+            .find(|(_, line)| line.trim_start() == "0")
+            .map(|(idx, _)| idx)
+            .expect("ELSE value line");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_value_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END")
+            .map(|(idx, _)| idx)
+            .expect("END line");
 
         assert!(
             formatted.contains("(\n        CASE v_mode\n            WHEN 1 THEN"),
             "CASE <expr> after '(' should get parenthesized CASE depth indent, got:\n{}",
             formatted
         );
-        assert!(
-            formatted.contains("ELSE\n            0\n        END"),
+        assert_eq!(
+            indent(lines[else_idx]),
+            indent(lines[when_idx]),
+            "ELSE should align with WHEN in the parenthesized CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[else_value_idx]),
+            indent(lines[else_idx]).saturating_add(4),
+            "ELSE value should indent one level deeper than ELSE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_idx]),
+            indent(lines[case_idx]),
             "CASE <expr> END should keep CASE-block depth, got:\n{}",
             formatted
         );
@@ -10583,14 +11036,61 @@ END;"#;
   );
 END;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .expect("CASE line");
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN v_mode = 1 THEN"))
+            .map(|(idx, _)| idx)
+            .expect("WHEN line");
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .expect("ELSE line");
+        let else_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_idx + 1)
+            .find(|(_, line)| line.trim_start() == "0")
+            .map(|(idx, _)| idx)
+            .expect("ELSE value line");
+        let end_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(else_value_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END CASE);")
+            .map(|(idx, _)| idx)
+            .expect("END CASE line");
 
         assert!(
             formatted.contains("CASE\n            WHEN v_mode = 1 THEN"),
             "Parenthesized CASE should still format branch depth, got:\n{}",
             formatted
         );
-        assert!(
-            formatted.contains("ELSE\n            0\n        END CASE);"),
+        assert_eq!(
+            indent(lines[else_idx]),
+            indent(lines[when_idx]),
+            "ELSE should align with WHEN in the parenthesized END CASE form, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[else_value_idx]),
+            indent(lines[else_idx]).saturating_add(4),
+            "ELSE value should indent one level deeper than ELSE in END CASE form, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_case_idx]),
+            indent(lines[case_idx]),
             "END CASE terminator should stay aligned with CASE header in parenthesized expression, got:\n{}",
             formatted
         );
@@ -15518,7 +16018,7 @@ FROM emp;"#;
     }
 
     #[test]
-    fn format_sql_basic_keeps_condition_operand_after_inline_block_comment_on_condition_depth() {
+    fn format_sql_basic_keeps_condition_operand_after_inline_block_comment_on_operator_depth() {
         let source = "select 1 from order_item oi where oi.order_id = v.order_id and oi.qty <= /* X: 0 이하 */ 0;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let expected = [
@@ -15526,7 +16026,7 @@ FROM emp;"#;
             "FROM order_item oi",
             "WHERE oi.order_id = v.order_id",
             "    AND oi.qty <= /* X: 0 이하 */",
-            "    0;",
+            "        0;",
         ]
         .join("\n");
 
@@ -15534,7 +16034,8 @@ FROM emp;"#;
     }
 
     #[test]
-    fn format_sql_basic_keeps_inline_comment_operand_depth_inside_not_exists_subquery() {
+    fn format_sql_basic_keeps_inline_comment_operand_depth_inside_not_exists_subquery_on_operator_depth(
+    ) {
         let source = r#"SELECT *
 FROM (
         /* Q: 인라인뷰 시작 */
@@ -15598,8 +16099,8 @@ ORDER BY v.amt DESC;"#;
 
         assert_eq!(
             indent(lines[operand_idx]),
-            indent(lines[and_idx]),
-            "operand after inline block comment inside NOT EXISTS should stay at the active condition indent, got:\n{}",
+            indent(lines[and_idx]).saturating_add(4),
+            "operand after inline block comment inside NOT EXISTS should indent one level deeper than the operator owner, got:\n{}",
             formatted
         );
         assert!(

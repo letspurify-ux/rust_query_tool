@@ -2957,6 +2957,36 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
     None
 }
 
+/// Returns the continuation kind for the leading clause/subclause header
+/// prefix on a formatter line.
+///
+/// This scans the leading meaningful words while they still form a keyword
+/// prefix and reuses the inline-comment header classification so secondary
+/// indentation can treat inline first-items (`SET col =`, `WHERE id =`,
+/// `UPDATE SET col =`, ...) the same way as later list/body items.
+pub(crate) fn format_leading_header_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    let words = leading_meaningful_words(line.trim_start(), 8);
+    let mut continuation_kind = None;
+
+    for idx in 0..words.len() {
+        let word_upper = words[idx].to_ascii_uppercase();
+        if !is_oracle_sql_keyword(&word_upper) {
+            break;
+        }
+
+        let previous_word = if idx > 0 { Some(words[idx - 1]) } else { None };
+        if let Some(kind) =
+            format_inline_comment_header_continuation_kind(previous_word, words[idx])
+        {
+            continuation_kind = Some(kind);
+        }
+    }
+
+    continuation_kind
+}
+
 /// Returns true when a token starts a flashback/temporal boundary expression.
 pub(crate) fn is_format_temporal_boundary_keyword(word: &str) -> bool {
     matches!(word.to_ascii_uppercase().as_str(), "TIMESTAMP" | "SCN")
@@ -3229,6 +3259,30 @@ mod tests {
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(None, "DUAL"),
+            None
+        );
+    }
+
+    #[test]
+    fn format_leading_header_continuation_kind_tracks_inline_clause_item_prefixes() {
+        assert_eq!(
+            format_leading_header_continuation_kind("SET e.updated_at ="),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_leading_header_continuation_kind("UPDATE SET t.val ="),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_leading_header_continuation_kind("WHERE e.emp_id ="),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_leading_header_continuation_kind("ORDER BY salary DESC"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_leading_header_continuation_kind("e.job_title ="),
             None
         );
     }

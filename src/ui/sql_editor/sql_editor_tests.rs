@@ -2894,14 +2894,14 @@ fn format_sql_package_body_case_inside_parentheses_keeps_newlines() {
 
     assert!(
         formatted.contains(
-            "v_val := fn_calc ((\n                CASE\n                WHEN v_mode = 1 THEN"
+            "v_val := fn_calc ((\n                CASE\n                    WHEN v_mode = 1 THEN"
         ),
         "CASE expression inside (( should expand with progressive depth, got: {}",
         formatted
     );
     assert!(
         formatted.contains(
-            "WHEN v_flag = 'Y' THEN\n                        100\n                        ELSE\n                        200\n                    END"
+            "WHEN v_flag = 'Y' THEN\n                                100\n                            ELSE\n                                200\n                        END"
         ),
         "Nested CASE branches inside parenthesis should stay on separate lines, got: {}",
         formatted
@@ -3454,7 +3454,7 @@ END;
     );
     assert!(
         formatted.contains(
-            "BEGIN\n    g_state :=\n    CASE\n        WHEN g_state IS NULL THEN\n            'BOOT'\n        ELSE\n            g_state || '_READY'\n    END;\nEND fmt_nested_pkg;\n/\n\nDECLARE"
+            "BEGIN\n    g_state :=\n        CASE\n            WHEN g_state IS NULL THEN\n                'BOOT'\n            ELSE\n                g_state || '_READY'\n        END;\nEND fmt_nested_pkg;\n/\n\nDECLARE"
         ),
         "package body initializer should close on package END and preserve following anonymous block, got: {formatted}"
     );
