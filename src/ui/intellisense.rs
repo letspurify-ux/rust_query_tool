@@ -1456,6 +1456,15 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_suggestions_include_char_keyword() {
+        let mut data = IntellisenseData::new();
+        let suggestions = data.get_suggestions("ch", false, None, false, false);
+
+        assert!(suggestions.iter().any(|s| s == "CHAR"));
+        assert!(!suggestions.iter().any(|s| s == "CHAR()"));
+    }
+
+    #[test]
     fn get_suggestions_include_plsql_diagnostics_as_bare_keywords() {
         let mut data = IntellisenseData::new();
         let suggestions = data.get_suggestions("sqlc", false, None, false, false);

@@ -103,6 +103,20 @@ fn test_keyword_highlighting() {
 }
 
 #[test]
+fn test_char_datatype_is_highlighted_as_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE TABLE t_char (c CHAR(10))";
+    let styles = highlighter.generate_styles(text);
+
+    let start = text.find("CHAR").unwrap_or(0);
+    let end = start + "CHAR".len();
+    assert!(
+        styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+        "CHAR should be highlighted as a keyword"
+    );
+}
+
+#[test]
 fn test_plsql_diagnostics_are_highlighted_as_keywords() {
     let highlighter = SqlHighlighter::new();
     let text = r#"BEGIN

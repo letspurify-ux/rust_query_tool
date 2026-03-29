@@ -58,6 +58,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CASCADE",
     "CASE",
     "CAST",
+    "CHAR",
     "CHECK",
     "CHUNK",
     "CLASS",
