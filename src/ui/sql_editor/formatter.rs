@@ -171,7 +171,7 @@ struct DmlCaseLayoutFrame {
 }
 
 #[derive(Clone, Copy)]
-struct DmlCaseConditionLayoutFrame {
+struct CaseConditionLayoutFrame {
     parser_depth: usize,
     continuation_depth: usize,
 }
@@ -1654,6 +1654,21 @@ impl SqlEditorWidget {
         let rest = rest.trim_start();
 
         rest.is_empty() || rest.starts_with(';')
+    }
+
+    fn starts_with_case_when(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHEN")
+    }
+
+    fn starts_with_case_else_branch(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSE")
+            && !crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSIF")
+            && !crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSEIF")
+    }
+
+    fn starts_with_case_branch_keyword(trimmed_upper: &str) -> bool {
+        Self::starts_with_case_when(trimmed_upper)
+            || Self::starts_with_case_else_branch(trimmed_upper)
     }
 
     fn paren_opens_analytic_layout(
@@ -6011,7 +6026,7 @@ impl SqlEditorWidget {
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
         let mut plsql_case_frames: Vec<usize> = Vec::new();
-        let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
+        let mut case_condition_frames: Vec<CaseConditionLayoutFrame> = Vec::new();
         let mut pending_query_head_frames: Vec<PendingQueryHeadLayoutFrame> = Vec::new();
         let mut pending_query_owner_open_align: Option<PendingQueryOwnerOpenAlignLayoutFrame> =
             None;
@@ -6115,8 +6130,7 @@ impl SqlEditorWidget {
             let paren_case_extra_indent = if !in_dml_statement
                 && in_paren_case_expression
                 && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
-                    || trimmed_upper.starts_with("WHEN ")
-                    || trimmed_upper.starts_with("ELSE")
+                    || Self::starts_with_case_branch_keyword(&trimmed_upper)
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
             {
                 1
@@ -6260,10 +6274,7 @@ impl SqlEditorWidget {
             });
             let next_line_is_case_branch = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
-                next_upper.starts_with("WHEN ")
-                    || (next_upper.starts_with("ELSE")
-                        && !next_upper.starts_with("ELSIF")
-                        && !next_upper.starts_with("ELSEIF"))
+                Self::starts_with_case_branch_keyword(&next_upper)
             });
             let next_line_existing_indent =
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].existing_indent);
@@ -6274,7 +6285,7 @@ impl SqlEditorWidget {
             // but is indented by phase 1 to align with other trigger header clauses.
             // Detect this by checking if WHEN at depth 0 follows a trigger header line
             // (previous line has higher existing_indent, indicating trigger header context).
-            let is_trigger_header_when = trimmed_upper.starts_with("WHEN ")
+            let is_trigger_header_when = Self::starts_with_case_when(&trimmed_upper)
                 && depth == 0
                 && existing_indent > 0
                 && last_code_idx.is_some_and(|prev_idx| {
@@ -6288,8 +6299,7 @@ impl SqlEditorWidget {
             let force_block_depth = !in_dml_statement
                 && !is_trigger_header_when
                 && (trimmed_upper.starts_with("EXCEPTION")
-                    || trimmed_upper.starts_with("WHEN ")
-                    || trimmed_upper.starts_with("ELSE")
+                    || Self::starts_with_case_branch_keyword(&trimmed_upper)
                     || trimmed_upper.starts_with("ELSIF")
                     || trimmed_upper.starts_with("ELSEIF")
                     || trimmed_upper.starts_with("CASE")
@@ -6355,11 +6365,23 @@ impl SqlEditorWidget {
                 Self::starts_with_condition_keyword(&trimmed_upper);
             let current_line_is_condition_query_owner =
                 current_query_owner_kind == Some(FormatQueryOwnerKind::Condition);
-            let active_dml_case_condition_frame = dml_case_condition_frames
+            let active_case_condition_frame = case_condition_frames
                 .iter()
                 .rev()
                 .find(|frame| frame.parser_depth == depth)
                 .copied();
+            let current_line_ends_case_condition = active_case_condition_frame.is_some_and(|frame| {
+                Self::line_contains_case_condition_terminator(
+                    &line_tokens,
+                    depth,
+                    frame.parser_depth,
+                )
+            });
+            let current_line_is_case_condition_continuation = active_case_condition_frame
+                .is_some()
+                && !current_line_ends_case_condition
+                && !Self::starts_with_case_branch_keyword(&trimmed_upper)
+                && !Self::starts_with_case_terminator(&trimmed_upper);
             let active_parenthesized_case_frame = (!in_dml_statement)
                 .then(|| case_layout_state.active_parenthesized_case_frame())
                 .flatten();
@@ -6688,7 +6710,7 @@ impl SqlEditorWidget {
                     .unwrap_or(parser_depth.saturating_add(1))
             } else if in_dml_statement
                 && (previous_line_is_case_header || previous_line_has_trailing_unclosed_case)
-                && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+                && Self::starts_with_case_branch_keyword(&trimmed_upper)
             {
                 last_code_indent
                     .map(|indent| indent.saturating_add(1).max(parser_depth))
@@ -6920,7 +6942,7 @@ impl SqlEditorWidget {
             }
             if in_dml_statement {
                 if let Some(case_frame) = dml_case_frames.last().copied() {
-                    if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                    if Self::starts_with_case_branch_keyword(&trimmed_upper) {
                         effective_depth =
                             effective_depth.max(case_frame.case_depth.saturating_add(1));
                     } else if Self::starts_with_case_terminator(&trimmed_upper) {
@@ -6928,23 +6950,22 @@ impl SqlEditorWidget {
                     }
                 }
             } else if let Some(case_depth) = plsql_case_frames.last().copied() {
-                if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                if Self::starts_with_case_branch_keyword(&trimmed_upper) {
                     effective_depth = effective_depth.max(case_depth.saturating_add(1));
                 } else if Self::starts_with_case_terminator(&trimmed_upper) {
                     effective_depth = effective_depth.max(case_depth);
                 }
             }
             if let Some(case_frame) = active_parenthesized_case_frame {
-                if case_frame.indent_branches
-                    && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+                if case_frame.indent_branches && Self::starts_with_case_branch_keyword(&trimmed_upper)
                 {
                     effective_depth = effective_depth.max(case_frame.depth.saturating_add(1));
                 } else if Self::starts_with_case_terminator(&trimmed_upper) {
                     effective_depth = effective_depth.max(case_frame.depth);
                 }
             }
-            if current_line_is_condition_keyword {
-                if let Some(frame) = active_dml_case_condition_frame {
+            if current_line_is_case_condition_continuation {
+                if let Some(frame) = active_case_condition_frame {
                     effective_depth = effective_depth.max(frame.continuation_depth);
                 }
             }
@@ -6975,8 +6996,7 @@ impl SqlEditorWidget {
             };
             let effective_depth =
                 if let Some(branch_body_depth) = pending_case_branch_body_depth_for_line {
-                    if trimmed_upper.starts_with("WHEN ")
-                        || trimmed_upper.starts_with("ELSE")
+                    if Self::starts_with_case_branch_keyword(&trimmed_upper)
                         || Self::starts_with_case_terminator(&trimmed_upper)
                     {
                         effective_depth
@@ -7421,7 +7441,7 @@ impl SqlEditorWidget {
                 && !current_line_starts_case
                 && previous_line_has_trailing_unclosed_case
                 && dml_case_frames.is_empty()
-                && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"))
+                && Self::starts_with_case_branch_keyword(&trimmed_upper)
             {
                 // CASE opened mid-line on the previous code line (e.g. `SELECT col, CASE`
                 // or `SET col = CASE`).  Retroactively push a frame so that WHEN/ELSE/END
@@ -7448,34 +7468,29 @@ impl SqlEditorWidget {
                         }
                     }
                 }
-                while dml_case_condition_frames
+                while case_condition_frames
                     .last()
                     .is_some_and(|frame| frame.parser_depth >= depth)
                 {
-                    dml_case_condition_frames.pop();
+                    case_condition_frames.pop();
                 }
             } else if !in_dml_statement && Self::starts_with_case_terminator(&trimmed_upper) {
                 let _ = plsql_case_frames.pop();
+                while case_condition_frames
+                    .last()
+                    .is_some_and(|frame| frame.parser_depth >= depth)
+                {
+                    case_condition_frames.pop();
+                }
             }
-            let line_ends_current_case_condition = dml_case_condition_frames
-                .last()
-                .copied()
-                .is_some_and(|frame| {
-                    Self::line_contains_dml_case_condition_terminator(
-                        &line_tokens,
-                        depth,
-                        frame.parser_depth,
-                    )
-                });
-            if line_ends_current_case_condition {
-                dml_case_condition_frames.pop();
+            if current_line_ends_case_condition {
+                case_condition_frames.pop();
             }
-            let starts_multiline_dml_case_condition = in_dml_statement
-                && trimmed_upper.starts_with("WHEN ")
-                && dml_case_frames.last().is_some()
-                && !Self::line_contains_dml_case_condition_terminator(&line_tokens, depth, depth);
-            if starts_multiline_dml_case_condition {
-                dml_case_condition_frames.push(DmlCaseConditionLayoutFrame {
+            let starts_multiline_case_condition = Self::starts_with_case_when(&trimmed_upper)
+                && (dml_case_frames.last().is_some() || plsql_case_frames.last().is_some())
+                && !Self::line_contains_case_condition_terminator(&line_tokens, depth, depth);
+            if starts_multiline_case_condition {
+                case_condition_frames.push(CaseConditionLayoutFrame {
                     parser_depth: depth.saturating_add(1),
                     continuation_depth: layouts[idx].final_depth.saturating_add(1),
                 });
@@ -7519,8 +7534,7 @@ impl SqlEditorWidget {
                     pending_query_head_frames.clear();
                 }
                 let case_condition_query_owner_depth = if current_line_is_condition_query_owner
-                    && current_line_is_condition_keyword
-                    && active_dml_case_condition_frame.is_some()
+                    && current_line_is_case_condition_continuation
                 {
                     Some(layouts[idx].final_depth.saturating_add(1))
                 } else {
@@ -7688,7 +7702,7 @@ impl SqlEditorWidget {
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
                 plsql_case_frames.clear();
-                dml_case_condition_frames.clear();
+                case_condition_frames.clear();
                 case_layout_state.clear();
                 join_on_condition_and_depth.clear();
             } else {
@@ -7723,10 +7737,7 @@ impl SqlEditorWidget {
 
             let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
             let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
-            let next_is_case_branch = next_upper.starts_with("WHEN ")
-                || (next_upper.starts_with("ELSE")
-                    && !next_upper.starts_with("ELSIF")
-                    && !next_upper.starts_with("ELSEIF"));
+            let next_is_case_branch = Self::starts_with_case_branch_keyword(&next_upper);
             if Self::starts_with_case_terminator(&previous_upper) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
                 layouts[idx].anchor_group = layouts[next_idx].anchor_group;
@@ -8375,7 +8386,7 @@ impl SqlEditorWidget {
         open_cases > 0
     }
 
-    fn line_contains_dml_case_condition_terminator(
+    fn line_contains_case_condition_terminator(
         tokens: &[SqlToken],
         initial_paren_depth: usize,
         target_paren_depth: usize,
@@ -8400,7 +8411,7 @@ impl SqlEditorWidget {
                         pending_end = false;
                     }
 
-                    if upper.eq("THEN") && paren_depth == target_paren_depth && open_cases == 0 {
+                    if upper.eq("THEN") && paren_depth <= target_paren_depth && open_cases == 0 {
                         return true;
                     }
 
@@ -10595,6 +10606,196 @@ FROM qt_fmt_emp e;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "auto formatting should stay stable for multiline searched CASE conditions"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_bare_when_expression_uses_case_continuation_depth() {
+        let source = r#"SELECT
+    CASE
+        WHEN
+        MAX (
+            CASE
+                WHEN u.qtr = 'Q2' THEN u.amt
+            END
+        ) > MAX (
+            CASE
+                WHEN u.qtr = 'Q1' THEN u.amt
+            END
+        )
+        THEN 'UP'
+        ELSE 'SAME'
+    END AS trend_flag
+FROM u;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim() == "WHEN")
+            .expect("formatted output should contain bare WHEN header");
+        let max_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("MAX ("))
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain multiline WHEN expression continuation");
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "THEN 'UP'")
+            .expect("formatted output should contain THEN line");
+
+        assert_eq!(
+            indent(lines[max_idx]),
+            indent(lines[when_idx]).saturating_add(4),
+            "bare WHEN continuation should indent one level deeper than WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[then_idx]),
+            indent(lines[when_idx]),
+            "THEN should realign with the bare WHEN header after multiline condition continuation, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_bare_when_exists_owner_uses_case_condition_stack() {
+        let source = r#"SELECT
+    CASE
+        WHEN
+        EXISTS (
+            SELECT 1
+            FROM dual
+        )
+        THEN 'Y'
+        ELSE 'N'
+    END AS flag
+FROM dual;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim() == "WHEN")
+            .expect("formatted output should contain bare WHEN header");
+        let exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "EXISTS (")
+            .expect("formatted output should contain EXISTS owner line");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain nested SELECT");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain EXISTS close paren");
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "THEN 'Y'")
+            .expect("formatted output should contain THEN line");
+
+        assert_eq!(
+            indent(lines[exists_idx]),
+            indent(lines[when_idx]).saturating_add(4),
+            "bare WHEN EXISTS owner should indent one level deeper than WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[exists_idx]).saturating_add(4),
+            "nested SELECT under bare WHEN EXISTS should use the promoted condition-owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[exists_idx]),
+            "EXISTS close paren should realign with the promoted owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[then_idx]),
+            indent(lines[when_idx]),
+            "THEN should realign with the bare WHEN header after EXISTS continuation, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_plsql_bare_when_exists_owner_uses_case_condition_stack() {
+        let source = r#"BEGIN
+v_flag :=
+CASE
+WHEN
+EXISTS (
+SELECT 1
+FROM dual
+)
+THEN 'Y'
+ELSE 'N'
+END;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim() == "WHEN")
+            .expect("formatted output should contain bare WHEN header");
+        let exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "EXISTS (")
+            .expect("formatted output should contain EXISTS owner line");
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .expect("formatted output should contain nested SELECT");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain EXISTS close paren");
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "THEN 'Y'")
+            .expect("formatted output should contain THEN line");
+
+        assert_eq!(
+            indent(lines[exists_idx]),
+            indent(lines[when_idx]).saturating_add(4),
+            "PL/SQL bare WHEN EXISTS owner should indent one level deeper than WHEN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[exists_idx]).saturating_add(4),
+            "PL/SQL nested SELECT under bare WHEN EXISTS should use the promoted condition-owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[exists_idx]),
+            "PL/SQL EXISTS close paren should realign with the promoted owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[then_idx]),
+            indent(lines[when_idx]),
+            "PL/SQL THEN should realign with the bare WHEN header after EXISTS continuation, got:\n{}",
+            formatted
         );
     }
 
