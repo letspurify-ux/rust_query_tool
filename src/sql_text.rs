@@ -1431,6 +1431,11 @@ pub(crate) enum FormatQueryOwnerKind {
     Condition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingFormatQueryOwnerHeaderKind {
+    ReferenceOn,
+}
+
 impl FormatQueryOwnerKind {
     /// Returns the analyzer owner-base depth that should feed the next nested
     /// query head after this owner line.
@@ -1463,6 +1468,51 @@ impl FormatQueryOwnerKind {
     }
 }
 
+impl PendingFormatQueryOwnerHeaderKind {
+    pub(crate) fn owner_kind(self) -> FormatQueryOwnerKind {
+        match self {
+            Self::ReferenceOn => FormatQueryOwnerKind::Clause,
+        }
+    }
+
+    pub(crate) fn line_completes(self, line: &str) -> bool {
+        match self {
+            Self::ReferenceOn => line_ends_with_keyword(line, "ON"),
+        }
+    }
+
+    pub(crate) fn line_can_continue(self, line: &str) -> bool {
+        if self.line_completes(line) {
+            return true;
+        }
+
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        match self {
+            Self::ReferenceOn => {
+                !starts_with_format_layout_clause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
+                    && !starts_with_format_model_subclause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "WINDOW")
+                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
+                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
+                    && !line_ends_with_pivot_owner(line)
+                    && !line_ends_with_unpivot_owner(line)
+                    && !line_ends_with_keyword(line, "COLUMNS")
+            }
+        }
+    }
+}
+
+pub(crate) fn format_query_owner_pending_header_kind(
+    line: &str,
+) -> Option<PendingFormatQueryOwnerHeaderKind> {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    (starts_with_keyword_token(&trimmed_upper, "REFERENCE")
+        && !line_ends_with_keyword(line, "ON")
+        && !line_ends_with_open_paren_before_inline_comment(line))
+    .then_some(PendingFormatQueryOwnerHeaderKind::ReferenceOn)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FormatIndentedParenOwnerKind {
     AnalyticOver,
@@ -1472,6 +1522,12 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     Pivot,
     Unpivot,
     StructuredColumns,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingFormatIndentedParenOwnerHeaderKind {
+    WindowAs,
+    NestedPathColumns,
 }
 
 const FORMAT_ANALYTIC_OVER_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
@@ -1534,6 +1590,35 @@ const FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
     &["DEFINE"],
 ];
 
+const FORMAT_ANALYTIC_WINDOW_BODY_CONTINUATION_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["PARTITION", "BY"],
+    &["ORDER", "BY"],
+    &["ROWS", "BETWEEN"],
+    &["RANGE", "BETWEEN"],
+    &["GROUPS", "BETWEEN"],
+];
+
+const FORMAT_MATCH_RECOGNIZE_BODY_CONTINUATION_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["PARTITION", "BY"],
+    &["ORDER", "BY"],
+    &["MEASURES"],
+    &["ONE", "ROW", "PER", "MATCH"],
+    &["ALL", "ROWS", "PER", "MATCH"],
+    &["WITH", "UNMATCHED", "ROWS"],
+    &["WITHOUT", "UNMATCHED", "ROWS"],
+    &["SHOW", "EMPTY", "MATCHES"],
+    &["OMIT", "EMPTY", "MATCHES"],
+    &["AFTER", "MATCH", "SKIP", "TO"],
+    &["SUBSET"],
+    &["PATTERN"],
+    &["DEFINE"],
+];
+
+const FORMAT_PIVOT_UNPIVOT_BODY_CONTINUATION_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR", "IN"]];
+
+const FORMAT_STRUCTURED_COLUMNS_BODY_CONTINUATION_KEYWORD_SEQUENCES: &[&[&str]] =
+    &[&["NESTED", "PATH"]];
+
 const FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR"]];
 
 const FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["NESTED"]];
@@ -1565,6 +1650,55 @@ fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> 
     sequences
         .iter()
         .any(|sequence| starts_with_keyword_sequence(text_upper, sequence))
+}
+
+fn leading_meaningful_words<'a>(line: &'a str, max_words: usize) -> Vec<&'a str> {
+    let mut words = Vec::with_capacity(max_words);
+    for skip_words in 0..max_words {
+        let Some((word, _)) = next_meaningful_word(line, skip_words) else {
+            break;
+        };
+        words.push(word);
+    }
+    words
+}
+
+fn leading_words_match_keyword_prefix(words: &[&str], sequence: &[&str]) -> usize {
+    words
+        .iter()
+        .zip(sequence.iter())
+        .take_while(|(word, expected)| word.eq_ignore_ascii_case(expected))
+        .count()
+}
+
+fn line_continues_keyword_sequence(
+    previous_line_upper: &str,
+    current_line_upper: &str,
+    sequence: &[&str],
+) -> bool {
+    let previous_words = leading_meaningful_words(previous_line_upper, sequence.len());
+    let matched_previous_words = leading_words_match_keyword_prefix(&previous_words, sequence);
+    if matched_previous_words == 0 || matched_previous_words >= sequence.len() {
+        return false;
+    }
+
+    let current_words = leading_meaningful_words(current_line_upper, sequence.len());
+    if current_words.is_empty() {
+        return false;
+    }
+
+    let remaining_sequence = &sequence[matched_previous_words..];
+    leading_words_match_keyword_prefix(&current_words, remaining_sequence) > 0
+}
+
+fn line_continues_any_keyword_sequence(
+    previous_line_upper: &str,
+    current_line_upper: &str,
+    sequences: &[&[&str]],
+) -> bool {
+    sequences.iter().any(|sequence| {
+        line_continues_keyword_sequence(previous_line_upper, current_line_upper, sequence)
+    })
 }
 
 fn leading_words_match_keyword_sequence(
@@ -1599,6 +1733,20 @@ impl FormatIndentedParenOwnerKind {
         }
     }
 
+    fn body_header_continuation_sequences(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::AnalyticOver | Self::Window => {
+                FORMAT_ANALYTIC_WINDOW_BODY_CONTINUATION_KEYWORD_SEQUENCES
+            }
+            Self::ModelSubclause => FORMAT_MODEL_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::MatchRecognize => FORMAT_MATCH_RECOGNIZE_BODY_CONTINUATION_KEYWORD_SEQUENCES,
+            Self::Pivot | Self::Unpivot => FORMAT_PIVOT_UNPIVOT_BODY_CONTINUATION_KEYWORD_SEQUENCES,
+            Self::StructuredColumns => {
+                FORMAT_STRUCTURED_COLUMNS_BODY_CONTINUATION_KEYWORD_SEQUENCES
+            }
+        }
+    }
+
     pub(crate) fn starts_body_header(self, text_upper: &str) -> bool {
         starts_with_any_keyword_sequence(text_upper, self.body_header_sequences())
     }
@@ -1612,17 +1760,45 @@ impl FormatIndentedParenOwnerKind {
             return true;
         }
 
+        previous_line_upper.is_some_and(|previous| {
+            line_continues_any_keyword_sequence(
+                previous.trim_start(),
+                text_upper.trim_start(),
+                self.body_header_continuation_sequences(),
+            ) || self.starts_special_body_header_continuation(previous, text_upper)
+        })
+    }
+
+    fn starts_special_body_header_continuation(
+        self,
+        previous_line_upper: &str,
+        current_line_upper: &str,
+    ) -> bool {
+        let current_line_upper = current_line_upper.trim_start();
+        if current_line_upper.is_empty()
+            || current_line_upper.starts_with(')')
+            || self.starts_body_header(current_line_upper)
+            || starts_with_format_layout_clause(current_line_upper)
+            || starts_with_format_set_operator(current_line_upper)
+            || starts_with_keyword_token(current_line_upper, "MODEL")
+            || starts_with_keyword_token(current_line_upper, "MATCH_RECOGNIZE")
+            || starts_with_keyword_token(current_line_upper, "WINDOW")
+        {
+            return false;
+        }
+
+        let previous_line_upper = previous_line_upper.trim_start();
         match self {
-            Self::Pivot | Self::Unpivot => {
-                starts_with_keyword_token(text_upper, "IN")
-                    && previous_line_upper.is_some_and(|previous| {
-                        starts_with_keyword_token(previous.trim_start(), "FOR")
-                    })
+            Self::AnalyticOver | Self::Window => {
+                starts_with_keyword_token(previous_line_upper, "ROWS")
+                    || starts_with_keyword_token(previous_line_upper, "RANGE")
+                    || starts_with_keyword_token(previous_line_upper, "GROUPS")
+                    || starts_with_keyword_token(previous_line_upper, "EXCLUDE")
             }
-            Self::AnalyticOver
-            | Self::ModelSubclause
-            | Self::Window
+            Self::ModelSubclause
             | Self::MatchRecognize
+            | Self::Pivot
+            | Self::Unpivot
             | Self::StructuredColumns => false,
         }
     }
@@ -1706,6 +1882,93 @@ impl FormatIndentedParenOwnerKind {
     ) -> Option<usize> {
         self.starts_contextual_body_header(text_upper, previous_line_upper)
             .then(|| self.body_depth(owner_depth))
+    }
+}
+
+impl PendingFormatIndentedParenOwnerHeaderKind {
+    pub(crate) fn owner_kind(self) -> FormatIndentedParenOwnerKind {
+        match self {
+            Self::WindowAs => FormatIndentedParenOwnerKind::Window,
+            Self::NestedPathColumns => FormatIndentedParenOwnerKind::StructuredColumns,
+        }
+    }
+
+    pub(crate) fn line_completes(self, line: &str) -> bool {
+        match self {
+            Self::WindowAs => line_ends_with_keyword(line, "AS"),
+            Self::NestedPathColumns => line_ends_with_keyword(line, "COLUMNS"),
+        }
+    }
+
+    pub(crate) fn line_can_continue(self, line: &str) -> bool {
+        if self.line_completes(line) {
+            return true;
+        }
+
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        match self {
+            Self::WindowAs => {
+                !starts_with_format_layout_clause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
+                    && !starts_with_format_model_subclause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
+                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
+                    && !line_ends_with_pivot_owner(line)
+                    && !line_ends_with_unpivot_owner(line)
+                    && !line_ends_with_keyword(line, "COLUMNS")
+            }
+            Self::NestedPathColumns => {
+                !starts_with_format_layout_clause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
+                    && !starts_with_format_model_subclause(&trimmed_upper)
+                    && !starts_with_keyword_token(&trimmed_upper, "WINDOW")
+                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
+                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
+                    && !line_ends_with_pivot_owner(line)
+                    && !line_ends_with_unpivot_owner(line)
+            }
+        }
+    }
+}
+
+pub(crate) fn format_indented_paren_pending_header_kind(
+    line: &str,
+) -> Option<PendingFormatIndentedParenOwnerHeaderKind> {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    if starts_with_keyword_token(&trimmed_upper, "WINDOW")
+        && !line_ends_with_keyword(line, "AS")
+        && !line_ends_with_open_paren_before_inline_comment(line)
+    {
+        return Some(PendingFormatIndentedParenOwnerHeaderKind::WindowAs);
+    }
+
+    let nested_second_word = next_meaningful_word(line.trim_start(), 1).map(|(word, _)| word);
+    (starts_with_keyword_token(&trimmed_upper, "NESTED")
+        && (line_ends_with_keyword(line, "NESTED")
+            || nested_second_word.is_some_and(|word| word.eq_ignore_ascii_case("PATH")))
+        && !line_ends_with_keyword(line, "COLUMNS")
+        && !line_ends_with_open_paren_before_inline_comment(line))
+    .then_some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
+}
+
+pub(crate) fn format_indented_paren_owner_header_continues(
+    pending_kind: FormatIndentedParenOwnerKind,
+    line: &str,
+) -> bool {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
+    match pending_kind {
+        FormatIndentedParenOwnerKind::Pivot => starts_with_keyword_token(&trimmed_upper, "XML"),
+        FormatIndentedParenOwnerKind::Unpivot => {
+            starts_with_keyword_token(&trimmed_upper, "INCLUDE")
+                || starts_with_keyword_token(&trimmed_upper, "EXCLUDE")
+                || starts_with_keyword_token(&trimmed_upper, "NULLS")
+        }
+        FormatIndentedParenOwnerKind::AnalyticOver
+        | FormatIndentedParenOwnerKind::ModelSubclause
+        | FormatIndentedParenOwnerKind::Window
+        | FormatIndentedParenOwnerKind::MatchRecognize
+        | FormatIndentedParenOwnerKind::StructuredColumns => false,
     }
 }
 
@@ -2669,6 +2932,102 @@ mod tests {
                 2,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn format_owner_relative_body_header_depth_detects_split_continuations() {
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Window.formatter_body_header_depth(
+                "BY deptno",
+                Some("PARTITION"),
+                2,
+            ),
+                Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::AnalyticOver.formatter_body_header_depth(
+                "UNBOUNDED PRECEDING",
+                Some("ROWS"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Window.formatter_body_header_depth(
+                "CURRENT ROW",
+                Some("EXCLUDE"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::Window.formatter_body_header_depth(
+                "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                Some("ROWS"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::MatchRecognize.formatter_body_header_depth(
+                "TO NEXT ROW",
+                Some("AFTER MATCH SKIP"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::MatchRecognize.formatter_body_header_depth(
+                "MATCH",
+                Some("ONE ROW PER"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::ModelSubclause.formatter_body_header_depth(
+                "UPDATED ROWS",
+                Some("RETURN"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            FormatIndentedParenOwnerKind::StructuredColumns.formatter_body_header_depth(
+                "PATH '$.items[*]' COLUMNS (",
+                Some("NESTED"),
+                2,
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn format_indented_paren_pending_header_kind_tracks_nested_path_columns_chains() {
+        assert_eq!(
+            format_indented_paren_pending_header_kind("NESTED"),
+            Some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
+        );
+        assert_eq!(
+            format_indented_paren_pending_header_kind("NESTED PATH '$.items[*]'"),
+            Some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
+        );
+        assert_eq!(format_indented_paren_pending_header_kind("NESTED TABLE"), None);
+        assert!(
+            PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns
+                .line_can_continue("PATH '$.items[*]'")
+        );
+        assert!(
+            PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns
+                .line_can_continue("'$.items[*]'")
+        );
+        assert!(
+            PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns
+                .line_can_continue("COLUMNS")
+        );
+        assert!(
+            PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns.line_completes("COLUMNS")
         );
     }
 

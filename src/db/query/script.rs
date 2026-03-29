@@ -196,6 +196,12 @@ struct PendingMultilineClauseOwnerFrame {
     owner_depth: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingPartialMultilineClauseOwnerFrame {
+    kind: sql_text::PendingFormatIndentedParenOwnerHeaderKind,
+    owner_depth: usize,
+}
+
 impl OwnerRelativeDepthFrame {
     fn model_clause(owner_depth: usize, start_parser_depth: usize) -> Self {
         Self {
@@ -264,6 +270,13 @@ struct PendingQueryBaseFrame {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingSplitQueryOwnerFrame {
+    owner_base_depth: usize,
+    next_query_head_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingPartialQueryOwnerFrame {
+    kind: sql_text::PendingFormatQueryOwnerHeaderKind,
     owner_base_depth: usize,
     next_query_head_depth: usize,
 }
@@ -1358,12 +1371,16 @@ impl QueryExecutor {
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
         let mut pending_query_bases: Vec<PendingQueryBaseFrame> = Vec::new();
         let mut pending_split_query_owner: Option<PendingSplitQueryOwnerFrame> = None;
+        let mut pending_partial_query_owner: Option<PendingPartialQueryOwnerFrame> = None;
         let mut in_block_comment = false;
         let mut non_query_into_continuation_depth: Option<usize> = None;
         let mut pending_condition_headers: Vec<PendingConditionHeader> = Vec::new();
         let mut active_condition_frames: Vec<ActiveConditionFrame> = Vec::new();
         let mut owner_relative_frames: Vec<OwnerRelativeDepthFrame> = Vec::new();
         let mut pending_multiline_clause_owner: Option<PendingMultilineClauseOwnerFrame> = None;
+        let mut pending_partial_multiline_clause_owner: Option<
+            PendingPartialMultilineClauseOwnerFrame,
+        > = None;
         let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
             None;
 
@@ -1427,15 +1444,17 @@ impl QueryExecutor {
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
                 pending_split_query_owner.take()
             } else {
-                pending_split_query_owner = None;
                 None
             };
             let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren {
                 pending_multiline_clause_owner.take()
             } else {
-                pending_multiline_clause_owner = None;
                 None
             };
+            if current_line_is_standalone_open_paren {
+                pending_partial_query_owner = None;
+                pending_partial_multiline_clause_owner = None;
+            }
             let multiline_clause_paren_profile = sql_text::significant_paren_profile(trimmed);
             let multiline_clause_owner_kind = Self::line_multiline_clause_owner_kind(trimmed)
                 .or(pending_multiline_clause_for_line.map(|frame| frame.kind));
@@ -1746,6 +1765,72 @@ impl QueryExecutor {
                 context.auto_depth = context.auto_depth.max(existing_indent);
             }
 
+            let visual_owner_depth = existing_indent.max(context.auto_depth);
+            let mut continued_partial_query_owner = None;
+            let mut completed_partial_query_owner = None;
+            let mut continued_multiline_clause_owner = None;
+            let mut continued_partial_multiline_clause_owner = None;
+            let mut completed_partial_multiline_clause_owner = None;
+
+            if !current_line_is_standalone_open_paren {
+                if let Some(frame) = pending_partial_query_owner {
+                    if frame.kind.line_can_continue(trimmed) {
+                        let owner_depth = frame.owner_base_depth.max(visual_owner_depth);
+                        let next_query_head_depth = frame
+                            .next_query_head_depth
+                            .max(owner_depth.saturating_add(1));
+                        if owner_depth > context.auto_depth {
+                            context.auto_depth = owner_depth;
+                        }
+                        if frame.kind.line_completes(trimmed) {
+                            completed_partial_query_owner = Some(PendingSplitQueryOwnerFrame {
+                                owner_base_depth: owner_depth,
+                                next_query_head_depth,
+                            });
+                        } else {
+                            continued_partial_query_owner = Some(PendingPartialQueryOwnerFrame {
+                                kind: frame.kind,
+                                owner_base_depth: owner_depth,
+                                next_query_head_depth,
+                            });
+                        }
+                    }
+                }
+
+                if let Some(frame) = pending_multiline_clause_owner {
+                    if sql_text::format_indented_paren_owner_header_continues(frame.kind, trimmed) {
+                        let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                        if owner_depth > context.auto_depth {
+                            context.auto_depth = owner_depth;
+                        }
+                        continued_multiline_clause_owner = Some(PendingMultilineClauseOwnerFrame {
+                            kind: frame.kind,
+                            owner_depth,
+                        });
+                    }
+                } else if let Some(frame) = pending_partial_multiline_clause_owner {
+                    if frame.kind.line_can_continue(trimmed) {
+                        let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                        if owner_depth > context.auto_depth {
+                            context.auto_depth = owner_depth;
+                        }
+                        if frame.kind.line_completes(trimmed) {
+                            completed_partial_multiline_clause_owner =
+                                Some(PendingMultilineClauseOwnerFrame {
+                                    kind: frame.kind.owner_kind(),
+                                    owner_depth,
+                                });
+                        } else {
+                            continued_partial_multiline_clause_owner =
+                                Some(PendingPartialMultilineClauseOwnerFrame {
+                                    kind: frame.kind,
+                                    owner_depth,
+                                });
+                        }
+                    }
+                }
+            }
+
             let condition_annotation = Self::annotate_parenthesized_condition_line(
                 line,
                 idx,
@@ -1770,17 +1855,20 @@ impl QueryExecutor {
 
             let base_depth_for_child_query = pending_split_query_owner_for_line
                 .map(|frame| frame.owner_base_depth)
+                .or_else(|| completed_partial_query_owner.map(|frame| frame.owner_base_depth))
                 .unwrap_or_else(|| {
                     Self::pending_query_owner_base_depth(existing_indent, context, &trimmed_upper)
                 });
             let next_query_head_depth = pending_split_query_owner_for_line
                 .map(|frame| frame.next_query_head_depth)
+                .or_else(|| completed_partial_query_owner.map(|frame| frame.next_query_head_depth))
                 .unwrap_or_else(|| {
                     Self::next_query_head_depth(existing_indent, context, &trimmed_upper)
                 });
             let owns_next_query = Self::line_owns_next_query(&trimmed_upper)
                 || Self::line_ends_with_then_before_inline_comment(trimmed)
                 || Self::line_ends_with_keyword_before_inline_comment_owns_query(trimmed)
+                || completed_partial_query_owner.is_some()
                 || Self::line_ends_with_open_paren_before_inline_comment(trimmed);
             if owns_next_query {
                 context.next_query_head_depth = Some(next_query_head_depth);
@@ -1793,12 +1881,32 @@ impl QueryExecutor {
                         owner_base_depth: base_depth_for_child_query,
                         next_query_head_depth,
                     });
+                } else {
+                    pending_split_query_owner = None;
                 }
             } else if !starts_new_query_frame
                 && !current_line_is_standalone_open_paren
                 && !pending_query_bases.is_empty()
             {
                 pending_query_bases.clear();
+            }
+
+            if !owns_next_query && !current_line_is_standalone_open_paren {
+                pending_split_query_owner = None;
+                pending_partial_query_owner = continued_partial_query_owner;
+                if pending_split_query_owner.is_none() && pending_partial_query_owner.is_none() {
+                    pending_partial_query_owner =
+                        sql_text::format_query_owner_pending_header_kind(trimmed).map(|kind| {
+                            let owner_base_depth = existing_indent.max(context.auto_depth);
+                            PendingPartialQueryOwnerFrame {
+                                kind,
+                                owner_base_depth,
+                                next_query_head_depth: owner_base_depth.saturating_add(1),
+                            }
+                        });
+                }
+            } else {
+                pending_partial_query_owner = None;
             }
 
             Self::apply_multiline_owner_relative_paren_profile(
@@ -1816,14 +1924,33 @@ impl QueryExecutor {
                 }
             }
 
-            if !starts_multiline_clause {
-                pending_multiline_clause_owner =
-                    Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
-                        PendingMultilineClauseOwnerFrame {
-                            kind,
-                            owner_depth: existing_indent.max(context.auto_depth),
-                        }
+            if starts_multiline_clause || current_line_is_standalone_open_paren {
+                pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
+            } else {
+                pending_multiline_clause_owner = continued_multiline_clause_owner
+                    .or(completed_partial_multiline_clause_owner)
+                    .or_else(|| {
+                        Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
+                            PendingMultilineClauseOwnerFrame {
+                                kind,
+                                owner_depth: existing_indent.max(context.auto_depth),
+                            }
+                        })
                     });
+                pending_partial_multiline_clause_owner = if pending_multiline_clause_owner.is_some()
+                {
+                    None
+                } else {
+                    continued_partial_multiline_clause_owner.or_else(|| {
+                        sql_text::format_indented_paren_pending_header_kind(trimmed).map(|kind| {
+                            PendingPartialMultilineClauseOwnerFrame {
+                                kind,
+                                owner_depth: existing_indent.max(context.auto_depth),
+                            }
+                        })
+                    })
+                };
             }
 
             if sql_text::starts_with_keyword_token(&trimmed_upper, "MODEL") {
@@ -1845,8 +1972,10 @@ impl QueryExecutor {
                 query_frames.pop();
                 pending_query_bases.clear();
                 pending_split_query_owner = None;
+                pending_partial_query_owner = None;
                 owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
                 pending_inline_comment_line_continuation = None;
             }
 
@@ -8887,6 +9016,77 @@ WHERE modeled.amount > 0;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_split_model_reference_on_header_chain_relative_to_owner() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits
+        ON
+        (
+            SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno
+        )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "REFERENCE ref_limits")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(on_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT limit_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[on_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "split MODEL REFERENCE ON line should stay aligned with the REFERENCE owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "standalone open paren after split MODEL REFERENCE ON should stay on the REFERENCE owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[reference_idx].auto_depth.saturating_add(1),
+            "split MODEL REFERENCE child SELECT should still be one level deeper than the REFERENCE owner"
+        );
+        assert_eq!(
+            contexts[select_idx].query_base_depth,
+            Some(contexts[reference_idx].auto_depth.saturating_add(1)),
+            "split MODEL REFERENCE child SELECT should keep a query base one level below the REFERENCE owner"
+        );
+        assert_eq!(
+            contexts[dimension_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "DIMENSION BY after split MODEL REFERENCE ON should return to the REFERENCE subclause depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_match_recognize_owner_stack_across_standalone_open_paren(
     ) {
         let sql = r#"SELECT *
@@ -9154,6 +9354,66 @@ WHERE pvt.total_amt_D10 IS NOT NULL;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_split_pivot_xml_header_chain_owner_stack_stable() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT *
+    FROM src
+    PIVOT
+    XML
+    (
+        SUM (amt) AS total_amt
+        FOR deptno IN (10 AS D10, 20 AS D20)
+    )
+) pvt
+WHERE pvt.total_amt_D10 IS NOT NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PIVOT")
+            .unwrap_or(0);
+        let xml_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "XML")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(xml_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sum_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SUM (amt) AS total_amt")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE pvt.total_amt_D10 IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[xml_idx].auto_depth, contexts[pivot_idx].auto_depth,
+            "PIVOT XML modifier line should stay aligned with the PIVOT owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[pivot_idx].auto_depth,
+            "standalone open paren after split PIVOT XML header chain should stay on the owner depth"
+        );
+        assert_eq!(
+            contexts[sum_idx].auto_depth,
+            contexts[pivot_idx].auto_depth.saturating_add(1),
+            "split PIVOT XML body should stay one level deeper than the original owner line"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, 0,
+            "outer WHERE should return to the top-level query depth after split PIVOT XML header chain closes"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_unpivot_include_nulls_owner_stack_across_standalone_open_paren(
     ) {
         let sql = r#"SELECT *
@@ -9215,6 +9475,72 @@ WHERE depivoted.sal_amt IS NOT NULL;"#;
         assert_eq!(
             contexts[outer_where_idx].auto_depth, 0,
             "outer WHERE should return to the top-level query depth after nested UNPIVOT INCLUDE NULLS closes"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_unpivot_include_nulls_header_chain_owner_stack_stable()
+    {
+        let sql = r#"SELECT *
+FROM (
+    SELECT job,
+        dept_tag,
+        sal_amt
+    FROM pivoted
+    UNPIVOT
+    INCLUDE NULLS
+    (
+        sal_amt
+        FOR dept_tag IN (D10 AS '10', D20 AS '20')
+    )
+) depivoted
+WHERE depivoted.sal_amt IS NOT NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let unpivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNPIVOT")
+            .unwrap_or(0);
+        let include_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "INCLUDE NULLS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(include_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "sal_amt")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE depivoted.sal_amt IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[include_idx].auto_depth, contexts[unpivot_idx].auto_depth,
+            "UNPIVOT INCLUDE NULLS modifier line should stay aligned with the UNPIVOT owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[unpivot_idx].auto_depth,
+            "standalone open paren after split UNPIVOT INCLUDE NULLS header chain should stay on the owner depth"
+        );
+        assert_eq!(
+            contexts[value_idx].auto_depth,
+            contexts[unpivot_idx].auto_depth.saturating_add(1),
+            "split UNPIVOT INCLUDE NULLS body should stay one level deeper than the original owner line"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, 0,
+            "outer WHERE should return to the top-level query depth after split UNPIVOT INCLUDE NULLS header chain closes"
         );
     }
 
@@ -9381,6 +9707,68 @@ WHERE ranked.dept_sum > 0;"#;
         assert_eq!(
             contexts[qualify_idx].auto_depth, contexts[window_idx].auto_depth,
             "QUALIFY after split WINDOW body should realign to the WINDOW owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_window_as_header_chain_owner_stack_stable() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT e.deptno,
+        SUM (e.sal) OVER w_dept AS dept_sum
+    FROM emp e
+    WINDOW w_dept
+    AS
+    (
+        PARTITION BY e.deptno
+        ORDER BY e.sal DESC, e.empno
+    )
+    QUALIFY ROW_NUMBER () OVER w_dept = 1
+) ranked
+WHERE ranked.dept_sum > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WINDOW w_dept")
+            .unwrap_or(0);
+        let as_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(as_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY e.deptno"))
+            .unwrap_or(0);
+        let qualify_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("QUALIFY ROW_NUMBER"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[as_idx].auto_depth, contexts[window_idx].auto_depth,
+            "split WINDOW AS line should stay aligned with the WINDOW owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[window_idx].auto_depth,
+            "standalone open paren after split WINDOW AS header chain should stay on the WINDOW owner depth"
+        );
+        assert_eq!(
+            contexts[partition_idx].auto_depth,
+            contexts[window_idx].auto_depth.saturating_add(1),
+            "split WINDOW body should stay one level deeper than the original owner line"
+        );
+        assert_eq!(
+            contexts[qualify_idx].auto_depth, contexts[window_idx].auto_depth,
+            "QUALIFY after split WINDOW AS header chain should realign to the WINDOW owner depth"
         );
     }
 
@@ -10023,6 +10411,60 @@ FROM JSON_TABLE(
         assert_eq!(
             contexts[outer_close_idx].auto_depth, contexts[columns_idx].auto_depth,
             "outer COLUMNS closing paren should realign with the outer owner"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_nested_path_columns_header_chain_on_owner_stack() {
+        let sql = r#"SELECT jt.order_id,
+    jt.sku
+FROM JSON_TABLE(
+    payload,
+    '$' COLUMNS (
+        order_id NUMBER PATH '$.order_id',
+        NESTED PATH '$.items[*]'
+        COLUMNS
+        (
+            sku VARCHAR2 (30) PATH '$.sku',
+            qty NUMBER PATH '$.qty'
+        )
+    )
+) jt;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let nested_path_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NESTED PATH '$.items[*]'")
+            .unwrap_or(0);
+        let columns_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COLUMNS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(columns_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sku_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("sku VARCHAR2"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[columns_idx].auto_depth, contexts[nested_path_idx].auto_depth,
+            "split nested COLUMNS header should stay aligned with the NESTED PATH owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[columns_idx].auto_depth,
+            "split nested COLUMNS opener should stay aligned with the completed COLUMNS owner"
+        );
+        assert_eq!(
+            contexts[sku_idx].auto_depth,
+            contexts[columns_idx].auto_depth.saturating_add(1),
+            "split nested COLUMNS items should be exactly one level deeper than their nested owner"
         );
     }
 

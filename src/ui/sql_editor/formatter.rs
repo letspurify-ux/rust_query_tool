@@ -290,8 +290,25 @@ struct PendingQueryHeadLayoutFrame {
 }
 
 #[derive(Clone, Copy)]
+struct PendingQueryOwnerOpenAlignLayoutFrame {
+    owner_depth: usize,
+}
+
+#[derive(Clone, Copy)]
 struct PendingMultilineClauseOwnerLayoutFrame {
     kind: FormatIndentedParenOwnerKind,
+    owner_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPartialMultilineClauseOwnerLayoutFrame {
+    kind: sql_text::PendingFormatIndentedParenOwnerHeaderKind,
+    owner_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPartialQueryOwnerLayoutFrame {
+    kind: sql_text::PendingFormatQueryOwnerHeaderKind,
     owner_depth: usize,
 }
 
@@ -5744,10 +5761,16 @@ impl SqlEditorWidget {
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
         let mut dml_case_condition_frames: Vec<DmlCaseConditionLayoutFrame> = Vec::new();
         let mut pending_query_head_frames: Vec<PendingQueryHeadLayoutFrame> = Vec::new();
+        let mut pending_query_owner_open_align: Option<PendingQueryOwnerOpenAlignLayoutFrame> =
+            None;
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
         let mut owner_relative_frames: Vec<OwnerRelativeLayoutFrame> = Vec::new();
         let mut pending_multiline_clause_owner: Option<PendingMultilineClauseOwnerLayoutFrame> =
             None;
+        let mut pending_partial_multiline_clause_owner: Option<
+            PendingPartialMultilineClauseOwnerLayoutFrame,
+        > = None;
+        let mut pending_partial_query_owner: Option<PendingPartialQueryOwnerLayoutFrame> = None;
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
         let mut prev_general_paren_frame_count: usize = 0;
         // Tracks the AND/OR depth while inside a JOIN ON/USING condition block.
@@ -5947,12 +5970,20 @@ impl SqlEditorWidget {
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
             let line_tokens = Self::tokenize_sql(trimmed);
             let current_query_owner_kind = crate::sql_text::format_query_owner_kind(trimmed);
+            let pending_query_owner_open_align_for_line = if current_line_is_standalone_open_paren {
+                pending_query_owner_open_align.take()
+            } else {
+                None
+            };
             let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren {
                 pending_multiline_clause_owner.take()
             } else {
-                pending_multiline_clause_owner = None;
                 None
             };
+            if current_line_is_standalone_open_paren {
+                pending_partial_multiline_clause_owner = None;
+                pending_partial_query_owner = None;
+            }
             let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
@@ -6717,6 +6748,9 @@ impl SqlEditorWidget {
             let effective_depth = pending_multiline_clause_for_line
                 .map(|frame| frame.owner_depth)
                 .unwrap_or(effective_depth);
+            let effective_depth = pending_query_owner_open_align_for_line
+                .map(|frame| frame.owner_depth)
+                .unwrap_or(effective_depth);
             let effective_depth =
                 if let Some(owner_depth) = current_line_closes_multiline_clause_owner_depth {
                     owner_depth
@@ -6776,6 +6810,70 @@ impl SqlEditorWidget {
                     .map(|frame| effective_depth.max(frame.continuation_depth))
                     .unwrap_or(effective_depth)
             } else {
+                effective_depth
+            };
+            let mut continued_multiline_clause_owner = None;
+            let mut continued_partial_multiline_clause_owner = None;
+            let mut completed_partial_multiline_clause_owner = None;
+            let mut continued_partial_query_owner = None;
+            let mut completed_partial_query_owner_kind = None;
+            let effective_depth = {
+                let mut effective_depth = effective_depth;
+                if !current_line_is_standalone_open_paren {
+                    let visual_owner_depth = effective_depth.max(existing_indent);
+                    if let Some(frame) = pending_multiline_clause_owner {
+                        if sql_text::format_indented_paren_owner_header_continues(
+                            frame.kind, trimmed,
+                        ) {
+                            let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                            effective_depth = owner_depth;
+                            continued_multiline_clause_owner =
+                                Some(PendingMultilineClauseOwnerLayoutFrame {
+                                    kind: frame.kind,
+                                    owner_depth,
+                                });
+                        }
+                    } else if let Some(frame) = pending_partial_multiline_clause_owner {
+                        if frame.kind.line_can_continue(trimmed) {
+                            let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                            effective_depth = owner_depth;
+                            if frame.kind.line_completes(trimmed) {
+                                completed_partial_multiline_clause_owner =
+                                    Some(PendingMultilineClauseOwnerLayoutFrame {
+                                        kind: frame.kind.owner_kind(),
+                                        owner_depth,
+                                    });
+                            } else {
+                                continued_partial_multiline_clause_owner =
+                                    Some(PendingPartialMultilineClauseOwnerLayoutFrame {
+                                        kind: frame.kind,
+                                        owner_depth,
+                                    });
+                            }
+                        }
+                    }
+                    if continued_multiline_clause_owner.is_none()
+                        && completed_partial_multiline_clause_owner.is_none()
+                        && continued_partial_multiline_clause_owner.is_none()
+                    {
+                        if let Some(frame) = pending_partial_query_owner {
+                            if frame.kind.line_can_continue(trimmed) {
+                                let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                                effective_depth = owner_depth;
+                                if frame.kind.line_completes(trimmed) {
+                                    completed_partial_query_owner_kind =
+                                        Some(frame.kind.owner_kind());
+                                } else {
+                                    continued_partial_query_owner =
+                                        Some(PendingPartialQueryOwnerLayoutFrame {
+                                            kind: frame.kind,
+                                            owner_depth,
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
                 effective_depth
             };
             if starts_query_head {
@@ -7049,14 +7147,23 @@ impl SqlEditorWidget {
                 } else {
                     None
                 };
-                let structural_query_owner_depth = case_condition_query_owner_depth.or_else(|| {
-                    Self::structural_next_query_head_depth(
-                        &layouts[idx],
-                        current_query_owner_kind,
-                        resolved_query_base_depth,
-                        current_condition_header_depth,
-                    )
-                });
+                let structural_query_owner_depth = case_condition_query_owner_depth
+                    .or_else(|| {
+                        completed_partial_query_owner_kind.map(|kind| {
+                            kind.formatter_child_query_head_depth(
+                                layouts[idx].final_depth,
+                                resolved_query_base_depth.or(layouts[idx].query_base_depth),
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        Self::structural_next_query_head_depth(
+                            &layouts[idx],
+                            current_query_owner_kind,
+                            resolved_query_base_depth,
+                            current_condition_header_depth,
+                        )
+                    });
                 let adjusted_next_query_head_depth =
                     if let Some(owner_depth) = structural_query_owner_depth {
                         owner_depth
@@ -7082,23 +7189,70 @@ impl SqlEditorWidget {
             {
                 pending_query_head_frames.clear();
             }
+            pending_query_owner_open_align = if current_line_is_standalone_open_paren {
+                None
+            } else if layouts[idx].next_query_head_depth.is_some()
+                && !Self::line_ends_with_open_paren_before_inline_comment(trimmed)
+                && (completed_partial_query_owner_kind.is_some()
+                    || crate::sql_text::format_query_owner_header_kind(trimmed).is_some())
+            {
+                Some(PendingQueryOwnerOpenAlignLayoutFrame {
+                    owner_depth: layouts[idx].final_depth,
+                })
+            } else {
+                None
+            };
 
-            if !current_line_starts_multiline_clause {
-                pending_multiline_clause_owner =
-                    Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
-                        PendingMultilineClauseOwnerLayoutFrame {
+            if current_line_starts_multiline_clause || current_line_is_standalone_open_paren {
+                pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
+            } else {
+                pending_multiline_clause_owner = continued_multiline_clause_owner
+                    .or(completed_partial_multiline_clause_owner)
+                    .or_else(|| {
+                        Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
+                            PendingMultilineClauseOwnerLayoutFrame {
+                                kind,
+                                owner_depth: effective_depth,
+                            }
+                        })
+                    });
+                pending_partial_multiline_clause_owner = if pending_multiline_clause_owner.is_some()
+                {
+                    None
+                } else {
+                    continued_partial_multiline_clause_owner.or_else(|| {
+                        sql_text::format_indented_paren_pending_header_kind(trimmed).map(|kind| {
+                            PendingPartialMultilineClauseOwnerLayoutFrame {
+                                kind,
+                                owner_depth: effective_depth,
+                            }
+                        })
+                    })
+                };
+            }
+            pending_partial_query_owner = if current_line_is_standalone_open_paren {
+                None
+            } else {
+                continued_partial_query_owner.or_else(|| {
+                    sql_text::format_query_owner_pending_header_kind(trimmed).map(|kind| {
+                        PendingPartialQueryOwnerLayoutFrame {
                             kind,
                             owner_depth: effective_depth,
                         }
-                    });
-            }
+                    })
+                })
+            };
 
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
                 pending_query_head_frames.clear();
                 resolved_query_base_depths.clear();
+                pending_query_owner_open_align = None;
                 owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
+                pending_partial_query_owner = None;
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
                 dml_case_condition_frames.clear();
@@ -15823,6 +15977,215 @@ ORDER BY u.dept_id,
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_pivot_xml_header_chain_owner_depths() {
+        let source = r#"SELECT *
+FROM (
+    SELECT *
+    FROM src
+    PIVOT
+    XML
+    (
+        SUM (amt) AS total_amt
+        FOR deptno IN (10 AS D10, 20 AS D20)
+    )
+) pvt
+WHERE pvt.total_amt_D10 IS NOT NULL;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PIVOT")
+            .unwrap_or(0);
+        let xml_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "XML")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(xml_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sum_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SUM (amt) AS total_amt")
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[xml_idx]), indent(lines[pivot_idx]),);
+        assert_eq!(indent(lines[open_idx]), indent(lines[pivot_idx]));
+        assert_eq!(
+            indent(lines[sum_idx]),
+            indent(lines[pivot_idx]).saturating_add(4)
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_unpivot_include_nulls_header_chain_owner_depths()
+    {
+        let source = r#"SELECT *
+FROM (
+    SELECT job,
+        dept_tag,
+        sal_amt
+    FROM pivoted
+    UNPIVOT
+    INCLUDE NULLS
+    (
+        sal_amt
+        FOR dept_tag IN (D10 AS '10', D20 AS '20')
+    )
+) depivoted
+WHERE depivoted.sal_amt IS NOT NULL;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let unpivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNPIVOT")
+            .unwrap_or(0);
+        let include_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "INCLUDE NULLS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(include_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "sal_amt")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[include_idx]), indent(lines[unpivot_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[unpivot_idx]));
+        assert_eq!(
+            indent(lines[value_idx]),
+            indent(lines[unpivot_idx]).saturating_add(4)
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_window_as_header_chain_owner_depths() {
+        let source = r#"SELECT *
+FROM (
+    SELECT e.deptno,
+        SUM (e.sal) OVER w_dept AS dept_sum
+    FROM emp e
+    WINDOW w_dept
+    AS
+    (
+        PARTITION BY e.deptno
+        ORDER BY e.sal DESC, e.empno
+    )
+    QUALIFY ROW_NUMBER () OVER w_dept = 1
+) ranked
+WHERE ranked.dept_sum > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WINDOW w_dept")
+            .unwrap_or(0);
+        let as_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(as_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY e.deptno"))
+            .unwrap_or(0);
+        let qualify_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("QUALIFY ROW_NUMBER"))
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[as_idx]), indent(lines[window_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[window_idx]));
+        assert_eq!(
+            indent(lines[partition_idx]),
+            indent(lines[window_idx]).saturating_add(4)
+        );
+        assert_eq!(indent(lines[qualify_idx]), indent(lines[window_idx]));
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_model_reference_on_header_chain_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits
+        ON
+        (
+            SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno
+        )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "REFERENCE ref_limits")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(on_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT limit_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[on_idx]), indent(lines[reference_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[reference_idx]));
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[reference_idx]).saturating_add(4)
+        );
+        assert_eq!(indent(lines[dimension_idx]), indent(lines[reference_idx]));
+    }
+
+    #[test]
     fn format_sql_basic_keeps_inline_comment_after_cross_apply_open_paren() {
         let source = "select * from org_enriched oe cross apply (-- inline\nselect oe.dept_id from dual\n) ca;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -22172,6 +22535,70 @@ FROM (
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_nested_path_columns_header_chain_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT *
+    FROM JSON_TABLE(
+        payload,
+        '$' COLUMNS
+        (
+            order_id NUMBER PATH '$.order_id',
+            NESTED PATH '$.items[*]'
+            COLUMNS
+            (
+                sku VARCHAR2 (30) PATH '$.sku',
+                qty NUMBER PATH '$.qty'
+            )
+        )
+    ) jt
+) outer_jt;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let nested_path_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NESTED PATH '$.items[*]'")
+            .unwrap_or(0);
+        let columns_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COLUMNS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(columns_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sku_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("sku VARCHAR2"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[columns_idx]),
+            indent(lines[nested_path_idx]),
+            "split nested COLUMNS header should stay aligned with the NESTED PATH owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[columns_idx]),
+            "split nested COLUMNS opener should stay aligned with the completed COLUMNS owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sku_idx]),
+            indent(lines[columns_idx]).saturating_add(4),
+            "split nested COLUMNS body should stay one level deeper than the nested owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_unpivot_owner_depth_relative_to_nested_query_base(
     ) {
         let source = r#"SELECT *
@@ -22785,6 +23212,286 @@ MATCH_RECOGNIZE (
         assert!(
             indent(lines[inner_one_row_idx]) > indent(lines[with_unmatched_idx]),
             "nested MATCH_RECOGNIZE subclauses should stay deeper than the outer MATCH_RECOGNIZE output modifiers, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_split_window_header_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        SUM (sal) OVER (
+            ORDER
+                    BY (
+                        SELECT MAX (x.sal)
+                        FROM emp x
+                        WHERE x.deptno = e.deptno
+                    )
+            ROWS
+                    BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_sal
+    FROM emp e
+) q
+WHERE running_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER")
+            .unwrap_or(0);
+        let by_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("BY ("))
+            .unwrap_or(0);
+        let rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROWS")
+            .unwrap_or(0);
+        let between_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")
+            })
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("WHERE running_sal > 0"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[by_idx]),
+            indent(lines[order_idx]),
+            "split WINDOW ORDER/BY continuation should realign with the WINDOW owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rows_idx]),
+            indent(lines[order_idx]),
+            "WINDOW ROWS header should stay on the same owner-relative body depth as ORDER, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[between_idx]),
+            indent(lines[rows_idx]),
+            "split WINDOW ROWS/BETWEEN continuation should realign with the WINDOW owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested WINDOW query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_split_window_frame_and_exclude_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        SUM (sal) OVER (
+            ORDER BY (
+                SELECT MAX (x.sal)
+                FROM emp x
+                WHERE x.deptno = e.deptno
+            )
+            ROWS
+                    UNBOUNDED PRECEDING
+            EXCLUDE
+                    CURRENT ROW
+        ) AS running_sal
+    FROM emp e
+) q
+WHERE running_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROWS")
+            .unwrap_or(0);
+        let unbounded_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UNBOUNDED PRECEDING")
+            .unwrap_or(0);
+        let exclude_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "EXCLUDE")
+            .unwrap_or(0);
+        let current_row_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CURRENT ROW")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("WHERE running_sal > 0"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[unbounded_idx]),
+            indent(lines[rows_idx]),
+            "split WINDOW ROWS frame continuation should realign with the WINDOW owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[exclude_idx]),
+            indent(lines[rows_idx]),
+            "WINDOW EXCLUDE header should stay aligned with sibling owner-relative frame headers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[current_row_idx]),
+            indent(lines[exclude_idx]),
+            "split WINDOW EXCLUDE continuation should realign with the WINDOW owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested WINDOW query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_split_match_recognize_modifier_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM sales
+MATCH_RECOGNIZE (
+    PARTITION BY cust_id
+    ORDER BY sale_date
+    ONE ROW PER
+            MATCH
+    AFTER MATCH SKIP
+            TO NEXT ROW
+    PATTERN (A)
+    DEFINE A AS amount > 0
+) mr;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let one_row_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ONE ROW PER")
+            .unwrap_or(0);
+        let match_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "MATCH")
+            .unwrap_or(0);
+        let after_skip_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AFTER MATCH SKIP")
+            .unwrap_or(0);
+        let to_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("TO NEXT ROW"))
+            .unwrap_or(0);
+        let pattern_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PATTERN (A)"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[match_idx]),
+            indent(lines[one_row_idx]),
+            "split MATCH_RECOGNIZE ONE ROW PER/MATCH continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[to_idx]),
+            indent(lines[after_skip_idx]),
+            "split MATCH_RECOGNIZE AFTER MATCH SKIP/TO continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[pattern_idx]),
+            indent(lines[one_row_idx]),
+            "MATCH_RECOGNIZE PATTERN should stay aligned with sibling owner-relative modifiers, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_split_model_modifier_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM sales
+MODEL
+    RETURN
+            UPDATED ROWS
+    RULES
+            AUTOMATIC ORDER
+            ITERATE (2)
+    (
+        amount[ANY] = amount[CV()] + 1
+    )
+WHERE amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let return_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RETURN")
+            .unwrap_or(0);
+        let updated_rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPDATED ROWS")
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RULES")
+            .unwrap_or(0);
+        let automatic_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AUTOMATIC ORDER")
+            .unwrap_or(0);
+        let iterate_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ITERATE (2)")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("WHERE amount > 0"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[updated_rows_idx]),
+            indent(lines[return_idx]),
+            "split MODEL RETURN/UPDATED ROWS continuation should realign with the MODEL owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rules_idx]),
+            indent(lines[return_idx]),
+            "MODEL RULES should stay aligned with the split RETURN modifier depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[automatic_idx]),
+            indent(lines[rules_idx]),
+            "MODEL AUTOMATIC ORDER should stay aligned with sibling owner-relative modifiers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[iterate_idx]),
+            indent(lines[rules_idx]),
+            "MODEL ITERATE should stay aligned with sibling owner-relative modifiers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the MODEL clause closes, got:\n{}",
             formatted
         );
     }
