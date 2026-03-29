@@ -441,6 +441,86 @@ fn phase_order_by() {
 }
 
 #[test]
+fn phase_grant_with_grant_option_does_not_enter_with_clause() {
+    let ctx = analyze("GRANT EXECUTE ON pkg_demo TO scott WITH | GRANT OPTION");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(
+        ctx.ctes.is_empty(),
+        "non-query WITH option must not create CTEs"
+    );
+}
+
+#[test]
+fn phase_query_with_read_only_option_leaves_query_context() {
+    let ctx = analyze("CREATE VIEW v_emp AS SELECT * FROM emp WITH | READ ONLY");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(!ctx.phase.is_column_context());
+    assert!(
+        ctx.ctes.is_empty(),
+        "query-tail WITH READ ONLY must not create CTEs"
+    );
+}
+
+#[test]
+fn phase_query_with_cascaded_check_option_leaves_query_context() {
+    let ctx = analyze(
+        "CREATE VIEW v_emp AS SELECT * FROM emp WHERE deptno > 10 WITH | CASCADED CHECK OPTION",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(!ctx.phase.is_column_context());
+    assert!(
+        ctx.ctes.is_empty(),
+        "query-tail WITH CASCADED CHECK OPTION must not create CTEs"
+    );
+}
+
+#[test]
+fn phase_fetch_with_ties_leaves_query_context() {
+    let ctx = analyze("SELECT * FROM emp ORDER BY empno FETCH FIRST 5 ROWS WITH | TIES");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(!ctx.phase.is_column_context());
+    assert!(
+        ctx.ctes.is_empty(),
+        "FETCH ... WITH TIES must not create CTEs"
+    );
+}
+
+#[test]
+fn phase_with_xmlnamespaces_clause_is_not_cte_column_context() {
+    let ctx = analyze("WITH XMLNAMESPACES (DEFAULT | 'urn:emp') SELECT * FROM emp");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(!ctx.phase.is_column_context());
+    assert!(
+        ctx.ctes.is_empty(),
+        "WITH XMLNAMESPACES must not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
+fn phase_with_change_tracking_context_clause_is_not_cte_column_context() {
+    let ctx = analyze("WITH CHANGE_TRACKING_CONTEXT (| 0x01) SELECT * FROM emp");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(!ctx.phase.is_column_context());
+    assert!(
+        ctx.ctes.is_empty(),
+        "WITH CHANGE_TRACKING_CONTEXT must not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
 fn phase_order_siblings_by() {
     let ctx = analyze("SELECT a FROM t ORDER SIBLINGS BY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
@@ -1555,6 +1635,79 @@ fn phase_select_json_value_returning_clause_stays_column_context() {
 }
 
 #[test]
+fn phase_select_json_query_with_wrapper_stays_column_context() {
+    let ctx = analyze("SELECT JSON_QUERY(e.payload, '$.items[*]' WITH | WRAPPER) FROM events e");
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EVENTS"),
+        "expected EVENTS table in scope inside JSON_QUERY WITH WRAPPER, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn phase_select_json_object_with_unique_keys_stays_column_context() {
+    let ctx = analyze(
+        "SELECT JSON_OBJECT('id' VALUE e.empno, 'name' VALUE e.ename WITH | UNIQUE KEYS) FROM emp e",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP table in scope inside JSON_OBJECT WITH UNIQUE KEYS, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn phase_select_json_object_with_unique_keys_after_comment_stays_column_context() {
+    let ctx = analyze(
+        "SELECT JSON_OBJECT('id' VALUE e.empno, 'name' VALUE e.ename /*opts*/ WITH | UNIQUE KEYS) FROM emp e",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP table in scope inside commented JSON_OBJECT WITH UNIQUE KEYS, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn phase_select_json_transform_set_stays_column_context() {
+    let ctx = analyze(
+        "SELECT JSON_TRANSFORM(e.payload, SET | '$.status' = 'DONE') AS payload2 FROM emp_json e",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP_JSON"),
+        "expected EMP_JSON table in scope inside JSON_TRANSFORM SET, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn phase_select_json_transform_set_after_comment_stays_column_context() {
+    let ctx = analyze(
+        "SELECT JSON_TRANSFORM(e.payload, /*op*/ SET | '$.status' = 'DONE') AS payload2 FROM emp_json e",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP_JSON"),
+        "expected EMP_JSON table in scope inside commented JSON_TRANSFORM SET, got {:?}",
+        names
+    );
+}
+
+#[test]
 fn phase_where_json_query_returning_clause_stays_where_context() {
     let ctx = analyze("SELECT * FROM events e WHERE JSON_QUERY(e.payload, '$' RETURNING | VARCHAR2(4000)) IS NOT NULL");
 
@@ -1988,10 +2141,169 @@ fn cte_cursor_in_main_query_where() {
 }
 
 #[test]
+fn insert_with_cte_source_query_keeps_cte_visible() {
+    let ctx =
+        analyze("INSERT INTO audit_log WITH recent AS (SELECT 1 AS id FROM dual) SELECT recent.| FROM recent");
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "RECENT"),
+        "insert-source WITH must keep CTE visible: {:?}",
+        cte_names(&ctx)
+    );
+    let recent_cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("recent"))
+        .expect("expected recent CTE in insert source query");
+    assert_eq!(
+        extract_select_list_columns(token_range_slice(
+            ctx.statement_tokens.as_ref(),
+            recent_cte.body_range,
+        )),
+        vec!["id"]
+    );
+    assert_eq!(
+        resolve_qualifier_tables("recent", &ctx.tables_in_scope),
+        vec!["recent".to_string()]
+    );
+}
+
+#[test]
 fn cte_cursor_in_cte_body() {
     let ctx = analyze("WITH temp AS (SELECT | FROM users) SELECT * FROM temp");
     assert_eq!(ctx.depth, 1);
     assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn later_cte_is_not_visible_inside_previous_cte_body() {
+    let ctx = analyze(
+        "WITH c1 AS (SELECT c2.| FROM dual), c2 AS (SELECT 1 AS id FROM dual) SELECT * FROM c1",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        !has_name(&cte_names(&ctx), "C2"),
+        "later sibling CTE must not be visible inside an earlier CTE body: {:?}",
+        cte_names(&ctx)
+    );
+    assert!(
+        !has_name(&table_names(&ctx), "C2"),
+        "later sibling CTE must not enter table scope inside an earlier CTE body: {:?}",
+        table_names(&ctx)
+    );
+}
+
+#[test]
+fn recursive_cte_is_visible_inside_its_own_body() {
+    let ctx = analyze(
+        "WITH r(n) AS (SELECT 1 FROM dual UNION ALL SELECT r.| FROM r WHERE n < 10) SELECT * FROM r",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "R"),
+        "recursive CTE should stay visible inside its own body: {:?}",
+        cte_names(&ctx)
+    );
+    let recursive_cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("r"))
+        .expect("expected recursive CTE in scope inside its own body");
+    assert_eq!(recursive_cte.explicit_columns, vec!["n"]);
+    assert_eq!(
+        resolve_qualifier_tables("r", &ctx.tables_in_scope),
+        vec!["r".to_string()]
+    );
+}
+
+#[test]
+fn recursive_cte_is_visible_in_recursive_term_before_self_reference_token() {
+    let ctx = analyze(
+        "WITH r(n) AS (SELECT 1 FROM dual UNION ALL SELECT | FROM r WHERE n < 10) SELECT * FROM r",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "R"),
+        "recursive CTE should be visible as soon as cursor enters recursive term: {:?}",
+        cte_names(&ctx)
+    );
+    assert!(
+        has_name(&table_names(&ctx), "R"),
+        "recursive CTE should enter table scope inside recursive term: {:?}",
+        table_names(&ctx)
+    );
+}
+
+#[test]
+fn recursive_cte_is_not_visible_in_anchor_term_before_set_operator() {
+    let ctx =
+        analyze("WITH r(n) AS (SELECT | FROM dual UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT * FROM r");
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        !has_name(&cte_names(&ctx), "R"),
+        "recursive CTE must stay hidden inside anchor term before set operator: {:?}",
+        cte_names(&ctx)
+    );
+    assert!(
+        !has_name(&table_names(&ctx), "R"),
+        "recursive CTE must stay out of table scope inside anchor term before set operator: {:?}",
+        table_names(&ctx)
+    );
+}
+
+#[test]
+fn recursive_cte_is_not_visible_in_nested_anchor_subquery_before_set_operator() {
+    let ctx = analyze(
+        "WITH r(n) AS (SELECT * FROM (SELECT | FROM dual) anchor_sub UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT * FROM r",
+    );
+
+    assert_eq!(ctx.depth, 2);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        !has_name(&cte_names(&ctx), "R"),
+        "recursive CTE must stay hidden inside nested anchor subquery before recursive term: {:?}",
+        cte_names(&ctx)
+    );
+    assert!(
+        !has_name(&table_names(&ctx), "R"),
+        "recursive CTE must stay out of nested anchor subquery table scope before recursive term: {:?}",
+        table_names(&ctx)
+    );
+}
+
+#[test]
+fn non_recursive_cte_is_not_visible_inside_its_own_body() {
+    let ctx = analyze("WITH temp AS (SELECT temp.| FROM users) SELECT * FROM temp");
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        !has_name(&cte_names(&ctx), "TEMP"),
+        "non-recursive CTE must not be visible inside its own body: {:?}",
+        cte_names(&ctx)
+    );
+    assert!(
+        !has_name(&table_names(&ctx), "TEMP"),
+        "non-recursive CTE must not enter table scope inside its own body: {:?}",
+        table_names(&ctx)
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| !table.name.eq_ignore_ascii_case("temp")),
+        "non-recursive CTE must stay out of visible table scope inside its own body: {:?}",
+        ctx.tables_in_scope
+    );
 }
 
 #[test]
@@ -2002,6 +2314,46 @@ fn cte_with_nested_subquery() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     let names = table_names(&ctx);
     assert!(names.iter().any(|n| n.eq_ignore_ascii_case("temp")));
+}
+
+#[test]
+fn outer_cte_is_visible_inside_non_lateral_from_subquery() {
+    let ctx = analyze(
+        "WITH outer_cte AS (SELECT 1 AS id FROM dual) \
+         SELECT * FROM (SELECT outer_cte.| FROM outer_cte) sub",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "OUTER_CTE"),
+        "outer CTE should remain visible inside a nested FROM subquery: {:?}",
+        cte_names(&ctx)
+    );
+    assert_eq!(
+        resolve_qualifier_tables("outer_cte", &ctx.tables_in_scope),
+        vec!["outer_cte".to_string()]
+    );
+}
+
+#[test]
+fn outer_cte_is_visible_in_second_set_operator_operand() {
+    let ctx = analyze(
+        "WITH outer_cte AS (SELECT 1 AS id FROM dual) \
+         SELECT id FROM outer_cte UNION ALL SELECT outer_cte.| FROM outer_cte",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "OUTER_CTE"),
+        "outer CTE should remain visible in later set-operator operands: {:?}",
+        cte_names(&ctx)
+    );
+    assert_eq!(
+        resolve_qualifier_tables("outer_cte", &ctx.tables_in_scope),
+        vec!["outer_cte".to_string()]
+    );
 }
 
 #[test]
@@ -4549,6 +4901,36 @@ fn nested_with_multiple_ctes_exposes_second_cte_table() {
 }
 
 #[test]
+fn nested_with_xmlnamespaces_clause_keeps_nested_query_depth_without_cte_state() {
+    let ctx = analyze(
+        "SELECT * FROM (WITH XMLNAMESPACES (DEFAULT | 'urn:emp') SELECT 1 AS id FROM dual) sub",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(
+        ctx.ctes.is_empty(),
+        "nested WITH XMLNAMESPACES must not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
+fn nested_with_change_tracking_context_clause_keeps_nested_query_depth_without_cte_state() {
+    let ctx = analyze(
+        "SELECT * FROM (WITH CHANGE_TRACKING_CONTEXT (| 0x01) SELECT 1 AS id FROM dual) sub",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(
+        ctx.ctes.is_empty(),
+        "nested WITH CHANGE_TRACKING_CONTEXT must not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
 fn nested_with_in_where_subquery_cte_body_depth_counts_parent_query() {
     let ctx = analyze(
         "SELECT * FROM outer_t o WHERE o.id IN (WITH cte AS (SELECT | FROM inner_t) SELECT id FROM cte)",
@@ -4835,6 +5217,15 @@ fn merge_update_set_target_list_prefers_target_phase() {
 }
 
 #[test]
+fn merge_update_set_after_comment_prefers_target_phase() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN UPDATE /* keep merge action */ SET |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
+    assert_eq!(ctx.focused_tables, vec!["target".to_string()]);
+}
+
+#[test]
 fn merge_when_not_matched_insert_column_list_is_column_context() {
     let ctx = analyze(
         "MERGE INTO target t USING source s ON (t.id = s.id) \
@@ -4842,6 +5233,17 @@ fn merge_when_not_matched_insert_column_list_is_column_context() {
     );
     assert_eq!(ctx.depth, 0);
     assert!(ctx.phase.is_column_context(), "phase: {:?}", ctx.phase);
+}
+
+#[test]
+fn merge_when_not_matched_insert_after_comment_keeps_merge_column_list_phase() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN /* keep merge action */ INSERT (|) VALUES (s.id)",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::MergeInsertColumnList);
+    assert_eq!(ctx.focused_tables, vec!["target".to_string()]);
 }
 
 #[test]
@@ -5222,6 +5624,214 @@ fn with_plsql_procedure_declaration_is_not_parsed_as_cte() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 }
 
+#[test]
+fn with_plsql_package_declaration_is_not_parsed_as_cte() {
+    let ctx = analyze(
+        "WITH PACKAGE pkg_demo AS FUNCTION f RETURN NUMBER; END pkg_demo; SELECT | FROM dual",
+    );
+
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.is_empty(),
+        "PL/SQL package declaration should not create CTEs: {:?}",
+        cte_n
+    );
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn with_plsql_type_declaration_is_not_parsed_as_cte() {
+    let ctx = analyze("WITH TYPE t_num IS TABLE OF NUMBER; SELECT | FROM dual");
+
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.is_empty(),
+        "PL/SQL type declaration should not create CTEs: {:?}",
+        cte_n
+    );
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn with_plsql_function_followed_by_cte_keeps_cte_visible() {
+    let ctx = analyze(
+        "WITH FUNCTION calc_depth RETURN NUMBER IS BEGIN RETURN 1; END; \
+         recursive_tree AS (SELECT 1 AS id FROM dual) \
+         SELECT recursive_tree.| FROM recursive_tree",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "RECURSIVE_TREE"),
+        "CTE after WITH FUNCTION should remain visible: {:?}",
+        cte_names(&ctx)
+    );
+    let cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("recursive_tree"))
+        .expect("expected recursive_tree CTE");
+    assert_eq!(
+        extract_select_list_columns(token_range_slice(
+            ctx.statement_tokens.as_ref(),
+            cte.body_range,
+        )),
+        vec!["id"]
+    );
+    assert_eq!(
+        resolve_qualifier_tables("recursive_tree", &ctx.tables_in_scope),
+        vec!["recursive_tree".to_string()]
+    );
+}
+
+#[test]
+fn with_plsql_function_with_nested_declare_block_keeps_following_cte_visible() {
+    let ctx = analyze(
+        r#"WITH FUNCTION calc_depth RETURN NUMBER IS
+BEGIN
+    DECLARE
+        v_depth NUMBER := 1;
+    BEGIN
+        v_depth := v_depth + 1;
+    END;
+    RETURN v_depth;
+END;
+recursive_tree AS (SELECT 1 AS id FROM dual)
+SELECT recursive_tree.| FROM recursive_tree"#,
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "RECURSIVE_TREE"),
+        "CTE after WITH FUNCTION nested DECLARE block should remain visible: {:?}",
+        cte_names(&ctx)
+    );
+    assert_eq!(
+        resolve_qualifier_tables("recursive_tree", &ctx.tables_in_scope),
+        vec!["recursive_tree".to_string()]
+    );
+}
+
+#[test]
+fn with_plsql_function_followed_by_explicit_with_query_keeps_cte_visible() {
+    let ctx = analyze(
+        "WITH FUNCTION calc_depth RETURN NUMBER IS BEGIN RETURN 1; END; \
+         WITH recursive_tree AS (SELECT 1 AS id FROM dual) \
+         SELECT recursive_tree.| FROM recursive_tree",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "RECURSIVE_TREE"),
+        "explicit WITH after WITH FUNCTION should remain visible: {:?}",
+        cte_names(&ctx)
+    );
+    assert_eq!(
+        resolve_qualifier_tables("recursive_tree", &ctx.tables_in_scope),
+        vec!["recursive_tree".to_string()]
+    );
+}
+
+#[test]
+fn with_plsql_function_followed_by_explicit_recursive_with_query_keeps_recursive_cte_visible() {
+    let ctx = analyze(
+        "WITH FUNCTION calc_depth RETURN NUMBER IS BEGIN RETURN 1; END; \
+         WITH r(n) AS (SELECT 1 FROM dual UNION ALL SELECT r.| FROM r WHERE n < 3) \
+         SELECT * FROM r",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "R"),
+        "explicit recursive WITH after WITH FUNCTION should remain visible: {:?}",
+        cte_names(&ctx)
+    );
+    let recursive_cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("r"))
+        .expect("expected recursive CTE after explicit WITH");
+    assert_eq!(recursive_cte.explicit_columns, vec!["n"]);
+    assert_eq!(
+        resolve_qualifier_tables("r", &ctx.tables_in_scope),
+        vec!["r".to_string()]
+    );
+}
+
+#[test]
+fn with_plsql_function_followed_by_call_resets_with_phase() {
+    let ctx = analyze(
+        "WITH FUNCTION calc_depth RETURN NUMBER IS BEGIN RETURN 1; END; CALL |pkg_demo.run_job()",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(
+        ctx.phase,
+        SqlPhase::Initial,
+        "CALL after WITH FUNCTION should leave declaration mode"
+    );
+    assert!(
+        ctx.ctes.is_empty(),
+        "CALL after WITH FUNCTION should not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
+fn with_plsql_type_followed_by_table_query_resets_with_phase() {
+    let ctx = analyze("WITH TYPE t_num IS TABLE OF NUMBER; TABLE |(t_num (1, 2, 3))");
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(
+        ctx.phase,
+        SqlPhase::Initial,
+        "TABLE query after WITH TYPE should leave declaration mode"
+    );
+    assert!(
+        ctx.ctes.is_empty(),
+        "TABLE query after WITH TYPE should not synthesize CTEs: {:?}",
+        cte_names(&ctx)
+    );
+}
+
+#[test]
+fn nested_with_scalar_subquery_after_comment_still_starts_query_scope() {
+    let ctx = analyze(
+        "SELECT (/* scalar */ WITH cte AS (SELECT 1 AS id FROM dual) SELECT cte.| FROM cte) AS nested_id FROM dual",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        has_name(&cte_names(&ctx), "CTE"),
+        "ctes: {:?}",
+        cte_names(&ctx)
+    );
+    let cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("cte"))
+        .expect("nested CTE should be visible at cursor");
+    assert_eq!(
+        extract_select_list_columns(token_range_slice(
+            ctx.statement_tokens.as_ref(),
+            cte.body_range,
+        )),
+        vec!["id"]
+    );
+    assert_eq!(
+        resolve_qualifier_tables("cte", &ctx.tables_in_scope),
+        vec!["cte".to_string()]
+    );
+}
+
 // ─── Oracle-specific: PIVOT/UNPIVOT ──────────────────────────────────────
 
 #[test]
@@ -5426,6 +6036,42 @@ fn match_recognize_clause_alias_after_base_table_is_collected_for_qualifier_reso
 }
 
 #[test]
+fn match_recognize_clause_alias_after_base_table_registers_virtual_relation_body() {
+    let ctx = analyze(
+        "SELECT mr.| \
+         FROM oqt_t_emp \
+         MATCH_RECOGNIZE ( \
+           MEASURES FIRST(ename) AS start_name \
+           PATTERN (a) \
+           DEFINE a AS sal > 0 \
+         ) mr",
+    );
+
+    let virtual_relation = ctx
+        .subqueries
+        .iter()
+        .find(|subq| subq.alias.eq_ignore_ascii_case("mr"))
+        .expect("expected MATCH_RECOGNIZE alias mr to be tracked as a virtual relation");
+    let body_tokens = token_range_slice(ctx.statement_tokens.as_ref(), virtual_relation.body_range);
+    let generated = extract_match_recognize_generated_columns(body_tokens);
+
+    assert!(
+        generated
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("start_name")),
+        "expected MATCH_RECOGNIZE MEASURES alias in virtual relation body, got: {:?}",
+        generated
+    );
+    assert!(
+        generated
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("a")),
+        "expected MATCH_RECOGNIZE pattern variable in virtual relation body, got: {:?}",
+        generated
+    );
+}
+
+#[test]
 fn match_recognize_spaced_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
     let ctx = analyze(
         "SELECT mrs.| FROM oqt_t_emp MATCH RECOGNIZE (PARTITION BY deptno ORDER BY empno PATTERN (a) DEFINE a AS sal > 0) mrs",
@@ -5549,6 +6195,31 @@ fn pivot_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
             .iter()
             .map(|table| (&table.name, &table.alias))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pivot_clause_alias_after_subquery_keeps_pivot_projection_in_virtual_relation_body() {
+    let ctx = analyze(
+        "SELECT p.| \
+         FROM (SELECT deptno, job, sal FROM oqt_t_emp) \
+         PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p",
+    );
+
+    let virtual_relation = ctx
+        .subqueries
+        .iter()
+        .find(|subq| subq.alias.eq_ignore_ascii_case("p"))
+        .expect("expected PIVOT alias p to be tracked as a virtual relation");
+    let body_tokens = token_range_slice(ctx.statement_tokens.as_ref(), virtual_relation.body_range);
+    let projected = extract_oracle_pivot_unpivot_projection_columns(body_tokens);
+
+    assert!(
+        projected
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("clerk_sal")),
+        "expected PIVOT generated alias in virtual relation body, got: {:?}",
+        projected
     );
 }
 
@@ -6083,6 +6754,26 @@ fn extract_oracle_model_generated_columns_from_measures_clause() {
     );
     let cols = extract_oracle_model_generated_columns(&tokens);
     assert_eq!(cols, vec!["sum_sal", "cnt", "avg_sal_calc", "sum_plus_100"]);
+}
+
+#[test]
+fn extract_recursive_cte_generated_columns_from_search_and_cycle_clauses() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SEARCH DEPTH FIRST BY n SET ord_seq \
+         CYCLE n SET is_cycle TO 'Y' DEFAULT 'N' \
+         SELECT |* FROM t",
+    );
+
+    let cte = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("t"))
+        .expect("expected recursive CTE t");
+
+    let cols =
+        extract_recursive_cte_generated_columns(ctx.statement_tokens.as_ref(), cte.body_range.end);
+    assert_eq!(cols, vec!["ord_seq", "is_cycle"]);
 }
 
 #[test]

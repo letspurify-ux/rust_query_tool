@@ -22,64 +22,40 @@ impl SqlEditorWidget {
             deep_ctx.statement_tokens.as_ref(),
             cte.body_range,
         );
+        let recursive_generated_columns = intellisense_context::extract_recursive_cte_generated_columns(
+            deep_ctx.statement_tokens.as_ref(),
+            cte.body_range.end,
+        );
         let cursor_in_explicit_list =
             Self::is_cursor_inside_cte_explicit_column_list(deep_ctx, cte);
         let prefer_body_projection = cursor_in_explicit_list && !cte.body_range.is_empty();
+        let should_infer_from_body =
+            !cte.body_range.is_empty() && (cte.explicit_columns.is_empty() || prefer_body_projection);
 
-        // While editing WITH cte(col1, ...), prefer body projection columns as completion
-        // candidates even when an explicit list is already partially typed.
-        let mut columns = Self::collect_cte_base_columns(cte, body_tokens, prefer_body_projection);
-
-        let mut wildcard_tables = Vec::new();
-        if Self::should_expand_cte_wildcards(cte, prefer_body_projection) {
-            let body_tables_in_scope =
-                intellisense_context::collect_tables_in_statement(body_tokens);
-            let (wildcard_columns, deps) = Self::expand_virtual_table_wildcards(
+        if should_infer_from_body {
+            let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
+            let (mut columns, wildcard_tables) = Self::collect_virtual_query_projection_columns(
                 body_tokens,
                 &body_tables_in_scope,
+                &[],
                 virtual_table_columns,
                 intellisense_data,
                 column_sender,
                 connection,
             );
-            if !deps.is_empty() {
-                wildcard_tables = deps;
-            }
-            columns.extend(wildcard_columns);
-        }
-
-        columns.extend(
-            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens),
-        );
-        Self::dedup_column_names_case_insensitive(&mut columns);
-        (columns, wildcard_tables)
-    }
-
-    fn collect_cte_base_columns(
-        cte: &intellisense_context::CteDefinition,
-        body_tokens: &[SqlToken],
-        prefer_body_projection: bool,
-    ) -> Vec<String> {
-        if prefer_body_projection {
-            return intellisense_context::extract_select_list_columns(body_tokens);
+            columns.extend(recursive_generated_columns);
+            Self::dedup_column_names_case_insensitive(&mut columns);
+            return (columns, wildcard_tables);
         }
 
         if !cte.explicit_columns.is_empty() {
-            return cte.explicit_columns.clone();
+            let mut columns = cte.explicit_columns.clone();
+            columns.extend(recursive_generated_columns);
+            Self::dedup_column_names_case_insensitive(&mut columns);
+            return (columns, Vec::new());
         }
 
-        if cte.body_range.is_empty() {
-            Vec::new()
-        } else {
-            intellisense_context::extract_select_list_columns(body_tokens)
-        }
-    }
-
-    fn should_expand_cte_wildcards(
-        cte: &intellisense_context::CteDefinition,
-        prefer_body_projection: bool,
-    ) -> bool {
-        !cte.body_range.is_empty() && (cte.explicit_columns.is_empty() || prefer_body_projection)
+        (recursive_generated_columns, Vec::new())
     }
 
     fn classify_intellisense_context(

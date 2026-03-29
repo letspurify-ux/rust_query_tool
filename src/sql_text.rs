@@ -786,6 +786,10 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     "HIERARCHY",
 ];
 
+/// Query-head `WITH` constructs that are neither CTEs nor PL/SQL declarations
+/// (e.g. SQL Server `WITH XMLNAMESPACES (...) SELECT ...`).
+const WITH_NON_CTE_QUERY_HEAD_KEYWORDS: &[&str] = &["XMLNAMESPACES"];
+
 const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &[
     "C",
     "JAVA",
@@ -1238,6 +1242,12 @@ pub(crate) fn with_plsql_declaration_starts_routine_body(word: &str) -> bool {
 /// clause (for example `WITH READ ONLY` in view definitions).
 pub(crate) fn is_with_non_plsql_clause_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_NON_PLSQL_CLAUSE_KEYWORDS)
+}
+
+/// Returns true when a top-level `WITH` starts a query-head clause that is not
+/// a CTE/PLSQL declaration (for example `WITH XMLNAMESPACES (...) SELECT ...`).
+pub(crate) fn is_with_non_cte_query_head_keyword(word: &str) -> bool {
+    matches_keyword(word, WITH_NON_CTE_QUERY_HEAD_KEYWORDS)
 }
 
 /// Returns true when a token can reasonably start a new top-level statement.
@@ -4275,6 +4285,7 @@ mod tests {
         assert!(is_with_plsql_declaration_keyword("procedure"));
         assert!(is_with_plsql_declaration_keyword("PACKAGE"));
         assert!(is_with_plsql_declaration_keyword("type"));
+        assert!(is_with_non_cte_query_head_keyword("xmlnamespaces"));
         assert!(with_plsql_declaration_starts_routine_body("PACKAGE"));
         assert!(!with_plsql_declaration_starts_routine_body("TYPE"));
         assert!(is_external_language_target_keyword("javascript"));

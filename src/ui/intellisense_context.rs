@@ -119,6 +119,7 @@ pub struct ScopedTableRef {
 #[allow(dead_code)]
 pub struct CteDefinition {
     pub name: String,
+    pub depth: usize,
     pub explicit_columns: Vec<String>,
     /// Token range for explicit column list inside `WITH cte(col1, col2) ...`.
     pub explicit_column_range: Option<TokenRange>,
@@ -126,7 +127,7 @@ pub struct CteDefinition {
     pub body_range: TokenRange,
 }
 
-/// A subquery alias with its body token range, for column inference.
+/// A virtual relation alias with its body token range, for column inference.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SubqueryDefinition {
@@ -214,6 +215,60 @@ impl CteState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WithPlsqlPendingDeclaration {
+    starts_body: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WithPlsqlBodyFrameKind {
+    Routine,
+    Block,
+    Case,
+    If,
+    Loop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WithPlsqlBodyFrame {
+    kind: WithPlsqlBodyFrameKind,
+    awaiting_begin: bool,
+}
+
+impl WithPlsqlBodyFrame {
+    fn routine() -> Self {
+        Self {
+            kind: WithPlsqlBodyFrameKind::Routine,
+            awaiting_begin: true,
+        }
+    }
+
+    fn nested(kind: WithPlsqlBodyFrameKind) -> Self {
+        Self {
+            kind,
+            awaiting_begin: false,
+        }
+    }
+
+    fn awaiting_begin(kind: WithPlsqlBodyFrameKind) -> Self {
+        Self {
+            kind,
+            awaiting_begin: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WithPlsqlState {
+    None,
+    Collecting {
+        active_body_frames: Vec<WithPlsqlBodyFrame>,
+        pending_routine_declaration: Option<WithPlsqlPendingDeclaration>,
+        pending_end: bool,
+    },
+    AwaitingMainQuery,
+}
+
 /// Current completion expectation derived from clause semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expectation {
@@ -249,23 +304,47 @@ pub(crate) fn analyze_cursor_context(
     let clamped_cursor_token_len = cursor_token_len.min(full_statement.len());
     let statement_tokens: Arc<[SqlToken]> = full_statement.to_vec().into();
     let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
+    let mut visible_cte_entries = parse_result.parsed_ctes.clone();
+    for open_entry in parse_result.cursor_open_ctes {
+        if visible_cte_entries.iter().any(|entry| {
+            entry.scope_id == open_entry.scope_id
+                && entry.body_scope_id == open_entry.body_scope_id
+                && entry.cte.name.eq_ignore_ascii_case(&open_entry.cte.name)
+        }) {
+            continue;
+        }
+        visible_cte_entries.push(open_entry);
+    }
     let table_analysis = filter_scope_entries(
         &parse_result.parsed_tables,
         &parse_result.parsed_subqueries,
         &parse_result.visible_scope_chain,
     );
-    let ctes = parse_ctes(statement_tokens.as_ref());
+    let ctes = filter_visible_ctes(
+        &visible_cte_entries,
+        &parse_result.visible_cte_scope_chain,
+        clamped_cursor_token_len,
+    );
 
     let mut tables_in_scope = table_analysis.tables;
     for cte in &ctes {
-        let already = tables_in_scope
+        let existing_idx = tables_in_scope
             .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(&cte.name));
-        if !already {
+            .position(|t| t.name.eq_ignore_ascii_case(&cte.name) && t.is_cte);
+        if let Some(existing_idx) = existing_idx {
+            if tables_in_scope[existing_idx].depth <= cte.depth {
+                tables_in_scope[existing_idx] = ScopedTableRef {
+                    name: cte.name.clone(),
+                    alias: None,
+                    depth: cte.depth,
+                    is_cte: true,
+                };
+            }
+        } else {
             tables_in_scope.push(ScopedTableRef {
                 name: cte.name.clone(),
                 alias: None,
-                depth: 0,
+                depth: cte.depth,
                 is_cte: true,
             });
         }
@@ -502,24 +581,132 @@ fn is_create_table_target(tokens: &[SqlToken], idx: usize) -> bool {
 }
 
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
-    matches!(keyword, "FUNCTION" | "PROCEDURE")
+    sql_text::is_with_plsql_declaration_keyword(keyword)
+}
+
+fn with_starts_non_plsql_option(tokens: &[SqlToken], with_idx: usize) -> bool {
+    next_word_upper(tokens, with_idx + 1)
+        .is_some_and(|(keyword, _)| sql_text::is_with_non_plsql_clause_keyword(&keyword))
+}
+
+fn with_parenthesized_clause_looks_like_cte_column_list(
+    tokens: &[SqlToken],
+    range: TokenRange,
+) -> bool {
+    let body_tokens = token_range_slice(tokens, range);
+    let body_depths = paren_depths(body_tokens);
+
+    for (body_idx, token) in body_tokens.iter().enumerate() {
+        if !is_top_level_depth(&body_depths, body_idx) {
+            continue;
+        }
+
+        match token {
+            SqlToken::Comment(_) => {}
+            SqlToken::Symbol(sym) if sym == "," => {}
+            SqlToken::Word(word)
+                if is_identifier_word_token(word)
+                    && !sql_text::ORACLE_SQL_KEYWORDS_SET
+                        .contains(word.to_ascii_uppercase().as_str()) => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+fn with_starts_parenthesized_query_head_clause(tokens: &[SqlToken], with_idx: usize) -> bool {
+    let Some((_head_name, head_name_idx)) = next_word_upper(tokens, with_idx + 1) else {
+        return false;
+    };
+
+    let open_paren_idx = skip_comment_tokens(tokens, head_name_idx + 1);
+    if !matches!(tokens.get(open_paren_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        return false;
+    }
+
+    let Some((clause_range, after_clause_idx)) =
+        extract_parenthesized_range(tokens, open_paren_idx)
+    else {
+        return false;
+    };
+
+    if with_parenthesized_clause_looks_like_cte_column_list(tokens, clause_range) {
+        return false;
+    }
+
+    next_word_upper(tokens, after_clause_idx)
+        .is_some_and(|(keyword, _)| sql_text::is_with_main_query_keyword(&keyword))
+}
+
+fn with_starts_non_cte_query_head(tokens: &[SqlToken], with_idx: usize) -> bool {
+    next_word_upper(tokens, with_idx + 1)
+        .is_some_and(|(keyword, _)| sql_text::is_with_non_cte_query_head_keyword(&keyword))
+        || with_starts_parenthesized_query_head_clause(tokens, with_idx)
 }
 
 fn should_enter_with_clause(
+    tokens: &[SqlToken],
+    with_idx: usize,
     current_phase: SqlPhase,
+    current_statement_kind: StatementKind,
+    relation_state: Expectation,
     depth: usize,
     last_word: Option<&str>,
+    allows_leading_query_expression: bool,
 ) -> bool {
+    if with_starts_non_plsql_option(tokens, with_idx) {
+        return false;
+    }
+
+    if with_starts_non_cte_query_head(tokens, with_idx) {
+        return false;
+    }
+
     if matches!(current_phase, SqlPhase::Initial) {
         return true;
     }
+
+    // `WITH FUNCTION/PROCEDURE/...; WITH cte AS (...) SELECT ...` re-enters
+    // the main query head after declaration mode has already put the parser in
+    // WITH-clause waiting state.
+    if matches!(current_phase, SqlPhase::WithClause) && last_word.is_none() {
+        return true;
+    }
+
+    if matches!(current_phase, SqlPhase::IntoClause)
+        && !relation_state.is_expect_table()
+        && matches!(current_statement_kind, StatementKind::Insert)
+    {
+        return true;
+    }
+
     // Preserve hierarchical-query `START WITH` semantics.
     if matches!(last_word, Some(prev) if prev.eq_ignore_ascii_case("START")) {
         return false;
     }
     // Nested subqueries can inherit a non-Initial parent phase (e.g. WHERE),
     // but a leading WITH right after `(` still starts a query scope.
-    depth > 0 && last_word.is_none()
+    depth > 0 && last_word.is_none() && allows_leading_query_expression
+}
+
+fn is_statement_keyword_suppressed_in_expression_phase(phase: SqlPhase) -> bool {
+    matches!(
+        phase,
+        SqlPhase::SelectList
+            | SqlPhase::JoinCondition
+            | SqlPhase::WhereClause
+            | SqlPhase::GroupByClause
+            | SqlPhase::HavingClause
+            | SqlPhase::OrderByClause
+            | SqlPhase::ConnectByClause
+            | SqlPhase::StartWithClause
+            | SqlPhase::MatchRecognizeClause
+            | SqlPhase::ValuesClause
+            | SqlPhase::PivotClause
+            | SqlPhase::ModelClause
+            | SqlPhase::SetClause
+    )
 }
 
 fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize> {
@@ -715,6 +902,14 @@ fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
 struct ParsedTableEntry {
     table: ScopedTableRef,
     scope_id: usize,
+    token_start: usize,
+    origin: ParsedTableEntryOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedTableEntryOrigin {
+    Relation,
+    DerivedAlias,
 }
 
 #[derive(Debug, Clone)]
@@ -724,12 +919,42 @@ struct ParsedSubqueryEntry {
 }
 
 #[derive(Debug, Clone)]
+struct ParsedCteEntry {
+    cte: CteDefinition,
+    scope_id: usize,
+    visible_from_token: usize,
+    body_scope_id: usize,
+    self_visible_from_token: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCteHeader {
+    name: String,
+    depth: usize,
+    explicit_columns: Vec<String>,
+    explicit_column_range: Option<TokenRange>,
+    scope_id: usize,
+    visible_from_token: usize,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCteDefinition {
+    header: PendingCteHeader,
+    body_depth: usize,
+    body_start: usize,
+    body_scope_id: usize,
+}
+
+#[derive(Debug, Clone)]
 struct CursorScanResult {
     phase: SqlPhase,
     depth: usize,
     visible_scope_chain: Vec<usize>,
+    visible_cte_scope_chain: Vec<usize>,
     parsed_tables: Vec<ParsedTableEntry>,
     parsed_subqueries: Vec<ParsedSubqueryEntry>,
+    parsed_ctes: Vec<ParsedCteEntry>,
+    cursor_open_ctes: Vec<ParsedCteEntry>,
     focused_tables: Vec<String>,
     excluded_target_table: Option<String>,
 }
@@ -748,6 +973,111 @@ fn build_visible_scope_chain(
     }
     visible_scope_chain.reverse();
     visible_scope_chain
+}
+
+fn scope_is_within_subtree(
+    scope_id: usize,
+    ancestor_scope_id: usize,
+    scope_parent: &HashMap<usize, Option<usize>>,
+) -> bool {
+    let mut current_scope = Some(scope_id);
+    while let Some(active_scope) = current_scope {
+        if active_scope == ancestor_scope_id {
+            return true;
+        }
+        current_scope = scope_parent.get(&active_scope).copied().flatten();
+    }
+    false
+}
+
+fn skip_set_operator_suffix(tokens: &[SqlToken], start_idx: usize) -> usize {
+    let mut idx = skip_comment_tokens(tokens, start_idx);
+
+    loop {
+        let Some((keyword, keyword_idx)) = next_word_upper(tokens, idx) else {
+            return idx;
+        };
+
+        if matches!(keyword.as_str(), "ALL" | "DISTINCT") {
+            idx = skip_comment_tokens(tokens, keyword_idx + 1);
+            continue;
+        }
+
+        return idx;
+    }
+}
+
+fn find_top_level_set_operator_operands(tokens: &[SqlToken], range: TokenRange) -> Vec<TokenRange> {
+    let body_tokens = token_range_slice(tokens, range);
+    let body_depths = paren_depths(body_tokens);
+    let mut operands = Vec::new();
+    let mut operand_start = range.start;
+    let mut saw_set_operator = false;
+
+    for (local_idx, token) in body_tokens.iter().enumerate() {
+        if !is_top_level_depth(&body_depths, local_idx) {
+            continue;
+        }
+
+        let SqlToken::Word(word) = token else {
+            continue;
+        };
+        let upper = word.to_ascii_uppercase();
+        if matches!(upper.as_str(), "UNION" | "INTERSECT" | "EXCEPT" | "MINUS")
+            && !is_multiset_set_operator(body_tokens, local_idx)
+        {
+            let operator_idx = range.start + local_idx;
+            if operand_start < operator_idx {
+                operands.push(TokenRange {
+                    start: operand_start,
+                    end: operator_idx,
+                });
+            }
+            operand_start = skip_set_operator_suffix(tokens, operator_idx + 1).min(range.end);
+            saw_set_operator = true;
+        }
+    }
+
+    if saw_set_operator && operand_start < range.end {
+        operands.push(TokenRange {
+            start: operand_start,
+            end: range.end,
+        });
+    }
+
+    operands
+}
+
+fn update_cte_body_self_visibility(
+    parsed_ctes: &mut [ParsedCteEntry],
+    parsed_tables: &[ParsedTableEntry],
+    scope_parent: &HashMap<usize, Option<usize>>,
+    tokens: &[SqlToken],
+) {
+    for entry in parsed_ctes {
+        let operand_ranges = find_top_level_set_operator_operands(tokens, entry.cte.body_range);
+        if operand_ranges.len() < 2 {
+            entry.self_visible_from_token = None;
+            continue;
+        }
+
+        entry.self_visible_from_token = operand_ranges.iter().skip(1).find_map(|operand_range| {
+            parsed_tables
+                .iter()
+                .any(|table_entry| {
+                    table_entry.origin == ParsedTableEntryOrigin::Relation
+                        && table_entry.token_start >= operand_range.start
+                        && table_entry.token_start < operand_range.end
+                        && table_entry.table.name.eq_ignore_ascii_case(&entry.cte.name)
+                        && scope_is_within_subtree(
+                            table_entry.scope_id,
+                            entry.body_scope_id,
+                            scope_parent,
+                        )
+                })
+                .then_some(operand_range.start)
+        });
+    }
 }
 
 fn nearest_target_table(depth_frames: &[ParserDepthFrame], depth: usize) -> Option<String> {
@@ -817,7 +1147,15 @@ fn snapshot_cursor_state(
     depth_frames: &[ParserDepthFrame],
     scope_stack: &[usize],
     visible_parent: &HashMap<usize, Option<usize>>,
-) -> (SqlPhase, usize, Vec<usize>, Vec<String>, Option<String>) {
+    cte_visible_parent: &HashMap<usize, Option<usize>>,
+) -> (
+    SqlPhase,
+    usize,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<String>,
+    Option<String>,
+) {
     let phase = depth_frames
         .get(depth)
         .map(|frame| frame.phase)
@@ -849,6 +1187,7 @@ fn snapshot_cursor_state(
         phase,
         query_depth,
         build_visible_scope_chain(scope_stack, visible_parent),
+        build_visible_scope_chain(scope_stack, cte_visible_parent),
         focused_tables,
         excluded_target_table,
     )
@@ -858,6 +1197,8 @@ fn snapshot_cursor_state(
 struct ParserDepthFrame {
     phase: SqlPhase,
     is_query_scope: bool,
+    allows_leading_query_expression: bool,
+    with_plsql_state: WithPlsqlState,
     statement_kind: StatementKind,
     open_cursor_active: bool,
     current_target_table: Option<String>,
@@ -881,6 +1222,211 @@ fn reset_relation_lookbehind(
     relation_modifier_state.clear();
     expectation.clear();
     *last_word = None;
+}
+
+fn start_with_plsql_declaration(frame: &mut ParserDepthFrame, keyword: &str) {
+    frame.with_plsql_state = WithPlsqlState::Collecting {
+        active_body_frames: Vec::new(),
+        pending_routine_declaration: Some(WithPlsqlPendingDeclaration {
+            starts_body: sql_text::with_plsql_declaration_starts_routine_body(keyword),
+        }),
+        pending_end: false,
+    };
+}
+
+fn pop_with_plsql_body_frame(
+    active_body_frames: &mut Vec<WithPlsqlBodyFrame>,
+    expected_kind: Option<WithPlsqlBodyFrameKind>,
+) {
+    if let Some(expected_kind) = expected_kind {
+        if active_body_frames
+            .last()
+            .is_some_and(|frame| frame.kind == expected_kind)
+        {
+            let _ = active_body_frames.pop();
+            return;
+        }
+
+        if let Some(frame_idx) = active_body_frames
+            .iter()
+            .rposition(|frame| frame.kind == expected_kind)
+        {
+            active_body_frames.remove(frame_idx);
+            return;
+        }
+    }
+
+    let _ = active_body_frames.pop();
+}
+
+fn track_with_plsql_collecting_word(frame: &mut ParserDepthFrame, keyword: &str) {
+    let WithPlsqlState::Collecting {
+        active_body_frames,
+        pending_routine_declaration,
+        pending_end,
+    } = &mut frame.with_plsql_state
+    else {
+        return;
+    };
+
+    let mut consumed_end_qualifier = false;
+    if *pending_end {
+        match keyword {
+            "CASE" => {
+                pop_with_plsql_body_frame(active_body_frames, Some(WithPlsqlBodyFrameKind::Case));
+                consumed_end_qualifier = true;
+            }
+            "IF" => {
+                pop_with_plsql_body_frame(active_body_frames, Some(WithPlsqlBodyFrameKind::If));
+                consumed_end_qualifier = true;
+            }
+            "LOOP" => {
+                pop_with_plsql_body_frame(active_body_frames, Some(WithPlsqlBodyFrameKind::Loop));
+                consumed_end_qualifier = true;
+            }
+            _ => {
+                pop_with_plsql_body_frame(active_body_frames, None);
+            }
+        }
+        *pending_end = false;
+    }
+
+    if consumed_end_qualifier {
+        return;
+    }
+
+    if sql_text::is_with_plsql_declaration_keyword(keyword) {
+        *pending_routine_declaration = Some(WithPlsqlPendingDeclaration {
+            starts_body: sql_text::with_plsql_declaration_starts_routine_body(keyword),
+        });
+        return;
+    }
+
+    if matches!(keyword, "AS" | "IS")
+        && pending_routine_declaration.is_some_and(|declaration| declaration.starts_body)
+    {
+        active_body_frames.push(WithPlsqlBodyFrame::routine());
+        *pending_routine_declaration = None;
+        return;
+    }
+
+    match keyword {
+        "BEGIN" => {
+            if let Some(body_frame) = active_body_frames.last_mut() {
+                if body_frame.awaiting_begin {
+                    body_frame.awaiting_begin = false;
+                } else {
+                    active_body_frames
+                        .push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::Block));
+                }
+            }
+        }
+        "DECLARE" => {
+            if !active_body_frames.is_empty() {
+                // A nested anonymous block starts at DECLARE and is completed by
+                // the matching END after its BEGIN. Track it as a single frame
+                // that is still waiting for BEGIN instead of double-counting the
+                // DECLARE and BEGIN tokens as separate blocks.
+                active_body_frames.push(WithPlsqlBodyFrame::awaiting_begin(
+                    WithPlsqlBodyFrameKind::Block,
+                ));
+            }
+        }
+        "CASE" => {
+            if !active_body_frames.is_empty() {
+                active_body_frames.push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::Case));
+            }
+        }
+        "IF" => {
+            if !active_body_frames.is_empty() {
+                active_body_frames.push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::If));
+            }
+        }
+        "LOOP" => {
+            if !active_body_frames.is_empty() {
+                active_body_frames.push(WithPlsqlBodyFrame::nested(WithPlsqlBodyFrameKind::Loop));
+            }
+        }
+        "END" => {
+            if !active_body_frames.is_empty() {
+                *pending_end = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_with_plsql_separator(frame: &mut ParserDepthFrame) -> bool {
+    match &mut frame.with_plsql_state {
+        WithPlsqlState::None => false,
+        WithPlsqlState::AwaitingMainQuery => true,
+        WithPlsqlState::Collecting {
+            active_body_frames,
+            pending_routine_declaration,
+            pending_end,
+        } => {
+            if *pending_end {
+                pop_with_plsql_body_frame(active_body_frames, None);
+                *pending_end = false;
+            }
+            *pending_routine_declaration = None;
+
+            if active_body_frames.is_empty() {
+                frame.with_plsql_state = WithPlsqlState::AwaitingMainQuery;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn push_completed_cte(
+    parsed_ctes: &mut Vec<ParsedCteEntry>,
+    open_cte: OpenCteDefinition,
+    body_end: usize,
+) {
+    parsed_ctes.push(ParsedCteEntry {
+        scope_id: open_cte.header.scope_id,
+        visible_from_token: open_cte.header.visible_from_token,
+        body_scope_id: open_cte.body_scope_id,
+        self_visible_from_token: None,
+        cte: CteDefinition {
+            name: open_cte.header.name,
+            depth: open_cte.header.depth,
+            explicit_columns: open_cte.header.explicit_columns,
+            explicit_column_range: open_cte.header.explicit_column_range,
+            body_range: TokenRange {
+                start: open_cte.body_start,
+                end: body_end.max(open_cte.body_start),
+            },
+        },
+    });
+}
+
+fn snapshot_open_ctes(
+    open_cte_stack: &[OpenCteDefinition],
+    body_end: usize,
+) -> Vec<ParsedCteEntry> {
+    open_cte_stack
+        .iter()
+        .map(|open_cte| ParsedCteEntry {
+            scope_id: open_cte.header.scope_id,
+            visible_from_token: open_cte.header.visible_from_token,
+            body_scope_id: open_cte.body_scope_id,
+            self_visible_from_token: None,
+            cte: CteDefinition {
+                name: open_cte.header.name.clone(),
+                depth: open_cte.header.depth,
+                explicit_columns: open_cte.header.explicit_columns.clone(),
+                explicit_column_range: open_cte.header.explicit_column_range,
+                body_range: TokenRange {
+                    start: open_cte.body_start,
+                    end: body_end.max(open_cte.body_start),
+                },
+            },
+        })
+        .collect()
 }
 
 fn close_parenthesis_scope(
@@ -977,16 +1523,21 @@ fn push_recent_relation_table(frame: &mut ParserDepthFrame, table_name: &str) {
 fn begin_set_operator_operand_scope(
     scope_stack: &mut [usize],
     next_scope_id: &mut usize,
+    scope_parent: &mut HashMap<usize, Option<usize>>,
     visible_parent: &mut HashMap<usize, Option<usize>>,
+    cte_visible_parent: &mut HashMap<usize, Option<usize>>,
 ) {
     let Some(current_scope) = scope_stack.last_mut() else {
         return;
     };
 
+    let cte_parent_scope = *current_scope;
     let parent_scope = visible_parent.get(current_scope).copied().unwrap_or(None);
     let operand_scope = *next_scope_id;
     *next_scope_id = next_scope_id.saturating_add(1);
+    scope_parent.insert(operand_scope, Some(cte_parent_scope));
     visible_parent.insert(operand_scope, parent_scope);
+    cte_visible_parent.insert(operand_scope, Some(cte_parent_scope));
     *current_scope = operand_scope;
 }
 
@@ -1185,6 +1736,8 @@ impl Default for ParserDepthFrame {
         Self {
             phase: SqlPhase::Initial,
             is_query_scope: false,
+            allows_leading_query_expression: false,
+            with_plsql_state: WithPlsqlState::None,
             statement_kind: StatementKind::Unknown,
             open_cursor_active: false,
             current_target_table: None,
@@ -1215,18 +1768,32 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut relation_state = Expectation::None;
     let mut all_tables: Vec<ParsedTableEntry> = Vec::new();
     let mut all_subqueries: Vec<ParsedSubqueryEntry> = Vec::new();
+    let mut all_ctes: Vec<ParsedCteEntry> = Vec::new();
     let mut subquery_tracks: Vec<(usize, usize)> = Vec::new(); // (depth, start_idx)
 
     let mut next_scope_id = 1usize;
     let mut scope_stack = vec![0usize];
+    let mut scope_parent: HashMap<usize, Option<usize>> = HashMap::new();
+    scope_parent.insert(0, None);
     let mut visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
     visible_parent.insert(0, None);
+    let mut cte_visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
+    cte_visible_parent.insert(0, None);
 
     let mut relation_modifier_state = RelationModifierState::None;
     let mut cte_state = CteState::Inactive;
+    let mut pending_cte_header: Option<PendingCteHeader> = None;
+    let mut open_cte_stack: Vec<OpenCteDefinition> = Vec::new();
+    let mut cursor_open_ctes: Vec<ParsedCteEntry> = Vec::new();
 
-    let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>, Vec<String>, Option<String>)> =
-        None;
+    let mut cursor_snapshot: Option<(
+        SqlPhase,
+        usize,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<String>,
+        Option<String>,
+    )> = None;
     let mut idx = 0;
 
     let mark_query_scope =
@@ -1252,7 +1819,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 &depth_frames,
                 &scope_stack,
                 &visible_parent,
+                &cte_visible_parent,
             ));
+            cursor_open_ctes = snapshot_open_ctes(&open_cte_stack, idx);
         }
 
         let token = &tokens[idx];
@@ -1286,6 +1855,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .map(|frame| frame.postgres_conflict_update_active)
                     .unwrap_or(false);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
+                let entering_cte_column_list = matches!(cte_state, CteState::AfterName);
+                let entering_cte_body = matches!(cte_state, CteState::ExpectBody);
                 parser_state.push_open_paren('(');
                 depth = parser_state.paren_depth();
 
@@ -1311,6 +1882,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if let Some(frame) = depth_frames.get_mut(depth) {
                     frame.phase = inherited_phase;
                     frame.is_query_scope = false;
+                    frame.allows_leading_query_expression =
+                        is_query_expression_start(tokens, idx + 1);
                     frame.statement_kind = parent_statement_kind;
                     frame.open_cursor_active = false;
                     frame.current_target_table = parent_target_table;
@@ -1332,12 +1905,35 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
                 scope_stack.push(scope_id);
+                scope_parent.insert(scope_id, Some(parent_scope_id));
+
+                if entering_cte_column_list {
+                    if let Some(header) = pending_cte_header.as_mut() {
+                        if let Some((expr_range, _)) = extract_parenthesized_range(tokens, idx) {
+                            header.explicit_column_range = Some(expr_range);
+                            header.explicit_columns =
+                                extract_cte_explicit_columns(tokens, expr_range);
+                        }
+                    }
+                }
+                if entering_cte_body {
+                    if let Some(header) = pending_cte_header.take() {
+                        open_cte_stack.push(OpenCteDefinition {
+                            header,
+                            body_depth: depth,
+                            body_start: idx.saturating_add(1),
+                            body_scope_id: scope_id,
+                        });
+                    }
+                }
 
                 let is_from_lateral_function = depth_frames
                     .get(depth)
                     .and_then(|frame| frame.paren_func.as_deref())
                     .is_some_and(is_implicitly_lateral_table_function);
-                let inherited_visible_parent = if matches!(parent_phase, SqlPhase::FromClause)
+                let inherited_visible_parent = if entering_cte_body {
+                    None
+                } else if matches!(parent_phase, SqlPhase::FromClause)
                     && !relation_modifier_state.blocks_outer_scope_cutoff()
                     && !is_from_lateral_function
                 {
@@ -1346,6 +1942,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     Some(parent_scope_id)
                 };
                 visible_parent.insert(scope_id, inherited_visible_parent);
+                // Row-source scope cutoffs should not hide statement-level WITH bindings.
+                cte_visible_parent.insert(scope_id, Some(parent_scope_id));
 
                 relation_modifier_state.clear();
                 relation_state.clear();
@@ -1361,6 +1959,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 continue;
             }
             SqlToken::Symbol(sym) if sym == ")" => {
+                while open_cte_stack
+                    .last()
+                    .is_some_and(|open_cte| open_cte.body_depth > depth)
+                {
+                    if let Some(open_cte) = open_cte_stack.pop() {
+                        push_completed_cte(&mut all_ctes, open_cte, idx);
+                    }
+                }
+                if open_cte_stack
+                    .last()
+                    .is_some_and(|open_cte| open_cte.body_depth == depth)
+                {
+                    if let Some(open_cte) = open_cte_stack.pop() {
+                        push_completed_cte(&mut all_ctes, open_cte, idx);
+                    }
+                }
                 cte_state = cte_state.close_parenthesis(depth);
 
                 while subquery_tracks.last().is_some_and(|track| track.0 > depth) {
@@ -1381,12 +1995,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             start: start_idx,
                             end: idx,
                         };
-                        if let Some((alias, next_idx)) = parse_subquery_alias(tokens, idx + 1) {
+                        if let Some((alias, next_idx, body_end)) =
+                            parse_subquery_alias(tokens, idx + 1)
+                        {
                             let relation_name_for_tracking = alias.clone();
                             all_subqueries.push(ParsedSubqueryEntry {
                                 subquery: SubqueryDefinition {
                                     alias: alias.clone(),
-                                    body_range,
+                                    body_range: TokenRange {
+                                        start: body_range.start,
+                                        end: body_end.max(body_range.end),
+                                    },
                                     depth: depth.saturating_sub(1),
                                 },
                                 scope_id: parent_scope_id,
@@ -1399,6 +2018,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     is_cte: false,
                                 },
                                 scope_id: parent_scope_id,
+                                token_start: start_idx,
+                                origin: ParsedTableEntryOrigin::DerivedAlias,
                             });
                             idx = next_idx;
                             close_parenthesis_scope(
@@ -1442,6 +2063,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 is_cte: false,
                             },
                             scope_id: parent_scope_id,
+                            token_start: start_idx,
+                            origin: ParsedTableEntryOrigin::DerivedAlias,
                         });
                         if depth_frames
                             .get(depth.saturating_sub(1))
@@ -1525,6 +2148,32 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 continue;
             }
             SqlToken::Symbol(sym) if sym == ";" => {
+                if handle_with_plsql_separator(&mut depth_frames[depth]) {
+                    depth_frames[depth].phase = SqlPhase::WithClause;
+                    depth_frames[depth].current_cte_name = None;
+                    relation_state.clear();
+                    last_word = None;
+                    cte_state = CteState::ExpectName;
+                    pending_cte_header = None;
+                    idx += 1;
+                    continue;
+                }
+
+                if matches!(
+                    depth_frames
+                        .get(depth)
+                        .map(|frame| frame.with_plsql_state.clone()),
+                    Some(WithPlsqlState::Collecting { .. })
+                ) {
+                    depth_frames[depth].phase = SqlPhase::Initial;
+                    depth_frames[depth].current_cte_name = None;
+                    relation_state.clear();
+                    last_word = None;
+                    pending_cte_header = None;
+                    idx += 1;
+                    continue;
+                }
+
                 let has_following_statement = tokens[idx + 1..]
                     .iter()
                     .any(|t| !matches!(t, SqlToken::Comment(_)));
@@ -1534,7 +2183,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 all_tables.clear();
                 all_subqueries.clear();
+                all_ctes.clear();
                 subquery_tracks.clear();
+                pending_cte_header = None;
+                open_cte_stack.clear();
 
                 query_depth = 0;
                 depth_frames = vec![ParserDepthFrame::default()];
@@ -1546,8 +2198,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 next_scope_id = 1;
                 scope_stack = vec![0usize];
+                scope_parent.clear();
+                scope_parent.insert(0, None);
                 visible_parent.clear();
                 visible_parent.insert(0, None);
+                cte_visible_parent.clear();
+                cte_visible_parent.insert(0, None);
                 relation_modifier_state.clear();
 
                 idx += 1;
@@ -1556,25 +2212,82 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             SqlToken::Word(word) => {
                 let upper = word.to_ascii_uppercase();
 
-                // CTE state machine
-                match cte_state {
-                    CteState::ExpectName if upper != "RECURSIVE" => {
-                        if is_with_plsql_declaration_keyword(upper.as_str()) {
-                            cte_state = CteState::Inactive;
-                        } else {
-                            cte_state = CteState::AfterName;
-                            if let Some(frame) = depth_frames.get_mut(depth) {
-                                frame.current_cte_name = Some(word.clone());
-                            }
+                match depth_frames
+                    .get(depth)
+                    .map(|frame| frame.with_plsql_state.clone())
+                    .unwrap_or(WithPlsqlState::None)
+                {
+                    WithPlsqlState::Collecting { .. } => {
+                        if let Some(frame) = depth_frames.get_mut(depth) {
+                            track_with_plsql_collecting_word(frame, upper.as_str());
                         }
                         idx += 1;
                         continue;
+                    }
+                    WithPlsqlState::AwaitingMainQuery => {
+                        if sql_text::is_with_plsql_declaration_keyword(&upper) {
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                start_with_plsql_declaration(frame, upper.as_str());
+                                frame.current_cte_name = None;
+                            }
+                            pending_cte_header = None;
+                            cte_state = CteState::Inactive;
+                            idx += 1;
+                            continue;
+                        }
+
+                        if let Some(frame) = depth_frames.get_mut(depth) {
+                            frame.with_plsql_state = WithPlsqlState::None;
+                        }
+                    }
+                    WithPlsqlState::None => {}
+                }
+
+                // CTE state machine
+                match cte_state {
+                    CteState::ExpectName if upper != "RECURSIVE" => {
+                        if sql_text::is_with_main_query_keyword(&upper) {
+                            cte_state = CteState::Inactive;
+                            pending_cte_header = None;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.current_cte_name = None;
+                            }
+                            // Process the main-query keyword normally below.
+                        } else if is_with_plsql_declaration_keyword(upper.as_str()) {
+                            cte_state = CteState::Inactive;
+                            pending_cte_header = None;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                start_with_plsql_declaration(frame, upper.as_str());
+                                frame.current_cte_name = None;
+                            }
+                            idx += 1;
+                            continue;
+                        } else {
+                            cte_state = CteState::AfterName;
+                            pending_cte_header = Some(PendingCteHeader {
+                                name: word.clone(),
+                                depth: query_depth,
+                                explicit_columns: Vec::new(),
+                                explicit_column_range: None,
+                                scope_id: *scope_stack.last().unwrap_or(&0),
+                                visible_from_token: idx.saturating_add(1),
+                            });
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.current_cte_name = Some(word.clone());
+                            }
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.with_plsql_state = WithPlsqlState::None;
+                            }
+                            idx += 1;
+                            continue;
+                        }
                     }
                     CteState::AfterName => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::Inactive;
+                            pending_cte_header = None;
                             if let Some(frame) = depth_frames.get_mut(depth) {
                                 frame.current_cte_name = None;
                             }
@@ -1588,6 +2301,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::Inactive;
+                            pending_cte_header = None;
                             if let Some(frame) = depth_frames.get_mut(depth) {
                                 frame.current_cte_name = None;
                             }
@@ -1709,13 +2423,56 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].postgres_conflict_update_active = false;
                         relation_state.clear();
                     }
+                    "WITH" if with_starts_non_cte_query_head(tokens, idx) => {
+                        // Some dialects use query-head `WITH` clauses that are not
+                        // subquery-factoring clauses, such as SQL Server
+                        // `WITH XMLNAMESPACES (...) SELECT ...`. These still start a
+                        // query scope for nested-depth tracking, but they must not
+                        // switch completion into CTE column-list semantics.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].current_cte_name = None;
+                        depth_frames[depth].postgres_conflict_update_active = false;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        pending_cte_header = None;
+                        cte_state = CteState::Inactive;
+                        relation_state.clear();
+                    }
+                    "WITH" if with_starts_non_plsql_option(tokens, idx) => {
+                        // Query-tail `WITH ...` options (`WITH READ ONLY`,
+                        // `WITH [CASCADED|LOCAL] CHECK OPTION`, `FETCH ... WITH TIES`,
+                        // `WITH NO DATA`, `WITH GRANT OPTION`, etc.) are not
+                        // subquery-factoring clauses. Treat them as a post-query
+                        // boundary so completion does not keep stale table/column
+                        // scope from the preceding SELECT/FETCH clause.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].current_cte_name = None;
+                        depth_frames[depth].locking_clause_active = false;
+                        depth_frames[depth].hierarchical_clause_active = false;
+                        relation_state.clear();
+                    }
                     "WITH"
-                        if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
+                        if should_enter_with_clause(
+                            tokens,
+                            idx,
+                            current_phase,
+                            depth_frames
+                                .get(depth)
+                                .map(|frame| frame.statement_kind)
+                                .unwrap_or(StatementKind::Unknown),
+                            relation_state,
+                            depth,
+                            last_word.as_deref(),
+                            depth_frames
+                                .get(depth)
+                                .map(|frame| frame.allows_leading_query_expression)
+                                .unwrap_or(false),
+                        ) =>
                     {
                         depth_frames[depth].phase = SqlPhase::WithClause;
                         depth_frames[depth].current_cte_name = None;
                         depth_frames[depth].postgres_conflict_update_active = false;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        pending_cte_header = None;
                         cte_state = CteState::ExpectName;
                         relation_state.clear();
                     }
@@ -1735,6 +2492,46 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].statement_kind = StatementKind::Unknown;
                         }
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].postgres_conflict_update_active = false;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        relation_state.clear();
+                    }
+                    "CALL" => {
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            depth_frames[depth].current_target_table = None;
+                            depth_frames[depth].dml_set_active = false;
+                            depth_frames[depth].returning_clause_active = false;
+                            depth_frames[depth].locking_clause_active = false;
+                            depth_frames[depth].hierarchical_clause_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.clear();
+                        }
+                    }
+                    "TABLE"
+                        if !relation_state.is_expect_table()
+                            && matches!(
+                                current_phase,
+                                SqlPhase::Initial | SqlPhase::WithClause
+                            )
+                            && last_word.is_none() =>
+                    {
+                        // Standalone query-head TABLE expressions (including
+                        // Oracle `WITH TYPE ...; TABLE (...)`) should reset the
+                        // declaration/CTE phase before parsing the row source body.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        depth_frames[depth].current_target_table = None;
+                        depth_frames[depth].dml_set_active = false;
+                        depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].locking_clause_active = false;
+                        depth_frames[depth].hierarchical_clause_active = false;
                         depth_frames[depth].postgres_conflict_update_active = false;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
@@ -2061,6 +2858,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let hierarchical_clause_active = depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.hierarchical_clause_active);
+                        let postgres_conflict_update_active = depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.postgres_conflict_update_active);
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
                         if hierarchical_clause_active {
                             // Oracle hierarchical query SEARCH/CYCLE clauses use
                             // `... SET <ordering_or_cycle_col>` where SET is not
@@ -2077,11 +2881,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::RecursiveCteGeneratedColumnName;
                             depth_frames[depth].dml_set_active = false;
                             depth_frames[depth].postgres_conflict_update_active = false;
+                        } else if is_statement_keyword_suppressed_in_expression_phase(current_phase)
+                            && !postgres_conflict_update_active
+                            && !(matches!(current_statement_kind, StatementKind::Merge)
+                                && matches!(last_word.as_deref(), Some("UPDATE")))
+                        {
+                            // Function-local operation keywords such as JSON_TRANSFORM `SET`
+                            // can appear inside expression contexts. Keep the surrounding
+                            // expression phase unless the token is the actual MERGE
+                            // `... UPDATE SET ...` introducer.
+                            relation_state.clear();
                         } else {
-                            let current_statement_kind = depth_frames
-                                .get(depth)
-                                .map(|frame| frame.statement_kind)
-                                .unwrap_or(StatementKind::Unknown);
                             if matches!(
                                 current_statement_kind,
                                 StatementKind::Insert
@@ -2353,7 +3163,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             begin_set_operator_operand_scope(
                                 &mut scope_stack,
                                 &mut next_scope_id,
+                                &mut scope_parent,
                                 &mut visible_parent,
+                                &mut cte_visible_parent,
                             );
                         }
                     }
@@ -2417,37 +3229,43 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                         end: relation_output_end,
                                     })
                                 });
-                                let relation_arg_tokens =
-                                    relation_body_range.map(|range| token_range_slice(tokens, range));
-                                let (alias, after_alias) =
+                                let relation_arg_tokens = relation_body_range
+                                    .map(|range| token_range_slice(tokens, range));
+                                let (direct_alias, direct_after_alias) =
                                     parse_alias_deep(tokens, relation_arg_end);
-                                let alias = alias.or_else(|| {
-                                    parse_alias_after_derived_relation_clauses(
-                                        tokens,
-                                        relation_arg_end,
-                                    )
-                                });
+                                let derived_alias = parse_alias_after_derived_relation_clauses(
+                                    tokens,
+                                    relation_arg_end,
+                                );
+                                let (alias, after_alias) =
+                                    if let Some((alias, next_idx, _)) = derived_alias.as_ref() {
+                                        (Some(alias.clone()), *next_idx)
+                                    } else {
+                                        (direct_alias, direct_after_alias)
+                                    };
                                 let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
-                                let uses_virtual_alias_scope = relation_arg_tokens
-                                    .is_some_and(|body_tokens| {
-                                        relation_uses_virtual_alias_scope(
-                                            &table_name,
-                                            body_tokens,
-                                        )
+                                let uses_virtual_alias_scope =
+                                    relation_arg_tokens.is_some_and(|body_tokens| {
+                                        relation_uses_virtual_alias_scope(&table_name, body_tokens)
                                     });
+                                let virtual_relation_body_range = derived_alias
+                                    .as_ref()
+                                    .map(|(_, _, body_end)| TokenRange {
+                                        start: idx,
+                                        end: *body_end,
+                                    })
+                                    .or(relation_body_range);
                                 let table_scope_name = if uses_virtual_alias_scope {
                                     alias.clone().unwrap_or_else(|| table_name.clone())
                                 } else {
                                     table_name.clone()
                                 };
                                 let relation_tracking_name = table_scope_name.clone();
-                                if let (Some(alias_name), Some(body_range), Some(body_tokens)) = (
-                                    alias.as_ref(),
-                                    relation_body_range,
-                                    relation_arg_tokens,
-                                ) {
-                                    if relation_uses_virtual_alias_scope(&table_name, body_tokens) {
+                                if let (Some(alias_name), Some(body_range)) =
+                                    (alias.as_ref(), virtual_relation_body_range)
+                                {
+                                    if uses_virtual_alias_scope || derived_alias.is_some() {
                                         all_subqueries.push(ParsedSubqueryEntry {
                                             subquery: SubqueryDefinition {
                                                 alias: alias_name.clone(),
@@ -2466,6 +3284,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                         is_cte: false,
                                     },
                                     scope_id,
+                                    token_start: idx,
+                                    origin: ParsedTableEntryOrigin::Relation,
                                 });
                                 if matches!(current_phase, SqlPhase::FromClause) {
                                     push_recent_relation_table(
@@ -2522,22 +3342,40 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             &depth_frames,
             &scope_stack,
             &visible_parent,
+            &cte_visible_parent,
         ));
+        cursor_open_ctes = snapshot_open_ctes(&open_cte_stack, cursor_token_len.min(tokens.len()));
     }
+    while let Some(open_cte) = open_cte_stack.pop() {
+        push_completed_cte(&mut all_ctes, open_cte, tokens.len());
+    }
+    update_cte_body_self_visibility(&mut all_ctes, &all_tables, &scope_parent, tokens);
+    update_cte_body_self_visibility(&mut cursor_open_ctes, &all_tables, &scope_parent, tokens);
     let (
         phase,
         cursor_query_depth,
         cursor_visible_scope_chain,
+        cursor_visible_cte_scope_chain,
         focused_tables,
         excluded_target_table,
-    ) = cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize], Vec::new(), None));
+    ) = cursor_snapshot.unwrap_or((
+        SqlPhase::Initial,
+        0usize,
+        vec![0usize],
+        vec![0usize],
+        Vec::new(),
+        None,
+    ));
 
     CursorScanResult {
         phase,
         depth: cursor_query_depth,
         visible_scope_chain: cursor_visible_scope_chain,
+        visible_cte_scope_chain: cursor_visible_cte_scope_chain,
         parsed_tables: all_tables,
         parsed_subqueries: all_subqueries,
+        parsed_ctes: all_ctes,
+        cursor_open_ctes,
         focused_tables,
         excluded_target_table,
     }
@@ -2589,6 +3427,54 @@ fn filter_scope_entries(
     TableAnalysis { tables, subqueries }
 }
 
+fn is_cursor_inside_cte_body(entry: &ParsedCteEntry, cursor_token_len: usize) -> bool {
+    cursor_token_len >= entry.cte.body_range.start && cursor_token_len < entry.cte.body_range.end
+}
+
+fn is_cursor_inside_cte_self_visible_region(
+    entry: &ParsedCteEntry,
+    cursor_token_len: usize,
+) -> bool {
+    entry
+        .self_visible_from_token
+        .is_some_and(|visible_from| cursor_token_len >= visible_from)
+}
+
+fn should_prefer_cte_entry(candidate: &ParsedCteEntry, existing: &ParsedCteEntry) -> bool {
+    candidate.self_visible_from_token.is_some() && existing.self_visible_from_token.is_none()
+        || candidate.cte.body_range.end > existing.cte.body_range.end
+}
+
+fn filter_visible_ctes(
+    parsed_ctes: &[ParsedCteEntry],
+    visible_scope_chain: &[usize],
+    cursor_token_len: usize,
+) -> Vec<CteDefinition> {
+    let visible_scope_ids: HashSet<usize> = visible_scope_chain.iter().copied().collect();
+    let mut visible_entries: Vec<ParsedCteEntry> = Vec::new();
+
+    for entry in parsed_ctes.iter().filter(|entry| {
+        visible_scope_ids.contains(&entry.scope_id)
+            && entry.visible_from_token <= cursor_token_len
+            && (!is_cursor_inside_cte_body(entry, cursor_token_len)
+                || is_cursor_inside_cte_self_visible_region(entry, cursor_token_len))
+    }) {
+        if let Some(existing) = visible_entries.iter_mut().find(|visible_entry| {
+            visible_entry.scope_id == entry.scope_id
+                && visible_entry.body_scope_id == entry.body_scope_id
+                && visible_entry.cte.name.eq_ignore_ascii_case(&entry.cte.name)
+        }) {
+            if should_prefer_cte_entry(entry, existing) {
+                *existing = entry.clone();
+            }
+            continue;
+        }
+        visible_entries.push(entry.clone());
+    }
+
+    visible_entries.into_iter().map(|entry| entry.cte).collect()
+}
+
 pub(crate) fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
     let start = range.start.min(tokens.len());
     let end = range.end.min(tokens.len());
@@ -2597,6 +3483,23 @@ pub(crate) fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[Sql
     } else {
         &tokens[start..end]
     }
+}
+
+fn extract_cte_explicit_columns(tokens: &[SqlToken], range: TokenRange) -> Vec<String> {
+    let expr_tokens = token_range_slice(tokens, range);
+    let expr_depths = paren_depths(expr_tokens);
+    let mut explicit_columns = Vec::new();
+
+    for (expr_idx, token) in expr_tokens.iter().enumerate() {
+        if !is_top_level_depth(&expr_depths, expr_idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            explicit_columns.push(word.clone());
+        }
+    }
+
+    explicit_columns
 }
 
 fn extract_parenthesized_range(
@@ -2640,6 +3543,7 @@ fn extract_parenthesized_range(
 }
 
 /// Parse CTE definitions from WITH clause.
+#[cfg(test)]
 fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
     let mut ctes = Vec::new();
     let mut idx = 0;
@@ -2717,17 +3621,8 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             if s == "(" {
                 if let Some((expr_range, next_idx)) = extract_parenthesized_range(tokens, idx) {
                     explicit_column_range = Some(expr_range);
-                    let expr_tokens = token_range_slice(tokens, expr_range);
-                    let expr_depths = paren_depths(expr_tokens);
+                    explicit_columns = extract_cte_explicit_columns(tokens, expr_range);
                     idx = next_idx;
-                    for (expr_idx, token) in expr_tokens.iter().enumerate() {
-                        if !is_top_level_depth(&expr_depths, expr_idx) {
-                            continue;
-                        }
-                        if let SqlToken::Word(w) = token {
-                            explicit_columns.push(w.clone());
-                        }
-                    }
                 }
             }
         }
@@ -2769,6 +3664,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 
         ctes.push(CteDefinition {
             name: cte_name,
+            depth: 0,
             explicit_columns,
             explicit_column_range,
             body_range,
@@ -3199,14 +4095,18 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
     parse_relation_alias_at(tokens, start, true)
 }
 
-fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
+fn parse_alias_after_derived_relation_clauses(
+    tokens: &[SqlToken],
+    start: usize,
+) -> Option<(String, usize, usize)> {
     let relation_postfix_end = skip_relation_postfix_clauses(tokens, start);
     let derived_end = skip_derived_relation_postfix_clauses(tokens, relation_postfix_end);
     if derived_end == relation_postfix_end {
         return None;
     }
     let alias_start = skip_relation_postfix_clauses(tokens, derived_end);
-    parse_relation_alias_at(tokens, alias_start, true).0
+    let (alias, next_idx) = parse_relation_alias_at(tokens, alias_start, true);
+    alias.map(|name| (name, next_idx, derived_end))
 }
 
 fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
@@ -3741,8 +4641,9 @@ fn skip_model_clause(tokens: &[SqlToken], start: usize) -> usize {
     idx
 }
 
-/// Parse an alias after a subquery closing ')'.
-fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
+/// Parse an alias after a subquery closing ')' and capture any trailing derived
+/// relation clauses that remain part of the virtual row source.
+fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize, usize)> {
     let mut idx = start;
     // Skip comments and stray closing parens to recover from malformed SQL like:
     // `FROM (SELECT ...) ) alias`
@@ -3762,9 +4663,10 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
     }
 
     idx = skip_relation_postfix_clauses(tokens, idx);
-    idx = skip_derived_relation_postfix_clauses(tokens, idx);
-    let (alias, next_idx) = parse_relation_alias_at(tokens, idx, true);
-    alias.map(|name| (name, next_idx))
+    let body_end = skip_derived_relation_postfix_clauses(tokens, idx);
+    let alias_start = skip_relation_postfix_clauses(tokens, body_end);
+    let (alias, next_idx) = parse_relation_alias_at(tokens, alias_start, true);
+    alias.map(|name| (name, next_idx, body_end))
 }
 
 fn is_join_keyword(word: &str) -> bool {
@@ -3953,10 +4855,19 @@ pub fn resolve_qualifier_tables(
 
 /// Resolve all table names from scope (for unqualified column suggestions).
 pub fn resolve_all_scope_tables(tables_in_scope: &[ScopedTableRef]) -> Vec<String> {
+    let mut ordered_tables: Vec<(usize, &ScopedTableRef)> =
+        tables_in_scope.iter().enumerate().collect();
+    ordered_tables.sort_by(|(left_idx, left), (right_idx, right)| {
+        right
+            .depth
+            .cmp(&left.depth)
+            .then_with(|| left_idx.cmp(right_idx))
+    });
+
     let mut result = Vec::new();
     let mut seen = HashSet::new();
 
-    for table_ref in tables_in_scope {
+    for (_, table_ref) in ordered_tables {
         let upper = table_ref.name.to_ascii_uppercase();
         if seen.insert(upper) {
             result.push(table_ref.name.clone());
@@ -4118,6 +5029,47 @@ pub(crate) fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec
         return Vec::new();
     };
     model_info.measure_columns
+}
+
+/// Extract recursive CTE-generated columns introduced by trailing SEARCH/CYCLE
+/// clauses after the CTE body.
+pub(crate) fn extract_recursive_cte_generated_columns(
+    tokens: &[SqlToken],
+    cte_body_end: usize,
+) -> Vec<String> {
+    let mut idx = skip_comment_tokens(tokens, cte_body_end.saturating_add(1));
+    let mut columns = Vec::new();
+
+    loop {
+        let Some((keyword, keyword_idx)) = next_word_upper(tokens, idx) else {
+            break;
+        };
+
+        match keyword.as_str() {
+            "SEARCH" => {
+                let Some((column, next_idx)) =
+                    parse_recursive_cte_search_generated_column(tokens, keyword_idx)
+                else {
+                    break;
+                };
+                columns.push(column);
+                idx = next_idx;
+            }
+            "CYCLE" => {
+                let Some((column, next_idx)) =
+                    parse_recursive_cte_cycle_generated_column(tokens, keyword_idx)
+                else {
+                    break;
+                };
+                columns.push(column);
+                idx = next_idx;
+            }
+            _ => break,
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
 }
 
 /// Extract MATCH_RECOGNIZE-generated columns from a query token stream.
@@ -4286,6 +5238,74 @@ pub(crate) fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> 
 
     dedup_columns_case_insensitive(&mut variables);
     variables
+}
+
+fn parse_recursive_cte_search_generated_column(
+    tokens: &[SqlToken],
+    search_idx: usize,
+) -> Option<(String, usize)> {
+    let (mode, mode_idx) = next_word_upper(tokens, search_idx.saturating_add(1))?;
+    if !matches!(mode.as_str(), "DEPTH" | "BREADTH") {
+        return None;
+    }
+
+    let (first, first_idx) = next_word_upper(tokens, mode_idx.saturating_add(1))?;
+    if first != "FIRST" {
+        return None;
+    }
+
+    let (by, by_idx) = next_word_upper(tokens, first_idx.saturating_add(1))?;
+    if by != "BY" {
+        return None;
+    }
+
+    find_recursive_cte_generated_column_after_set(tokens, by_idx.saturating_add(1))
+}
+
+fn parse_recursive_cte_cycle_generated_column(
+    tokens: &[SqlToken],
+    cycle_idx: usize,
+) -> Option<(String, usize)> {
+    find_recursive_cte_generated_column_after_set(tokens, cycle_idx.saturating_add(1))
+}
+
+fn find_recursive_cte_generated_column_after_set(
+    tokens: &[SqlToken],
+    start_idx: usize,
+) -> Option<(String, usize)> {
+    let mut idx = skip_comment_tokens(tokens, start_idx);
+
+    while idx < tokens.len() {
+        match tokens.get(idx) {
+            Some(SqlToken::Comment(_)) => {
+                idx += 1;
+            }
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SET") => {
+                let column_idx = next_non_comment_index(tokens, idx.saturating_add(1));
+                let SqlToken::Word(column_name) = tokens.get(column_idx)? else {
+                    return None;
+                };
+                if !is_identifier_word_token(column_name) {
+                    return None;
+                }
+                return Some((
+                    strip_identifier_quotes(column_name),
+                    skip_comment_tokens(tokens, column_idx.saturating_add(1)),
+                ));
+            }
+            Some(SqlToken::Word(word))
+                if sql_text::is_with_main_query_keyword(&word.to_ascii_uppercase()) =>
+            {
+                return None;
+            }
+            Some(_) => {
+                idx += 1;
+            }
+            None => break,
+        }
+    }
+
+    None
 }
 
 fn extract_match_recognize_clause_tokens(tokens: &[SqlToken]) -> Option<&[SqlToken]> {

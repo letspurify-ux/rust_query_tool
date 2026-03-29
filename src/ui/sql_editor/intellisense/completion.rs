@@ -547,42 +547,22 @@ impl SqlEditorWidget {
                         body_virtual_table_columns.insert(cte.name.clone(), nested_columns);
                     }
                 }
-                let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
-                let body_tables_in_scope =
-                    body_ctx.tables_in_scope.clone();
-                if columns.is_empty() {
-                    columns = intellisense_context::extract_table_function_columns(body_tokens);
-                }
-                if columns.is_empty() {
-                    columns = Self::infer_columns_from_partial_select_qualifiers(
+                let body_local_tables =
+                    intellisense_context::collect_tables_in_statement(body_tokens);
+                let (columns, wildcard_tables) =
+                    Self::collect_virtual_relation_columns_for_completion(
                         body_tokens,
-                        &body_tables_in_scope,
+                        &body_local_tables,
                         &deep_ctx.tables_in_scope,
                         &body_virtual_table_columns,
                         intellisense_data,
                         column_sender,
                         connection,
                     );
-                }
-                let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
-                    body_tokens,
-                    &body_tables_in_scope,
-                    &body_virtual_table_columns,
-                    intellisense_data,
-                    column_sender,
-                    connection,
-                );
                 if !wildcard_tables.is_empty() {
                     virtual_wildcard_dependencies
                         .insert(subq.alias.to_uppercase(), wildcard_tables);
                 }
-                columns.extend(wildcard_columns);
-                columns.extend(
-                    intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
-                        body_tokens,
-                    ),
-                );
-                Self::dedup_column_names_case_insensitive(&mut columns);
                 if !columns.is_empty() {
                     virtual_table_columns.insert(subq.alias.clone(), columns);
                 }
@@ -665,18 +645,18 @@ impl SqlEditorWidget {
                 derived_columns,
             );
         }
-        let context_alias_suggestions = if matches!(
+        let context_name_suggestions = if matches!(
             context,
             SqlContext::VariableName | SqlContext::BindValue
         ) || restrict_to_relation_columns
         {
             Vec::new()
         } else {
-            Self::collect_context_alias_suggestions(&snapshot.prefix, deep_ctx)
+            Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
         };
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
-            context_alias_suggestions,
+            context_name_suggestions,
             matches!(context, SqlContext::TableName),
             qualifier.is_some(),
         );
@@ -833,13 +813,15 @@ impl SqlEditorWidget {
         })
     }
 
-    fn collect_context_alias_suggestions(
+    fn collect_context_name_suggestions(
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
+        context: SqlContext,
     ) -> Vec<String> {
         let prefix_upper = prefix.to_ascii_uppercase();
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
+        let allow_relation_aliases = !matches!(context, SqlContext::TableName);
 
         let mut push_candidate = |candidate: &str| {
             if candidate.is_empty() {
@@ -856,9 +838,11 @@ impl SqlEditorWidget {
             }
         };
 
-        for table_ref in &deep_ctx.tables_in_scope {
-            if let Some(alias) = table_ref.alias.as_deref() {
-                push_candidate(alias);
+        if allow_relation_aliases {
+            for table_ref in &deep_ctx.tables_in_scope {
+                if let Some(alias) = table_ref.alias.as_deref() {
+                    push_candidate(alias);
+                }
             }
         }
 
@@ -866,8 +850,10 @@ impl SqlEditorWidget {
             push_candidate(&cte.name);
         }
 
-        for subq in &deep_ctx.subqueries {
-            push_candidate(&subq.alias);
+        if allow_relation_aliases {
+            for subq in &deep_ctx.subqueries {
+                push_candidate(&subq.alias);
+            }
         }
 
         suggestions
@@ -988,6 +974,144 @@ impl SqlEditorWidget {
         columns
     }
 
+    fn build_virtual_table_columns_for_query_body(
+        body_tokens: &[SqlToken],
+        seed_virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> HashMap<String, Vec<String>> {
+        let body_ctx = intellisense_context::analyze_cursor_context(body_tokens, body_tokens.len());
+        let mut virtual_table_columns = seed_virtual_table_columns.clone();
+
+        for cte in &body_ctx.ctes {
+            let (columns, _) = Self::collect_cte_virtual_columns_for_completion(
+                &body_ctx,
+                cte,
+                &virtual_table_columns,
+                intellisense_data,
+                column_sender,
+                connection,
+            );
+            if !columns.is_empty() {
+                virtual_table_columns.insert(cte.name.clone(), columns);
+            }
+        }
+
+        for subq in &body_ctx.subqueries {
+            let relation_tokens = intellisense_context::token_range_slice(
+                body_ctx.statement_tokens.as_ref(),
+                subq.body_range,
+            );
+            let relation_ctx =
+                intellisense_context::analyze_cursor_context(relation_tokens, relation_tokens.len());
+            let mut relation_virtual_table_columns = virtual_table_columns.clone();
+
+            for cte in &relation_ctx.ctes {
+                let (columns, _) = Self::collect_cte_virtual_columns_for_completion(
+                    &relation_ctx,
+                    cte,
+                    &relation_virtual_table_columns,
+                    intellisense_data,
+                    column_sender,
+                    connection,
+                );
+                if !columns.is_empty() {
+                    relation_virtual_table_columns.insert(cte.name.clone(), columns);
+                }
+            }
+
+            let relation_local_tables =
+                intellisense_context::collect_tables_in_statement(relation_tokens);
+            let (columns, _) = Self::collect_virtual_relation_columns_for_completion(
+                relation_tokens,
+                &relation_local_tables,
+                &body_ctx.tables_in_scope,
+                &relation_virtual_table_columns,
+                intellisense_data,
+                column_sender,
+                connection,
+            );
+            if !columns.is_empty() {
+                virtual_table_columns.insert(subq.alias.clone(), columns);
+            }
+        }
+
+        virtual_table_columns
+    }
+
+    fn collect_virtual_query_projection_columns(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        let available_virtual_table_columns = Self::build_virtual_table_columns_for_query_body(
+            body_tokens,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+        );
+        let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+        if columns.is_empty() {
+            columns = intellisense_context::extract_table_function_columns(body_tokens);
+        }
+        columns.extend(Self::infer_columns_from_partial_select_qualifiers(
+            body_tokens,
+            body_tables_in_scope,
+            outer_tables_in_scope,
+            &available_virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+        ));
+
+        let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
+            body_tokens,
+            body_tables_in_scope,
+            &available_virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+        );
+        columns.extend(wildcard_columns);
+        columns.extend(intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
+            body_tokens,
+        ));
+        columns.extend(intellisense_context::extract_oracle_model_generated_columns(
+            body_tokens,
+        ));
+        columns.extend(intellisense_context::extract_match_recognize_generated_columns(
+            body_tokens,
+        ));
+        Self::dedup_column_names_case_insensitive(&mut columns);
+        (columns, wildcard_tables)
+    }
+
+    fn collect_virtual_relation_columns_for_completion(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        Self::collect_virtual_query_projection_columns(
+            body_tokens,
+            body_tables_in_scope,
+            outer_tables_in_scope,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+        )
+    }
+
     fn restricts_to_relation_column_names(phase: intellisense_context::SqlPhase) -> bool {
         matches!(
             phase,
@@ -1058,6 +1182,35 @@ impl SqlEditorWidget {
         qualifier: Option<&str>,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
+        fn prepend_virtual_alias_if_present(
+            tables: &mut Vec<String>,
+            qualifier: &str,
+            deep_ctx: &intellisense_context::CursorContext,
+        ) {
+            let Some(alias) = deep_ctx
+                .subqueries
+                .iter()
+                .find(|subq| subq.alias.eq_ignore_ascii_case(qualifier))
+                .map(|subq| subq.alias.clone())
+            else {
+                return;
+            };
+
+            if tables.iter().any(|table| table.eq_ignore_ascii_case(&alias)) {
+                if let Some(existing_idx) =
+                    tables.iter().position(|table| table.eq_ignore_ascii_case(&alias))
+                {
+                    if existing_idx != 0 {
+                        let existing = tables.remove(existing_idx);
+                        tables.insert(0, existing);
+                    }
+                }
+                return;
+            }
+
+            tables.insert(0, alias);
+        }
+
         let focused_tables = (!deep_ctx.focused_tables.is_empty()).then_some(&deep_ctx.focused_tables);
         if qualifier.is_some()
             && matches!(
@@ -1087,16 +1240,19 @@ impl SqlEditorWidget {
                 .cloned()
                 .collect();
             if !filtered.is_empty() {
+                let mut filtered = filtered;
+                prepend_virtual_alias_if_present(&mut filtered, qualifier, deep_ctx);
                 return filtered;
             }
         }
         let unresolved_direct = resolved.len() == 1 && resolved[0].eq_ignore_ascii_case(qualifier);
         if !unresolved_direct {
-            return if focused_tables.is_some() {
-                Vec::new()
-            } else {
-                resolved
-            };
+            if focused_tables.is_some() {
+                return Vec::new();
+            }
+            let mut resolved = resolved;
+            prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
+            return resolved;
         }
 
         let pattern_vars = intellisense_context::extract_match_recognize_pattern_variables(
@@ -1109,6 +1265,8 @@ impl SqlEditorWidget {
             return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
         }
 
+        let mut resolved = resolved;
+        prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
         resolved
     }
 
