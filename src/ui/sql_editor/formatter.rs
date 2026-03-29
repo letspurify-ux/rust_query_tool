@@ -59,6 +59,7 @@ enum OwnerRelativeLayoutFrameKind {
 struct OwnerRelativeLayoutFrame {
     owner_depth: usize,
     kind: OwnerRelativeLayoutFrameKind,
+    pending_body_header_continuation: Option<sql_text::FormatBodyHeaderContinuationState>,
 }
 
 impl OwnerRelativeLayoutFrame {
@@ -66,6 +67,7 @@ impl OwnerRelativeLayoutFrame {
         Self {
             owner_depth,
             kind: OwnerRelativeLayoutFrameKind::ModelClause { start_parser_depth },
+            pending_body_header_continuation: None,
         }
     }
 
@@ -76,11 +78,21 @@ impl OwnerRelativeLayoutFrame {
                 kind,
                 nested_paren_depth: 1,
             },
+            pending_body_header_continuation: None,
         }
     }
 
     fn owner_depth(self) -> usize {
         self.owner_depth
+    }
+
+    fn owner_kind(self) -> FormatIndentedParenOwnerKind {
+        match self.kind {
+            OwnerRelativeLayoutFrameKind::ModelClause { .. } => {
+                FormatIndentedParenOwnerKind::ModelSubclause
+            }
+            OwnerRelativeLayoutFrameKind::MultilineClause { kind, .. } => kind,
+        }
     }
 
     fn body_depth(self) -> usize {
@@ -94,23 +106,11 @@ impl OwnerRelativeLayoutFrame {
         }
     }
 
-    fn formatter_body_header_depth(
-        self,
-        text_upper: &str,
-        previous_line_upper: Option<&str>,
-    ) -> Option<usize> {
-        match self.kind {
-            OwnerRelativeLayoutFrameKind::ModelClause { .. } => {
-                FormatIndentedParenOwnerKind::ModelSubclause.formatter_body_header_depth(
-                    text_upper,
-                    previous_line_upper,
-                    self.owner_depth,
-                )
-            }
-            OwnerRelativeLayoutFrameKind::MultilineClause { kind, .. } => {
-                kind.formatter_body_header_depth(text_upper, previous_line_upper, self.owner_depth)
-            }
-        }
+    fn formatter_body_header_depth(self, text_upper: &str) -> Option<usize> {
+        self.owner_kind()
+            .body_header_line_state(text_upper, self.pending_body_header_continuation)
+            .is_header
+            .then(|| self.body_depth())
     }
 
     fn enforces_body_floor(self) -> bool {
@@ -118,6 +118,13 @@ impl OwnerRelativeLayoutFrame {
             self.kind,
             OwnerRelativeLayoutFrameKind::MultilineClause { .. }
         )
+    }
+
+    fn note_body_header_line(&mut self, text_upper: &str) {
+        self.pending_body_header_continuation = self
+            .owner_kind()
+            .body_header_line_state(text_upper, self.pending_body_header_continuation)
+            .next_state;
     }
 
     fn is_match_recognize(self) -> bool {
@@ -5623,6 +5630,44 @@ impl SqlEditorWidget {
         true
     }
 
+    fn normalize_split_query_owner_header_depth(
+        trimmed: &str,
+        trimmed_upper: &str,
+        effective_depth: usize,
+        resolved_query_base_depth: Option<usize>,
+        current_condition_header_depth: Option<usize>,
+        current_line_multiline_clause_owner_kind: Option<FormatIndentedParenOwnerKind>,
+        active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
+    ) -> usize {
+        if Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
+            return effective_depth;
+        }
+
+        if current_line_multiline_clause_owner_kind.is_some()
+            || active_owner_relative_frame
+                .and_then(|frame| frame.formatter_body_header_depth(trimmed_upper))
+                .is_some()
+        {
+            return effective_depth;
+        }
+
+        let owner_kind = crate::sql_text::format_query_owner_header_kind(trimmed);
+        if owner_kind != Some(crate::sql_text::FormatQueryOwnerKind::Condition) {
+            return effective_depth;
+        }
+
+        if Self::is_dml_clause_starter(trimmed_upper) {
+            return effective_depth;
+        }
+
+        owner_kind
+            .and_then(|kind| {
+                kind.header_depth_floor(resolved_query_base_depth, current_condition_header_depth)
+            })
+            .map(|depth_floor| effective_depth.max(depth_floor))
+            .unwrap_or(effective_depth)
+    }
+
     fn pop_expired_owner_relative_layout_frames(
         owner_relative_frames: &mut Vec<OwnerRelativeLayoutFrame>,
         depth: usize,
@@ -5632,9 +5677,12 @@ impl SqlEditorWidget {
             .last()
             .is_some_and(|frame| match frame.kind {
                 OwnerRelativeLayoutFrameKind::ModelClause { start_parser_depth } => {
+                    let continues_model_header =
+                        frame.formatter_body_header_depth(trimmed_upper).is_some();
                     depth < start_parser_depth
                         || (depth <= start_parser_depth
                             && Self::is_dml_clause_starter(trimmed_upper)
+                            && !continues_model_header
                             && !crate::sql_text::starts_with_keyword_token(trimmed_upper, "MODEL")
                             && !crate::sql_text::starts_with_format_model_subclause(trimmed_upper))
                 }
@@ -5714,7 +5762,6 @@ impl SqlEditorWidget {
 
     fn normalize_indented_owner_relative_depth(
         trimmed_upper: &str,
-        previous_code_trimmed_upper: Option<&str>,
         starts_with_close_paren: bool,
         current_line_multiline_clause_owner_kind: Option<FormatIndentedParenOwnerKind>,
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
@@ -5731,9 +5778,7 @@ impl SqlEditorWidget {
                 return frame.body_depth();
             }
 
-            if let Some(body_depth) =
-                frame.formatter_body_header_depth(trimmed_upper, previous_code_trimmed_upper)
-            {
+            if let Some(body_depth) = frame.formatter_body_header_depth(trimmed_upper) {
                 return body_depth;
             }
         }
@@ -6666,8 +6711,6 @@ impl SqlEditorWidget {
                     .to_ascii_uppercase()
                     .starts_with("SELECT /*+")
             });
-            let previous_code_trimmed_upper =
-                last_code_idx.map(|prev_idx| layouts[prev_idx].trimmed.to_ascii_uppercase());
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
@@ -6735,9 +6778,17 @@ impl SqlEditorWidget {
                 } else {
                     effective_depth
                 };
+            let effective_depth = Self::normalize_split_query_owner_header_depth(
+                trimmed,
+                &trimmed_upper,
+                effective_depth,
+                resolved_query_base_depth,
+                parenthesized_condition_header_depth,
+                current_line_multiline_clause_owner_kind,
+                active_owner_relative_frame,
+            );
             let effective_depth = Self::normalize_indented_owner_relative_depth(
                 &trimmed_upper,
-                previous_code_trimmed_upper.as_deref(),
                 starts_with_close_paren,
                 current_line_multiline_clause_owner_kind,
                 active_owner_relative_frame,
@@ -6820,12 +6871,11 @@ impl SqlEditorWidget {
             let effective_depth = {
                 let mut effective_depth = effective_depth;
                 if !current_line_is_standalone_open_paren {
-                    let visual_owner_depth = effective_depth.max(existing_indent);
                     if let Some(frame) = pending_multiline_clause_owner {
                         if sql_text::format_indented_paren_owner_header_continues(
                             frame.kind, trimmed,
                         ) {
-                            let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                            let owner_depth = frame.owner_depth;
                             effective_depth = owner_depth;
                             continued_multiline_clause_owner =
                                 Some(PendingMultilineClauseOwnerLayoutFrame {
@@ -6835,7 +6885,7 @@ impl SqlEditorWidget {
                         }
                     } else if let Some(frame) = pending_partial_multiline_clause_owner {
                         if frame.kind.line_can_continue(trimmed) {
-                            let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                            let owner_depth = frame.owner_depth;
                             effective_depth = owner_depth;
                             if frame.kind.line_completes(trimmed) {
                                 completed_partial_multiline_clause_owner =
@@ -6858,7 +6908,10 @@ impl SqlEditorWidget {
                     {
                         if let Some(frame) = pending_partial_query_owner {
                             if frame.kind.line_can_continue(trimmed) {
-                                let owner_depth = frame.owner_depth.max(visual_owner_depth);
+                                // Preserve the stored owner anchor so nested
+                                // split headers normalize relative to their
+                                // semantic owner, not a stray manual indent.
+                                let owner_depth = frame.owner_depth;
                                 effective_depth = owner_depth;
                                 if frame.kind.line_completes(trimmed) {
                                     completed_partial_query_owner_kind =
@@ -7001,6 +7054,9 @@ impl SqlEditorWidget {
             } else {
                 parenthesized_condition_header_depth
             };
+            if let Some(frame) = owner_relative_frames.last_mut() {
+                frame.note_body_header_line(&trimmed_upper);
+            }
             Self::apply_multiline_owner_relative_paren_profile(
                 &mut owner_relative_frames,
                 &multiline_clause_paren_profile,
@@ -14170,6 +14226,80 @@ AND e.status = 'A';"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_not_exists_header_on_condition_depth() {
+        let source = r#"SELECT e.empno
+FROM emp e
+WHERE
+NOT EXISTS
+(
+    SELECT 1
+    FROM bonus b
+    WHERE b.empno = e.empno
+)
+AND e.status = 'A';"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE")
+            .unwrap_or(0);
+        let not_exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NOT EXISTS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "(")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.status = 'A';")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[not_exists_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "split NOT EXISTS header should stay on the active condition depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[not_exists_idx]),
+            "split NOT EXISTS opener should stay aligned with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[not_exists_idx]).saturating_add(4),
+            "child SELECT under split NOT EXISTS should stay one level deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[not_exists_idx]),
+            "split NOT EXISTS closing paren should realign with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "AND after split NOT EXISTS should return to the outer condition continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_nested_split_exists_owner_stack_stable() {
         let source = r#"SELECT d.deptno
 FROM dept d
@@ -14338,6 +14468,90 @@ FROM
             indent(lines[outer_close_idx]),
             indent(lines[from_indices[0]]),
             "outer split FROM closer should realign with the outer FROM line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_all_header_relative_to_nested_query_base() {
+        let source = r#"SELECT d.deptno
+FROM dept d
+WHERE d.deptno IN (
+    SELECT e.deptno
+    FROM emp e
+    WHERE e.sal >
+    ALL
+    (
+        SELECT b.sal
+        FROM bonus b
+        WHERE b.empno = e.empno
+    )
+    AND e.active = 'Y'
+);"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE e.sal >")
+            .unwrap_or(0);
+        let all_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ALL")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(all_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT b.sal")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == ")")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.active = 'Y'")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[all_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "split ALL header should stay relative to the nested WHERE condition depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[all_idx]),
+            "split ALL opener should stay aligned with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[all_idx]).saturating_add(4),
+            "child SELECT under split ALL should stay one level deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[all_idx]),
+            "split ALL closing paren should realign with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "AND after split ALL should return to the nested WHERE continuation depth, got:\n{}",
             formatted
         );
     }
@@ -16075,6 +16289,53 @@ WHERE depivoted.sal_amt IS NOT NULL;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_normalizes_overindented_split_pivot_xml_header_chain_to_structural_owner_depth(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT *
+    FROM src
+    PIVOT
+            XML
+                    (
+                        SUM (amt) AS total_amt
+                        FOR deptno IN (10 AS D10, 20 AS D20)
+                    )
+) pvt
+WHERE pvt.total_amt_D10 IS NOT NULL;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PIVOT")
+            .unwrap_or(0);
+        let xml_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "XML")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(xml_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sum_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SUM (amt) AS total_amt")
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[xml_idx]), indent(lines[pivot_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[pivot_idx]));
+        assert_eq!(
+            indent(lines[sum_idx]),
+            indent(lines[pivot_idx]).saturating_add(4)
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_window_as_header_chain_owner_depths() {
         let source = r#"SELECT *
 FROM (
@@ -16087,6 +16348,60 @@ FROM (
         PARTITION BY e.deptno
         ORDER BY e.sal DESC, e.empno
     )
+    QUALIFY ROW_NUMBER () OVER w_dept = 1
+) ranked
+WHERE ranked.dept_sum > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WINDOW w_dept")
+            .unwrap_or(0);
+        let as_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(as_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PARTITION BY e.deptno"))
+            .unwrap_or(0);
+        let qualify_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("QUALIFY ROW_NUMBER"))
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[as_idx]), indent(lines[window_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[window_idx]));
+        assert_eq!(
+            indent(lines[partition_idx]),
+            indent(lines[window_idx]).saturating_add(4)
+        );
+        assert_eq!(indent(lines[qualify_idx]), indent(lines[window_idx]));
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_overindented_split_window_as_chain_to_structural_owner_depth(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT e.deptno,
+        SUM (e.sal) OVER w_dept AS dept_sum
+    FROM emp e
+    WINDOW w_dept
+            AS
+                    (
+                        PARTITION BY e.deptno
+                        ORDER BY e.sal DESC, e.empno
+                    )
     QUALIFY ROW_NUMBER () OVER w_dept = 1
 ) ranked
 WHERE ranked.dept_sum > 0;"#;
@@ -16143,6 +16458,64 @@ FROM (
             FROM limits l
             WHERE l.deptno = sales.deptno
         )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "REFERENCE ref_limits")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(on_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT limit_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(indent(lines[on_idx]), indent(lines[reference_idx]));
+        assert_eq!(indent(lines[open_idx]), indent(lines[reference_idx]));
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[reference_idx]).saturating_add(4)
+        );
+        assert_eq!(indent(lines[dimension_idx]), indent(lines[reference_idx]));
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_overindented_split_model_reference_on_chain_to_structural_owner_depth(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits
+                ON
+                        (
+                            SELECT limit_amt
+                            FROM limits l
+                            WHERE l.deptno = sales.deptno
+                        )
         DIMENSION BY (month_key)
         MEASURES (amount)
         RULES UPDATE (amount[ANY] = amount[CV()] + 1)
@@ -22873,6 +23246,209 @@ FROM emp;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_within_group_owner_depth_relative_to_nested_query_base(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        LISTAGG (e.ename, ', ')
+        WITHIN GROUP
+        (
+            ORDER
+            BY e.ename
+        ) AS names
+    FROM emp e
+) grouped
+WHERE grouped.names IS NOT NULL;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let within_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WITHIN GROUP")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(within_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER")
+            .unwrap_or(0);
+        let by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BY e.ename")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") AS names")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE grouped.names IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[within_idx]),
+            "split WITHIN GROUP opener should stay aligned with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[within_idx]).saturating_add(4),
+            "WITHIN GROUP ORDER should be one level deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[by_idx]),
+            indent(lines[order_idx]),
+            "split WITHIN GROUP BY should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[within_idx]),
+            "WITHIN GROUP closing line should realign with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested WITHIN GROUP query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_keep_body_relative_after_nested_subquery() {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        MAX (e.sal)
+        KEEP
+        (
+            DENSE_RANK
+            LAST
+            ORDER
+            BY (
+                SELECT MAX (b.sal)
+                FROM bonus b
+                WHERE b.empno = e.empno
+            ),
+            e.empno
+        ) AS top_sal
+    FROM emp e
+) ranked
+WHERE ranked.top_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let keep_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "KEEP")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(keep_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let dense_rank_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DENSE_RANK")
+            .unwrap_or(0);
+        let last_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "LAST")
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER")
+            .unwrap_or(0);
+        let by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BY (")
+            .unwrap_or(0);
+        let inner_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT MAX (b.sal)")
+            .unwrap_or(0);
+        let empno_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") AS top_sal")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE ranked.top_sal > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[keep_idx]),
+            "split KEEP opener should stay aligned with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[dense_rank_idx]),
+            indent(lines[keep_idx]).saturating_add(4),
+            "KEEP body should be one level deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[last_idx]),
+            indent(lines[dense_rank_idx]),
+            "split KEEP LAST should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[dense_rank_idx]),
+            "split KEEP ORDER should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[by_idx]),
+            indent(lines[dense_rank_idx]),
+            "split KEEP BY should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_select_idx]) > indent(lines[by_idx]),
+            "nested SELECT inside KEEP ORDER BY should stay deeper than the KEEP owner body, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[empno_idx]),
+            indent(lines[dense_rank_idx]),
+            "KEEP sibling ORDER BY items should realign with the owner-relative body depth after nested subqueries close, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[keep_idx]),
+            "KEEP closing line should realign with the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the nested KEEP query closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_pops_nested_multiline_owner_frames_when_close_parens_share_line(
     ) {
         let source = r#"SELECT
@@ -23492,6 +24068,167 @@ WHERE amount > 0;"#;
             indent(lines[outer_where_idx]),
             0,
             "outer WHERE should return to the top-level query depth after the MODEL clause closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_multi_step_model_modifier_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM sales
+MODEL
+    RETURN
+            UPDATED
+                    ROWS
+    RULES
+            AUTOMATIC
+                    ORDER
+    (
+        amount[ANY] = amount[CV()] + 1
+    )
+WHERE amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let return_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RETURN")
+            .unwrap_or(0);
+        let updated_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPDATED")
+            .unwrap_or(0);
+        let rows_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROWS")
+            .unwrap_or(0);
+        let rules_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "RULES")
+            .unwrap_or(0);
+        let automatic_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AUTOMATIC")
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("WHERE amount > 0"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[updated_idx]),
+            indent(lines[return_idx]),
+            "split MODEL RETURN/UPDATED continuation should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rows_idx]),
+            indent(lines[return_idx]),
+            "split MODEL RETURN/UPDATED/ROWS continuation should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[automatic_idx]),
+            indent(lines[rules_idx]),
+            "split MODEL RULES/AUTOMATIC continuation should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[rules_idx]),
+            "split MODEL AUTOMATIC/ORDER continuation should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after the MODEL clause closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_multi_step_match_recognize_continuations_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM sales
+MATCH_RECOGNIZE (
+    ONE
+            ROW PER
+                    MATCH
+    AFTER
+            MATCH SKIP
+                    TO NEXT ROW
+    PATTERN (A)
+    DEFINE A AS amount > 0
+) mr;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let one_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ONE")
+            .unwrap_or(0);
+        let row_per_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROW PER")
+            .unwrap_or(0);
+        let match_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "MATCH")
+            .unwrap_or(0);
+        let after_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AFTER")
+            .unwrap_or(0);
+        let match_skip_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "MATCH SKIP")
+            .unwrap_or(0);
+        let to_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "TO NEXT ROW")
+            .unwrap_or(0);
+        let pattern_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PATTERN (A)"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[row_per_idx]),
+            indent(lines[one_idx]),
+            "split MATCH_RECOGNIZE ONE/ROW PER continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[match_idx]),
+            indent(lines[one_idx]),
+            "split MATCH_RECOGNIZE ONE/ROW PER/MATCH continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[match_skip_idx]),
+            indent(lines[after_idx]),
+            "split MATCH_RECOGNIZE AFTER/MATCH SKIP continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[to_idx]),
+            indent(lines[after_idx]),
+            "split MATCH_RECOGNIZE AFTER/MATCH SKIP/TO continuation should realign with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[pattern_idx]),
+            indent(lines[one_idx]),
+            "MATCH_RECOGNIZE PATTERN should stay aligned with sibling owner-relative modifiers after multi-step continuations, got:\n{}",
             formatted
         );
     }
