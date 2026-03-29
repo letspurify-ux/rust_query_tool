@@ -172,7 +172,7 @@ struct DmlCaseLayoutFrame {
 
 #[derive(Clone, Copy)]
 struct CaseConditionLayoutFrame {
-    parser_depth: usize,
+    owner_parser_depth: usize,
     continuation_depth: usize,
 }
 
@@ -5587,6 +5587,7 @@ impl SqlEditorWidget {
         start_idx: usize,
         next_code_trimmed: Option<&str>,
         line_depth: usize,
+        general_line_depth: usize,
         is_multiline_clause_owner: bool,
         is_condition_query_owner: bool,
         is_standalone_open_paren_owner: bool,
@@ -5632,8 +5633,8 @@ impl SqlEditorWidget {
                             .iter()
                             .rev()
                             .find(|f| f.kind == ParenLayoutFrameKind::General)
-                            .map(|f| f.continuation_depth.max(line_depth))
-                            .unwrap_or(line_depth)
+                            .map(|f| f.continuation_depth.max(general_line_depth))
+                            .unwrap_or(general_line_depth)
                     } else {
                         line_depth
                     };
@@ -6365,16 +6366,12 @@ impl SqlEditorWidget {
                 Self::starts_with_condition_keyword(&trimmed_upper);
             let current_line_is_condition_query_owner =
                 current_query_owner_kind == Some(FormatQueryOwnerKind::Condition);
-            let active_case_condition_frame = case_condition_frames
-                .iter()
-                .rev()
-                .find(|frame| frame.parser_depth == depth)
-                .copied();
+            let active_case_condition_frame = case_condition_frames.last().copied();
             let current_line_ends_case_condition = active_case_condition_frame.is_some_and(|frame| {
                 Self::line_contains_case_condition_terminator(
                     &line_tokens,
                     depth,
-                    frame.parser_depth,
+                    frame.owner_parser_depth,
                 )
             });
             let current_line_is_case_condition_continuation = active_case_condition_frame
@@ -7470,7 +7467,7 @@ impl SqlEditorWidget {
                 }
                 while case_condition_frames
                     .last()
-                    .is_some_and(|frame| frame.parser_depth >= depth)
+                    .is_some_and(|frame| frame.owner_parser_depth >= depth)
                 {
                     case_condition_frames.pop();
                 }
@@ -7478,7 +7475,7 @@ impl SqlEditorWidget {
                 let _ = plsql_case_frames.pop();
                 while case_condition_frames
                     .last()
-                    .is_some_and(|frame| frame.parser_depth >= depth)
+                    .is_some_and(|frame| frame.owner_parser_depth >= depth)
                 {
                     case_condition_frames.pop();
                 }
@@ -7491,7 +7488,7 @@ impl SqlEditorWidget {
                 && !Self::line_contains_case_condition_terminator(&line_tokens, depth, depth);
             if starts_multiline_case_condition {
                 case_condition_frames.push(CaseConditionLayoutFrame {
-                    parser_depth: depth.saturating_add(1),
+                    owner_parser_depth: depth,
                     continuation_depth: layouts[idx].final_depth.saturating_add(1),
                 });
             }
@@ -7513,11 +7510,19 @@ impl SqlEditorWidget {
             let current_line_is_query_owner_standalone_open_paren =
                 current_line_is_standalone_open_paren
                     && continued_plsql_child_query_owner.is_none();
+            let current_line_general_paren_depth = if starts_multiline_case_condition
+                && !current_line_is_condition_query_owner
+            {
+                effective_depth.saturating_add(1)
+            } else {
+                effective_depth
+            };
             Self::update_paren_layout_frames_for_line(
                 &line_tokens,
                 paren_frame_scan_start_idx,
                 next_code_trimmed,
                 effective_depth,
+                current_line_general_paren_depth,
                 current_line_starts_multiline_clause,
                 current_line_is_condition_query_owner,
                 current_line_is_query_owner_standalone_open_paren,
@@ -10610,6 +10615,43 @@ FROM qt_fmt_emp e;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_when_function_paren_body_uses_case_condition_owner_depth() {
+        let source = r#"SELECT
+    CASE
+        WHEN MAX (
+            CASE
+                WHEN u.qtr = 'Q2' THEN u.amt
+            END
+        ) > 0 THEN 'UP'
+        ELSE 'SAME'
+    END AS trend_flag
+FROM u;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN MAX ("))
+            .expect("formatted output should contain WHEN MAX owner line");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain nested CASE under MAX");
+
+        assert_eq!(
+            indent(lines[case_idx]),
+            indent(lines[when_idx]).saturating_add(8),
+            "nested CASE inside WHEN-owned MAX should include both the WHEN continuation depth and the MAX paren depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_bare_when_expression_uses_case_continuation_depth() {
         let source = r#"SELECT
     CASE
@@ -10656,8 +10698,8 @@ FROM u;"#;
         );
         assert_eq!(
             indent(lines[then_idx]),
-            indent(lines[when_idx]),
-            "THEN should realign with the bare WHEN header after multiline condition continuation, got:\n{}",
+            indent(lines[max_idx]),
+            "THEN should stay on the active bare WHEN continuation depth after multiline condition continuation, got:\n{}",
             formatted
         );
     }
@@ -10724,8 +10766,8 @@ FROM dual;"#;
         );
         assert_eq!(
             indent(lines[then_idx]),
-            indent(lines[when_idx]),
-            "THEN should realign with the bare WHEN header after EXISTS continuation, got:\n{}",
+            indent(lines[exists_idx]),
+            "THEN should stay on the active bare WHEN continuation depth after EXISTS continuation, got:\n{}",
             formatted
         );
     }
@@ -10793,8 +10835,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[then_idx]),
-            indent(lines[when_idx]),
-            "PL/SQL THEN should realign with the bare WHEN header after EXISTS continuation, got:\n{}",
+            indent(lines[exists_idx]),
+            "PL/SQL THEN should stay on the active bare WHEN continuation depth after EXISTS continuation, got:\n{}",
             formatted
         );
     }
@@ -18253,22 +18295,22 @@ SELECT
     ) AS q2_amt,
     CASE
         WHEN MAX (
-            CASE
-                WHEN u.qtr = 'Q2' THEN u.amt
-            END
-        ) > MAX (
-            CASE
-                WHEN u.qtr = 'Q1' THEN u.amt
-            END
+                CASE
+                    WHEN u.qtr = 'Q2' THEN u.amt
+                END
+            ) > MAX (
+                CASE
+                    WHEN u.qtr = 'Q1' THEN u.amt
+                END
         ) THEN 'UP'
         WHEN MAX (
-            CASE
-                WHEN u.qtr = 'Q2' THEN u.amt
-            END
-        ) < MAX (
-            CASE
-                WHEN u.qtr = 'Q1' THEN u.amt
-            END
+                CASE
+                    WHEN u.qtr = 'Q2' THEN u.amt
+                END
+            ) < MAX (
+                CASE
+                    WHEN u.qtr = 'Q1' THEN u.amt
+                END
         ) THEN 'DOWN'
         ELSE 'SAME'
     END AS trend_flag
