@@ -103,6 +103,25 @@ fn test_keyword_highlighting() {
 }
 
 #[test]
+fn test_plsql_diagnostics_are_highlighted_as_keywords() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"BEGIN
+    DBMS_OUTPUT.PUT_LINE(SQLCODE);
+    DBMS_OUTPUT.PUT_LINE(SQLERRM);
+END;"#;
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["SQLCODE", "SQLERRM"] {
+        let start = text.find(token).unwrap_or(0);
+        let end = start + token.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{token} should be highlighted as a keyword"
+        );
+    }
+}
+
+#[test]
 fn test_type_body_member_modifiers_are_highlighted_as_keywords() {
     let highlighter = SqlHighlighter::new();
     let text = r#"CREATE OR REPLACE TYPE BODY money_t AS

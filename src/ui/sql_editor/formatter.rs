@@ -24369,6 +24369,80 @@ FROM (
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_nested_columns_header_without_path_keyword_relative_to_owner(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT *
+    FROM JSON_TABLE(
+        payload,
+        '$' COLUMNS
+        (
+            order_id NUMBER PATH '$.order_id',
+            NESTED '$.items[*]'
+            COLUMNS
+            (
+                sku VARCHAR2 (30) PATH '$.sku',
+                qty NUMBER PATH '$.qty'
+            )
+        )
+    ) jt
+) outer_jt;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let order_id_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("order_id NUMBER"))
+            .unwrap_or(0);
+        let nested_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NESTED '$.items[*]'")
+            .unwrap_or(0);
+        let columns_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COLUMNS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(columns_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sku_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("sku VARCHAR2"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[nested_idx]),
+            indent(lines[order_id_idx]),
+            "PATH 생략형 nested owner should stay aligned with sibling outer COLUMNS items, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[columns_idx]),
+            indent(lines[nested_idx]),
+            "split nested COLUMNS header without PATH should stay aligned with the NESTED owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[columns_idx]),
+            "split nested COLUMNS opener without PATH should stay aligned with the completed owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sku_idx]),
+            indent(lines[columns_idx]).saturating_add(4),
+            "split nested COLUMNS body without PATH should stay one level deeper than the nested owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_unpivot_owner_depth_relative_to_nested_query_base(
     ) {
         let source = r#"SELECT *

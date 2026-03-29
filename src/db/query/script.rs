@@ -11994,6 +11994,69 @@ FROM JSON_TABLE(
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_split_nested_columns_header_without_path_keyword_on_owner_stack(
+    ) {
+        let sql = r#"SELECT jt.order_id,
+    jt.sku
+FROM JSON_TABLE(
+    payload,
+    '$' COLUMNS (
+        order_id NUMBER PATH '$.order_id',
+        NESTED '$.items[*]'
+        COLUMNS
+        (
+            sku VARCHAR2 (30) PATH '$.sku',
+            qty NUMBER PATH '$.qty'
+        )
+    )
+) jt;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let order_id_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("order_id NUMBER"))
+            .unwrap_or(0);
+        let nested_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NESTED '$.items[*]'")
+            .unwrap_or(0);
+        let columns_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COLUMNS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(columns_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let sku_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("sku VARCHAR2"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[nested_idx].auto_depth, contexts[order_id_idx].auto_depth,
+            "PATH 생략형 nested owner should stay aligned with sibling outer COLUMNS items"
+        );
+        assert_eq!(
+            contexts[columns_idx].auto_depth, contexts[nested_idx].auto_depth,
+            "split nested COLUMNS header without PATH should stay on the NESTED owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[columns_idx].auto_depth,
+            "split nested COLUMNS opener without PATH should stay aligned with the completed owner"
+        );
+        assert_eq!(
+            contexts[sku_idx].auto_depth,
+            contexts[columns_idx].auto_depth.saturating_add(1),
+            "split nested COLUMNS body without PATH should stay one level deeper than the nested owner"
+        );
+    }
+
+    #[test]
     fn line_block_depths_dedents_all_leading_closing_parens_on_line() {
         let sql = "SELECT *\nFROM (\nSELECT *\nFROM (\nSELECT 1 FROM dual\n))\nWHERE 1 = 1;";
 

@@ -1456,6 +1456,15 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_suggestions_include_plsql_diagnostics_as_bare_keywords() {
+        let mut data = IntellisenseData::new();
+        let suggestions = data.get_suggestions("sqlc", false, None, false, false);
+
+        assert!(suggestions.iter().any(|s| s == "SQLCODE"));
+        assert!(!suggestions.iter().any(|s| s == "SQLCODE()"));
+    }
+
+    #[test]
     fn get_suggestions_prefers_columns_in_column_context_with_empty_prefix() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];

@@ -471,6 +471,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SOURCE",
     "SPECIFICATION",
     "SPOOL",
+    "SQLCODE",
+    "SQLERRM",
     "SQLERROR",
     "SQL_TRACE",
     "START",
@@ -1593,7 +1595,7 @@ impl PendingFormatQueryOwnerHeaderKind {
 /// - query-owner headers and pending fragments (`FROM`, `JOIN`, `LATERAL`,
 ///   `REFERENCE ... ON`, `NOT EXISTS`, ...)
 /// - multiline owner headers and pending fragments (`WITHIN GROUP`,
-///   `WINDOW ... AS`, `NESTED PATH ... COLUMNS`, ...)
+///   `WINDOW ... AS`, `NESTED [PATH] ... COLUMNS`, ...)
 /// - generic expression query owners (`CURSOR`, `MULTISET`)
 /// - PL/SQL child-query owners (`BEGIN`, `CURSOR ... IS`, `OPEN ... FOR`, ...)
 fn starts_with_auto_format_owner_boundary(line: &str) -> bool {
@@ -1938,7 +1940,7 @@ impl FormatIndentedParenOwnerKind {
                 &["DEFINE"],
             ],
             Self::Pivot | Self::Unpivot => &[&["FOR", "IN"]],
-            Self::StructuredColumns => &[&["NESTED", "PATH", "COLUMNS"]],
+            Self::StructuredColumns => &[&["NESTED", "PATH", "COLUMNS"], &["NESTED", "COLUMNS"]],
         }
     }
 
@@ -2284,8 +2286,7 @@ pub(crate) fn format_indented_paren_pending_header_kind(
 
     let nested_second_word = next_meaningful_word(line.trim_start(), 1).map(|(word, _)| word);
     (starts_with_keyword_token(&trimmed_upper, "NESTED")
-        && (line_ends_with_keyword(line, "NESTED")
-            || nested_second_word.is_some_and(|word| word.eq_ignore_ascii_case("PATH")))
+        && !nested_second_word.is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
         && !line_ends_with_keyword(line, "COLUMNS")
         && !line_ends_with_open_paren_before_inline_comment(line))
     .then_some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
@@ -3551,6 +3552,14 @@ mod tests {
             Some(3)
         );
         assert_eq!(
+            FormatIndentedParenOwnerKind::StructuredColumns.formatter_body_header_depth(
+                "COLUMNS (",
+                Some("NESTED '$.items[*]'"),
+                2,
+            ),
+            Some(3)
+        );
+        assert_eq!(
             FormatIndentedParenOwnerKind::WithinGroup.formatter_body_header_depth(
                 "BY ename",
                 Some("ORDER"),
@@ -3661,6 +3670,10 @@ mod tests {
             Some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
         );
         assert_eq!(
+            format_indented_paren_pending_header_kind("NESTED '$.items[*]'"),
+            Some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
+        );
+        assert_eq!(
             format_indented_paren_pending_header_kind("NESTED TABLE"),
             None
         );
@@ -3721,6 +3734,10 @@ mod tests {
         );
         assert_eq!(
             format_indented_paren_owner_header_kind("NESTED PATH '$.items[*]' COLUMNS"),
+            Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        );
+        assert_eq!(
+            format_indented_paren_owner_header_kind("NESTED '$.items[*]' COLUMNS"),
             Some(FormatIndentedParenOwnerKind::StructuredColumns)
         );
     }
@@ -4133,6 +4150,8 @@ mod tests {
             "RECOGNIZE",
             "REPEATABLE",
             "SHARE",
+            "SQLCODE",
+            "SQLERRM",
             "STATIC",
             "SUBMULTISET",
             "TABLESAMPLE",
