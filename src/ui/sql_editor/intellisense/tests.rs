@@ -50,6 +50,17 @@ fn analyze_full_script_marker(
     (normalized_statement, normalized_cursor, deep_ctx)
 }
 
+fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::CursorContext {
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
+}
+
 fn assert_has_case_insensitive(values: &[String], expected: &str) {
     assert!(
         values
@@ -2268,6 +2279,63 @@ END;"#,
 }
 
 #[test]
+fn local_symbol_suggestions_include_declared_exceptions() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    e_missing_data EXCEPTION;
+BEGIN
+    RAISE __CODEX_CURSOR__;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, "e_missing_data");
+}
+
+#[test]
+fn local_symbol_suggestions_keep_exception_visibility_scoped_to_nested_block() {
+    let inner_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    e_outer EXCEPTION;
+BEGIN
+    DECLARE
+        e_inner EXCEPTION;
+    BEGIN
+        RAISE __CODEX_CURSOR__;
+    END;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&inner_suggestions, "e_outer");
+    assert_has_case_insensitive(&inner_suggestions, "e_inner");
+
+    let outer_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    e_outer EXCEPTION;
+BEGIN
+    DECLARE
+        e_inner EXCEPTION;
+    BEGIN
+        NULL;
+    END;
+
+    RAISE __CODEX_CURSOR__;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&outer_suggestions, "e_outer");
+    assert!(
+        !outer_suggestions
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("e_inner")),
+        "inner exception should not remain visible after END: {:?}",
+        outer_suggestions
+    );
+}
+
+#[test]
 fn local_symbol_suggestions_include_package_body_outer_declarations() {
     let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
         r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
@@ -3692,6 +3760,85 @@ fn collect_derived_columns_for_order_by_includes_select_aliases() {
 }
 
 #[test]
+fn collect_derived_columns_for_nested_subquery_order_by_uses_current_projection_only() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT q.inner_empno AS outer_alias \
+         FROM ( \
+           SELECT e.empno AS inner_empno, e.ename AS inner_name \
+           FROM emp e \
+           ORDER BY | \
+         ) q",
+    );
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause
+    );
+
+    let derived = SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx);
+    assert_has_case_insensitive(&derived, "inner_empno");
+    assert_has_case_insensitive(&derived, "inner_name");
+    assert!(
+        !derived.iter().any(|c| c.eq_ignore_ascii_case("outer_alias")),
+        "outer query alias must not leak into nested subquery ORDER BY: {:?}",
+        derived
+    );
+}
+
+#[test]
+fn collect_derived_columns_for_cte_body_order_by_uses_current_cte_projection_only() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "WITH detail AS ( \
+           SELECT e.empno AS cte_empno, e.ename AS cte_name \
+           FROM emp e \
+           ORDER BY | \
+         ) \
+         SELECT detail.cte_empno AS outer_alias \
+         FROM detail",
+    );
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause
+    );
+
+    let derived = SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx);
+    assert_has_case_insensitive(&derived, "cte_empno");
+    assert_has_case_insensitive(&derived, "cte_name");
+    assert!(
+        !derived.iter().any(|c| c.eq_ignore_ascii_case("outer_alias")),
+        "outer SELECT alias must not leak into CTE body ORDER BY: {:?}",
+        derived
+    );
+}
+
+#[test]
+fn collect_derived_columns_for_analytic_order_by_excludes_select_aliases() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT e.empno AS alias_empno, \
+                SUM(e.sal) OVER (PARTITION BY e.deptno ORDER BY |) AS running_sal \
+         FROM emp e",
+    );
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause
+    );
+
+    let derived = SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx);
+    assert!(
+        !derived.iter().any(|c| c.eq_ignore_ascii_case("alias_empno")),
+        "analytic ORDER BY must not suggest select-list aliases: {:?}",
+        derived
+    );
+    assert!(
+        !derived.iter().any(|c| c.eq_ignore_ascii_case("running_sal")),
+        "analytic ORDER BY must not suggest sibling analytic aliases: {:?}",
+        derived
+    );
+}
+
+#[test]
 fn infer_columns_from_partial_select_qualifier_uses_virtual_table_columns() {
     let sql_with_cursor = r#"
 SELECT
@@ -3820,6 +3967,118 @@ CROSS APPLY (
 
     for expected in ["order_id", "sku", "qty", "price", "line_amt"] {
         assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn collect_virtual_relation_columns_include_outer_scope_qualified_wildcards() {
+    let sql_with_cursor = r#"
+SELECT
+  src.|
+FROM parent_table p
+CROSS APPLY (
+  SELECT
+    p.*,
+    c.child_only
+  FROM child_table c
+  WHERE c.parent_id = p.id
+) src
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["PARENT_TABLE".to_string(), "CHILD_TABLE".to_string()];
+        guard.rebuild_indices();
+        guard.set_columns_for_table(
+            "PARENT_TABLE",
+            vec!["ID".to_string(), "PARENT_ONLY".to_string()],
+        );
+        guard.set_columns_for_table(
+            "CHILD_TABLE",
+            vec![
+                "ID".to_string(),
+                "PARENT_ID".to_string(),
+                "CHILD_ONLY".to_string(),
+            ],
+        );
+    }
+
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    let columns = virtual_table_columns
+        .get("src")
+        .cloned()
+        .unwrap_or_default();
+
+    for expected in ["id", "parent_only", "child_only"] {
+        assert_has_case_insensitive(&columns, expected);
+    }
+}
+
+#[test]
+fn collect_virtual_relation_columns_include_outer_virtual_scope_qualified_wildcards() {
+    let sql_with_cursor = r#"
+WITH parent_rows AS (
+  SELECT
+    p.id,
+    p.parent_only
+  FROM parent_table p
+)
+SELECT
+  src.|
+FROM parent_rows pr
+CROSS APPLY (
+  SELECT
+    pr.*
+  FROM dual
+) src
+"#;
+
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["PARENT_TABLE".to_string()];
+        guard.rebuild_indices();
+        guard.set_columns_for_table(
+            "PARENT_TABLE",
+            vec!["ID".to_string(), "PARENT_ONLY".to_string()],
+        );
+    }
+
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_table_columns =
+        collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
+    let columns = virtual_table_columns
+        .get("src")
+        .cloned()
+        .unwrap_or_default();
+
+    for expected in ["id", "parent_only"] {
+        assert_has_case_insensitive(&columns, expected);
     }
 }
 

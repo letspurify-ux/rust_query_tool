@@ -820,11 +820,6 @@ impl SqlEditorWidget {
             {
                 return None;
             }
-            if let Some(next_word) = Self::token_word(&next_token.token) {
-                if next_word.eq_ignore_ascii_case("EXCEPTION") {
-                    return None;
-                }
-            }
         }
 
         Some(name)

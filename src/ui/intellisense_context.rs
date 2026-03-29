@@ -161,6 +161,8 @@ pub struct CursorContext {
     pub(crate) statement_tokens: Arc<[SqlToken]>,
     /// Number of tokens located before/at cursor in `statement_tokens`.
     pub cursor_token_len: usize,
+    /// Innermost query body containing the cursor when inside a CTE/subquery.
+    pub(crate) active_query_range: Option<TokenRange>,
     /// Current SQL phase at cursor position
     pub phase: SqlPhase,
     /// Current parenthesis nesting depth (0 = top level)
@@ -304,6 +306,11 @@ pub(crate) fn analyze_cursor_context(
     let clamped_cursor_token_len = cursor_token_len.min(full_statement.len());
     let statement_tokens: Arc<[SqlToken]> = full_statement.to_vec().into();
     let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
+    let active_query_range = find_active_query_range(
+        &parse_result.parsed_ctes,
+        &parse_result.parsed_subqueries,
+        clamped_cursor_token_len,
+    );
     let mut visible_cte_entries = parse_result.parsed_ctes.clone();
     for open_entry in parse_result.cursor_open_ctes {
         if visible_cte_entries.iter().any(|entry| {
@@ -370,6 +377,7 @@ pub(crate) fn analyze_cursor_context(
     CursorContext {
         statement_tokens,
         cursor_token_len: clamped_cursor_token_len,
+        active_query_range,
         phase: parse_result.phase,
         depth: parse_result.depth,
         tables_in_scope,
@@ -3473,6 +3481,45 @@ fn filter_visible_ctes(
     }
 
     visible_entries.into_iter().map(|entry| entry.cte).collect()
+}
+
+fn token_range_contains_cursor(range: TokenRange, cursor_token_len: usize) -> bool {
+    !range.is_empty() && cursor_token_len >= range.start && cursor_token_len <= range.end
+}
+
+fn should_prefer_active_query_range(candidate: TokenRange, existing: TokenRange) -> bool {
+    let candidate_len = candidate.end.saturating_sub(candidate.start);
+    let existing_len = existing.end.saturating_sub(existing.start);
+    candidate_len < existing_len
+        || (candidate_len == existing_len && candidate.start >= existing.start)
+}
+
+fn find_active_query_range(
+    parsed_ctes: &[ParsedCteEntry],
+    parsed_subqueries: &[ParsedSubqueryEntry],
+    cursor_token_len: usize,
+) -> Option<TokenRange> {
+    let mut active_range = None;
+
+    let mut consider = |range: TokenRange| {
+        if !token_range_contains_cursor(range, cursor_token_len) {
+            return;
+        }
+
+        if active_range.is_none_or(|existing| should_prefer_active_query_range(range, existing)) {
+            active_range = Some(range);
+        }
+    };
+
+    for entry in parsed_ctes {
+        consider(entry.cte.body_range);
+    }
+
+    for entry in parsed_subqueries {
+        consider(entry.subquery.body_range);
+    }
+
+    active_range
 }
 
 pub(crate) fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {

@@ -1168,6 +1168,97 @@ impl SqlEditorWidget {
         common_columns
     }
 
+    fn current_query_tokens<'a>(
+        deep_ctx: &'a intellisense_context::CursorContext,
+    ) -> &'a [SqlToken] {
+        deep_ctx
+            .active_query_range
+            .map(|range| {
+                intellisense_context::token_range_slice(deep_ctx.statement_tokens.as_ref(), range)
+            })
+            .unwrap_or_else(|| deep_ctx.statement_tokens.as_ref())
+    }
+
+    fn cursor_token_len_in_current_query(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> usize {
+        deep_ctx
+            .active_query_range
+            .map(|range| {
+                deep_ctx
+                    .cursor_token_len
+                    .saturating_sub(range.start)
+                    .min(range.end.saturating_sub(range.start))
+            })
+            .unwrap_or(deep_ctx.cursor_token_len)
+    }
+
+    fn next_word_upper_in_tokens(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
+        let mut current_idx = idx;
+        while current_idx < tokens.len() {
+            match &tokens[current_idx] {
+                SqlToken::Comment(_) => current_idx += 1,
+                SqlToken::Word(word) => return Some((word.to_ascii_uppercase(), current_idx)),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn cursor_is_in_query_level_order_by(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> bool {
+        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause) {
+            return false;
+        }
+
+        let current_query_tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let token_depths = crate::ui::sql_depth::paren_depths(current_query_tokens);
+        let mut idx = 0usize;
+        let limit = cursor_token_len.min(current_query_tokens.len());
+
+        while idx < limit {
+            if !crate::ui::sql_depth::is_top_level_depth(&token_depths, idx) {
+                idx += 1;
+                continue;
+            }
+
+            let SqlToken::Word(word) = &current_query_tokens[idx] else {
+                idx += 1;
+                continue;
+            };
+            if !word.eq_ignore_ascii_case("ORDER") {
+                idx += 1;
+                continue;
+            }
+
+            let Some((next_keyword, next_idx)) =
+                Self::next_word_upper_in_tokens(current_query_tokens, idx + 1)
+            else {
+                return false;
+            };
+
+            if next_keyword == "BY" && next_idx < limit {
+                return true;
+            }
+
+            if next_keyword == "SIBLINGS" {
+                if let Some((tail_keyword, tail_idx)) =
+                    Self::next_word_upper_in_tokens(current_query_tokens, next_idx + 1)
+                {
+                    if tail_keyword == "BY" && tail_idx < limit {
+                        return true;
+                    }
+                }
+            }
+
+            idx += 1;
+        }
+
+        false
+    }
+
     fn find_virtual_columns_case_insensitive<'a>(
         virtual_table_columns: &'a HashMap<String, Vec<String>>,
         table: &str,
@@ -1256,7 +1347,7 @@ impl SqlEditorWidget {
         }
 
         let pattern_vars = intellisense_context::extract_match_recognize_pattern_variables(
-            deep_ctx.statement_tokens.as_ref(),
+            Self::current_query_tokens(deep_ctx),
         );
         if pattern_vars
             .iter()
@@ -1302,27 +1393,19 @@ impl SqlEditorWidget {
     fn collect_derived_columns_for_context(
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
-        let mut derived_columns = intellisense_context::extract_oracle_unpivot_generated_columns(
-            deep_ctx.statement_tokens.as_ref(),
+        let current_query_tokens = Self::current_query_tokens(deep_ctx);
+        let mut derived_columns =
+            intellisense_context::extract_oracle_unpivot_generated_columns(current_query_tokens);
+        derived_columns.extend(
+            intellisense_context::extract_oracle_model_generated_columns(current_query_tokens),
         );
         derived_columns.extend(
-            intellisense_context::extract_oracle_model_generated_columns(
-                deep_ctx.statement_tokens.as_ref(),
-            ),
-        );
-        derived_columns.extend(
-            intellisense_context::extract_match_recognize_generated_columns(
-                deep_ctx.statement_tokens.as_ref(),
-            ),
+            intellisense_context::extract_match_recognize_generated_columns(current_query_tokens),
         );
 
-        if matches!(
-            deep_ctx.phase,
-            intellisense_context::SqlPhase::OrderByClause
-        ) {
-            derived_columns.extend(intellisense_context::extract_select_list_columns(
-                deep_ctx.statement_tokens.as_ref(),
-            ));
+        if Self::cursor_is_in_query_level_order_by(deep_ctx) {
+            derived_columns
+                .extend(intellisense_context::extract_select_list_columns(current_query_tokens));
         }
 
         Self::dedup_column_names_case_insensitive(&mut derived_columns);
