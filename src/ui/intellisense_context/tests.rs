@@ -6981,6 +6981,65 @@ CROSS APPLY JSON_TABLE(
 }
 
 #[test]
+fn sql_server_openjson_with_clause_alias_collects_virtual_columns() {
+    let ctx = analyze(
+        r#"
+SELECT oj.|
+FROM orders o
+CROSS APPLY OPENJSON(
+  o.payload,
+  '$.items'
+) WITH (
+  item_id int '$.id',
+  item_nm nvarchar(100) '$.name'
+) oj
+"#,
+    );
+
+    let tables = resolve_qualifier_tables("oj", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["oj".to_string()]);
+
+    let oj = ctx
+        .subqueries
+        .iter()
+        .find(|subquery| subquery.alias.eq_ignore_ascii_case("oj"))
+        .expect("OPENJSON alias should be collected as virtual relation");
+    let body_tokens = token_range_slice(ctx.statement_tokens.as_ref(), oj.body_range);
+    let columns = extract_table_function_columns(body_tokens);
+    assert!(
+        columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case("item_id")),
+        "expected item_id from OPENJSON WITH clause, got {:?}",
+        columns
+    );
+    assert!(
+        columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case("item_nm")),
+        "expected item_nm from OPENJSON WITH clause, got {:?}",
+        columns
+    );
+}
+
+#[test]
+fn sql_server_openjson_without_with_clause_keeps_function_name_resolution() {
+    let ctx = analyze("SELECT oj.| FROM orders o CROSS APPLY OPENJSON(o.payload) oj");
+    let tables = resolve_qualifier_tables("oj", &ctx.tables_in_scope);
+    assert_eq!(tables, vec!["OPENJSON".to_string()]);
+    assert!(
+        ctx.subqueries
+            .iter()
+            .all(|subquery| !subquery.alias.eq_ignore_ascii_case("oj")),
+        "OPENJSON without explicit output columns should not become a virtual relation: {:?}",
+        ctx.subqueries
+            .iter()
+            .map(|subquery| &subquery.alias)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn oracle_table_function_alias_is_collected() {
     let ctx = analyze("SELECT t.| FROM TABLE(pkg_get_rows(:p_id)) t");
     let tables = resolve_qualifier_tables("t", &ctx.tables_in_scope);

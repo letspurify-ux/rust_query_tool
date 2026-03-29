@@ -1425,6 +1425,10 @@ pub(crate) fn starts_with_format_set_operator(text_upper: &str) -> bool {
         .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
+pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
+    first_meaningful_word(trimmed_upper).is_some_and(is_subquery_head_keyword)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FormatQueryOwnerKind {
     Clause,
@@ -1433,8 +1437,29 @@ pub(crate) enum FormatQueryOwnerKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatPlsqlChildQueryOwnerKind {
+    ControlBody,
+    CursorDeclaration,
+    OpenCursorFor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingFormatPlsqlChildQueryOwnerHeaderKind {
+    CursorDeclaration,
+    OpenCursorFor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingFormatQueryOwnerHeaderKind {
     ReferenceOn,
+    JoinLike,
+    ConditionNot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SplitQueryOwnerLookaheadKind {
+    GenericExpression,
+    DirectFromItem,
 }
 
 impl FormatQueryOwnerKind {
@@ -1484,15 +1509,36 @@ impl FormatQueryOwnerKind {
 }
 
 impl PendingFormatQueryOwnerHeaderKind {
-    pub(crate) fn owner_kind(self) -> FormatQueryOwnerKind {
+    pub(crate) fn owner_kind_for_line(self, line: &str) -> Option<FormatQueryOwnerKind> {
         match self {
-            Self::ReferenceOn => FormatQueryOwnerKind::Clause,
+            Self::ReferenceOn => Some(FormatQueryOwnerKind::Clause),
+            Self::JoinLike => {
+                if line_ends_with_keyword(line, "APPLY") {
+                    Some(FormatQueryOwnerKind::FromItem)
+                } else if line_ends_with_keyword(line, "JOIN") {
+                    Some(FormatQueryOwnerKind::Clause)
+                } else {
+                    None
+                }
+            }
+            Self::ConditionNot => {
+                let trimmed_upper = line.trim_start().to_ascii_uppercase();
+                (starts_with_keyword_token(&trimmed_upper, "EXISTS")
+                    || starts_with_keyword_token(&trimmed_upper, "IN")
+                    || line_ends_with_keyword(line, "EXISTS")
+                    || line_ends_with_keyword(line, "IN"))
+                .then_some(FormatQueryOwnerKind::Condition)
+            }
         }
     }
 
     pub(crate) fn line_completes(self, line: &str) -> bool {
         match self {
             Self::ReferenceOn => line_ends_with_keyword(line, "ON"),
+            Self::JoinLike => {
+                line_ends_with_keyword(line, "JOIN") || line_ends_with_keyword(line, "APPLY")
+            }
+            Self::ConditionNot => self.owner_kind_for_line(line).is_some(),
         }
     }
 
@@ -1503,29 +1549,166 @@ impl PendingFormatQueryOwnerHeaderKind {
 
         let trimmed_upper = line.trim_start().to_ascii_uppercase();
         match self {
-            Self::ReferenceOn => {
-                !starts_with_format_layout_clause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
-                    && !starts_with_format_model_subclause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "WINDOW")
-                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
-                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
-                    && !line_ends_with_pivot_owner(line)
-                    && !line_ends_with_unpivot_owner(line)
-                    && !line_ends_with_keyword(line, "COLUMNS")
+            Self::ReferenceOn => !starts_with_auto_format_owner_boundary(line),
+            // JOIN/APPLY modifier chains are the only structural continuation
+            // that can legally extend this pending owner family.
+            // Everything else must terminate the pending header immediately.
+            Self::JoinLike => starts_with_pending_query_owner_join_modifier(&trimmed_upper),
+            Self::ConditionNot => self.line_completes(line),
+        }
+    }
+
+    pub(crate) fn normalized_current_line_depth(
+        self,
+        current_depth: usize,
+        query_base_depth: Option<usize>,
+        condition_header_depth: Option<usize>,
+    ) -> usize {
+        match self {
+            Self::ReferenceOn => current_depth,
+            Self::JoinLike => query_base_depth.unwrap_or(current_depth),
+            Self::ConditionNot => FormatQueryOwnerKind::Condition
+                .header_depth_floor(query_base_depth, condition_header_depth)
+                .map(|depth_floor| current_depth.max(depth_floor))
+                .unwrap_or(current_depth),
+        }
+    }
+}
+
+/// Returns true when `line` begins a structural formatter boundary that must
+/// terminate any pending split-owner/header continuation.
+///
+/// This intentionally covers every nested-owner family that can redirect the
+/// indentation state machine onto a different stack:
+/// - query-owner headers and pending fragments (`FROM`, `JOIN`, `LATERAL`,
+///   `REFERENCE ... ON`, `NOT EXISTS`, ...)
+/// - multiline owner headers and pending fragments (`WITHIN GROUP`,
+///   `WINDOW ... AS`, `NESTED PATH ... COLUMNS`, ...)
+/// - generic expression query owners (`CURSOR`, `MULTISET`)
+/// - PL/SQL child-query owners (`BEGIN`, `CURSOR ... IS`, `OPEN ... FOR`, ...)
+fn starts_with_auto_format_owner_boundary(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let trimmed_upper = trimmed.to_ascii_uppercase();
+    starts_with_format_layout_clause(&trimmed_upper)
+        || starts_with_format_set_operator(&trimmed_upper)
+        || format_query_owner_header_kind(trimmed).is_some()
+        || format_query_owner_pending_header_kind(trimmed).is_some()
+        || format_indented_paren_owner_header_kind(trimmed).is_some()
+        || format_indented_paren_pending_header_kind(trimmed).is_some()
+        || line_ends_with_format_expression_query_owner_keyword(trimmed)
+        || format_plsql_child_query_owner_kind(&trimmed_upper).is_some()
+        || format_plsql_child_query_owner_pending_header_kind(trimmed).is_some()
+}
+
+pub(crate) fn format_plsql_child_query_owner_kind(
+    text_upper: &str,
+) -> Option<FormatPlsqlChildQueryOwnerKind> {
+    let trimmed = text_upper.trim();
+
+    if starts_with_keyword_token(trimmed, "BEGIN")
+        || starts_with_keyword_token(trimmed, "EXCEPTION")
+        || starts_with_keyword_token(trimmed, "ELSE")
+        || starts_with_keyword_token(trimmed, "ELSIF")
+        || starts_with_keyword_token(trimmed, "ELSEIF")
+    {
+        Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+    } else if starts_with_keyword_token(trimmed, "CURSOR")
+        && (trimmed.contains(" IS") || trimmed.contains(" AS"))
+    {
+        Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+    } else if starts_with_keyword_token(trimmed, "OPEN") && trimmed.contains(" FOR") {
+        Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+    } else {
+        None
+    }
+}
+
+impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
+    pub(crate) fn line_completes(self, line: &str) -> bool {
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
+        match self {
+            Self::CursorDeclaration => {
+                starts_with_keyword_token(&trimmed_upper, "IS")
+                    || starts_with_keyword_token(&trimmed_upper, "AS")
+                    || line_ends_with_keyword(line, "IS")
+                    || line_ends_with_keyword(line, "AS")
+            }
+            Self::OpenCursorFor => {
+                starts_with_keyword_token(&trimmed_upper, "FOR")
+                    || line_ends_with_keyword(line, "FOR")
             }
         }
     }
+
+    pub(crate) fn line_can_continue(self, line: &str) -> bool {
+        if self.line_completes(line) {
+            return true;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.ends_with(';') {
+            return false;
+        }
+
+        !starts_with_auto_format_owner_boundary(trimmed)
+    }
+}
+
+pub(crate) fn format_plsql_child_query_owner_pending_header_kind(
+    line: &str,
+) -> Option<PendingFormatPlsqlChildQueryOwnerHeaderKind> {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
+    if starts_with_keyword_token(&trimmed_upper, "CURSOR")
+        && format_plsql_child_query_owner_kind(&trimmed_upper)
+            != Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+        && !line.trim_end().ends_with(';')
+    {
+        return Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration);
+    }
+
+    (starts_with_keyword_token(&trimmed_upper, "OPEN")
+        && format_plsql_child_query_owner_kind(&trimmed_upper)
+            != Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        && !line.trim_end().ends_with(';'))
+    .then_some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
 }
 
 pub(crate) fn format_query_owner_pending_header_kind(
     line: &str,
 ) -> Option<PendingFormatQueryOwnerHeaderKind> {
     let trimmed_upper = line.trim_start().to_ascii_uppercase();
-    (starts_with_keyword_token(&trimmed_upper, "REFERENCE")
+    if starts_with_keyword_token(&trimmed_upper, "REFERENCE")
         && !line_ends_with_keyword(line, "ON")
+        && !line_ends_with_open_paren_before_inline_comment(line)
+    {
+        return Some(PendingFormatQueryOwnerHeaderKind::ReferenceOn);
+    }
+
+    if line_ends_with_keyword(line, "NOT")
+        && !line_ends_with_identifier_sequence(line, &["IS", "NOT"])
+        && !line_ends_with_open_paren_before_inline_comment(line)
+    {
+        return Some(PendingFormatQueryOwnerHeaderKind::ConditionNot);
+    }
+
+    (starts_with_pending_query_owner_join_modifier(&trimmed_upper)
+        && !line_ends_with_keyword(line, "JOIN")
+        && !line_ends_with_keyword(line, "APPLY")
         && !line_ends_with_open_paren_before_inline_comment(line))
-    .then_some(PendingFormatQueryOwnerHeaderKind::ReferenceOn)
+    .then_some(PendingFormatQueryOwnerHeaderKind::JoinLike)
+}
+
+fn starts_with_pending_query_owner_join_modifier(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "OUTER")
+        || FORMAT_JOIN_MODIFIER_KEYWORDS
+            .iter()
+            .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2067,40 +2250,7 @@ impl PendingFormatIndentedParenOwnerHeaderKind {
             return true;
         }
 
-        let trimmed_upper = line.trim_start().to_ascii_uppercase();
-        match self {
-            Self::WindowAs => {
-                !starts_with_format_layout_clause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
-                    && !starts_with_format_model_subclause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
-                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
-                    && !line_ends_with_pivot_owner(line)
-                    && !line_ends_with_unpivot_owner(line)
-                    && !line_ends_with_keyword(line, "COLUMNS")
-            }
-            Self::WithinGroup => {
-                !starts_with_format_layout_clause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
-                    && !starts_with_format_model_subclause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "WINDOW")
-                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
-                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
-                    && !line_ends_with_pivot_owner(line)
-                    && !line_ends_with_unpivot_owner(line)
-                    && !line_ends_with_keyword(line, "COLUMNS")
-            }
-            Self::NestedPathColumns => {
-                !starts_with_format_layout_clause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "MODEL")
-                    && !starts_with_format_model_subclause(&trimmed_upper)
-                    && !starts_with_keyword_token(&trimmed_upper, "WINDOW")
-                    && !starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
-                    && !starts_with_format_match_recognize_subclause(&trimmed_upper)
-                    && !line_ends_with_pivot_owner(line)
-                    && !line_ends_with_unpivot_owner(line)
-            }
-        }
+        !starts_with_auto_format_owner_boundary(line)
     }
 }
 
@@ -2154,10 +2304,24 @@ pub(crate) fn format_indented_paren_owner_header_continues(
     }
 }
 
+/// Returns true when `text_upper` is the trailing token of a split MODEL
+/// subclause header that can still own a following standalone `(` line.
+///
+/// This covers headers whose final token is not itself recognized as a direct
+/// MODEL subclause start, such as `PARTITION / BY / (` or
+/// `RULES / AUTOMATIC / ORDER / (`.
+pub(crate) fn starts_with_format_model_multiline_owner_tail(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "BY")
+        || starts_with_keyword_token(text_upper, "ORDER")
+        || starts_with_keyword_token(text_upper, "ALL")
+}
+
 /// Returns the formatter query-owner kind when `line` ends on the owner header
 /// token itself and the opening parenthesis starts on a later line.
 pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
-    if line_ends_with_keyword(line, "LATERAL") || line_ends_with_keyword(line, "APPLY") {
+    if line_ends_with_format_direct_from_item_query_owner_keyword(line)
+        || line_ends_with_keyword(line, "APPLY")
+    {
         return Some(FormatQueryOwnerKind::FromItem);
     }
 
@@ -2205,6 +2369,39 @@ pub(crate) fn format_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind
     line_ends_with_open_paren_before_inline_comment(line)
         .then(|| format_query_owner_header_kind(line))
         .flatten()
+}
+
+/// Detects split query-owner headers whose nested query starts on a later
+/// standalone `(` line followed by a query head.
+///
+/// The formatter's analyzer and indentation phases both use this helper so the
+/// owner-family classification stays consistent for nested wrapper/query-owner
+/// constructs such as `CURSOR`, `MULTISET`, `LATERAL`, and `TABLE`.
+pub(crate) fn split_query_owner_lookahead_kind(
+    line: &str,
+    next_code_is_standalone_open_paren: bool,
+    head_trimmed_upper: Option<&str>,
+) -> Option<SplitQueryOwnerLookaheadKind> {
+    if line_ends_with_open_paren_before_inline_comment(line)
+        || !next_code_is_standalone_open_paren
+        || !head_trimmed_upper.is_some_and(line_starts_query_head)
+    {
+        return None;
+    }
+
+    if line_ends_with_format_expression_query_owner_keyword(line)
+        && format_query_owner_header_kind(line).is_none()
+        && format_indented_paren_owner_header_kind(line).is_none()
+        && format_query_owner_pending_header_kind(line).is_none()
+        && format_indented_paren_pending_header_kind(line).is_none()
+    {
+        return Some(SplitQueryOwnerLookaheadKind::GenericExpression);
+    }
+
+    (line_ends_with_format_direct_from_item_query_owner_keyword(line)
+        && format_query_owner_pending_header_kind(line).is_none()
+        && format_indented_paren_pending_header_kind(line).is_none())
+    .then_some(SplitQueryOwnerLookaheadKind::DirectFromItem)
 }
 
 /// Returns true when `text_upper` starts with a MODEL subclause whose body is
@@ -2423,6 +2620,26 @@ fn line_ends_with_unpivot_owner(line: &str) -> bool {
         || line_ends_with_identifier_sequence(line, &["UNPIVOT", "EXCLUDE", "NULLS"])
 }
 
+pub(crate) fn line_ends_with_format_expression_query_owner_keyword(line: &str) -> bool {
+    line_ends_with_identifier_sequence(line, &["CURSOR"])
+        || line_ends_with_identifier_sequence(line, &["MULTISET"])
+}
+
+fn line_ends_with_format_table_from_item_query_owner_keyword(line: &str) -> bool {
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    (starts_with_keyword_token(&trimmed_upper, "TABLE")
+        || line_ends_with_identifier_sequence(line, &["FROM", "TABLE"])
+        || line_ends_with_identifier_sequence(line, &["JOIN", "TABLE"])
+        || line_ends_with_identifier_sequence(line, &["APPLY", "TABLE"])
+        || line_ends_with_identifier_sequence(line, &["USING", "TABLE"]))
+        && line_ends_with_identifier_sequence(line, &["TABLE"])
+}
+
+pub(crate) fn line_ends_with_format_direct_from_item_query_owner_keyword(line: &str) -> bool {
+    line_ends_with_identifier_sequence(line, &["LATERAL"])
+        || line_ends_with_format_table_from_item_query_owner_keyword(line)
+}
+
 fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
     line_ends_with_identifier_sequence(line, &[keyword])
 }
@@ -2590,6 +2807,68 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
     }
 
     profile
+}
+
+pub(crate) fn significant_paren_depth_after_profile(
+    mut depth: usize,
+    paren_profile: &SignificantParenProfile,
+) -> usize {
+    for event in &paren_profile.events {
+        match event {
+            SignificantParenEvent::Open => {
+                depth = depth.saturating_add(1);
+            }
+            SignificantParenEvent::Close => {
+                depth = depth.saturating_sub(1);
+            }
+        }
+    }
+
+    depth
+}
+
+/// Returns the meaningful remainder of `line` after consuming any leading
+/// close-paren run, including intervening whitespace or block comments.
+pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut consumed_close = false;
+
+    loop {
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+        }
+
+        if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+
+        if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
+            return "";
+        }
+
+        if bytes.get(idx) == Some(&b')') {
+            consumed_close = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        break;
+    }
+
+    if consumed_close {
+        line.get(idx..).map(str::trim_start).unwrap_or("")
+    } else {
+        line.trim_start()
+    }
 }
 
 /// Returns true when a leading keyword should preserve the next line as a
@@ -2798,6 +3077,13 @@ mod tests {
     }
 
     #[test]
+    fn line_starts_query_head_recognizes_select_and_with_heads() {
+        assert!(line_starts_query_head("SELECT empno"));
+        assert!(line_starts_query_head("WITH bonus_cte AS"));
+        assert!(!line_starts_query_head("ORDER BY empno"));
+    }
+
+    #[test]
     fn significant_paren_profile_tracks_event_order_and_leading_closes() {
         let profile = significant_paren_profile(") ) PARTITION BY (expr + (1))");
 
@@ -2828,6 +3114,28 @@ mod tests {
                 SignificantParenEvent::Open,
                 SignificantParenEvent::Close,
             ]
+        );
+    }
+
+    #[test]
+    fn significant_paren_depth_after_profile_tracks_nested_events() {
+        let balanced = significant_paren_profile("(a + (b))");
+        assert_eq!(significant_paren_depth_after_profile(0, &balanced), 0);
+
+        let unbalanced = significant_paren_profile("(a + (b)");
+        assert_eq!(significant_paren_depth_after_profile(1, &unbalanced), 2);
+    }
+
+    #[test]
+    fn trim_after_leading_close_parens_skips_comments_and_returns_remaining_code() {
+        assert_eq!(
+            trim_after_leading_close_parens(" ) /* nested */ EXCLUDE CURRENT ROW"),
+            "EXCLUDE CURRENT ROW"
+        );
+        assert_eq!(trim_after_leading_close_parens(") -- comment only"), "");
+        assert_eq!(
+            trim_after_leading_close_parens("PARTITION BY deptno"),
+            "PARTITION BY deptno"
         );
     }
 
@@ -3091,6 +3399,15 @@ mod tests {
     }
 
     #[test]
+    fn format_model_multiline_owner_tail_helper_covers_split_owner_header_tails() {
+        assert!(starts_with_format_model_multiline_owner_tail("BY"));
+        assert!(starts_with_format_model_multiline_owner_tail("ORDER"));
+        assert!(starts_with_format_model_multiline_owner_tail("ALL"));
+        assert!(!starts_with_format_model_multiline_owner_tail("ROWS"));
+        assert!(!starts_with_format_model_multiline_owner_tail("ON"));
+    }
+
+    #[test]
     fn format_model_subclause_phase1_breaks_keep_rules_headers_but_not_rules_modifiers() {
         assert!(
             FormatIndentedParenOwnerKind::ModelSubclause.starts_phase1_body_header_words(
@@ -3349,6 +3666,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_indented_paren_owner_headers_stop_on_other_structural_owner_boundaries() {
+        let within_group = PendingFormatIndentedParenOwnerHeaderKind::WithinGroup;
+        let window_as = PendingFormatIndentedParenOwnerHeaderKind::WindowAs;
+        let nested_columns = PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns;
+
+        assert!(!within_group.line_can_continue("LATERAL"));
+        assert!(!within_group.line_can_continue("CURSOR"));
+        assert!(!window_as.line_can_continue("REFERENCE ref_limits"));
+        assert!(!window_as.line_can_continue("OPEN c_emp"));
+        assert!(!nested_columns.line_can_continue("LEFT OUTER"));
+        assert!(!nested_columns.line_can_continue("BEGIN"));
+    }
+
+    #[test]
     fn format_indented_paren_owner_header_kind_covers_split_owner_heads() {
         assert_eq!(
             format_indented_paren_owner_header_kind("SUM (sal) OVER"),
@@ -3411,6 +3742,14 @@ mod tests {
             Some(FormatQueryOwnerKind::FromItem)
         );
         assert_eq!(
+            format_query_owner_kind("FROM TABLE ("),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_kind("LEFT JOIN TABLE ("),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
             format_query_owner_kind("MERGE INTO dst d USING ("),
             Some(FormatQueryOwnerKind::Clause)
         );
@@ -3461,6 +3800,14 @@ mod tests {
             Some(FormatQueryOwnerKind::FromItem)
         );
         assert_eq!(
+            format_query_owner_header_kind("FROM TABLE"),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
+            format_query_owner_header_kind("LEFT JOIN TABLE"),
+            Some(FormatQueryOwnerKind::FromItem)
+        );
+        assert_eq!(
             format_query_owner_header_kind("REFERENCE ref_limits ON"),
             Some(FormatQueryOwnerKind::Clause)
         );
@@ -3478,6 +3825,211 @@ mod tests {
         assert_eq!(format_query_owner_header_kind("ALL ROWS PER MATCH"), None);
         assert_eq!(format_query_owner_header_kind("FOR rec IN"), None);
         assert_eq!(format_query_owner_header_kind("UNION ALL"), None);
+        assert_eq!(format_query_owner_header_kind("CREATE TABLE"), None);
+    }
+
+    #[test]
+    fn format_query_owner_pending_header_kind_tracks_split_join_and_apply_modifier_chains() {
+        let natural_pending =
+            format_query_owner_pending_header_kind("NATURAL").expect("pending NATURAL owner");
+        assert!(natural_pending.line_can_continue("LEFT"));
+        assert!(!natural_pending.line_completes("LEFT"));
+
+        let join_pending =
+            format_query_owner_pending_header_kind("LEFT OUTER").expect("pending LEFT OUTER owner");
+        assert!(join_pending.line_can_continue("JOIN"));
+        assert!(join_pending.line_completes("JOIN"));
+
+        let apply_pending =
+            format_query_owner_pending_header_kind("CROSS").expect("pending CROSS owner");
+        assert!(apply_pending.line_can_continue("APPLY"));
+        assert!(apply_pending.line_completes("APPLY"));
+    }
+
+    #[test]
+    fn format_query_owner_pending_header_kind_tracks_split_not_condition_owner_chain() {
+        let not_pending = format_query_owner_pending_header_kind("NOT").expect("pending NOT owner");
+
+        assert!(not_pending.line_can_continue("EXISTS"));
+        assert!(not_pending.line_can_continue("IN"));
+        assert!(not_pending.line_completes("EXISTS"));
+        assert!(not_pending.line_completes("IN"));
+        assert_eq!(
+            not_pending.owner_kind_for_line("EXISTS"),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert_eq!(
+            not_pending.owner_kind_for_line("IN"),
+            Some(FormatQueryOwnerKind::Condition)
+        );
+        assert!(!not_pending.line_can_continue("SELECT"));
+    }
+
+    #[test]
+    fn split_query_owner_lookahead_kind_detects_safe_split_owner_headers() {
+        assert_eq!(
+            split_query_owner_lookahead_kind("CURSOR", true, Some("SELECT empno")),
+            Some(SplitQueryOwnerLookaheadKind::GenericExpression)
+        );
+        assert_eq!(
+            split_query_owner_lookahead_kind("MULTISET", true, Some("WITH bonus_cte AS")),
+            Some(SplitQueryOwnerLookaheadKind::GenericExpression)
+        );
+        assert_eq!(
+            split_query_owner_lookahead_kind("LATERAL", true, Some("SELECT empno")),
+            Some(SplitQueryOwnerLookaheadKind::DirectFromItem)
+        );
+        assert_eq!(
+            split_query_owner_lookahead_kind("FROM TABLE", true, Some("SELECT empno")),
+            Some(SplitQueryOwnerLookaheadKind::DirectFromItem)
+        );
+        assert_eq!(
+            split_query_owner_lookahead_kind("ORDER BY", true, Some("SELECT empno")),
+            None
+        );
+        assert_eq!(
+            split_query_owner_lookahead_kind("CURSOR", false, Some("SELECT empno")),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_reference_owner_header_stops_on_other_structural_owner_boundaries() {
+        let reference_pending = PendingFormatQueryOwnerHeaderKind::ReferenceOn;
+
+        assert!(!reference_pending.line_can_continue("LATERAL"));
+        assert!(!reference_pending.line_can_continue("CURSOR"));
+        assert!(!reference_pending.line_can_continue("BEGIN"));
+        assert!(!reference_pending.line_can_continue("OPEN c_emp"));
+    }
+
+    #[test]
+    fn format_expression_query_owner_keywords_cover_safe_split_expression_wrappers() {
+        assert!(line_ends_with_format_expression_query_owner_keyword(
+            "CURSOR"
+        ));
+        assert!(line_ends_with_format_expression_query_owner_keyword(
+            "MULTISET -- wrapper comment"
+        ));
+        assert!(!line_ends_with_format_expression_query_owner_keyword(
+            "ORDER BY"
+        ));
+        assert!(!line_ends_with_format_expression_query_owner_keyword(
+            "SELECT e.empno,"
+        ));
+    }
+
+    #[test]
+    fn format_direct_from_item_query_owner_keywords_cover_safe_split_lateral_headers() {
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "LATERAL"
+        ));
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "LATERAL -- derived rows"
+        ));
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "TABLE"
+        ));
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "TABLE -- derived rows"
+        ));
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "FROM TABLE"
+        ));
+        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+            "LEFT JOIN TABLE"
+        ));
+        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+            "OUTER APPLY"
+        ));
+        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+            "TABLE collection_expr"
+        ));
+        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+            "CREATE TABLE"
+        ));
+        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+            "JOIN"
+        ));
+    }
+
+    #[test]
+    fn format_plsql_child_query_owner_kind_covers_nested_control_and_query_owners() {
+        assert_eq!(
+            format_plsql_child_query_owner_kind("BEGIN"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("EXCEPTION"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("ELSE"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("ELSIF v_ready THEN"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("ELSEIF v_ready THEN"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("CURSOR c_emp IS"),
+            Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("CURSOR c_emp (p_deptno NUMBER) AS"),
+            Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("OPEN c_emp FOR"),
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("OPEN c_emp FOR SELECT empno FROM emp"),
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
+        assert_eq!(format_plsql_child_query_owner_kind("LOOP"), None);
+        assert_eq!(format_plsql_child_query_owner_kind("END IF;"), None);
+        assert_eq!(format_plsql_child_query_owner_kind("FOR rec IN ("), None);
+    }
+
+    #[test]
+    fn format_plsql_child_query_owner_pending_header_kind_tracks_split_cursor_and_open_headers() {
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("CURSOR c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("OPEN c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("CURSOR c_emp IS"),
+            None
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("OPEN c_emp FOR"),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_plsql_child_query_owner_header_kind_recognizes_split_completion_lines() {
+        let cursor_kind = PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration;
+        assert!(cursor_kind.line_completes("IS"));
+        assert!(cursor_kind.line_completes(") AS"));
+        assert!(cursor_kind.line_can_continue("(p_deptno NUMBER,"));
+        assert!(cursor_kind.line_can_continue("p_ename VARCHAR2(30)"));
+        assert!(!cursor_kind.line_can_continue("SELECT empno"));
+
+        let open_kind = PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor;
+        assert!(open_kind.line_completes("FOR"));
+        assert!(open_kind.line_completes("FOR /* owner */"));
+        assert!(open_kind.line_can_continue("c_emp"));
+        assert!(!open_kind.line_can_continue("SELECT empno"));
     }
 
     #[test]

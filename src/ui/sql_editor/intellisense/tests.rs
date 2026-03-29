@@ -2039,6 +2039,89 @@ ORDER BY x.deptno
     }
 
     #[test]
+    fn openjson_alias_qualified_column_suggestions_include_with_clause_names() {
+        let sql_with_cursor = r#"
+SELECT
+  oj.|
+FROM orders o
+CROSS APPLY OPENJSON(
+  o.payload,
+  '$.items'
+) WITH (
+  item_id int '$.id',
+  item_nm nvarchar(100) '$.name',
+  item_qty int '$.qty'
+) oj
+ORDER BY oj.item_id
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+        let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+        let cursor_in_statement = cursor.saturating_sub(stmt_start);
+        let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("oj", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["oj".to_string()]);
+
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+
+        for subq in &deep_ctx.subqueries {
+            let body_tokens = intellisense_context::token_range_slice(
+                deep_ctx.statement_tokens.as_ref(),
+                subq.body_range,
+            );
+            let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+            if columns.is_empty() {
+                columns = intellisense_context::extract_table_function_columns(body_tokens);
+            }
+            let body_tables_in_scope =
+                intellisense_context::collect_tables_in_statement(body_tokens);
+            let (wildcard_columns, _wildcard_tables) =
+                SqlEditorWidget::expand_virtual_table_wildcards(
+                    body_tokens,
+                    &body_tables_in_scope,
+                    &HashMap::new(),
+                    &data,
+                    &sender,
+                    &connection,
+                );
+            columns.extend(wildcard_columns);
+            SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
+            if !columns.is_empty() {
+                lock_or_recover(&data).set_virtual_table_columns(&subq.alias, columns);
+            }
+        }
+
+        let mut guard = lock_or_recover(&data);
+        let suggestions = guard.get_column_suggestions("", Some(&column_tables));
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("item_id")),
+            "expected item_id suggestion, got: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("item_nm")),
+            "expected item_nm suggestion, got: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("item_qty")),
+            "expected item_qty suggestion, got: {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
     fn cte_chain_qualified_column_suggestions_include_wildcard_expansion() {
         let sql_with_cursor = r#"
 WITH

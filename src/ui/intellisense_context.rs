@@ -312,9 +312,21 @@ fn is_from_consuming_function(name: &str) -> bool {
     )
 }
 
-/// FROM-clause table functions that may reference left-side row source aliases.
-fn is_from_lateral_table_function(name: &str) -> bool {
+/// FROM-clause table functions that may reference left-side row source aliases
+/// without an explicit APPLY/LATERAL modifier.
+fn is_implicitly_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE" | "UNNEST" | "TABLE")
+}
+
+fn relation_has_explicit_output_columns(tokens: &[SqlToken]) -> bool {
+    !extract_table_function_columns(tokens).is_empty()
+}
+
+fn relation_uses_virtual_alias_scope(table_name: &str, relation_body_tokens: &[SqlToken]) -> bool {
+    relation_function_name_hint(table_name)
+        .as_deref()
+        .is_some_and(is_implicitly_lateral_table_function)
+        || relation_has_explicit_output_columns(relation_body_tokens)
 }
 
 fn is_merge_action_context(
@@ -1324,7 +1336,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 let is_from_lateral_function = depth_frames
                     .get(depth)
                     .and_then(|frame| frame.paren_func.as_deref())
-                    .is_some_and(is_from_lateral_table_function);
+                    .is_some_and(is_implicitly_lateral_table_function);
                 let inherited_visible_parent = if matches!(parent_phase, SqlPhase::FromClause)
                     && !relation_modifier_state.blocks_outer_scope_cutoff()
                     && !is_from_lateral_function
@@ -2394,6 +2406,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 let relation_arg_end = relation_arg_parsed
                                     .map(|(_, arg_end_idx)| arg_end_idx)
                                     .unwrap_or(next_idx);
+                                let relation_output_end = if relation_arg_range.is_some() {
+                                    skip_relation_postfix_clauses(tokens, relation_arg_end)
+                                } else {
+                                    relation_arg_end
+                                };
+                                let relation_body_range = relation_arg_range.and_then(|_| {
+                                    (idx < relation_output_end).then_some(TokenRange {
+                                        start: idx,
+                                        end: relation_output_end,
+                                    })
+                                });
+                                let relation_arg_tokens =
+                                    relation_body_range.map(|range| token_range_slice(tokens, range));
                                 let (alias, after_alias) =
                                     parse_alias_deep(tokens, relation_arg_end);
                                 let alias = alias.or_else(|| {
@@ -2404,21 +2429,25 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
-                                let is_lateral_table_function = relation_name_hint
-                                    .as_deref()
-                                    .is_some_and(is_from_lateral_table_function);
-                                let table_scope_name = if is_lateral_table_function {
+                                let uses_virtual_alias_scope = relation_arg_tokens
+                                    .is_some_and(|body_tokens| {
+                                        relation_uses_virtual_alias_scope(
+                                            &table_name,
+                                            body_tokens,
+                                        )
+                                    });
+                                let table_scope_name = if uses_virtual_alias_scope {
                                     alias.clone().unwrap_or_else(|| table_name.clone())
                                 } else {
                                     table_name.clone()
                                 };
                                 let relation_tracking_name = table_scope_name.clone();
-                                if let (Some(alias_name), Some(body_range), Some(function_name)) = (
+                                if let (Some(alias_name), Some(body_range), Some(body_tokens)) = (
                                     alias.as_ref(),
-                                    relation_arg_range,
-                                    relation_name_hint.as_deref(),
+                                    relation_body_range,
+                                    relation_arg_tokens,
                                 ) {
-                                    if is_from_lateral_table_function(function_name) {
+                                    if relation_uses_virtual_alias_scope(&table_name, body_tokens) {
                                         all_subqueries.push(ParsedSubqueryEntry {
                                             subquery: SubqueryDefinition {
                                                 alias: alias_name.clone(),
@@ -3968,8 +3997,9 @@ pub(crate) fn extract_select_list_wildcard_tables(
     tables
 }
 
-/// Extract column names from table-function `COLUMNS` clauses such as
-/// `XMLTABLE(... COLUMNS col1 NUMBER PATH '...', col2 VARCHAR2(30) PATH '...')`.
+/// Extract column names from explicit table-function output clauses such as
+/// `XMLTABLE(... COLUMNS col1 NUMBER PATH '...')` or
+/// `OPENJSON(... WITH (col1 int '$.id'))`.
 /// Returns discovered column names in appearance order.
 pub(crate) fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
     let token_depths = paren_depths(tokens);
@@ -4637,12 +4667,19 @@ fn collect_table_function_columns(
             idx += 1;
             continue;
         };
-        if !word.eq_ignore_ascii_case("COLUMNS") {
+        let marker_upper = word.to_ascii_uppercase();
+        if marker_upper != "COLUMNS" && marker_upper != "WITH" {
             idx += 1;
             continue;
         }
 
         let next_idx = next_non_comment_index(tokens, idx.saturating_add(1));
+        if marker_upper == "WITH"
+            && !matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
+            idx += 1;
+            continue;
+        }
         if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
             if let Some((range, after_paren)) = extract_parenthesized_range(tokens, next_idx) {
                 let range_tokens = token_range_slice(tokens, range);
