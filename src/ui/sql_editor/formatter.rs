@@ -6778,27 +6778,32 @@ impl SqlEditorWidget {
                         })
                         .unwrap_or(condition_indent.saturating_add(1).max(parser_depth))
                 } else if previous_line_is_condition_keyword {
-                    let paren_context_stable =
-                        current_general_paren_frame_count == prev_general_paren_frame_count;
-                    if paren_context_stable {
-                        last_code_indent
-                            .map(|indent| indent.max(condition_indent))
-                            .unwrap_or(condition_indent)
-                    } else if let Some(frame) = active_general_paren_frame {
-                        let base = frame.continuation_depth.max(condition_indent);
-                        // Add +1 when the paren was opened at or above the
-                        // query base (owner_depth < condition_indent), meaning
-                        // it is a condition-grouping paren on the WHERE/ON/
-                        // HAVING line.  Parens opened deeper (on an AND/OR
-                        // line that was already +1'd) have continuation that
-                        // already accounts for the extra level.
-                        if frame.owner_depth < condition_indent {
-                            base.saturating_add(1)
-                        } else {
-                            base
-                        }
+                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied()
+                    {
+                        join_and_depth.max(condition_indent)
                     } else {
-                        condition_indent
+                        let paren_context_stable =
+                            current_general_paren_frame_count == prev_general_paren_frame_count;
+                        if paren_context_stable {
+                            last_code_indent
+                                .map(|indent| indent.max(condition_indent))
+                                .unwrap_or(condition_indent)
+                        } else if let Some(frame) = active_general_paren_frame {
+                            let base = frame.continuation_depth.max(condition_indent);
+                            // Add +1 when the paren was opened at or above the
+                            // query base (owner_depth < condition_indent), meaning
+                            // it is a condition-grouping paren on the WHERE/ON/
+                            // HAVING line.  Parens opened deeper (on an AND/OR
+                            // line that was already +1'd) have continuation that
+                            // already accounts for the extra level.
+                            if frame.owner_depth < condition_indent {
+                                base.saturating_add(1)
+                            } else {
+                                base
+                            }
+                        } else {
+                            condition_indent
+                        }
                     }
                 } else if let Some(frame) = active_general_paren_frame {
                     // Inside a General paren opened at query base level,

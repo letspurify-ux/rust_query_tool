@@ -6780,6 +6780,29 @@ WHEN MATCHED THEN UPDATE SET
     }
 
     #[test]
+    fn format_sql_basic_realigns_join_on_nested_paren_condition_continuations() {
+        let sql = "select *
+from a
+join b
+    on ((1 = 1
+                and 2 = 2))
+        and 3 = 3;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "JOIN b
+    ON ((1 = 1
+            AND 2 = 2))
+        AND 3 = 3;"
+            ),
+            "nested ON-condition continuation should realign to ON-owned depth after parenthesized body closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn cursor_result_column_names_preserve_raw_headers_for_later_print() {
         let columns = vec![
             ColumnInfo {
