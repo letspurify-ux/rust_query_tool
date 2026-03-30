@@ -166,6 +166,8 @@ struct QueryBaseDepthFrame {
     pending_same_depth_set_operator_head: bool,
     into_continuation: bool,
     trailing_comma_continuation: bool,
+    from_item_list_body_depth: Option<usize>,
+    pending_from_item_body: bool,
     multitable_insert_branch_depth: usize,
     is_multitable_insert: bool,
     merge_branch_body_depth: Option<usize>,
@@ -1571,6 +1573,8 @@ impl QueryExecutor {
                     pending_same_depth_set_operator_head: false,
                     into_continuation: false,
                     trailing_comma_continuation: false,
+                    from_item_list_body_depth: None,
+                    pending_from_item_body: false,
                     multitable_insert_branch_depth: 0,
                     is_multitable_insert: Self::line_is_multitable_insert_header(&trimmed_upper),
                     merge_branch_body_depth: None,
@@ -1644,6 +1648,15 @@ impl QueryExecutor {
                 let is_join_clause = Self::auto_format_is_join_clause(&trimmed_upper);
                 let is_join_condition_clause =
                     Self::auto_format_is_join_condition_clause(&trimmed_upper);
+                let from_item_list_body_depth = frame
+                    .from_item_list_body_depth
+                    .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
+                let current_line_is_bare_direct_from_item_query_owner =
+                    current_line_is_direct_split_from_item_query_owner
+                        && Self::line_starts_with_bare_direct_from_item_query_owner(&trimmed_upper);
+                let current_line_is_pending_from_item_body = frame.pending_from_item_body
+                    && matches!(clause_kind, None | Some(AutoFormatClauseKind::Table))
+                    && !sql_text::line_has_leading_significant_close_paren(trimmed);
                 let is_query_condition_continuation_clause =
                     Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper);
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
@@ -1687,6 +1700,10 @@ impl QueryExecutor {
                     };
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
+                } else if current_line_is_pending_from_item_body {
+                    context.auto_depth = from_item_list_body_depth;
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(frame.query_base_depth);
                 } else if is_multitable_insert_branch_header {
                     context.auto_depth = frame.query_base_depth.saturating_add(1);
                 } else if is_multitable_insert_branch_clause {
@@ -1694,6 +1711,12 @@ impl QueryExecutor {
                         .query_base_depth
                         .saturating_add(1)
                         .saturating_add(frame.multitable_insert_branch_depth);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if current_line_is_bare_direct_from_item_query_owner
+                    && frame.trailing_comma_continuation
+                {
+                    context.auto_depth = from_item_list_body_depth;
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
                 } else if reuses_active_query_base && !is_merge_branch_dml {
@@ -1738,6 +1761,14 @@ impl QueryExecutor {
                     frame.trailing_comma_continuation =
                         Self::line_ends_with_comma_before_inline_comment(trimmed)
                             && !sql_text::line_has_leading_significant_close_paren(trimmed);
+                    if clause_kind == Some(AutoFormatClauseKind::From) {
+                        frame.from_item_list_body_depth =
+                            Some(frame.query_base_depth.saturating_add(1));
+                        frame.pending_from_item_body =
+                            Self::line_is_standalone_from_clause_header(&trimmed_upper);
+                    } else if frame.pending_from_item_body {
+                        frame.pending_from_item_body = false;
+                    }
                     if frame.is_multitable_insert {
                         if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
                             frame.multitable_insert_branch_depth = 1;
@@ -1772,11 +1803,10 @@ impl QueryExecutor {
                     }
                     if Self::auto_format_is_join_condition_clause(&trimmed_upper) {
                         frame.pending_join_condition_continuation = true;
-                    } else if Self::auto_format_is_join_clause(&trimmed_upper) {
-                        frame.pending_join_condition_continuation = false;
-                    } else if !Self::auto_format_is_query_condition_continuation_clause(
-                        &trimmed_upper,
-                    ) && clause_kind.is_some()
+                    } else if Self::auto_format_is_join_clause(&trimmed_upper)
+                        || (!Self::auto_format_is_query_condition_continuation_clause(
+                            &trimmed_upper,
+                        ) && clause_kind.is_some())
                     {
                         frame.pending_join_condition_continuation = false;
                     }
@@ -2016,7 +2046,9 @@ impl QueryExecutor {
                     context.condition_header_depth,
                 );
             }
-            if current_line_is_direct_split_from_item_query_owner {
+            if current_line_is_direct_split_from_item_query_owner
+                && !Self::line_starts_with_bare_direct_from_item_query_owner(&trimmed_upper)
+            {
                 if let Some(query_base_depth) = context.query_base_depth {
                     context.auto_depth = query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
@@ -2743,12 +2775,8 @@ impl QueryExecutor {
         next_code_indices: &[Option<usize>],
         line: &str,
     ) -> Option<sql_text::SplitQueryOwnerLookaheadKind> {
-        let Some(open_idx) = next_code_indices.get(idx).copied().flatten() else {
-            return None;
-        };
-        let Some(head_idx) = next_code_indices.get(open_idx).copied().flatten() else {
-            return None;
-        };
+        let open_idx = next_code_indices.get(idx).copied().flatten()?;
+        let head_idx = next_code_indices.get(open_idx).copied().flatten()?;
         let head_upper = lines[head_idx].trim_start().to_ascii_uppercase();
         sql_text::split_query_owner_lookahead_kind(
             line,
@@ -2944,6 +2972,15 @@ impl QueryExecutor {
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
         Self::trailing_significant_byte_before_inline_comment(line) == Some(b',')
+    }
+
+    fn line_is_standalone_from_clause_header(trimmed_upper: &str) -> bool {
+        trimmed_upper.trim() == "FROM"
+    }
+
+    fn line_starts_with_bare_direct_from_item_query_owner(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "LATERAL")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "TABLE")
     }
 
     fn inline_comment_line_continuation_for_line(
@@ -12924,8 +12961,9 @@ AND d.status = 'A';"#;
             .unwrap_or(0);
 
         assert_eq!(
-            contexts[lateral_idx].auto_depth, contexts[from_idx].auto_depth,
-            "split LATERAL owner line should stay on the nested FROM-item base depth"
+            contexts[lateral_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "split LATERAL owner line should step into the structural FROM-item sibling depth"
         );
         assert_eq!(
             contexts[open_idx].auto_depth, contexts[lateral_idx].auto_depth,
@@ -13020,6 +13058,81 @@ AND d.status = 'A';"#;
         assert_eq!(
             contexts[inner_where_idx].auto_depth, contexts[from_table_idx].auto_depth,
             "query clauses after the split TABLE subquery should restore the inner query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_standalone_from_item_body_on_structural_list_depth() {
+        let sql = r#"SELECT d.deptno
+FROM
+    dept d,
+            LATERAL
+                    (
+                        SELECT MAX (e.sal) AS max_sal
+                        FROM emp e
+                        WHERE e.deptno = d.deptno
+                    ) lat
+WHERE d.deptno > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let from_idx = find_line("FROM");
+        let dept_idx = find_line("dept d,");
+        let lateral_idx = find_line("LATERAL");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(lateral_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT MAX"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(nested_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") lat"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let where_idx = find_line("WHERE d.deptno > 0;");
+
+        assert_eq!(
+            contexts[dept_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "first FROM item after a standalone header should use the structural list body depth"
+        );
+        assert_eq!(
+            contexts[lateral_idx].auto_depth, contexts[dept_idx].auto_depth,
+            "comma sibling after a mixed FROM item should reuse the structural list body depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[lateral_idx].auto_depth,
+            "standalone open paren after split LATERAL should stay on the structural owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[lateral_idx].auto_depth.saturating_add(1),
+            "child SELECT under split LATERAL should stay one level deeper than the structural owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[lateral_idx].auto_depth,
+            "split LATERAL closing paren should realign with the structural owner depth"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
+            "WHERE after the comma sibling should return to the FROM owner depth"
         );
     }
 

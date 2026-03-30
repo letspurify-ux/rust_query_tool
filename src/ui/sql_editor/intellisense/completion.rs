@@ -1168,9 +1168,7 @@ impl SqlEditorWidget {
         common_columns
     }
 
-    fn current_query_tokens<'a>(
-        deep_ctx: &'a intellisense_context::CursorContext,
-    ) -> &'a [SqlToken] {
+    fn current_query_tokens(deep_ctx: &intellisense_context::CursorContext) -> &[SqlToken] {
         deep_ctx
             .active_query_range
             .map(|range| {

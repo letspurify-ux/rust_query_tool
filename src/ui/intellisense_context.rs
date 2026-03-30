@@ -1939,11 +1939,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .and_then(|frame| frame.paren_func.as_deref())
                     .is_some_and(is_implicitly_lateral_table_function);
-                let inherited_visible_parent = if entering_cte_body {
-                    None
-                } else if matches!(parent_phase, SqlPhase::FromClause)
-                    && !relation_modifier_state.blocks_outer_scope_cutoff()
-                    && !is_from_lateral_function
+                let inherited_visible_parent = if entering_cte_body
+                    || (matches!(parent_phase, SqlPhase::FromClause)
+                        && !relation_modifier_state.blocks_outer_scope_cutoff()
+                        && !is_from_lateral_function)
                 {
                     None
                 } else {
@@ -2899,20 +2898,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // expression phase unless the token is the actual MERGE
                             // `... UPDATE SET ...` introducer.
                             relation_state.clear();
+                        } else if matches!(
+                            current_statement_kind,
+                            StatementKind::Insert | StatementKind::Update | StatementKind::Merge
+                        ) {
+                            depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
+                            depth_frames[depth].dml_set_active = true;
                         } else {
-                            if matches!(
-                                current_statement_kind,
-                                StatementKind::Insert
-                                    | StatementKind::Update
-                                    | StatementKind::Merge
-                            ) {
-                                depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
-                                depth_frames[depth].dml_set_active = true;
-                            } else {
-                                depth_frames[depth].phase = SqlPhase::SetClause;
-                                depth_frames[depth].dml_set_active = false;
-                                depth_frames[depth].postgres_conflict_update_active = false;
-                            }
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            depth_frames[depth].dml_set_active = false;
+                            depth_frames[depth].postgres_conflict_update_active = false;
                         }
                         relation_state.clear();
                     }

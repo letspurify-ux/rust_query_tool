@@ -1844,7 +1844,7 @@ fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> 
         .any(|sequence| starts_with_keyword_sequence(text_upper, sequence))
 }
 
-fn leading_meaningful_words<'a>(line: &'a str, max_words: usize) -> Vec<&'a str> {
+fn leading_meaningful_words(line: &str, max_words: usize) -> Vec<&str> {
     let mut words = Vec::with_capacity(max_words);
     for skip_words in 0..max_words {
         let Some((word, _)) = next_meaningful_word(line, skip_words) else {
@@ -2458,10 +2458,10 @@ pub(crate) fn format_indented_paren_owner_header_kind(
     }
 }
 
-fn line_trailing_identifiers_before_inline_comment<'a>(
-    line: &'a str,
+fn line_trailing_identifiers_before_inline_comment(
+    line: &str,
     max_identifiers: usize,
-) -> (Option<u8>, Vec<&'a str>) {
+) -> (Option<u8>, Vec<&str>) {
     let bytes = line.as_bytes();
     let mut idx = 0usize;
     let mut in_single_quote = false;
