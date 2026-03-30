@@ -171,6 +171,7 @@ struct QueryBaseDepthFrame {
     merge_branch_body_depth: Option<usize>,
     merge_branch_action: Option<MergeBranchAction>,
     pending_for_update_clause_update_line: bool,
+    pending_join_condition_continuation: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1576,6 +1577,7 @@ impl QueryExecutor {
                     merge_branch_body_depth: None,
                     merge_branch_action: None,
                     pending_for_update_clause_update_line: false,
+                    pending_join_condition_continuation: false,
                 });
             } else if let Some(frame) = query_frames.last().copied() {
                 let reuses_active_query_base = clause_kind.is_some_and(|kind| {
@@ -1677,7 +1679,13 @@ impl QueryExecutor {
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(frame.query_base_depth);
                 } else if is_join_condition_clause || is_query_condition_continuation_clause {
-                    context.auto_depth = frame.query_base_depth.saturating_add(1);
+                    context.auto_depth = if is_query_condition_continuation_clause
+                        && frame.pending_join_condition_continuation
+                    {
+                        frame.query_base_depth.saturating_add(2)
+                    } else {
+                        frame.query_base_depth.saturating_add(1)
+                    };
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
                 } else if is_multitable_insert_branch_header {
@@ -1767,6 +1775,16 @@ impl QueryExecutor {
                         {
                             frame.pending_for_update_clause_update_line = false;
                         }
+                    }
+                    if Self::auto_format_is_join_condition_clause(&trimmed_upper) {
+                        frame.pending_join_condition_continuation = true;
+                    } else if Self::auto_format_is_join_clause(&trimmed_upper) {
+                        frame.pending_join_condition_continuation = false;
+                    } else if !Self::auto_format_is_query_condition_continuation_clause(
+                        &trimmed_upper,
+                    ) && clause_kind.is_some()
+                    {
+                        frame.pending_join_condition_continuation = false;
                     }
                 }
             }
