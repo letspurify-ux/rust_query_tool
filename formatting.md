@@ -221,3 +221,22 @@ split owner/header chain도 continuation의 한 종류로 본다.
 - hanging indent 보존 여부는 계산된 구조 depth를 바꾸지 않는 범위에서만 결정되어야 한다.
 
 이 순서를 벗어나는 예외 규칙은 대부분 depth 불일치의 원인이다.
+
+## 9. 현재 구현의 한계와 Phase 1 브릿지
+
+현재 구현은 Phase 1 (format_statement)과 Phase 2 (resolve_code_line_layouts)로 나뉜다.
+
+- Phase 1: 줄 분리, 키워드 대문자화, 기본 들여쓰기 적용
+- Phase 2: owner stack 기반 구조 depth 재계산
+
+Phase 2는 모든 구문에 대해 완전한 구조 정보를 가지고 있지는 않다. 다음 경우에는 Phase 1이 부여한 `existing_indent`를 제한된 범위 내에서 참조한다:
+
+- **트리거 헤더** (BEFORE, REFERENCING, FOR EACH ROW, WHEN): parser_depth는 0이지만 CREATE TRIGGER의 하위 구문이므로 Phase 1이 부여한 indent를 보존
+- **FORALL body**: FORALL 하위의 DML 문장은 Phase 2에서 전용 owner frame이 없으므로 Phase 1 indent를 bounded fallback으로 참조
+- **DML fallback**: query clause body 등 parser_depth만으로 표현할 수 없는 구조 depth를 `existing_indent.clamp(parser_depth, parser_depth + max_extra)`로 보존
+
+이 `existing_indent` 참조는 원칙적으로는 위반이지만, 해당 구문에 대한 Phase 2 전용 owner frame 추적이 추가되기 전까지의 과도기적 브릿지다. 향후 다음을 추가하면 `existing_indent` 의존을 완전히 제거할 수 있다:
+
+1. 트리거 헤더 owner frame (CREATE TRIGGER → BEFORE/FOR EACH ROW 범위)
+2. FORALL body owner frame
+3. query clause body depth의 Phase 2 독립 추적 (analyzer의 auto_depth를 모든 줄에 확대)
