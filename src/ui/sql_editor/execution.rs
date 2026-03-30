@@ -4860,14 +4860,14 @@ impl SqlEditorWidget {
         }
     }
 
-    fn expand_tabs(text: &str) -> String {
-        const TAB_STOP: usize = 8;
+    fn expand_tabs_with_stop(text: &str, tab_stop: usize) -> String {
+        let tab_stop = tab_stop.max(1);
         let mut out = String::with_capacity(text.len());
         let mut col = 0usize;
 
         for ch in text.chars() {
             if ch == '\t' {
-                let spaces = TAB_STOP - (col % TAB_STOP);
+                let spaces = tab_stop.saturating_sub(col % tab_stop).max(1);
                 for _ in 0..spaces {
                     out.push(' ');
                 }
@@ -4879,6 +4879,11 @@ impl SqlEditorWidget {
         }
 
         out
+    }
+
+    fn expand_tabs(text: &str) -> String {
+        const TAB_STOP: usize = 8;
+        Self::expand_tabs_with_stop(text, TAB_STOP)
     }
 
     pub(super) fn format_script_output_line(
@@ -6371,6 +6376,12 @@ mod disconnected_precheck_gate_tests {
 
         assert!(!policy.has_connect_command);
         assert!(policy.requires_connected_session);
+    }
+
+    #[test]
+    fn expand_tabs_with_stop_clamps_zero_tab_stop() {
+        let rendered = SqlEditorWidget::expand_tabs_with_stop("a\tb", 0);
+        assert_eq!(rendered, "a b");
     }
 }
 
