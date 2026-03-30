@@ -1503,6 +1503,18 @@ impl SqlEditorWidget {
         Self::INDENT_TAB_WIDTH.max(1)
     }
 
+    fn safe_indent_div(value: usize) -> usize {
+        value
+            .checked_div(Self::normalized_indent_tab_width())
+            .unwrap_or(0)
+    }
+
+    fn is_indent_tab_aligned(value: usize) -> bool {
+        value
+            .checked_rem(Self::normalized_indent_tab_width())
+            .map_or(true, |remainder| remainder == 0)
+    }
+
     fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
         let mut idx = start_idx;
         while idx > 0 {
@@ -2939,7 +2951,7 @@ impl SqlEditorWidget {
                 out.push('\n');
             }
             out.push_str(&" ".repeat(indent_spaces));
-            *line_indent = indent_spaces / Self::normalized_indent_tab_width();
+            *line_indent = Self::safe_indent_div(indent_spaces);
             *at_line_start = false;
             *needs_space = false;
         };
@@ -5348,7 +5360,7 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: leading_indent_columns / Self::normalized_indent_tab_width(),
+                existing_indent: Self::safe_indent_div(leading_indent_columns),
                 existing_indent_spaces: leading_indent_columns,
                 final_depth: 0,
                 anchor_group: None,
@@ -7855,7 +7867,7 @@ impl SqlEditorWidget {
         };
         if layout.kind != LineLayoutKind::Code
             || layout.existing_indent_spaces == 0
-            || layout.existing_indent_spaces % Self::normalized_indent_tab_width() == 0
+            || Self::is_indent_tab_aligned(layout.existing_indent_spaces)
         {
             return false;
         }

@@ -682,3 +682,28 @@ fn compute_incremental_start_from_text(text: &str, pos: i32, _ins: i32, _del: i3
 fn is_string_or_comment_style(style: char) -> bool {
     is_continuation_style(style)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::syntax_highlight::SqlHighlighter;
+
+    #[test]
+    fn incremental_direct_rehighlight_end_returns_zero_for_empty_text() {
+        let shadow = HighlightShadowState::default();
+        let end = incremental_direct_rehighlight_end(&shadow, 5, 3, 7, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn rebuild_with_empty_text_keeps_shadow_empty() {
+        let highlighter = SqlHighlighter::new();
+        let (styles, line_states) = build_logical_styles_and_line_states(&highlighter, "");
+        let mut shadow = HighlightShadowState::default();
+        shadow.rebuild(String::new(), &styles, line_states);
+
+        assert_eq!(shadow.len(), 0);
+        assert_eq!(shadow.line_count(), 0);
+        assert!(shadow.line_exit_state(0).is_none());
+    }
+}
