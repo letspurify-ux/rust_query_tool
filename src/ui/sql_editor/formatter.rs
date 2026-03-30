@@ -6309,8 +6309,6 @@ impl SqlEditorWidget {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_case_branch_keyword(&next_upper)
             });
-            let next_line_existing_indent =
-                next_code_indices[idx].map(|next_idx| layouts[next_idx].existing_indent);
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
                 && !next_line_is_named_plain_end;
@@ -6640,14 +6638,11 @@ impl SqlEditorWidget {
                     Self::is_dml_clause_starter(&next_upper)
                 })
             {
+                // Nested `(` before clause: parser_depth already reflects
+                // paren nesting, so source indent is not needed here.
                 last_code_indent
-                    .map(|indent| {
-                        indent
-                            .saturating_add(1)
-                            .max(parser_depth)
-                            .max(existing_indent)
-                    })
-                    .unwrap_or(existing_indent.max(parser_depth.saturating_add(1)))
+                    .map(|indent| indent.saturating_add(1).max(parser_depth))
+                    .unwrap_or(parser_depth.saturating_add(1))
             } else if in_dml_statement
                 && current_line_starts_case
                 && previous_line_is_dml_clause_starter
@@ -6880,7 +6875,9 @@ impl SqlEditorWidget {
                 if last_code_indent.is_some_and(|indent| indent > parser_depth) {
                     last_code_indent.unwrap_or(parser_depth)
                 } else {
-                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                    // Consecutive clause starters share the same structural
+                    // depth.  Use parser_depth instead of source indent.
+                    parser_depth
                 }
             } else if in_dml_statement
                 && Self::is_dml_clause_starter(&trimmed_upper)
@@ -6909,11 +6906,13 @@ impl SqlEditorWidget {
                 && last_code_idx.is_some_and(|prev_idx| {
                     layouts[prev_idx].query_role == AutoFormatQueryRole::None
                 })
-                && existing_indent > parser_depth
             {
+                // Close paren with popped query frame: the post-processing
+                // stage uses frame.owner_depth for proper alignment.
+                // Use structural depth here, not source indent.
                 last_code_indent
-                    .map(|indent| indent.saturating_sub(1).max(existing_indent))
-                    .unwrap_or(existing_indent)
+                    .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                    .unwrap_or(parser_depth)
             } else if in_query_statement
                 && starts_with_close_paren
                 && (previous_line_is_dml_clause_line
@@ -6933,29 +6932,29 @@ impl SqlEditorWidget {
                         paren_case_close_frame_depth.unwrap_or_else(fallback_close_depth)
                     }
                 } else if next_line_is_case_branch {
-                    next_line_existing_indent.unwrap_or(parser_depth)
+                    // Structural: close paren before CASE branch aligns to
+                    // parser_depth (the depth after consuming the leading `)`).
+                    parser_depth
                 } else if previous_line_is_dml_clause_line {
                     last_code_indent
                         .map(|indent| indent.saturating_sub(1).max(parser_depth))
                         .unwrap_or(parser_depth)
                 } else if previous_line_is_plain_end {
-                    parser_depth.saturating_add(2)
+                    // Close paren after END: the `)` closes exactly one frame,
+                    // so its depth is the popped owner's depth = parser_depth.
+                    parser_depth
                 } else {
                     last_code_indent
                         .map(|indent| indent.saturating_sub(1).max(parser_depth))
-                        .unwrap_or_else(|| {
-                            existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
-                        })
+                        .unwrap_or(parser_depth)
                 }
             } else if in_query_statement && starts_with_close_paren {
+                // Close paren depth: use structural info. The post-processing
+                // stage (7196-7210) overrides with the actual popped frame's
+                // owner_depth when available.
                 last_code_indent
-                    .map(|indent| {
-                        indent
-                            .saturating_sub(1)
-                            .max(existing_indent)
-                            .max(parser_depth)
-                    })
-                    .unwrap_or(existing_indent.max(parser_depth))
+                    .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                    .unwrap_or(parser_depth)
             } else if in_query_statement
                 && previous_line_is_close_paren_with_trailing_comma
                 && !Self::is_dml_clause_starter(&trimmed_upper)
@@ -6965,6 +6964,10 @@ impl SqlEditorWidget {
                     .map(|indent| indent.max(existing_indent))
                     .unwrap_or(existing_indent.max(parser_depth))
             } else if in_dml_statement {
+                // DML fallback: existing_indent bounded by parser_depth and
+                // parser_depth + max_extra.  max_extra = 2 accommodates query
+                // structure depth (clause body, expression nesting) that
+                // parser_depth alone does not capture.
                 let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
                 let max_extra = if closes_into_list || follows_comma_run {
                     0
@@ -7095,7 +7098,9 @@ impl SqlEditorWidget {
                             .contains("WITHIN")
                     })
                 {
-                    last_code_indent.unwrap_or(effective_depth.max(existing_indent))
+                    // WITHIN GROUP split: GROUP continues at the same
+                    // structural depth as the WITHIN line.
+                    last_code_indent.unwrap_or(effective_depth)
                 } else {
                     effective_depth
                 };
