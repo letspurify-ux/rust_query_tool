@@ -175,6 +175,14 @@ fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, 
 }
 
 impl AppState {
+    fn next_spinner_frame(current_frame: usize, frame_count: usize) -> Option<usize> {
+        if frame_count == 0 {
+            return None;
+        }
+
+        Some((current_frame.saturating_add(1)) % frame_count)
+    }
+
     const STATUS_SPINNER_FRAMES: [&'static str; 10] =
         ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -420,12 +428,13 @@ impl AppState {
             return;
         }
         let frame_count = Self::STATUS_SPINNER_FRAMES.len();
-        if frame_count == 0 {
+        let Some(next_frame) = Self::next_spinner_frame(self.status_animation_frame, frame_count)
+        else {
             self.status_animation_running = false;
             self.status_animation_message.clear();
             return;
-        }
-        self.status_animation_frame = (self.status_animation_frame + 1) % frame_count;
+        };
+        self.status_animation_frame = next_frame;
         self.render_status_animation_frame();
     }
 
@@ -438,7 +447,10 @@ impl AppState {
             self.status_animation_message.clear();
             return;
         }
-        let frame = Self::STATUS_SPINNER_FRAMES[self.status_animation_frame];
+        let frame_idx = self
+            .status_animation_frame
+            .min(Self::STATUS_SPINNER_FRAMES.len().saturating_sub(1));
+        let frame = Self::STATUS_SPINNER_FRAMES[frame_idx];
         let conn_info = self
             .connection_info
             .lock()
@@ -4454,6 +4466,7 @@ The crash has been recorded in the application log.",
         text = text.replace("\r\n", "\n");
         text.replace('\r', "\n")
     }
+
 }
 
 impl Default for MainWindow {
@@ -4550,5 +4563,17 @@ mod tests {
     fn resolve_progress_tab_index_keeps_batch_offset_when_tabs_grow() {
         assert_eq!(resolve_progress_tab_index(6, 3, None, 0), 3);
         assert_eq!(resolve_progress_tab_index(6, 3, None, 2), 5);
+    }
+
+    #[test]
+    fn next_spinner_frame_returns_none_when_frame_count_is_zero() {
+        assert_eq!(AppState::next_spinner_frame(0, 0), None);
+        assert_eq!(AppState::next_spinner_frame(42, 0), None);
+    }
+
+    #[test]
+    fn next_spinner_frame_wraps_with_non_zero_frame_count() {
+        assert_eq!(AppState::next_spinner_frame(0, 10), Some(1));
+        assert_eq!(AppState::next_spinner_frame(9, 10), Some(0));
     }
 }
