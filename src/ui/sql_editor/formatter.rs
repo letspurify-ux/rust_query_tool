@@ -167,7 +167,7 @@ impl OwnerRelativeLayoutFrame {
 #[derive(Clone, Copy)]
 struct DmlCaseLayoutFrame {
     case_depth: usize,
-    expression_owner_depth: Option<usize>,
+    expression_close_depth: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -5615,21 +5615,6 @@ impl SqlEditorWidget {
         previous_line_ends_with_open_paren: bool,
         paren_layout_frames: &mut Vec<ParenLayoutFrame>,
     ) {
-        let has_parent_general_frame = paren_layout_frames
-            .iter()
-            .any(|frame| frame.kind == ParenLayoutFrameKind::General);
-        let standalone_open_has_nested_wrapper_child = is_standalone_open_paren_owner
-            && next_code_trimmed
-                .is_some_and(Self::line_is_standalone_open_paren_before_inline_comment);
-        let standalone_open_has_progressive_child = is_standalone_open_paren_owner
-            && next_code_trimmed.is_some_and(|next| {
-                let next_upper = next.to_ascii_uppercase();
-                standalone_open_has_nested_wrapper_child
-                    || Self::line_starts_query_head(&next_upper)
-                    || ((has_parent_general_frame || standalone_open_case_child_is_progressive)
-                        && crate::sql_text::starts_with_keyword_token(&next_upper, "CASE"))
-            });
-
         for token_idx in start_idx..tokens.len() {
             match &tokens[token_idx] {
                 SqlToken::Comment(_) => {}
@@ -5659,15 +5644,7 @@ impl SqlEditorWidget {
                         line_depth
                     };
                     let continuation_depth = match kind {
-                        ParenLayoutFrameKind::General => {
-                            if is_standalone_open_paren_owner
-                                && !standalone_open_has_progressive_child
-                            {
-                                base_depth
-                            } else {
-                                base_depth.saturating_add(1)
-                            }
-                        }
+                        ParenLayoutFrameKind::General => base_depth.saturating_add(1),
                         ParenLayoutFrameKind::Query
                         | ParenLayoutFrameKind::ConditionQuery
                         | ParenLayoutFrameKind::MultilineClause => line_depth,
@@ -5675,8 +5652,7 @@ impl SqlEditorWidget {
                     let keeps_parent_owner_depth = kind == ParenLayoutFrameKind::General
                         && is_standalone_open_paren_owner
                         && !previous_line_ends_with_open_paren
-                        && (!standalone_open_has_progressive_child
-                            || standalone_open_case_child_is_progressive);
+                        && standalone_open_case_child_is_progressive;
                     let owner_depth = if keeps_parent_owner_depth {
                         line_depth.saturating_sub(1)
                     } else {
@@ -5751,6 +5727,33 @@ impl SqlEditorWidget {
             return false;
         }
         true
+    }
+
+    fn general_paren_condition_continuation_depth(
+        base_condition_depth: usize,
+        last_code_indent: Option<usize>,
+        current_general_paren_frame_count: usize,
+        prev_general_paren_frame_count: usize,
+    ) -> Option<usize> {
+        if current_general_paren_frame_count == 0 {
+            return None;
+        }
+
+        let target_depth =
+            base_condition_depth.saturating_add(current_general_paren_frame_count);
+        let paren_context_stable =
+            current_general_paren_frame_count == prev_general_paren_frame_count;
+
+        Some(if paren_context_stable {
+            last_code_indent
+                .map(|indent| indent.max(target_depth))
+                .unwrap_or(target_depth)
+        } else {
+            // Condition continuation follows the number of currently-open
+            // general paren groups. Every active `(` adds exactly one level,
+            // and closing parens naturally reduce the count on the next line.
+            target_depth
+        })
     }
 
     fn normalize_split_query_owner_header_depth(
@@ -6368,14 +6371,22 @@ impl SqlEditorWidget {
                 && current_line_starts_case
                 && !previous_line_ends_with_then
                 && !previous_line_is_else
-                && previous_line_has_unclosed_open_paren;
+                && previous_line_has_unclosed_open_paren
+                && !previous_line_is_standalone_open_paren;
             let current_line_dml_case_expression_owner_depth =
-                if current_line_starts_dml_case_expression
-                    && (previous_line_is_dml_clause_starter
-                        || previous_line_ends_with_trailing_comma
-                        || follows_comma_run)
-                {
+                if current_line_starts_dml_case_expression {
+                    // CASE inside a parenthesized DML expression inherits the
+                    // line that opened the still-active `(`. The CASE body is
+                    // rendered one level deeper than that owner line.
                     last_code_indent
+                } else {
+                    None
+                };
+            let current_line_dml_case_expression_close_owner_depth =
+                if current_line_starts_dml_case_expression {
+                    last_code_idx
+                        .and_then(|prev_idx| layouts[prev_idx].dml_case_expression_close_depth)
+                        .or(last_code_indent)
                 } else {
                     None
                 };
@@ -6586,13 +6597,18 @@ impl SqlEditorWidget {
                 let owner_depth =
                     pending_dml_case_expression_close_depth_for_line.unwrap_or(parser_depth);
                 current_line_dml_case_expression_close_depth = Some(owner_depth);
-                owner_depth.max(parser_depth)
+                owner_depth
             } else if starts_with_close_paren && is_paren_case_closer {
-                paren_case_close_frame_depth.unwrap_or_else(|| {
+                let fallback_close_depth = || {
                     last_code_indent
                         .map(|indent| indent.saturating_sub(1).max(paren_case_base_depth))
                         .unwrap_or(paren_case_base_depth)
-                })
+                };
+                if next_line_is_case_branch {
+                    fallback_close_depth()
+                } else {
+                    paren_case_close_frame_depth.unwrap_or_else(fallback_close_depth)
+                }
             } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth {
                 owner_depth
                     .saturating_add(1)
@@ -6758,65 +6774,77 @@ impl SqlEditorWidget {
                     .map(|depth| depth.saturating_add(1))
                     .unwrap_or(parser_depth.saturating_add(1));
                 if previous_line_starts_with_close_paren {
-                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
-                        // Inside a JOIN ON condition block: AND/OR after a
-                        // close paren (e.g. subquery) should stay at the
-                        // same depth as other AND/OR in this ON block.
-                        join_and_depth.max(condition_indent)
-                    } else {
-                        last_code_indent
-                            .map(|indent| indent.max(condition_indent))
-                            .unwrap_or(condition_indent)
-                    }
-                } else if previous_line_is_join_condition_clause {
-                    last_code_indent
-                        .map(|indent| {
-                            indent
-                                .saturating_add(1)
-                                .max(condition_indent.saturating_add(1))
-                                .max(parser_depth)
-                        })
-                        .unwrap_or(condition_indent.saturating_add(1).max(parser_depth))
-                } else if previous_line_is_condition_keyword {
                     if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied()
                     {
-                        join_and_depth.max(condition_indent)
+                        let join_condition_depth_floor = join_and_depth.max(condition_indent);
+                        Self::general_paren_condition_continuation_depth(
+                            join_condition_depth_floor,
+                            last_code_indent,
+                            current_general_paren_frame_count,
+                            prev_general_paren_frame_count,
+                        )
+                        .unwrap_or(join_condition_depth_floor)
                     } else {
-                        let paren_context_stable =
-                            current_general_paren_frame_count == prev_general_paren_frame_count;
-                        if paren_context_stable {
+                        Self::general_paren_condition_continuation_depth(
+                            condition_indent,
+                            last_code_indent,
+                            current_general_paren_frame_count,
+                            prev_general_paren_frame_count,
+                        )
+                        .unwrap_or_else(|| {
                             last_code_indent
                                 .map(|indent| indent.max(condition_indent))
                                 .unwrap_or(condition_indent)
-                        } else if let Some(frame) = active_general_paren_frame {
-                            let base = frame.continuation_depth.max(condition_indent);
-                            // Add +1 when the paren was opened at or above the
-                            // query base (owner_depth < condition_indent), meaning
-                            // it is a condition-grouping paren on the WHERE/ON/
-                            // HAVING line.  Parens opened deeper (on an AND/OR
-                            // line that was already +1'd) have continuation that
-                            // already accounts for the extra level.
-                            if frame.owner_depth < condition_indent {
-                                base.saturating_add(1)
-                            } else {
-                                base
-                            }
-                        } else {
-                            condition_indent
-                        }
+                        })
                     }
-                } else if let Some(frame) = active_general_paren_frame {
-                    // Inside a General paren opened at query base level,
-                    // AND/OR should indent one more level so that grouping
-                    // parens visually add depth:
-                    //   WHERE (col = 1          -- paren at condition base
-                    //           AND col2 = 2)   -- AND one level deeper
-                    let base = frame.continuation_depth.max(condition_indent);
-                    if frame.owner_depth < condition_indent {
-                        base.saturating_add(1)
+                } else if previous_line_is_join_condition_clause {
+                    let join_condition_depth_floor = join_on_condition_and_depth
+                        .last()
+                        .map(|(join_and_depth, _)| (*join_and_depth).max(condition_indent))
+                        .unwrap_or_else(|| condition_indent.saturating_add(1).max(parser_depth));
+                    Self::general_paren_condition_continuation_depth(
+                        join_condition_depth_floor,
+                        last_code_indent,
+                        current_general_paren_frame_count,
+                        prev_general_paren_frame_count,
+                    )
+                    .unwrap_or_else(|| {
+                        last_code_indent
+                            .map(|indent| {
+                                indent
+                                    .saturating_add(1)
+                                    .max(join_condition_depth_floor)
+                                    .max(parser_depth)
+                            })
+                            .unwrap_or(join_condition_depth_floor.max(parser_depth))
+                    })
+                } else if previous_line_is_condition_keyword {
+                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
+                        let join_condition_depth_floor = join_and_depth.max(condition_indent);
+                        Self::general_paren_condition_continuation_depth(
+                            join_condition_depth_floor,
+                            last_code_indent,
+                            current_general_paren_frame_count,
+                            prev_general_paren_frame_count,
+                        )
+                        .unwrap_or(join_condition_depth_floor)
                     } else {
-                        base
+                        Self::general_paren_condition_continuation_depth(
+                            condition_indent,
+                            last_code_indent,
+                            current_general_paren_frame_count,
+                            prev_general_paren_frame_count,
+                        )
+                        .unwrap_or(condition_indent)
                     }
+                } else if active_general_paren_frame.is_some() {
+                    Self::general_paren_condition_continuation_depth(
+                        condition_indent,
+                        last_code_indent,
+                        current_general_paren_frame_count,
+                        prev_general_paren_frame_count,
+                    )
+                    .unwrap_or(condition_indent.max(parser_depth))
                 } else {
                     condition_indent.max(parser_depth)
                 }
@@ -6898,14 +6926,19 @@ impl SqlEditorWidget {
                     || next_line_is_case_branch
                     || is_paren_case_closer)
             {
-                if next_line_is_case_branch {
-                    next_line_existing_indent.unwrap_or(parser_depth)
-                } else if is_paren_case_closer {
-                    paren_case_close_frame_depth.unwrap_or_else(|| {
+                if is_paren_case_closer {
+                    let fallback_close_depth = || {
                         last_code_indent
                             .map(|indent| indent.saturating_sub(1).max(paren_case_base_depth))
                             .unwrap_or(paren_case_base_depth)
-                    })
+                    };
+                    if next_line_is_case_branch {
+                        fallback_close_depth()
+                    } else {
+                        paren_case_close_frame_depth.unwrap_or_else(fallback_close_depth)
+                    }
+                } else if next_line_is_case_branch {
+                    next_line_existing_indent.unwrap_or(parser_depth)
                 } else if previous_line_is_dml_clause_line {
                     last_code_indent
                         .map(|indent| indent.saturating_sub(1).max(parser_depth))
@@ -6986,7 +7019,9 @@ impl SqlEditorWidget {
             }
             if current_line_is_case_condition_continuation {
                 if let Some(frame) = active_case_condition_frame {
-                    effective_depth = effective_depth.max(frame.continuation_depth);
+                    if current_line_dml_case_expression_close_depth.is_none() {
+                        effective_depth = effective_depth.max(frame.continuation_depth);
+                    }
                 }
             }
 
@@ -7018,6 +7053,7 @@ impl SqlEditorWidget {
                 if let Some(branch_body_depth) = pending_case_branch_body_depth_for_line {
                     if Self::starts_with_case_branch_keyword(&trimmed_upper)
                         || Self::starts_with_case_terminator(&trimmed_upper)
+                        || current_line_dml_case_expression_close_depth.is_some()
                     {
                         effective_depth
                     } else {
@@ -7130,7 +7166,10 @@ impl SqlEditorWidget {
                     && current_line_is_condition_keyword
                     && previous_line_starts_with_close_paren);
             let defers_to_condition_close_alignment =
-                condition_close_alignment_active && popped_query_paren_frame.is_none();
+                condition_close_alignment_active
+                    && popped_query_paren_frame.is_none()
+                    && !(current_line_dml_case_expression_close_depth.is_some()
+                        && leading_close_continues_expression);
             let clause_starter_uses_general_paren_continuation =
                 Self::clause_starter_uses_general_paren_continuation(
                     &trimmed_upper,
@@ -7143,12 +7182,17 @@ impl SqlEditorWidget {
                 && !is_paren_case_closer
                 && close_continuation_frame.is_some()
             {
-                close_continuation_frame
-                    .map(|frame| effective_depth.max(frame.continuation_depth))
-                    .unwrap_or(effective_depth)
+                if let Some(owner_depth) = current_line_dml_case_expression_close_depth {
+                    effective_depth.max(owner_depth.saturating_add(1))
+                } else {
+                    close_continuation_frame
+                        .map(|frame| effective_depth.max(frame.continuation_depth))
+                        .unwrap_or(effective_depth)
+                }
             } else if starts_with_close_paren
                 && !defers_to_condition_close_alignment
                 && !is_paren_case_closer
+                && current_line_dml_case_expression_close_depth.is_none()
                 && !line_has_owner_relative_body_header_after_leading_close
             {
                 if let Some(owner_depth) = current_line_closes_multiline_clause_owner_depth {
@@ -7453,7 +7497,7 @@ impl SqlEditorWidget {
             if in_dml_statement && current_line_starts_case {
                 dml_case_frames.push(DmlCaseLayoutFrame {
                     case_depth: effective_depth,
-                    expression_owner_depth: current_line_dml_case_expression_owner_depth,
+                    expression_close_depth: current_line_dml_case_expression_close_owner_depth,
                 });
             } else if !in_dml_statement && current_line_starts_case {
                 plsql_case_frames.push(effective_depth);
@@ -7471,7 +7515,7 @@ impl SqlEditorWidget {
                     .unwrap_or(effective_depth.saturating_sub(1));
                 dml_case_frames.push(DmlCaseLayoutFrame {
                     case_depth: inferred_case_depth,
-                    expression_owner_depth: None,
+                    expression_close_depth: None,
                 });
             }
             if in_dml_statement
@@ -7479,10 +7523,10 @@ impl SqlEditorWidget {
                 && !dml_case_frames.is_empty()
             {
                 if let Some(frame) = dml_case_frames.pop() {
-                    if frame.expression_owner_depth.is_some()
+                    if frame.expression_close_depth.is_some()
                         && next_code_trimmed.is_some_and(|next| next.trim_start().starts_with(')'))
                     {
-                        if let Some(owner_depth) = frame.expression_owner_depth {
+                        if let Some(owner_depth) = frame.expression_close_depth {
                             case_layout_state
                                 .note_pending_dml_case_expression_close_depth(owner_depth);
                         }
@@ -10022,6 +10066,52 @@ END;"#;
             indent(lines[open_idx]),
             indent(lines[assignment_idx]).saturating_add(4),
             "line after := should use the assignment owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_multiline_assignment_paren_body_tracks_open_close_depth() {
+        let source = r#"BEGIN
+  v_txt :=
+  (
+    p_txt
+  );
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "(")
+            .expect("open paren line");
+        let body_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx + 1)
+            .find(|(_, line)| line.trim_start() == "p_txt")
+            .map(|(idx, _)| idx)
+            .expect("paren body line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(body_idx + 1)
+            .find(|(_, line)| line.trim_start() == ");" || line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("close paren line");
+
+        assert_eq!(
+            indent(lines[body_idx]),
+            indent(lines[open_idx]).saturating_add(4),
+            "body inside standalone assignment parens should be one level deeper than the open paren line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[open_idx]),
+            "close paren after standalone assignment parens should return to the open paren depth, got:\n{}",
             formatted
         );
     }
@@ -20042,8 +20132,8 @@ ON r.region_id = d.region_id;"#;
 
         assert_eq!(
             indent(lines[or_idx]),
-            indent(lines[on_idx]),
-            "OR after closed paren group in JOIN ON should return to ON depth, got:\n{}",
+            indent(lines[on_idx]).saturating_add(4),
+            "OR after closed paren group in JOIN ON should return to the JOIN condition continuation depth, got:\n{}",
             formatted
         );
         assert!(
@@ -20056,6 +20146,323 @@ ON r.region_id = d.region_id;"#;
         assert_eq!(
             reformatted, formatted,
             "formatting should be stable for JOIN ON with nested paren conditions"
+        );
+    }
+
+    #[test]
+    fn join_on_double_wrapper_parens_get_progressive_depth() {
+        let input = r#"SELECT *
+FROM a
+JOIN b
+ON ((1 = 1
+    AND 2 = 2))
+AND 3 = 3;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON ((1 = 1"))
+            .expect("should contain ON ((1 = 1");
+        let and_inner = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND 2 = 2"))
+            .expect("should contain AND 2 = 2");
+        let and_outer = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND 3 = 3"))
+            .expect("should contain AND 3 = 3");
+
+        assert_eq!(
+            indent(lines[and_inner]),
+            indent(lines[on_idx]).saturating_add(12),
+            "AND inside ON (( should add one continuation level plus one level per open paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_outer]),
+            indent(lines[on_idx]).saturating_add(4),
+            "AND after the closed ON paren group should return to the ON continuation depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should be stable for JOIN ON with repeated wrapper parens"
+        );
+    }
+
+    #[test]
+    fn join_on_inner_close_then_and_keeps_outer_open_paren_depth() {
+        let input = r#"SELECT *
+FROM a
+JOIN b
+ON (
+    (
+        a.id = b.id
+    )
+    AND a.flag = b.flag
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON"))
+            .expect("should contain ON");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND a.flag"))
+            .expect("should contain AND a.flag");
+        let prev_idx = and_idx.checked_sub(1).expect("AND line should have a previous line");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]).saturating_add(8),
+            "AND after an inner close should keep the remaining outer ON paren depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines[prev_idx].contains(')'),
+            "the line before AND should still contain the inner close paren, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[and_idx]) >= indent(lines[prev_idx]),
+            "AND should remain at the outer ON paren depth after the inner close, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn where_inner_close_then_and_keeps_outer_open_paren_depth() {
+        let input = r#"SELECT *
+FROM emp
+WHERE (
+    (
+        deptno = 10
+    )
+    AND status = 'A'
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE"))
+            .expect("should contain WHERE");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND status = 'A'"))
+            .expect("should contain AND status = 'A'");
+
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[where_idx]).saturating_add(8),
+            "AND after an inner close should keep the remaining outer WHERE paren depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn split_where_standalone_open_paren_keeps_body_one_level_deeper_than_wrapper() {
+        let input = r#"SELECT *
+FROM emp
+WHERE
+(
+deptno = 10
+AND status = 'A'
+)
+AND active = 1;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE"))
+            .expect("should contain WHERE");
+        let and_inner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(where_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("AND status = 'A'"))
+            .map(|(idx, _)| idx)
+            .expect("should contain inner AND");
+        let and_outer_idx = lines
+            .iter()
+            .enumerate()
+            .skip(and_inner_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("AND active = 1;"))
+            .map(|(idx, _)| idx)
+            .expect("should contain outer AND");
+
+        assert!(
+            indent(lines[and_inner_idx]) > indent(lines[where_idx]),
+            "AND inside the parenthesized WHERE group should be deeper than the WHERE owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_outer_idx]),
+            indent(lines[where_idx]).saturating_add(4),
+            "AND after the split WHERE paren group should return to the condition continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn split_join_on_standalone_open_paren_keeps_body_one_level_deeper_than_wrapper() {
+        let input = r#"SELECT *
+FROM emp e
+JOIN dept d
+ON
+(
+e.deptno = d.deptno
+AND e.status = d.status
+)
+AND e.active = d.active;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON"))
+            .expect("should contain ON");
+        let and_inner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(on_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("AND e.status = d.status"))
+            .map(|(idx, _)| idx)
+            .expect("should contain inner AND");
+        let and_outer_idx = lines
+            .iter()
+            .enumerate()
+            .skip(and_inner_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("AND e.active = d.active;"))
+            .map(|(idx, _)| idx)
+            .expect("should contain outer AND");
+
+        assert!(
+            indent(lines[and_inner_idx]) > indent(lines[on_idx]),
+            "AND inside the parenthesized JOIN ON group should be deeper than the ON owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_outer_idx]),
+            indent(lines[on_idx]).saturating_add(4),
+            "AND after the split JOIN ON paren group should return to the ON continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_join_on_nested_paren_groups_deeper_than_on_with_inline_comments(
+    ) {
+        let source = r#"SELECT *
+FROM emp e
+JOIN dept d
+    ON (e.dept_id = d.dept_id -- branch one
+            AND e.loc_id = d.loc_id) -- close one
+        OR (e.alt_dept_id = d.dept_id -- branch two
+            AND e.alt_loc_id = d.loc_id) -- close two
+JOIN region r
+    ON r.region_id = d.region_id;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let on_idx =
+            find_line_starting_with(&lines, "ON (e.dept_id = d.dept_id").expect("first ON line");
+        let and_first_idx =
+            find_line_starting_with(&lines, "AND e.loc_id = d.loc_id)").expect("first AND line");
+        let or_idx = find_line_starting_with(&lines, "OR (e.alt_dept_id = d.dept_id")
+            .expect("OR branch line");
+        let and_second_idx = find_line_starting_with(&lines, "AND e.alt_loc_id = d.loc_id)")
+            .expect("second AND line");
+        let join_region_idx =
+            find_line_starting_with(&lines, "JOIN region r").expect("next JOIN line");
+
+        assert_eq!(
+            leading_spaces(lines[and_first_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(8),
+            "AND inside JOIN ON paren group should be two levels deeper than ON, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[or_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(4),
+            "OR after the closed JOIN ON paren group should return to the ON continuation depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[and_second_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(8),
+            "AND inside the second JOIN ON paren group should match the first nested condition depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[join_region_idx]).saturating_add(4),
+            leading_spaces(lines[on_idx]),
+            "the next JOIN should return to the query base depth after the ON groups, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_join_on_nested_paren_groups_deeper_than_on_with_inline_comments() {
+        let source = r#"SELECT *
+FROM emp e
+JOIN dept d
+ON (e.dept_id = d.dept_id -- branch one
+AND e.loc_id = d.loc_id) -- close one
+OR (e.alt_dept_id = d.dept_id -- branch two
+AND e.alt_loc_id = d.loc_id) -- close two
+JOIN region r
+ON r.region_id = d.region_id;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let on_idx =
+            find_line_starting_with(&lines, "ON (e.dept_id = d.dept_id").expect("first ON line");
+        let and_first_idx =
+            find_line_starting_with(&lines, "AND e.loc_id = d.loc_id)").expect("first AND line");
+        let or_idx = find_line_starting_with(&lines, "OR (e.alt_dept_id = d.dept_id")
+            .expect("OR branch line");
+        let and_second_idx = find_line_starting_with(&lines, "AND e.alt_loc_id = d.loc_id)")
+            .expect("second AND line");
+        let join_region_idx =
+            find_line_starting_with(&lines, "JOIN region r").expect("next JOIN line");
+
+        assert_eq!(
+            leading_spaces(lines[and_first_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(8),
+            "full formatter should keep AND inside JOIN ON paren groups two levels deeper than ON, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[or_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(4),
+            "full formatter should return OR to the ON continuation depth after the closed paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[and_second_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(8),
+            "full formatter should keep the second nested AND aligned with the first nested AND, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[join_region_idx]).saturating_add(4),
+            leading_spaces(lines[on_idx]),
+            "full formatter should return the next JOIN to the query base depth, got:\n{}",
+            formatted
         );
     }
 

@@ -5242,11 +5242,11 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("( -- inline comment\n            CASE\n                WHEN score > 10 THEN 'HIGH'"),
-        "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
+        formatted.contains("( -- inline comment\n                CASE\n                    WHEN score > 10 THEN 'HIGH'"),
+        "OPEN FOR nested CASE after an opening paren comment should indent one level deeper than the paren line, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n        ) AS bucket"),
+        formatted.contains("END\n            ) AS bucket"),
         "CASE END and close paren should preserve stable OPEN FOR expression indentation, got: {formatted}"
     );
 }
@@ -5270,20 +5270,93 @@ FROM dual;
 END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
-    assert!(
-        formatted.contains(
-            "END
-                )
-                ELSE 'LOW'"
-        ),
-        "inner CASE close-paren should stay aligned at nested depth, got: {formatted}"
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+    let outer_open_idx = lines
+        .iter()
+        .position(|line| line.trim() == "(")
+        .expect("should contain outer expression wrapper");
+    let outer_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_open_idx + 1)
+        .find(|(_, line)| line.trim_start() == "CASE")
+        .map(|(idx, _)| idx)
+        .expect("should contain outer CASE");
+    let inner_open_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_case_idx + 1)
+        .find(|(_, line)| line.trim() == "(")
+        .map(|(idx, _)| idx)
+        .expect("should contain inner expression wrapper");
+    let inner_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_open_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("CASE -- nested expression"))
+        .map(|(idx, _)| idx)
+        .expect("should contain inner CASE");
+    let inner_end_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_case_idx + 1)
+        .find(|(_, line)| line.trim() == "END")
+        .map(|(idx, _)| idx)
+        .expect("should contain inner END");
+    let inner_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_end_idx + 1)
+        .find(|(_, line)| line.trim() == ")")
+        .map(|(idx, _)| idx)
+        .expect("should contain inner close paren");
+    let else_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_close_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("ELSE 'LOW'"))
+        .map(|(idx, _)| idx)
+        .expect("should contain ELSE 'LOW'");
+    let outer_end_idx = lines
+        .iter()
+        .enumerate()
+        .skip(else_idx + 1)
+        .find(|(_, line)| line.trim() == "END")
+        .map(|(idx, _)| idx)
+        .expect("should contain outer END");
+    let outer_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_end_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with(") AS bucket"))
+        .map(|(idx, _)| idx)
+        .expect("should contain outer close paren");
+
+    assert_eq!(
+        indent(lines[outer_case_idx]),
+        indent(lines[outer_open_idx]).saturating_add(4),
+        "outer CASE body should be one level deeper than its wrapper line, got:\n{}",
+        formatted
     );
-    assert!(
-        formatted.contains(
-            "END
-        ) AS bucket"
-        ),
-        "outer CASE close-paren should stay aligned at OPEN FOR expression depth, got: {formatted}"
+    assert_eq!(
+        indent(lines[inner_case_idx]),
+        indent(lines[inner_open_idx]).saturating_add(4),
+        "inner CASE body should be one level deeper than its wrapper line, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[inner_close_idx]),
+        indent(lines[else_idx]),
+        "inner close-paren should return to the surrounding branch depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[outer_close_idx]),
+        indent(lines[outer_open_idx]),
+        "outer close-paren should return to the OPEN FOR expression wrapper depth, got:\n{}",
+        formatted
     );
 }
 

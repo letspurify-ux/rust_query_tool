@@ -6794,10 +6794,10 @@ join b
             formatted.contains(
                 "JOIN b
     ON ((1 = 1
-            AND 2 = 2))
+                AND 2 = 2))
         AND 3 = 3;"
             ),
-            "nested ON-condition continuation should realign to ON-owned depth after parenthesized body closes, got:\n{}",
+            "nested ON-condition continuation should add one level per open paren before returning to the ON continuation depth, got:\n{}",
             formatted
         );
     }

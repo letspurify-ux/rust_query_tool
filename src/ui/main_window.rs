@@ -4466,7 +4466,6 @@ The crash has been recorded in the application log.",
         text = text.replace("\r\n", "\n");
         text.replace('\r', "\n")
     }
-
 }
 
 impl Default for MainWindow {
