@@ -1497,6 +1497,12 @@ impl OpenCursorFormatState {
 }
 
 impl SqlEditorWidget {
+    const INDENT_TAB_WIDTH: usize = 4;
+
+    fn normalized_indent_tab_width() -> usize {
+        Self::INDENT_TAB_WIDTH.max(1)
+    }
+
     fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
         let mut idx = start_idx;
         while idx > 0 {
@@ -1567,7 +1573,7 @@ impl SqlEditorWidget {
     }
 
     fn leading_indent_columns(line: &str) -> usize {
-        const INDENT_TAB_WIDTH: usize = 4;
+        let indent_tab_width = Self::normalized_indent_tab_width();
         let mut columns = 0usize;
 
         for ch in line.chars() {
@@ -1577,7 +1583,7 @@ impl SqlEditorWidget {
                 }
                 '\t' => {
                     let next_tab_stop =
-                        ((columns / INDENT_TAB_WIDTH).saturating_add(1)) * INDENT_TAB_WIDTH;
+                        ((columns / indent_tab_width).saturating_add(1)) * indent_tab_width;
                     columns = next_tab_stop;
                 }
                 _ if ch.is_whitespace() => {
@@ -2933,7 +2939,7 @@ impl SqlEditorWidget {
                 out.push('\n');
             }
             out.push_str(&" ".repeat(indent_spaces));
-            *line_indent = indent_spaces / 4;
+            *line_indent = indent_spaces / Self::normalized_indent_tab_width();
             *at_line_start = false;
             *needs_space = false;
         };
@@ -5342,7 +5348,7 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: leading_indent_columns / 4,
+                existing_indent: leading_indent_columns / Self::normalized_indent_tab_width(),
                 existing_indent_spaces: leading_indent_columns,
                 final_depth: 0,
                 anchor_group: None,
@@ -5842,10 +5848,7 @@ impl SqlEditorWidget {
             .unwrap_or(line_depth)
     }
 
-    fn line_starts_structural_operator_rhs(
-        line: &str,
-        next_code_trimmed: Option<&str>,
-    ) -> bool {
+    fn line_starts_structural_operator_rhs(line: &str, next_code_trimmed: Option<&str>) -> bool {
         if crate::sql_text::format_query_owner_header_kind(line).is_some()
             || crate::sql_text::format_query_owner_pending_header_kind(line).is_some()
         {
@@ -6369,15 +6372,15 @@ impl SqlEditorWidget {
             let current_line_is_condition_query_owner =
                 current_query_owner_kind == Some(FormatQueryOwnerKind::Condition);
             let active_case_condition_frame = case_condition_frames.last().copied();
-            let current_line_ends_case_condition = active_case_condition_frame.is_some_and(|frame| {
-                Self::line_contains_case_condition_terminator(
-                    &line_tokens,
-                    depth,
-                    frame.owner_parser_depth,
-                )
-            });
-            let current_line_is_case_condition_continuation = active_case_condition_frame
-                .is_some()
+            let current_line_ends_case_condition =
+                active_case_condition_frame.is_some_and(|frame| {
+                    Self::line_contains_case_condition_terminator(
+                        &line_tokens,
+                        depth,
+                        frame.owner_parser_depth,
+                    )
+                });
+            let current_line_is_case_condition_continuation = active_case_condition_frame.is_some()
                 && !current_line_ends_case_condition
                 && !Self::starts_with_case_branch_keyword(&trimmed_upper)
                 && !Self::starts_with_case_terminator(&trimmed_upper);
@@ -6956,7 +6959,8 @@ impl SqlEditorWidget {
                 }
             }
             if let Some(case_frame) = active_parenthesized_case_frame {
-                if case_frame.indent_branches && Self::starts_with_case_branch_keyword(&trimmed_upper)
+                if case_frame.indent_branches
+                    && Self::starts_with_case_branch_keyword(&trimmed_upper)
                 {
                     effective_depth = effective_depth.max(case_frame.depth.saturating_add(1));
                 } else if Self::starts_with_case_terminator(&trimmed_upper) {
@@ -7512,13 +7516,12 @@ impl SqlEditorWidget {
             let current_line_is_query_owner_standalone_open_paren =
                 current_line_is_standalone_open_paren
                     && continued_plsql_child_query_owner.is_none();
-            let current_line_general_paren_depth = if starts_multiline_case_condition
-                && !current_line_is_condition_query_owner
-            {
-                effective_depth.saturating_add(1)
-            } else {
-                effective_depth
-            };
+            let current_line_general_paren_depth =
+                if starts_multiline_case_condition && !current_line_is_condition_query_owner {
+                    effective_depth.saturating_add(1)
+                } else {
+                    effective_depth
+                };
             Self::update_paren_layout_frames_for_line(
                 &line_tokens,
                 paren_frame_scan_start_idx,
@@ -7852,7 +7855,7 @@ impl SqlEditorWidget {
         };
         if layout.kind != LineLayoutKind::Code
             || layout.existing_indent_spaces == 0
-            || layout.existing_indent_spaces % 4 == 0
+            || layout.existing_indent_spaces % Self::normalized_indent_tab_width() == 0
         {
             return false;
         }
@@ -9437,6 +9440,14 @@ mod formatter_scope_state_tests {
             formatted.contains("CYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"),
             "CYCLE clause should keep its inline SET payload, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn normalized_indent_tab_width_never_returns_zero() {
+        assert!(
+            SqlEditorWidget::normalized_indent_tab_width() > 0,
+            "indent tab width must never be zero to avoid division/modulo panics"
         );
     }
 }
