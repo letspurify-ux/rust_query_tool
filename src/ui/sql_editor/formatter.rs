@@ -1836,8 +1836,10 @@ impl SqlEditorWidget {
             if source.is_empty() || formatted.is_empty() {
                 return 0;
             }
-            let scaled_pos =
-                (source_pos as u128).saturating_mul(formatted.len() as u128) / source.len() as u128;
+            let scaled_pos = (source_pos as u128)
+                .saturating_mul(formatted.len() as u128)
+                .checked_div(source.len() as u128)
+                .unwrap_or(0);
             return Self::clamp_to_char_boundary(formatted, scaled_pos as usize) as i32;
         }
 
