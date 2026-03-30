@@ -1961,7 +1961,7 @@ impl FormatIndentedParenOwnerKind {
     fn freeform_body_header_continues(self, text_upper: &str) -> bool {
         let trimmed_upper = text_upper.trim_start();
         !trimmed_upper.is_empty()
-            && !trimmed_upper.starts_with(')')
+            && !line_has_leading_significant_close_paren(trimmed_upper)
             && self
                 .best_split_body_header_prefix_match(trimmed_upper)
                 .is_none()
@@ -2839,6 +2839,10 @@ pub(crate) fn significant_paren_depth_after_profile(
     depth
 }
 
+pub(crate) fn line_has_leading_significant_close_paren(line: &str) -> bool {
+    significant_paren_profile(line).leading_close_count > 0
+}
+
 /// Returns the meaningful remainder of `line` after consuming any leading
 /// close-paren run, including intervening whitespace or block comments.
 pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
@@ -3166,6 +3170,18 @@ mod tests {
 
         let unbalanced = significant_paren_profile("(a + (b)");
         assert_eq!(significant_paren_depth_after_profile(1, &unbalanced), 2);
+    }
+
+    #[test]
+    fn line_has_leading_significant_close_paren_ignores_comments_and_detects_real_closes() {
+        assert!(line_has_leading_significant_close_paren(
+            "/* leading note */ ) AND status = 'A'"
+        ));
+        assert!(line_has_leading_significant_close_paren(" ) "));
+        assert!(!line_has_leading_significant_close_paren(
+            "/* leading note */ deptno = 10"
+        ));
+        assert!(!line_has_leading_significant_close_paren("q'[)]'"));
     }
 
     #[test]

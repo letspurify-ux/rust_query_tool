@@ -1422,7 +1422,6 @@ impl QueryExecutor {
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
             let trimmed = line.trim_start();
-            let existing_indent = line.len().saturating_sub(trimmed.len()) / 4;
             let mut context = AutoFormatLineContext {
                 parser_depth,
                 auto_depth: parser_depth,
@@ -1655,7 +1654,7 @@ impl QueryExecutor {
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(trimmed)
                 {
-                    let cte_base_depth = existing_indent.max(frame.query_base_depth);
+                    let cte_base_depth = frame.query_base_depth;
                     context.auto_depth = cte_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
                     context.query_base_depth = Some(cte_base_depth);
@@ -1738,7 +1737,7 @@ impl QueryExecutor {
                     }
                     frame.trailing_comma_continuation =
                         Self::line_ends_with_comma_before_inline_comment(trimmed)
-                            && !trimmed.starts_with(')');
+                            && !sql_text::line_has_leading_significant_close_paren(trimmed);
                     if frame.is_multitable_insert {
                         if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
                             frame.multitable_insert_branch_depth = 1;
@@ -1748,20 +1747,15 @@ impl QueryExecutor {
                     }
                     if frame.head_kind == Some(AutoFormatClauseKind::Merge) {
                         if Self::auto_format_is_merge_branch_header(&trimmed_upper) {
-                            frame.merge_branch_body_depth = Some(
-                                existing_indent
-                                    .max(frame.query_base_depth)
-                                    .saturating_add(1),
-                            );
+                            frame.merge_branch_body_depth =
+                                Some(frame.query_base_depth.saturating_add(1));
                             frame.merge_branch_action = None;
                         } else if let Some(action) =
                             Self::merge_branch_action_from_clause_kind(clause_kind)
                         {
-                            frame.merge_branch_body_depth.get_or_insert_with(|| {
-                                existing_indent
-                                    .max(frame.query_base_depth)
-                                    .saturating_add(1)
-                            });
+                            frame
+                                .merge_branch_body_depth
+                                .get_or_insert_with(|| frame.query_base_depth.saturating_add(1));
                             frame.merge_branch_action = Some(action);
                         }
                     }
@@ -1803,7 +1797,7 @@ impl QueryExecutor {
                 non_query_into_continuation_depth = None;
             }
 
-            if trimmed.starts_with(')') {
+            if sql_text::line_has_leading_significant_close_paren(trimmed) {
                 if let Some(close_align_depth) = closing_query_close_align_depth {
                     context.auto_depth = close_align_depth;
                 }
@@ -2033,18 +2027,14 @@ impl QueryExecutor {
                 .map(|frame| frame.owner_base_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.owner_base_depth))
                 .or_else(|| completed_plsql_child_query_owner.map(|frame| frame.owner_base_depth))
-                .unwrap_or_else(|| {
-                    Self::pending_query_owner_base_depth(existing_indent, context, &trimmed_upper)
-                });
+                .unwrap_or_else(|| Self::pending_query_owner_base_depth(context, &trimmed_upper));
             let next_query_head_depth = pending_split_query_owner_for_line
                 .map(|frame| frame.next_query_head_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.next_query_head_depth))
                 .or_else(|| {
                     completed_plsql_child_query_owner.map(|frame| frame.next_query_head_depth)
                 })
-                .unwrap_or_else(|| {
-                    Self::next_query_head_depth(existing_indent, context, &trimmed_upper)
-                });
+                .unwrap_or_else(|| Self::next_query_head_depth(context, &trimmed_upper));
             let line_opens_child_query =
                 Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                     && continued_plsql_child_query_owner.is_none();
@@ -2196,7 +2186,7 @@ impl QueryExecutor {
             pending_inline_comment_line_continuation =
                 Self::inline_comment_line_continuation_for_line(
                     trimmed,
-                    existing_indent.max(context.auto_depth),
+                    context.auto_depth,
                     context.query_base_depth,
                     clause_kind,
                 );
@@ -2896,26 +2886,24 @@ impl QueryExecutor {
         let aligns_owner_boundary = frame.nested_paren_depth == 0
             || nested_paren_depth_after_line == 0
             || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
-            || trimmed.starts_with(')');
+            || sql_text::line_has_leading_significant_close_paren(trimmed);
 
         aligns_owner_boundary.then_some(frame.owner_base_depth)
     }
 
     fn pending_query_owner_base_depth(
-        existing_indent: usize,
         context: AutoFormatLineContext,
         trimmed_upper: &str,
     ) -> usize {
         let normalized = trimmed_upper.trim_end();
         let structural_owner_base = context.auto_depth;
-        let visual_owner_base = existing_indent.max(structural_owner_base);
         if context.condition_role != AutoFormatConditionRole::None {
             if let Some(header_depth) = context.condition_header_depth {
                 if Self::line_ends_with_open_paren_before_inline_comment(normalized)
                     && normalized == "("
-                    && visual_owner_base > header_depth
+                    && structural_owner_base > header_depth
                 {
-                    return visual_owner_base;
+                    return structural_owner_base;
                 }
                 return header_depth;
             }
@@ -2929,16 +2917,11 @@ impl QueryExecutor {
                     context.query_base_depth,
                 )
             })
-            .unwrap_or(visual_owner_base)
+            .unwrap_or(structural_owner_base)
     }
 
-    fn next_query_head_depth(
-        existing_indent: usize,
-        context: AutoFormatLineContext,
-        trimmed_upper: &str,
-    ) -> usize {
-        Self::pending_query_owner_base_depth(existing_indent, context, trimmed_upper)
-            .saturating_add(1)
+    fn next_query_head_depth(context: AutoFormatLineContext, trimmed_upper: &str) -> usize {
+        Self::pending_query_owner_base_depth(context, trimmed_upper).saturating_add(1)
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
@@ -7692,6 +7675,55 @@ FROM outer_2;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_normalize_overindented_cte_header_to_with_owner_depth() {
+        let sql = r#"WITH
+            dept_stats AS (
+                SELECT deptno
+                FROM emp
+            )
+SELECT *
+FROM dept_stats;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH");
+        let cte_idx = find_line("dept_stats AS (");
+        let select_idx = find_line("SELECT deptno");
+        let close_idx = find_line(")");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT *")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "overindented CTE header should snap back to the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[cte_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT should stay exactly one level deeper than the CTE owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[cte_idx].auto_depth,
+            "CTE closing paren should realign with the CTE owner depth"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after an overindented CTE should return to the WITH base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_case_after_then_on_branch_body_depth() {
         let sql = r#"SELECT
     CASE
@@ -8093,6 +8125,109 @@ WHEN NOT MATCHED THEN
         assert_eq!(
             contexts[values_idx].auto_depth, contexts[insert_idx].auto_depth,
             "VALUES should stay on the INSERT branch depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_normalize_overindented_merge_branch_body_to_structural_depth() {
+        let sql = r#"MERGE INTO target_table t
+USING source_table s
+ON (t.id = s.id)
+WHEN MATCHED THEN
+            UPDATE
+                    SET t.name = s.name
+WHEN NOT MATCHED THEN
+            INSERT (id, name)
+                    VALUES (s.id, s.name);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let when_matched_idx = find_line("WHEN MATCHED THEN");
+        let update_idx = find_line("UPDATE");
+        let set_idx = find_line("SET t.name = s.name");
+        let when_not_matched_idx = find_line("WHEN NOT MATCHED THEN");
+        let insert_idx = find_line("INSERT (id, name)");
+        let values_idx = find_line("VALUES (s.id, s.name);");
+
+        assert_eq!(
+            contexts[update_idx].auto_depth,
+            contexts[when_matched_idx].auto_depth.saturating_add(1),
+            "overindented MERGE UPDATE action should stay exactly one level deeper than WHEN MATCHED"
+        );
+        assert_eq!(
+            contexts[set_idx].auto_depth, contexts[update_idx].auto_depth,
+            "SET in MERGE UPDATE branch should stay on the UPDATE branch depth"
+        );
+        assert_eq!(
+            contexts[insert_idx].auto_depth,
+            contexts[when_not_matched_idx].auto_depth.saturating_add(1),
+            "overindented MERGE INSERT action should stay exactly one level deeper than WHEN NOT MATCHED"
+        );
+        assert_eq!(
+            contexts[values_idx].auto_depth, contexts[insert_idx].auto_depth,
+            "VALUES in MERGE INSERT branch should stay on the INSERT branch depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_normalize_overindented_merge_branch_headers_to_merge_base() {
+        let sql = r#"MERGE INTO target_table t
+USING source_table s
+ON (t.id = s.id)
+            WHEN MATCHED THEN
+UPDATE
+SET t.name = s.name
+            WHEN NOT MATCHED THEN
+INSERT (id, name)
+VALUES (s.id, s.name);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let merge_idx = find_line("MERGE INTO target_table t");
+        let when_matched_idx = find_line("WHEN MATCHED THEN");
+        let update_idx = find_line("UPDATE");
+        let set_idx = find_line("SET t.name = s.name");
+        let when_not_matched_idx = find_line("WHEN NOT MATCHED THEN");
+        let insert_idx = find_line("INSERT (id, name)");
+        let values_idx = find_line("VALUES (s.id, s.name);");
+
+        assert_eq!(
+            contexts[when_matched_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "overindented WHEN MATCHED should snap back to the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[update_idx].auto_depth,
+            contexts[when_matched_idx].auto_depth.saturating_add(1),
+            "UPDATE under an overindented WHEN MATCHED should stay exactly one level deeper than the MERGE branch header"
+        );
+        assert_eq!(
+            contexts[set_idx].auto_depth, contexts[update_idx].auto_depth,
+            "SET in MERGE UPDATE branch should stay on the branch body depth"
+        );
+        assert_eq!(
+            contexts[when_not_matched_idx].auto_depth, contexts[merge_idx].auto_depth,
+            "overindented WHEN NOT MATCHED should snap back to the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[insert_idx].auto_depth,
+            contexts[when_not_matched_idx].auto_depth.saturating_add(1),
+            "INSERT under an overindented WHEN NOT MATCHED should stay exactly one level deeper than the MERGE branch header"
+        );
+        assert_eq!(
+            contexts[values_idx].auto_depth, contexts[insert_idx].auto_depth,
+            "VALUES in MERGE INSERT branch should stay on the branch body depth"
         );
     }
 
@@ -9743,6 +9878,42 @@ deptno;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_ignore_existing_indent_for_inline_comment_header_continuation() {
+        let sql = r#"SELECT deptno,
+    COUNT(*) AS cnt
+FROM emp
+GROUP BY /* keep */
+                deptno;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "GROUP BY /* keep */")
+            .unwrap_or(0);
+        let deptno_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[deptno_idx].auto_depth,
+            contexts[group_by_idx].auto_depth.saturating_add(1),
+            "inline-comment continuation depth must come from the GROUP BY header depth, not the raw existing indent"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "inline-comment continuation should still be tracked as a continuation"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
+            "inline-comment continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_limit_comment_continuation_uses_operand_depth() {
         let sql = r#"SELECT e.empno
 FROM emp e
@@ -10802,10 +10973,6 @@ FROM dual;"#;
             .iter()
             .position(|line| line.trim_start() == ") THEN 'Y'")
             .unwrap_or(0);
-        let wrapper_existing_indent = lines[wrapper_idx]
-            .len()
-            .saturating_sub(lines[wrapper_idx].trim_start().len())
-            / 4;
 
         assert_eq!(
             contexts[wrapper_idx].condition_header_line,
@@ -10819,8 +10986,8 @@ FROM dual;"#;
         );
         assert_eq!(
             contexts[select_idx].auto_depth,
-            wrapper_existing_indent.saturating_add(1),
-            "nested SELECT should be one level deeper than the innermost wrapper line's visual owner depth"
+            contexts[wrapper_idx].auto_depth.saturating_add(1),
+            "nested SELECT should be one level deeper than the innermost wrapper owner depth"
         );
         assert_eq!(
             contexts[close_then_idx].condition_role,
@@ -12106,6 +12273,40 @@ WHERE 1 = 1;";
 
         let depths = QueryExecutor::line_block_depths(sql);
         assert_eq!(depths, vec![0, 0, 1, 1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn auto_format_line_contexts_align_comment_prefixed_query_close_with_owner_depth() {
+        let sql = "SELECT *
+FROM (
+SELECT 1
+FROM dual
+/* close */ )
+WHERE 1 = 1;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM (")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* close */ )"))
+            .unwrap_or(0);
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[from_idx].auto_depth,
+            "comment-prefixed close paren should return to the query owner depth"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
+            "outer WHERE should stay on the query owner depth after the comment-prefixed close"
+        );
     }
 
     #[test]
