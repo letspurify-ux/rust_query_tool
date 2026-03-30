@@ -141,6 +141,25 @@ fn collect_virtual_columns_from_relations(
 }
 
 #[test]
+fn column_load_worker_pool_enqueue_returns_err_when_worker_pool_is_empty() {
+    let pool = ColumnLoadWorkerPool {
+        worker_senders: Vec::new(),
+        worker_handles: Mutex::new(Vec::new()),
+        next_worker: AtomicUsize::new(0),
+    };
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let task = ColumnLoadTask {
+        table_key: "EMP".to_string(),
+        connection: create_shared_connection(),
+        sender,
+    };
+
+    let result = pool.enqueue(task.clone());
+    assert!(result.is_err());
+    assert_eq!(result.err().map(|value| value.table_key), Some(task.table_key));
+}
+
+#[test]
 fn test7_set_operator_order_by_keeps_compound_statement_context() {
     let script = load_intellisense_test_file("test7.txt");
 
