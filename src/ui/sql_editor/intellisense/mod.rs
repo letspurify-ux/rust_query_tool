@@ -92,10 +92,20 @@ struct ColumnLoadWorkerPool {
 
 impl ColumnLoadWorkerPool {
     fn enqueue(&self, task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
-        if self.worker_senders.is_empty() {
+        let worker_count = self.worker_senders.len();
+        if worker_count == 0 {
             return Err(task);
         }
-        let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_senders.len();
+
+        let next = self.next_worker.fetch_add(1, Ordering::Relaxed);
+        let Some(index) = next.checked_rem(worker_count) else {
+            crate::utils::logging::log_error(
+                "sql_editor::intellisense::column_loader",
+                "failed to select column-load worker: worker count is zero",
+            );
+            return Err(task);
+        };
+
         let task_for_err = task.clone();
         self.worker_senders[index]
             .send(ColumnLoadWorkerMessage::Task(task))

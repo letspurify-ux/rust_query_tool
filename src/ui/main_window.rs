@@ -419,13 +419,23 @@ impl AppState {
         if !self.status_animation_running {
             return;
         }
-        self.status_animation_frame =
-            (self.status_animation_frame + 1) % Self::STATUS_SPINNER_FRAMES.len();
+        let frame_count = Self::STATUS_SPINNER_FRAMES.len();
+        if frame_count == 0 {
+            self.status_animation_running = false;
+            self.status_animation_message.clear();
+            return;
+        }
+        self.status_animation_frame = (self.status_animation_frame + 1) % frame_count;
         self.render_status_animation_frame();
     }
 
     fn render_status_animation_frame(&mut self) {
         if !self.status_animation_running {
+            return;
+        }
+        if Self::STATUS_SPINNER_FRAMES.is_empty() {
+            self.status_animation_running = false;
+            self.status_animation_message.clear();
             return;
         }
         let frame = Self::STATUS_SPINNER_FRAMES[self.status_animation_frame];
