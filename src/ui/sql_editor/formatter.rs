@@ -4848,21 +4848,22 @@ impl SqlEditorWidget {
                                     && !construct.grant_revoke_active.is_active()
                                     && !trigger_header_state.is_active()
                                 {
-                                    let comma_extra_indent = if matches!(
-                                        active_phase1_wrapped_owner_kind,
-                                        Some(
-                                            FormatIndentedParenOwnerKind::WithinGroup
-                                                | FormatIndentedParenOwnerKind::Keep
-                                        )
-                                    ) || (matches!(current_clause.as_deref(), Some("SET"))
-                                        && construct.merge_active.is_active())
-                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                            && construct.cursor_sql_active.is_active())
-                                    {
-                                        0
-                                    } else {
-                                        1
-                                    };
+                                    let comma_extra_indent =
+                                        if matches!(
+                                            active_phase1_wrapped_owner_kind,
+                                            Some(
+                                                FormatIndentedParenOwnerKind::WithinGroup
+                                                    | FormatIndentedParenOwnerKind::Keep
+                                            )
+                                        ) || (matches!(current_clause.as_deref(), Some("SET"))
+                                            && construct.merge_active.is_active())
+                                            || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                                && construct.cursor_sql_active.is_active())
+                                        {
+                                            0
+                                        } else {
+                                            1
+                                        };
                                     if current_query_has_apply
                                         && matches!(current_clause.as_deref(), Some("SELECT"))
                                     {
@@ -6346,8 +6347,8 @@ impl SqlEditorWidget {
                 && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
                 && !Self::starts_with_bare_end(&trimmed_upper);
             // Detect FORALL body lines structurally via frame.
-            let forall_body_depth = forall_body_frame
-                .map(|frame| frame.owner_depth.saturating_add(1));
+            let forall_body_depth =
+                forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
             let force_block_depth = !in_dml_statement
                 && !is_trigger_header_when
                 && (trimmed_upper.starts_with("EXCEPTION")
@@ -6554,6 +6555,9 @@ impl SqlEditorWidget {
             let resolved_query_base_depth = resolved_query_base_frame
                 .map(|frame| frame.resolved_base_depth)
                 .or(layouts[idx].query_base_depth);
+            let query_list_body_depth_floor = resolved_query_base_depth
+                .or(layouts[idx].query_base_depth)
+                .map(|depth| depth.saturating_add(1));
             let analyzer_query_depth = if let Some(query_base_depth) = layouts[idx].query_base_depth
             {
                 let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
@@ -6711,11 +6715,11 @@ impl SqlEditorWidget {
                 if previous_line_starts_with_using_clause {
                     last_code_indent
                         .map(|indent| indent.saturating_add(1).max(parser_depth))
-                        .unwrap_or(parser_depth.saturating_add(1).max(existing_indent))
+                        .unwrap_or(parser_depth.saturating_add(1))
                 } else {
                     last_code_indent
                         .map(|indent| indent.max(parser_depth))
-                        .unwrap_or(parser_depth.max(existing_indent))
+                        .unwrap_or(parser_depth)
                 }
             } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
             {
@@ -6853,21 +6857,25 @@ impl SqlEditorWidget {
                 }
             } else if in_query_statement
                 && previous_line_is_close_paren_with_trailing_comma
-                && existing_indent > parser_depth
                 && !Self::is_dml_clause_starter(&trimmed_upper)
                 && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 && !starts_with_close_paren
             {
-                last_code_indent
-                    .map(|indent| indent.max(existing_indent))
-                    .unwrap_or(existing_indent)
+                query_list_body_depth_floor
+                    .unwrap_or(analyzer_query_depth)
+                    .max(analyzer_query_depth)
+                    .max(
+                        last_code_indent
+                            .map(|indent| indent.max(parser_depth))
+                            .unwrap_or(parser_depth),
+                    )
             } else if in_dml_statement
                 && follows_comma_run
                 && previous_code_is_inline_merge_update_set
                 && !Self::is_dml_clause_starter(&trimmed_upper)
                 && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
             {
-                last_code_indent.unwrap_or(parser_depth.max(existing_indent))
+                last_code_indent.unwrap_or(parser_depth)
             } else if in_dml_statement
                 && follows_comma_run
                 && !Self::is_dml_clause_starter(&trimmed_upper)
@@ -6875,7 +6883,7 @@ impl SqlEditorWidget {
             {
                 last_code_indent
                     .map(|indent| indent.max(parser_depth))
-                    .unwrap_or(parser_depth.max(existing_indent))
+                    .unwrap_or(parser_depth)
             } else if in_dml_statement
                 && previous_line_ends_with_trailing_comma
                 && !previous_line_is_dml_clause_line
@@ -6973,14 +6981,18 @@ impl SqlEditorWidget {
                 && !Self::is_dml_clause_starter(&trimmed_upper)
                 && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
             {
-                last_code_indent
-                    .map(|indent| indent.max(existing_indent))
-                    .unwrap_or(existing_indent.max(parser_depth))
+                query_list_body_depth_floor
+                    .unwrap_or(analyzer_query_depth)
+                    .max(analyzer_query_depth)
+                    .max(
+                        last_code_indent
+                            .map(|indent| indent.max(parser_depth))
+                            .unwrap_or(parser_depth),
+                    )
             } else if in_dml_statement {
-                // DML fallback: existing_indent bounded by parser_depth and
-                // parser_depth + max_extra.  max_extra = 2 accommodates query
-                // structure depth (clause body, expression nesting) that
-                // parser_depth alone does not capture.
+                // DML/query fallback: unresolved continuation lines still use
+                // a bounded raw-indent bridge until every expression/list body
+                // owns an explicit frame in phase 2.
                 let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
                 let max_extra = if closes_into_list || follows_comma_run {
                     0
@@ -6988,6 +7000,17 @@ impl SqlEditorWidget {
                     2
                 };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
+            } else if !in_query_statement
+                && !starts_with_close_paren
+                && last_code_idx.is_some_and(|prev_idx| {
+                    let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&prev_upper, "BEGIN")
+                        || crate::sql_text::starts_with_keyword_token(&prev_upper, "DECLARE")
+                        || prev_upper.eq("LOOP")
+                        || prev_upper.eq("REPEAT")
+                })
+            {
+                parser_depth
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth
             } else {
@@ -11330,6 +11353,38 @@ END;"#;
             indent(lines[end_idx]),
             0,
             "outer END should remain at the enclosing BEGIN depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_overindented_begin_body_statement_to_structural_depth(
+    ) {
+        let source = r#"BEGIN
+                NULL;
+END;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[null_idx]),
+            4,
+            "BEGIN body statement should use the structural block body depth instead of preserving raw indent, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_idx]),
+            0,
+            "END should stay aligned with the BEGIN owner depth, got:\n{}",
             formatted
         );
     }
@@ -18754,6 +18809,80 @@ WHERE bonus_view.bonus_deptno = d.deptno;"#;
             indent(lines[where_idx]),
             indent(lines[from_idx]),
             "WHERE after the split TABLE item should return to the FROM header depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_sibling_after_close_paren_comma_to_structural_from_item_list_depth(
+    ) {
+        let source = r#"SELECT d.deptno
+FROM
+        dept d,
+                    LATERAL
+                                (
+                                    SELECT MAX (e.sal) AS max_sal
+                                    FROM emp e
+                                    WHERE e.deptno = d.deptno
+                                ) lat,
+                                                    dept_hist h
+WHERE d.deptno = h.deptno;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM")
+            .unwrap_or(0);
+        let dept_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "dept d,")
+            .unwrap_or(0);
+        let lateral_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "LATERAL")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") lat,"))
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "dept_hist h")
+            .unwrap_or(0);
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE d.deptno = h.deptno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[dept_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "first FROM-item sibling should stay exactly one level deeper than the FROM header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[lateral_idx]),
+            indent(lines[dept_idx]),
+            "split LATERAL owner should stay on the structural FROM-item sibling depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[lateral_idx]),
+            "split LATERAL close line should realign with the owner depth before the trailing comma, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[dept_idx]),
+            "sibling after `),` must reuse the existing FROM-item list depth instead of its raw indent, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[where_idx]),
+            indent(lines[from_idx]),
+            "WHERE after the sibling should return to the FROM header depth, got:\n{}",
             formatted
         );
     }

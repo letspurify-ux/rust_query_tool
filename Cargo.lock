@@ -1367,8 +1367,11 @@ dependencies = [
  "miniquad",
  "once_cell",
  "oracle",
+ "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
+ "syn 2.0.117",
  "windows-sys 0.61.2",
  "winres",
 ]

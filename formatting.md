@@ -24,6 +24,12 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 
 구조 계산 = `owner/body/list body/close depth`. 렌더링 계산 = `render indent`.
 
+`existing_indent`는 입력 텍스트의 과거 시각 정보일 뿐이다.
+
+- 구조 계산에서는 owner stack / query frame / condition frame / multiline owner frame 같은 의미 상태만 사용한다.
+- `existing_indent`는 hanging indent 보존처럼 render 단계에서만 직접 참조할 수 있다.
+- 구조 계산에서 `existing_indent`를 참조해야 한다면, 그 줄은 아직 frame/state 모델이 빠진 임시 브릿지로 간주해야 한다.
+
 ## 2. 핵심 공리
 
 ### 2.1 구조 depth는 시각 indent로부터 역산 금지
@@ -39,6 +45,11 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 ### 2.2 모든 open event는 정확히 +1
 
 한 번의 opener가 두 단계 이상을 만들면 안 된다. 다단계 점프처럼 보여도 실제 전이는 항상 "owner frame 하나 push"의 합성이어야 한다.
+
+예시:
+
+- `FROM (` 뒤의 child query head가 query base 대비 `+2`처럼 보이더라도, 실제 구조 전이는 `FROM body +1` 후 `child query head +1`의 합성이다.
+- `THEN` 다음 `BEGIN`도 branch body frame `+1`과 block frame `+1`을 분리해서 해석해야 한다.
 
 ### 2.3 모든 close event는 pop된 owner의 depth로 정렬
 
@@ -68,6 +79,11 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 
 종류만 다르고 전이 규칙(push +1, pop −1, close = owner depth)은 동일하다.
 
+추가 원칙:
+
+- `),` 뒤의 다음 sibling도 새 owner가 아니라 기존 list body 위에서 해석한다.
+- comment-only / comma-only line은 frame을 열거나 닫지 않으며, 인접 code line의 구조 depth를 빌려 렌더링만 한다.
+
 ## 4. continuation line
 
 owner를 열지도 닫지도 않으면, 현재 활성 stack의 depth를 그대로 사용한다.
@@ -93,8 +109,10 @@ split owner/header가 다음 줄까지 이어지는 경우:
 
 ## 6. Phase 1 브릿지 원칙
 
-Phase 2가 아직 독립적으로 추적하지 못하는 구조(query clause body depth 등)는 Phase 1의 `existing_indent`를 bounded fallback으로 참조할 수 있다.
+Phase 2가 아직 독립적으로 추적하지 못하는 구조(query clause body depth 등)는 우선 Phase 1 analyzer가 이미 정규화한 구조 출력(`auto_depth`, `query_base_depth`, `next_query_head_depth`)을 브릿지로 사용해야 한다.
 
-- fallback은 `parser_depth` 기준 bounded clamp만 허용한다.
-- 구조 frame으로 대체 가능해지면 즉시 fallback을 제거한다.
-- 남은 fallback: query clause body depth (Phase 2 독립 추적으로 제거 예정)
+- 구조 depth 입력 우선순위는 `Phase 2 frame/state` → `Phase 1 analyzer 구조값` → bounded raw-indent bridge 순서다.
+- raw-indent bridge는 owner/body/list body/close depth가 이미 결정된 줄에는 금지한다. 허용 범위는 아직 frame/state가 없는 continuation line으로 한정한다.
+- `existing_indent`를 써야 한다면 `parser_depth` 기준 bounded clamp만 허용한다.
+- raw-indent bridge는 "새 depth를 발명"하는 용도가 아니라, 아직 모델링되지 않은 continuation를 임시로 유지하는 용도여야 한다.
+- 같은 구문을 analyzer 또는 explicit frame으로 표현할 수 있게 되면 raw-indent bridge를 즉시 제거한다.
