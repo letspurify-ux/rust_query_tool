@@ -38,7 +38,6 @@ struct LineLayout<'a> {
     next_query_head_depth: Option<usize>,
     condition_header_line: Option<usize>,
     condition_role: AutoFormatConditionRole,
-    existing_indent: usize,
     existing_indent_spaces: usize,
     final_depth: usize,
     anchor_group: Option<usize>,
@@ -5377,7 +5376,6 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.condition_role)
                     .unwrap_or(AutoFormatConditionRole::None),
-                existing_indent: Self::safe_indent_div(leading_indent_columns),
                 existing_indent_spaces: leading_indent_columns,
                 final_depth: 0,
                 anchor_group: None,
@@ -5725,6 +5723,20 @@ impl SqlEditorWidget {
         .then(|| layout.final_depth.saturating_add(1))
     }
 
+    fn completed_plsql_child_query_owner_frame_kind(
+        trimmed_upper: &str,
+    ) -> Option<sql_text::PendingFormatPlsqlChildQueryOwnerHeaderKind> {
+        match crate::sql_text::format_plsql_child_query_owner_kind(trimmed_upper) {
+            Some(crate::sql_text::FormatPlsqlChildQueryOwnerKind::CursorDeclaration) => {
+                Some(sql_text::PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration)
+            }
+            Some(crate::sql_text::FormatPlsqlChildQueryOwnerKind::OpenCursorFor) => {
+                Some(sql_text::PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
+            }
+            _ => None,
+        }
+    }
+
     fn clause_starter_uses_general_paren_continuation(
         trimmed_upper: &str,
         starts_query_head: bool,
@@ -6024,12 +6036,20 @@ impl SqlEditorWidget {
         }
 
         let trimmed = line.trim_start();
-        let aligns_owner_boundary = frame.nested_paren_depth == 0
-            || nested_paren_depth_after_line == 0
+        if frame.kind.line_completes(line)
             || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
-            || crate::sql_text::line_has_leading_significant_close_paren(trimmed);
+            || crate::sql_text::line_has_leading_significant_close_paren(trimmed)
+        {
+            return Some(frame.owner_depth);
+        }
 
-        aligns_owner_boundary.then_some(frame.owner_depth)
+        if frame.nested_paren_depth == 0 {
+            return Some(frame.owner_depth.saturating_add(1));
+        }
+
+        let closes_nested_wrapper =
+            frame.nested_paren_depth > 0 && nested_paren_depth_after_line == 0;
+        closes_nested_wrapper.then_some(frame.owner_depth)
     }
 
     fn normalize_indented_owner_relative_depth(
@@ -6113,7 +6133,6 @@ impl SqlEditorWidget {
 
             let trimmed = layouts[idx].trimmed;
             let depth = layouts[idx].parser_depth;
-            let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
@@ -7005,10 +7024,8 @@ impl SqlEditorWidget {
                 })
             {
                 parser_depth
-            } else if existing_indent > parser_depth.saturating_add(3) {
-                parser_depth
             } else {
-                parser_depth.max(existing_indent)
+                parser_depth
             };
             if previous_line_is_order_by_clause
                 && previous_line_ends_with_trailing_comma
@@ -7183,6 +7200,7 @@ impl SqlEditorWidget {
                     trimmed,
                     nested_paren_depth_after_line,
                 )
+                .map(|depth| effective_depth.max(depth))
                 .unwrap_or(effective_depth)
             } else {
                 effective_depth
@@ -7285,14 +7303,13 @@ impl SqlEditorWidget {
                         if frame.kind.line_completes(trimmed) && nested_paren_depth_after_line == 0
                         {
                             completed_plsql_child_query_owner = true;
-                        } else {
-                            continued_plsql_child_query_owner =
-                                Some(PendingPlsqlChildQueryOwnerLayoutFrame {
-                                    kind: frame.kind,
-                                    owner_depth: frame.owner_depth,
-                                    nested_paren_depth: nested_paren_depth_after_line,
-                                });
                         }
+                        continued_plsql_child_query_owner =
+                            Some(PendingPlsqlChildQueryOwnerLayoutFrame {
+                                kind: frame.kind,
+                                owner_depth: frame.owner_depth,
+                                nested_paren_depth: nested_paren_depth_after_line,
+                            });
                     }
                 }
                 if !current_line_is_standalone_open_paren {
@@ -7742,15 +7759,17 @@ impl SqlEditorWidget {
                     })
                 })
             };
-            pending_plsql_child_query_owner = if completed_plsql_child_query_owner
-                || layouts[idx].next_query_head_depth.is_some()
+            pending_plsql_child_query_owner = if let Some(frame) = continued_plsql_child_query_owner
             {
-                None
-            } else if let Some(frame) = continued_plsql_child_query_owner {
                 Some(frame)
+            } else if completed_plsql_child_query_owner {
+                None
             } else {
-                sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed).map(|kind| {
-                    PendingPlsqlChildQueryOwnerLayoutFrame {
+                Self::completed_plsql_child_query_owner_frame_kind(&trimmed_upper)
+                    .or_else(|| {
+                        sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed)
+                    })
+                    .map(|kind| PendingPlsqlChildQueryOwnerLayoutFrame {
                         kind,
                         owner_depth: effective_depth,
                         nested_paren_depth:
@@ -7758,8 +7777,7 @@ impl SqlEditorWidget {
                                 0,
                                 &multiline_clause_paren_profile,
                             ),
-                    }
-                })
+                    })
             };
             if pending_operator_for_line.is_some() && !pending_operator_layout_frames.is_empty() {
                 pending_operator_layout_frames.pop();
@@ -11374,6 +11392,76 @@ END;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_normalizes_mildly_overindented_begin_body_statement_to_structural_depth(
+    ) {
+        let source = r#"BEGIN
+        NULL;
+END;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[null_idx]),
+            4,
+            "mildly overindented BEGIN body statements should still snap to the structural block body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_idx]),
+            0,
+            "END should stay aligned with the BEGIN owner depth after mild overindent normalization, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_mildly_overindented_then_body_statement_to_structural_depth(
+    ) {
+        let source = r#"BEGIN
+    IF 1 = 1 THEN
+            NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF 1 = 1 THEN")
+            .unwrap_or(0);
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[null_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "THEN body statements should use the structural branch body depth instead of preserving mild raw indent drift, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should stay aligned with IF after branch body normalization, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn plsql_else_if_clause_uses_block_depth_without_extra_into_indent() {
         let sql = r#"BEGIN
   IF 1 = 1 THEN
@@ -14856,7 +14944,7 @@ END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("WHERE (e.manager_id IS NULL\n                    OR e.manager_id = 100)"),
+            formatted.contains("WHERE (e.manager_id IS NULL\n                OR e.manager_id = 100)"),
             "Non-SELECT parenthesis pair inside OPEN ... FOR WHERE should stay paired and indented, got:
 {}",
             formatted
@@ -14874,7 +14962,7 @@ END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                    OR e.department_id = 90)"),
+            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                OR e.department_id = 90)"),
             "Nested non-SELECT parenthesis pairs in OPEN ... FOR WHERE should stay paired and indented, got:
 {}",
             formatted

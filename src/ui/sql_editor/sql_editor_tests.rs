@@ -5370,11 +5370,11 @@ BEGIN
     IF INSERTING THEN
         :NEW.updated_at := NULL;
         IF :NEW.note IS
-                NULL THEN
-                :NEW.note := 'auto-note:' || :NEW.sku;
+        NULL THEN
+            :NEW.note := 'auto-note:' || :NEW.sku;
         END IF;
     ELSIF UPDATING THEN
-            :NEW.updated_at := SYSDATE;
+        :NEW.updated_at := SYSDATE;
     END IF;
 END;"#;
 
@@ -5386,11 +5386,11 @@ BEGIN
     IF INSERTING THEN
         :NEW.updated_at := NULL;
         IF :NEW.note IS
-                NULL THEN
-                :NEW.note := 'auto-note:' || :NEW.sku;
+        NULL THEN
+            :NEW.note := 'auto-note:' || :NEW.sku;
         END IF;
     ELSIF UPDATING THEN
-            :NEW.updated_at := SYSDATE;
+        :NEW.updated_at := SYSDATE;
     END IF;
 END;"#;
 

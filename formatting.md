@@ -27,8 +27,10 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 `existing_indent`는 입력 텍스트의 과거 시각 정보일 뿐이다.
 
 - 구조 계산에서는 owner stack / query frame / condition frame / multiline owner frame / 정규화된 line continuation state 같은 의미 상태만 사용한다.
+- 이전 줄의 `final_depth`, analyzer가 제공한 `parser_depth`/`auto_depth`/`query_base_depth`, pending owner frame처럼 이미 구조 규칙으로 계산된 값은 재사용 가능한 구조 상태다.
 - `existing_indent`는 hanging indent 보존처럼 render 단계에서만 직접 참조할 수 있다.
-- 구조 계산에서 `existing_indent`를 참조해야 한다면, 그 줄은 아직 frame/state 모델이 빠진 임시 브릿지로 간주해야 한다.
+- `existing_indent`는 구조 depth의 fallback, soft floor, tie-breaker, "조금만 더 들여쓰기 되어 있으면 유지" 같은 보정 규칙으로도 사용하면 안 된다.
+- 구조 계산에서 `existing_indent`를 참조해야 한다면, 그 줄은 아직 frame/state 모델이 빠진 임시 브릿지로 간주해야 하며 제거 대상이다.
 
 ## 2. 핵심 공리
 
@@ -41,6 +43,12 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 - 다음 child query head가 어떤 owner에서 파생되었는가
 
 기존 줄의 공백 수, 수동 정렬, hanging indent 공백 수 → 구조 판단 근거가 될 수 없다.
+
+금지 예시:
+
+- `parser_depth.max(existing_indent)`
+- `existing_indent > parser_depth + n` 같은 임계치 기반 soft clamp
+- "조금만 더 들여쓰기 되어 있으면 continuation로 간주" 같은 휴리스틱
 
 ### 2.2 모든 open event는 정확히 +1
 

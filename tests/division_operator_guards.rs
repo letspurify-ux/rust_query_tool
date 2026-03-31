@@ -399,25 +399,25 @@ fn expected_arithmetic_sites() -> BTreeSet<ArithmeticSite> {
         site!("src/ui/sql_editor/execution.rs", 5919, "div", "size / 80"),
         site!(
             "src/ui/sql_editor/formatter.rs",
-            1524,
+            1523,
             "checked_div",
             "value . checked_div (Self :: normalized_indent_tab_width ())"
         ),
         site!(
             "src/ui/sql_editor/formatter.rs",
-            1530,
+            1529,
             "checked_rem",
             "value . checked_rem (Self :: normalized_indent_tab_width ())"
         ),
         site!(
             "src/ui/sql_editor/formatter.rs",
-            1615,
+            1614,
             "div",
             "columns / indent_tab_width"
         ),
         site!(
             "src/ui/sql_editor/formatter.rs",
-            1874,
+            1873,
             "checked_div",
             "(source_pos as u128) . saturating_mul (formatted . len () as u128) . checked_div (source . len () as u128)"
         ),
