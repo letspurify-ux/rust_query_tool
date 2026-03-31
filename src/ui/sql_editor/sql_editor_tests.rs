@@ -3762,7 +3762,7 @@ END torture_pkg;
     );
     assert!(
         formatted.contains(
-            "FORALL i IN 1..v_ids.COUNT SAVE EXCEPTIONS\n        UPDATE emp\n        SET sal = sal * 1.1\n        WHERE empno = v_ids (i);"
+            "FORALL i IN 1..v_ids.COUNT SAVE EXCEPTIONS\n            UPDATE emp\n            SET sal = sal * 1.1\n            WHERE empno = v_ids (i);"
         ),
         "FORALL block should keep DML indentation and SAVE EXCEPTIONS on the loop header, got: {formatted}"
     );

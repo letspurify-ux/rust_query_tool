@@ -332,6 +332,22 @@ struct PendingPlsqlChildQueryOwnerLayoutFrame {
     nested_paren_depth: usize,
 }
 
+/// Tracks CREATE TRIGGER header scope (BEFORE/FOR EACH ROW/WHEN/REFERENCING).
+/// Active from the first trigger header line until BEGIN is encountered.
+#[derive(Clone, Copy)]
+struct TriggerHeaderLayoutFrame {
+    /// Structural depth for trigger header body lines (always 1).
+    body_depth: usize,
+}
+
+/// Tracks FORALL body scope.
+/// Active from the FORALL header line until the DML body statement ends with `;`.
+#[derive(Clone, Copy)]
+struct ForallBodyLayoutFrame {
+    /// The FORALL header line's structural depth.
+    owner_depth: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ParenLayoutFrameKind {
     General,
@@ -6084,6 +6100,10 @@ impl SqlEditorWidget {
         // Stores (and_depth, parser_depth_of_on_line) for nested JOIN ON/USING
         // blocks, with the innermost active context at the end.
         let mut join_on_condition_and_depth: Vec<(usize, usize)> = Vec::new();
+        // Trigger header owner frame: tracks CREATE TRIGGER → BEGIN scope.
+        let mut trigger_header_frame: Option<TriggerHeaderLayoutFrame> = None;
+        // FORALL body owner frame: tracks FORALL → end-of-DML-body scope.
+        let mut forall_body_frame: Option<ForallBodyLayoutFrame> = None;
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -6312,21 +6332,22 @@ impl SqlEditorWidget {
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
                 && !next_line_is_named_plain_end;
-            // Trigger header WHEN (e.g. WHEN (n.sal > 0)) appears at parser_depth 0
-            // but is indented by phase 1 to align with other trigger header clauses.
-            // Detect this by checking if WHEN at depth 0 follows a trigger header line
-            // (previous line has higher existing_indent, indicating trigger header context).
-            let is_trigger_header_when = Self::starts_with_case_when(&trimmed_upper)
+            // Trigger header WHEN uses the trigger_header_frame instead of
+            // existing_indent to determine structural depth.
+            let is_trigger_header_when = trigger_header_frame.is_some()
+                && Self::starts_with_case_when(&trimmed_upper)
+                && depth == 0;
+            // Detect trigger header body lines structurally via frame.
+            let is_trigger_header_body_line = trigger_header_frame.is_some()
                 && depth == 0
-                && existing_indent > 0
-                && last_code_idx.is_some_and(|prev_idx| {
-                    let prev_trimmed_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                    prev_trimmed_upper.ends_with("ROW")
-                        || prev_trimmed_upper.starts_with("REFERENCING ")
-                        || prev_trimmed_upper.starts_with("FOR EACH ROW")
-                        || (layouts[prev_idx].parser_depth == 0
-                            && layouts[prev_idx].existing_indent > 0)
-                });
+                && !in_dml_statement
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE")
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
+                && !Self::starts_with_bare_end(&trimmed_upper);
+            // Detect FORALL body lines structurally via frame.
+            let forall_body_depth = forall_body_frame
+                .map(|frame| frame.owner_depth.saturating_add(1));
             let force_block_depth = !in_dml_statement
                 && !is_trigger_header_when
                 && (trimmed_upper.starts_with("EXCEPTION")
@@ -6545,20 +6566,21 @@ impl SqlEditorWidget {
             let mut current_line_dml_case_expression_close_depth = None;
             // BEGIN after trigger header (WHEN/FOR EACH ROW) should stay at
             // parser_depth (base indent), not inherit the trigger header's +1 depth.
-            let is_trigger_header_begin = !in_dml_statement
+            // BEGIN after trigger header closes the trigger header frame
+            // and stays at parser_depth (base indent).
+            let is_trigger_header_begin = trigger_header_frame.is_some()
+                && !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                && depth == 0
-                && existing_indent == 0
-                && last_code_idx.is_some_and(|prev_idx| {
-                    let prev = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                    layouts[prev_idx].existing_indent > 0
-                        && (prev.ends_with(')')
-                            || prev.ends_with("ROW")
-                            || prev.starts_with("REFERENCING ")
-                            || prev.starts_with("FOR EACH"))
-                });
+                && depth == 0;
             let mut effective_depth = if is_trigger_header_begin {
                 parser_depth
+            } else if is_trigger_header_body_line {
+                // Trigger header lines (BEFORE, REFERENCING, FOR EACH ROW,
+                // WHEN) are structurally at body_depth of the CREATE TRIGGER
+                // owner frame.
+                trigger_header_frame
+                    .map(|frame| frame.body_depth)
+                    .unwrap_or(parser_depth)
             } else if !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
                 && previous_line_ends_with_then
@@ -6713,19 +6735,10 @@ impl SqlEditorWidget {
                 && !current_line_is_parenthesized_condition_close
             {
                 parser_depth.saturating_add(1)
-            } else if in_dml_statement
-                && previous_line_is_forall_header
-                && Self::is_dml_clause_starter(&trimmed_upper)
-            {
-                last_code_indent
-                    .map(|indent| {
-                        if indent <= 1 {
-                            indent.saturating_add(1)
-                        } else {
-                            indent
-                        }
-                    })
-                    .unwrap_or(parser_depth)
+            } else if in_dml_statement && forall_body_depth.is_some() {
+                // FORALL body: all DML lines inside FORALL are at
+                // owner_depth + 1 structurally.
+                forall_body_depth.unwrap_or(parser_depth).max(parser_depth)
             } else if in_dml_statement
                 && previous_line_is_select_header
                 && previous_select_follows_cursor_header
@@ -7747,6 +7760,28 @@ impl SqlEditorWidget {
                 });
             }
 
+            // ── Trigger header frame lifecycle ──
+            // Activate when we see a CREATE TRIGGER line.
+            if depth == 0
+                && !in_dml_statement
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
+                && Self::is_create_trigger_statement(trimmed)
+            {
+                trigger_header_frame = Some(TriggerHeaderLayoutFrame { body_depth: 1 });
+            }
+            // Deactivate on BEGIN (the trigger body starts).
+            if is_trigger_header_begin {
+                trigger_header_frame = None;
+            }
+
+            // ── FORALL body frame lifecycle ──
+            // Activate when we see a FORALL header line.
+            if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FORALL") {
+                forall_body_frame = Some(ForallBodyLayoutFrame {
+                    owner_depth: layouts[idx].final_depth,
+                });
+            }
+
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
                 pending_query_head_frames.clear();
@@ -7764,6 +7799,10 @@ impl SqlEditorWidget {
                 case_condition_frames.clear();
                 case_layout_state.clear();
                 join_on_condition_and_depth.clear();
+                // FORALL body ends when its DML statement terminates.
+                forall_body_frame = None;
+                // Trigger header frame also clears on `;` (safety).
+                trigger_header_frame = None;
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();

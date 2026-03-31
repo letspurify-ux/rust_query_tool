@@ -95,12 +95,13 @@ split owner/header가 다음 줄까지 이어지는 경우:
 
 Phase 2(resolve_code_line_layouts)가 모든 구문의 구조 정보를 갖고 있지는 않다. 다음 경우에는 Phase 1(format_statement)이 부여한 `existing_indent`를 bounded fallback으로 참조한다:
 
-- 트리거 헤더 (BEFORE, REFERENCING, FOR EACH ROW, WHEN)
-- FORALL body
 - DML fallback (query clause body 등 parser_depth만으로 표현 불가한 depth)
+
+구현 완료:
+
+- ~~트리거 헤더~~ → `TriggerHeaderLayoutFrame` 도입 완료
+- ~~FORALL body~~ → `ForallBodyLayoutFrame` 도입 완료
 
 향후 제거 방법:
 
-1. 트리거 헤더 owner frame 추가
-2. FORALL body owner frame 추가
-3. query clause body depth의 Phase 2 독립 추적
+1. query clause body depth의 Phase 2 독립 추적 (analyzer의 auto_depth를 모든 줄에 확대)
