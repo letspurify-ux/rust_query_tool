@@ -31,13 +31,13 @@ fn fill_icon(buffer: &mut [u8], size: usize) {
     }
 
     let size_f = size as f32;
-    let aa = 2.2 / size_f;
+    let aa = safe_div(2.2, size_f);
 
     for y in 0..size {
         for x in 0..size {
             let idx = (y * size + x) * 4;
-            let px = ((x as f32 + 0.5) / size_f) * 2.0 - 1.0;
-            let py = ((y as f32 + 0.5) / size_f) * 2.0 - 1.0;
+            let px = safe_div(x as f32 + 0.5, size_f) * 2.0 - 1.0;
+            let py = safe_div(y as f32 + 0.5, size_f) * 2.0 - 1.0;
 
             // ── Background: Apple-style squircle ──
             let bg_dist = rounded_rect_sdf(px, py, 0.84, 0.84, 0.28);
@@ -60,8 +60,9 @@ fn fill_icon(buffer: &mut [u8], size: usize) {
             let mut alpha = bg_alpha * 255.0;
 
             // Subtle radial brightness at centre
-            let centre_glow =
-                (1.0 - (px * px + py * py).sqrt() / 1.2).clamp(0.0, 1.0).powf(2.0);
+            let centre_glow = (1.0 - safe_div((px * px + py * py).sqrt(), 1.2))
+                .clamp(0.0, 1.0)
+                .powf(2.0);
             blend(
                 &mut color,
                 &mut alpha,
@@ -94,7 +95,7 @@ fn fill_icon(buffer: &mut [u8], size: usize) {
 
             // Main S body — white with very subtle vertical warm/cool tint
             let s_body = coverage(s_dist - stroke_hw, aa);
-            let vert_t = ((py + 0.50) / 1.0).clamp(0.0, 1.0);
+            let vert_t = safe_div(py + 0.50, 1.0).clamp(0.0, 1.0);
             let body_color = [
                 lerp(245.0, 255.0, vert_t),
                 lerp(248.0, 252.0, vert_t),
@@ -144,15 +145,15 @@ fn blend(base: &mut [f32; 3], alpha: &mut f32, top: [f32; 3], cov: f32) {
         return;
     }
     let sa = cov.clamp(0.0, 1.0) * 255.0;
-    let df = 1.0 - sa / 255.0;
-    base[0] = base[0] * df + top[0] * (sa / 255.0);
-    base[1] = base[1] * df + top[1] * (sa / 255.0);
-    base[2] = base[2] * df + top[2] * (sa / 255.0);
+    let df = 1.0 - safe_div(sa, 255.0);
+    base[0] = base[0] * df + top[0] * safe_div(sa, 255.0);
+    base[1] = base[1] * df + top[1] * safe_div(sa, 255.0);
+    base[2] = base[2] * df + top[2] * safe_div(sa, 255.0);
     *alpha = alpha.max(sa);
 }
 
 fn coverage(distance: f32, aa: f32) -> f32 {
-    ((aa - distance) / aa).clamp(0.0, 1.0)
+    safe_div(aa - distance, aa).clamp(0.0, 1.0)
 }
 
 fn segment_distance(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -164,7 +165,7 @@ fn segment_distance(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32
     if ab_len_sq <= f32::EPSILON {
         return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
     }
-    let t = ((apx * abx + apy * aby) / ab_len_sq).clamp(0.0, 1.0);
+    let t = safe_div(apx * abx + apy * aby, ab_len_sq).clamp(0.0, 1.0);
     let cx = ax + abx * t;
     let cy = ay + aby * t;
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()

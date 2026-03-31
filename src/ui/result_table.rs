@@ -22,6 +22,7 @@ use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::theme;
+use crate::utils::arithmetic::safe_div;
 
 fn byte_index_after_n_chars(s: &str, n: usize) -> usize {
     if n == 0 {
@@ -1172,7 +1173,7 @@ impl ResultTableWidget {
 
     fn estimate_text_width(text: &str, font_size: u32) -> i32 {
         let col_count = Self::display_col_count(text) as i32;
-        let avg_char_px = ((font_size as i32 * 62) + 99) / 100;
+        let avg_char_px = safe_div((font_size as i32 * 62) + 99, 100);
         let raw = col_count.saturating_mul(avg_char_px) + TABLE_CELL_PADDING * 2 + 2;
         raw.clamp(
             Self::min_col_width_for_font(font_size),
@@ -1182,7 +1183,7 @@ impl ResultTableWidget {
 
     fn estimate_display_width(text: &str, font_size: u32, max_cell_display_chars: usize) -> i32 {
         let display_chars = Self::longest_line_char_count(text, max_cell_display_chars);
-        let avg_char_px = ((font_size as i32 * 62) + 99) / 100;
+        let avg_char_px = safe_div((font_size as i32 * 62) + 99, 100);
         let raw = display_chars as i32 * avg_char_px + TABLE_CELL_PADDING * 2 + 2;
         // Cap scales with the cell preview setting rather than a fixed font-based limit,
         // so users who raise the preview length get proportionally wider columns.
@@ -2946,8 +2947,11 @@ impl ResultTableWidget {
         }
 
         let visible_height = data_bottom.saturating_sub(data_top);
-        let visible_rows =
-            ((visible_height.saturating_add(row_h).saturating_sub(1)) / row_h).max(1);
+        let visible_rows = safe_div(
+            visible_height.saturating_add(row_h).saturating_sub(1),
+            row_h,
+        )
+        .max(1);
         let visible_bottom = data_top
             .saturating_add(visible_rows.saturating_mul(row_h))
             .min(data_bottom);
@@ -2969,7 +2973,7 @@ impl ResultTableWidget {
         }
 
         let hidden_px = viewport_start.saturating_sub(item_end);
-        Some((hidden_px / item_extent).max(1))
+        Some(safe_div(hidden_px, item_extent).max(1))
     }
 
     fn estimate_uniform_row_candidate(
@@ -2985,7 +2989,12 @@ impl ResultTableWidget {
 
         let delta = mouse_y.saturating_sub(start_y);
         let last_row = rows.saturating_sub(1);
-        Some(start_row.saturating_add(delta / row_h).max(0).min(last_row))
+        Some(
+            start_row
+                .saturating_add(safe_div(delta, row_h))
+                .max(0)
+                .min(last_row),
+        )
     }
 
     fn estimate_row_hit(
@@ -3025,7 +3034,7 @@ impl ResultTableWidget {
         }
 
         let delta = mouse_y.saturating_sub(start_y);
-        let mut candidate = start_row.saturating_add(delta / row_h);
+        let mut candidate = start_row.saturating_add(safe_div(delta, row_h));
         let last_row = rows.saturating_sub(1);
         candidate = candidate.max(0).min(last_row);
 
@@ -3058,7 +3067,7 @@ impl ResultTableWidget {
         }
 
         let delta = mouse_x.saturating_sub(start_x);
-        let mut candidate = start_col.saturating_add(delta / start_w);
+        let mut candidate = start_col.saturating_add(safe_div(delta, start_w));
         let last_col = cols.saturating_sub(1);
         candidate = candidate.max(0).min(last_col);
 
@@ -3449,7 +3458,7 @@ impl ResultTableWidget {
                 }
                 if cw > 0 && cx.saturating_add(cw) <= mouse_x {
                     let gap_px = mouse_x - cx.saturating_add(cw);
-                    let skip = (gap_px / cw).max(1);
+                    let skip = safe_div(gap_px, cw).max(1);
                     col = col.saturating_add(skip);
                     continue;
                 }
@@ -3528,7 +3537,7 @@ impl ResultTableWidget {
             }
 
             let hidden_px = data_left - (cx + cw);
-            let skip = (hidden_px / cw).max(1);
+            let skip = safe_div(hidden_px, cw).max(1);
             col = col.saturating_add(skip);
         }
 

@@ -1,6 +1,8 @@
 use miniquad::*;
 use std::time::Instant;
 
+use crate::utils::arithmetic::safe_div;
+
 use super::shaders;
 
 const TITLE_TEXTURE_WIDTH: u16 = 1280;
@@ -681,7 +683,7 @@ fn downsample_mask(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Ve
                     sum += src.get(y * sw + x).copied().unwrap_or(0) as u32;
                 }
             }
-            dst[dy * dw + dx] = (sum / 4) as u8;
+            dst[dy * dw + dx] = safe_div(sum, 4) as u8;
         }
     }
     dst
@@ -698,15 +700,15 @@ fn build_title_texture() -> Vec<u8> {
     let mut hi_mask = vec![0u8; sw * sh];
 
     let title_columns = text_columns(TITLE_TEXT);
-    let title_usable_width = sw.saturating_mul(9) / 10;
-    let title_usable_height = sh.saturating_mul(13) / 32;
-    let title_scale_x = title_usable_width / title_columns.max(1);
-    let title_scale_y = title_usable_height / GLYPH_ROWS;
+    let title_usable_width = safe_div(sw.saturating_mul(9), 10);
+    let title_usable_height = safe_div(sh.saturating_mul(13), 32);
+    let title_scale_x = safe_div(title_usable_width, title_columns.max(1));
+    let title_scale_y = safe_div(title_usable_height, GLYPH_ROWS);
     let title_scale = title_scale_x.min(title_scale_y).max(1);
     let title_width = title_columns.saturating_mul(title_scale);
     let title_height = GLYPH_ROWS.saturating_mul(title_scale);
-    let title_origin_x = sw.saturating_sub(title_width) / 2;
-    let title_origin_y = sh.saturating_mul(7) / 32;
+    let title_origin_x = safe_div(sw.saturating_sub(title_width), 2);
+    let title_origin_y = safe_div(sh.saturating_mul(7), 32);
     draw_text_mask(
         &mut hi_mask,
         sw,
@@ -718,15 +720,15 @@ fn build_title_texture() -> Vec<u8> {
     );
 
     let subtitle_columns = text_columns(SUBTITLE_TEXT);
-    let subtitle_usable_width = sw.saturating_mul(7) / 10;
-    let subtitle_usable_height = sh.saturating_mul(5) / 32;
-    let subtitle_scale_x = subtitle_usable_width / subtitle_columns.max(1);
-    let subtitle_scale_y = subtitle_usable_height / GLYPH_ROWS;
+    let subtitle_usable_width = safe_div(sw.saturating_mul(7), 10);
+    let subtitle_usable_height = safe_div(sh.saturating_mul(5), 32);
+    let subtitle_scale_x = safe_div(subtitle_usable_width, subtitle_columns.max(1));
+    let subtitle_scale_y = safe_div(subtitle_usable_height, GLYPH_ROWS);
     let subtitle_scale = subtitle_scale_x.min(subtitle_scale_y).max(1);
     let subtitle_width = subtitle_columns.saturating_mul(subtitle_scale);
     let title_right = title_origin_x.saturating_add(title_width);
     let subtitle_origin_x = title_right.saturating_sub(subtitle_width);
-    let subtitle_gap = sh.saturating_mul(3) / 32;
+    let subtitle_gap = safe_div(sh.saturating_mul(3), 32);
     let subtitle_origin_y = title_origin_y
         .saturating_add(title_height)
         .saturating_add(subtitle_gap);
@@ -746,7 +748,7 @@ fn build_title_texture() -> Vec<u8> {
     let version_scale = subtitle_scale.saturating_sub(1).max(1);
     let version_width = version_columns.saturating_mul(version_scale);
     let version_origin_x = title_right.saturating_sub(version_width);
-    let version_gap = sh.saturating_mul(2) / 32;
+    let version_gap = safe_div(sh.saturating_mul(2), 32);
     let version_origin_y = subtitle_origin_y
         .saturating_add(subtitle_height)
         .saturating_add(version_gap);
@@ -766,7 +768,7 @@ fn build_title_texture() -> Vec<u8> {
     for i in 0..hi_mask.len() {
         let v = version_hi.get(i).copied().unwrap_or(0);
         if v > 0 {
-            let reduced = ((v as u32).saturating_mul(153) / 255) as u8;
+            let reduced = safe_div((v as u32).saturating_mul(153), 255) as u8;
             if let Some(cell) = hi_mask.get_mut(i) {
                 *cell = (*cell).max(reduced);
             }
@@ -893,15 +895,15 @@ impl SplashStage {
         let elapsed = self.elapsed();
 
         // Fade in over 0.8 seconds
-        let fade_in = (elapsed / 0.8).min(1.0);
+        let fade_in = safe_div(elapsed, 0.8).min(1.0);
 
         // Fade out
         let fade_out = if let Some(fo_start) = self.fade_out_start {
             let fo_elapsed = elapsed - fo_start;
-            (1.0 - fo_elapsed / 0.5).max(0.0)
+            (1.0 - safe_div(fo_elapsed, 0.5)).max(0.0)
         } else if elapsed > 9.5 {
             // Auto fade-out in last 0.5s
-            ((10.0 - elapsed) / 0.5).max(0.0)
+            safe_div(10.0 - elapsed, 0.5).max(0.0)
         } else {
             1.0
         };

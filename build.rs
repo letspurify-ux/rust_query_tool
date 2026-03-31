@@ -174,4 +174,12 @@ fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
 
 // ── Icon pixel generation (shared with src/app_icon.rs via icon_fill.rs) ──
 
+fn safe_div(lhs: f32, rhs: f32) -> f32 {
+    if rhs.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        lhs / rhs
+    }
+}
+
 include!("src/icon_fill.rs");

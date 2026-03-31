@@ -35,6 +35,7 @@ use crate::ui::{
     IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QueryHistoryDialog, QueryProgress,
     QueryTabId, QueryTabsWidget, ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
+use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
 
 fn try_set_mutex_flag(flag: &Arc<Mutex<bool>>) -> bool {
@@ -180,7 +181,7 @@ impl AppState {
             return None;
         }
 
-        Some((current_frame.saturating_add(1)) % frame_count)
+        Some(safe_rem(current_frame.saturating_add(1), frame_count))
     }
 
     const STATUS_SPINNER_FRAMES: [&'static str; 10] =
@@ -1349,7 +1350,7 @@ impl MainWindow {
                             *query_split_ratio_for_tile
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                Some(desired_query_height as f64 / right_height as f64);
+                                Some(safe_div(desired_query_height as f64, right_height as f64));
                         }
                         return true;
                     }
@@ -1374,7 +1375,7 @@ impl MainWindow {
                             *query_split_ratio_for_tile
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                Some(query_height as f64 / right_height as f64);
+                                Some(safe_div(query_height as f64, right_height as f64));
                         }
                         return true;
                     }
@@ -3895,7 +3896,7 @@ impl MainWindow {
         const CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
         const CHANNEL_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.25;
         const MEMORY_TRIM_IDLE_CYCLE_THRESHOLD: usize =
-            (60.0 / CHANNEL_POLL_IDLE_INTERVAL_SECONDS) as usize;
+            safe_div_f64_to_usize(60.0, CHANNEL_POLL_IDLE_INTERVAL_SECONDS);
 
         fn schedule_poll(
             schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,

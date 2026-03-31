@@ -41,7 +41,7 @@ impl SqlEditorWidget {
         buffer.set_text(&info);
         display.set_buffer(buffer);
 
-        let close_btn_x = (600 - BUTTON_WIDTH) / 2;
+        let close_btn_x = crate::utils::arithmetic::safe_div(600 - BUTTON_WIDTH, 2);
         let mut close_btn = fltk::button::Button::default()
             .with_pos(close_btn_x, 360)
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -93,7 +93,7 @@ impl SqlEditorWidget {
         buffer.set_text(content);
         display.set_buffer(buffer);
 
-        let close_btn_x = (760 - BUTTON_WIDTH) / 2;
+        let close_btn_x = crate::utils::arithmetic::safe_div(760 - BUTTON_WIDTH, 2);
         let mut close_btn = fltk::button::Button::default()
             .with_pos(close_btn_x, 460)
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)

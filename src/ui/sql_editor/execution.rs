@@ -24,6 +24,7 @@ use crate::db::{
     QueryResult, ScriptItem, SessionState, ToolCommand,
 };
 use crate::sql_text;
+use crate::utils::arithmetic::{safe_div, safe_rem};
 
 use super::*;
 
@@ -4867,7 +4868,9 @@ impl SqlEditorWidget {
 
         for ch in text.chars() {
             if ch == '\t' {
-                let spaces = tab_stop.saturating_sub(col % tab_stop).max(1);
+                let spaces = tab_stop
+                    .saturating_sub(safe_rem(col, tab_stop))
+                    .max(1);
                 for _ in 0..spaces {
                     out.push(' ');
                 }
@@ -5916,7 +5919,7 @@ impl SqlEditorWidget {
         let max_lines = if size == 0 {
             10_000
         } else {
-            (size / 80).clamp(1, 10_000)
+            safe_div(size, 80).clamp(1, 10_000)
         };
         let lines = QueryExecutor::get_dbms_output(conn, max_lines)?;
         if lines.is_empty() {

@@ -12,6 +12,7 @@ use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
 use crate::ui::{configured_editor_profile, configured_ui_font_size};
+use crate::utils::arithmetic::safe_div;
 
 pub struct MenuBarBuilder;
 
@@ -43,7 +44,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     buffer.set_text(content);
     display.set_buffer(buffer);
 
-    let button_x = (width - BUTTON_WIDTH) / 2;
+    let button_x = safe_div(width - BUTTON_WIDTH, 2);
     let button_y = height - BUTTON_HEIGHT - DIALOG_MARGIN;
     let mut close_btn = Button::default()
         .with_pos(button_x, button_y)

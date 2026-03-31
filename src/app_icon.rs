@@ -1,6 +1,8 @@
 use fltk::{enums::ColorDepth, image::RgbImage, prelude::WindowExt};
 use miniquad::conf::Icon;
 
+use crate::utils::arithmetic::safe_div;
+
 include!("icon_fill.rs");
 
 const BIG_ICON_SIZE: usize = 64;

@@ -21,6 +21,8 @@ pub mod theme;
 
 use fltk::{app, prelude::WidgetExt, window::Window};
 
+use crate::utils::arithmetic::safe_div;
+
 pub use connection_dialog::*;
 pub use find_replace::*;
 pub use font_settings::*;
@@ -52,14 +54,14 @@ pub fn center_on_main(window: &mut Window) {
 
     let (x, y) = if let Some((mx, my, mw, mh)) = target {
         (
-            mx + (mw - window.width()) / 2,
-            my + (mh - window.height()) / 2,
+            mx + safe_div(mw - window.width(), 2),
+            my + safe_div(mh - window.height(), 2),
         )
     } else {
         let (sw, sh) = app::screen_size();
         (
-            ((sw as i32) - window.width()) / 2,
-            ((sh as i32) - window.height()) / 2,
+            safe_div((sw as i32) - window.width(), 2),
+            safe_div((sh as i32) - window.height(), 2),
         )
     };
     window.set_pos(x, y);
