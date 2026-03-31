@@ -113,6 +113,14 @@ enum AutoFormatClauseKind {
     Except,
     Set,
     Into,
+    Offset,
+    Fetch,
+    Limit,
+    Returning,
+    Model,
+    Window,
+    MatchRecognize,
+    Qualify,
     Pivot,
     Unpivot,
 }
@@ -1418,6 +1426,7 @@ impl QueryExecutor {
         let mut pending_partial_multiline_clause_owner: Option<
             PendingPartialMultilineClauseOwnerFrame,
         > = None;
+        let mut pending_line_continuation: Option<InlineCommentLineContinuation> = None;
         let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
             None;
 
@@ -1483,10 +1492,19 @@ impl QueryExecutor {
                 &trimmed_upper,
             );
             let active_frame = query_frames.last().copied();
+            let active_line_continuation = pending_line_continuation.take();
             let active_inline_comment_line_continuation =
                 pending_inline_comment_line_continuation.take();
+            let next_code_trimmed = next_code_indices
+                .get(idx)
+                .copied()
+                .flatten()
+                .and_then(|next_idx| lines.get(next_idx).copied());
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
+            let blocks_structural_line_continuation =
+                Self::line_starts_continuation_boundary(trimmed)
+                    && !current_line_is_standalone_open_paren;
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
                 pending_split_query_owner.take()
             } else {
@@ -1735,7 +1753,16 @@ impl QueryExecutor {
                 context.query_role = AutoFormatQueryRole::Continuation;
             }
 
-            if clause_kind.is_none() {
+            if clause_kind.is_none() && !blocks_structural_line_continuation {
+                if let Some(continuation) = active_line_continuation {
+                    context.auto_depth = context.auto_depth.max(continuation.depth);
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                    context.query_base_depth =
+                        context.query_base_depth.or(continuation.query_base_depth);
+                }
+            }
+
+            if clause_kind.is_none() && !blocks_structural_line_continuation {
                 if let Some(continuation) = active_inline_comment_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
@@ -2215,12 +2242,24 @@ impl QueryExecutor {
                 ));
             }
 
+            pending_line_continuation = if context.query_base_depth.is_some() || clause_kind.is_some()
+            {
+                Self::line_continuation_for_line(
+                    trimmed,
+                    context.auto_depth,
+                    context.query_base_depth,
+                    clause_kind,
+                    next_code_trimmed,
+                )
+            } else {
+                None
+            };
             pending_inline_comment_line_continuation =
                 Self::inline_comment_line_continuation_for_line(
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
-                    clause_kind,
+                    next_code_trimmed,
                 );
 
             if trimmed.ends_with(';') {
@@ -2232,6 +2271,7 @@ impl QueryExecutor {
                 owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
                 pending_partial_multiline_clause_owner = None;
+                pending_line_continuation = None;
                 pending_inline_comment_line_continuation = None;
             }
 
@@ -2294,6 +2334,22 @@ impl QueryExecutor {
             Some(AutoFormatClauseKind::Set)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "INTO") {
             Some(AutoFormatClauseKind::Into)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "OFFSET") {
+            Some(AutoFormatClauseKind::Offset)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "FETCH") {
+            Some(AutoFormatClauseKind::Fetch)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "LIMIT") {
+            Some(AutoFormatClauseKind::Limit)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "RETURNING") {
+            Some(AutoFormatClauseKind::Returning)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "MODEL") {
+            Some(AutoFormatClauseKind::Model)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "WINDOW") {
+            Some(AutoFormatClauseKind::Window)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "MATCH_RECOGNIZE") {
+            Some(AutoFormatClauseKind::MatchRecognize)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "QUALIFY") {
+            Some(AutoFormatClauseKind::Qualify)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "PIVOT") {
             Some(AutoFormatClauseKind::Pivot)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "UNPIVOT") {
@@ -2983,39 +3039,157 @@ impl QueryExecutor {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "TABLE")
     }
 
-    fn inline_comment_line_continuation_for_line(
+    fn line_starts_continuation_boundary(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let trimmed_upper = trimmed.to_ascii_uppercase();
+        Self::auto_format_clause_kind(&trimmed_upper).is_some()
+            || Self::auto_format_is_join_clause(&trimmed_upper)
+            || Self::auto_format_is_join_condition_clause(&trimmed_upper)
+            || Self::auto_format_is_for_update_clause(&trimmed_upper)
+            || sql_text::format_query_owner_header_kind(trimmed).is_some()
+            || sql_text::format_query_owner_pending_header_kind(trimmed).is_some()
+            || sql_text::format_indented_paren_owner_header_kind(trimmed).is_some()
+            || sql_text::format_indented_paren_pending_header_kind(trimmed).is_some()
+            || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
+            || sql_text::format_plsql_child_query_owner_kind(&trimmed_upper).is_some()
+            || sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed).is_some()
+    }
+
+    fn line_continuation_for_line(
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
         clause_kind: Option<AutoFormatClauseKind>,
+        next_code_trimmed: Option<&str>,
     ) -> Option<InlineCommentLineContinuation> {
-        if let Some(kind) = Self::trailing_inline_comment_continuation_kind(line, clause_kind) {
-            let continuation_depth = match kind {
-                InlineCommentContinuationKind::SameDepth => depth,
-                InlineCommentContinuationKind::OneDeeperThanQueryBase => {
-                    query_base_depth.unwrap_or(depth).saturating_add(1)
-                }
-                InlineCommentContinuationKind::OneDeeperThanCurrentDepth => depth.saturating_add(1),
-            };
-            Some(InlineCommentLineContinuation {
-                depth: continuation_depth,
-                query_base_depth,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn trailing_inline_comment_continuation_kind(
-        line: &str,
-        _clause_kind: Option<AutoFormatClauseKind>,
-    ) -> Option<InlineCommentContinuationKind> {
-        let prefix = Self::trailing_inline_comment_prefix(line)?;
-        let trimmed_prefix = prefix.trim_end();
-        if trimmed_prefix.is_empty() {
+        let next_line = next_code_trimmed?;
+        let next_line_is_standalone_open_paren =
+            Self::line_is_standalone_open_paren_before_inline_comment(next_line);
+        if Self::line_starts_continuation_boundary(next_line)
+            && !(next_line_is_standalone_open_paren
+                && Self::line_allows_structural_header_continuation(clause_kind))
+        {
             return None;
         }
 
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.ends_with(';') {
+            return None;
+        }
+
+        let kind = Self::line_continuation_kind(trimmed, clause_kind)?;
+        let continuation_depth = match kind {
+            InlineCommentContinuationKind::SameDepth => depth,
+            InlineCommentContinuationKind::OneDeeperThanQueryBase => {
+                query_base_depth.unwrap_or(depth).saturating_add(1)
+            }
+            InlineCommentContinuationKind::OneDeeperThanCurrentDepth => depth.saturating_add(1),
+        };
+        Some(InlineCommentLineContinuation {
+            depth: continuation_depth,
+            query_base_depth,
+        })
+    }
+
+    fn inline_comment_line_continuation_for_line(
+        line: &str,
+        depth: usize,
+        query_base_depth: Option<usize>,
+        next_code_trimmed: Option<&str>,
+    ) -> Option<InlineCommentLineContinuation> {
+        let next_line = next_code_trimmed?;
+        if Self::line_starts_continuation_boundary(next_line) {
+            return None;
+        }
+
+        let prefix = Self::trailing_inline_comment_prefix(line)?;
+        let trimmed = prefix.trim_end();
+        if trimmed.is_empty() || trimmed.ends_with(';') {
+            return None;
+        }
+
+        let kind = Self::inline_comment_line_continuation_kind(trimmed)?;
+        let continuation_depth = match kind {
+            InlineCommentContinuationKind::SameDepth => depth,
+            InlineCommentContinuationKind::OneDeeperThanQueryBase => {
+                query_base_depth.unwrap_or(depth).saturating_add(1)
+            }
+            InlineCommentContinuationKind::OneDeeperThanCurrentDepth => depth.saturating_add(1),
+        };
+        Some(InlineCommentLineContinuation {
+            depth: continuation_depth,
+            query_base_depth,
+        })
+    }
+
+    fn line_continuation_kind(
+        trimmed_prefix: &str,
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> Option<InlineCommentContinuationKind> {
+        if Self::line_has_trailing_continuation_operator(trimmed_prefix) {
+            return Some(
+                Self::leading_header_line_continuation_kind(trimmed_prefix)
+                    .unwrap_or(InlineCommentContinuationKind::SameDepth),
+            );
+        }
+
+        Self::line_allows_structural_header_continuation(clause_kind)
+            .then(|| Self::leading_header_line_continuation_kind(trimmed_prefix))
+            .flatten()
+    }
+
+    fn line_allows_structural_header_continuation(
+        clause_kind: Option<AutoFormatClauseKind>,
+    ) -> bool {
+        matches!(
+            clause_kind,
+            Some(
+                AutoFormatClauseKind::Group
+                    | AutoFormatClauseKind::Having
+                    | AutoFormatClauseKind::Order
+                    | AutoFormatClauseKind::Values
+                    | AutoFormatClauseKind::Offset
+                    | AutoFormatClauseKind::Fetch
+                    | AutoFormatClauseKind::Limit
+                    | AutoFormatClauseKind::Returning
+                    | AutoFormatClauseKind::Qualify
+            )
+        )
+    }
+
+    fn inline_comment_line_continuation_kind(
+        trimmed_prefix: &str,
+    ) -> Option<InlineCommentContinuationKind> {
+        if Self::line_has_trailing_continuation_operator(trimmed_prefix) {
+            return Some(InlineCommentContinuationKind::SameDepth);
+        }
+
+        let words: Vec<&str> = trimmed_prefix
+            .split_whitespace()
+            .filter(|word| !word.is_empty())
+            .collect();
+        let last_word = words.last().copied()?;
+        let previous_word = words.get(words.len().saturating_sub(2)).copied();
+        sql_text::format_inline_comment_header_continuation_kind(previous_word, last_word).map(
+            |kind| match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
+                    InlineCommentContinuationKind::SameDepth
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    InlineCommentContinuationKind::OneDeeperThanQueryBase
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+                }
+            },
+        )
+    }
+
+    fn line_has_trailing_continuation_operator(trimmed_prefix: &str) -> bool {
         let trailing_operator_symbol = Self::trailing_significant_byte_before_inline_comment(
             trimmed_prefix,
         )
@@ -3036,50 +3210,23 @@ impl QueryExecutor {
             )
         });
 
-        if trailing_operator_keyword || trailing_operator_symbol {
-            return Some(InlineCommentContinuationKind::SameDepth);
-        }
-
-        if Self::prefix_ends_with_unfinished_clause_header(trimmed_prefix) {
-            return Some(
-                Self::unfinished_clause_header_inline_comment_continuation_kind(trimmed_prefix),
-            );
-        }
-
-        None
+        trailing_operator_keyword || trailing_operator_symbol
     }
 
-    fn unfinished_clause_header_inline_comment_continuation_kind(
+    fn leading_header_line_continuation_kind(
         trimmed_prefix: &str,
-    ) -> InlineCommentContinuationKind {
-        match Self::trailing_header_comment_continuation_kind(trimmed_prefix) {
-            Some(sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth) => {
+    ) -> Option<InlineCommentContinuationKind> {
+        sql_text::format_leading_header_continuation_kind(trimmed_prefix).map(|kind| match kind {
+            sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
                 InlineCommentContinuationKind::SameDepth
             }
-            Some(sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase) => {
+            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
                 InlineCommentContinuationKind::OneDeeperThanQueryBase
             }
-            Some(sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine) => {
+            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
                 InlineCommentContinuationKind::OneDeeperThanCurrentDepth
             }
-            None => InlineCommentContinuationKind::SameDepth,
-        }
-    }
-
-    fn prefix_ends_with_unfinished_clause_header(prefix: &str) -> bool {
-        Self::trailing_header_comment_continuation_kind(prefix).is_some()
-    }
-
-    fn trailing_header_comment_continuation_kind(
-        trimmed_prefix: &str,
-    ) -> Option<sql_text::FormatInlineCommentHeaderContinuationKind> {
-        let words: Vec<&str> = trimmed_prefix
-            .split_whitespace()
-            .filter(|word| !word.is_empty())
-            .collect();
-        let last_word = words.last().copied()?;
-        let previous_word = words.get(words.len().saturating_sub(2)).copied();
-        sql_text::format_inline_comment_header_continuation_kind(previous_word, last_word)
+        })
     }
 
     fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
@@ -9985,6 +10132,78 @@ LIMIT -- page size
         assert_eq!(
             contexts[operand_idx].query_base_depth, contexts[limit_idx].query_base_depth,
             "LIMIT inline-header continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_limit_split_operand_uses_structural_continuation_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+ORDER BY e.empno
+LIMIT
+10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let limit_idx = lines
+            .iter()
+            .position(|line| line.trim() == "LIMIT")
+            .unwrap_or(0);
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "10;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[operand_idx].auto_depth,
+            contexts[limit_idx].auto_depth.saturating_add(1),
+            "LIMIT operand on the next line should derive from the LIMIT clause depth, not raw source indent"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "split LIMIT operand should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_base_depth, contexts[limit_idx].query_base_depth,
+            "split LIMIT operand should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_where_operator_rhs_uses_structural_continuation_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE e.empno =
+10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE e.empno ="))
+            .unwrap_or(0);
+        let operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "10;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[operand_idx].auto_depth,
+            contexts[where_idx]
+                .query_base_depth
+                .unwrap_or(contexts[where_idx].auto_depth)
+                .saturating_add(1),
+            "split WHERE rhs should use query-base continuation depth instead of raw indent"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "split WHERE rhs should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[operand_idx].query_base_depth, contexts[where_idx].query_base_depth,
+            "split WHERE rhs should preserve the active query base depth"
         );
     }
 

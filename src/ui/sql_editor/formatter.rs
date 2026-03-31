@@ -6990,16 +6990,10 @@ impl SqlEditorWidget {
                             .unwrap_or(parser_depth),
                     )
             } else if in_dml_statement {
-                // DML/query fallback: unresolved continuation lines still use
-                // a bounded raw-indent bridge until every expression/list body
-                // owns an explicit frame in phase 2.
-                let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
-                let max_extra = if closes_into_list || follows_comma_run {
-                    0
-                } else {
-                    2
-                };
-                existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
+                // DML/query fallback: continuation/body depth must already be
+                // encoded in structural analyzer/frame state. Do not revive
+                // source indent as a structural bridge here.
+                analyzer_query_depth.max(parser_depth)
             } else if !in_query_statement
                 && !starts_with_close_paren
                 && last_code_idx.is_some_and(|prev_idx| {
@@ -8165,16 +8159,6 @@ impl SqlEditorWidget {
     fn starts_with_condition_keyword(trimmed_upper: &str) -> bool {
         crate::sql_text::starts_with_keyword_token(trimmed_upper, "AND")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OR")
-    }
-
-    fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
-            || crate::sql_text::starts_with_format_set_operator(trimmed_upper)
     }
 
     fn fetch_into_has_multiple_targets(tokens: &[SqlToken], into_idx: usize) -> bool {
@@ -23290,6 +23274,48 @@ MATCH_RECOGNIZE (
         assert!(
             leading_spaces(lines[operand_idx]) > leading_spaces(lines[limit_idx]),
             "LIMIT operand should stay deeper than the LIMIT clause line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_limit_split_operand_ignores_existing_indent() {
+        let source = r#"SELECT e.empno
+FROM emp e
+ORDER BY e.empno
+LIMIT
+                10;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let limit_idx = find_line_starting_with(&lines, "LIMIT").expect("LIMIT clause line");
+        let operand_idx = find_line_starting_with(&lines, "10;").expect("LIMIT operand line");
+
+        assert_eq!(
+            leading_spaces(lines[operand_idx]),
+            leading_spaces(lines[limit_idx]).saturating_add(4),
+            "split LIMIT operand depth must normalize from the structural LIMIT depth, not raw existing indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_where_rhs_split_ignores_existing_indent() {
+        let source = r#"SELECT e.empno
+FROM emp e
+WHERE e.empno =
+                10;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let where_idx =
+            find_line_starting_with(&lines, "WHERE e.empno =").expect("WHERE operator line");
+        let operand_idx = find_line_starting_with(&lines, "10;").expect("WHERE rhs line");
+
+        assert_eq!(
+            leading_spaces(lines[operand_idx]),
+            leading_spaces(lines[where_idx]).saturating_add(8),
+            "split WHERE rhs depth must normalize from the structural WHERE continuation depth, not raw existing indent, got:\n{}",
             formatted
         );
     }

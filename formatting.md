@@ -26,7 +26,7 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 
 `existing_indent`는 입력 텍스트의 과거 시각 정보일 뿐이다.
 
-- 구조 계산에서는 owner stack / query frame / condition frame / multiline owner frame 같은 의미 상태만 사용한다.
+- 구조 계산에서는 owner stack / query frame / condition frame / multiline owner frame / 정규화된 line continuation state 같은 의미 상태만 사용한다.
 - `existing_indent`는 hanging indent 보존처럼 render 단계에서만 직접 참조할 수 있다.
 - 구조 계산에서 `existing_indent`를 참조해야 한다면, 그 줄은 아직 frame/state 모델이 빠진 임시 브릿지로 간주해야 한다.
 
@@ -105,14 +105,6 @@ split owner/header가 다음 줄까지 이어지는 경우:
 - pending owner는 원래 owner depth를 그대로 들고 간다
 - 현재 줄의 기존 indent로 pending depth를 재보정하면 안 된다
 
+query/body/continuation depth는 이미 정규화된 구조 컨텍스트(`auto_depth`, `query_base_depth`, `next_query_head_depth`, explicit continuation state)로만 전달해야 한다.
+
 렌더링 단계의 hanging indent 보존은 구조 depth 계산이 끝난 뒤에만 적용한다.
-
-## 6. Phase 1 브릿지 원칙
-
-Phase 2가 아직 독립적으로 추적하지 못하는 구조(query clause body depth 등)는 우선 Phase 1 analyzer가 이미 정규화한 구조 출력(`auto_depth`, `query_base_depth`, `next_query_head_depth`)을 브릿지로 사용해야 한다.
-
-- 구조 depth 입력 우선순위는 `Phase 2 frame/state` → `Phase 1 analyzer 구조값` → bounded raw-indent bridge 순서다.
-- raw-indent bridge는 owner/body/list body/close depth가 이미 결정된 줄에는 금지한다. 허용 범위는 아직 frame/state가 없는 continuation line으로 한정한다.
-- `existing_indent`를 써야 한다면 `parser_depth` 기준 bounded clamp만 허용한다.
-- raw-indent bridge는 "새 depth를 발명"하는 용도가 아니라, 아직 모델링되지 않은 continuation를 임시로 유지하는 용도여야 한다.
-- 같은 구문을 analyzer 또는 explicit frame으로 표현할 수 있게 되면 raw-indent bridge를 즉시 제거한다.
