@@ -91,17 +91,10 @@ split owner/header가 다음 줄까지 이어지는 경우:
 
 렌더링 단계의 hanging indent 보존은 구조 depth 계산이 끝난 뒤에만 적용한다.
 
-## 6. 현재 구현의 한계 (Phase 1 브릿지)
+## 6. Phase 1 브릿지 원칙
 
-Phase 2(resolve_code_line_layouts)가 모든 구문의 구조 정보를 갖고 있지는 않다. 다음 경우에는 Phase 1(format_statement)이 부여한 `existing_indent`를 bounded fallback으로 참조한다:
+Phase 2가 아직 독립적으로 추적하지 못하는 구조(query clause body depth 등)는 Phase 1의 `existing_indent`를 bounded fallback으로 참조할 수 있다.
 
-- DML fallback (query clause body 등 parser_depth만으로 표현 불가한 depth)
-
-구현 완료:
-
-- ~~트리거 헤더~~ → `TriggerHeaderLayoutFrame` 도입 완료
-- ~~FORALL body~~ → `ForallBodyLayoutFrame` 도입 완료
-
-향후 제거 방법:
-
-1. query clause body depth의 Phase 2 독립 추적 (analyzer의 auto_depth를 모든 줄에 확대)
+- fallback은 `parser_depth` 기준 bounded clamp만 허용한다.
+- 구조 frame으로 대체 가능해지면 즉시 fallback을 제거한다.
+- 남은 fallback: query clause body depth (Phase 2 독립 추적으로 제거 예정)
