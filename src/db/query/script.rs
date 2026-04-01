@@ -22,10 +22,65 @@ pub(crate) enum AutoFormatConditionRole {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum AutoFormatLineSemantic {
+    #[default]
+    None,
+    Clause(AutoFormatClauseKind),
+    JoinClause,
+    JoinConditionClause,
+    ConditionContinuation,
+}
+
+impl AutoFormatLineSemantic {
+    fn from_analysis(
+        clause_kind: Option<AutoFormatClauseKind>,
+        query_role: AutoFormatQueryRole,
+        is_join_clause: bool,
+        is_join_condition_clause: bool,
+        is_query_condition_continuation_clause: bool,
+    ) -> Self {
+        if query_role == AutoFormatQueryRole::Continuation && is_join_condition_clause {
+            Self::JoinConditionClause
+        } else if query_role == AutoFormatQueryRole::Continuation
+            && is_query_condition_continuation_clause
+        {
+            Self::ConditionContinuation
+        } else if query_role == AutoFormatQueryRole::Base && is_join_clause {
+            Self::JoinClause
+        } else if let Some(kind) = clause_kind {
+            Self::Clause(kind)
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn is_clause(self) -> bool {
+        matches!(self, Self::Clause(_))
+    }
+
+    pub(crate) fn is_join_clause(self) -> bool {
+        matches!(self, Self::JoinClause)
+    }
+
+    pub(crate) fn is_join_condition_clause(self) -> bool {
+        matches!(self, Self::JoinConditionClause)
+    }
+
+    pub(crate) fn is_condition_continuation(self) -> bool {
+        matches!(self, Self::ConditionContinuation)
+    }
+
+    pub(crate) fn is_clause_boundary(self) -> bool {
+        self.is_clause() || self.is_join_clause()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AutoFormatLineContext {
     pub(crate) parser_depth: usize,
     pub(crate) auto_depth: usize,
     pub(crate) query_role: AutoFormatQueryRole,
+    pub(crate) line_semantic: AutoFormatLineSemantic,
     pub(crate) query_base_depth: Option<usize>,
     pub(crate) starts_query_frame: bool,
     pub(crate) next_query_head_depth: Option<usize>,
@@ -90,7 +145,7 @@ struct ConditionLineAnnotation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AutoFormatClauseKind {
+pub(crate) enum AutoFormatClauseKind {
     With,
     Select,
     Insert,
@@ -1454,6 +1509,9 @@ impl QueryExecutor {
                 auto_depth: parser_depth,
                 ..AutoFormatLineContext::default()
             };
+            let mut current_line_is_join_clause = false;
+            let mut current_line_is_join_condition_clause = false;
+            let mut current_line_is_query_condition_continuation_clause = false;
 
             if trimmed.is_empty() {
                 contexts.push(context);
@@ -1704,6 +1762,8 @@ impl QueryExecutor {
                 let is_join_clause = Self::auto_format_is_join_clause(&clause_detection_upper);
                 let is_join_condition_clause =
                     Self::auto_format_is_join_condition_clause(&clause_detection_upper);
+                current_line_is_join_clause = is_join_clause;
+                current_line_is_join_condition_clause = is_join_condition_clause;
                 let from_item_list_body_depth = frame
                     .from_item_list_body_depth
                     .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
@@ -1717,6 +1777,8 @@ impl QueryExecutor {
                     Self::auto_format_is_query_condition_continuation_clause(
                         &clause_detection_upper,
                     );
+                current_line_is_query_condition_continuation_clause =
+                    is_query_condition_continuation_clause;
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
                     && Self::auto_format_is_for_update_clause(&clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
@@ -1822,6 +1884,14 @@ impl QueryExecutor {
                         context.query_base_depth.or(continuation.query_base_depth);
                 }
             }
+
+            context.line_semantic = AutoFormatLineSemantic::from_analysis(
+                clause_kind,
+                context.query_role,
+                current_line_is_join_clause,
+                current_line_is_join_condition_clause,
+                current_line_is_query_condition_continuation_clause,
+            );
 
             if let Some(frame) = query_frames.last_mut() {
                 if context
@@ -2463,8 +2533,7 @@ impl QueryExecutor {
     }
 
     fn auto_format_is_join_condition_clause(trimmed_upper: &str) -> bool {
-        sql_text::starts_with_keyword_token(trimmed_upper, "ON")
-            || sql_text::starts_with_keyword_token(trimmed_upper, "USING")
+        sql_text::is_format_join_condition_clause(trimmed_upper)
     }
 
     fn auto_format_is_query_condition_continuation_clause(trimmed_upper: &str) -> bool {
@@ -8768,6 +8837,53 @@ WHERE F IN (
             contexts[on_idx].auto_depth,
             query_base_depth.saturating_add(1),
             "ON should be one level deeper than the query base"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_incomplete_nested_join_on_one_level_deeper_than_join() {
+        let sql = r#"select 1
+from (a
+    join (
+        select 1
+        from a
+        inner join a
+    on 1 = 1"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let inner_join_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("inner join a"))
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().to_ascii_uppercase().starts_with("ON "))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[on_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "Incomplete nested JOIN ON should still stay in continuation role"
+        );
+        assert_eq!(
+            contexts[inner_join_idx].line_semantic,
+            crate::db::AutoFormatLineSemantic::JoinClause,
+            "INNER JOIN line should be classified once by the analyzer as a join clause"
+        );
+        assert_eq!(
+            contexts[on_idx].line_semantic,
+            crate::db::AutoFormatLineSemantic::JoinConditionClause,
+            "ON line should be classified once by the analyzer as a join condition clause"
+        );
+        assert_eq!(
+            contexts[on_idx].query_base_depth, contexts[inner_join_idx].query_base_depth,
+            "Incomplete nested JOIN ON should keep the active child query base"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth,
+            contexts[inner_join_idx].auto_depth.saturating_add(1),
+            "Incomplete nested JOIN ON should stay exactly one structural level deeper than INNER JOIN"
         );
     }
 

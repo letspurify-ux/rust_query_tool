@@ -1,6 +1,6 @@
 use crate::db::{
-    AutoFormatConditionRole, AutoFormatLineContext, AutoFormatQueryRole, FormatItem, QueryExecutor,
-    ScriptItem, ToolCommand,
+    AutoFormatConditionRole, AutoFormatLineContext, AutoFormatLineSemantic, AutoFormatQueryRole,
+    FormatItem, QueryExecutor, ScriptItem, ToolCommand,
 };
 use crate::sql_text::{
     self, FormatIndentedParenOwnerKind, FormatQueryOwnerKind, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS,
@@ -33,6 +33,7 @@ struct LineLayout<'a> {
     parser_depth: usize,
     auto_depth: usize,
     query_role: AutoFormatQueryRole,
+    line_semantic: AutoFormatLineSemantic,
     query_base_depth: Option<usize>,
     starts_query_frame: bool,
     next_query_head_depth: Option<usize>,
@@ -5377,6 +5378,10 @@ impl SqlEditorWidget {
                     .get(idx)
                     .map(|ctx| ctx.query_role)
                     .unwrap_or(AutoFormatQueryRole::None),
+                line_semantic: contexts
+                    .get(idx)
+                    .map(|ctx| ctx.line_semantic)
+                    .unwrap_or(AutoFormatLineSemantic::None),
                 query_base_depth: contexts.get(idx).and_then(|ctx| ctx.query_base_depth),
                 starts_query_frame: contexts
                     .get(idx)
@@ -5765,7 +5770,7 @@ impl SqlEditorWidget {
         trimmed_upper: &str,
         starts_query_head: bool,
         starts_with_close_paren: bool,
-        current_line_is_condition_keyword: bool,
+        current_line_is_condition_boundary: bool,
         current_line_starts_case: bool,
         current_line_starts_multiline_clause: bool,
         owner_relative_body_header_depth_for_line: Option<usize>,
@@ -5776,7 +5781,7 @@ impl SqlEditorWidget {
         let frame = active_general_paren_frame?;
         if starts_with_close_paren
             || starts_query_head
-            || current_line_is_condition_keyword
+            || current_line_is_condition_boundary
             || current_line_starts_case
             || Self::starts_with_case_branch_keyword(trimmed_upper)
             || Self::starts_with_case_terminator(trimmed_upper)
@@ -6321,14 +6326,10 @@ impl SqlEditorWidget {
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "FORALL")
             });
             let previous_line_is_condition_keyword = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                Self::starts_with_condition_keyword(&prev_upper)
+                layouts[prev_idx].line_semantic.is_condition_continuation()
             });
-            let previous_line_is_join_condition_clause = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                crate::sql_text::starts_with_keyword_token(&prev_upper, "ON")
-                    || crate::sql_text::starts_with_keyword_token(&prev_upper, "USING")
-            });
+            let previous_line_is_join_condition_clause = last_code_idx
+                .is_some_and(|prev_idx| layouts[prev_idx].line_semantic.is_join_condition_clause());
             let previous_code_is_inline_merge_update_set = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 prev_upper.starts_with("UPDATE SET ") || prev_upper.eq("UPDATE SET")
@@ -6463,7 +6464,9 @@ impl SqlEditorWidget {
                     None
                 };
             let current_line_is_condition_keyword =
-                Self::starts_with_condition_keyword(&trimmed_upper);
+                layouts[idx].line_semantic.is_condition_continuation();
+            let current_line_is_join_condition_clause =
+                layouts[idx].line_semantic.is_join_condition_clause();
             let current_line_is_condition_query_owner =
                 current_query_owner_kind == Some(FormatQueryOwnerKind::Condition);
             let active_case_condition_frame = case_condition_frames.last().copied();
@@ -6553,7 +6556,7 @@ impl SqlEditorWidget {
                 .count();
             let current_line_starts_condition_after_leading_close = starts_with_close_paren
                 && leading_close_continues_expression
-                && Self::starts_with_condition_keyword(&owner_relative_detection_upper);
+                && layouts[idx].line_semantic.is_condition_continuation();
             let paren_case_close_frame_depth = last_popped_general_paren_frame.map(|frame| {
                 let preferred_close_depth = if in_dml_statement
                     || layouts[idx].query_base_depth.is_some()
@@ -6989,7 +6992,7 @@ impl SqlEditorWidget {
                 &trimmed_upper,
                 starts_query_head,
                 starts_with_close_paren,
-                current_line_is_condition_keyword,
+                current_line_is_condition_keyword || current_line_is_join_condition_clause,
                 current_line_starts_case,
                 current_line_starts_multiline_clause,
                 owner_relative_body_header_depth_for_line,
@@ -7296,16 +7299,7 @@ impl SqlEditorWidget {
             // continues a join condition.  Clear on a new clause/JOIN
             // at the same or lower parser depth (not inside subqueries).
             {
-                let is_join_condition_line =
-                    crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ON")
-                        || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING");
-                let is_join_clause_line = QueryExecutor::auto_format_is_join_clause(&trimmed_upper);
-                let is_dml_clause = Self::is_dml_clause_starter(&trimmed_upper)
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
-                if is_join_condition_line
-                    && layouts[idx].query_role == AutoFormatQueryRole::Continuation
-                {
+                if layouts[idx].line_semantic.is_join_condition_clause() {
                     while join_on_condition_and_depth
                         .last()
                         .is_some_and(|(_, on_depth)| *on_depth >= depth)
@@ -7318,7 +7312,7 @@ impl SqlEditorWidget {
                 {
                     // AND/OR continues the join condition block; keep the
                     // tracked depth (don't clear).
-                } else if (is_join_clause_line || is_dml_clause || starts_query_head)
+                } else if (layouts[idx].line_semantic.is_clause_boundary() || starts_query_head)
                     && join_on_condition_and_depth
                         .last()
                         .is_some_and(|(_, on_depth)| depth <= *on_depth)
@@ -7963,11 +7957,6 @@ impl SqlEditorWidget {
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
         crate::sql_text::starts_with_format_layout_clause(trimmed_upper)
-    }
-
-    fn starts_with_condition_keyword(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_keyword_token(trimmed_upper, "AND")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OR")
     }
 
     fn fetch_into_has_multiple_targets(tokens: &[SqlToken], into_idx: usize) -> bool {
@@ -22152,6 +22141,36 @@ join b on a.id = b.id and a.x = b.x
             indent(lines[and_idx]),
             indent(lines[on_idx]) + 4,
             "AND after ON should be one level deeper even in subquery, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_incomplete_nested_join_on_one_level_deeper_than_join() {
+        let input = r#"select 1
+from (a
+    join (
+        select 1
+        from a
+        inner join a
+    on 1 = 1"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let inner_join_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("INNER JOIN a"))
+            .expect("should contain INNER JOIN a");
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON "))
+            .expect("should contain ON");
+
+        assert_eq!(
+            indent(lines[on_idx]),
+            indent(lines[inner_join_idx]).saturating_add(4),
+            "Incomplete nested JOIN ON should stay one level deeper than INNER JOIN, got:\n{}",
             formatted
         );
     }

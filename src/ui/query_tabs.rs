@@ -419,19 +419,35 @@ mod tests {
 
     #[test]
     fn tab_strip_left_anchor_reset_requires_real_overflow_state() {
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(0, 320, 240));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(1, 320, 240));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 0, 240));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 320, 0));
-        assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 320, 240));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            0, 320, 240
+        ));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            1, 320, 240
+        ));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            2, 0, 240
+        ));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            2, 320, 0
+        ));
+        assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            2, 320, 240
+        ));
     }
 
     #[test]
     fn pointer_event_suppression_only_applies_to_mouse_driven_tab_events() {
         let depth = Arc::new(Mutex::new(1u32));
 
-        assert!(QueryTabsWidget::should_suppress_pointer_event(&depth, Event::Move));
-        assert!(QueryTabsWidget::should_suppress_pointer_event(&depth, Event::Push));
+        assert!(QueryTabsWidget::should_suppress_pointer_event(
+            &depth,
+            Event::Move
+        ));
+        assert!(QueryTabsWidget::should_suppress_pointer_event(
+            &depth,
+            Event::Push
+        ));
         assert!(QueryTabsWidget::should_suppress_pointer_event(
             &depth,
             Event::Released

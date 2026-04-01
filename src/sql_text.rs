@@ -1442,6 +1442,10 @@ pub(crate) fn starts_with_format_set_operator(text_upper: &str) -> bool {
         .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
+pub(crate) fn is_format_join_condition_clause(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "ON") || starts_with_keyword_token(text_upper, "USING")
+}
+
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
     first_meaningful_word(trimmed_upper).is_some_and(is_subquery_head_keyword)
 }
