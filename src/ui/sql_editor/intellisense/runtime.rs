@@ -103,26 +103,31 @@ impl SqlEditorWidget {
         editor.handle(move |ed, ev| {
             match ev {
                 Event::DndEnter | Event::DndDrag => {
-                    *dnd_drop_state_for_handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        DndDropState::AwaitingPaste;
+                    Self::set_dnd_drop_state(
+                        &dnd_drop_state_for_handle,
+                        DndDropState::AwaitingPaste,
+                    );
                     true
                 }
                 Event::DndLeave => {
-                    *dnd_drop_state_for_handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = DndDropState::Idle;
+                    Self::set_dnd_drop_state(&dnd_drop_state_for_handle, DndDropState::Idle);
                     true
                 }
                 Event::DndRelease => {
-                    *dnd_drop_state_for_handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        DndDropState::AwaitingPaste;
+                    Self::set_dnd_drop_state(
+                        &dnd_drop_state_for_handle,
+                        DndDropState::AwaitingPaste,
+                    );
                     true
                 }
                 Event::Enter | Event::Move | Event::Drag | Event::Released => {
+                    // File drag-and-drop only needs the eventual Paste payload.
+                    // Avoid cursor hit-testing while the editor is in FLTK's DnD
+                    // sequence because that path is unrelated to file-open flow
+                    // and can trip widget-internal geometry assumptions.
+                    if Self::should_skip_pointer_position_tracking(&dnd_drop_state_for_handle) {
+                        return false;
+                    }
                     let pos = ed.xy_to_position(
                         fltk::app::event_x(),
                         fltk::app::event_y(),
@@ -916,14 +921,7 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Paste => {
-                    let from_drop = {
-                        let mut drop_state = dnd_drop_state_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let was_drop = matches!(*drop_state, DndDropState::AwaitingPaste);
-                        *drop_state = DndDropState::Idle;
-                        was_drop
-                    };
+                    let from_drop = Self::take_pending_dnd_drop(&dnd_drop_state_for_handle);
                     if !from_drop {
                         return false;
                     }
@@ -939,6 +937,30 @@ impl SqlEditorWidget {
                 _ => false,
             }
         });
+    }
+
+    fn set_dnd_drop_state(state: &Arc<Mutex<DndDropState>>, next: DndDropState) {
+        *state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+
+    fn should_skip_pointer_position_tracking(state: &Arc<Mutex<DndDropState>>) -> bool {
+        matches!(
+            *state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            DndDropState::AwaitingPaste
+        )
+    }
+
+    fn take_pending_dnd_drop(state: &Arc<Mutex<DndDropState>>) -> bool {
+        let mut drop_state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let was_drop = matches!(*drop_state, DndDropState::AwaitingPaste);
+        *drop_state = DndDropState::Idle;
+        was_drop
     }
 
     fn extract_dropped_file_path(raw: &str) -> Option<PathBuf> {

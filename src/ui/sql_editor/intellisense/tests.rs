@@ -1619,6 +1619,32 @@ fn parse_dropped_file_token_strips_wrapping_quotes() {
 }
 
 #[test]
+fn pointer_position_tracking_is_skipped_while_file_drop_is_pending() {
+    let state = Arc::new(Mutex::new(DndDropState::Idle));
+
+    assert!(!SqlEditorWidget::should_skip_pointer_position_tracking(
+        &state
+    ));
+
+    SqlEditorWidget::set_dnd_drop_state(&state, DndDropState::AwaitingPaste);
+
+    assert!(SqlEditorWidget::should_skip_pointer_position_tracking(
+        &state
+    ));
+}
+
+#[test]
+fn take_pending_dnd_drop_resets_state_to_idle() {
+    let state = Arc::new(Mutex::new(DndDropState::AwaitingPaste));
+
+    assert!(SqlEditorWidget::take_pending_dnd_drop(&state));
+    assert!(!SqlEditorWidget::take_pending_dnd_drop(&state));
+    assert!(!SqlEditorWidget::should_skip_pointer_position_tracking(
+        &state
+    ));
+}
+
+#[test]
 fn typed_char_from_key_event_falls_back_for_shifted_underscore() {
     let ch = SqlEditorWidget::typed_char_from_key_event("", Key::from_char('-'), true, None);
     assert_eq!(ch, Some('_'));
