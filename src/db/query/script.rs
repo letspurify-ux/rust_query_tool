@@ -1599,7 +1599,9 @@ impl QueryExecutor {
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
             let blocks_structural_line_continuation =
-                Self::line_starts_continuation_boundary(trimmed)
+                (Self::line_starts_continuation_boundary(trimmed)
+                    || (leading_close_has_mixed_continuation
+                        && Self::line_starts_continuation_boundary(clause_detection_trimmed)))
                     && !current_line_is_standalone_open_paren;
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
                 pending_split_query_owner.take()
@@ -1951,11 +1953,11 @@ impl QueryExecutor {
                             frame.pending_for_update_clause_update_line = false;
                         }
                     }
-                    if Self::auto_format_is_join_condition_clause(&trimmed_upper) {
+                    if Self::auto_format_is_join_condition_clause(&clause_detection_upper) {
                         frame.pending_join_condition_continuation = true;
-                    } else if Self::auto_format_is_join_clause(&trimmed_upper)
+                    } else if Self::auto_format_is_join_clause(&clause_detection_upper)
                         || (!Self::auto_format_is_query_condition_continuation_clause(
-                            &trimmed_upper,
+                            &clause_detection_upper,
                         ) && clause_kind.is_some())
                     {
                         frame.pending_join_condition_continuation = false;
@@ -2389,7 +2391,6 @@ impl QueryExecutor {
                         trimmed,
                         context.auto_depth,
                         context.query_base_depth,
-                        clause_kind,
                         next_code_trimmed,
                     )
                 } else {
@@ -2519,20 +2520,7 @@ impl QueryExecutor {
     }
 
     pub(crate) fn auto_format_is_join_clause(trimmed_upper: &str) -> bool {
-        if sql_text::starts_with_keyword_token(trimmed_upper, "JOIN")
-            || sql_text::starts_with_keyword_token(trimmed_upper, "APPLY")
-        {
-            return true;
-        }
-
-        let starts_with_join_modifier = [
-            "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
-        ]
-        .iter()
-        .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword));
-
-        starts_with_join_modifier
-            && (trimmed_upper.contains(" JOIN") || trimmed_upper.contains(" APPLY"))
+        sql_text::starts_with_format_join_clause(trimmed_upper)
     }
 
     fn auto_format_is_join_condition_clause(trimmed_upper: &str) -> bool {
@@ -2545,16 +2533,11 @@ impl QueryExecutor {
     }
 
     fn auto_format_is_for_update_clause(trimmed_upper: &str) -> bool {
-        Self::auto_format_is_for_update_split_header(trimmed_upper)
-            || (sql_text::starts_with_keyword_token(trimmed_upper, "FOR")
-                && trimmed_upper.contains(" UPDATE"))
+        sql_text::starts_with_format_for_update_clause(trimmed_upper)
     }
 
     fn auto_format_is_for_update_split_header(trimmed_upper: &str) -> bool {
-        sql_text::starts_with_keyword_token(trimmed_upper, "FOR")
-            && !trimmed_upper.contains(" LOOP")
-            && !trimmed_upper.contains(" IN ")
-            && !trimmed_upper.contains(" UPDATE")
+        sql_text::starts_with_format_for_update_split_header(trimmed_upper)
     }
 
     fn pending_condition_header_for_word(
@@ -3209,17 +3192,10 @@ impl QueryExecutor {
         }
 
         let trimmed_upper = trimmed.to_ascii_uppercase();
-        // Shared query/multiline/PLSQL owner taxonomy must stay aligned with
-        // sql_text. Pure generic-expression owners such as `MULTISET` are
-        // intentionally excluded here because a caller may still need to carry
-        // operator/comment continuation depth onto that RHS line, while real
-        // split PL/SQL child-query headers such as bare `CURSOR` still remain
-        // structural boundaries through the shared helper.
-        Self::auto_format_clause_kind(&trimmed_upper).is_some()
-            || Self::auto_format_is_join_clause(&trimmed_upper)
-            || Self::auto_format_is_join_condition_clause(&trimmed_upper)
-            || Self::auto_format_is_for_update_clause(&trimmed_upper)
-            || sql_text::starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
+        sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+            trimmed,
+        ) || trimmed_upper.starts_with("WHEN MATCHED")
+            || trimmed_upper.starts_with("WHEN NOT MATCHED")
             || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
     }
 
@@ -3227,25 +3203,24 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
-        clause_kind: Option<AutoFormatClauseKind>,
         next_code_trimmed: Option<&str>,
     ) -> Option<InlineCommentLineContinuation> {
-        let next_line = next_code_trimmed?;
-        let next_line_is_standalone_open_paren =
-            Self::line_is_standalone_open_paren_before_inline_comment(next_line);
-        if Self::line_starts_continuation_boundary(next_line)
-            && !(next_line_is_standalone_open_paren
-                && Self::line_allows_structural_header_continuation(clause_kind))
-        {
-            return None;
-        }
-
         let trimmed = line.trim_end();
         if trimmed.is_empty() || trimmed.ends_with(';') {
             return None;
         }
 
-        let kind = Self::line_continuation_kind(trimmed, clause_kind)?;
+        let next_line = next_code_trimmed?;
+        let next_line_is_standalone_open_paren =
+            Self::line_is_standalone_open_paren_before_inline_comment(next_line);
+        if Self::line_starts_continuation_boundary(next_line)
+            && !(next_line_is_standalone_open_paren
+                && Self::line_can_continue_across_standalone_open_boundary(trimmed))
+        {
+            return None;
+        }
+
+        let kind = Self::line_continuation_kind(trimmed)?;
         let continuation_depth = match kind {
             InlineCommentContinuationKind::SameDepth => depth,
             InlineCommentContinuationKind::OneDeeperThanQueryBase => {
@@ -3257,6 +3232,11 @@ impl QueryExecutor {
             depth: continuation_depth,
             query_base_depth,
         })
+    }
+
+    fn line_can_continue_across_standalone_open_boundary(line: &str) -> bool {
+        Self::line_has_trailing_continuation_operator(line)
+            || sql_text::format_bare_structural_header_continuation_kind(line).is_some()
     }
 
     fn inline_comment_line_continuation_for_line(
@@ -3290,10 +3270,7 @@ impl QueryExecutor {
         })
     }
 
-    fn line_continuation_kind(
-        trimmed_prefix: &str,
-        clause_kind: Option<AutoFormatClauseKind>,
-    ) -> Option<InlineCommentContinuationKind> {
+    fn line_continuation_kind(trimmed_prefix: &str) -> Option<InlineCommentContinuationKind> {
         if Self::line_has_trailing_continuation_operator(trimmed_prefix) {
             return Some(
                 Self::leading_header_line_continuation_kind(trimmed_prefix)
@@ -3301,30 +3278,25 @@ impl QueryExecutor {
             );
         }
 
-        Self::line_allows_structural_header_continuation(clause_kind)
-            .then(|| Self::leading_header_line_continuation_kind(trimmed_prefix))
-            .flatten()
+        Self::bare_structural_header_line_continuation_kind(trimmed_prefix)
     }
 
-    fn line_allows_structural_header_continuation(
-        clause_kind: Option<AutoFormatClauseKind>,
-    ) -> bool {
-        matches!(
-            clause_kind,
-            Some(
-                AutoFormatClauseKind::Group
-                    | AutoFormatClauseKind::Having
-                    | AutoFormatClauseKind::Order
-                    | AutoFormatClauseKind::Values
-                    | AutoFormatClauseKind::Offset
-                    | AutoFormatClauseKind::Fetch
-                    | AutoFormatClauseKind::Limit
-                    | AutoFormatClauseKind::Returning
-                    | AutoFormatClauseKind::Qualify
-                    | AutoFormatClauseKind::Search
-                    | AutoFormatClauseKind::Cycle
-            )
-        )
+    fn bare_structural_header_line_continuation_kind(
+        trimmed_prefix: &str,
+    ) -> Option<InlineCommentContinuationKind> {
+        sql_text::format_bare_structural_header_continuation_kind(trimmed_prefix).map(|kind| {
+            match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
+                    InlineCommentContinuationKind::SameDepth
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    InlineCommentContinuationKind::OneDeeperThanQueryBase
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+                }
+            }
+        })
     }
 
     fn inline_comment_line_continuation_kind(
@@ -3356,43 +3328,25 @@ impl QueryExecutor {
     }
 
     fn line_has_trailing_continuation_operator(trimmed_prefix: &str) -> bool {
-        let trailing_operator_symbol = Self::trailing_significant_byte_before_inline_comment(
-            trimmed_prefix,
-        )
-        .is_some_and(|byte| {
-            matches!(
-                byte,
-                b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'^'
-            )
-        });
-        let trailing_word_upper = trimmed_prefix
-            .split_whitespace()
-            .last()
-            .map(|word| word.to_ascii_uppercase());
-        let trailing_operator_keyword = trailing_word_upper.as_deref().is_some_and(|upper| {
-            matches!(
-                upper,
-                "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT" | "EXISTS"
-            )
-        });
-
-        trailing_operator_keyword || trailing_operator_symbol
+        sql_text::line_has_trailing_format_continuation_operator(trimmed_prefix)
     }
 
     fn leading_header_line_continuation_kind(
         trimmed_prefix: &str,
     ) -> Option<InlineCommentContinuationKind> {
-        sql_text::format_leading_header_continuation_kind(trimmed_prefix).map(|kind| match kind {
-            sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
-                InlineCommentContinuationKind::SameDepth
-            }
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                InlineCommentContinuationKind::OneDeeperThanQueryBase
-            }
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                InlineCommentContinuationKind::OneDeeperThanCurrentDepth
-            }
-        })
+        sql_text::format_structural_header_continuation_kind(trimmed_prefix).map(
+            |kind| match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
+                    InlineCommentContinuationKind::SameDepth
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    InlineCommentContinuationKind::OneDeeperThanQueryBase
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+                }
+            },
+        )
     }
 
     fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
@@ -8780,6 +8734,43 @@ UPDATE OF e.sal NOWAIT;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_for_update_inline_comment_body_on_shared_clause_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+FOR UPDATE -- lock mode
+SKIP LOCKED;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let for_update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR UPDATE --"))
+            .unwrap_or(0);
+        let skip_locked_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SKIP LOCKED;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[skip_locked_idx].auto_depth,
+            contexts[for_update_idx]
+                .query_base_depth
+                .unwrap_or(contexts[for_update_idx].auto_depth)
+                .saturating_add(1),
+            "line after `FOR UPDATE -- ...` should stay on the dedicated FOR UPDATE body depth"
+        );
+        assert_eq!(
+            contexts[skip_locked_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "FOR UPDATE inline-comment continuation should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[skip_locked_idx].query_base_depth, contexts[for_update_idx].query_base_depth,
+            "FOR UPDATE inline-comment continuation should preserve the active query base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_nested_join_and_condition_depths_on_query_base() {
         let sql = r#"SELECT D
 FROM E
@@ -10071,6 +10062,43 @@ JOIN amounts a
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_keyword_operator_rhs_on_shared_condition_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE e.empno IS
+NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let is_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE e.empno IS")
+            .unwrap_or(0);
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[null_idx].auto_depth,
+            contexts[is_idx]
+                .query_base_depth
+                .unwrap_or(contexts[is_idx].auto_depth)
+                .saturating_add(1),
+            "keyword operator RHS should stay on the shared clause-body depth under the active query base"
+        );
+        assert_eq!(
+            contexts[null_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "keyword operator RHS should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[null_idx].query_base_depth, contexts[is_idx].query_base_depth,
+            "keyword operator RHS should preserve the active query base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_promote_select_list_after_inline_comment_on_select_header() {
         let sql = r#"CREATE OR REPLACE PROCEDURE test_open_with_proc IS
     p_rc SYS_REFCURSOR;
@@ -10660,6 +10688,118 @@ WHERE e.empno =
         assert_eq!(
             contexts[operand_idx].query_base_depth, contexts[where_idx].query_base_depth,
             "split WHERE rhs should preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_bare_where_header_uses_shared_structural_continuation_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE
+e.empno = 10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim() == "WHERE")
+            .unwrap_or(0);
+        let predicate_idx = lines
+            .iter()
+            .position(|line| line.trim() == "e.empno = 10;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[predicate_idx].auto_depth,
+            contexts[where_idx].auto_depth.saturating_add(1),
+            "bare WHERE header should open the same structural continuation depth that phase 2 renders"
+        );
+        assert_eq!(
+            contexts[predicate_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "predicate after bare WHERE should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[predicate_idx].query_base_depth, contexts[where_idx].query_base_depth,
+            "bare WHERE continuation should preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_bare_from_header_uses_shared_structural_continuation_depth() {
+        let sql = r#"SELECT e.empno
+FROM
+emp e
+WHERE e.empno = 10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim() == "FROM")
+            .unwrap_or(0);
+        let item_idx = lines
+            .iter()
+            .position(|line| line.trim() == "emp e")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[item_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "bare FROM header should push the next from-item onto the shared list/body depth"
+        );
+        assert_eq!(
+            contexts[item_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "from-item after bare FROM should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[item_idx].query_base_depth, contexts[from_idx].query_base_depth,
+            "bare FROM continuation should preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_bare_on_header_uses_shared_structural_continuation_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+JOIN dept d
+ON
+e.deptno = d.deptno
+AND e.status = d.status;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim() == "ON")
+            .unwrap_or(0);
+        let predicate_idx = lines
+            .iter()
+            .position(|line| line.trim() == "e.deptno = d.deptno")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim() == "AND e.status = d.status;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[predicate_idx].auto_depth, contexts[on_idx].auto_depth,
+            "bare ON header should keep the first predicate on the shared ON-clause depth"
+        );
+        assert_eq!(
+            contexts[predicate_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "predicate after bare ON should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[predicate_idx].query_base_depth, contexts[on_idx].query_base_depth,
+            "bare ON continuation should preserve the active query base depth"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[predicate_idx].auto_depth.saturating_add(1),
+            "subsequent join-condition continuations should stay one level deeper than the ON-clause depth"
         );
     }
 
@@ -11833,6 +11973,53 @@ WHERE deptno IN (
         assert_eq!(
             contexts[order_by_idx].auto_depth, contexts[select_idx].auto_depth,
             "same-line `) ORDER BY ...` should align with the outer query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_join_same_line_close_and_on_as_join_condition_continuation()
+    {
+        let sql = r#"SELECT e.empno
+FROM emp e
+JOIN (
+    SELECT d.deptno
+    FROM dept d
+) ON d.deptno = e.deptno
+AND e.status = 'A';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "JOIN (")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") ON d.deptno = e.deptno")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.status = 'A';")
+            .unwrap_or(0);
+
+        assert!(
+            contexts[on_idx].line_semantic.is_join_condition_clause(),
+            "same-line `) ON ...` should re-enter the JOIN condition taxonomy"
+        );
+        assert_eq!(
+            contexts[on_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "same-line `) ON ...` should stay on the outer JOIN condition continuation role"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth,
+            contexts[join_idx].auto_depth.saturating_add(1),
+            "same-line `) ON ...` should stay one level deeper than the JOIN owner depth"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[on_idx].auto_depth.saturating_add(1),
+            "AND after same-line `) ON ...` should stay one level deeper than the outer JOIN condition depth"
         );
     }
 

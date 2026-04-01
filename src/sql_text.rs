@@ -1442,8 +1442,62 @@ pub(crate) fn starts_with_format_set_operator(text_upper: &str) -> bool {
         .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
+pub(crate) fn starts_with_format_join_clause(text_upper: &str) -> bool {
+    if starts_with_keyword_token(text_upper, "JOIN")
+        || starts_with_keyword_token(text_upper, "APPLY")
+    {
+        return true;
+    }
+
+    let starts_with_join_modifier = starts_with_keyword_token(text_upper, "OUTER")
+        || FORMAT_JOIN_MODIFIER_KEYWORDS
+            .iter()
+            .any(|keyword| starts_with_keyword_token(text_upper, keyword));
+
+    starts_with_join_modifier && (text_upper.contains(" JOIN") || text_upper.contains(" APPLY"))
+}
+
 pub(crate) fn is_format_join_condition_clause(text_upper: &str) -> bool {
     starts_with_keyword_token(text_upper, "ON") || starts_with_keyword_token(text_upper, "USING")
+}
+
+pub(crate) fn starts_with_format_for_update_split_header(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "FOR")
+        && !text_upper.contains(" LOOP")
+        && !text_upper.contains(" IN ")
+        && !text_upper.contains(" UPDATE")
+}
+
+pub(crate) fn starts_with_format_for_update_clause(text_upper: &str) -> bool {
+    starts_with_format_for_update_split_header(text_upper)
+        || (starts_with_keyword_token(text_upper, "FOR") && text_upper.contains(" UPDATE"))
+}
+
+/// Shared structural boundary helper for continuation/comment carry.
+///
+/// This intentionally excludes generic expression owners such as `MULTISET`
+/// so callers can keep operator RHS continuation on those lines when needed.
+pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+    line: &str,
+) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let trimmed_upper = trimmed.to_ascii_uppercase();
+    line_starts_query_head(&trimmed_upper)
+        || starts_with_format_layout_clause(&trimmed_upper)
+        || starts_with_keyword_token(&trimmed_upper, "INTO")
+        || starts_with_keyword_token(&trimmed_upper, "USING")
+        || starts_with_format_join_clause(&trimmed_upper)
+        || is_format_join_condition_clause(&trimmed_upper)
+        || starts_with_format_for_update_clause(&trimmed_upper)
+        || format_query_owner_pending_header_kind(trimmed).is_some()
+        || format_indented_paren_pending_header_kind(trimmed).is_some()
+        || starts_with_format_model_subclause(&trimmed_upper)
+        || starts_with_format_match_recognize_subclause(&trimmed_upper)
+        || starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
 }
 
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
@@ -1523,6 +1577,7 @@ impl FormatQueryOwnerKind {
         match self {
             Self::Clause | Self::Condition => query_base_depth
                 .map(|depth| depth.saturating_add(2))
+                .map(|depth| depth.max(resolved_owner_depth.saturating_add(1)))
                 .unwrap_or(resolved_owner_depth.saturating_add(1)),
             Self::FromItem => resolved_owner_depth.saturating_add(1),
         }
@@ -2965,15 +3020,8 @@ pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
         return false;
     };
 
-    let trimmed_upper = trimmed.to_ascii_uppercase();
-    line_starts_query_head(&trimmed_upper)
-        || starts_with_format_layout_clause(&trimmed_upper)
-        || starts_with_auto_format_owner_boundary(trimmed)
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed)
         || is_format_comment_continuation_keyword(first_token)
-        || (starts_with_keyword_token(&trimmed_upper, "FOR")
-            && trimmed_upper.contains(" UPDATE")
-            && !trimmed_upper.contains(" LOOP")
-            && !trimmed_upper.contains(" IN "))
 }
 
 /// Returns true when a leading keyword should preserve the next line as a
@@ -2981,6 +3029,281 @@ pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
 pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_LAYOUT_CLAUSE_START_KEYWORDS)
         || matches_keyword(word, FORMAT_COMMENT_CONTINUATION_KEYWORDS)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatTrailingMeaningfulToken<'a> {
+    Word(&'a str),
+    Symbol(&'a str),
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FormatTrailingContinuationOperatorKind {
+    Keyword,
+    Symbol,
+}
+
+fn push_format_trailing_meaningful_token<'a>(
+    previous: &mut Option<FormatTrailingMeaningfulToken<'a>>,
+    last: &mut Option<FormatTrailingMeaningfulToken<'a>>,
+    token: FormatTrailingMeaningfulToken<'a>,
+) {
+    *previous = *last;
+    *last = Some(token);
+}
+
+fn is_format_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$' | b'#')
+}
+
+fn is_format_identifier_continue_byte(byte: u8) -> bool {
+    is_format_identifier_start_byte(byte) || byte.is_ascii_digit()
+}
+
+fn trailing_meaningful_tokens_before_inline_comment(
+    line: &str,
+) -> (
+    Option<FormatTrailingMeaningfulToken<'_>>,
+    Option<FormatTrailingMeaningfulToken<'_>>,
+) {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut previous = None;
+    let mut last = None;
+
+    while idx < bytes.len() {
+        let Some(remaining) = line.get(idx..) else {
+            break;
+        };
+
+        if remaining.starts_with("--") {
+            break;
+        }
+
+        if remaining.starts_with("/*") {
+            let Some(block_end) = remaining.get(2..).and_then(|body| body.find("*/")) else {
+                break;
+            };
+            idx = idx.saturating_add(block_end).saturating_add(4);
+            continue;
+        }
+
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    let closing = q_quote_closing_byte(delimiter);
+                    let mut local_idx = idx.saturating_add(3);
+                    while local_idx < bytes.len() {
+                        if bytes[local_idx] == closing
+                            && bytes.get(local_idx.saturating_add(1)) == Some(&b'\'')
+                        {
+                            local_idx = local_idx.saturating_add(2);
+                            break;
+                        }
+                        local_idx = local_idx.saturating_add(1);
+                    }
+                    push_format_trailing_meaningful_token(
+                        &mut previous,
+                        &mut last,
+                        FormatTrailingMeaningfulToken::Other,
+                    );
+                    idx = local_idx.min(bytes.len());
+                    continue;
+                }
+            }
+        }
+
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    let closing = q_quote_closing_byte(delimiter);
+                    let mut local_idx = idx.saturating_add(4);
+                    while local_idx < bytes.len() {
+                        if bytes[local_idx] == closing
+                            && bytes.get(local_idx.saturating_add(1)) == Some(&b'\'')
+                        {
+                            local_idx = local_idx.saturating_add(2);
+                            break;
+                        }
+                        local_idx = local_idx.saturating_add(1);
+                    }
+                    push_format_trailing_meaningful_token(
+                        &mut previous,
+                        &mut last,
+                        FormatTrailingMeaningfulToken::Other,
+                    );
+                    idx = local_idx.min(bytes.len());
+                    continue;
+                }
+            }
+        }
+
+        if current == b'\'' {
+            let mut local_idx = idx.saturating_add(1);
+            while local_idx < bytes.len() {
+                if bytes[local_idx] == b'\'' {
+                    if bytes.get(local_idx.saturating_add(1)) == Some(&b'\'') {
+                        local_idx = local_idx.saturating_add(2);
+                        continue;
+                    }
+                    local_idx = local_idx.saturating_add(1);
+                    break;
+                }
+                local_idx = local_idx.saturating_add(1);
+            }
+            push_format_trailing_meaningful_token(
+                &mut previous,
+                &mut last,
+                FormatTrailingMeaningfulToken::Other,
+            );
+            idx = local_idx.min(bytes.len());
+            continue;
+        }
+
+        if current == b'"' {
+            let mut local_idx = idx.saturating_add(1);
+            while local_idx < bytes.len() {
+                if bytes[local_idx] == b'"' {
+                    local_idx = local_idx.saturating_add(1);
+                    break;
+                }
+                local_idx = local_idx.saturating_add(1);
+            }
+            push_format_trailing_meaningful_token(
+                &mut previous,
+                &mut last,
+                FormatTrailingMeaningfulToken::Other,
+            );
+            idx = local_idx.min(bytes.len());
+            continue;
+        }
+
+        let Some(ch) = remaining.chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            idx = idx.saturating_add(ch.len_utf8());
+            continue;
+        }
+
+        if is_format_identifier_start_byte(current) {
+            let start = idx;
+            idx = idx.saturating_add(1);
+            while idx < bytes.len() && is_format_identifier_continue_byte(bytes[idx]) {
+                idx = idx.saturating_add(1);
+            }
+            push_format_trailing_meaningful_token(
+                &mut previous,
+                &mut last,
+                line.get(start..idx)
+                    .map(FormatTrailingMeaningfulToken::Word)
+                    .unwrap_or(FormatTrailingMeaningfulToken::Other),
+            );
+            continue;
+        }
+
+        if current.is_ascii_digit() {
+            idx = idx.saturating_add(1);
+            while idx < bytes.len() {
+                let next_byte = bytes[idx];
+                if next_byte.is_ascii_whitespace()
+                    || (next_byte == b'-' && bytes.get(idx.saturating_add(1)) == Some(&b'-'))
+                    || (next_byte == b'/' && bytes.get(idx.saturating_add(1)) == Some(&b'*'))
+                    || next_byte == b'\''
+                    || next_byte == b'"'
+                {
+                    break;
+                }
+                if next_byte.is_ascii_punctuation() && next_byte != b'.' {
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            push_format_trailing_meaningful_token(
+                &mut previous,
+                &mut last,
+                FormatTrailingMeaningfulToken::Other,
+            );
+            continue;
+        }
+
+        let start = idx;
+        idx = idx.saturating_add(1);
+        while idx < bytes.len() {
+            let next_byte = bytes[idx];
+            if next_byte.is_ascii_whitespace()
+                || is_format_identifier_start_byte(next_byte)
+                || next_byte.is_ascii_digit()
+                || next_byte == b'\''
+                || next_byte == b'"'
+                || (next_byte == b'-' && bytes.get(idx.saturating_add(1)) == Some(&b'-'))
+                || (next_byte == b'/' && bytes.get(idx.saturating_add(1)) == Some(&b'*'))
+            {
+                break;
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        push_format_trailing_meaningful_token(
+            &mut previous,
+            &mut last,
+            line.get(start..idx)
+                .map(FormatTrailingMeaningfulToken::Symbol)
+                .unwrap_or(FormatTrailingMeaningfulToken::Other),
+        );
+    }
+
+    (previous, last)
+}
+
+fn format_trailing_continuation_operator_kind_from_token(
+    previous: Option<FormatTrailingMeaningfulToken<'_>>,
+    last: FormatTrailingMeaningfulToken<'_>,
+) -> Option<FormatTrailingContinuationOperatorKind> {
+    match last {
+        FormatTrailingMeaningfulToken::Word(word) => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT" | "EXISTS"
+        )
+        .then_some(FormatTrailingContinuationOperatorKind::Keyword),
+        FormatTrailingMeaningfulToken::Symbol(symbol) => match symbol {
+            ":=" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "+" | "-" | "||" | "%" | "^"
+            | "|" | "=>" => Some(FormatTrailingContinuationOperatorKind::Symbol),
+            "*" => (!matches!(
+                previous,
+                Some(FormatTrailingMeaningfulToken::Word(word))
+                    if word.eq_ignore_ascii_case("SELECT")
+            ))
+            .then_some(FormatTrailingContinuationOperatorKind::Symbol),
+            "/" => previous
+                .is_some()
+                .then_some(FormatTrailingContinuationOperatorKind::Symbol),
+            _ => None,
+        },
+        FormatTrailingMeaningfulToken::Other => None,
+    }
+}
+
+/// Returns the trailing continuation-operator family for `line` after skipping
+/// inline comments and quoted literals.
+pub(crate) fn format_trailing_continuation_operator_kind(
+    line: &str,
+) -> Option<FormatTrailingContinuationOperatorKind> {
+    let (previous, last) = trailing_meaningful_tokens_before_inline_comment(line);
+    last.and_then(|last| format_trailing_continuation_operator_kind_from_token(previous, last))
+}
+
+/// Returns true when the last meaningful token before an inline comment or
+/// end-of-line is an operator that keeps the next line as an RHS continuation.
+pub(crate) fn line_has_trailing_format_continuation_operator(line: &str) -> bool {
+    format_trailing_continuation_operator_kind(line).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3008,6 +3331,7 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
             ("WITHIN", "GROUP")
                 | ("DENSE_RANK", "FIRST")
                 | ("DENSE_RANK", "LAST")
+                | ("FOR", "UPDATE")
                 | ("GROUP", "BY")
                 | ("ORDER", "BY")
                 | ("PARTITION", "BY")
@@ -3024,7 +3348,15 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
             || (matches!(previous_upper.as_str(), "BETWEEN" | "OF")
                 && is_format_temporal_boundary_keyword(last_upper.as_str()))
         {
-            return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+            let continuation_kind = if matches!(
+                (previous_upper.as_str(), last_upper.as_str()),
+                ("FOR", "UPDATE")
+            ) {
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase
+            } else {
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine
+            };
+            return Some(continuation_kind);
         }
     }
 
@@ -3050,8 +3382,8 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
     None
 }
 
-/// Returns the continuation kind for the leading clause/subclause header
-/// prefix on a formatter line.
+/// Returns the continuation kind for the leading structural header prefix on a
+/// formatter/analyzer line.
 ///
 /// This scans the leading meaningful words while they still form a keyword
 /// prefix and reuses the inline-comment header classification so secondary
@@ -3078,6 +3410,85 @@ pub(crate) fn format_leading_header_continuation_kind(
     }
 
     continuation_kind
+}
+
+/// Returns the shared structural continuation kind for a bare header line or
+/// inline first-item prefix.
+///
+/// Both analyzer and formatter phase 2 use this helper so bare header splits
+/// (`WHERE` -> next line operand, `FROM` -> next line item, `ON` -> next line
+/// condition, ...) follow the same taxonomy as inline-comment header splits.
+///
+/// Structural carry still depends on the shared boundary helper above. Owner
+/// header chains such as `WINDOW ... AS`, `PIVOT XML`, `RULES AUTOMATIC`, and
+/// `MATCH_RECOGNIZE` subclauses are stopped there instead of being treated as
+/// generic continuation consumers.
+pub(crate) fn format_structural_header_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    format_leading_header_continuation_kind(line)
+}
+
+pub(crate) fn format_bare_structural_header_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    let words_upper = leading_meaningful_words(line.trim_start(), 8)
+        .into_iter()
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    if words_upper.is_empty() || !words_upper.iter().all(|word| is_oracle_sql_keyword(word)) {
+        return None;
+    }
+
+    let words = words_upper.iter().map(String::as_str).collect::<Vec<_>>();
+    let exact = |expected: &[&str]| words.as_slice() == expected;
+
+    if exact(&["WITH"]) {
+        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
+    }
+
+    if exact(&["SELECT"])
+        || exact(&["VALUES"])
+        || exact(&["SET"])
+        || exact(&["RETURNING"])
+        || exact(&["OFFSET"])
+        || exact(&["FETCH"])
+        || exact(&["LIMIT"])
+        || exact(&["GROUP", "BY"])
+        || exact(&["ORDER", "BY"])
+        || exact(&["START", "WITH"])
+        || exact(&["CONNECT", "BY"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    if exact(&["FROM"])
+        || exact(&["WHERE"])
+        || exact(&["HAVING"])
+        || exact(&["USING"])
+        || exact(&["INTO"])
+        || exact(&["ON"])
+        || exact(&["UNION"])
+        || exact(&["INTERSECT"])
+        || exact(&["MINUS"])
+        || exact(&["EXCEPT"])
+        || exact(&["QUALIFY"])
+        || exact(&["SEARCH"])
+        || exact(&["CYCLE"])
+        || exact(&["FOR", "UPDATE"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase);
+    }
+
+    if words
+        .last()
+        .is_some_and(|last| matches!(*last, "JOIN" | "APPLY"))
+        && starts_with_format_join_clause(&words.join(" "))
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    None
 }
 
 /// Returns true when a token starts a flashback/temporal boundary expression.
@@ -3340,6 +3751,36 @@ mod tests {
     }
 
     #[test]
+    fn trailing_format_continuation_operator_helper_tracks_shared_keyword_and_symbol_taxonomy() {
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.empno IS"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.ename LIKE"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.sal BETWEEN"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.empno ="
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "pkg_lock.request =>"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "e.qty /* gap */ <="
+        ));
+
+        assert!(!line_has_trailing_format_continuation_operator("SELECT *"));
+        assert!(!line_has_trailing_format_continuation_operator(
+            "FOR UPDATE NOWAIT"
+        ));
+        assert!(!line_has_trailing_format_continuation_operator(
+            "WHERE e.empno"
+        ));
+    }
+
+    #[test]
     fn format_temporal_boundary_keywords_cover_timestamp_and_scn() {
         assert!(is_format_temporal_boundary_keyword("timestamp"));
         assert!(is_format_temporal_boundary_keyword("SCN"));
@@ -3375,6 +3816,10 @@ mod tests {
         assert_eq!(
             format_inline_comment_header_continuation_kind(Some("ORDER"), "BY"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("FOR"), "UPDATE"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(Some("MATCH"), "SKIP"),
@@ -3439,6 +3884,50 @@ mod tests {
         assert_eq!(
             format_leading_header_continuation_kind("e.job_title ="),
             None
+        );
+    }
+
+    #[test]
+    fn format_structural_header_continuation_kind_tracks_bare_headers_and_inline_prefixes() {
+        assert_eq!(
+            format_structural_header_continuation_kind("FROM"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("ON"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("WHERE e.emp_id ="),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("USING d,"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("LEFT OUTER JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+    }
+
+    #[test]
+    fn structural_continuation_boundary_helper_blocks_owner_relative_subclauses() {
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "AUTOMATIC ORDER"
+            )
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "MEASURES match_number () AS match_no"
+            )
+        );
+        assert_eq!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "emp e"
+            ),
+            false
         );
     }
 
@@ -4184,6 +4673,43 @@ mod tests {
     }
 
     #[test]
+    fn structural_continuation_boundary_helper_tracks_join_condition_and_for_update() {
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "LEFT OUTER JOIN dept d"
+            )
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "ON d.deptno = e.deptno"
+            )
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "FOR UPDATE OF e.sal"
+            )
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "CALL pkg_do_work()"
+            )
+        );
+        assert!(
+            !starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "MULTISET"
+            )
+        );
+    }
+
+    #[test]
+    fn mixed_leading_close_continuation_recognizes_join_condition_boundary() {
+        assert!(line_has_mixed_leading_close_continuation(
+            ") ON d.deptno = e.deptno"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(") JOIN dept d"));
+    }
+
+    #[test]
     fn format_direct_from_item_query_owner_keywords_cover_safe_split_lateral_headers() {
         assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
             "LATERAL"
@@ -4341,6 +4867,10 @@ mod tests {
         assert_eq!(
             FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(2, Some(2)),
             4
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(4, Some(2)),
+            5
         );
     }
 
