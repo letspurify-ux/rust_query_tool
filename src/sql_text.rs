@@ -1500,6 +1500,55 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
         || starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
 }
 
+/// Returns true when a CREATE query-body DDL header line owns the following
+/// query body through a trailing `AS`.
+pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
+    if !line_ends_with_keyword(line, "AS") {
+        return false;
+    }
+
+    let trimmed_upper = line.trim_start().to_ascii_uppercase();
+    if !starts_with_keyword_token(&trimmed_upper, "CREATE") {
+        return false;
+    }
+
+    let words: Vec<&str> = trimmed_upper.split_whitespace().collect();
+    let mut idx = 1usize;
+
+    while idx < words.len() {
+        match words[idx] {
+            "OR" if words.get(idx + 1).copied() == Some("REPLACE") => {
+                idx += 2;
+            }
+            "NO" if words.get(idx + 1).copied() == Some("FORCE") => {
+                idx += 2;
+            }
+            "FORCE" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" => {
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+
+    if matches!(words.get(idx).copied(), Some("VIEW")) {
+        return true;
+    }
+
+    if matches!(words.get(idx).copied(), Some("MATERIALIZED"))
+        && matches!(words.get(idx + 1).copied(), Some("VIEW"))
+    {
+        return true;
+    }
+
+    if matches!(words.get(idx).copied(), Some("TABLE")) {
+        return true;
+    }
+
+    (matches!(words.get(idx).copied(), Some("GLOBAL" | "PRIVATE")))
+        && matches!(words.get(idx + 1).copied(), Some("TEMPORARY"))
+        && matches!(words.get(idx + 2).copied(), Some("TABLE"))
+}
+
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
     first_meaningful_word(trimmed_upper).is_some_and(is_subquery_head_keyword)
 }
@@ -4601,6 +4650,31 @@ mod tests {
             Some(FormatQueryOwnerKind::Condition)
         );
         assert!(!not_pending.line_can_continue("SELECT"));
+    }
+
+    #[test]
+    fn create_query_body_header_detects_view_and_ctas_headers() {
+        assert!(line_is_create_query_body_header(
+            "CREATE OR REPLACE VIEW v_demo AS"
+        ));
+        assert!(line_is_create_query_body_header(
+            "CREATE MATERIALIZED VIEW mv_demo AS"
+        ));
+        assert!(line_is_create_query_body_header(
+            "CREATE TABLE t_demo AS"
+        ));
+        assert!(line_is_create_query_body_header(
+            "CREATE GLOBAL TEMPORARY TABLE t_demo AS"
+        ));
+        assert!(line_is_create_query_body_header(
+            "CREATE PRIVATE TEMPORARY TABLE ora$ptt_demo AS"
+        ));
+        assert!(!line_is_create_query_body_header(
+            "CREATE TABLE t_demo (id NUMBER)"
+        ));
+        assert!(!line_is_create_query_body_header(
+            "CREATE PACKAGE pkg_demo AS"
+        ));
     }
 
     #[test]

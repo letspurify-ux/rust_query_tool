@@ -2145,6 +2145,19 @@ fn collect_context_name_suggestions_in_non_table_context_include_aliases_and_cte
 }
 
 #[test]
+fn collect_context_name_suggestions_include_exact_alias_prefix_match() {
+    let full = SqlEditorWidget::tokenize_sql(
+        "WITH recent_emp AS (SELECT empno FROM emp) SELECT  FROM emp e",
+    );
+    let ctx = intellisense_context::analyze_cursor_context(&full, full.len());
+
+    let suggestions =
+        SqlEditorWidget::collect_context_name_suggestions("e", &ctx, SqlContext::ColumnName);
+
+    assert_has_case_insensitive(&suggestions, "e");
+}
+
+#[test]
 fn collect_context_name_suggestions_in_table_context_keep_only_ctes() {
     let script = "WITH recent_emp AS (SELECT empno FROM emp)\nSELECT *\nFROM emp e\nCROSS APPLY (SELECT deptno FROM dept) sub\nJOIN __CODEX_CURSOR__";
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
@@ -3770,6 +3783,17 @@ fn merge_derived_columns_includes_match_recognize_measures_aliases() {
 }
 
 #[test]
+fn merge_derived_columns_includes_exact_prefix_match() {
+    let merged = SqlEditorWidget::merge_suggestions_with_derived_columns(
+        vec!["empno".to_string()],
+        "start_name",
+        vec!["start_name".to_string(), "end_name".to_string()],
+    );
+
+    assert_has_case_insensitive(&merged, "start_name");
+}
+
+#[test]
 fn collect_derived_columns_for_order_by_includes_select_aliases() {
     let sql_with_cursor = "SELECT \
              oh.order_id, \
@@ -4877,6 +4901,27 @@ fn collect_common_column_suggestions_for_join_using_intersects_columns() {
         "suggestions: {:?}",
         suggestions
     );
+}
+
+#[test]
+fn collect_common_column_suggestions_include_exact_prefix_match() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table(
+        "EMPLOYEES",
+        vec!["EMPNO".to_string(), "DEPTNO".to_string()],
+    );
+    data.set_columns_for_table(
+        "DEPARTMENTS",
+        vec!["DEPTNO".to_string(), "LOCATION_ID".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_common_column_suggestions(
+        "deptno",
+        &["EMPLOYEES".to_string(), "DEPARTMENTS".to_string()],
+        &data,
+    );
+
+    assert_has_case_insensitive(&suggestions, "DEPTNO");
 }
 
 #[test]

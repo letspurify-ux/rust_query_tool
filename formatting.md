@@ -13,6 +13,7 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 - `THEN`, `ELSE`, `EXCEPTION` 분기/핸들러 body opener
 - `MERGE WHEN ... THEN`, `INSERT ALL/FIRST` branch, `FORALL` 같은 DML/PLSQL body owner
 - `CREATE TRIGGER` header (`BEFORE`, `REFERENCING`, `FOR EACH ROW`, `WHEN`)처럼 `BEGIN` 전까지 유지되는 header body owner
+- `CREATE TABLE ... AS`, `CREATE [MATERIALIZED] VIEW ... AS`처럼 trailing `AS`가 다음 본문 query(`WITH`, `SELECT`, `VALUES` 등)를 여는 DDL header body owner
 
 주의:
 
@@ -163,6 +164,7 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 | `INSERT ALL/FIRST` branch | body frame push | 다음 sibling branch / driving query에서 pop | — |
 | `FORALL` body | body frame push | body DML statement 종료 시 pop | — |
 | `CREATE TRIGGER` header | header/body frame push | `BEGIN` 또는 statement boundary에서 pop | — |
+| `CREATE TABLE ... AS`, `CREATE [MATERIALIZED] VIEW ... AS` | header/body frame push | 본문 query statement boundary에서 pop | — |
 
 종류만 다르고 전이 규칙(push +1, pop −1, pure close align = owner depth)은 동일하다.
 
@@ -227,6 +229,7 @@ formatter는 그 owner를 즉시 잊으면 안 된다.
   wrapper line 정렬에 쓰는 값은 항상 `owner depth`다.
 - 특히 `WHERE EXISTS`, `WHERE IN`, `... > ANY`처럼 condition owner는 owner line 자체는 clause/condition depth에 남아 있으면서도,
   child query head만 그보다 한 단계 더 깊어질 수 있다.
+- `CREATE TABLE t AS`, `CREATE OR REPLACE VIEW v AS`도 같은 규칙을 따른다. 다음 real body line이 `WITH`든 바로 `SELECT`든 첫 query head는 `owner depth + 1`에서 시작해야 한다.
 - comment-only / blank / comma-only line은 anchor를 소비하지 않는다.
 - standalone `(`, leading `)` wrapper line도 anchor를 먼저 소비하지 않고 owner depth 정렬만 수행한다.
 - 첫 real child body/query line이 나타날 때만 anchor가 body/query depth로 전이된다.

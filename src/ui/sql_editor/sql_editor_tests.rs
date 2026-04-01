@@ -5380,7 +5380,8 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
-    BEFORE INSERT OR UPDATE ON oqt_t_child
+    BEFORE INSERT OR UPDATE
+    ON oqt_t_child
     FOR EACH ROW
 BEGIN
     IF INSERTING THEN
@@ -7375,6 +7376,220 @@ LEFT JOIN emp e
         indent(lines[close_idx]),
         indent(lines[when_idx]),
         "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn format_sql_view_header_indents_cte_body_one_level_deeper() {
+    let input = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
+SELECT dept_id, parent_dept_id, dept_path_txt, lvl
+FROM dept
+)
+SELECT dept_id
+FROM dept_path;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WITH dept_path"))
+        .unwrap_or(0);
+    let cte_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(with_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SELECT")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let main_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(with_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SELECT dept_id")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[with_idx]),
+        4,
+        "VIEW body WITH should be one level deeper than the CREATE VIEW header, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[cte_select_idx]),
+        8,
+        "CTE body SELECT should be one level deeper than the WITH header under CREATE VIEW, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[main_select_idx]),
+        4,
+        "main SELECT after CTE should stay on the CREATE VIEW body depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_view_header_indents_plain_select_body_one_level_deeper() {
+    let input = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+SELECT dept_id
+FROM dept;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "SELECT dept_id")
+        .unwrap_or(0);
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "FROM dept;")
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[select_idx]),
+        4,
+        "SELECT under CREATE VIEW ... AS should be indented one level deeper than the header, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[from_idx]),
+        4,
+        "FROM under CREATE VIEW ... AS should stay on the view body depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_ctas_header_indents_cte_body_one_level_deeper() {
+    let input = r#"CREATE TABLE qt_fmt_emp_t AS
+WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
+SELECT dept_id, parent_dept_id, dept_path_txt, lvl
+FROM dept
+)
+SELECT dept_id
+FROM dept_path;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WITH dept_path"))
+        .unwrap_or(0);
+    let cte_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(with_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SELECT")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let main_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(with_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SELECT dept_id")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[with_idx]),
+        4,
+        "CTAS body WITH should be one level deeper than the CREATE TABLE header, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[cte_select_idx]),
+        8,
+        "CTE body SELECT should be one level deeper than the WITH header under CTAS, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[main_select_idx]),
+        4,
+        "main SELECT after CTAS CTE should stay on the CREATE TABLE body depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_ctas_header_indents_plain_select_body_one_level_deeper() {
+    let input = r#"CREATE TABLE qt_fmt_emp_t AS
+SELECT dept_id
+FROM dept;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "SELECT dept_id")
+        .unwrap_or(0);
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "FROM dept;")
+        .unwrap_or(0);
+
+    assert_eq!(
+        indent(lines[select_idx]),
+        4,
+        "SELECT under CREATE TABLE ... AS should be indented one level deeper than the header, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        indent(lines[from_idx]),
+        4,
+        "FROM under CREATE TABLE ... AS should stay on the CTAS body depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_type_body_keeps_member_function_header_on_one_line() {
+    let input = r#"CREATE OR REPLACE TYPE BODY money_t AS
+    MEMBER
+    FUNCTION to_string RETURN VARCHAR2 IS
+    BEGIN
+        RETURN TO_CHAR (self.amount, 'FM999,999,999,990.00') || ' ' || self.currency;
+    END to_string;
+END;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("MEMBER FUNCTION to_string RETURN VARCHAR2 IS"),
+        "TYPE BODY member function header should stay on one line, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("MEMBER\n    FUNCTION to_string"),
+        "TYPE BODY member function header must not split MEMBER and FUNCTION across lines, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_type_body_keeps_constructor_function_header_on_one_line() {
+    let input = r#"CREATE OR REPLACE TYPE BODY money_t AS
+    CONSTRUCTOR
+    FUNCTION money_t RETURN SELF AS RESULT IS
+    BEGIN
+        RETURN;
+    END;
+END;"#;
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("CONSTRUCTOR FUNCTION money_t RETURN SELF AS RESULT IS"),
+        "TYPE BODY constructor function header should stay on one line, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("CONSTRUCTOR\n    FUNCTION money_t"),
+        "TYPE BODY constructor function header must not split CONSTRUCTOR and FUNCTION across lines, got:\n{}",
+        formatted
     );
 }
 

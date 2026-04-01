@@ -967,8 +967,9 @@ impl ConstructState {
         if keyword == "OR" && matches!(prev_word_upper, Some("CREATE")) {
             return true;
         }
-        // Trigger: OR/ON in trigger header
-        if trigger_header_state.is_active() && matches!(keyword, "OR" | "ON") {
+        // Trigger: keep event chains inline (`INSERT OR UPDATE`), but let
+        // `ON <table>` break onto its own trigger-header line.
+        if trigger_header_state.is_active() && keyword == "OR" {
             return true;
         }
         // CREATE INDEX ON
@@ -3125,7 +3126,11 @@ impl SqlEditorWidget {
             match &tokens[idx] {
                 SqlToken::Word(word) => {
                     let upper = word.to_uppercase();
+                    let as_belongs_to_constructor_result_clause = upper == "AS"
+                        && matches!(prev_word_upper.as_deref(), Some("SELF"))
+                        && next_word_is("RESULT");
                     let with_plsql_body_starts_here = matches!(upper.as_str(), "AS" | "IS")
+                        && !as_belongs_to_constructor_result_clause
                         && with_cte_state.collecting_routine_declaration_body_start();
                     with_cte_state.on_word(upper.as_str(), prev_word_upper.as_deref());
                     let in_sql_case_clause = matches!(
@@ -3271,6 +3276,10 @@ impl SqlEditorWidget {
                         && !(follows_alias_keyword
                             && sql_text::is_plsql_control_keyword(upper.as_str())
                             && !next_word_is("THEN"));
+                    let follows_type_method_modifier = matches!(
+                        prev_word_upper.as_deref(),
+                        Some("MEMBER" | "STATIC" | "CONSTRUCTOR")
+                    );
                     let at_package_body_member_depth =
                         is_package_body_statement && indent_level == 1;
                     if upper == "END" && !treat_control_keyword_as_identifier {
@@ -3748,7 +3757,7 @@ impl SqlEditorWidget {
                             || block_stack.iter().any(|s| s == "PACKAGE_BODY")
                             || at_package_body_member_depth)
                     {
-                        if !at_line_start {
+                        if !at_line_start && !follows_type_method_modifier {
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
@@ -4239,6 +4248,7 @@ impl SqlEditorWidget {
                     }
 
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
+                        && !as_belongs_to_constructor_result_clause
                         && !trigger_header_state.is_active()
                         && (construct.create_object.is_some()
                             || construct.routine_decl_pending.is_active()
@@ -6785,12 +6795,9 @@ impl SqlEditorWidget {
                 parenthesized_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
                 parser_depth
-            } else if current_line_is_pending_partial_multiline_owner {
-                structural_body_depth_for_line
-                    .or(active_structural_continuation_depth_for_line)
-                    .unwrap_or(parser_depth)
-                    .max(parser_depth)
-            } else if current_line_is_standalone_open_paren {
+            } else if current_line_is_pending_partial_multiline_owner
+                || current_line_is_standalone_open_paren
+            {
                 structural_body_depth_for_line
                     .or(active_structural_continuation_depth_for_line)
                     .unwrap_or(parser_depth)
@@ -12098,8 +12105,8 @@ END;"#;
         let sql = r#"create or replace noneditionable trigger "SYSTEM"."OQT_TRG_MEG_CUD" after insert or update or delete on oqt_meg_master for each row begin if inserting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('INSERT', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'key='||:NEW.master_key||', status='||:NEW.status||', amount='||TO_CHAR(:NEW.amount)); elsif updating then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('UPDATE', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'status:'||:OLD.status||'->'||:NEW.status||', amount:'||TO_CHAR(:OLD.amount)||'->'||TO_CHAR(:NEW.amount)); elsif deleting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('DELETE', 'OQT_MEG_MASTER', 'master_id='||:OLD.master_id, 'key='||:OLD.master_key||', status='||:OLD.status||', amount='||TO_CHAR(:OLD.amount)); end if; end; alter trigger "SYSTEM"."OQT_TRG_MEG_CUD" enable"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
         assert!(
-            formatted.contains("\n    AFTER INSERT OR UPDATE OR DELETE ON oqt_meg_master"),
-            "Trigger timing/event header should stay on one indented line, got:\n{}",
+            formatted.contains("\n    AFTER INSERT OR UPDATE OR DELETE\n    ON oqt_meg_master"),
+            "Trigger ON clause should start on its own trigger header line, got:\n{}",
             formatted
         );
         assert!(
@@ -23097,10 +23104,16 @@ from (a
     fn format_sql_trigger_referencing_and_when_alignment() {
         let source = "CREATE OR REPLACE TRIGGER trg_emp_biu BEFORE INSERT OR UPDATE OF sal, comm ON emp REFERENCING NEW AS n OLD AS o FOR EACH ROW WHEN (n.sal > 0) BEGIN :n.comm := NVL(:n.comm, 0); END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
-        // Comma in trigger header should NOT cause a line break
+        // Comma in UPDATE OF column list should stay inline inside the trigger event clause.
         assert!(
-            formatted.contains("OF sal, comm ON emp"),
-            "UPDATE OF column list commas should stay inline in trigger header, got:\n{}",
+            formatted.contains("UPDATE OF sal, comm"),
+            "UPDATE OF column list commas should stay inline in trigger event clause, got:\n{}",
+            formatted
+        );
+        // ON should start a new trigger header line.
+        assert!(
+            formatted.contains("\n    ON emp"),
+            "Trigger ON clause should start on its own line at trigger header indent, got:\n{}",
             formatted
         );
         // REFERENCING should start a new line at trigger header indent
@@ -23146,8 +23159,30 @@ from (a
         let source = "CREATE OR REPLACE TRIGGER trg_test AFTER UPDATE OF col1, col2, col3 ON my_table FOR EACH ROW BEGIN NULL; END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("OF col1, col2, col3 ON my_table"),
+            formatted.contains("UPDATE OF col1, col2, col3"),
             "Multiple columns in trigger UPDATE OF should stay inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\n    ON my_table"),
+            "Trigger ON clause should move to its own line after UPDATE OF, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_trigger_before_insert_places_on_on_separate_header_line() {
+        let source = "CREATE OR REPLACE TRIGGER oqt_trg_test_bi BEFORE INSERT ON oqt_t_test FOR EACH ROW DECLARE v_tag VARCHAR2(30) := 'TRG'; BEGIN NULL; END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("\n    BEFORE INSERT\n    ON oqt_t_test\n    FOR EACH ROW"),
+            "Trigger header should place ON on its own line between timing/event and FOR EACH ROW, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("\nDECLARE\n    v_tag VARCHAR2")
+                && formatted.contains(":= 'TRG';"),
+            "DECLARE section should stay below the trigger header, got:\n{}",
             formatted
         );
     }

@@ -828,9 +828,7 @@ impl SqlEditorWidget {
                 return;
             }
             let candidate_upper = candidate.to_ascii_uppercase();
-            if !prefix_upper.is_empty()
-                && (!candidate_upper.starts_with(&prefix_upper) || candidate_upper == prefix_upper)
-            {
+            if !prefix_upper.is_empty() && !candidate_upper.starts_with(&prefix_upper) {
                 return;
             }
             if seen.insert(candidate_upper) {
@@ -1160,8 +1158,7 @@ impl SqlEditorWidget {
         let prefix_upper = prefix.to_ascii_uppercase();
         common_columns.retain(|column| {
             let upper = column.to_ascii_uppercase();
-            prefix_upper.is_empty()
-                || (upper.starts_with(prefix_upper.as_str()) && upper != prefix_upper)
+            prefix_upper.is_empty() || upper.starts_with(prefix_upper.as_str())
         });
         Self::dedup_column_names_case_insensitive(&mut common_columns);
         common_columns.truncate(MAX_MERGED_SUGGESTIONS);
@@ -1374,9 +1371,7 @@ impl SqlEditorWidget {
 
         for column in derived_columns {
             let upper = column.to_ascii_uppercase();
-            if !prefix_upper.is_empty()
-                && (!upper.starts_with(prefix_upper.as_str()) || upper == prefix_upper)
-            {
+            if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
                 continue;
             }
             if seen.insert(upper) {

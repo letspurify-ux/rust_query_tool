@@ -380,9 +380,6 @@ impl IntellisenseData {
                     if !keyword.starts_with(prefix_upper.as_str()) {
                         break;
                     }
-                    if *keyword == prefix_upper {
-                        continue;
-                    }
                     if seen.insert((*keyword).to_string()) {
                         suggestions.push((*keyword).to_string());
                     }
@@ -398,9 +395,6 @@ impl IntellisenseData {
                 for func in &ORACLE_FUNCTIONS[start..] {
                     if !func.starts_with(prefix_upper.as_str()) {
                         break;
-                    }
-                    if *func == prefix_upper {
-                        continue;
                     }
                     let rendered = format!("{func}{FUNCTION_SUFFIX}");
                     if seen.insert(rendered.to_uppercase()) {
@@ -788,9 +782,6 @@ impl IntellisenseData {
         for entry in entries.iter().skip(start) {
             if !entry.upper.starts_with(prefix_upper) {
                 break;
-            }
-            if !prefix_upper.is_empty() && entry.upper == prefix_upper {
-                continue;
             }
             if seen.insert(entry.upper.clone()) {
                 suggestions.push(entry.name.clone());
@@ -1919,26 +1910,35 @@ mod intellisense_tests {
     }
 
     #[test]
-    fn get_suggestions_excludes_exact_prefix_match() {
+    fn get_suggestions_includes_exact_prefix_match() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["AB".to_string(), "ABC_TABLE".to_string()];
         data.rebuild_indices();
 
         let suggestions = data.get_suggestions("ab", false, None, false, false);
 
-        assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("ab")));
+        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("ab")));
         assert!(suggestions
             .iter()
             .any(|s| s.eq_ignore_ascii_case("abc_table")));
     }
 
     #[test]
-    fn get_suggestions_excludes_exact_prefix_match_for_wrapped_entries() {
+    fn get_suggestions_includes_exact_keyword_match() {
         let mut data = IntellisenseData::new();
 
-        let suggestions = data.get_suggestions("sum()", false, None, false, false);
+        let suggestions = data.get_suggestions("as", false, None, false, false);
 
-        assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("sum()")));
+        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("as")));
+    }
+
+    #[test]
+    fn get_suggestions_includes_exact_function_prefix_match() {
+        let mut data = IntellisenseData::new();
+
+        let suggestions = data.get_suggestions("sum", false, None, false, false);
+
+        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("sum()")));
     }
 
     #[test]
