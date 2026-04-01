@@ -29,6 +29,7 @@ pub struct ResultTabsWidget {
     max_cell_display_chars: Arc<Mutex<usize>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
+    suppress_pointer_event_depth: Arc<Mutex<u32>>,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,32 @@ struct ScriptOutputTab {
     group: Group,
     display: TextDisplay,
     buffer: TextBuffer,
+}
+
+struct PointerEventSuppressGuard {
+    counter: Arc<Mutex<u32>>,
+}
+
+impl PointerEventSuppressGuard {
+    fn new(counter: Arc<Mutex<u32>>) -> Self {
+        {
+            let mut guard = counter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = guard.saturating_add(1);
+        }
+        Self { counter }
+    }
+}
+
+impl Drop for PointerEventSuppressGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = guard.saturating_sub(1);
+    }
 }
 
 impl ResultTabsWidget {
@@ -114,10 +141,38 @@ impl ResultTabsWidget {
         }
     }
 
+    fn should_reset_tab_strip_left_anchor(child_count: i32, width: i32, height: i32) -> bool {
+        child_count > 1 && width > 0 && height > 0
+    }
+
+    fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
+        matches!(
+            ev,
+            Event::Enter
+                | Event::Move
+                | Event::Push
+                | Event::Drag
+                | Event::Released
+                | Event::Leave
+                | Event::MouseWheel
+        ) && *depth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            > 0
+    }
+
     fn reset_tab_strip_left_anchor(&mut self) {
         // Re-applying overflow mode resets FLTK's internal tab offset,
-        // keeping the visible strip anchored from the left.
-        self.tabs.handle_overflow(TabsOverflow::Pulldown);
+        // keeping the visible strip anchored from the left. Skip transient
+        // empty/single-tab states while tabs are being recreated because
+        // overflow math is irrelevant there.
+        if Self::should_reset_tab_strip_left_anchor(
+            self.tabs.children(),
+            self.tabs.w(),
+            self.tabs.h(),
+        ) {
+            self.tabs.handle_overflow(TabsOverflow::Pulldown);
+        }
     }
 
     fn maybe_shrink_tab_storage(data: &mut Vec<ResultTab>) {
@@ -183,6 +238,7 @@ impl ResultTabsWidget {
             Arc::new(Mutex::new(None));
         let on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
             Arc::new(Mutex::new(None));
+        let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
 
         tabs.begin();
         let (x, y, w, h) = Self::content_bounds(&tabs);
@@ -225,6 +281,7 @@ impl ResultTabsWidget {
         let active_for_cb = active_index.clone();
         let script_for_cb = script_output.clone();
         let on_change_for_cb = on_change_callback.clone();
+        let suppress_pointer_for_cb = suppress_pointer_event_depth.clone();
         tabs.set_callback(move |t| {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
@@ -254,7 +311,12 @@ impl ResultTabsWidget {
 
         let tabs_for_key = tabs.clone();
         tabs.handle(move |tabs, ev| {
-            if matches!(ev, Event::MouseWheel) {
+            if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
+                return true;
+            }
+            if matches!(ev, Event::MouseWheel)
+                && Self::should_reset_tab_strip_left_anchor(tabs.children(), tabs.w(), tabs.h())
+            {
                 // Prevent FLTK Tabs from applying wheel-based strip offset changes.
                 // Wheel events can bubble down from nearby panes and cause the
                 // result-tab header to snap right unexpectedly.
@@ -306,6 +368,7 @@ impl ResultTabsWidget {
             max_cell_display_chars,
             execute_sql_callback,
             on_change_callback,
+            suppress_pointer_event_depth,
         }
     }
 
@@ -351,6 +414,8 @@ impl ResultTabsWidget {
     }
 
     pub fn clear(&mut self) {
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let tabs_to_delete: Vec<_> = self
             .data
             .lock()
@@ -439,6 +504,8 @@ impl ResultTabsWidget {
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let existing_group = {
             self.data
                 .lock()
@@ -814,6 +881,8 @@ impl ResultTabsWidget {
             None => return false, // Script Output tab cannot be closed
         };
 
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let tab = {
             let mut data = self
                 .data
@@ -887,6 +956,8 @@ impl ResultTabsWidget {
     }
 
     pub fn select_script_output(&mut self) {
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let script_group = self
             .script_output
             .lock()

@@ -21,6 +21,7 @@ pub struct QueryTabsWidget {
     next_id: Arc<Mutex<QueryTabId>>,
     on_select: Arc<Mutex<Option<TabSelectCallback>>>,
     suppress_select_callback_depth: Arc<Mutex<u32>>,
+    suppress_pointer_event_depth: Arc<Mutex<u32>>,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,32 @@ impl CallbackSuppressGuard {
 }
 
 impl Drop for CallbackSuppressGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = guard.saturating_sub(1);
+    }
+}
+
+struct PointerEventSuppressGuard {
+    counter: Arc<Mutex<u32>>,
+}
+
+impl PointerEventSuppressGuard {
+    fn new(counter: Arc<Mutex<u32>>) -> Self {
+        {
+            let mut guard = counter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = guard.saturating_add(1);
+        }
+        Self { counter }
+    }
+}
+
+impl Drop for PointerEventSuppressGuard {
     fn drop(&mut self) {
         let mut guard = self
             .counter
@@ -115,10 +142,38 @@ impl QueryTabsWidget {
         }
     }
 
+    fn should_reset_tab_strip_left_anchor(child_count: i32, width: i32, height: i32) -> bool {
+        child_count > 1 && width > 0 && height > 0
+    }
+
+    fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
+        matches!(
+            ev,
+            Event::Enter
+                | Event::Move
+                | Event::Push
+                | Event::Drag
+                | Event::Released
+                | Event::Leave
+                | Event::MouseWheel
+        ) && *depth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            > 0
+    }
+
     fn reset_tab_strip_left_anchor(&mut self) {
         // Re-applying overflow mode resets FLTK's internal tab offset,
-        // keeping the visible strip anchored from the left.
-        self.tabs.handle_overflow(TabsOverflow::Pulldown);
+        // keeping the visible strip anchored from the left. Skip transient
+        // empty/single-tab states while tabs are being closed/recreated
+        // because FLTK does not need overflow math there.
+        if Self::should_reset_tab_strip_left_anchor(
+            self.tabs.children(),
+            self.tabs.w(),
+            self.tabs.h(),
+        ) {
+            self.tabs.handle_overflow(TabsOverflow::Pulldown);
+        }
     }
 
     fn maybe_shrink_entry_storage(entries: &mut Vec<TabEntry>) {
@@ -144,22 +199,17 @@ impl QueryTabsWidget {
         // `Compress` dynamically shrinks/expands tab buttons as width changes,
         // which causes distracting header size jumps during splitter drags.
         tabs.handle_overflow(TabsOverflow::Pulldown);
-        tabs.handle(move |tabs, ev| {
-            if matches!(ev, Event::MouseWheel) {
-                tabs.handle_overflow(TabsOverflow::Pulldown);
-                return true;
-            }
-            false
-        });
 
         let entries = Arc::new(Mutex::new(Vec::<TabEntry>::new()));
         let next_id = Arc::new(Mutex::new(1u64));
         let on_select = Arc::new(Mutex::new(None::<TabSelectCallback>));
         let suppress_select_callback_depth = Arc::new(Mutex::new(0u32));
+        let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
 
         let entries_for_cb = entries.clone();
         let on_select_for_cb = on_select.clone();
         let suppress_for_cb = suppress_select_callback_depth.clone();
+        let suppress_pointer_for_cb = suppress_pointer_event_depth.clone();
         tabs.set_callback(move |tabs| {
             if *suppress_for_cb
                 .lock()
@@ -185,6 +235,18 @@ impl QueryTabsWidget {
         tabs.resize_callback(move |t, _, _, _, _| {
             Self::layout_children(t);
         });
+        tabs.handle(move |tabs, ev| {
+            if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
+                return true;
+            }
+            if matches!(ev, Event::MouseWheel)
+                && Self::should_reset_tab_strip_left_anchor(tabs.children(), tabs.w(), tabs.h())
+            {
+                tabs.handle_overflow(TabsOverflow::Pulldown);
+                return true;
+            }
+            false
+        });
 
         Self {
             tabs,
@@ -192,6 +254,7 @@ impl QueryTabsWidget {
             next_id,
             on_select,
             suppress_select_callback_depth,
+            suppress_pointer_event_depth,
         }
     }
 
@@ -235,6 +298,8 @@ impl QueryTabsWidget {
                 id: tab_id,
                 group: group.clone(),
             });
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         let _ = self.tabs.set_value(&group);
@@ -246,6 +311,8 @@ impl QueryTabsWidget {
 
     pub fn select(&mut self, tab_id: QueryTabId) {
         if let Some(group) = self.tab_group(tab_id) {
+            let _pointer_suppress_guard =
+                PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
             let _suppress_guard =
                 CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
             let _ = self.tabs.set_value(&group);
@@ -267,6 +334,8 @@ impl QueryTabsWidget {
 
     pub fn set_tab_label(&mut self, tab_id: QueryTabId, label: &str) {
         if let Some(group) = self.tab_group(tab_id) {
+            let _pointer_suppress_guard =
+                PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
             let mut group = group;
             group.set_label(&Self::display_label(label));
             group.set_align(Align::Center | Align::Inside);
@@ -292,6 +361,8 @@ impl QueryTabsWidget {
             (group, replacement)
         };
 
+        let _pointer_suppress_guard =
+            PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         if let Some(replacement_group) = replacement_group {
@@ -337,5 +408,37 @@ impl QueryTabsWidget {
 impl Default for QueryTabsWidget {
     fn default() -> Self {
         Self::new(0, 0, 100, 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryTabsWidget;
+    use fltk::enums::Event;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn tab_strip_left_anchor_reset_requires_real_overflow_state() {
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(0, 320, 240));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(1, 320, 240));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 0, 240));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 320, 0));
+        assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(2, 320, 240));
+    }
+
+    #[test]
+    fn pointer_event_suppression_only_applies_to_mouse_driven_tab_events() {
+        let depth = Arc::new(Mutex::new(1u32));
+
+        assert!(QueryTabsWidget::should_suppress_pointer_event(&depth, Event::Move));
+        assert!(QueryTabsWidget::should_suppress_pointer_event(&depth, Event::Push));
+        assert!(QueryTabsWidget::should_suppress_pointer_event(
+            &depth,
+            Event::Released
+        ));
+        assert!(!QueryTabsWidget::should_suppress_pointer_event(
+            &depth,
+            Event::KeyDown
+        ));
     }
 }
