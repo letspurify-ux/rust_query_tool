@@ -455,6 +455,15 @@ impl SqlEditorWidget {
         Self::remember_preferred_insert_position(slot, buffer, pos);
     }
 
+    fn refresh_editor_display_metrics(editor: &mut TextEditor) {
+        // Force FLTK to recalculate internal display metrics before the next
+        // pointer hit-test. Without this, a freshly created/activated editor can
+        // still hold stale zero-width column metrics until an external redraw.
+        let (x, y, w, h) = (editor.x(), editor.y(), editor.w(), editor.h());
+        editor.resize(x, y, w, h);
+        editor.redraw();
+    }
+
     fn preferred_insert_position_for_external_insert(&self) -> i32 {
         let fallback = self.editor.insert_position();
         let candidate = load_mutex_i32_option(&self.preferred_insert_position).unwrap_or(fallback);
@@ -1496,6 +1505,12 @@ impl SqlEditorWidget {
         self.buffer.clone()
     }
 
+    pub fn stabilize_display_metrics(&mut self) {
+        Self::refresh_editor_display_metrics(&mut self.editor);
+        app::redraw();
+        app::flush();
+    }
+
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32, ui_size: i32) {
         let size_i32 = size as i32;
         self.editor.set_text_font(profile.normal);
@@ -1507,19 +1522,8 @@ impl SqlEditorWidget {
         let style_table = create_style_table_with(profile, size);
         self.editor
             .set_highlight_data(self.style_buffer.clone(), style_table);
-        // Force FLTK to recalculate internal display metrics (line heights,
-        // character widths, scroll positions) by triggering a no-op resize.
-        // Without this, the TextEditor may render with stale cached metrics
-        // until an external event (e.g. window resize) forces recalculation.
-        let (x, y, w, h) = (
-            self.editor.x(),
-            self.editor.y(),
-            self.editor.w(),
-            self.editor.h(),
-        );
-        self.editor.resize(x, y, w, h);
+        Self::refresh_editor_display_metrics(&mut self.editor);
         self.timeout_input.redraw();
-        self.editor.redraw();
     }
 
     #[allow(dead_code)]

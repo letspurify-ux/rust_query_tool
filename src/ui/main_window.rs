@@ -257,6 +257,7 @@ impl AppState {
         let tab = self.editor_tabs[index].clone();
         self.active_editor_tab_id = tab_id;
         self.sql_editor = tab.sql_editor;
+        self.sql_editor.stabilize_display_metrics();
         self.sql_buffer = tab.sql_buffer;
         *self
             .current_file
@@ -2176,13 +2177,14 @@ impl MainWindow {
         let tab_id = state.query_tabs.add_tab(&label);
         let group = state.query_tabs.tab_group(tab_id)?;
         group.begin();
-        let editor =
+        let mut editor =
             SqlEditorWidget::new(state.connection.clone(), state.query_timeout_input.clone());
         let mut editor_group = editor.get_group().clone();
         editor_group.resize(group.x(), group.y(), group.w(), group.h());
         editor_group.layout();
         group.resizable(&editor_group);
         group.end();
+        editor.stabilize_display_metrics();
         let inherited_intellisense = state.schema_intellisense_data.clone();
         *editor
             .get_intellisense_data()
