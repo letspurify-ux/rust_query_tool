@@ -643,6 +643,8 @@ pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
     "OFFSET",
     "FETCH",
     "LIMIT",
+    "SEARCH",
+    "CYCLE",
 ];
 
 pub(crate) const FORMAT_SET_OPERATOR_KEYWORDS: &[&str] = &["UNION", "INTERSECT", "MINUS", "EXCEPT"];
@@ -679,6 +681,8 @@ const FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS: &[&str] = &[
     "PIVOT",
     "UNPIVOT",
     "QUALIFY",
+    "SEARCH",
+    "CYCLE",
 ];
 
 /// Clause/subclause headers whose body should continue one level deeper than
@@ -1476,8 +1480,8 @@ pub(crate) enum SplitQueryOwnerLookaheadKind {
 }
 
 impl FormatQueryOwnerKind {
-    /// Returns the minimum visual depth that a split owner-header line should
-    /// keep before the child query opens.
+    /// Returns the minimum structural owner depth that a split owner-header
+    /// line should keep before the child query opens.
     pub(crate) fn header_depth_floor(
         self,
         query_base_depth: Option<usize>,
@@ -1494,14 +1498,14 @@ impl FormatQueryOwnerKind {
     /// query head after this owner line.
     pub(crate) fn auto_format_child_query_owner_base_depth(
         self,
-        visual_owner_depth: usize,
+        resolved_owner_depth: usize,
         query_base_depth: Option<usize>,
     ) -> usize {
         match self {
             Self::Condition => query_base_depth
-                .map(|depth| visual_owner_depth.max(depth.saturating_add(1)))
-                .unwrap_or(visual_owner_depth.saturating_add(1)),
-            Self::Clause | Self::FromItem => visual_owner_depth,
+                .map(|depth| resolved_owner_depth.max(depth.saturating_add(1)))
+                .unwrap_or(resolved_owner_depth.saturating_add(1)),
+            Self::Clause | Self::FromItem => resolved_owner_depth,
         }
     }
 
@@ -1509,14 +1513,14 @@ impl FormatQueryOwnerKind {
     /// relative to this owner line and the surrounding resolved query base.
     pub(crate) fn formatter_child_query_head_depth(
         self,
-        visual_owner_depth: usize,
+        resolved_owner_depth: usize,
         query_base_depth: Option<usize>,
     ) -> usize {
         match self {
             Self::Clause | Self::Condition => query_base_depth
                 .map(|depth| depth.saturating_add(2))
-                .unwrap_or(visual_owner_depth.saturating_add(1)),
-            Self::FromItem => visual_owner_depth.saturating_add(1),
+                .unwrap_or(resolved_owner_depth.saturating_add(1)),
+            Self::FromItem => resolved_owner_depth.saturating_add(1),
         }
     }
 }
@@ -1588,18 +1592,10 @@ impl PendingFormatQueryOwnerHeaderKind {
     }
 }
 
-/// Returns true when `line` begins a structural formatter boundary that must
-/// terminate any pending split-owner/header continuation.
-///
-/// This intentionally covers every nested-owner family that can redirect the
-/// indentation state machine onto a different stack:
-/// - query-owner headers and pending fragments (`FROM`, `JOIN`, `LATERAL`,
-///   `REFERENCE ... ON`, `NOT EXISTS`, ...)
-/// - multiline owner headers and pending fragments (`WITHIN GROUP`,
-///   `WINDOW ... AS`, `NESTED [PATH] ... COLUMNS`, ...)
-/// - generic expression query owners (`CURSOR`, `MULTISET`)
-/// - PL/SQL child-query owners (`BEGIN`, `CURSOR ... IS`, `OPEN ... FOR`, ...)
-fn starts_with_auto_format_owner_boundary(line: &str) -> bool {
+fn starts_with_auto_format_owner_boundary_impl(
+    line: &str,
+    include_expression_query_owner: bool,
+) -> bool {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return false;
@@ -1612,9 +1608,33 @@ fn starts_with_auto_format_owner_boundary(line: &str) -> bool {
         || format_query_owner_pending_header_kind(trimmed).is_some()
         || format_indented_paren_owner_header_kind(trimmed).is_some()
         || format_indented_paren_pending_header_kind(trimmed).is_some()
-        || line_ends_with_format_expression_query_owner_keyword(trimmed)
+        || (include_expression_query_owner
+            && line_ends_with_format_expression_query_owner_keyword(trimmed))
         || format_plsql_child_query_owner_kind(&trimmed_upper).is_some()
         || format_plsql_child_query_owner_pending_header_kind(trimmed).is_some()
+}
+
+/// Returns true when `line` begins a structural formatter boundary that must
+/// terminate any pending split-owner/header continuation.
+///
+/// This intentionally covers every nested-owner family that can redirect the
+/// indentation state machine onto a different stack:
+/// - query-owner headers and pending fragments (`FROM`, `JOIN`, `LATERAL`,
+///   `REFERENCE ... ON`, `NOT EXISTS`, ...)
+/// - multiline owner headers and pending fragments (`WITHIN GROUP`,
+///   `WINDOW ... AS`, `NESTED [PATH] ... COLUMNS`, ...)
+/// - generic expression query owners (`CURSOR`, `MULTISET`)
+/// - PL/SQL child-query owners (`BEGIN`, `CURSOR ... IS`, `OPEN ... FOR`, ...)
+pub(crate) fn starts_with_auto_format_owner_boundary(line: &str) -> bool {
+    starts_with_auto_format_owner_boundary_impl(line, true)
+}
+
+/// Returns true when `line` begins a shared structural owner/layout boundary
+/// that should stop comment/header continuation, while still allowing generic
+/// expression RHS lines such as `MULTISET` to remain operator continuations
+/// when a caller needs that behavior.
+pub(crate) fn starts_with_auto_format_owner_boundary_without_expression_owner(line: &str) -> bool {
+    starts_with_auto_format_owner_boundary_impl(line, false)
 }
 
 pub(crate) fn format_plsql_child_query_owner_kind(
@@ -2251,10 +2271,21 @@ impl PendingFormatIndentedParenOwnerHeaderKind {
     }
 
     pub(crate) fn line_completes(self, line: &str) -> bool {
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+
         match self {
-            Self::WindowAs => line_ends_with_keyword(line, "AS"),
-            Self::WithinGroup => line_ends_with_keyword(line, "GROUP"),
-            Self::NestedPathColumns => line_ends_with_keyword(line, "COLUMNS"),
+            Self::WindowAs => {
+                starts_with_keyword_token(&trimmed_upper, "AS")
+                    || line_ends_with_keyword(line, "AS")
+            }
+            Self::WithinGroup => {
+                starts_with_keyword_token(&trimmed_upper, "GROUP")
+                    || line_ends_with_keyword(line, "GROUP")
+            }
+            Self::NestedPathColumns => {
+                starts_with_keyword_token(&trimmed_upper, "COLUMNS")
+                    || line_ends_with_keyword(line, "COLUMNS")
+            }
         }
     }
 
@@ -2887,6 +2918,60 @@ pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
     }
 }
 
+/// Returns true when the meaningful remainder of a leading-close line keeps
+/// evaluating the same expression after the close has been consumed.
+///
+/// Examples:
+/// - `) AND EXISTS (` -> true
+/// - `), 0` -> true
+/// - `)` / `),` / `) JOIN t` -> false
+pub(crate) fn line_continues_expression_after_leading_close(line: &str) -> bool {
+    let trimmed = trim_after_leading_close_parens(line);
+    let Some(first_token) = first_meaningful_word(trimmed) else {
+        return false;
+    };
+
+    match first_token {
+        "," => {
+            let remainder = trimmed.get(first_token.len()..).unwrap_or("");
+            first_meaningful_word(remainder).is_some()
+        }
+        "+" | "-" | "*" | "/" | "%" | "^" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "||"
+        | "|" => true,
+        _ => matches!(
+            first_token.to_ascii_uppercase().as_str(),
+            "AND" | "OR" | "IS" | "IN" | "LIKE" | "BETWEEN" | "NOT"
+        ),
+    }
+}
+
+/// Returns true when a leading-close line must keep interpreting the remaining
+/// tokens structurally after consuming the close segment.
+///
+/// This covers both expression continuations (`) AND ...`, `), value`) and
+/// clause/query-header transitions such as `) ORDER BY ...` or
+/// `) UPDATE demo ...`.
+pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
+    if line_continues_expression_after_leading_close(line) {
+        return true;
+    }
+
+    let trimmed = trim_after_leading_close_parens(line);
+    let Some(first_token) = first_meaningful_word(trimmed) else {
+        return false;
+    };
+
+    let trimmed_upper = trimmed.to_ascii_uppercase();
+    line_starts_query_head(&trimmed_upper)
+        || starts_with_format_layout_clause(&trimmed_upper)
+        || starts_with_auto_format_owner_boundary(trimmed)
+        || is_format_comment_continuation_keyword(first_token)
+        || (starts_with_keyword_token(&trimmed_upper, "FOR")
+            && trimmed_upper.contains(" UPDATE")
+            && !trimmed_upper.contains(" LOOP")
+            && !trimmed_upper.contains(" IN "))
+}
+
 /// Returns true when a leading keyword should preserve the next line as a
 /// continuation after a comment split.
 pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
@@ -3104,6 +3189,12 @@ mod tests {
         assert!(starts_with_format_layout_clause("OFFSET 10 ROWS"));
         assert!(starts_with_format_layout_clause("FETCH FIRST 5 ROWS ONLY"));
         assert!(starts_with_format_layout_clause("LIMIT 50"));
+        assert!(starts_with_format_layout_clause(
+            "SEARCH DEPTH FIRST BY id SET ord"
+        ));
+        assert!(starts_with_format_layout_clause(
+            "CYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"
+        ));
     }
 
     #[test]
@@ -3198,6 +3289,42 @@ mod tests {
     }
 
     #[test]
+    fn line_continues_expression_after_leading_close_distinguishes_mixed_and_pure_close_lines() {
+        assert!(line_continues_expression_after_leading_close(
+            ") AND EXISTS ("
+        ));
+        assert!(line_continues_expression_after_leading_close(
+            ") /* gap */ IS NULL"
+        ));
+        assert!(line_continues_expression_after_leading_close("), 0"));
+
+        assert!(!line_continues_expression_after_leading_close(")"));
+        assert!(!line_continues_expression_after_leading_close("),"));
+        assert!(!line_continues_expression_after_leading_close(
+            ") JOIN dept d"
+        ));
+    }
+
+    #[test]
+    fn line_has_mixed_leading_close_continuation_covers_clause_and_query_head_reclassification() {
+        assert!(line_has_mixed_leading_close_continuation(") AND EXISTS ("));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") ORDER BY empno"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") UPDATE demo SET flag = 'Y'"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") FOR UPDATE NOWAIT"
+        ));
+
+        assert!(!line_has_mixed_leading_close_continuation(")"));
+        assert!(!line_has_mixed_leading_close_continuation("),"));
+        assert!(!line_has_mixed_leading_close_continuation(") bonus_view"));
+        assert!(!line_has_mixed_leading_close_continuation(") THEN"));
+    }
+
+    #[test]
     fn format_comment_continuation_keywords_cover_clause_and_condition_heads() {
         assert!(is_format_comment_continuation_keyword("WINDOW"));
         assert!(is_format_comment_continuation_keyword("QUALIFY"));
@@ -3272,6 +3399,14 @@ mod tests {
         assert_eq!(
             format_inline_comment_header_continuation_kind(Some("LEFT"), "JOIN"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "SEARCH"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "CYCLE"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(None, "DUAL"),
@@ -3732,6 +3867,10 @@ mod tests {
         );
         assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup.line_can_continue("GROUP"));
         assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup.line_completes("GROUP"));
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup
+            .line_can_continue("GROUP (ORDER BY e.ename)"));
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup
+            .line_completes("GROUP (ORDER BY e.ename)"));
         assert_eq!(
             format_indented_paren_pending_header_kind("NESTED"),
             Some(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns)
@@ -3757,6 +3896,14 @@ mod tests {
         assert!(
             PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns.line_completes("COLUMNS")
         );
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::WindowAs
+            .line_can_continue("AS (PARTITION BY deptno)"));
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::WindowAs
+            .line_completes("AS (PARTITION BY deptno)"));
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns
+            .line_can_continue("COLUMNS (deptno PATH '$.deptno')"));
+        assert!(PendingFormatIndentedParenOwnerHeaderKind::NestedPathColumns
+            .line_completes("COLUMNS (deptno PATH '$.deptno')"));
     }
 
     #[test]
@@ -4015,6 +4162,21 @@ mod tests {
         assert!(!line_ends_with_format_expression_query_owner_keyword(
             "SELECT e.empno,"
         ));
+    }
+
+    #[test]
+    fn auto_format_owner_boundary_helpers_share_owner_taxonomy_but_can_exclude_expression_rhs() {
+        assert!(starts_with_auto_format_owner_boundary("WHERE EXISTS"));
+        assert!(starts_with_auto_format_owner_boundary("WINDOW w_dept AS"));
+        assert!(starts_with_auto_format_owner_boundary("MULTISET"));
+        assert!(starts_with_auto_format_owner_boundary("CURSOR"));
+
+        assert!(starts_with_auto_format_owner_boundary_without_expression_owner("WHERE EXISTS"));
+        assert!(
+            starts_with_auto_format_owner_boundary_without_expression_owner("WINDOW w_dept AS")
+        );
+        assert!(!starts_with_auto_format_owner_boundary_without_expression_owner("MULTISET"));
+        assert!(starts_with_auto_format_owner_boundary_without_expression_owner("CURSOR"));
     }
 
     #[test]

@@ -123,6 +123,8 @@ enum AutoFormatClauseKind {
     Qualify,
     Pivot,
     Unpivot,
+    Search,
+    Cycle,
 }
 
 impl AutoFormatClauseKind {
@@ -182,6 +184,16 @@ struct QueryBaseDepthFrame {
     merge_branch_action: Option<MergeBranchAction>,
     pending_for_update_clause_update_line: bool,
     pending_join_condition_continuation: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TriggerHeaderDepthFrame {
+    body_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForallBodyDepthFrame {
+    owner_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,6 +317,7 @@ struct PendingQueryBaseFrame {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingSplitQueryOwnerFrame {
+    owner_align_depth: usize,
     owner_base_depth: usize,
     next_query_head_depth: usize,
 }
@@ -312,6 +325,7 @@ struct PendingSplitQueryOwnerFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingPartialQueryOwnerFrame {
     kind: sql_text::PendingFormatQueryOwnerHeaderKind,
+    owner_align_depth: usize,
     owner_base_depth: usize,
     next_query_head_depth: usize,
 }
@@ -1429,6 +1443,8 @@ impl QueryExecutor {
         let mut pending_line_continuation: Option<InlineCommentLineContinuation> = None;
         let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
             None;
+        let mut trigger_header_frame: Option<TriggerHeaderDepthFrame> = None;
+        let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1474,7 +1490,28 @@ impl QueryExecutor {
             }
 
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            let clause_kind = Self::auto_format_clause_kind(&trimmed_upper);
+            let line_has_leading_close_paren =
+                sql_text::line_has_leading_significant_close_paren(trimmed);
+            let leading_close_has_mixed_continuation = line_has_leading_close_paren
+                && sql_text::line_has_mixed_leading_close_continuation(trimmed);
+            let clause_detection_trimmed = if leading_close_has_mixed_continuation {
+                sql_text::trim_after_leading_close_parens(trimmed)
+            } else {
+                trimmed
+            };
+            let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
+            let is_trigger_header_begin = trigger_header_frame.is_some()
+                && parser_depth == 0
+                && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN");
+            let is_trigger_header_body_line = trigger_header_frame.is_some()
+                && parser_depth == 0
+                && !sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                && !sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE")
+                && !sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
+                && !sql_text::starts_with_keyword_token(&trimmed_upper, "END");
+            let forall_body_depth =
+                forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
+            let clause_kind = Self::auto_format_clause_kind(&clause_detection_upper);
             let split_query_owner_lookahead_kind =
                 Self::split_query_owner_lookahead_kind(&lines, idx, &next_code_indices, trimmed);
             let current_line_is_generic_split_query_owner = matches!(
@@ -1570,6 +1607,7 @@ impl QueryExecutor {
                 let parent_base_depth = pending_query_bases
                     .last()
                     .map(|frame| frame.owner_base_depth)
+                    .or_else(|| forall_body_frame.map(|frame| frame.owner_depth))
                     .or_else(|| active_frame.map(|frame| frame.query_base_depth));
                 let query_base_depth = parent_base_depth
                     .map(|depth| depth.saturating_add(1))
@@ -1611,11 +1649,11 @@ impl QueryExecutor {
                             && parser_depth == frame.start_parser_depth)
                 });
                 let is_merge_using_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_using_clause(&trimmed_upper);
+                    && Self::auto_format_is_merge_using_clause(&clause_detection_upper);
                 let is_merge_on_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_on_clause(&trimmed_upper);
+                    && Self::auto_format_is_merge_on_clause(&clause_detection_upper);
                 let is_merge_branch_header = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_branch_header(&trimmed_upper);
+                    && Self::auto_format_is_merge_branch_header(&clause_detection_upper);
                 let merge_branch_body_depth = frame
                     .merge_branch_body_depth
                     .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
@@ -1646,7 +1684,7 @@ impl QueryExecutor {
                         )
                     );
                 let is_merge_branch_condition_clause = frame.merge_branch_body_depth.is_some()
-                    && Self::auto_format_is_merge_branch_condition_clause(&trimmed_upper);
+                    && Self::auto_format_is_merge_branch_condition_clause(&clause_detection_upper);
                 let is_merge_branch_dml = frame.head_kind == Some(AutoFormatClauseKind::Merge)
                     && matches!(
                         clause_kind,
@@ -1663,9 +1701,9 @@ impl QueryExecutor {
                     );
                 let is_multitable_insert_branch_header = frame.is_multitable_insert
                     && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"));
-                let is_join_clause = Self::auto_format_is_join_clause(&trimmed_upper);
+                let is_join_clause = Self::auto_format_is_join_clause(&clause_detection_upper);
                 let is_join_condition_clause =
-                    Self::auto_format_is_join_condition_clause(&trimmed_upper);
+                    Self::auto_format_is_join_condition_clause(&clause_detection_upper);
                 let from_item_list_body_depth = frame
                     .from_item_list_body_depth
                     .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
@@ -1676,9 +1714,11 @@ impl QueryExecutor {
                     && matches!(clause_kind, None | Some(AutoFormatClauseKind::Table))
                     && !sql_text::line_has_leading_significant_close_paren(trimmed);
                 let is_query_condition_continuation_clause =
-                    Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper);
+                    Self::auto_format_is_query_condition_continuation_clause(
+                        &clause_detection_upper,
+                    );
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
-                    && Self::auto_format_is_for_update_clause(&trimmed_upper);
+                    && Self::auto_format_is_for_update_clause(&clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
 
@@ -1751,6 +1791,18 @@ impl QueryExecutor {
             } else if let Some(into_depth) = non_query_into_continuation_depth {
                 context.auto_depth = into_depth.saturating_add(1);
                 context.query_role = AutoFormatQueryRole::Continuation;
+            } else if let Some(body_depth) = forall_body_depth {
+                if clause_kind.is_some_and(AutoFormatClauseKind::is_query_head) {
+                    context.auto_depth = body_depth;
+                }
+            }
+
+            if let Some(frame) = trigger_header_frame {
+                if is_trigger_header_body_line {
+                    context.auto_depth = frame.body_depth;
+                } else if is_trigger_header_begin {
+                    context.auto_depth = parser_depth;
+                }
             }
 
             if clause_kind.is_none() && !blocks_structural_line_continuation {
@@ -1854,7 +1906,7 @@ impl QueryExecutor {
                 non_query_into_continuation_depth = None;
             }
 
-            if sql_text::line_has_leading_significant_close_paren(trimmed) {
+            if line_has_leading_close_paren && !leading_close_has_mixed_continuation {
                 if let Some(close_align_depth) = closing_query_close_align_depth {
                     context.auto_depth = close_align_depth;
                 }
@@ -1863,10 +1915,10 @@ impl QueryExecutor {
             if let Some(frame) = pending_split_query_owner_for_line {
                 // A standalone `(` after a split owner such as `WHERE EXISTS`
                 // or `FROM` remains part of that owner context, not the child
-                // query yet. Keep the opener aligned with the resolved owner
-                // base depth so nested split owners stay relative to their own
-                // query base instead of falling back to the enclosing frame.
-                context.auto_depth = frame.owner_base_depth;
+                // query yet. Keep the opener aligned with the completed
+                // owner's own depth while still carrying the child-query base
+                // separately through `next_query_head_depth`.
+                context.auto_depth = frame.owner_align_depth;
             }
 
             if let Some(frame) = pending_multiline_clause_for_line {
@@ -1953,6 +2005,7 @@ impl QueryExecutor {
                 if frame.kind.line_can_continue(trimmed) {
                     if frame.kind.line_completes(trimmed) && nested_paren_depth_after_line == 0 {
                         completed_plsql_child_query_owner = Some(PendingSplitQueryOwnerFrame {
+                            owner_align_depth: frame.owner_base_depth,
                             owner_base_depth: frame.owner_base_depth,
                             next_query_head_depth: frame.next_query_head_depth,
                         });
@@ -1973,22 +2026,25 @@ impl QueryExecutor {
                     if frame.kind.line_can_continue(trimmed) {
                         // Split owner chains keep the original structural
                         // anchor; raw line indent must not become the new base.
-                        let owner_depth = frame.owner_base_depth;
+                        let owner_align_depth = frame.owner_align_depth;
+                        let owner_base_depth = frame.owner_base_depth;
                         let next_query_head_depth = frame
                             .next_query_head_depth
-                            .max(owner_depth.saturating_add(1));
-                        if owner_depth > context.auto_depth {
-                            context.auto_depth = owner_depth;
+                            .max(owner_base_depth.saturating_add(1));
+                        if owner_align_depth > context.auto_depth {
+                            context.auto_depth = owner_align_depth;
                         }
                         if frame.kind.line_completes(trimmed) {
                             completed_partial_query_owner = Some(PendingSplitQueryOwnerFrame {
-                                owner_base_depth: owner_depth,
+                                owner_align_depth,
+                                owner_base_depth,
                                 next_query_head_depth,
                             });
                         } else {
                             continued_partial_query_owner = Some(PendingPartialQueryOwnerFrame {
                                 kind: frame.kind,
-                                owner_base_depth: owner_depth,
+                                owner_align_depth,
+                                owner_base_depth,
                                 next_query_head_depth,
                             });
                         }
@@ -2045,9 +2101,19 @@ impl QueryExecutor {
             context.condition_header_line = condition_annotation.header_line_idx;
             context.condition_header_depth = condition_annotation.header_depth;
             context.condition_role = condition_annotation.role;
+            let leading_close_condition_continuation = context.condition_role
+                == AutoFormatConditionRole::Continuation
+                && sql_text::line_has_leading_significant_close_paren(line)
+                && Self::auto_format_is_query_condition_continuation_clause(
+                    &sql_text::trim_after_leading_close_parens(line).to_ascii_uppercase(),
+                );
             if context.condition_role == AutoFormatConditionRole::Closer {
                 if let Some(header_depth) = context.condition_header_depth {
                     context.auto_depth = header_depth;
+                }
+            } else if leading_close_condition_continuation {
+                if let Some(header_depth) = context.condition_header_depth {
+                    context.auto_depth = header_depth.saturating_add(1);
                 }
             }
             if clause_kind.is_none()
@@ -2115,6 +2181,7 @@ impl QueryExecutor {
                 });
                 if !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
                     pending_split_query_owner = Some(PendingSplitQueryOwnerFrame {
+                        owner_align_depth: context.auto_depth,
                         owner_base_depth: base_depth_for_child_query,
                         next_query_head_depth,
                     });
@@ -2137,6 +2204,7 @@ impl QueryExecutor {
                             let owner_base_depth = context.auto_depth;
                             PendingPartialQueryOwnerFrame {
                                 kind,
+                                owner_align_depth: owner_base_depth,
                                 owner_base_depth,
                                 next_query_head_depth: owner_base_depth.saturating_add(1),
                             }
@@ -2242,18 +2310,18 @@ impl QueryExecutor {
                 ));
             }
 
-            pending_line_continuation = if context.query_base_depth.is_some() || clause_kind.is_some()
-            {
-                Self::line_continuation_for_line(
-                    trimmed,
-                    context.auto_depth,
-                    context.query_base_depth,
-                    clause_kind,
-                    next_code_trimmed,
-                )
-            } else {
-                None
-            };
+            pending_line_continuation =
+                if context.query_base_depth.is_some() || clause_kind.is_some() {
+                    Self::line_continuation_for_line(
+                        trimmed,
+                        context.auto_depth,
+                        context.query_base_depth,
+                        clause_kind,
+                        next_code_trimmed,
+                    )
+                } else {
+                    None
+                };
             pending_inline_comment_line_continuation =
                 Self::inline_comment_line_continuation_for_line(
                     trimmed,
@@ -2261,6 +2329,18 @@ impl QueryExecutor {
                     context.query_base_depth,
                     next_code_trimmed,
                 );
+
+            if parser_depth == 0 && Self::is_create_trigger(trimmed) {
+                trigger_header_frame = Some(TriggerHeaderDepthFrame { body_depth: 1 });
+            }
+            if is_trigger_header_begin {
+                trigger_header_frame = None;
+            }
+            if sql_text::starts_with_keyword_token(&trimmed_upper, "FORALL") {
+                forall_body_frame = Some(ForallBodyDepthFrame {
+                    owner_depth: context.auto_depth,
+                });
+            }
 
             if trimmed.ends_with(';') {
                 query_frames.pop();
@@ -2273,6 +2353,8 @@ impl QueryExecutor {
                 pending_partial_multiline_clause_owner = None;
                 pending_line_continuation = None;
                 pending_inline_comment_line_continuation = None;
+                trigger_header_frame = None;
+                forall_body_frame = None;
             }
 
             contexts.push(context);
@@ -2354,6 +2436,10 @@ impl QueryExecutor {
             Some(AutoFormatClauseKind::Pivot)
         } else if sql_text::starts_with_keyword_token(trimmed_upper, "UNPIVOT") {
             Some(AutoFormatClauseKind::Unpivot)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "SEARCH") {
+            Some(AutoFormatClauseKind::Search)
+        } else if sql_text::starts_with_keyword_token(trimmed_upper, "CYCLE") {
+            Some(AutoFormatClauseKind::Cycle)
         } else {
             None
         }
@@ -2658,9 +2744,14 @@ impl QueryExecutor {
             idx += 1;
         }
 
+        let leading_close_condition_continuation = saw_leading_close_paren
+            && Self::auto_format_is_query_condition_continuation_clause(
+                &sql_text::trim_after_leading_close_parens(line).to_ascii_uppercase(),
+            );
+
         if annotation.role == AutoFormatConditionRole::None && annotation.header_line_idx.is_some()
         {
-            annotation.role = if saw_leading_close_paren {
+            annotation.role = if saw_leading_close_paren && !leading_close_condition_continuation {
                 AutoFormatConditionRole::Closer
             } else {
                 AutoFormatConditionRole::Continuation
@@ -3046,17 +3137,18 @@ impl QueryExecutor {
         }
 
         let trimmed_upper = trimmed.to_ascii_uppercase();
+        // Shared query/multiline/PLSQL owner taxonomy must stay aligned with
+        // sql_text. Pure generic-expression owners such as `MULTISET` are
+        // intentionally excluded here because a caller may still need to carry
+        // operator/comment continuation depth onto that RHS line, while real
+        // split PL/SQL child-query headers such as bare `CURSOR` still remain
+        // structural boundaries through the shared helper.
         Self::auto_format_clause_kind(&trimmed_upper).is_some()
             || Self::auto_format_is_join_clause(&trimmed_upper)
             || Self::auto_format_is_join_condition_clause(&trimmed_upper)
             || Self::auto_format_is_for_update_clause(&trimmed_upper)
-            || sql_text::format_query_owner_header_kind(trimmed).is_some()
-            || sql_text::format_query_owner_pending_header_kind(trimmed).is_some()
-            || sql_text::format_indented_paren_owner_header_kind(trimmed).is_some()
-            || sql_text::format_indented_paren_pending_header_kind(trimmed).is_some()
+            || sql_text::starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
             || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
-            || sql_text::format_plsql_child_query_owner_kind(&trimmed_upper).is_some()
-            || sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed).is_some()
     }
 
     fn line_continuation_for_line(
@@ -3157,6 +3249,8 @@ impl QueryExecutor {
                     | AutoFormatClauseKind::Limit
                     | AutoFormatClauseKind::Returning
                     | AutoFormatClauseKind::Qualify
+                    | AutoFormatClauseKind::Search
+                    | AutoFormatClauseKind::Cycle
             )
         )
     }
@@ -7966,6 +8060,108 @@ FROM dual;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_trigger_header_body_uses_structural_owner_depth() {
+        let sql = r#"CREATE OR REPLACE TRIGGER trg_emp_audit
+BEFORE INSERT OR UPDATE
+ON emp
+FOR EACH ROW
+WHEN (NEW.sal > 0)
+BEGIN
+    :NEW.updated_at := SYSTIMESTAMP;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |prefix: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or(0)
+        };
+
+        let create_idx = find_line("CREATE OR REPLACE TRIGGER");
+        let before_idx = find_line("BEFORE INSERT OR UPDATE");
+        let on_idx = find_line("ON emp");
+        let for_each_idx = find_line("FOR EACH ROW");
+        let when_idx = find_line("WHEN (NEW.sal > 0)");
+        let begin_idx = find_line("BEGIN");
+        let assign_idx = find_line(":NEW.updated_at := SYSTIMESTAMP;");
+
+        assert_eq!(
+            contexts[before_idx].auto_depth,
+            contexts[create_idx].auto_depth.saturating_add(1),
+            "trigger header body lines should indent one level deeper than CREATE TRIGGER"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth, contexts[before_idx].auto_depth,
+            "ON line should stay on the trigger header body depth"
+        );
+        assert_eq!(
+            contexts[for_each_idx].auto_depth, contexts[before_idx].auto_depth,
+            "FOR EACH ROW should stay on the trigger header body depth"
+        );
+        assert_eq!(
+            contexts[when_idx].auto_depth, contexts[before_idx].auto_depth,
+            "WHEN header should stay on the trigger header body depth"
+        );
+        assert_eq!(
+            contexts[begin_idx].auto_depth, contexts[create_idx].auto_depth,
+            "BEGIN should close the trigger header owner and return to the trigger base depth"
+        );
+        assert_eq!(
+            contexts[assign_idx].auto_depth,
+            contexts[begin_idx].auto_depth.saturating_add(1),
+            "trigger body statements should indent one level deeper than BEGIN"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_forall_body_uses_structural_owner_depth() {
+        let sql = r#"BEGIN
+    IF v_ready THEN
+        FORALL i IN 1..v_ids.COUNT
+            UPDATE emp
+            SET sal = v_sals(i)
+            WHERE empno = v_ids(i);
+    END IF;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |prefix: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or(0)
+        };
+
+        let if_idx = find_line("IF v_ready THEN");
+        let forall_idx = find_line("FORALL i IN 1..v_ids.COUNT");
+        let update_idx = find_line("UPDATE emp");
+        let set_idx = find_line("SET sal = v_sals(i)");
+        let where_idx = find_line("WHERE empno = v_ids(i);");
+
+        assert_eq!(
+            contexts[forall_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "FORALL should open one structural body level under the IF body"
+        );
+        assert_eq!(
+            contexts[update_idx].auto_depth,
+            contexts[forall_idx].auto_depth.saturating_add(1),
+            "FORALL DML body should start one level deeper than the FORALL owner"
+        );
+        assert_eq!(
+            contexts[set_idx].auto_depth, contexts[update_idx].auto_depth,
+            "SET should stay on the UPDATE query base depth inside FORALL"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, contexts[update_idx].auto_depth,
+            "WHERE should stay on the UPDATE query base depth inside FORALL"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_recursive_cte_set_operator_select_on_cte_body_base() {
         let sql = r#"WITH r (node_id, parent_id, node_name, lvl, PATH) AS (
     SELECT
@@ -8085,6 +8281,68 @@ FROM src;"#;
             contexts[second_select_idx].query_base_depth,
             contexts[first_select_idx].query_base_depth,
             "The second SELECT in a plain CTE compound query should keep the same query base depth as the first SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_recursive_cte_search_cycle_as_stable_query_base_clauses() {
+        let sql = r#"WITH r (n) AS (
+    SELECT 1
+    FROM dual
+    UNION ALL
+    SELECT n + 1
+    FROM r
+    WHERE n < 3
+)
+                SEARCH DEPTH FIRST BY n SET ord
+                CYCLE n SET is_cycle TO 'Y' DEFAULT 'N'
+SELECT n, ord, is_cycle
+FROM r;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH r"))
+            .unwrap_or(0);
+        let search_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SEARCH"))
+            .unwrap_or(0);
+        let cycle_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("CYCLE"))
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cycle_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[search_idx].auto_depth,
+            contexts[with_idx].auto_depth,
+            "SEARCH clause should reuse the recursive WITH query-base depth instead of preserving manual overindent"
+        );
+        assert_eq!(
+            contexts[cycle_idx].auto_depth,
+            contexts[with_idx].auto_depth,
+            "CYCLE clause should reuse the recursive WITH query-base depth instead of preserving manual overindent"
+        );
+        assert_eq!(
+            contexts[search_idx].query_base_depth, contexts[with_idx].query_base_depth,
+            "SEARCH clause should stay attached to the active recursive WITH query frame"
+        );
+        assert_eq!(
+            contexts[cycle_idx].query_base_depth, contexts[with_idx].query_base_depth,
+            "CYCLE clause should stay attached to the active recursive WITH query frame"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[with_idx].auto_depth,
+            "Main SELECT after SEARCH/CYCLE should still return to the recursive WITH query-base depth"
         );
     }
 
@@ -8779,7 +9037,7 @@ FROM emp_data x;"#;
     }
 
     #[test]
-    fn auto_format_line_contexts_keep_split_exists_open_paren_on_condition_owner_base() {
+    fn auto_format_line_contexts_keep_split_exists_open_paren_on_condition_owner_depth() {
         let sql = r#"SELECT e.empno
 FROM emp e
 WHERE EXISTS
@@ -8818,16 +9076,14 @@ AND e.status = 'A';"#;
                 contexts[exists_idx].query_base_depth,
             )
             .saturating_add(1);
-        let expected_owner_base_depth = sql_text::FormatQueryOwnerKind::Condition
-            .auto_format_child_query_owner_base_depth(
-                contexts[exists_idx].auto_depth,
-                contexts[exists_idx].query_base_depth,
-            );
-
         assert_eq!(
             contexts[open_idx].next_query_head_depth,
             Some(expected_select_depth),
             "standalone open paren after WHERE EXISTS should preserve the owner's promoted child-query head depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[exists_idx].auto_depth,
+            "standalone open paren after WHERE EXISTS should stay on the completed owner depth"
         );
         assert_eq!(
             contexts[select_idx].auto_depth, expected_select_depth,
@@ -8839,8 +9095,8 @@ AND e.status = 'A';"#;
             "AND after split EXISTS subquery should return to the outer condition continuation depth"
         );
         assert_eq!(
-            contexts[close_idx].auto_depth, expected_owner_base_depth,
-            "split EXISTS closing paren should stay on the promoted owner base depth"
+            contexts[close_idx].auto_depth, contexts[exists_idx].auto_depth,
+            "split EXISTS closing paren should stay on the completed owner depth"
         );
     }
 
@@ -9135,36 +9391,25 @@ AND d.status = 'A';"#;
             .iter()
             .position(|line| line.trim_start() == "AND d.status = 'A';")
             .unwrap_or(0);
-        let outer_owner_base_depth = sql_text::FormatQueryOwnerKind::Condition
-            .auto_format_child_query_owner_base_depth(
-                contexts[outer_exists_idx].auto_depth,
-                contexts[outer_exists_idx].query_base_depth,
-            );
-        let inner_owner_base_depth = sql_text::FormatQueryOwnerKind::Condition
-            .auto_format_child_query_owner_base_depth(
-                contexts[inner_exists_idx].auto_depth,
-                contexts[inner_exists_idx].query_base_depth,
-            );
-
         assert_eq!(
-            contexts[open_indices[0]].auto_depth, outer_owner_base_depth,
-            "outer split EXISTS opener should stay aligned with the outer owner base depth"
+            contexts[open_indices[0]].auto_depth, contexts[outer_exists_idx].auto_depth,
+            "outer split EXISTS opener should stay aligned with the outer owner depth"
         );
         assert_eq!(
-            contexts[open_indices[1]].auto_depth, inner_owner_base_depth,
-            "inner split EXISTS opener should stay aligned with the inner owner base depth"
+            contexts[open_indices[1]].auto_depth, contexts[inner_exists_idx].auto_depth,
+            "inner split EXISTS opener should stay aligned with the inner owner depth"
         );
         assert!(
             contexts[inner_select_idx].auto_depth > contexts[open_indices[1]].auto_depth,
             "inner split EXISTS child SELECT should stay deeper than the standalone opener"
         );
         assert_eq!(
-            contexts[close_indices[0]].auto_depth, inner_owner_base_depth,
-            "inner split EXISTS closer should stay on the inner owner base depth"
+            contexts[close_indices[0]].auto_depth, contexts[inner_exists_idx].auto_depth,
+            "inner split EXISTS closer should stay on the inner owner depth"
         );
         assert_eq!(
-            contexts[close_indices[1]].auto_depth, outer_owner_base_depth,
-            "outer split EXISTS closer should stay on the outer owner base depth"
+            contexts[close_indices[1]].auto_depth, contexts[outer_exists_idx].auto_depth,
+            "outer split EXISTS closer should stay on the outer owner depth"
         );
         assert_eq!(
             contexts[inner_and_idx].auto_depth,
@@ -9482,12 +9727,12 @@ WHERE d.deptno IN (
                 );
 
             assert_eq!(
-                contexts[outer_open_idx].auto_depth, outer_owner_base_depth,
-                "split {keyword} opener should stay aligned with the outer promoted owner base depth"
+                contexts[outer_open_idx].auto_depth, contexts[outer_owner_idx].auto_depth,
+                "split {keyword} opener should stay aligned with the outer owner depth"
             );
             assert_eq!(
-                contexts[inner_open_idx].auto_depth, inner_owner_base_depth,
-                "nested split {keyword} opener should stay aligned with the inner promoted owner base depth"
+                contexts[inner_open_idx].auto_depth, contexts[inner_owner_idx].auto_depth,
+                "nested split {keyword} opener should stay aligned with the inner owner depth"
             );
             assert_eq!(
                 contexts[inner_select_idx].auto_depth,
@@ -9500,12 +9745,12 @@ WHERE d.deptno IN (
                 "grandchild SELECT under split inner {keyword} should be one level deeper than the inner promoted owner base depth"
             );
             assert_eq!(
-                contexts[inner_close_idx].auto_depth, inner_owner_base_depth,
-                "nested split {keyword} closer should realign with the inner promoted owner base depth"
+                contexts[inner_close_idx].auto_depth, contexts[inner_owner_idx].auto_depth,
+                "nested split {keyword} closer should realign with the inner owner depth"
             );
             assert_eq!(
-                contexts[outer_close_idx].auto_depth, outer_owner_base_depth,
-                "split outer {keyword} closer should realign with the outer promoted owner base depth"
+                contexts[outer_close_idx].auto_depth, contexts[outer_owner_idx].auto_depth,
+                "split outer {keyword} closer should realign with the outer owner depth"
             );
             assert_eq!(
                 contexts[inner_and_idx].auto_depth,
@@ -10022,6 +10267,98 @@ END;"#;
         assert_eq!(
             contexts[from_idx].query_base_depth, contexts[select_idx].query_base_depth,
             "FROM under split CURSOR ... IS should keep the same query base as its SELECT head"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_open_owner_fragments_on_owner_depth() {
+        let sql = r#"BEGIN
+OPEN
+c_emp
+FOR
+SELECT empno
+FROM emp;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OPEN")
+            .unwrap_or(0);
+        let cursor_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "c_emp")
+            .unwrap_or(0);
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FOR")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cursor_idx].auto_depth, contexts[open_idx].auto_depth,
+            "split OPEN cursor-name fragment should stay aligned with the OPEN owner depth"
+        );
+        assert_eq!(
+            contexts[for_idx].auto_depth, contexts[open_idx].auto_depth,
+            "split FOR line should stay aligned with the OPEN owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[for_idx].auto_depth.saturating_add(1),
+            "SELECT after split OPEN ... FOR should stay one level deeper than the completed owner"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_cursor_owner_name_fragment_on_owner_depth() {
+        let sql = r#"DECLARE
+CURSOR
+c_emp
+IS
+SELECT empno
+FROM emp;
+BEGIN
+NULL;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let cursor_header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CURSOR")
+            .unwrap_or(0);
+        let cursor_name_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "c_emp")
+            .unwrap_or(0);
+        let is_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IS")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cursor_name_idx].auto_depth, contexts[cursor_header_idx].auto_depth,
+            "split CURSOR name fragment should stay aligned with the CURSOR owner depth"
+        );
+        assert_eq!(
+            contexts[is_idx].auto_depth, contexts[cursor_header_idx].auto_depth,
+            "split IS line should stay aligned with the CURSOR owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[is_idx].auto_depth.saturating_add(1),
+            "SELECT after split CURSOR ... IS should stay one level deeper than the completed owner"
         );
     }
 
@@ -11249,6 +11586,134 @@ FROM dual;"#;
             contexts[close_then_idx].condition_role,
             AutoFormatConditionRole::Closer,
             "outer close-paren THEN line should still be treated as the condition closer"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_same_line_close_and_condition_keyword_as_continuation() {
+        let sql = r#"BEGIN
+    IF (
+        v_ready = 'Y'
+    ) AND v_dept = 10 THEN
+        NULL;
+    END IF;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF (")
+            .unwrap_or(0);
+        let close_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") AND v_dept = 10 THEN")
+            .unwrap_or(0);
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_and_idx].condition_role,
+            AutoFormatConditionRole::Continuation,
+            "same-line `) AND ...` under IF should continue the condition instead of becoming a pure closer"
+        );
+        assert_eq!(
+            contexts[close_and_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "same-line `) AND ...` should stay on the IF condition continuation depth"
+        );
+        assert_eq!(
+            contexts[null_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "the THEN body should still open exactly one level deeper than the IF owner"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_query_same_line_close_and_condition_keyword_as_continuation()
+    {
+        let sql = r#"SELECT o.id
+FROM outer_t o
+WHERE EXISTS (
+    SELECT 1
+    FROM inner_t i
+    WHERE i.outer_id = o.id
+) AND EXISTS (
+    SELECT 1
+    FROM bonus b
+    WHERE b.outer_id = o.id
+);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let where_exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE EXISTS (")
+            .unwrap_or(0);
+        let same_line_and_exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") AND EXISTS (")
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(same_line_and_exists_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[same_line_and_exists_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "same-line `) AND EXISTS (` should keep the outer WHERE continuation role"
+        );
+        assert_eq!(
+            contexts[same_line_and_exists_idx].auto_depth,
+            contexts[where_exists_idx].auto_depth.saturating_add(1),
+            "same-line `) AND EXISTS (` should stay on the outer WHERE continuation depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].query_base_depth,
+            Some(contexts[same_line_and_exists_idx].auto_depth.saturating_add(1)),
+            "child SELECT after same-line `) AND EXISTS (` should anchor from the continued owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_same_line_close_and_order_by_as_outer_clause_base() {
+        let sql = r#"SELECT empno
+FROM emp
+WHERE deptno IN (
+    SELECT deptno
+    FROM dept
+) ORDER BY empno;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let order_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") ORDER BY empno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[order_by_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "same-line `) ORDER BY ...` should re-enter the outer query clause stack"
+        );
+        assert_eq!(
+            contexts[order_by_idx].query_base_depth,
+            Some(contexts[select_idx].auto_depth),
+            "same-line `) ORDER BY ...` should keep the outer query base depth"
+        );
+        assert_eq!(
+            contexts[order_by_idx].auto_depth, contexts[select_idx].auto_depth,
+            "same-line `) ORDER BY ...` should align with the outer query base depth"
         );
     }
 

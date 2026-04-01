@@ -4868,9 +4868,7 @@ impl SqlEditorWidget {
 
         for ch in text.chars() {
             if ch == '\t' {
-                let spaces = tab_stop
-                    .saturating_sub(safe_rem(col, tab_stop))
-                    .max(1);
+                let spaces = tab_stop.saturating_sub(safe_rem(col, tab_stop)).max(1);
                 for _ in 0..spaces {
                     out.push(' ');
                 }

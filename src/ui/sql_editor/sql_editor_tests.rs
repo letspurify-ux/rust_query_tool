@@ -4933,7 +4933,7 @@ SELECT
     ROW_NUMBER () OVER (
         PARTITION BY deptno
         ORDER BY hiredate,
-            empno
+        empno
     ) AS rn,
     SUM (sal) OVER (
         PARTITION BY deptno
