@@ -388,6 +388,7 @@ struct PendingPartialQueryOwnerFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingPlsqlChildQueryOwnerFrame {
     kind: sql_text::PendingFormatPlsqlChildQueryOwnerHeaderKind,
+    owner_align_depth: usize,
     owner_base_depth: usize,
     next_query_head_depth: usize,
     nested_paren_depth: usize,
@@ -2075,7 +2076,7 @@ impl QueryExecutor {
                 if frame.kind.line_can_continue(trimmed) {
                     if frame.kind.line_completes(trimmed) && nested_paren_depth_after_line == 0 {
                         completed_plsql_child_query_owner = Some(PendingSplitQueryOwnerFrame {
-                            owner_align_depth: frame.owner_base_depth,
+                            owner_align_depth: frame.owner_align_depth,
                             owner_base_depth: frame.owner_base_depth,
                             next_query_head_depth: frame.next_query_head_depth,
                         });
@@ -2083,6 +2084,7 @@ impl QueryExecutor {
                         continued_plsql_child_query_owner =
                             Some(PendingPlsqlChildQueryOwnerFrame {
                                 kind: frame.kind,
+                                owner_align_depth: frame.owner_align_depth,
                                 owner_base_depth: frame.owner_base_depth,
                                 next_query_head_depth: frame.next_query_head_depth,
                                 nested_paren_depth: nested_paren_depth_after_line,
@@ -2293,6 +2295,7 @@ impl QueryExecutor {
                     sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed).map(
                         |kind| PendingPlsqlChildQueryOwnerFrame {
                             kind,
+                            owner_align_depth: context.auto_depth,
                             owner_base_depth: context.auto_depth,
                             next_query_head_depth: context.auto_depth.saturating_add(1),
                             nested_paren_depth:
@@ -3132,7 +3135,7 @@ impl QueryExecutor {
             || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
             || sql_text::line_has_leading_significant_close_paren(trimmed);
 
-        aligns_owner_boundary.then_some(frame.owner_base_depth)
+        aligns_owner_boundary.then_some(frame.owner_align_depth)
     }
 
     fn pending_query_owner_base_depth(

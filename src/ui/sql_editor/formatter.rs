@@ -5426,48 +5426,6 @@ impl SqlEditorWidget {
         (previous_code_indices, next_code_indices)
     }
 
-    fn line_layout_preceding_comment_or_comma_run_has_comma(
-        layouts: &[LineLayout<'_>],
-        idx: usize,
-    ) -> bool {
-        let mut scan_idx = idx;
-        let mut saw_comma = false;
-
-        while scan_idx > 0 {
-            scan_idx = scan_idx.saturating_sub(1);
-            match layouts[scan_idx].kind {
-                LineLayoutKind::CommentOnly => continue,
-                LineLayoutKind::CommaOnly => {
-                    saw_comma = true;
-                }
-                LineLayoutKind::Blank | LineLayoutKind::Verbatim | LineLayoutKind::Code => break,
-            }
-        }
-
-        saw_comma
-    }
-
-    fn previous_dml_clause_starter_depth(
-        layouts: &[LineLayout<'_>],
-        idx: usize,
-        target_depth: usize,
-    ) -> Option<usize> {
-        for prev_idx in (0..idx).rev() {
-            if layouts[prev_idx].kind != LineLayoutKind::Code {
-                continue;
-            }
-
-            let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-            if Self::is_dml_clause_starter(&prev_upper)
-                && layouts[prev_idx].final_depth == target_depth
-            {
-                return Some(target_depth);
-            }
-        }
-
-        None
-    }
-
     fn parenthesized_condition_header_depth(
         layouts: &[LineLayout<'_>],
         idx: usize,
@@ -5666,18 +5624,42 @@ impl SqlEditorWidget {
 
     fn structural_next_query_head_depth(
         layout: &LineLayout<'_>,
+        line_semantic: AutoFormatLineSemantic,
         query_owner_kind: Option<FormatQueryOwnerKind>,
         resolved_query_base_depth: Option<usize>,
         current_condition_header_depth: Option<usize>,
+        current_general_paren_frame_count: usize,
     ) -> Option<usize> {
         if !Self::line_ends_with_open_paren_before_inline_comment(layout.trimmed) {
             return None;
         }
 
         if query_owner_kind == Some(FormatQueryOwnerKind::Condition) {
-            if let Some(header_depth) = current_condition_header_depth {
-                return Some(header_depth.saturating_add(1));
-            }
+            let condition_head_depth = resolved_query_base_depth
+                .or(layout.query_base_depth)
+                .map(|query_base_depth| {
+                    let extra_depth = usize::from(!line_semantic.is_condition_continuation());
+                    query_base_depth
+                        .saturating_add(1)
+                        .saturating_add(extra_depth)
+                })
+                .or_else(|| {
+                    current_condition_header_depth
+                        .map(|header_depth| header_depth.saturating_add(1))
+                });
+            let owner_relative_depth = layout.final_depth.saturating_add(1);
+            let uses_owner_relative_condition_floor = line_semantic.is_condition_continuation()
+                && current_general_paren_frame_count == 0
+                && current_condition_header_depth.is_none();
+            return Some(
+                if uses_owner_relative_condition_floor {
+                    condition_head_depth
+                        .map(|depth| depth.max(owner_relative_depth))
+                        .unwrap_or(owner_relative_depth)
+                } else {
+                    condition_head_depth.unwrap_or(owner_relative_depth)
+                },
+            );
         }
 
         query_owner_kind
@@ -5748,6 +5730,23 @@ impl SqlEditorWidget {
         Some(base_condition_depth.saturating_add(current_general_paren_frame_count))
     }
 
+    fn active_query_condition_continuation_depth(
+        query_condition_depth: usize,
+        current_general_paren_frame_count: usize,
+        join_on_condition_and_depth: &[(usize, usize)],
+    ) -> usize {
+        let base_condition_depth = join_on_condition_and_depth
+            .last()
+            .map(|(join_and_depth, _)| (*join_and_depth).max(query_condition_depth))
+            .unwrap_or(query_condition_depth);
+
+        Self::general_paren_condition_continuation_depth(
+            base_condition_depth,
+            current_general_paren_frame_count,
+        )
+        .unwrap_or(base_condition_depth)
+    }
+
     fn query_condition_body_depth(
         resolved_query_base_depth: Option<usize>,
         parser_depth: usize,
@@ -5755,15 +5754,6 @@ impl SqlEditorWidget {
         resolved_query_base_depth
             .unwrap_or(parser_depth)
             .saturating_add(1)
-    }
-
-    fn query_list_continuation_depth(
-        query_list_body_depth_floor: Option<usize>,
-        analyzer_query_depth: usize,
-    ) -> usize {
-        query_list_body_depth_floor
-            .unwrap_or(analyzer_query_depth)
-            .max(analyzer_query_depth)
     }
 
     fn normalized_general_paren_body_depth(
@@ -5972,6 +5962,71 @@ impl SqlEditorWidget {
             .unwrap_or(line_depth)
     }
 
+    fn structural_header_continuation_depth(
+        line: &str,
+        line_depth: usize,
+        resolved_query_base_depth: Option<usize>,
+        query_base_depth: Option<usize>,
+    ) -> Option<usize> {
+        let query_base_depth = resolved_query_base_depth.or(query_base_depth);
+
+        sql_text::format_leading_header_continuation_kind(line).map(|kind| match kind {
+            sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => line_depth,
+            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                query_base_depth.unwrap_or(line_depth).saturating_add(1)
+            }
+            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                line_depth.saturating_add(1)
+            }
+        })
+    }
+
+    fn control_branch_body_depth(
+        line_depth: usize,
+        parenthesized_condition_header_depth: Option<usize>,
+        line_is_parenthesized_condition_header: bool,
+    ) -> usize {
+        let owner_depth = if line_is_parenthesized_condition_header {
+            line_depth
+        } else {
+            parenthesized_condition_header_depth.unwrap_or(line_depth)
+        };
+        owner_depth
+            .saturating_add(1)
+    }
+
+    fn line_starts_structural_continuation_boundary(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let trimmed_upper = trimmed.to_ascii_uppercase();
+        Self::is_dml_clause_starter(&trimmed_upper)
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+            || sql_text::starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
+            || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
+    }
+
+    fn structural_list_continuation_depth(
+        line: &str,
+        line_depth: usize,
+        stable_list_depth: Option<usize>,
+        carried_depth: Option<usize>,
+        header_continuation_depth: Option<usize>,
+    ) -> Option<usize> {
+        let ends_with_trailing_comma =
+            Self::line_ends_with_comma_before_inline_comment(line) || line.trim_end().ends_with(',');
+        if !ends_with_trailing_comma {
+            return None;
+        }
+
+        header_continuation_depth
+            .or(stable_list_depth)
+            .or(carried_depth)
+            .or(Some(line_depth))
+    }
+
     fn line_starts_structural_operator_rhs(line: &str, next_code_trimmed: Option<&str>) -> bool {
         // Keep operator-RHS continuation boundaries on the same shared
         // structural taxonomy as the analyzer. Generic expression owners such
@@ -6161,6 +6216,10 @@ impl SqlEditorWidget {
         let mut trigger_header_frame: Option<TriggerHeaderLayoutFrame> = None;
         // FORALL body owner frame: tracks FORALL → end-of-DML-body scope.
         let mut forall_body_frame: Option<ForallBodyLayoutFrame> = None;
+        // Keeps clause/list/body continuation on explicit structural depth
+        // instead of reconstructing it from previous-line shape heuristics.
+        let mut active_structural_continuation_depth: Option<usize> = None;
+        let mut pending_control_branch_body_depth: Option<usize> = None;
 
         for idx in 0..layouts.len() {
             if layouts[idx].kind != LineLayoutKind::Code {
@@ -6172,6 +6231,9 @@ impl SqlEditorWidget {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
+            let incoming_structural_continuation_depth = active_structural_continuation_depth;
+            let pending_control_branch_body_depth_for_line =
+                pending_control_branch_body_depth.take();
 
             Self::pop_expired_owner_relative_layout_frames(
                 &mut owner_relative_frames,
@@ -6198,9 +6260,6 @@ impl SqlEditorWidget {
 
             let previous_line_ends_with_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
-            });
-            let previous_line_is_cte_definition_header = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_is_cte_definition_header(layouts[prev_idx].trimmed)
             });
             let previous_line_is_standalone_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_is_standalone_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
@@ -6231,8 +6290,6 @@ impl SqlEditorWidget {
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
-            let starts_subquery_head =
-                starts_dml || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH");
             if starts_dml {
                 in_dml_statement = true;
             }
@@ -6254,39 +6311,12 @@ impl SqlEditorWidget {
                 last_code_idx.is_some_and(|prev_idx| {
                     Self::line_has_inline_comment_after_case_terminator(layouts[prev_idx].trimmed)
                 });
-            let previous_line_starts_with_using_clause = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
-            });
             let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
                     || layouts[prev_idx].trimmed.trim_end().ends_with(',')
             });
-            let previous_line_is_close_paren_with_trailing_comma =
-                last_code_idx.is_some_and(|prev_idx| {
-                    layouts[prev_idx].has_leading_close_paren
-                        && (Self::line_ends_with_comma_before_inline_comment(
-                            layouts[prev_idx].trimmed,
-                        ) || layouts[prev_idx].trimmed.trim_end().ends_with(','))
-                });
             let previous_line_ends_with_then = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_then_before_inline_comment(layouts[prev_idx].trimmed)
-            });
-            let previous_line_is_dml_clause_line = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                Self::is_dml_clause_starter(&prev_upper)
-                    || crate::sql_text::starts_with_keyword_token(&prev_upper, "INTO")
-            });
-            let previous_line_is_dml_clause_starter = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                Self::is_dml_clause_starter(&prev_upper)
-            });
-            let previous_line_is_select_header = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                crate::sql_text::starts_with_keyword_token(&prev_upper, "SELECT")
-            });
-            let previous_line_is_order_by_clause = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                prev_upper.starts_with("ORDER BY")
             });
             let previous_code_is_cursor_header = last_code_idx.is_some_and(|prev_idx| {
                 let cursor_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
@@ -6295,22 +6325,6 @@ impl SqlEditorWidget {
                     Some(crate::sql_text::FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
                 )
             });
-            let previous_select_follows_cursor_header = last_code_idx
-                .and_then(|prev_idx| previous_code_indices.get(prev_idx).copied().flatten())
-                .is_some_and(|cursor_idx| {
-                    let cursor_upper = layouts[cursor_idx].trimmed.to_ascii_uppercase();
-                    matches!(
-                        crate::sql_text::format_plsql_child_query_owner_kind(&cursor_upper),
-                        Some(crate::sql_text::FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
-                    )
-                });
-            let previous_line_has_trailing_unclosed_case = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_has_trailing_unclosed_case(layouts[prev_idx].trimmed)
-            });
-            let previous_line_is_case_header = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                crate::sql_text::starts_with_keyword_token(&prev_upper, "CASE")
-            });
             let previous_line_is_else = last_code_idx.is_some_and(|prev_idx| {
                 layouts[prev_idx]
                     .trimmed
@@ -6318,24 +6332,61 @@ impl SqlEditorWidget {
                     .trim()
                     .eq("ELSE")
             });
-            let previous_line_has_unclosed_open_paren = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_has_unclosed_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
-            });
+            let control_branch_body_depth_for_line = pending_control_branch_body_depth_for_line
+                .or_else(|| {
+                    last_code_idx.and_then(|prev_idx| {
+                        let previous_trimmed_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                        if Self::line_ends_with_then_before_inline_comment(layouts[prev_idx].trimmed)
+                            || previous_trimmed_upper.trim() == "ELSE"
+                            || previous_trimmed_upper.trim() == "EXCEPTION"
+                        {
+                            Some(Self::control_branch_body_depth(
+                                layouts[prev_idx].final_depth,
+                                Self::parenthesized_condition_header_depth(layouts, prev_idx),
+                                layouts[prev_idx].condition_role
+                                    == AutoFormatConditionRole::Header,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                });
             let previous_line_is_forall_header = last_code_idx.is_some_and(|prev_idx| {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "FORALL")
             });
-            let previous_line_is_condition_keyword = last_code_idx.is_some_and(|prev_idx| {
-                layouts[prev_idx].line_semantic.is_condition_continuation()
-            });
-            let previous_line_is_join_condition_clause = last_code_idx
-                .is_some_and(|prev_idx| layouts[prev_idx].line_semantic.is_join_condition_clause());
-            let previous_code_is_inline_merge_update_set = last_code_idx.is_some_and(|prev_idx| {
-                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
-                prev_upper.starts_with("UPDATE SET ") || prev_upper.eq("UPDATE SET")
-            });
             let previous_line_starts_with_close_paren =
                 last_code_idx.is_some_and(|prev_idx| layouts[prev_idx].has_leading_close_paren);
+            let previous_line_is_query_owner_open_paren = last_code_idx.is_some_and(|prev_idx| {
+                previous_line_ends_with_open_paren
+                    && crate::sql_text::format_query_owner_kind(layouts[prev_idx].trimmed)
+                        .is_some()
+            });
+            let previous_line_is_query_owner_standalone_open_paren =
+                last_code_idx.is_some_and(|prev_idx| {
+                    if !Self::line_is_standalone_open_paren_before_inline_comment(
+                        layouts[prev_idx].trimmed,
+                    ) {
+                        return false;
+                    }
+
+                    previous_code_indices
+                        .get(prev_idx)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|owner_idx| {
+                            crate::sql_text::format_query_owner_header_kind(
+                                layouts[owner_idx].trimmed,
+                            )
+                            .is_some()
+                                || Self::split_query_owner_lookahead_kind(
+                                    layouts,
+                                    owner_idx,
+                                    next_code_indices,
+                                )
+                                .is_some()
+                        })
+                });
             let next_code_trimmed =
                 next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
             let next_next_code_trimmed = next_code_indices[idx]
@@ -6436,33 +6487,8 @@ impl SqlEditorWidget {
             let paren_case_base_depth = parser_depth;
             let parser_depth = parser_depth + usize::from(is_paren_case_closer);
             let last_code_depth = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
-            let follows_comma_run =
-                Self::line_layout_preceding_comment_or_comma_run_has_comma(layouts, idx);
             let current_line_starts_case =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
-            let current_line_starts_dml_case_expression = in_dml_statement
-                && current_line_starts_case
-                && !previous_line_ends_with_then
-                && !previous_line_is_else
-                && previous_line_has_unclosed_open_paren
-                && !previous_line_is_standalone_open_paren;
-            let current_line_dml_case_expression_owner_depth =
-                if current_line_starts_dml_case_expression {
-                    // CASE inside a parenthesized DML expression inherits the
-                    // line that opened the still-active `(`. The CASE body is
-                    // rendered one level deeper than that owner line.
-                    last_code_depth
-                } else {
-                    None
-                };
-            let current_line_dml_case_expression_close_owner_depth =
-                if current_line_starts_dml_case_expression {
-                    last_code_idx
-                        .and_then(|prev_idx| layouts[prev_idx].dml_case_expression_close_depth)
-                        .or(last_code_depth)
-                } else {
-                    None
-                };
             let current_line_is_condition_keyword =
                 layouts[idx].line_semantic.is_condition_continuation();
             let current_line_is_join_condition_clause =
@@ -6510,6 +6536,10 @@ impl SqlEditorWidget {
                 current_line_multiline_clause_owner_kind.is_some();
             let active_owner_relative_frame =
                 Self::active_owner_relative_layout_frame(&owner_relative_frames);
+            let current_line_is_pending_partial_multiline_owner =
+                sql_text::format_indented_paren_pending_header_kind(trimmed).is_some();
+            let current_line_is_pending_partial_query_owner =
+                sql_text::format_query_owner_pending_header_kind(trimmed).is_some();
             let owner_relative_body_header_depth_for_line =
                 active_owner_relative_frame.and_then(|frame| {
                     frame.formatter_body_header_depth(&owner_relative_detection_upper)
@@ -6537,15 +6567,28 @@ impl SqlEditorWidget {
                 .rev()
                 .find(|frame| frame.kind == ParenLayoutFrameKind::General)
                 .copied();
+            let current_line_starts_dml_case_expression = in_dml_statement
+                && current_line_starts_case
+                && !previous_line_ends_with_then
+                && !previous_line_is_else
+                && active_general_paren_frame.is_some();
+            let current_line_dml_case_expression_owner_depth =
+                if current_line_starts_dml_case_expression {
+                    // CASE inside a parenthesized DML expression must stay
+                    // attached to the active `(` owner frame rather than
+                    // reconstructing depth from the previous rendered line.
+                    active_general_paren_frame.map(|frame| frame.owner_depth)
+                } else {
+                    None
+                };
+            let current_line_dml_case_expression_close_owner_depth =
+                if current_line_starts_dml_case_expression {
+                    active_general_paren_frame.map(|frame| frame.owner_depth)
+                } else {
+                    None
+                };
             let active_match_recognize_clause = active_owner_relative_frame
                 .is_some_and(OwnerRelativeLayoutFrame::is_match_recognize);
-            let previous_line_is_match_recognize_order_by = active_match_recognize_clause
-                && last_code_idx.is_some_and(|prev_idx| {
-                    layouts[prev_idx]
-                        .trimmed
-                        .to_ascii_uppercase()
-                        .starts_with("ORDER BY")
-                });
             let current_line_is_match_recognize_subclause = active_match_recognize_clause
                 && sql_text::starts_with_format_match_recognize_subclause(
                     &owner_relative_detection_upper,
@@ -6554,9 +6597,6 @@ impl SqlEditorWidget {
                 .iter()
                 .filter(|frame| frame.kind == ParenLayoutFrameKind::General)
                 .count();
-            let current_line_starts_condition_after_leading_close = starts_with_close_paren
-                && leading_close_continues_expression
-                && layouts[idx].line_semantic.is_condition_continuation();
             let paren_case_close_frame_depth = last_popped_general_paren_frame.map(|frame| {
                 let preferred_close_depth = if in_dml_statement
                     || layouts[idx].query_base_depth.is_some()
@@ -6585,6 +6625,39 @@ impl SqlEditorWidget {
                 && !current_line_is_match_recognize_subclause
                 && !previous_line_is_forall_header
                 && !use_cursor_parser_depth;
+            let current_line_is_owner_boundary_without_expression_owner =
+                crate::sql_text::starts_with_auto_format_owner_boundary_without_expression_owner(
+                    trimmed,
+                );
+            let current_line_structural_header_continuation_kind =
+                sql_text::format_leading_header_continuation_kind(trimmed);
+            let current_line_is_structural_continuation_target =
+                current_line_is_standalone_open_paren
+                    || current_line_starts_multiline_clause
+                    || current_query_owner_kind.is_some()
+                    || current_line_is_pending_partial_multiline_owner
+                    || current_line_is_pending_partial_query_owner
+                    || current_line_structural_header_continuation_kind.is_some();
+            let current_line_rejects_structural_continuation_depth =
+                (current_line_is_owner_boundary_without_expression_owner
+                    && !current_line_is_structural_continuation_target)
+                    || current_line_is_join_condition_clause
+                    || current_line_is_condition_keyword
+                    || current_line_is_parenthesized_condition_header
+                    || current_line_is_parenthesized_condition_close
+                    || starts_with_close_paren;
+            let current_line_clears_structural_continuation_depth =
+                current_line_is_owner_boundary_without_expression_owner
+                    || current_line_is_join_condition_clause
+                    || current_line_is_condition_keyword
+                    || current_line_is_parenthesized_condition_header
+                    || current_line_is_parenthesized_condition_close
+                    || current_line_is_standalone_open_paren
+                    || starts_with_close_paren;
+            let active_structural_continuation_depth_for_line =
+                (!current_line_rejects_structural_continuation_depth)
+                    .then_some(incoming_structural_continuation_depth)
+                    .flatten();
             let current_line_query_close_align_depth = resolved_query_base_depths
                 .iter()
                 .rev()
@@ -6604,9 +6677,6 @@ impl SqlEditorWidget {
             let resolved_query_base_depth = resolved_query_base_frame
                 .map(|frame| frame.resolved_base_depth)
                 .or(layouts[idx].query_base_depth);
-            let query_list_body_depth_floor = resolved_query_base_depth
-                .or(layouts[idx].query_base_depth)
-                .map(|depth| depth.saturating_add(1));
             let analyzer_query_depth = if let Some(query_base_depth) = layouts[idx].query_base_depth
             {
                 let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
@@ -6616,12 +6686,18 @@ impl SqlEditorWidget {
             } else {
                 layouts[idx].auto_depth
             };
+            let structural_body_depth_for_line = active_owner_relative_frame
+                .map(OwnerRelativeLayoutFrame::body_depth)
+                .or_else(|| {
+                    in_query_statement.then(|| {
+                        resolved_query_base_depth
+                            .or(layouts[idx].query_base_depth)
+                            .unwrap_or(parser_depth)
+                            .saturating_add(1)
+                    })
+                });
             let query_condition_depth =
                 Self::query_condition_body_depth(resolved_query_base_depth, parser_depth);
-            let query_list_continuation_depth = Self::query_list_continuation_depth(
-                query_list_body_depth_floor,
-                analyzer_query_depth,
-            );
             let mut current_line_dml_case_expression_close_depth = None;
             // BEGIN after trigger header (WHEN/FOR EACH ROW) should stay at
             // parser_depth (base indent), not inherit the trigger header's +1 depth.
@@ -6640,37 +6716,6 @@ impl SqlEditorWidget {
                 trigger_header_frame
                     .map(|frame| frame.body_depth)
                     .unwrap_or(parser_depth)
-            } else if !in_dml_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                && previous_line_ends_with_then
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && previous_line_ends_with_then
-                && current_line_starts_case
-                && !starts_query_head
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement && previous_line_ends_with_then && !starts_query_head {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && previous_line_is_else
-                && current_line_starts_case
-                && !starts_query_head
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement && previous_line_is_else {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
             } else if in_dml_statement
                 && starts_with_close_paren
                 && pending_dml_case_expression_close_depth_for_line.is_some()
@@ -6694,72 +6739,43 @@ impl SqlEditorWidget {
                 } else {
                     analyzer_query_depth
                 }
-            } else if in_dml_statement
-                && current_line_starts_case
-                && previous_line_ends_with_open_paren
-                && !previous_line_is_standalone_open_paren
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && trimmed == "("
-                && previous_line_ends_with_open_paren
-                && next_code_trimmed.is_some_and(|next| {
-                    let next_upper = next.to_ascii_uppercase();
-                    Self::is_dml_clause_starter(&next_upper)
-                })
-            {
-                // Nested `(` before clause: parser_depth already reflects
-                // paren nesting, so source indent is not needed here.
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && current_line_starts_case
-                && previous_line_is_dml_clause_starter
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
             } else if (in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                 && use_cursor_parser_depth)
                 || Self::starts_with_end_suffix_terminator(&trimmed_upper)
             {
                 parser_depth
-            } else if (current_line_is_parenthesized_condition_close
+            } else if current_line_is_parenthesized_condition_close
                 && !is_paren_case_closer
-                && popped_query_paren_frame.is_none())
-                || (current_line_is_parenthesized_condition
-                    && current_line_is_condition_keyword
-                    && previous_line_starts_with_close_paren)
+                && popped_query_paren_frame.is_none()
             {
                 parenthesized_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
                 parser_depth
-            } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
-                if previous_line_starts_with_using_clause {
-                    last_code_depth
-                        .map(|indent| indent.saturating_add(1).max(parser_depth))
-                        .unwrap_or(parser_depth.saturating_add(1))
-                } else {
-                    last_code_depth
-                        .map(|indent| indent.max(parser_depth))
-                        .unwrap_or(parser_depth)
-                }
-            } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
-            {
-                let nested_subquery_depth = if previous_line_is_cte_definition_header
-                    || current_line_is_parenthesized_condition
+            } else if current_line_is_pending_partial_multiline_owner {
+                structural_body_depth_for_line
+                    .or(active_structural_continuation_depth_for_line)
+                    .unwrap_or(parser_depth)
+                    .max(parser_depth)
+            } else if current_line_is_standalone_open_paren {
+                structural_body_depth_for_line
+                    .or(active_structural_continuation_depth_for_line)
+                    .unwrap_or(parser_depth)
+                    .max(parser_depth)
+            } else if let Some(branch_body_depth) = control_branch_body_depth_for_line {
+                if trimmed_upper.trim() == "ELSE"
+                    || trimmed_upper.starts_with("ELSIF ")
+                    || trimmed_upper.starts_with("ELSEIF ")
+                    || trimmed_upper.trim() == "EXCEPTION"
+                    || Self::starts_with_bare_end(&trimmed_upper)
+                    || Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 {
                     parser_depth
                 } else {
-                    parser_depth.saturating_add(1)
-                };
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
-                    .unwrap_or(nested_subquery_depth)
+                    branch_body_depth.max(parser_depth)
+                }
+            } else if let Some(continuation_depth) = active_structural_continuation_depth_for_line {
+                continuation_depth.max(parser_depth)
             } else if !in_dml_statement
                 && current_line_is_parenthesized_condition
                 && !current_line_is_parenthesized_condition_header
@@ -6770,158 +6786,12 @@ impl SqlEditorWidget {
                 // FORALL body: all DML lines inside FORALL are at
                 // owner_depth + 1 structurally.
                 forall_body_depth.unwrap_or(parser_depth).max(parser_depth)
-            } else if in_dml_statement
-                && previous_line_is_select_header
-                && previous_select_follows_cursor_header
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                && !starts_with_close_paren
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && previous_line_is_select_header
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                && !starts_with_close_paren
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_dml_statement
-                && (previous_line_is_case_header || previous_line_has_trailing_unclosed_case)
-                && Self::starts_with_case_branch_keyword(&trimmed_upper)
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if previous_line_is_order_by_clause
-                && previous_line_ends_with_trailing_comma
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !sql_text::starts_with_format_match_recognize_subclause(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if previous_line_is_match_recognize_order_by
-                && previous_line_ends_with_trailing_comma
-                && !sql_text::starts_with_format_match_recognize_subclause(&trimmed_upper)
-            {
-                last_code_depth
-                    .map(|indent| indent.saturating_add(1).max(parser_depth))
-                    .unwrap_or(parser_depth.saturating_add(1))
-            } else if in_query_statement && current_line_starts_condition_after_leading_close {
-                if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
-                    let join_condition_depth_floor = join_and_depth.max(query_condition_depth);
-                    Self::general_paren_condition_continuation_depth(
-                        join_condition_depth_floor,
-                        current_general_paren_frame_count,
-                    )
-                    .unwrap_or(join_condition_depth_floor)
-                } else {
-                    Self::general_paren_condition_continuation_depth(
-                        query_condition_depth,
-                        current_general_paren_frame_count,
-                    )
-                    .unwrap_or(query_condition_depth)
-                }
             } else if in_query_statement && current_line_is_condition_keyword {
-                if previous_line_starts_with_close_paren {
-                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
-                        let join_condition_depth_floor = join_and_depth.max(query_condition_depth);
-                        Self::general_paren_condition_continuation_depth(
-                            join_condition_depth_floor,
-                            current_general_paren_frame_count,
-                        )
-                        .unwrap_or(join_condition_depth_floor)
-                    } else {
-                        Self::general_paren_condition_continuation_depth(
-                            query_condition_depth,
-                            current_general_paren_frame_count,
-                        )
-                        .unwrap_or(query_condition_depth)
-                    }
-                } else if previous_line_is_join_condition_clause {
-                    let join_condition_depth_floor = join_on_condition_and_depth
-                        .last()
-                        .map(|(join_and_depth, _)| (*join_and_depth).max(query_condition_depth))
-                        .unwrap_or_else(|| query_condition_depth.saturating_add(1));
-                    Self::general_paren_condition_continuation_depth(
-                        join_condition_depth_floor,
-                        current_general_paren_frame_count,
-                    )
-                    .unwrap_or(join_condition_depth_floor)
-                } else if previous_line_is_condition_keyword {
-                    if let Some((join_and_depth, _)) = join_on_condition_and_depth.last().copied() {
-                        let join_condition_depth_floor = join_and_depth.max(query_condition_depth);
-                        Self::general_paren_condition_continuation_depth(
-                            join_condition_depth_floor,
-                            current_general_paren_frame_count,
-                        )
-                        .unwrap_or(join_condition_depth_floor)
-                    } else {
-                        Self::general_paren_condition_continuation_depth(
-                            query_condition_depth,
-                            current_general_paren_frame_count,
-                        )
-                        .unwrap_or(query_condition_depth)
-                    }
-                } else if active_general_paren_frame.is_some() {
-                    Self::general_paren_condition_continuation_depth(
-                        query_condition_depth,
-                        current_general_paren_frame_count,
-                    )
-                    .unwrap_or(query_condition_depth)
-                } else {
-                    query_condition_depth
-                }
-            } else if in_query_statement
-                && previous_line_is_close_paren_with_trailing_comma
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                && !starts_with_close_paren
-            {
-                query_list_continuation_depth
-            } else if in_dml_statement
-                && follows_comma_run
-                && previous_code_is_inline_merge_update_set
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-            {
-                last_code_depth.unwrap_or(parser_depth)
-            } else if in_dml_statement
-                && follows_comma_run
-                && !Self::is_dml_clause_starter(&trimmed_upper)
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-            {
-                last_code_depth
-                    .map(|indent| indent.max(parser_depth))
-                    .unwrap_or(parser_depth)
-            } else if in_dml_statement
-                && previous_line_ends_with_trailing_comma
-                && !previous_line_is_dml_clause_line
-            {
-                last_code_depth.unwrap_or(parser_depth)
-            } else if in_dml_statement
-                && Self::is_dml_clause_starter(&trimmed_upper)
-                && previous_line_is_dml_clause_starter
-            {
-                if last_code_depth.is_some_and(|indent| indent > parser_depth) {
-                    last_code_depth.unwrap_or(parser_depth)
-                } else {
-                    // Consecutive clause starters share the same structural
-                    // depth.  Use parser_depth instead of source indent.
-                    parser_depth
-                }
-            } else if in_dml_statement
-                && Self::is_dml_clause_starter(&trimmed_upper)
-                && previous_line_starts_with_close_paren
-            {
-                resolved_query_base_depth
-                    .or(layouts[idx].query_base_depth)
-                    .unwrap_or(parser_depth)
+                Self::active_query_condition_continuation_depth(
+                    query_condition_depth,
+                    current_general_paren_frame_count,
+                    &join_on_condition_and_depth,
+                )
             } else if starts_with_close_paren {
                 parser_depth
             } else if in_dml_statement {
@@ -6964,27 +6834,17 @@ impl SqlEditorWidget {
                 }
             }
 
-            let previous_line_is_select_hint = last_code_idx.is_some_and(|prev_idx| {
-                layouts[prev_idx]
-                    .trimmed
-                    .to_ascii_uppercase()
-                    .starts_with("SELECT /*+")
-            });
-            let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
-            let effective_depth = if starts_query_head && previous_line_ends_with_open_paren {
+            let effective_depth = if starts_query_head
+                && previous_line_ends_with_open_paren
+                && !previous_line_is_query_owner_open_paren
+                && !previous_line_is_query_owner_standalone_open_paren
+            {
                 // Query heads opened on the next line should inherit any still-open
                 // general paren continuation depth from the owner line, not just the
                 // analyzer's single pending query-base level.
                 active_general_paren_frame
                     .map(|frame| effective_depth.max(frame.continuation_depth))
                     .unwrap_or(effective_depth)
-            } else {
-                effective_depth
-            };
-            let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
-                effective_depth.max(1)
             } else {
                 effective_depth
             };
@@ -7014,23 +6874,6 @@ impl SqlEditorWidget {
                 } else {
                     effective_depth
                 };
-            let clause_anchor_depth = if !uses_analyzer_query_depth
-                && !previous_line_starts_with_close_paren
-                && Self::is_dml_clause_starter(&trimmed_upper)
-            {
-                Self::previous_dml_clause_starter_depth(layouts, idx, parser_depth).or_else(|| {
-                    Self::previous_dml_clause_starter_depth(
-                        layouts,
-                        idx,
-                        parser_depth.saturating_add(1),
-                    )
-                })
-            } else {
-                None
-            };
-            let effective_depth = clause_anchor_depth
-                .map(|anchor_depth| effective_depth.max(anchor_depth))
-                .unwrap_or(effective_depth);
             let effective_depth = Self::normalize_split_query_owner_header_depth(
                 trimmed,
                 &owner_relative_detection_upper,
@@ -7093,6 +6936,22 @@ impl SqlEditorWidget {
                     .filter(|frame| frame.enforces_body_floor())
                     .map(|frame| effective_depth.max(frame.body_depth()))
                     .unwrap_or(effective_depth)
+            };
+            let effective_depth =
+                if let Some(branch_body_depth) = control_branch_body_depth_for_line {
+                    if !in_dml_statement
+                        && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                            || crate::sql_text::starts_with_keyword_token(
+                                &trimmed_upper,
+                                "DECLARE",
+                            ))
+                    {
+                        effective_depth.max(branch_body_depth)
+                    } else {
+                        effective_depth
+                    }
+            } else {
+                effective_depth
             };
             let close_continuation_frame =
                 active_general_paren_frame.or(last_popped_general_paren_frame);
@@ -7395,24 +7254,20 @@ impl SqlEditorWidget {
                     case_depth: effective_depth,
                     expression_close_depth: current_line_dml_case_expression_close_owner_depth,
                 });
-            } else if !in_dml_statement && current_line_starts_case {
-                plsql_case_frames.push(effective_depth);
             } else if in_dml_statement
                 && !current_line_starts_case
-                && previous_line_has_trailing_unclosed_case
-                && dml_case_frames.is_empty()
-                && Self::starts_with_case_branch_keyword(&trimmed_upper)
+                && Self::line_has_trailing_unclosed_case(trimmed)
             {
-                // CASE opened mid-line on the previous code line (e.g. `SELECT col, CASE`
-                // or `SET col = CASE`).  Retroactively push a frame so that WHEN/ELSE/END
-                // on subsequent lines get the correct minimum depth enforcement.
-                let inferred_case_depth = last_code_idx
-                    .map(|prev_idx| layouts[prev_idx].final_depth)
-                    .unwrap_or(effective_depth.saturating_sub(1));
+                // CASE opened mid-line on the current owner line
+                // (`SELECT col, CASE`, `SET col = CASE`) must become an
+                // explicit frame immediately so later WHEN/ELSE/END lines can
+                // consume structural state directly.
                 dml_case_frames.push(DmlCaseLayoutFrame {
-                    case_depth: inferred_case_depth,
-                    expression_close_depth: None,
+                    case_depth: effective_depth,
+                    expression_close_depth: current_line_dml_case_expression_close_owner_depth,
                 });
+            } else if !in_dml_statement && current_line_starts_case {
+                plsql_case_frames.push(effective_depth);
             }
             if in_dml_statement
                 && Self::starts_with_case_terminator(&trimmed_upper)
@@ -7471,6 +7326,48 @@ impl SqlEditorWidget {
             {
                 case_layout_state.consume_pending_dml_case_expression_close_depth();
             }
+            let structural_list_body_depth = structural_body_depth_for_line;
+            let next_header_continuation_depth = next_code_trimmed.and_then(|next| {
+                if Self::line_starts_structural_continuation_boundary(next) {
+                    return None;
+                }
+
+                current_line_structural_header_continuation_kind.and_then(|_| {
+                    Self::structural_header_continuation_depth(
+                        trimmed,
+                        layouts[idx].final_depth,
+                        resolved_query_base_depth,
+                        layouts[idx].query_base_depth,
+                    )
+                })
+            });
+            let next_structural_continuation_depth = next_header_continuation_depth.or_else(|| {
+                Self::structural_list_continuation_depth(
+                    trimmed,
+                    layouts[idx].final_depth,
+                    structural_list_body_depth,
+                    active_structural_continuation_depth_for_line
+                        .or(incoming_structural_continuation_depth),
+                    next_header_continuation_depth,
+                )
+            });
+            active_structural_continuation_depth =
+                if let Some(continuation_depth) = next_structural_continuation_depth {
+                    Some(continuation_depth)
+                } else if current_line_clears_structural_continuation_depth {
+                    None
+                } else {
+                    active_structural_continuation_depth_for_line
+                };
+            pending_control_branch_body_depth = (!in_dml_statement
+                && (Self::line_ends_with_then_before_inline_comment(trimmed)
+                    || trimmed_upper.trim() == "ELSE"
+                    || trimmed_upper.trim() == "EXCEPTION"))
+                .then_some(Self::control_branch_body_depth(
+                    layouts[idx].final_depth,
+                    parenthesized_condition_header_depth,
+                    current_line_is_parenthesized_condition_header,
+                ));
             let current_line_is_query_owner_standalone_open_paren =
                 current_line_is_standalone_open_paren
                     && continued_plsql_child_query_owner.is_none();
@@ -7501,6 +7398,8 @@ impl SqlEditorWidget {
                 if resolved_query_base_depths.is_empty() && !starts_query_head {
                     pending_query_head_frames.clear();
                 }
+                let split_owner_standalone_head_depth = pending_query_owner_open_align_for_line
+                    .map(|frame| frame.owner_depth.saturating_add(1));
                 let case_condition_query_owner_depth = if current_line_is_condition_query_owner
                     && current_line_is_case_condition_continuation
                 {
@@ -7508,7 +7407,8 @@ impl SqlEditorWidget {
                 } else {
                     None
                 };
-                let structural_query_owner_depth = case_condition_query_owner_depth
+                let structural_query_owner_depth = split_owner_standalone_head_depth
+                    .or(case_condition_query_owner_depth)
                     .or_else(|| {
                         completed_partial_query_owner_kind.map(|kind| {
                             kind.formatter_child_query_head_depth(
@@ -7524,9 +7424,11 @@ impl SqlEditorWidget {
                     .or_else(|| {
                         Self::structural_next_query_head_depth(
                             &layouts[idx],
+                            layouts[idx].line_semantic,
                             current_query_owner_kind,
                             resolved_query_base_depth,
                             current_condition_header_depth,
+                            current_general_paren_frame_count,
                         )
                     })
                     .or_else(|| {
@@ -7676,6 +7578,8 @@ impl SqlEditorWidget {
                 pending_query_owner_open_align = None;
                 pending_operator_layout_frames.clear();
                 pending_plsql_child_query_owner = None;
+                active_structural_continuation_depth = None;
+                pending_control_branch_body_depth = None;
                 owner_relative_frames.clear();
                 pending_multiline_clause_owner = None;
                 pending_partial_multiline_clause_owner = None;
@@ -8234,25 +8138,6 @@ impl SqlEditorWidget {
         false
     }
 
-    fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
-        let tokens = super::query_text::tokenize_sql(line);
-        let mut paren_balance = 0usize;
-
-        for token in tokens {
-            if let SqlToken::Symbol(sym) = token {
-                for ch in sym.chars() {
-                    match ch {
-                        '(' => paren_balance = paren_balance.saturating_add(1),
-                        ')' => paren_balance = paren_balance.saturating_sub(1),
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        paren_balance > 0
-    }
-
     /// Returns `true` when `line` contains a CASE keyword that is not closed
     /// by a matching END on the same line.  This detects mid-line CASE
     /// expressions such as `SELECT col, CASE` or `SET col = CASE` so that
@@ -8351,20 +8236,6 @@ impl SqlEditorWidget {
         }
 
         false
-    }
-
-    fn line_is_cte_definition_header(line: &str) -> bool {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
-            return false;
-        }
-
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.starts_with("WITH ") {
-            return upper.contains(" AS ");
-        }
-
-        upper.contains(" AS (")
     }
 
     fn line_starts_with_using_clause(line: &str) -> bool {
@@ -20623,7 +20494,7 @@ FROM t1;"#;
     #[test]
     fn format_sql_basic_mid_line_case_after_comma_opens_frame() {
         // Stage 1 keeps CASE on the same line as the preceding comma item,
-        // so the DmlCaseLayoutFrame must be pushed retroactively.
+        // so phase 2 must open the CASE frame from that owner line itself.
         let source = "SELECT col1, CASE\nWHEN col2 = 1 THEN 'a'\nELSE 'b'\nEND AS result\nFROM t1;";
 
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -20686,6 +20557,149 @@ FROM t1;"#;
         assert!(
             leading_spaces(lines[when_idx]) > leading_spaces(lines[end_idx]),
             "WHEN should indent deeper than END in UPDATE SET CASE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_then_body_depth_across_comment_gap() {
+        let source = r#"BEGIN
+    IF 1 = 1 THEN
+        -- comment
+        BEGIN
+            NULL;
+        END;
+    END IF;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF 1 = 1 THEN")
+            .expect("IF line should exist");
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("BEGIN line should exist");
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .expect("END IF line should exist");
+
+        assert_eq!(
+            indent(lines[begin_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "BEGIN after comment gap should still consume the stored THEN body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should remain aligned with IF after comment-gap THEN body formatting, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_select_list_depth_without_previous_line_bridge() {
+        let source = r#"SELECT
+    deptno,
+    SUM (
+        sal
+    ) AS total_sal,
+    AVG (comm) AS avg_comm
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno,")
+            .expect("first select-list item should exist");
+        let second_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SUM ("))
+            .expect("second select-list item should exist");
+        let third_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AVG (comm)"))
+            .expect("third select-list item should exist");
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .expect("FROM line should exist");
+
+        assert_eq!(
+            indent(lines[first_item_idx]),
+            indent(lines[second_item_idx]),
+            "active structural continuation depth should keep later SELECT items on the same list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[second_item_idx]),
+            indent(lines[third_item_idx]),
+            "all SELECT list items should share one canonical list depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[from_idx]) < indent(lines[first_item_idx]),
+            "FROM should clear the carried SELECT list continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_select_hint_continuation_across_comment_gap() {
+        let source = r#"SELECT /*+ INDEX(emp emp_idx) */
+    -- keep list depth
+    empno,
+    ename
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT /*+"))
+            .expect("SELECT hint line should exist");
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "empno,")
+            .expect("first select item should exist");
+        let second_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ename")
+            .expect("second select item should exist");
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .expect("FROM line should exist");
+
+        assert_eq!(
+            indent(lines[first_item_idx]),
+            indent(lines[select_idx]).saturating_add(4),
+            "SELECT hint continuation depth should survive comment gaps and indent the first list item structurally, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[first_item_idx]),
+            indent(lines[second_item_idx]),
+            "later SELECT items should reuse the same carried structural continuation depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[from_idx]) < indent(lines[first_item_idx]),
+            "FROM should clear the SELECT hint continuation depth instead of inheriting it, got:\n{}",
             formatted
         );
     }
