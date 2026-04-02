@@ -1731,7 +1731,13 @@ impl QueryExecutor {
                         Some(AutoFormatClauseKind::Into | AutoFormatClauseKind::Values)
                     );
                 let is_multitable_insert_branch_header = frame.is_multitable_insert
-                    && (trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE"));
+                    && (sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &trimmed_upper,
+                        &["WHEN"],
+                    ) || sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &trimmed_upper,
+                        &["ELSE"],
+                    ));
                 let is_join_clause = Self::auto_format_is_join_clause(&clause_detection_upper);
                 let is_join_condition_clause =
                     Self::auto_format_is_join_condition_clause(&clause_detection_upper);
@@ -1892,7 +1898,13 @@ impl QueryExecutor {
                         frame.pending_from_item_body = false;
                     }
                     if frame.is_multitable_insert {
-                        if trimmed_upper.starts_with("WHEN ") || trimmed_upper.starts_with("ELSE") {
+                        if sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                            &trimmed_upper,
+                            &["WHEN"],
+                        ) || sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                            &trimmed_upper,
+                            &["ELSE"],
+                        ) {
                             frame.multitable_insert_branch_depth = 1;
                         } else if clause_kind == Some(AutoFormatClauseKind::Select) {
                             frame.multitable_insert_branch_depth = 0;
@@ -2892,8 +2904,7 @@ impl QueryExecutor {
     }
 
     fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
-        Self::trailing_identifier_before_inline_comment(line)
-            .is_some_and(|identifier| identifier.eq_ignore_ascii_case("THEN"))
+        sql_text::line_ends_with_identifier_sequence_before_inline_comment(line, &["THEN"])
     }
 
     fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
@@ -3195,7 +3206,13 @@ impl QueryExecutor {
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("INSERT ALL") || trimmed_upper.starts_with("INSERT FIRST")
+        sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+            trimmed_upper,
+            &["INSERT", "ALL"],
+        ) || sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+            trimmed_upper,
+            &["INSERT", "FIRST"],
+        )
     }
 
     fn line_is_cte_definition_header(line: &str) -> bool {
@@ -3204,12 +3221,18 @@ impl QueryExecutor {
             return false;
         }
 
-        let upper = trimmed.to_ascii_uppercase();
-        if sql_text::starts_with_keyword_token(&upper, "WITH") {
-            return upper.contains(" AS ");
+        let words = sql_text::meaningful_identifier_words_before_inline_comment(trimmed, 4);
+        if words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+        {
+            return words
+                .iter()
+                .skip(1)
+                .any(|word| word.eq_ignore_ascii_case("AS"));
         }
 
-        upper.contains(" AS (")
+        words.iter().any(|word| word.eq_ignore_ascii_case("AS"))
     }
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
@@ -3336,10 +3359,7 @@ impl QueryExecutor {
             return Some(InlineCommentContinuationKind::SameDepth);
         }
 
-        let words: Vec<&str> = trimmed_prefix
-            .split_whitespace()
-            .filter(|word| !word.is_empty())
-            .collect();
+        let words = sql_text::trailing_identifier_words_before_inline_comment(trimmed_prefix, 2);
         let last_word = words.last().copied()?;
         let previous_word = words.get(words.len().saturating_sub(2)).copied();
         sql_text::format_inline_comment_header_continuation_kind(previous_word, last_word).map(
@@ -3377,68 +3397,6 @@ impl QueryExecutor {
                 }
             },
         )
-    }
-
-    fn trailing_identifier_before_inline_comment(line: &str) -> Option<&str> {
-        let bytes = line.as_bytes();
-        let mut idx = 0usize;
-        let mut last_identifier: Option<(usize, usize)> = None;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-
-        while idx < bytes.len() {
-            let current = bytes[idx];
-
-            if in_single_quote {
-                if current == b'\'' {
-                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
-                        idx += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if current == b'"' {
-                    in_double_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-                break;
-            }
-            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-                break;
-            }
-            if current == b'\'' {
-                in_single_quote = true;
-                idx += 1;
-                continue;
-            }
-            if current == b'"' {
-                in_double_quote = true;
-                idx += 1;
-                continue;
-            }
-            if sql_text::is_identifier_start_byte(current) {
-                let start = idx;
-                idx += 1;
-                while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
-                    idx += 1;
-                }
-                last_identifier = Some((start, idx));
-                continue;
-            }
-
-            idx += 1;
-        }
-
-        last_identifier.and_then(|(start, end)| line.get(start..end))
     }
 
     pub fn strip_leading_comments(sql: &str) -> String {
@@ -8700,6 +8658,39 @@ SKIP LOCKED;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_for_update_inline_comment_body_with_block_comment_gap() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+FOR /* keep */ UPDATE -- lock mode
+SKIP LOCKED;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let for_update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR /* keep */ UPDATE --"))
+            .unwrap_or(0);
+        let skip_locked_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SKIP LOCKED;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[skip_locked_idx].auto_depth,
+            contexts[for_update_idx]
+                .query_base_depth
+                .unwrap_or(contexts[for_update_idx].auto_depth)
+                .saturating_add(1),
+            "line after `FOR /* ... */ UPDATE -- ...` should stay on the dedicated FOR UPDATE body depth"
+        );
+        assert_eq!(
+            contexts[skip_locked_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "FOR /* ... */ UPDATE -- ... continuation should stay marked as continuation"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_mixed_close_for_update_comment_body_on_structural_tail_depth()
     {
         let sql = r#"SELECT e.empno
@@ -10482,6 +10473,207 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_open_for_owner_depth_with_comment_glued_header() {
+        let sql = r#"BEGIN
+OPEN c_emp/* gap */FOR
+SELECT empno
+FROM emp;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OPEN c_emp/* gap */FOR")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[open_idx].auto_depth.saturating_add(1),
+            "SELECT after comment-glued OPEN ... FOR should still stay one level deeper than the owner"
+        );
+        assert_eq!(
+            contexts[from_idx].query_base_depth, contexts[select_idx].query_base_depth,
+            "FROM under comment-glued OPEN ... FOR should keep the same query base as SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_cursor_is_owner_depth_with_comment_glued_header() {
+        let sql = r#"DECLARE
+CURSOR c_emp/* gap */IS
+SELECT empno
+FROM emp;
+BEGIN
+NULL;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let cursor_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CURSOR c_emp/* gap */IS")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[cursor_idx].auto_depth.saturating_add(1),
+            "SELECT after comment-glued CURSOR ... IS should still stay one level deeper than the owner"
+        );
+        assert_eq!(
+            contexts[from_idx].query_base_depth, contexts[select_idx].query_base_depth,
+            "FROM under comment-glued CURSOR ... IS should keep the same query base as SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_create_query_body_owner_with_comment_gaps() {
+        let sql = r#"CREATE/* gap */OR/* gap */REPLACE/* gap */VIEW v_demo AS
+SELECT empno
+FROM emp;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let create_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("CREATE/* gap */OR/* gap */REPLACE")
+            })
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[create_idx].auto_depth.saturating_add(1),
+            "SELECT after comment-gapped CREATE ... VIEW ... AS should still stay one level deeper than the DDL owner"
+        );
+        assert_eq!(
+            contexts[from_idx].query_base_depth, contexts[select_idx].query_base_depth,
+            "FROM under comment-gapped CREATE ... AS should keep the same query base as SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_cte_header_depth_with_comment_gaps() {
+        let sql = r#"WITH
+base_emp/* gap */AS(
+SELECT empno
+FROM emp
+)
+SELECT empno
+FROM base_emp;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH");
+        let cte_idx = find_line("base_emp/* gap */AS(");
+        let cte_select_idx = find_line("SELECT empno");
+        let close_idx = find_line(")");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT empno")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "comment-gapped CTE header should stay aligned with the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[cte_select_idx].auto_depth,
+            contexts[cte_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT after comment-gapped AS should stay exactly one level deeper than the CTE owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[cte_idx].auto_depth,
+            "comment-gapped CTE closing paren should realign with the CTE owner depth"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after a comment-gapped CTE should return to the WITH base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_merge_branch_body_depth_with_comment_gaps() {
+        let sql = r#"MERGE INTO tgt t
+USING src s
+ON (t.id = s.id)
+WHEN/* gap */MATCHED/* gap */THEN
+UPDATE SET t.val = s.val
+WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN
+INSERT (id, val)
+VALUES (s.id, s.val);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let when_matched_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN/* gap */MATCHED/* gap */THEN")
+            .unwrap_or(0);
+        let update_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "UPDATE SET t.val = s.val")
+            .unwrap_or(0);
+        let when_not_matched_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN")
+            .unwrap_or(0);
+        let insert_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "INSERT (id, val)")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[update_idx].auto_depth,
+            contexts[when_matched_idx].auto_depth.saturating_add(1),
+            "UPDATE after comment-gapped WHEN MATCHED THEN should still open exactly one body level"
+        );
+        assert_eq!(
+            contexts[insert_idx].auto_depth,
+            contexts[when_not_matched_idx].auto_depth.saturating_add(1),
+            "INSERT after comment-gapped WHEN NOT MATCHED THEN should still open exactly one body level"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_promote_group_by_item_after_inline_comment_on_header() {
         let sql = r#"SELECT deptno,
     COUNT(*) AS cnt
@@ -10514,6 +10706,43 @@ deptno;"#;
         assert_eq!(
             contexts[deptno_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
             "GROUP BY inline-header continuation should preserve the query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_promote_group_by_item_after_inline_comment_header_with_block_comment_gap(
+    ) {
+        let sql = r#"SELECT deptno,
+    COUNT(*) AS cnt
+FROM emp
+GROUP /* keep */ BY -- header
+deptno;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "GROUP /* keep */ BY -- header")
+            .unwrap_or(0);
+        let deptno_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[deptno_idx].auto_depth,
+            contexts[group_by_idx].auto_depth.saturating_add(1),
+            "GROUP /* ... */ BY -- ... should still carry the next item onto the GROUP BY body depth"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "GROUP /* ... */ BY -- ... continuation should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[deptno_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
+            "GROUP /* ... */ BY -- ... continuation should preserve the active query base"
         );
     }
 
@@ -11859,6 +12088,35 @@ END;"#;
             contexts[null_idx].auto_depth,
             contexts[if_idx].auto_depth.saturating_add(1),
             "the THEN body should still open exactly one level deeper than the IF owner"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_then_body_after_inline_block_comment_inside_condition() {
+        let sql = r#"BEGIN
+    IF v_ready = /* gap */ 'Y' THEN
+        BEGIN
+            NULL;
+        END;
+    END IF;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF v_ready = /* gap */ 'Y' THEN")
+            .unwrap_or(0);
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .find_map(|(idx, line)| (idx > if_idx && line.trim_start() == "BEGIN").then_some(idx))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[begin_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "inline block comment inside the IF condition must not stop THEN body depth carry"
         );
     }
 

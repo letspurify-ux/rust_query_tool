@@ -1094,12 +1094,14 @@ fn format_sql_keeps_delete_alias_named_if_inline() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("DELETE\nFROM sales IF") && formatted.contains("WHERE IF.id = 1;"),
+        formatted.contains("DELETE FROM sales IF") && formatted.contains("WHERE IF.id = 1;"),
         "DELETE alias IF should remain inline and usable in member access, got:\n{}",
         formatted
     );
     assert!(
-        !formatted.contains("\nIF\n") && !formatted.contains("\n    IF\n"),
+        !formatted.contains("DELETE\nFROM sales IF")
+            && !formatted.contains("\nIF\n")
+            && !formatted.contains("\n    IF\n"),
         "DELETE alias IF should not be treated as block keyword, got:\n{}",
         formatted
     );
@@ -1119,6 +1121,50 @@ fn format_sql_breaks_minified_package_body_members() {
         formatted.contains("END;\n\n    FUNCTION f RETURN NUMBER IS"),
         "Package body members should be separated by blank line, got: {}",
         formatted
+    );
+}
+
+#[test]
+fn format_sql_breaks_semicolon_separated_declare_statements() {
+    let input =
+        "DECLARE v_old_sal NUMBER; v_new_sal NUMBER; BEGIN v_old_sal := 1; v_new_sal := 2; END;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("DECLARE\n    v_old_sal NUMBER;\n    v_new_sal NUMBER;\nBEGIN"),
+        "semicolon-separated DECLARE statements should each break onto their own line, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("BEGIN\n    v_old_sal := 1;\n    v_new_sal := 2;\nEND;"),
+        "semicolon-separated BEGIN body statements should each break onto their own line, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_breaks_semicolon_separated_package_body_declarations() {
+    let input = "CREATE OR REPLACE PACKAGE BODY pkg AS v_one NUMBER; v_two NUMBER; PROCEDURE p IS BEGIN NULL; END p; END pkg;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "PACKAGE BODY pkg AS\n    v_one NUMBER;\n    v_two NUMBER;\n    PROCEDURE p IS"
+        ),
+        "semicolon-separated package body declarations should each break onto their own line, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("PROCEDURE p IS\n    BEGIN\n        NULL;\n    END p;"),
+        "package body routine body should remain structured after semicolon splitting, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_breaks_next_statement_even_with_inline_block_comment_after_semicolon() {
+    let input = "BEGIN v_val := 0; /* keep */ v_val := 1; END;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("BEGIN\n    v_val := 0;\n    /* keep */\n    v_val := 1;\nEND;"),
+        "statement separators should still break before the next code line even when an inline block comment follows the semicolon, got: {formatted}"
     );
 }
 

@@ -1612,6 +1612,210 @@ pub(crate) fn first_meaningful_word(line: &str) -> Option<&str> {
     next_meaningful_word(line, 0).map(|(word, _)| word)
 }
 
+/// Returns identifier tokens in source order before an inline comment or end
+/// of line, skipping quoted literals, quoted identifiers, and block comments.
+pub(crate) fn meaningful_identifier_words_before_inline_comment(
+    line: &str,
+    max_identifiers: usize,
+) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_block_comment = false;
+    let mut q_quote_end: Option<u8> = None;
+    let mut identifiers = Vec::with_capacity(max_identifiers);
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'-') {
+            break;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if is_identifier_start_byte(current) {
+            let start = idx;
+            idx = idx.saturating_add(1);
+            while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+                idx = idx.saturating_add(1);
+            }
+            if let Some(identifier) = line.get(start..idx) {
+                identifiers.push(identifier);
+                if identifiers.len() == max_identifiers {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    identifiers
+}
+
+fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut identifiers = Vec::with_capacity(max_identifiers);
+
+    while idx < bytes.len() && identifiers.len() < max_identifiers {
+        while idx < bytes.len() {
+            let current = bytes[idx];
+            let next = bytes.get(idx.saturating_add(1)).copied();
+            if current.is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if current == b'-' && next == Some(b'-') {
+                return identifiers;
+            }
+            if current == b'/' && next == Some(b'*') {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+            break;
+        }
+
+        if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+            break;
+        }
+
+        let start = idx;
+        idx = idx.saturating_add(1);
+        while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+            idx = idx.saturating_add(1);
+        }
+
+        if let Some(identifier) = line.get(start..idx) {
+            identifiers.push(identifier);
+        } else {
+            break;
+        }
+    }
+
+    identifiers
+}
+
+fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return true;
+    }
+
+    let identifiers = leading_identifier_words(line, sequence.len());
+    identifiers.len() == sequence.len()
+        && identifiers
+            .iter()
+            .zip(sequence.iter())
+            .all(|(identifier, expected)| {
+                identifier
+                    .as_bytes()
+                    .eq_ignore_ascii_case(expected.as_bytes())
+            })
+}
+
+/// Returns true when the leading structural identifier sequence on `line`
+/// matches `sequence`, skipping only whitespace and block comments between
+/// identifiers.
+pub(crate) fn line_starts_with_identifier_sequence_before_inline_comment(
+    line: &str,
+    sequence: &[&str],
+) -> bool {
+    line_starts_with_identifier_sequence(line, sequence)
+}
+
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS)
 }
@@ -1687,7 +1891,7 @@ pub(crate) fn is_format_column_constraint_keyword(word: &str) -> bool {
 pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
     FORMAT_LAYOUT_CLAUSE_START_KEYWORDS
         .iter()
-        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+        .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1700,13 +1904,13 @@ pub(crate) enum FormatSetOperatorKind {
 
 impl FormatSetOperatorKind {
     pub(crate) fn from_clause_start(text_upper: &str) -> Option<Self> {
-        if starts_with_keyword_token(text_upper, "UNION") {
+        if line_starts_with_identifier_sequence(text_upper, &["UNION"]) {
             Some(Self::Union)
-        } else if starts_with_keyword_token(text_upper, "INTERSECT") {
+        } else if line_starts_with_identifier_sequence(text_upper, &["INTERSECT"]) {
             Some(Self::Intersect)
-        } else if starts_with_keyword_token(text_upper, "MINUS") {
+        } else if line_starts_with_identifier_sequence(text_upper, &["MINUS"]) {
             Some(Self::Minus)
-        } else if starts_with_keyword_token(text_upper, "EXCEPT") {
+        } else if line_starts_with_identifier_sequence(text_upper, &["EXCEPT"]) {
             Some(Self::Except)
         } else {
             None
@@ -1721,47 +1925,76 @@ pub(crate) fn is_format_set_operator_keyword(word: &str) -> bool {
 pub(crate) fn starts_with_format_set_operator(text_upper: &str) -> bool {
     FORMAT_SET_OPERATOR_KEYWORDS
         .iter()
-        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+        .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
 pub(crate) fn starts_with_format_join_clause(text_upper: &str) -> bool {
-    if starts_with_keyword_token(text_upper, "JOIN")
-        || starts_with_keyword_token(text_upper, "APPLY")
-    {
+    let words = leading_identifier_words(text_upper, 4);
+    let Some(first_word) = words.first().copied() else {
+        return false;
+    };
+
+    if first_word.eq_ignore_ascii_case("JOIN") || first_word.eq_ignore_ascii_case("APPLY") {
         return true;
     }
 
-    let starts_with_join_modifier = starts_with_keyword_token(text_upper, "OUTER")
+    let starts_with_join_modifier = first_word.eq_ignore_ascii_case("OUTER")
         || FORMAT_JOIN_MODIFIER_KEYWORDS
             .iter()
-            .any(|keyword| starts_with_keyword_token(text_upper, keyword));
+            .any(|keyword| first_word.eq_ignore_ascii_case(keyword));
 
-    starts_with_join_modifier && (text_upper.contains(" JOIN") || text_upper.contains(" APPLY"))
+    starts_with_join_modifier
+        && words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("JOIN") || word.eq_ignore_ascii_case("APPLY"))
 }
 
 pub(crate) fn is_format_join_condition_clause(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "ON") || starts_with_keyword_token(text_upper, "USING")
+    line_starts_with_identifier_sequence(text_upper, &["ON"])
+        || line_starts_with_identifier_sequence(text_upper, &["USING"])
 }
 
 pub(crate) fn starts_with_format_for_update_split_header(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "FOR")
-        && !text_upper.contains(" LOOP")
-        && !text_upper.contains(" IN ")
-        && !text_upper.contains(" UPDATE")
+    let words = leading_identifier_words(text_upper, 8);
+    words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+        && !words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("LOOP"))
+        && !words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("IN"))
+        && !words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("UPDATE"))
 }
 
 pub(crate) fn starts_with_format_for_update_clause(text_upper: &str) -> bool {
-    starts_with_format_for_update_split_header(text_upper)
-        || (starts_with_keyword_token(text_upper, "FOR") && text_upper.contains(" UPDATE"))
+    starts_with_format_for_update_split_header(text_upper) || {
+        let words = leading_identifier_words(text_upper, 8);
+        words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+            && words
+                .iter()
+                .skip(1)
+                .any(|word| word.eq_ignore_ascii_case("UPDATE"))
+    }
 }
 
 pub(crate) fn starts_with_format_merge_branch_header(text_upper: &str) -> bool {
-    let trimmed_upper = text_upper.trim_start();
-    trimmed_upper.starts_with("WHEN MATCHED") || trimmed_upper.starts_with("WHEN NOT MATCHED")
+    line_starts_with_identifier_sequence(text_upper, &["WHEN", "MATCHED"])
+        || line_starts_with_identifier_sequence(text_upper, &["WHEN", "NOT", "MATCHED"])
 }
 
 pub(crate) fn starts_with_format_merge_branch_condition_clause(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "AND") || starts_with_keyword_token(text_upper, "OR")
+    line_starts_with_identifier_sequence(text_upper, &["AND"])
+        || line_starts_with_identifier_sequence(text_upper, &["OR"])
 }
 
 fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
@@ -1775,8 +2008,8 @@ fn starts_with_auto_format_structural_continuation_boundary_without_expression_o
     let trimmed_upper = trimmed.to_ascii_uppercase();
     line_starts_query_head(&trimmed_upper)
         || starts_with_format_layout_clause(&trimmed_upper)
-        || starts_with_keyword_token(&trimmed_upper, "INTO")
-        || starts_with_keyword_token(&trimmed_upper, "USING")
+        || line_starts_with_identifier_sequence(trimmed, &["INTO"])
+        || line_starts_with_identifier_sequence(trimmed, &["USING"])
         || starts_with_format_join_clause(&trimmed_upper)
         || is_format_join_condition_clause(&trimmed_upper)
         || starts_with_format_for_update_clause(&trimmed_upper)
@@ -1824,50 +2057,85 @@ pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
         return false;
     }
 
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
-    if !starts_with_keyword_token(&trimmed_upper, "CREATE") {
+    let words = meaningful_identifier_words_before_inline_comment(line, 8);
+    if !words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+    {
         return false;
     }
-
-    let words: Vec<&str> = trimmed_upper.split_whitespace().collect();
     let mut idx = 1usize;
 
     while idx < words.len() {
-        match words[idx] {
-            "OR" if words.get(idx + 1).copied() == Some("REPLACE") => {
+        match words.get(idx).copied() {
+            Some(word)
+                if word.eq_ignore_ascii_case("OR")
+                    && words
+                        .get(idx + 1)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("REPLACE")) =>
+            {
                 idx += 2;
             }
-            "NO" if words.get(idx + 1).copied() == Some("FORCE") => {
+            Some(word)
+                if word.eq_ignore_ascii_case("NO")
+                    && words
+                        .get(idx + 1)
+                        .is_some_and(|word| word.eq_ignore_ascii_case("FORCE")) =>
+            {
                 idx += 2;
             }
-            "FORCE" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" => {
+            Some(word)
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "FORCE" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING"
+                ) =>
+            {
                 idx += 1;
             }
             _ => break,
         }
     }
 
-    if matches!(words.get(idx).copied(), Some("VIEW")) {
-        return true;
-    }
-
-    if matches!(words.get(idx).copied(), Some("MATERIALIZED"))
-        && matches!(words.get(idx + 1).copied(), Some("VIEW"))
+    if words
+        .get(idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("VIEW"))
     {
         return true;
     }
 
-    if matches!(words.get(idx).copied(), Some("TABLE")) {
+    if words
+        .get(idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("MATERIALIZED"))
+        && words
+            .get(idx + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("VIEW"))
+    {
         return true;
     }
 
-    (matches!(words.get(idx).copied(), Some("GLOBAL" | "PRIVATE")))
-        && matches!(words.get(idx + 1).copied(), Some("TEMPORARY"))
-        && matches!(words.get(idx + 2).copied(), Some("TABLE"))
+    if words
+        .get(idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+    {
+        return true;
+    }
+
+    words
+        .get(idx)
+        .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "GLOBAL" | "PRIVATE"))
+        && words
+            .get(idx + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("TEMPORARY"))
+        && words
+            .get(idx + 2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
 }
 
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
-    first_meaningful_word(trimmed_upper).is_some_and(is_subquery_head_keyword)
+    leading_identifier_words(trimmed_upper, 1)
+        .first()
+        .copied()
+        .is_some_and(is_subquery_head_keyword)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1965,8 +2233,8 @@ impl PendingFormatQueryOwnerHeaderKind {
             }
             Self::ConditionNot => {
                 let trimmed_upper = line.trim_start().to_ascii_uppercase();
-                (starts_with_keyword_token(&trimmed_upper, "EXISTS")
-                    || starts_with_keyword_token(&trimmed_upper, "IN")
+                (line_starts_with_identifier_sequence(&trimmed_upper, &["EXISTS"])
+                    || line_starts_with_identifier_sequence(&trimmed_upper, &["IN"])
                     || line_ends_with_keyword(line, "EXISTS")
                     || line_ends_with_keyword(line, "IN"))
                 .then_some(FormatQueryOwnerKind::Condition)
@@ -2065,39 +2333,46 @@ pub(crate) fn starts_with_auto_format_owner_boundary_without_expression_owner(li
 pub(crate) fn format_plsql_child_query_owner_kind(
     text_upper: &str,
 ) -> Option<FormatPlsqlChildQueryOwnerKind> {
-    let trimmed = text_upper.trim();
+    let words = meaningful_identifier_words_before_inline_comment(text_upper, 8);
+    let Some(first_word) = words.first().copied() else {
+        return None;
+    };
 
-    if starts_with_keyword_token(trimmed, "BEGIN")
-        || starts_with_keyword_token(trimmed, "EXCEPTION")
-        || starts_with_keyword_token(trimmed, "ELSE")
-        || starts_with_keyword_token(trimmed, "ELSIF")
-        || starts_with_keyword_token(trimmed, "ELSEIF")
-    {
-        Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
-    } else if starts_with_keyword_token(trimmed, "CURSOR")
-        && (trimmed.contains(" IS") || trimmed.contains(" AS"))
-    {
-        Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
-    } else if starts_with_keyword_token(trimmed, "OPEN") && trimmed.contains(" FOR") {
-        Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
-    } else {
-        None
+    if matches!(
+        first_word.to_ascii_uppercase().as_str(),
+        "BEGIN" | "EXCEPTION" | "ELSE" | "ELSIF" | "ELSEIF"
+    ) {
+        return Some(FormatPlsqlChildQueryOwnerKind::ControlBody);
     }
+
+    if first_word.eq_ignore_ascii_case("CURSOR")
+        && words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS"))
+    {
+        return Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration);
+    }
+
+    (first_word.eq_ignore_ascii_case("OPEN")
+        && words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("FOR")))
+    .then_some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
 }
 
 impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
     pub(crate) fn line_completes(self, line: &str) -> bool {
-        let trimmed_upper = line.trim_start().to_ascii_uppercase();
-
         match self {
             Self::CursorDeclaration => {
-                starts_with_keyword_token(&trimmed_upper, "IS")
-                    || starts_with_keyword_token(&trimmed_upper, "AS")
+                line_starts_with_identifier_sequence(line, &["IS"])
+                    || line_starts_with_identifier_sequence(line, &["AS"])
                     || line_ends_with_keyword(line, "IS")
                     || line_ends_with_keyword(line, "AS")
             }
             Self::OpenCursorFor => {
-                starts_with_keyword_token(&trimmed_upper, "FOR")
+                line_starts_with_identifier_sequence(line, &["FOR"])
                     || line_ends_with_keyword(line, "FOR")
             }
         }
@@ -2120,18 +2395,16 @@ impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
 pub(crate) fn format_plsql_child_query_owner_pending_header_kind(
     line: &str,
 ) -> Option<PendingFormatPlsqlChildQueryOwnerHeaderKind> {
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
-
-    if starts_with_keyword_token(&trimmed_upper, "CURSOR")
-        && format_plsql_child_query_owner_kind(&trimmed_upper)
+    if line_starts_with_identifier_sequence(line, &["CURSOR"])
+        && format_plsql_child_query_owner_kind(line)
             != Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
         && !line.trim_end().ends_with(';')
     {
         return Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration);
     }
 
-    (starts_with_keyword_token(&trimmed_upper, "OPEN")
-        && format_plsql_child_query_owner_kind(&trimmed_upper)
+    (line_starts_with_identifier_sequence(line, &["OPEN"])
+        && format_plsql_child_query_owner_kind(line)
             != Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
         && !line.trim_end().ends_with(';'))
     .then_some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
@@ -2141,7 +2414,7 @@ pub(crate) fn format_query_owner_pending_header_kind(
     line: &str,
 ) -> Option<PendingFormatQueryOwnerHeaderKind> {
     let trimmed_upper = line.trim_start().to_ascii_uppercase();
-    if starts_with_keyword_token(&trimmed_upper, "REFERENCE")
+    if line_starts_with_identifier_sequence(line, &["REFERENCE"])
         && !line_ends_with_keyword(line, "ON")
         && !line_ends_with_open_paren_before_inline_comment(line)
     {
@@ -2163,10 +2436,10 @@ pub(crate) fn format_query_owner_pending_header_kind(
 }
 
 fn starts_with_pending_query_owner_join_modifier(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "OUTER")
+    line_starts_with_identifier_sequence(text_upper, &["OUTER"])
         || FORMAT_JOIN_MODIFIER_KEYWORDS
             .iter()
-            .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+            .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2260,27 +2533,17 @@ const FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR"]]
 
 const FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["NESTED"]];
 
-fn strip_keyword_token_prefix<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = text.trim_start();
-    starts_with_keyword_token(trimmed, keyword)
-        .then(|| trimmed.get(keyword.len()..))
-        .flatten()
-}
-
 fn starts_with_keyword_sequence(text_upper: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return false;
     }
 
-    let mut remaining = text_upper.trim_start();
-    for keyword in sequence {
-        let Some(next) = strip_keyword_token_prefix(remaining, keyword) else {
-            return false;
-        };
-        remaining = next.trim_start();
-    }
-
-    true
+    let words = leading_identifier_words(text_upper, sequence.len());
+    words.len() == sequence.len()
+        && words
+            .iter()
+            .zip(sequence.iter())
+            .all(|(word, keyword)| word.as_bytes().eq_ignore_ascii_case(keyword.as_bytes()))
 }
 
 fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> bool {
@@ -2290,14 +2553,7 @@ fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> 
 }
 
 fn leading_meaningful_words(line: &str, max_words: usize) -> Vec<&str> {
-    let mut words = Vec::with_capacity(max_words);
-    for skip_words in 0..max_words {
-        let Some((word, _)) = next_meaningful_word(line, skip_words) else {
-            break;
-        };
-        words.push(word);
-    }
-    words
+    leading_identifier_words(line, max_words)
 }
 
 fn leading_words_match_keyword_prefix(words: &[&str], sequence: &[&str]) -> usize {
@@ -2412,9 +2668,9 @@ impl FormatIndentedParenOwnerKind {
                 .is_none()
             && !starts_with_format_layout_clause(trimmed_upper)
             && !starts_with_format_set_operator(trimmed_upper)
-            && !starts_with_keyword_token(trimmed_upper, "MODEL")
-            && !starts_with_keyword_token(trimmed_upper, "MATCH_RECOGNIZE")
-            && !starts_with_keyword_token(trimmed_upper, "WINDOW")
+            && !line_starts_with_identifier_sequence(trimmed_upper, &["MODEL"])
+            && !line_starts_with_identifier_sequence(trimmed_upper, &["MATCH_RECOGNIZE"])
+            && !line_starts_with_identifier_sequence(trimmed_upper, &["WINDOW"])
     }
 
     fn best_split_body_header_prefix_match(self, text_upper: &str) -> Option<(u64, usize)> {
@@ -2696,19 +2952,17 @@ impl PendingFormatIndentedParenOwnerHeaderKind {
     }
 
     pub(crate) fn line_completes(self, line: &str) -> bool {
-        let trimmed_upper = line.trim_start().to_ascii_uppercase();
-
         match self {
             Self::WindowAs => {
-                starts_with_keyword_token(&trimmed_upper, "AS")
+                line_starts_with_identifier_sequence(line, &["AS"])
                     || line_ends_with_keyword(line, "AS")
             }
             Self::WithinGroup => {
-                starts_with_keyword_token(&trimmed_upper, "GROUP")
+                line_starts_with_identifier_sequence(line, &["GROUP"])
                     || line_ends_with_keyword(line, "GROUP")
             }
             Self::NestedPathColumns => {
-                starts_with_keyword_token(&trimmed_upper, "COLUMNS")
+                line_starts_with_identifier_sequence(line, &["COLUMNS"])
                     || line_ends_with_keyword(line, "COLUMNS")
             }
         }
@@ -2726,7 +2980,6 @@ impl PendingFormatIndentedParenOwnerHeaderKind {
 pub(crate) fn format_indented_paren_pending_header_kind(
     line: &str,
 ) -> Option<PendingFormatIndentedParenOwnerHeaderKind> {
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
     if line_ends_with_keyword(line, "WITHIN")
         && !line_ends_with_keyword(line, "GROUP")
         && !line_ends_with_open_paren_before_inline_comment(line)
@@ -2734,7 +2987,7 @@ pub(crate) fn format_indented_paren_pending_header_kind(
         return Some(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup);
     }
 
-    if starts_with_keyword_token(&trimmed_upper, "WINDOW")
+    if line_starts_with_identifier_sequence(line, &["WINDOW"])
         && !line_ends_with_keyword(line, "AS")
         && !line_ends_with_open_paren_before_inline_comment(line)
     {
@@ -2742,7 +2995,7 @@ pub(crate) fn format_indented_paren_pending_header_kind(
     }
 
     let nested_second_word = next_meaningful_word(line.trim_start(), 1).map(|(word, _)| word);
-    (starts_with_keyword_token(&trimmed_upper, "NESTED")
+    (line_starts_with_identifier_sequence(line, &["NESTED"])
         && !nested_second_word.is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
         && !line_ends_with_keyword(line, "COLUMNS")
         && !line_ends_with_open_paren_before_inline_comment(line))
@@ -2753,14 +3006,12 @@ pub(crate) fn format_indented_paren_owner_header_continues(
     pending_kind: FormatIndentedParenOwnerKind,
     line: &str,
 ) -> bool {
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
-
     match pending_kind {
-        FormatIndentedParenOwnerKind::Pivot => starts_with_keyword_token(&trimmed_upper, "XML"),
+        FormatIndentedParenOwnerKind::Pivot => line_starts_with_identifier_sequence(line, &["XML"]),
         FormatIndentedParenOwnerKind::Unpivot => {
-            starts_with_keyword_token(&trimmed_upper, "INCLUDE")
-                || starts_with_keyword_token(&trimmed_upper, "EXCLUDE")
-                || starts_with_keyword_token(&trimmed_upper, "NULLS")
+            line_starts_with_identifier_sequence(line, &["INCLUDE"])
+                || line_starts_with_identifier_sequence(line, &["EXCLUDE"])
+                || line_starts_with_identifier_sequence(line, &["NULLS"])
         }
         FormatIndentedParenOwnerKind::AnalyticOver
         | FormatIndentedParenOwnerKind::WithinGroup
@@ -2779,9 +3030,9 @@ pub(crate) fn format_indented_paren_owner_header_continues(
 /// MODEL subclause start, such as `PARTITION / BY / (` or
 /// `RULES / AUTOMATIC / ORDER / (`.
 pub(crate) fn starts_with_format_model_multiline_owner_tail(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "BY")
-        || starts_with_keyword_token(text_upper, "ORDER")
-        || starts_with_keyword_token(text_upper, "ALL")
+    line_starts_with_identifier_sequence(text_upper, &["BY"])
+        || line_starts_with_identifier_sequence(text_upper, &["ORDER"])
+        || line_starts_with_identifier_sequence(text_upper, &["ALL"])
 }
 
 /// Returns the formatter query-owner kind when `line` ends on the owner header
@@ -2794,15 +3045,15 @@ pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOw
     }
 
     let trimmed_upper = line.trim_start().to_ascii_uppercase();
-    let starts_query_head =
-        first_meaningful_word(&trimmed_upper).is_some_and(is_subquery_head_keyword);
+    let starts_query_head = line_starts_query_head(line);
     let starts_non_query_owner_subclause = starts_query_head
-        || starts_with_keyword_token(&trimmed_upper, "MODEL")
+        || line_starts_with_identifier_sequence(line, &["MODEL"])
         || starts_with_format_model_subclause(&trimmed_upper)
-        || starts_with_keyword_token(&trimmed_upper, "MATCH_RECOGNIZE")
+        || line_starts_with_identifier_sequence(line, &["MATCH_RECOGNIZE"])
         || starts_with_format_match_recognize_subclause(&trimmed_upper)
-        || starts_with_keyword_token(&trimmed_upper, "WINDOW");
-    if starts_with_keyword_token(&trimmed_upper, "REFERENCE") && line_ends_with_keyword(line, "ON")
+        || line_starts_with_identifier_sequence(line, &["WINDOW"]);
+    if line_starts_with_identifier_sequence(line, &["REFERENCE"])
+        && line_ends_with_keyword(line, "ON")
     {
         return Some(FormatQueryOwnerKind::Clause);
     }
@@ -2816,7 +3067,7 @@ pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOw
 
     let starts_set_operator = starts_with_format_set_operator(&trimmed_upper);
     if !starts_non_query_owner_subclause
-        && !starts_with_keyword_token(&trimmed_upper, "FOR")
+        && !line_starts_with_identifier_sequence(line, &["FOR"])
         && !starts_set_operator
         && (line_ends_with_keyword(line, "IN")
             || line_ends_with_keyword(line, "EXISTS")
@@ -2897,7 +3148,7 @@ pub(crate) fn format_indented_paren_owner_header_kind(
         Some(FormatIndentedParenOwnerKind::Keep)
     } else if starts_with_format_model_subclause(&trimmed_upper) {
         Some(FormatIndentedParenOwnerKind::ModelSubclause)
-    } else if starts_with_keyword_token(&trimmed_upper, "WINDOW")
+    } else if line_starts_with_identifier_sequence(line, &["WINDOW"])
         && line_ends_with_keyword(line, "AS")
     {
         Some(FormatIndentedParenOwnerKind::Window)
@@ -3045,6 +3296,24 @@ fn line_trailing_identifiers_before_inline_comment(
     (last_significant_byte, trailing_identifiers)
 }
 
+/// Returns the trailing identifier words before an inline comment or end of
+/// line, skipping quoted literals and inline block comments.
+pub(crate) fn trailing_identifier_words_before_inline_comment(
+    line: &str,
+    max_identifiers: usize,
+) -> Vec<&str> {
+    line_trailing_identifiers_before_inline_comment(line, max_identifiers).1
+}
+
+/// Returns true when the trailing identifier sequence before an inline comment
+/// or end of line matches `sequence`.
+pub(crate) fn line_ends_with_identifier_sequence_before_inline_comment(
+    line: &str,
+    sequence: &[&str],
+) -> bool {
+    line_ends_with_identifier_sequence(line, sequence)
+}
+
 fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return true;
@@ -3076,8 +3345,7 @@ pub(crate) fn line_ends_with_format_expression_query_owner_keyword(line: &str) -
 }
 
 fn line_ends_with_format_table_from_item_query_owner_keyword(line: &str) -> bool {
-    let trimmed_upper = line.trim_start().to_ascii_uppercase();
-    (starts_with_keyword_token(&trimmed_upper, "TABLE")
+    (line_starts_with_identifier_sequence(line, &["TABLE"])
         || line_ends_with_identifier_sequence(line, &["FROM", "TABLE"])
         || line_ends_with_identifier_sequence(line, &["JOIN", "TABLE"])
         || line_ends_with_identifier_sequence(line, &["APPLY", "TABLE"])
@@ -3984,9 +4252,25 @@ mod tests {
     }
 
     #[test]
+    fn structural_prefix_helpers_ignore_inline_block_comment_gaps() {
+        assert!(starts_with_format_join_clause(
+            "LEFT/* gap */OUTER/* gap */JOIN emp e"
+        ));
+        assert!(starts_with_format_for_update_clause(
+            "FOR/* gap */UPDATE SKIP LOCKED"
+        ));
+        assert!(starts_with_format_for_update_split_header("FOR/* gap */"));
+        assert!(starts_with_format_merge_branch_header(
+            "WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN"
+        ));
+        assert!(is_format_join_condition_clause("USING/* gap */(deptno)"));
+    }
+
+    #[test]
     fn line_starts_query_head_recognizes_select_and_with_heads() {
         assert!(line_starts_query_head("SELECT empno"));
         assert!(line_starts_query_head("WITH bonus_cte AS"));
+        assert!(line_starts_query_head("/* gap */SELECT empno"));
         assert!(!line_starts_query_head("ORDER BY empno"));
     }
 
@@ -4196,6 +4480,25 @@ mod tests {
         ));
         assert!(line_ends_with_comma_before_inline_comment(
             "q'[/* literal */]' , -- trailing comma"
+        ));
+    }
+
+    #[test]
+    fn trailing_identifier_helpers_skip_inline_block_comments_and_literals() {
+        assert_eq!(
+            trailing_identifier_words_before_inline_comment("GROUP /* gap */ BY -- keep", 2),
+            vec!["GROUP", "BY"]
+        );
+        assert_eq!(
+            trailing_identifier_words_before_inline_comment(
+                "FOR q'[ignored UPDATE]' /* gap */ UPDATE -- keep",
+                2
+            ),
+            vec!["FOR", "UPDATE"]
+        );
+        assert!(line_ends_with_identifier_sequence_before_inline_comment(
+            "IF v_ready = /* gap */ 'Y' THEN",
+            &["THEN"]
         ));
     }
 
@@ -4517,6 +4820,9 @@ mod tests {
         assert!(starts_with_format_match_recognize_subclause(
             "OMIT EMPTY MATCHES"
         ));
+        assert!(starts_with_format_match_recognize_subclause(
+            "AFTER/* gap */MATCH/* gap */SKIP"
+        ));
     }
 
     #[test]
@@ -4603,6 +4909,7 @@ mod tests {
         ));
         assert!(starts_with_format_model_subclause("RETURN ALL ROWS"));
         assert!(starts_with_format_model_subclause("RETURN UPDATED ROWS"));
+        assert!(starts_with_format_model_subclause("PARTITION/* gap */BY"));
     }
 
     #[test]
@@ -5106,11 +5413,17 @@ mod tests {
             "CREATE OR REPLACE VIEW v_demo AS"
         ));
         assert!(line_is_create_query_body_header(
+            "CREATE/* gap */OR/* gap */REPLACE/* gap */VIEW \"v_demo\" AS"
+        ));
+        assert!(line_is_create_query_body_header(
             "CREATE MATERIALIZED VIEW mv_demo AS"
         ));
         assert!(line_is_create_query_body_header("CREATE TABLE t_demo AS"));
         assert!(line_is_create_query_body_header(
             "CREATE GLOBAL TEMPORARY TABLE t_demo AS"
+        ));
+        assert!(line_is_create_query_body_header(
+            "CREATE/* gap */GLOBAL/* gap */TEMPORARY/* gap */TABLE \"t demo\" AS"
         ));
         assert!(line_is_create_query_body_header(
             "CREATE PRIVATE TEMPORARY TABLE ora$ptt_demo AS"
@@ -5294,11 +5607,19 @@ mod tests {
             Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
         );
         assert_eq!(
+            format_plsql_child_query_owner_kind("CURSOR/* gap */\"c emp\"/* gap */IS"),
+            Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+        );
+        assert_eq!(
             format_plsql_child_query_owner_kind("OPEN c_emp FOR"),
             Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
         );
         assert_eq!(
             format_plsql_child_query_owner_kind("OPEN c_emp FOR SELECT empno FROM emp"),
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("OPEN/* gap */c_emp/* gap */FOR"),
             Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
         );
         assert_eq!(format_plsql_child_query_owner_kind("LOOP"), None);
@@ -5313,7 +5634,15 @@ mod tests {
             Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration)
         );
         assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("/* gap */CURSOR c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration)
+        );
+        assert_eq!(
             format_plsql_child_query_owner_pending_header_kind("OPEN c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("/* gap */OPEN c_emp"),
             Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
         );
         assert_eq!(
@@ -5330,6 +5659,7 @@ mod tests {
     fn pending_plsql_child_query_owner_header_kind_recognizes_split_completion_lines() {
         let cursor_kind = PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration;
         assert!(cursor_kind.line_completes("IS"));
+        assert!(cursor_kind.line_completes("/* gap */IS"));
         assert!(cursor_kind.line_completes(") AS"));
         assert!(cursor_kind.line_can_continue("(p_deptno NUMBER,"));
         assert!(cursor_kind.line_can_continue("p_ename VARCHAR2(30)"));
@@ -5337,6 +5667,7 @@ mod tests {
 
         let open_kind = PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor;
         assert!(open_kind.line_completes("FOR"));
+        assert!(open_kind.line_completes("/* gap */FOR"));
         assert!(open_kind.line_completes("FOR /* owner */"));
         assert!(open_kind.line_can_continue("c_emp"));
         assert!(!open_kind.line_can_continue("SELECT empno"));

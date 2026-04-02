@@ -77,7 +77,9 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 - trailing inline comment나 inline block comment가 split owner/open/close recognition을 끊으면 안 된다.
 - leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
+- line head prefix 판정도 예외가 아니다. `CREATE /* gap */ MATERIALIZED /* gap */ VIEW ... AS`, `OPEN c /* gap */ FOR`, `CURSOR c /* gap */ IS`, `WHEN /* gap */ NOT /* gap */ MATCHED THEN`, `MATCH /* gap */ RECOGNIZE` 같은 multi-keyword owner/header는 raw prefix string이나 `contains()`가 아니라 comment-stripped meaningful identifier sequence로 판정해야 한다.
 - `END /* gap */ IF`, `END -- gap` 다음 suffix line, `) /* gap */ ORDER BY` 같은 형태도 주석을 제거한 structural token sequence로 판정해야 한다.
+- line tail/suffix 판정도 예외가 아니다. `GROUP /* gap */ BY -- ...`, `FOR /* gap */ UPDATE -- ...`, `IF ... /* gap */ THEN`처럼 split header나 trailing terminator를 판정할 때도 raw whitespace split이 아니라 comment-stripped meaningful identifier sequence를 사용해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
 
 ## 2. 구조 계약

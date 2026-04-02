@@ -917,6 +917,10 @@ impl ConstructState {
         if keyword == "INTO" && matches!(prev_word_upper, Some("MERGE")) {
             return true;
         }
+        // DELETE FROM stays on same line
+        if keyword == "FROM" && matches!(prev_word_upper, Some("DELETE")) {
+            return true;
+        }
         // START WITH stays on same line
         if keyword == "WITH" && matches!(prev_word_upper, Some("START")) {
             return true;
@@ -2341,6 +2345,84 @@ impl SqlEditorWidget {
             formatted_statement.insert(insert_at, ';');
         }
     }
+
+    fn split_inline_statement_separators(formatted: &str) -> String {
+        if formatted.is_empty() {
+            return String::new();
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(formatted);
+        let mut split_points: Vec<usize> = Vec::new();
+
+        for (idx, span) in spans.iter().enumerate() {
+            if !matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                || Self::semicolon_belongs_to_non_sql_line(formatted, span.start)
+            {
+                continue;
+            }
+
+            let line_end = formatted[span.end..]
+                .find('\n')
+                .map_or(formatted.len(), |offset| span.end + offset);
+            let mut split_at = None;
+
+            for next_span in spans.iter().skip(idx.saturating_add(1)) {
+                if next_span.start >= line_end {
+                    break;
+                }
+
+                match &next_span.token {
+                    SqlToken::Comment(comment) if comment.contains('\n') => break,
+                    SqlToken::Comment(_) => {}
+                    _ => {
+                        let mut candidate = next_span.start;
+                        while candidate > span.end {
+                            match formatted.as_bytes().get(candidate.saturating_sub(1)) {
+                                Some(b' ' | b'\t') => candidate = candidate.saturating_sub(1),
+                                _ => break,
+                            }
+                        }
+                        split_at = Some(candidate.max(span.end));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(split_at) = split_at {
+                split_points.push(split_at);
+            }
+        }
+
+        if split_points.is_empty() {
+            return formatted.to_string();
+        }
+
+        split_points.sort_unstable();
+        split_points.dedup();
+
+        let mut out = String::with_capacity(
+            formatted
+                .len()
+                .saturating_add(split_points.len()),
+        );
+        let mut cursor = 0usize;
+
+        for split_at in split_points {
+            if split_at <= cursor || split_at > formatted.len() {
+                continue;
+            }
+
+            out.push_str(&formatted[cursor..split_at]);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            cursor = split_at;
+        }
+
+        out.push_str(&formatted[cursor..]);
+        out
+    }
+
     pub(crate) fn format_sql_basic(sql: &str) -> String {
         Self::format_sql_basic_with_terminator_policy(sql, true)
     }
@@ -3475,7 +3557,7 @@ impl SqlEditorWidget {
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
                         current_clause.as_deref(),
-                        Some("FROM" | "UPDATE" | "INTO" | "MERGE" | "USING")
+                        Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
                     );
                     let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
                     let next_word_is_clause_keyword = next_word.is_none_or(|word| {
@@ -5543,7 +5625,8 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        Self::apply_parser_depth_indentation(out.trim_end())
+        let normalized = Self::split_inline_statement_separators(out.trim_end());
+        Self::apply_parser_depth_indentation(&normalized)
     }
 
     fn apply_parser_depth_indentation(formatted: &str) -> String {
@@ -8436,16 +8519,7 @@ impl SqlEditorWidget {
     }
 
     fn line_ends_with_then_before_inline_comment(line: &str) -> bool {
-        let tokens = super::query_text::tokenize_sql(line);
-        for token in tokens.iter().rev() {
-            match token {
-                SqlToken::Comment(_) => continue,
-                SqlToken::Word(word) => return word.eq_ignore_ascii_case("THEN"),
-                _ => return false,
-            }
-        }
-
-        false
+        crate::sql_text::line_ends_with_identifier_sequence_before_inline_comment(line, &["THEN"])
     }
 
     /// Returns `true` when `line` contains a CASE keyword that is not closed
@@ -11780,6 +11854,34 @@ END;"#;
             indent(lines[end_if_idx]),
             indent(lines[if_idx]),
             "END IF should stay aligned with IF after branch body normalization, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_then_body_depth_with_inline_block_comment_inside_condition(
+    ) {
+        let source = r#"BEGIN
+    IF v_ready = /* gap */ 'Y' THEN
+            NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF v_ready = /* gap */ 'Y' THEN")
+            .unwrap_or(0);
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[null_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "inline block comment inside the IF condition must not block THEN body depth normalization, got:\n{}",
             formatted
         );
     }
@@ -24877,6 +24979,52 @@ GROUP BY /* keep */
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_block_comment_gap_inside_inline_comment_header_continuation(
+    ) {
+        let source = r#"SELECT deptno,
+    COUNT(*) AS cnt
+FROM emp
+GROUP /* keep */ BY -- header
+                deptno;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let group_by_idx =
+            find_line_starting_with(&lines, "GROUP /* keep */ BY").expect("GROUP BY owner line");
+        let deptno_idx = find_line_starting_with(&lines, "deptno;")
+            .expect("GROUP BY continuation line after block-comment gap");
+
+        assert_eq!(
+            leading_spaces(lines[deptno_idx]),
+            leading_spaces(lines[group_by_idx]).saturating_add(4),
+            "GROUP /* ... */ BY -- ... continuation depth must normalize from the structural GROUP BY depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_for_update_body_depth_with_block_comment_gap() {
+        let source = r#"SELECT e.empno
+FROM emp e
+FOR /* keep */ UPDATE -- lock mode
+                SKIP LOCKED;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let for_update_idx = find_line_starting_with(&lines, "FOR /* keep */ UPDATE")
+            .expect("FOR UPDATE owner line");
+        let skip_locked_idx =
+            find_line_starting_with(&lines, "SKIP LOCKED;").expect("SKIP LOCKED continuation");
+
+        assert_eq!(
+            leading_spaces(lines[skip_locked_idx]),
+            leading_spaces(lines[for_update_idx]).saturating_add(4),
+            "FOR /* ... */ UPDATE -- ... continuation depth must normalize from the structural FOR UPDATE depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_values_comment_continuation_keeps_tuple_indent() {
         let source = "INSERT INTO t_log (id, msg)\nVALUES -- tuple payload\n(1, 'x');";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -25252,6 +25400,11 @@ GROUP BY /* keep */
     fn format_sql_with_delete_cte_keeps_where_indent() {
         let source = "WITH old AS (\nSELECT id FROM archive WHERE ts < SYSDATE - 30\n)\nDELETE FROM main_tbl\nWHERE id IN (SELECT id FROM old);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("DELETE FROM main_tbl"),
+            "DELETE FROM should stay on the same line, got:\n{}",
+            formatted
+        );
         // WITH + DELETE: the CTE state must close so WHERE gets proper clause indent
         assert!(
             formatted.contains("\nWHERE"),
@@ -25264,6 +25417,23 @@ GROUP BY /* keep */
             formatted, formatted_again,
             "WITH+DELETE formatting should be idempotent, got:\n{}",
             formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_delete_from_inline() {
+        let source = "DELETE FROM emp WHERE deptno = 10;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("DELETE FROM emp"),
+            "DELETE FROM should stay on the same line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("DELETE\nFROM emp"),
+            "DELETE and FROM should not be split across lines, got:\n{}",
+            formatted
         );
     }
 
@@ -30422,6 +30592,211 @@ END;"#;
             leading_spaces(lines[select_idx]),
             leading_spaces(lines[is_idx]).saturating_add(4),
             "SELECT after split CURSOR ... IS should stay one level deeper than the completed owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_open_for_owner_depth_with_comment_glued_header() {
+        let source = r#"BEGIN
+OPEN c_emp/* gap */FOR
+            SELECT empno
+    FROM emp;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let open_idx =
+            find_line_starting_with(&lines, "OPEN c_emp/* gap */FOR").expect("OPEN owner line");
+        let select_idx = find_line_starting_with(&lines, "SELECT empno").expect("SELECT line");
+        let from_idx = find_line_starting_with(&lines, "FROM emp;").expect("FROM line");
+
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[open_idx]).saturating_add(4),
+            "SELECT after comment-glued OPEN ... FOR should stay one level deeper than the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "FROM under comment-glued OPEN ... FOR should stay on the same query base as SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_cursor_is_owner_depth_with_comment_glued_header() {
+        let source = r#"DECLARE
+CURSOR c_emp/* gap */IS
+            SELECT empno
+FROM emp;
+BEGIN
+NULL;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let cursor_idx =
+            find_line_starting_with(&lines, "CURSOR c_emp/* gap */IS").expect("CURSOR owner line");
+        let select_idx = find_line_starting_with(&lines, "SELECT empno").expect("SELECT line");
+        let from_idx = find_line_starting_with(&lines, "FROM emp;").expect("FROM line");
+
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "SELECT after comment-glued CURSOR ... IS should stay one level deeper than the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "FROM under comment-glued CURSOR ... IS should stay on the same query base as SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_create_query_body_owner_with_comment_gaps() {
+        let source = r#"CREATE/* gap */OR/* gap */REPLACE/* gap */VIEW v_demo AS
+            SELECT empno
+FROM emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx = find_line_starting_with(&lines, "CREATE/* gap */OR/* gap */REPLACE")
+            .expect("CREATE VIEW header line");
+        let select_idx = find_line_starting_with(&lines, "SELECT empno").expect("SELECT line");
+        let from_idx = find_line_starting_with(&lines, "FROM emp;").expect("FROM line");
+
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "SELECT after comment-gapped CREATE ... AS should stay one level deeper than the DDL owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "FROM under comment-gapped CREATE ... AS should stay on the same query base as SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_cte_header_depth_with_comment_gaps() {
+        let source = r#"WITH
+base_emp/* gap */AS(
+            SELECT empno
+FROM emp
+)
+SELECT empno
+FROM base_emp;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let with_idx = find_line_starting_with(&lines, "WITH").expect("WITH line");
+        let cte_idx =
+            find_line_starting_with(&lines, "base_emp/* gap */AS(").expect("CTE header line");
+        let cte_select_idx =
+            find_line_starting_with(&lines, "SELECT empno").expect("CTE SELECT line");
+        let close_idx = find_line_starting_with(&lines, ")").expect("CTE close line");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT empno")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[cte_idx]),
+            leading_spaces(lines[with_idx]),
+            "comment-gapped CTE header should stay aligned with WITH, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[cte_select_idx]),
+            leading_spaces(lines[cte_idx]).saturating_add(4),
+            "CTE body SELECT after comment-gapped AS should stay one level deeper than the CTE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[cte_idx]),
+            "comment-gapped CTE closing paren should realign with the CTE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[main_select_idx]),
+            leading_spaces(lines[with_idx]),
+            "main SELECT after a comment-gapped CTE should return to the WITH base depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_delete_from_inline() {
+        let source = r#"DELETE FROM emp
+WHERE deptno = 10;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let delete_idx =
+            find_line_starting_with(&lines, "DELETE FROM emp").expect("DELETE FROM line");
+        let where_idx = find_line_starting_with(&lines, "WHERE deptno = 10;").expect("WHERE line");
+
+        assert_eq!(
+            leading_spaces(lines[where_idx]),
+            leading_spaces(lines[delete_idx]),
+            "WHERE should keep the DELETE statement base depth when DELETE FROM stays inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("DELETE\nFROM emp"),
+            "parser-depth indentation should not split DELETE FROM, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_merge_branch_body_depth_with_comment_gaps() {
+        let source = r#"MERGE INTO tgt t
+USING src s
+ON (t.id = s.id)
+WHEN/* gap */MATCHED/* gap */THEN
+                UPDATE SET t.val = s.val
+WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN
+                    INSERT (id, val)
+VALUES (s.id, s.val);"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let when_matched_idx = find_line_starting_with(&lines, "WHEN/* gap */MATCHED/* gap */THEN")
+            .expect("WHEN MATCHED line");
+        let update_idx =
+            find_line_starting_with(&lines, "UPDATE SET t.val = s.val").expect("UPDATE line");
+        let when_not_matched_idx =
+            find_line_starting_with(&lines, "WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN")
+                .expect("WHEN NOT MATCHED line");
+        let insert_idx = find_line_starting_with(&lines, "INSERT (id, val)").expect("INSERT line");
+
+        assert_eq!(
+            leading_spaces(lines[update_idx]),
+            leading_spaces(lines[when_matched_idx]).saturating_add(4),
+            "UPDATE after comment-gapped WHEN MATCHED THEN should stay one body level deeper, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[insert_idx]),
+            leading_spaces(lines[when_not_matched_idx]).saturating_add(4),
+            "INSERT after comment-gapped WHEN NOT MATCHED THEN should stay one body level deeper, got:\n{}",
             formatted
         );
     }
