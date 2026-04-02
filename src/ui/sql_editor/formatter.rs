@@ -6384,8 +6384,6 @@ impl SqlEditorWidget {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 crate::sql_text::starts_with_keyword_token(&prev_upper, "FORALL")
             });
-            let previous_line_starts_with_close_paren =
-                last_code_idx.is_some_and(|prev_idx| layouts[prev_idx].has_leading_close_paren);
             let previous_line_is_query_owner_open_paren = last_code_idx.is_some_and(|prev_idx| {
                 previous_line_ends_with_open_paren
                     && crate::sql_text::format_query_owner_kind(layouts[prev_idx].trimmed).is_some()
@@ -6992,10 +6990,7 @@ impl SqlEditorWidget {
             };
             let close_continuation_frame =
                 active_general_paren_frame.or(last_popped_general_paren_frame);
-            let condition_close_alignment_active = current_line_is_parenthesized_condition_close
-                || (current_line_is_parenthesized_condition
-                    && current_line_is_condition_keyword
-                    && previous_line_starts_with_close_paren);
+            let condition_close_alignment_active = current_line_is_parenthesized_condition_close;
             let defers_to_condition_close_alignment = condition_close_alignment_active
                 && popped_query_paren_frame.is_none()
                 && !(current_line_dml_case_expression_close_depth.is_some()
@@ -16069,6 +16064,104 @@ WHERE deptno IN (
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_mixed_close_order_by_items_on_structural_tail_depth()
+    {
+        let source = r#"SELECT empno
+FROM emp
+WHERE deptno IN (
+        SELECT deptno
+        FROM dept
+    ) ORDER BY
+        empno,
+        hiredate;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let order_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") ORDER BY")
+            .unwrap_or(0);
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "empno,")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[order_by_idx]),
+            indent(lines[select_idx]),
+            "mixed leading-close `) ORDER BY` should stay on the outer query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[first_item_idx]),
+            indent(lines[order_by_idx]).saturating_add(4),
+            "ORDER BY item after mixed leading-close header should use structural header continuation depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::apply_parser_depth_indentation(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "mixed leading-close ORDER BY header continuation should stay stable"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_mixed_close_group_by_items_on_structural_tail_depth()
+    {
+        let source = r#"SELECT deptno, job
+FROM emp
+WHERE deptno IN (
+        SELECT deptno
+        FROM dept
+    ) GROUP BY
+        deptno,
+        job;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT deptno, job")
+            .unwrap_or(0);
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") GROUP BY")
+            .unwrap_or(0);
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno,")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[group_by_idx]),
+            indent(lines[select_idx]),
+            "mixed leading-close `) GROUP BY` should stay on the outer query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[first_item_idx]),
+            indent(lines[group_by_idx]).saturating_add(4),
+            "GROUP BY item after mixed leading-close header should use structural header continuation depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::apply_parser_depth_indentation(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "mixed leading-close GROUP BY header continuation should stay stable"
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_treats_join_same_line_close_and_on_as_outer_join_condition_depth(
     ) {
         let source = r#"SELECT e.empno
@@ -21402,6 +21495,53 @@ AND active = 1;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_condition_keyword_after_pure_close_line() {
+        let source = r#"BEGIN
+    IF (
+        v_ready = 'Y'
+    )
+    AND v_dept = 10 THEN
+        NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF (")
+            .expect("should contain IF line");
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .expect("should contain pure close line");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND v_dept = 10 THEN")
+            .expect("should contain outer AND line");
+
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[if_idx]),
+            "pure close line should align with the IF owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "AND after a pure close line should return to the structural condition continuation depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::apply_parser_depth_indentation(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "pure close line followed by condition continuation should stay stable"
+        );
+    }
+
+    #[test]
     fn join_on_nested_paren_and_or_keeps_correct_depths() {
         let input = r#"SELECT *
 FROM emp e
@@ -23680,6 +23820,45 @@ MATCH_RECOGNIZE (
             SqlEditorWidget::format_sql_basic(&formatted),
             formatted,
             "FOR UPDATE inline-comment body layout should remain stable"
+        );
+    }
+
+    #[test]
+    fn format_sql_mixed_close_for_update_inline_comment_keeps_lock_body_on_structural_tail_depth() {
+        let source = "SELECT *\nFROM emp\nWHERE deptno IN (\n    SELECT deptno\n    FROM dept\n) FOR UPDATE -- lock mode\nSKIP LOCKED;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT *")
+            .unwrap_or(0);
+        let for_update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") FOR UPDATE --"))
+            .unwrap_or(0);
+        let skip_locked_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SKIP LOCKED;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[for_update_idx]),
+            indent(lines[select_idx]),
+            "mixed leading-close `) FOR UPDATE -- ...` should realign to the outer query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[skip_locked_idx]),
+            indent(lines[for_update_idx]).saturating_add(4),
+            "SKIP LOCKED after mixed leading-close `) FOR UPDATE -- ...` should use the structural FOR UPDATE body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic(&formatted),
+            formatted,
+            "mixed leading-close FOR UPDATE inline-comment body layout should remain stable"
         );
     }
 

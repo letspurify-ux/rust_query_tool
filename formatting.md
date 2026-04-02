@@ -130,6 +130,14 @@ depth = 현재 시점에 열려 있는 구문 소유자(active syntactic owners)
 
 줄이 `)` 로 시작하면, 그 close event를 먼저 소비한 뒤 나머지 토큰을 해석한다.
 
+- mixed leading-close line의 clause/header/continuation 분류 입력은 raw line이 아니라
+  **leading close segment를 소비한 뒤의 structural tail** 이어야 한다.
+- 즉 `) ORDER BY`, `) GROUP BY`, `) FOR UPDATE`, `) AND EXISTS (` 는
+  `)` 자체를 정렬용 close event로 먼저 처리한 뒤,
+  `ORDER BY` / `GROUP BY` / `FOR UPDATE` / `AND EXISTS (` 를 현재 줄의 실제 구조 tail로 다시 분류해야 한다.
+- 이 규칙은 analyzer의 continuation carry, formatter phase 2의 clause/header 재분류,
+  inline-comment/bare-header continuation depth 계산에 동일하게 적용되어야 한다.
+
 ### 2.5 주석 / 문자열 / quoted literal 내부는 depth event가 아니다
 
 문자열·주석·q-quote·quoted identifier 내부의 괄호는 depth를 바꾸면 안 된다.
@@ -199,12 +207,21 @@ continuation/operator RHS/header carry를 중단하는 경계는 analyzer/format
 - dedicated clause boundary: `FOR UPDATE`
 - owner boundary: shared `sql_text` owner helper가 인식하는 query owner / multiline owner / PL/SQL child-query owner
 - standalone `(` wrapper line
+- mixed leading-close line은 raw line이 아니라 close를 소비한 structural tail을 위 taxonomy에 대입해야 한다.
+  예: `) ORDER BY ...` 는 `ORDER BY ...`, `) FOR UPDATE ...` 는 `FOR UPDATE ...` 로 판정한다.
 
 그리고 bare header continuation depth 분류도 shared taxonomy여야 한다.
 
 - same-depth header: `WITH` 같은 owner/header chain 조각
-- query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `CONNECT`, `START`, `UNION/INTERSECT/MINUS/EXCEPT`, `MODEL`, `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `QUALIFY`, `SEARCH`, `CYCLE`
+- query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
 - current-line+1 header: `SELECT`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`, split `JOIN/APPLY`, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `WITHIN GROUP`, `DENSE_RANK FIRST/LAST`, `AFTER MATCH`, `MATCH SKIP`, `START WITH`, `CONNECT BY`
+
+주의:
+
+- `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `MODEL` 은 generic bare-header continuation consumer가 아니라
+  dedicated multiline owner / subclause family로 관리한다.
+- 즉 이들은 bare header continuation keyword 집합에 넣어 다음 줄 depth를 generic carry로 열지 말고,
+  pending/active owner frame으로 owner depth와 body depth를 유지해야 한다.
 
 이 분류는 comment split 전용 로직이 아니라 bare header split, inline first-item split, wrapper `(` 앞뒤 continuation에 공통으로 재사용해야 한다.
 

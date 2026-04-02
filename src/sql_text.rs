@@ -1473,11 +1473,7 @@ pub(crate) fn starts_with_format_for_update_clause(text_upper: &str) -> bool {
         || (starts_with_keyword_token(text_upper, "FOR") && text_upper.contains(" UPDATE"))
 }
 
-/// Shared structural boundary helper for continuation/comment carry.
-///
-/// This intentionally excludes generic expression owners such as `MULTISET`
-/// so callers can keep operator RHS continuation on those lines when needed.
-pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
     line: &str,
 ) -> bool {
     let trimmed = line.trim_start();
@@ -1498,6 +1494,18 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
         || starts_with_format_model_subclause(&trimmed_upper)
         || starts_with_format_match_recognize_subclause(&trimmed_upper)
         || starts_with_auto_format_owner_boundary_without_expression_owner(trimmed)
+}
+
+/// Shared structural boundary helper for continuation/comment carry.
+///
+/// This intentionally excludes generic expression owners such as `MULTISET`
+/// so callers can keep operator RHS continuation on those lines when needed.
+pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+    line: &str,
+) -> bool {
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
+        auto_format_structural_tail(line),
+    )
 }
 
 /// Returns true when a CREATE query-body DDL header line owns the following
@@ -3026,6 +3034,25 @@ pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
     }
 }
 
+/// Returns the structural classification tail for auto-formatting helpers.
+///
+/// Pure close lines stay as-is, but mixed leading-close lines consume the
+/// close segment first so clause/header/continuation helpers can classify the
+/// surviving structural tail (`) ORDER BY` -> `ORDER BY`, `) FOR UPDATE` ->
+/// `FOR UPDATE`, `) AND EXISTS (` -> `AND EXISTS (`).
+pub(crate) fn auto_format_structural_tail(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return trimmed;
+    }
+
+    if line_has_mixed_leading_close_continuation(trimmed) {
+        trim_after_leading_close_parens(trimmed)
+    } else {
+        trimmed
+    }
+}
+
 /// Returns true when the meaningful remainder of a leading-close line keeps
 /// evaluating the same expression after the close has been consumed.
 ///
@@ -3069,7 +3096,7 @@ pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
         return false;
     };
 
-    starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed)
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(trimmed)
         || is_format_comment_continuation_keyword(first_token)
 }
 
@@ -3475,13 +3502,13 @@ pub(crate) fn format_leading_header_continuation_kind(
 pub(crate) fn format_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    format_leading_header_continuation_kind(line)
+    format_leading_header_continuation_kind(auto_format_structural_tail(line))
 }
 
 pub(crate) fn format_bare_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let words_upper = leading_meaningful_words(line.trim_start(), 8)
+    let words_upper = leading_meaningful_words(auto_format_structural_tail(line), 8)
         .into_iter()
         .map(str::to_ascii_uppercase)
         .collect::<Vec<_>>();
@@ -3957,6 +3984,34 @@ mod tests {
         assert_eq!(
             format_structural_header_continuation_kind("LEFT OUTER JOIN"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+    }
+
+    #[test]
+    fn structural_tail_helpers_consume_mixed_leading_close_before_reclassifying_headers() {
+        assert_eq!(auto_format_structural_tail(") ORDER BY empno"), "ORDER BY empno");
+        assert_eq!(auto_format_structural_tail("/*c*/ ) FOR UPDATE"), "FOR UPDATE");
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") ORDER BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") GROUP BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind(") FOR UPDATE -- lock"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                ") ORDER BY empno"
+            )
+        );
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                ") FOR UPDATE"
+            )
         );
     }
 

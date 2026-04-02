@@ -2181,6 +2181,22 @@ impl QueryExecutor {
                 && Self::auto_format_is_query_condition_continuation_clause(
                     &sql_text::trim_after_leading_close_parens(line).to_ascii_uppercase(),
                 );
+            let pure_close_bare_condition_continuation = context.condition_role
+                == AutoFormatConditionRole::Continuation
+                && !sql_text::line_has_leading_significant_close_paren(line)
+                && Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper)
+                && idx > 0
+                && contexts.get(idx.saturating_sub(1)).is_some_and(|previous| {
+                    previous.condition_role == AutoFormatConditionRole::Closer
+                        && previous.condition_header_line == context.condition_header_line
+                })
+                && context
+                    .condition_header_line
+                    .and_then(|header_idx| lines.get(header_idx))
+                    .is_some_and(|header_line| {
+                        Self::line_is_bare_parenthesized_condition_header(header_line)
+                    });
+
             if context.condition_role == AutoFormatConditionRole::Closer {
                 if let Some(header_depth) = context.condition_header_depth {
                     context.auto_depth = header_depth;
@@ -2188,6 +2204,10 @@ impl QueryExecutor {
             } else if leading_close_condition_continuation {
                 if let Some(header_depth) = context.condition_header_depth {
                     context.auto_depth = header_depth.saturating_add(1);
+                }
+            } else if pure_close_bare_condition_continuation {
+                if let Some(header_depth) = context.condition_header_depth {
+                    context.auto_depth = context.auto_depth.max(header_depth.saturating_add(1));
                 }
             }
             if clause_kind.is_none()
@@ -2904,6 +2924,60 @@ impl QueryExecutor {
     fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
         let prefix = Self::trailing_inline_comment_prefix(line).unwrap_or(line);
         prefix.trim() == "("
+    }
+
+    fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+
+        let start = idx;
+        while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+            idx += 1;
+        }
+
+        if start == idx {
+            return false;
+        }
+
+        let leading_word = trimmed[start..idx].to_ascii_uppercase();
+        if !matches!(
+            leading_word.as_str(),
+            "IF" | "ELSIF" | "ELSEIF" | "WHILE" | "WHEN"
+        ) {
+            return false;
+        }
+
+        while idx < bytes.len() {
+            if bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+                continue;
+            }
+
+            if bytes[idx] == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+                return false;
+            }
+
+            if bytes[idx] == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+                idx += 2;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+
+            return bytes[idx] == b'(';
+        }
+
+        false
     }
 
     fn line_multiline_clause_owner_kind(
@@ -8772,6 +8846,49 @@ SKIP LOCKED;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_mixed_close_for_update_comment_body_on_structural_tail_depth()
+    {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE e.deptno IN (
+    SELECT d.deptno
+    FROM dept d
+) FOR UPDATE -- lock mode
+SKIP LOCKED;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT e.empno")
+            .unwrap_or(0);
+        let for_update_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") FOR UPDATE --"))
+            .unwrap_or(0);
+        let skip_locked_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SKIP LOCKED;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[for_update_idx].query_base_depth,
+            Some(contexts[select_idx].auto_depth),
+            "mixed leading-close `) FOR UPDATE` should re-enter the outer query base"
+        );
+        assert_eq!(
+            contexts[skip_locked_idx].auto_depth,
+            contexts[select_idx].auto_depth.saturating_add(1),
+            "SKIP LOCKED after mixed leading-close `) FOR UPDATE -- ...` should use the structural FOR UPDATE body depth"
+        );
+        assert_eq!(
+            contexts[skip_locked_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "mixed leading-close FOR UPDATE comment body should stay marked as continuation"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_nested_join_and_condition_depths_on_query_base() {
         let sql = r#"SELECT D
 FROM E
@@ -11978,6 +12095,92 @@ WHERE deptno IN (
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_mixed_close_order_by_items_on_structural_tail_depth() {
+        let sql = r#"SELECT empno
+FROM emp
+WHERE deptno IN (
+    SELECT deptno
+    FROM dept
+) ORDER BY
+empno,
+hiredate;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT empno")
+            .unwrap_or(0);
+        let order_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") ORDER BY")
+            .unwrap_or(0);
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "empno,")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[order_by_idx].auto_depth,
+            contexts[select_idx].auto_depth,
+            "mixed leading-close `) ORDER BY` should align with the outer query base depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].auto_depth,
+            contexts[order_by_idx].auto_depth.saturating_add(1),
+            "ORDER BY item after mixed leading-close header should use the structural header continuation depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].query_base_depth,
+            contexts[order_by_idx].query_base_depth,
+            "ORDER BY item after mixed leading-close header should preserve the outer query base"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_mixed_close_group_by_items_on_structural_tail_depth() {
+        let sql = r#"SELECT deptno, job
+FROM emp
+WHERE deptno IN (
+    SELECT deptno
+    FROM dept
+) GROUP BY
+deptno,
+job;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT deptno, job")
+            .unwrap_or(0);
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") GROUP BY")
+            .unwrap_or(0);
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "deptno,")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[group_by_idx].auto_depth,
+            contexts[select_idx].auto_depth,
+            "mixed leading-close `) GROUP BY` should align with the outer query base depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].auto_depth,
+            contexts[group_by_idx].auto_depth.saturating_add(1),
+            "GROUP BY item after mixed leading-close header should use the structural header continuation depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].query_base_depth,
+            contexts[group_by_idx].query_base_depth,
+            "GROUP BY item after mixed leading-close header should preserve the outer query base"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_treat_join_same_line_close_and_on_as_join_condition_continuation()
     {
         let sql = r#"SELECT e.empno
@@ -13334,6 +13537,49 @@ WHERE 1 = 1;";
         assert_eq!(
             contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
             "outer WHERE should stay on the query owner depth after the comment-prefixed close"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_condition_keyword_after_pure_close_line_on_condition_depth() {
+        let sql = r#"BEGIN
+    IF (
+        v_ready = 'Y'
+    )
+    AND v_dept = 10 THEN
+        NULL;
+    END IF;
+END;"#;
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF (")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND v_dept = 10 THEN")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "pure close line should stay classified as the parenthesized condition closer"
+        );
+        assert_eq!(
+            contexts[and_idx].condition_role,
+            AutoFormatConditionRole::Continuation,
+            "AND after a pure close line should continue the active parenthesized condition state"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "AND after a pure close line should return to the condition continuation depth"
         );
     }
 
