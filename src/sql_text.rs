@@ -748,6 +748,12 @@ pub(crate) const FORMAT_BLOCK_START_KEYWORDS: &[&str] = &["DECLARE", "IF", "REPE
 pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] =
     &["LOOP", "IF", "CASE", "REPEAT", "FOR", "WHILE"];
 
+/// Leading suffix keywords that can follow a split `END` line before the
+/// logical owner is fully qualified or closed.
+const FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS: &[&str] = &[
+    "LOOP", "IF", "CASE", "REPEAT", "FOR", "WHILE", "BEFORE", "AFTER", "INSTEAD",
+];
+
 /// Shared SQL keyword lookup set for lexer/highlighting and IntelliSense checks.
 pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
@@ -1502,6 +1508,51 @@ pub(crate) fn first_meaningful_word(line: &str) -> Option<&str> {
     next_meaningful_word(line, 0).map(|(word, _)| word)
 }
 
+pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS)
+}
+
+pub(crate) fn is_format_plain_end_suffix_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS)
+}
+
+pub(crate) fn starts_with_format_end_suffix_terminator(text_upper: &str) -> bool {
+    if !starts_with_keyword_token(text_upper, "END") {
+        return false;
+    }
+
+    let Some(rest) = text_upper.strip_prefix("END") else {
+        return false;
+    };
+
+    let rest = rest.trim_start();
+    FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS
+        .iter()
+        .any(|keyword| starts_with_keyword_token(rest, keyword))
+}
+
+pub(crate) fn starts_with_format_plain_end(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "END")
+        && !starts_with_format_end_suffix_terminator(text_upper)
+}
+
+pub(crate) fn starts_with_format_bare_end(text_upper: &str) -> bool {
+    if !starts_with_format_plain_end(text_upper) {
+        return false;
+    }
+
+    let Some(rest) = text_upper.strip_prefix("END") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+
+    rest.is_empty() || rest.starts_with(';')
+}
+
+pub(crate) fn starts_with_format_named_plain_end(text_upper: &str) -> bool {
+    starts_with_format_plain_end(text_upper) && !starts_with_format_bare_end(text_upper)
+}
+
 /// Returns true when a keyword can head a subquery body after `(`.
 pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
     matches_keyword(word, SUBQUERY_HEAD_KEYWORDS)
@@ -1600,6 +1651,15 @@ pub(crate) fn starts_with_format_for_update_clause(text_upper: &str) -> bool {
         || (starts_with_keyword_token(text_upper, "FOR") && text_upper.contains(" UPDATE"))
 }
 
+pub(crate) fn starts_with_format_merge_branch_header(text_upper: &str) -> bool {
+    let trimmed_upper = text_upper.trim_start();
+    trimmed_upper.starts_with("WHEN MATCHED") || trimmed_upper.starts_with("WHEN NOT MATCHED")
+}
+
+pub(crate) fn starts_with_format_merge_branch_condition_clause(text_upper: &str) -> bool {
+    starts_with_keyword_token(text_upper, "AND") || starts_with_keyword_token(text_upper, "OR")
+}
+
 fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
     line: &str,
 ) -> bool {
@@ -1633,6 +1693,24 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
     starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
         auto_format_structural_tail(line),
     )
+}
+
+/// Returns true when a line begins any shared structural continuation boundary
+/// that must terminate carry into the next code line.
+///
+/// This extends the base boundary taxonomy with standalone wrapper `(` lines
+/// and MERGE branch headers so analyzer and formatter phase 2 can stop
+/// clause/list/operator carry through the same helper.
+pub(crate) fn starts_with_auto_format_structural_continuation_boundary(line: &str) -> bool {
+    let trimmed = auto_format_structural_tail(line);
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let trimmed_upper = trimmed.to_ascii_uppercase();
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(trimmed)
+        || starts_with_format_merge_branch_header(&trimmed_upper)
+        || line_is_standalone_open_paren_before_inline_comment(trimmed)
 }
 
 /// Returns true when a CREATE query-body DDL header line owns the following
@@ -3205,7 +3283,7 @@ pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormatTrailingMeaningfulToken<'a> {
+pub(crate) enum FormatTrailingMeaningfulToken<'a> {
     Word(&'a str),
     Symbol(&'a str),
     Other,
@@ -3436,7 +3514,7 @@ fn trailing_meaningful_tokens_before_inline_comment(
     (previous, last)
 }
 
-fn format_trailing_continuation_operator_kind_from_token(
+pub(crate) fn format_trailing_continuation_operator_kind_from_token_pair(
     previous: Option<FormatTrailingMeaningfulToken<'_>>,
     last: FormatTrailingMeaningfulToken<'_>,
 ) -> Option<FormatTrailingContinuationOperatorKind> {
@@ -3470,7 +3548,7 @@ pub(crate) fn format_trailing_continuation_operator_kind(
     line: &str,
 ) -> Option<FormatTrailingContinuationOperatorKind> {
     let (previous, last) = trailing_meaningful_tokens_before_inline_comment(line);
-    last.and_then(|last| format_trailing_continuation_operator_kind_from_token(previous, last))
+    last.and_then(|last| format_trailing_continuation_operator_kind_from_token_pair(previous, last))
 }
 
 /// Returns true when the last meaningful token before an inline comment or
@@ -3954,6 +4032,32 @@ mod tests {
     }
 
     #[test]
+    fn trailing_continuation_operator_token_pair_helper_preserves_projection_and_division_exceptions(
+    ) {
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                Some(FormatTrailingMeaningfulToken::Word("SELECT")),
+                FormatTrailingMeaningfulToken::Symbol("*"),
+            ),
+            None
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                Some(FormatTrailingMeaningfulToken::Word("qty")),
+                FormatTrailingMeaningfulToken::Symbol("/"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Symbol)
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                None,
+                FormatTrailingMeaningfulToken::Symbol("/"),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn format_temporal_boundary_keywords_cover_timestamp_and_scn() {
         assert!(is_format_temporal_boundary_keyword("timestamp"));
         assert!(is_format_temporal_boundary_keyword("SCN"));
@@ -3975,6 +4079,26 @@ mod tests {
         assert!(line_ends_with_comma_before_inline_comment(
             "q'[/* literal */]' , -- trailing comma"
         ));
+    }
+
+    #[test]
+    fn format_plain_end_helpers_cover_named_and_trigger_timing_suffixes() {
+        assert!(is_format_block_end_qualifier_keyword("IF"));
+        assert!(!is_format_block_end_qualifier_keyword("BEFORE"));
+        assert!(is_format_plain_end_suffix_keyword("BEFORE"));
+        assert!(is_format_plain_end_suffix_keyword("INSTEAD"));
+        assert!(starts_with_format_end_suffix_terminator(
+            "END BEFORE EACH ROW"
+        ));
+        assert!(starts_with_format_end_suffix_terminator(
+            "END AFTER STATEMENT"
+        ));
+        assert!(starts_with_format_end_suffix_terminator("END INSTEAD OF"));
+        assert!(starts_with_format_plain_end("END trg_pkg;"));
+        assert!(!starts_with_format_plain_end("END BEFORE STATEMENT"));
+        assert!(starts_with_format_bare_end("END;"));
+        assert!(starts_with_format_named_plain_end("END trg_pkg;"));
+        assert!(!starts_with_format_named_plain_end("END AFTER STATEMENT"));
     }
 
     #[test]
@@ -4133,6 +4257,9 @@ mod tests {
                 ") FOR UPDATE"
             )
         );
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            ") FOR UPDATE"
+        ));
     }
 
     #[test]
@@ -4153,6 +4280,30 @@ mod tests {
             ),
             false
         );
+    }
+
+    #[test]
+    fn structural_continuation_boundary_helper_covers_merge_branches_and_wrappers() {
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            "WHEN MATCHED THEN"
+        ));
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            "WHEN NOT MATCHED THEN"
+        ));
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            "( -- wrapper"
+        ));
+        assert!(starts_with_format_merge_branch_header("WHEN MATCHED THEN"));
+        assert!(starts_with_format_merge_branch_header(
+            "WHEN NOT MATCHED THEN"
+        ));
+        assert!(starts_with_format_merge_branch_condition_clause(
+            "AND target.is_active = 1"
+        ));
+        assert!(starts_with_format_merge_branch_condition_clause(
+            "OR target.is_active = 1"
+        ));
+        assert!(!starts_with_format_merge_branch_header("WHENEVER SQLERROR"));
     }
 
     #[test]

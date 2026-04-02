@@ -862,20 +862,7 @@ impl QueryExecutor {
         }
 
         fn is_end_suffix_keyword(leading_word: Option<&str>) -> bool {
-            leading_word.is_some_and(|word| {
-                matches!(
-                    word,
-                    _ if word.eq_ignore_ascii_case("CASE")
-                        || word.eq_ignore_ascii_case("IF")
-                        || word.eq_ignore_ascii_case("LOOP")
-                        || word.eq_ignore_ascii_case("WHILE")
-                        || word.eq_ignore_ascii_case("FOR")
-                        || word.eq_ignore_ascii_case("BEFORE")
-                        || word.eq_ignore_ascii_case("AFTER")
-                        || word.eq_ignore_ascii_case("INSTEAD")
-                        || word.eq_ignore_ascii_case("REPEAT")
-                )
-            })
+            leading_word.is_some_and(sql_text::is_format_plain_end_suffix_keyword)
         }
 
         fn is_non_label_control_keyword(leading_word: Option<&str>) -> bool {
@@ -2894,11 +2881,11 @@ impl QueryExecutor {
     }
 
     fn auto_format_is_merge_branch_header(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("WHEN MATCHED") || trimmed_upper.starts_with("WHEN NOT MATCHED")
+        sql_text::starts_with_format_merge_branch_header(trimmed_upper)
     }
 
     fn auto_format_is_merge_branch_condition_clause(trimmed_upper: &str) -> bool {
-        trimmed_upper.starts_with("AND ") || trimmed_upper.starts_with("OR ")
+        sql_text::starts_with_format_merge_branch_condition_clause(trimmed_upper)
     }
 
     fn merge_branch_action_from_clause_kind(
@@ -3260,17 +3247,7 @@ impl QueryExecutor {
     }
 
     fn line_starts_continuation_boundary(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            return true;
-        }
-
-        let trimmed_upper = trimmed.to_ascii_uppercase();
-        sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
-            trimmed,
-        ) || trimmed_upper.starts_with("WHEN MATCHED")
-            || trimmed_upper.starts_with("WHEN NOT MATCHED")
-            || Self::line_is_standalone_open_paren_before_inline_comment(trimmed)
+        sql_text::starts_with_auto_format_structural_continuation_boundary(line)
     }
 
     fn line_continuation_for_line(
@@ -8682,6 +8659,25 @@ UPDATE OF e.sal NOWAIT;"#;
             contexts[update_idx].auto_depth, contexts[from_idx].auto_depth,
             "split UPDATE line in SELECT FOR UPDATE should stay on query base depth"
         );
+    }
+
+    #[test]
+    fn line_starts_continuation_boundary_uses_shared_merge_and_wrapper_taxonomy() {
+        assert!(QueryExecutor::line_starts_continuation_boundary(
+            "WHEN MATCHED THEN"
+        ));
+        assert!(QueryExecutor::line_starts_continuation_boundary(
+            "WHEN NOT MATCHED THEN"
+        ));
+        assert!(QueryExecutor::line_starts_continuation_boundary(
+            "( -- wrapper"
+        ));
+        assert!(QueryExecutor::line_starts_continuation_boundary(
+            ") FOR UPDATE"
+        ));
+        assert!(!QueryExecutor::line_starts_continuation_boundary(
+            "target_table t"
+        ));
     }
 
     #[test]
