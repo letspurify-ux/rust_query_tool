@@ -2165,7 +2165,7 @@ fn encode_fltk_style_bytes_zeroes_utf8_continuations() {
     let encoded = encode_fltk_style_bytes(text, &logical).unwrap_or_default();
 
     assert_eq!(encoded.len(), text.len());
-    assert_eq!(encoded.get(0).copied(), Some(STYLE_KEYWORD as u8));
+    assert_eq!(encoded.first().copied(), Some(STYLE_KEYWORD as u8));
     assert_eq!(encoded.get(1).copied(), Some(0));
     assert_eq!(encoded.get(2).copied(), Some(0));
     assert_eq!(encoded.get(3).copied(), Some(STYLE_KEYWORD as u8));
@@ -5217,8 +5217,8 @@ END;"#;
         formatted
     );
     assert!(
-        formatted.contains("END\n            );"),
-        "CASE END and closing parenthesis should be split across lines, got: {}",
+        formatted.contains("END\n        );"),
+        "CASE END and closing parenthesis should be split across lines and the pure close should return to the paren owner depth, got: {}",
         formatted
     );
     assert!(
@@ -5268,8 +5268,8 @@ END;"#;
         "CASE block after parenthesis+comment should stay indented as expression depth, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n        );"),
-        "closing parenthesis should remain aligned with expression depth, got: {formatted}"
+        formatted.contains("END\n    );"),
+        "closing parenthesis should realign with the parenthesized expression owner depth, got: {formatted}"
     );
 }
 
@@ -7199,11 +7199,45 @@ SELECT
 FROM base_emp b
 ;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "WITH")
+        .unwrap_or(0);
+    let cte_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "base_emp AS (")
+        .unwrap_or(0);
+    let cte_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "SELECT")
+        .unwrap_or(0);
+    let scalar_open_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "(")
+        .unwrap_or(0);
+    let scalar_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(scalar_open_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start().starts_with("SELECT MAX"))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
 
-    assert!(
-        formatted.contains(
-            "    base_emp AS (\n        SELECT\n            e.empno,\n            e.ename,\n            (\n                SELECT MAX (x.sal)\n                FROM emp x\n                WHERE x.deptno = e.deptno\n            ) AS max_sal\n        FROM emp e"
-        ),
+    assert_eq!(
+        indent(lines[cte_idx]),
+        indent(lines[with_idx]),
+        "WITH FUNCTION CTE header should stay aligned with the WITH owner depth, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[cte_select_idx]),
+        indent(lines[cte_idx]).saturating_add(4),
+        "CTE body SELECT inside WITH FUNCTION should stay exactly one level deeper than the CTE header, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[scalar_select_idx]),
+        indent(lines[scalar_open_idx]).saturating_add(4),
         "scalar subquery inside WITH FUNCTION CTE should follow the same base-depth rule as other child queries, got:\n{formatted}"
     );
 }
@@ -7422,6 +7456,62 @@ LEFT JOIN emp e
         indent(lines[close_idx]),
         indent(lines[when_idx]),
         "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn format_sql_nested_operator_scalar_subquery_keeps_owner_and_child_query_depths_stable() {
+    let input = r#"SELECT
+    (
+        SELECT COUNT (*)
+        FROM (
+                SELECT 1
+                FROM employees e5
+                WHERE e5.manager_id = e.employee_id
+                        AND EXISTS (
+                            SELECT 1
+                            FROM employees e6
+                            WHERE e6.manager_id = e5.employee_id
+                                    AND e6.salary > (
+                            SELECT PERCENTILE_CONT (0.75) WITHIN GROUP (ORDER BY salary)
+                            FROM employees e7
+                            WHERE e7.department_id = e5.department_id
+                        )
+                        )
+            )
+    ) AS deep_report_count
+FROM a;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = r#"SELECT
+    (
+        SELECT COUNT (*)
+        FROM (
+                SELECT 1
+                FROM employees e5
+                WHERE e5.manager_id = e.employee_id
+                    AND EXISTS (
+                        SELECT 1
+                        FROM employees e6
+                        WHERE e6.manager_id = e5.employee_id
+                            AND e6.salary > (
+                                SELECT PERCENTILE_CONT (0.75) WITHIN GROUP (ORDER BY salary)
+                                FROM employees e7
+                                WHERE e7.department_id = e5.department_id
+                            )
+                    )
+            )
+    ) AS deep_report_count
+FROM a;"#;
+
+    assert_eq!(
+        formatted, expected,
+        "nested operator-owned scalar subqueries should follow the same owner/child ladder without wrapper double-counting"
+    );
+    assert_eq!(
+        SqlEditorWidget::format_sql_basic(&formatted),
+        formatted,
+        "nested operator-owned scalar subquery formatting should remain idempotent"
     );
 }
 

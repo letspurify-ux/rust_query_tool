@@ -1121,6 +1121,9 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
     let Some(rest) = text_upper.strip_prefix(keyword) else {
         return false;
     };
+    if rest.starts_with("/*") || rest.starts_with("--") {
+        return true;
+    }
     match rest.as_bytes().first() {
         None => true,
         Some(&b) if b < 0x80 => b.is_ascii_whitespace() || matches!(b, b';' | b',' | b'(' | b')'),
@@ -1429,7 +1432,11 @@ pub(crate) fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
 }
 
 pub(crate) fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
-    let prefix = trailing_inline_comment_prefix(line).unwrap_or(line);
+    let trimmed = trim_leading_sql_comments(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+    let prefix = trailing_inline_comment_prefix(trimmed).unwrap_or(trimmed);
     prefix.trim() == "("
 }
 
@@ -1757,12 +1764,17 @@ fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
             }
             if current == b'/' && next == Some(b'*') {
                 idx = idx.saturating_add(2);
+                let mut closed_comment = false;
                 while idx + 1 < bytes.len() {
                     if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
                         idx = idx.saturating_add(2);
+                        closed_comment = true;
                         break;
                     }
                     idx = idx.saturating_add(1);
+                }
+                if !closed_comment {
+                    return identifiers;
                 }
                 continue;
             }
@@ -1792,7 +1804,11 @@ fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
 fn identifier_sequence_segment_count(sequence: &[&str]) -> usize {
     sequence
         .iter()
-        .map(|word| word.split('_').filter(|segment| !segment.is_empty()).count())
+        .map(|word| {
+            word.split('_')
+                .filter(|segment| !segment.is_empty())
+                .count()
+        })
         .sum()
 }
 
@@ -1921,12 +1937,17 @@ fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
         }
         if current == b'/' && next == Some(b'*') {
             idx = idx.saturating_add(2);
+            let mut closed_comment = false;
             while idx + 1 < bytes.len() {
                 if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
                     idx = idx.saturating_add(2);
+                    closed_comment = true;
                     break;
                 }
                 idx = idx.saturating_add(1);
+            }
+            if !closed_comment {
+                return true;
             }
             continue;
         }
@@ -1944,6 +1965,13 @@ pub(crate) fn line_starts_with_identifier_sequence_before_inline_comment(
     sequence: &[&str],
 ) -> bool {
     line_starts_with_identifier_sequence(line, sequence)
+}
+
+pub(crate) fn line_has_exact_identifier_sequence_before_inline_comment(
+    line: &str,
+    sequence: &[&str],
+) -> bool {
+    line_has_exact_identifier_sequence(line, sequence)
 }
 
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
@@ -2537,6 +2565,7 @@ pub(crate) enum FormatQueryOwnerKind {
     Clause,
     FromItem,
     Condition,
+    Operator,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2577,6 +2606,7 @@ impl FormatQueryOwnerKind {
             Self::Clause | Self::FromItem => query_base_depth,
             Self::Condition => condition_header_depth
                 .or_else(|| query_base_depth.map(|depth| depth.saturating_add(1))),
+            Self::Operator => None,
         }
     }
 
@@ -2591,7 +2621,7 @@ impl FormatQueryOwnerKind {
             Self::Condition => query_base_depth
                 .map(|depth| resolved_owner_depth.max(depth.saturating_add(1)))
                 .unwrap_or(resolved_owner_depth.saturating_add(1)),
-            Self::Clause | Self::FromItem => resolved_owner_depth,
+            Self::Clause | Self::FromItem | Self::Operator => resolved_owner_depth,
         }
     }
 
@@ -2607,9 +2637,43 @@ impl FormatQueryOwnerKind {
                 .map(|depth| depth.saturating_add(2))
                 .map(|depth| depth.max(resolved_owner_depth.saturating_add(1)))
                 .unwrap_or(resolved_owner_depth.saturating_add(1)),
-            Self::FromItem => resolved_owner_depth.saturating_add(1),
+            Self::FromItem | Self::Operator => resolved_owner_depth.saturating_add(1),
         }
     }
+}
+
+fn is_format_operator_query_owner_symbol(symbol: &str) -> bool {
+    matches!(symbol, "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=")
+}
+
+fn format_condition_operator_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind> {
+    let (previous, last) = trailing_meaningful_tokens_before_inline_comment(line);
+
+    match (previous, last) {
+        (_, Some(FormatTrailingMeaningfulToken::Symbol(symbol)))
+            if is_format_operator_query_owner_symbol(symbol) =>
+        {
+            Some(FormatQueryOwnerKind::Operator)
+        }
+        (
+            Some(FormatTrailingMeaningfulToken::Symbol(symbol)),
+            Some(FormatTrailingMeaningfulToken::Symbol("(")),
+        ) if is_format_operator_query_owner_symbol(symbol) => Some(FormatQueryOwnerKind::Operator),
+        _ => None,
+    }
+}
+
+pub(crate) fn contextual_format_query_owner_kind(
+    line: &str,
+    allow_condition_operator_owner: bool,
+) -> Option<FormatQueryOwnerKind> {
+    format_query_owner_kind(line)
+        .or_else(|| format_query_owner_header_kind(line))
+        .or_else(|| {
+            allow_condition_operator_owner
+                .then(|| format_condition_operator_query_owner_kind(line))
+                .flatten()
+        })
 }
 
 impl PendingFormatQueryOwnerHeaderKind {
@@ -2728,9 +2792,7 @@ pub(crate) fn format_plsql_child_query_owner_kind(
     text_upper: &str,
 ) -> Option<FormatPlsqlChildQueryOwnerKind> {
     let words = meaningful_identifier_words_before_inline_comment(text_upper, 8);
-    let Some(first_word) = words.first().copied() else {
-        return None;
-    };
+    let first_word = words.first().copied()?;
 
     if matches!(
         first_word.to_ascii_uppercase().as_str(),
@@ -2806,7 +2868,7 @@ pub(crate) fn format_plsql_child_query_owner_pending_header_kind(
         && format_plsql_child_query_owner_kind(structural_tail)
             != Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
         && !ends_with_semicolon)
-    .then_some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
+        .then_some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
 }
 
 pub(crate) fn format_query_owner_pending_header_kind(
@@ -3792,10 +3854,11 @@ fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
     line_ends_with_identifier_sequence(line, &[keyword])
 }
 
-fn line_ends_with_semicolon_before_inline_comment(line: &str) -> bool {
+pub(crate) fn line_ends_with_semicolon_before_inline_comment(line: &str) -> bool {
     matches!(
         trailing_meaningful_tokens_before_inline_comment(line).1,
-        Some(FormatTrailingMeaningfulToken::Symbol(symbol)) if symbol == ";"
+        Some(FormatTrailingMeaningfulToken::Symbol(symbol))
+            if symbol.as_bytes().last() == Some(&b';')
     )
 }
 
@@ -4915,9 +4978,20 @@ mod tests {
         assert!(line_is_standalone_open_paren_before_inline_comment(
             "( /* wrap */"
         ));
+        assert!(line_is_standalone_open_paren_before_inline_comment(
+            "/* lead */ ( /* wrap */"
+        ));
         assert!(line_ends_with_comma_before_inline_comment(
             "q'[/* literal */]' , -- trailing comma"
         ));
+    }
+
+    #[test]
+    fn starts_with_keyword_token_treats_immediate_comments_as_token_boundaries() {
+        assert!(starts_with_keyword_token("ELSE/* GAP */", "ELSE"));
+        assert!(starts_with_keyword_token("EXCEPTION-- GAP", "EXCEPTION"));
+        assert!(starts_with_keyword_token("CASE/* GAP */", "CASE"));
+        assert!(!starts_with_keyword_token("ELSEIF", "ELSE"));
     }
 
     #[test]
@@ -4942,6 +5016,9 @@ mod tests {
         ));
         assert!(line_ends_with_semicolon_before_inline_comment(
             "OPEN c_emp /* gap */ ; /* keep */"
+        ));
+        assert!(line_ends_with_semicolon_before_inline_comment(
+            "VALUES (1); -- keep terminated"
         ));
         assert!(!line_ends_with_semicolon_before_inline_comment(
             "OPEN c_emp -- keep comment"
@@ -5213,6 +5290,14 @@ mod tests {
             format_structural_header_continuation_kind("DENSE /* gap */ RANK LAST ORDER BY")
         );
         assert_eq!(
+            format_bare_structural_header_continuation_kind("SELECT /*+ keep carrying"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("GROUP BY /* keep carrying"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
             format_bare_structural_header_continuation_kind("SELECT DISTINCT empno"),
             None
         );
@@ -5258,11 +5343,10 @@ mod tests {
                 "MEASURES match_number () AS match_no"
             )
         );
-        assert_eq!(
-            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+        assert!(
+            !starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
                 "emp e"
-            ),
-            false
+            )
         );
     }
 
@@ -6416,6 +6500,10 @@ mod tests {
             Some(5)
         );
         assert_eq!(
+            FormatQueryOwnerKind::Operator.header_depth_floor(Some(2), None),
+            None
+        );
+        assert_eq!(
             FormatQueryOwnerKind::Clause.auto_format_child_query_owner_base_depth(2, Some(2)),
             2
         );
@@ -6432,6 +6520,10 @@ mod tests {
             3
         );
         assert_eq!(
+            FormatQueryOwnerKind::Operator.auto_format_child_query_owner_base_depth(4, Some(2)),
+            4
+        );
+        assert_eq!(
             FormatQueryOwnerKind::Clause.formatter_child_query_head_depth(2, Some(2)),
             4
         );
@@ -6446,6 +6538,30 @@ mod tests {
         assert_eq!(
             FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(4, Some(2)),
             5
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::Operator.formatter_child_query_head_depth(4, Some(2)),
+            5
+        );
+    }
+
+    #[test]
+    fn contextual_format_query_owner_kind_recognizes_condition_operator_scalar_subqueries() {
+        assert_eq!(
+            contextual_format_query_owner_kind("AND e.salary > (", true),
+            Some(FormatQueryOwnerKind::Operator)
+        );
+        assert_eq!(
+            contextual_format_query_owner_kind("AND e.salary >", true),
+            Some(FormatQueryOwnerKind::Operator)
+        );
+        assert_eq!(
+            contextual_format_query_owner_kind("AND e.salary > (", false),
+            None
+        );
+        assert_eq!(
+            contextual_format_query_owner_kind("SUBSET ab = (", false),
+            None
         );
     }
 

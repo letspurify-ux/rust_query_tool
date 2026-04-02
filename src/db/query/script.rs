@@ -228,6 +228,7 @@ struct QueryBaseDepthFrame {
     close_align_depth: usize,
     start_parser_depth: usize,
     head_kind: Option<AutoFormatClauseKind>,
+    with_main_query_started: bool,
     pending_same_depth_set_operator_head: bool,
     into_continuation: bool,
     trailing_comma_continuation: bool,
@@ -1661,6 +1662,7 @@ impl QueryExecutor {
                     close_align_depth,
                     start_parser_depth: parser_depth,
                     head_kind: clause_kind,
+                    with_main_query_started: clause_kind != Some(AutoFormatClauseKind::With),
                     pending_same_depth_set_operator_head: false,
                     into_continuation: false,
                     trailing_comma_continuation: false,
@@ -1782,8 +1784,8 @@ impl QueryExecutor {
                 current_line_is_query_condition_continuation_clause =
                     is_query_condition_continuation_clause
                         && !current_line_starts_pending_merge_branch_header
-                        && !active_merge_branch_header
-                            .is_some_and(|progress| !progress.uses_condition_depth);
+                        && active_merge_branch_header
+                            .is_none_or(|progress| progress.uses_condition_depth);
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
                     && Self::auto_format_is_for_update_clause(&clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
@@ -1916,6 +1918,19 @@ impl QueryExecutor {
                     .is_some_and(|depth| depth == frame.query_base_depth)
                     || parser_depth >= frame.start_parser_depth
                 {
+                    // A WITH query frame stays open across local FUNCTION /
+                    // PROCEDURE / PACKAGE definitions until the actual main
+                    // query head appears on the WITH base depth.
+                    if frame.head_kind == Some(AutoFormatClauseKind::With)
+                        && !frame.with_main_query_started
+                        && parser_depth == frame.start_parser_depth
+                        && !Self::line_is_cte_definition_header(clause_detection_trimmed)
+                        && clause_kind.is_some_and(|kind| {
+                            kind.is_query_head() && kind != AutoFormatClauseKind::With
+                        })
+                    {
+                        frame.with_main_query_started = true;
+                    }
                     if let Some(kind) = clause_kind {
                         frame.pending_same_depth_set_operator_head = kind.is_set_operator();
                         if kind == AutoFormatClauseKind::Into {
@@ -2528,7 +2543,10 @@ impl QueryExecutor {
                 });
             }
 
-            if trimmed.ends_with(';') {
+            let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
+                frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
+            });
+            if trimmed.ends_with(';') && semicolon_closes_active_query_frame {
                 query_frames.pop();
                 pending_query_bases.clear();
                 pending_split_query_owner = None;
@@ -3286,8 +3304,10 @@ impl QueryExecutor {
     ) -> usize {
         let normalized = trimmed_upper.trim_end();
         let structural_owner_base = context.auto_depth;
-        let current_line_query_owner_kind = sql_text::format_query_owner_kind(normalized)
-            .or_else(|| sql_text::format_query_owner_header_kind(normalized));
+        let current_line_query_owner_kind = sql_text::contextual_format_query_owner_kind(
+            normalized,
+            context.line_semantic.is_condition_continuation(),
+        );
         if context.condition_role != AutoFormatConditionRole::None {
             if let Some(header_depth) = context.condition_header_depth {
                 if current_line_query_owner_kind.is_some() && structural_owner_base > header_depth {
@@ -9288,6 +9308,95 @@ FROM dual;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_with_function_following_cte_siblings_on_with_depth() {
+        let sql = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+aggregated AS (
+    SELECT
+        parent_id,
+        COUNT (*) AS child_count,
+        MAX (DEPTH) AS max_depth,
+        LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+    FROM recursive_tree
+    WHERE DEPTH > 1
+    GROUP BY parent_id
+)
+SELECT
+    rt.*,
+    a.child_count,
+    a.max_depth,
+    a.children
+FROM recursive_tree rt
+LEFT JOIN aggregated a
+    ON rt.node_id = a.parent_id
+ORDER BY rt.PATH;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH");
+        let recursive_cte_idx =
+            find_line("recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (");
+        let aggregated_cte_idx = find_line("aggregated AS (");
+        let aggregated_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(aggregated_cte_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[recursive_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "first CTE after WITH FUNCTION body should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[aggregated_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "sibling CTE after a WITH FUNCTION body should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[aggregated_select_idx].auto_depth,
+            contexts[aggregated_cte_idx].auto_depth.saturating_add(1),
+            "aggregated CTE body SELECT should stay exactly one level deeper than the CTE header"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_for_in_subquery_on_for_header_depth() {
         let sql = r#"BEGIN
     FOR rec IN
@@ -10456,6 +10565,65 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_select_list_depth_after_multiline_select_hint_block() {
+        let sql = r#"SELECT /*+ FULL(t) PARALLEL(t, 8) USE_HASH(t s)
+          INDEX(s idx_status)
+          NO_MERGE QB_NAME(main_query) */
+t.id,
+    /* 이건 일반 주석; END; / */
+    s.status
+FROM my_table t
+JOIN status_table s
+    ON t.id = s.id
+WHERE /*+ 이건 힌트가 아닌 주석 */
+    t.active = 'Y';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT /*+ FULL(t)"))
+            .unwrap_or(0);
+        let first_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "t.id,")
+            .unwrap_or(0);
+        let second_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "s.status")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM my_table t")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[first_item_idx].auto_depth,
+            contexts[select_idx].auto_depth.saturating_add(1),
+            "multiline SELECT hint block should keep the first select-list item on structural list depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].auto_depth,
+            contexts[second_item_idx].auto_depth,
+            "comment gaps after a multiline SELECT hint block should not clear the carried select-list depth"
+        );
+        assert_eq!(
+            contexts[first_item_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "first select-list item after a multiline SELECT hint block should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[first_item_idx].query_base_depth, contexts[select_idx].query_base_depth,
+            "multiline SELECT hint block should preserve the active query base for carried select-list items"
+        );
+        assert!(
+            contexts[from_idx].auto_depth < contexts[first_item_idx].auto_depth,
+            "FROM should clear the carried select-list depth after the multiline SELECT hint block"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_replace_outer_control_owner_before_open_for_query_owner() {
         let sql = r#"BEGIN
 NULL;
@@ -10892,7 +11060,10 @@ AND e.status = 'A';"#;
             .iter()
             .position(|line| line.trim_start() == "WHERE EXISTS")
             .unwrap_or(0);
-        let open_idx = lines.iter().position(|line| line.trim() == "(").unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "(")
+            .unwrap_or(0);
         let select_idx = lines
             .iter()
             .position(|line| line.trim_start() == "/* gap */ SELECT 1")
@@ -10901,7 +11072,10 @@ AND e.status = 'A';"#;
             .iter()
             .position(|line| line.trim_start() == "FROM bonus b")
             .unwrap_or(0);
-        let close_idx = lines.iter().position(|line| line.trim() == ")").unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
         let and_idx = lines
             .iter()
             .position(|line| line.trim_start() == "AND e.status = 'A';")
@@ -10969,7 +11143,10 @@ AND d.status = 'A';"#;
             .iter()
             .position(|line| line.trim_start() == "LATERAL")
             .unwrap_or(0);
-        let open_idx = lines.iter().position(|line| line.trim_start() == "(").unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "(")
+            .unwrap_or(0);
         let select_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("/* gap */ SELECT MAX"))
