@@ -62,23 +62,7 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
         _tokens: &[SqlToken],
     ) -> SqlContext {
-        if deep_ctx.phase.is_variable_context() {
-            SqlContext::VariableName
-        } else if deep_ctx.phase.is_bind_context() {
-            SqlContext::BindValue
-        } else if deep_ctx.phase.is_table_context() {
-            SqlContext::TableName
-        } else if deep_ctx.phase.is_column_context()
-            || matches!(deep_ctx.phase, intellisense_context::SqlPhase::PivotClause)
-        {
-            if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
-                SqlContext::ColumnOrAll
-            } else {
-                SqlContext::ColumnName
-            }
-        } else {
-            SqlContext::General
-        }
+        sql_context_for_phase(deep_ctx.phase)
     }
 
     fn column_load_worker_pool() -> &'static ColumnLoadWorkerPool {

@@ -19,6 +19,7 @@ pub enum SqlPhase {
     JoinUsingColumnList,
     RecursiveCteColumnList,
     RecursiveCteGeneratedColumnName,
+    HierarchicalGeneratedColumnName,
     SelectList,
     IntoClause,
     DmlSetTargetList,
@@ -101,6 +102,13 @@ impl SqlPhase {
 
     pub fn is_bind_context(&self) -> bool {
         matches!(self, SqlPhase::UsingBindList)
+    }
+
+    pub fn is_generated_name_context(&self) -> bool {
+        matches!(
+            self,
+            SqlPhase::RecursiveCteGeneratedColumnName | SqlPhase::HierarchicalGeneratedColumnName
+        )
     }
 }
 
@@ -2874,9 +2882,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .unwrap_or(StatementKind::Unknown);
                         if hierarchical_clause_active {
                             // Oracle hierarchical query SEARCH/CYCLE clauses use
-                            // `... SET <ordering_or_cycle_col>` where SET is not
-                            // DML assignment syntax.
-                            depth_frames[depth].phase = SqlPhase::ConnectByClause;
+                            // `... SET <ordering_or_cycle_col>` where SET introduces
+                            // a generated output column name rather than a column
+                            // expression or DML assignment target.
+                            depth_frames[depth].phase = SqlPhase::HierarchicalGeneratedColumnName;
                             depth_frames[depth].dml_set_active = false;
                             depth_frames[depth].postgres_conflict_update_active = false;
                         } else if matches!(current_phase, SqlPhase::RecursiveCteColumnList)

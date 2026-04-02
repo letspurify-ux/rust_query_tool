@@ -4,7 +4,56 @@ struct AsyncIntellisenseParseResult {
     routine_cache: RoutineSymbolCacheEntry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectListWildcardMode {
+    None,
+    Unqualified,
+    Qualified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClauseCompletionPolicy {
+    restrict_to_relation_columns: bool,
+    select_list_wildcard_mode: SelectListWildcardMode,
+}
+
+impl ClauseCompletionPolicy {
+    fn for_phase(phase: intellisense_context::SqlPhase, has_qualifier: bool) -> Self {
+        let restrict_to_relation_columns = matches!(
+            phase,
+            intellisense_context::SqlPhase::CteColumnList
+                | intellisense_context::SqlPhase::ConflictTargetList
+                | intellisense_context::SqlPhase::JoinUsingColumnList
+                | intellisense_context::SqlPhase::RecursiveCteColumnList
+                | intellisense_context::SqlPhase::DmlSetTargetList
+                | intellisense_context::SqlPhase::InsertColumnList
+                | intellisense_context::SqlPhase::MergeInsertColumnList
+                | intellisense_context::SqlPhase::DmlReturningList
+                | intellisense_context::SqlPhase::LockingColumnList
+        );
+        let select_list_wildcard_mode =
+            if matches!(phase, intellisense_context::SqlPhase::SelectList) {
+                if has_qualifier {
+                    SelectListWildcardMode::Qualified
+                } else {
+                    SelectListWildcardMode::Unqualified
+                }
+            } else {
+                SelectListWildcardMode::None
+            };
+
+        Self {
+            restrict_to_relation_columns,
+            select_list_wildcard_mode,
+        }
+    }
+}
+
 impl SqlEditorWidget {
+    fn context_suppresses_completion(context: SqlContext) -> bool {
+        matches!(context, SqlContext::GeneratedName)
+    }
+
     pub(super) fn trigger_intellisense(
         editor: &TextEditor,
         buffer: &TextBuffer,
@@ -22,7 +71,8 @@ impl SqlEditorWidget {
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
-            && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos) == Some(';');
+            && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos)
+                == Some(';');
 
         if should_hide_after_statement_terminator {
             intellisense_popup
@@ -65,10 +115,7 @@ impl SqlEditorWidget {
 
         // Cache miss means full parse is pending on a worker.
         // Hide stale popup/completion state to avoid applying outdated candidates.
-        Self::clear_intellisense_ui_state(
-            intellisense_popup,
-            runtime,
-        );
+        Self::clear_intellisense_ui_state(intellisense_popup, runtime);
 
         Self::queue_async_intellisense_parse(
             editor,
@@ -130,9 +177,7 @@ impl SqlEditorWidget {
         runtime.clear_ui_tracking();
     }
 
-    fn clear_intellisense_state_for_external_hide(
-        runtime: &Arc<IntellisenseRuntimeState>,
-    ) {
+    fn clear_intellisense_state_for_external_hide(runtime: &Arc<IntellisenseRuntimeState>) {
         Self::invalidate_and_clear_pending_intellisense_state(runtime);
     }
 
@@ -231,9 +276,7 @@ impl SqlEditorWidget {
         });
     }
 
-    fn invalidate_and_clear_pending_intellisense_state(
-        runtime: &Arc<IntellisenseRuntimeState>,
-    ) {
+    fn invalidate_and_clear_pending_intellisense_state(runtime: &Arc<IntellisenseRuntimeState>) {
         runtime.clear_ui_tracking();
         Self::invalidate_keyup_debounce_with_parse_generation(runtime, true);
     }
@@ -285,11 +328,11 @@ impl SqlEditorWidget {
                             .cloned()
                     }
                     .unwrap_or_else(|| {
-                            Self::build_routine_symbol_cache_entry(
-                                snapshot_for_thread.buffer_revision,
-                                &expanded_statement,
-                                text_bind_names,
-                            )
+                        Self::build_routine_symbol_cache_entry(
+                            snapshot_for_thread.buffer_revision,
+                            &expanded_statement,
+                            text_bind_names,
+                        )
                     });
                     let analysis = Self::build_intellisense_analysis_from_routine_cache(
                         &routine_cache,
@@ -378,11 +421,7 @@ impl SqlEditorWidget {
         match recv_result {
             Ok(Ok(parsed)) => {
                 if !Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    || !Self::is_intellisense_snapshot_current(
-                        &editor,
-                        &runtime,
-                        snapshot.as_ref(),
-                    )
+                    || !Self::is_intellisense_snapshot_current(&editor, &runtime, snapshot.as_ref())
                 {
                     return;
                 }
@@ -411,11 +450,7 @@ impl SqlEditorWidget {
                     &format!("failed to parse intellisense context: {message}"),
                 );
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    && Self::is_intellisense_snapshot_current(
-                        &editor,
-                        &runtime,
-                        snapshot.as_ref(),
-                    )
+                    && Self::is_intellisense_snapshot_current(&editor, &runtime, snapshot.as_ref())
                 {
                     Self::clear_intellisense_ui_state(&intellisense_popup, &runtime);
                 }
@@ -436,11 +471,7 @@ impl SqlEditorWidget {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    && Self::is_intellisense_snapshot_current(
-                        &editor,
-                        &runtime,
-                        snapshot.as_ref(),
-                    )
+                    && Self::is_intellisense_snapshot_current(&editor, &runtime, snapshot.as_ref())
                 {
                     Self::clear_intellisense_ui_state(&intellisense_popup, &runtime);
                 }
@@ -462,12 +493,21 @@ impl SqlEditorWidget {
         let qualifier = snapshot.qualifier.as_deref();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
-        let restrict_to_relation_columns =
-            Self::restricts_to_relation_column_names(deep_ctx.phase);
+        if Self::context_suppresses_completion(context) {
+            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+            return;
+        }
+        let completion_policy =
+            ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
+        let restrict_to_relation_columns = completion_policy.restrict_to_relation_columns;
         let cursor_in_statement = snapshot
             .cursor_pos_usize
             .saturating_sub(analysis.statement_start)
-            .min(analysis.statement_end.saturating_sub(analysis.statement_start));
+            .min(
+                analysis
+                    .statement_end
+                    .saturating_sub(analysis.statement_start),
+            );
         let session_bind_names = if qualifier.is_none()
             && !matches!(context, SqlContext::TableName)
             && !restrict_to_relation_columns
@@ -494,11 +534,10 @@ impl SqlEditorWidget {
         let include_columns = qualifier.is_some()
             || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
 
-        let allow_empty_prefix =
-            qualifier.is_some()
-                || include_columns
-                || matches!(context, SqlContext::TableName)
-                || !local_suggestions.is_empty();
+        let allow_empty_prefix = qualifier.is_some()
+            || include_columns
+            || matches!(context, SqlContext::TableName)
+            || !local_suggestions.is_empty();
         if snapshot.prefix.is_empty() && !allow_empty_prefix {
             // Context no longer allows completion for empty prefix, so hide
             // stale popup state immediately.
@@ -616,27 +655,33 @@ impl SqlEditorWidget {
                 None
             };
             if qualifier.is_none()
-                && matches!(deep_ctx.phase, intellisense_context::SqlPhase::JoinUsingColumnList)
-            {
-                Self::collect_common_column_suggestions(
-                    &snapshot.prefix,
-                    &column_tables,
-                    &data,
+                && matches!(
+                    deep_ctx.phase,
+                    intellisense_context::SqlPhase::JoinUsingColumnList
                 )
-            } else if qualifier.is_some() {
-                data.get_column_suggestions(&snapshot.prefix, column_scope)
-            } else if matches!(context, SqlContext::VariableName | SqlContext::BindValue) {
-                Vec::new()
+            {
+                Self::collect_common_column_suggestions(&snapshot.prefix, &column_tables, &data)
             } else {
-                data.get_suggestions(
+                Self::base_suggestions_for_context(
+                    &mut data,
                     &snapshot.prefix,
-                    include_columns,
+                    qualifier,
                     column_scope,
-                    matches!(context, SqlContext::TableName),
-                    matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+                    include_columns,
+                    context,
+                    restrict_to_relation_columns,
                 )
             }
         };
+        let wildcard_suggestions =
+            Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx);
+        if !wildcard_suggestions.is_empty() {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                wildcard_suggestions,
+                true,
+            );
+        }
         if include_columns && qualifier.is_none() && !restrict_to_relation_columns {
             let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
             suggestions = Self::merge_suggestions_with_derived_columns(
@@ -645,15 +690,14 @@ impl SqlEditorWidget {
                 derived_columns,
             );
         }
-        let context_name_suggestions = if matches!(
-            context,
-            SqlContext::VariableName | SqlContext::BindValue
-        ) || restrict_to_relation_columns
-        {
-            Vec::new()
-        } else {
-            Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
-        };
+        let context_name_suggestions =
+            if matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+                || restrict_to_relation_columns
+            {
+                Vec::new()
+            } else {
+                Self::collect_context_name_suggestions(&snapshot.prefix, deep_ctx, context)
+            };
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_name_suggestions,
@@ -716,6 +760,40 @@ impl SqlEditorWidget {
         )));
         let mut editor = editor.clone();
         let _ = editor.take_focus();
+    }
+
+    fn base_suggestions_for_context(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        qualifier: Option<&str>,
+        column_scope: Option<&[String]>,
+        include_columns: bool,
+        context: SqlContext,
+        restrict_to_relation_columns: bool,
+    ) -> Vec<String> {
+        if qualifier.is_some() {
+            return data.get_column_suggestions(prefix, column_scope);
+        }
+
+        if matches!(context, SqlContext::VariableName | SqlContext::BindValue) {
+            return Vec::new();
+        }
+
+        if matches!(context, SqlContext::TableName) {
+            return data.get_relation_suggestions(prefix);
+        }
+
+        if restrict_to_relation_columns {
+            return data.get_column_suggestions(prefix, column_scope);
+        }
+
+        data.get_suggestions(
+            prefix,
+            include_columns,
+            column_scope,
+            false,
+            matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+        )
     }
 
     fn expand_virtual_table_wildcards(
@@ -854,6 +932,56 @@ impl SqlEditorWidget {
             }
         }
 
+        suggestions
+    }
+
+    fn collect_clause_wildcard_suggestions(
+        prefix: &str,
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let policy = ClauseCompletionPolicy::for_phase(deep_ctx.phase, qualifier.is_some());
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        let mut push_candidate = |candidate: String| {
+            if candidate.is_empty() {
+                return;
+            }
+            let candidate_upper = candidate.to_ascii_uppercase();
+            if !prefix_upper.is_empty() && !candidate_upper.starts_with(prefix_upper.as_str()) {
+                return;
+            }
+            if seen.insert(candidate_upper) {
+                suggestions.push(candidate);
+            }
+        };
+
+        match policy.select_list_wildcard_mode {
+            SelectListWildcardMode::None => {}
+            SelectListWildcardMode::Qualified => {
+                push_candidate("*".to_string());
+            }
+            SelectListWildcardMode::Unqualified => {
+                push_candidate("*".to_string());
+                let current_query_tokens = Self::current_query_tokens(deep_ctx);
+                let current_query_tables =
+                    intellisense_context::collect_tables_in_statement(current_query_tokens);
+                for table_ref in current_query_tables {
+                    let scope_name = table_ref
+                        .alias
+                        .as_deref()
+                        .unwrap_or(table_ref.name.as_str());
+                    let rendered_scope = Self::render_select_list_wildcard_scope(scope_name);
+                    if !rendered_scope.is_empty() {
+                        push_candidate(format!("{rendered_scope}.*"));
+                    }
+                }
+            }
+        }
+
+        suggestions.truncate(MAX_MERGED_SUGGESTIONS);
         suggestions
     }
 
@@ -1001,8 +1129,10 @@ impl SqlEditorWidget {
                 body_ctx.statement_tokens.as_ref(),
                 subq.body_range,
             );
-            let relation_ctx =
-                intellisense_context::analyze_cursor_context(relation_tokens, relation_tokens.len());
+            let relation_ctx = intellisense_context::analyze_cursor_context(
+                relation_tokens,
+                relation_tokens.len(),
+            );
             let mut relation_virtual_table_columns = virtual_table_columns.clone();
 
             for cte in &relation_ctx.ctes {
@@ -1077,15 +1207,12 @@ impl SqlEditorWidget {
             connection,
         );
         columns.extend(wildcard_columns);
-        columns.extend(intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
-            body_tokens,
-        ));
-        columns.extend(intellisense_context::extract_oracle_model_generated_columns(
-            body_tokens,
-        ));
-        columns.extend(intellisense_context::extract_match_recognize_generated_columns(
-            body_tokens,
-        ));
+        columns.extend(
+            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens),
+        );
+        columns.extend(intellisense_context::extract_oracle_model_generated_columns(body_tokens));
+        columns
+            .extend(intellisense_context::extract_match_recognize_generated_columns(body_tokens));
         Self::dedup_column_names_case_insensitive(&mut columns);
         (columns, wildcard_tables)
     }
@@ -1107,21 +1234,6 @@ impl SqlEditorWidget {
             intellisense_data,
             column_sender,
             connection,
-        )
-    }
-
-    fn restricts_to_relation_column_names(phase: intellisense_context::SqlPhase) -> bool {
-        matches!(
-            phase,
-            intellisense_context::SqlPhase::CteColumnList
-                | intellisense_context::SqlPhase::ConflictTargetList
-                | intellisense_context::SqlPhase::JoinUsingColumnList
-                | intellisense_context::SqlPhase::RecursiveCteColumnList
-                | intellisense_context::SqlPhase::DmlSetTargetList
-                | intellisense_context::SqlPhase::InsertColumnList
-                | intellisense_context::SqlPhase::MergeInsertColumnList
-                | intellisense_context::SqlPhase::DmlReturningList
-                | intellisense_context::SqlPhase::LockingColumnList
         )
     }
 
@@ -1174,9 +1286,7 @@ impl SqlEditorWidget {
             .unwrap_or_else(|| deep_ctx.statement_tokens.as_ref())
     }
 
-    fn cursor_token_len_in_current_query(
-        deep_ctx: &intellisense_context::CursorContext,
-    ) -> usize {
+    fn cursor_token_len_in_current_query(deep_ctx: &intellisense_context::CursorContext) -> usize {
         deep_ctx
             .active_query_range
             .map(|range| {
@@ -1200,10 +1310,11 @@ impl SqlEditorWidget {
         None
     }
 
-    fn cursor_is_in_query_level_order_by(
-        deep_ctx: &intellisense_context::CursorContext,
-    ) -> bool {
-        if !matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause) {
+    fn cursor_is_in_query_level_order_by(deep_ctx: &intellisense_context::CursorContext) -> bool {
+        if !matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        ) {
             return false;
         }
 
@@ -1282,9 +1393,13 @@ impl SqlEditorWidget {
                 return;
             };
 
-            if tables.iter().any(|table| table.eq_ignore_ascii_case(&alias)) {
-                if let Some(existing_idx) =
-                    tables.iter().position(|table| table.eq_ignore_ascii_case(&alias))
+            if tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(&alias))
+            {
+                if let Some(existing_idx) = tables
+                    .iter()
+                    .position(|table| table.eq_ignore_ascii_case(&alias))
                 {
                     if existing_idx != 0 {
                         let existing = tables.remove(existing_idx);
@@ -1297,7 +1412,8 @@ impl SqlEditorWidget {
             tables.insert(0, alias);
         }
 
-        let focused_tables = (!deep_ctx.focused_tables.is_empty()).then_some(&deep_ctx.focused_tables);
+        let focused_tables =
+            (!deep_ctx.focused_tables.is_empty()).then_some(&deep_ctx.focused_tables);
         if qualifier.is_some()
             && matches!(
                 deep_ctx.phase,
@@ -1397,8 +1513,9 @@ impl SqlEditorWidget {
         );
 
         if Self::cursor_is_in_query_level_order_by(deep_ctx) {
-            derived_columns
-                .extend(intellisense_context::extract_select_list_columns(current_query_tokens));
+            derived_columns.extend(intellisense_context::extract_select_list_columns(
+                current_query_tokens,
+            ));
         }
 
         Self::dedup_column_names_case_insensitive(&mut derived_columns);
@@ -1570,5 +1687,50 @@ impl SqlEditorWidget {
         false
     }
 
+    fn render_select_list_wildcard_scope(scope_name: &str) -> String {
+        let segments = Self::relation_name_segments(scope_name).unwrap_or_else(|| {
+            let stripped = Self::strip_identifier_quotes(scope_name);
+            if stripped.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![stripped]
+            }
+        });
+        if segments.is_empty() {
+            return String::new();
+        }
 
+        segments
+            .into_iter()
+            .map(|segment| Self::quote_identifier_segment_for_completion(&segment))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn quote_identifier_segment_for_completion(text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return "\"\"".to_string();
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return trimmed.to_string();
+        }
+        if Self::is_unquoted_completion_identifier(trimmed) {
+            return trimmed.to_string();
+        }
+
+        format!("\"{}\"", trimmed.replace('"', "\"\""))
+    }
+
+    fn is_unquoted_completion_identifier(text: &str) -> bool {
+        let mut chars = text.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first.is_ascii_alphabetic() || matches!(first, '_' | '$' | '#')) {
+            return false;
+        }
+
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    }
 }

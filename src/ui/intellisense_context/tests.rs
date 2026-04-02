@@ -7506,19 +7506,22 @@ fn grammar_hierarchical_search_by_clause_stays_column_context() {
 }
 
 #[test]
-fn grammar_hierarchical_search_set_alias_does_not_switch_to_with_clause() {
+fn grammar_hierarchical_search_set_uses_generated_column_name_phase() {
     let ctx =
         analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |");
-    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+    assert_eq!(ctx.phase, SqlPhase::HierarchicalGeneratedColumnName);
+    assert!(!ctx.phase.is_column_context());
+    assert!(ctx.phase.is_generated_name_context());
 }
 
 #[test]
-fn grammar_hierarchical_cycle_set_alias_does_not_switch_to_set_clause() {
+fn grammar_hierarchical_cycle_set_uses_generated_column_name_phase() {
     let ctx = analyze(
         "SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'",
     );
-    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
-    assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.phase, SqlPhase::HierarchicalGeneratedColumnName);
+    assert!(!ctx.phase.is_column_context());
+    assert!(ctx.phase.is_generated_name_context());
 }
 
 #[test]

@@ -5603,7 +5603,10 @@ impl SqlEditorWidget {
                 } else if trimmed.is_empty() {
                     false
                 } else {
-                    Self::line_is_comment_only_with_block_state(raw, &mut in_block_comment)
+                    crate::sql_text::line_is_comment_only_with_block_state(
+                        raw,
+                        &mut in_block_comment,
+                    )
                 };
                 if !is_comment_only && !trimmed.is_empty() {
                     crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
@@ -6550,7 +6553,8 @@ impl SqlEditorWidget {
 
             let trimmed = layouts[idx].trimmed;
             let depth = layouts[idx].parser_depth;
-            let trimmed_upper = trimmed.to_ascii_uppercase();
+            let structural_trimmed = crate::sql_text::auto_format_structural_tail(trimmed);
+            let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
             let incoming_structural_continuation_depth = active_structural_continuation_depth;
@@ -6632,7 +6636,8 @@ impl SqlEditorWidget {
                     Self::split_plain_end_continuation_progress(&line_tokens, frame.kind)
                         .map(|progress| (frame, progress))
                 });
-            let current_query_owner_kind = crate::sql_text::format_query_owner_kind(trimmed);
+            let current_query_owner_kind =
+                crate::sql_text::format_query_owner_kind(structural_trimmed);
             let split_query_owner_lookahead_kind =
                 Self::split_query_owner_lookahead_kind(layouts, idx, next_code_indices);
             let current_line_is_generic_split_query_owner = matches!(
@@ -6759,7 +6764,7 @@ impl SqlEditorWidget {
                     frame.progress_over_line(trimmed, &multiline_clause_paren_profile)
                 });
             let owner_relative_detection_trimmed =
-                sql_text::trim_after_leading_close_parens(trimmed);
+                sql_text::trim_after_leading_close_parens(structural_trimmed);
             let owner_relative_detection_upper =
                 owner_relative_detection_trimmed.to_ascii_uppercase();
             let current_line_tail_is_condition_keyword = starts_with_close_paren
@@ -6787,9 +6792,9 @@ impl SqlEditorWidget {
             let active_owner_relative_frame =
                 Self::active_owner_relative_layout_frame(&owner_relative_frames);
             let current_line_is_pending_partial_multiline_owner =
-                sql_text::format_indented_paren_pending_header_kind(trimmed).is_some();
+                sql_text::format_indented_paren_pending_header_kind(structural_trimmed).is_some();
             let current_line_is_pending_partial_query_owner =
-                sql_text::format_query_owner_pending_header_kind(trimmed).is_some();
+                sql_text::format_query_owner_pending_header_kind(structural_trimmed).is_some();
             let owner_relative_body_header_depth_for_line =
                 active_owner_relative_frame.and_then(|frame| {
                     frame.formatter_body_header_depth(&owner_relative_detection_upper)
@@ -7669,8 +7674,7 @@ impl SqlEditorWidget {
                         Self::split_plain_end_continuation_progress(&next_tokens, frame.kind)
                             .is_some()
                     })
-                }) || (current_line_starts_end_suffix_terminator
-                    && next_line_is_named_plain_end);
+                }) || (current_line_starts_end_suffix_terminator && next_line_is_named_plain_end);
             pending_control_branch_body_depth = (!in_dml_statement
                 && (Self::line_ends_with_then_before_inline_comment(trimmed)
                     || trimmed_upper.trim() == "ELSE"
@@ -7813,12 +7817,12 @@ impl SqlEditorWidget {
                 pending_multiline_clause_owner = continued_multiline_clause_owner
                     .or(completed_partial_multiline_clause_owner)
                     .or_else(|| {
-                        Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
-                            PendingMultilineClauseOwnerLayoutFrame {
+                        Self::line_multiline_clause_owner_header_kind(structural_trimmed).map(
+                            |kind| PendingMultilineClauseOwnerLayoutFrame {
                                 kind,
                                 owner_depth: effective_depth,
-                            }
-                        })
+                            },
+                        )
                     })
                     .or_else(|| {
                         split_model_multiline_owner_tail.then_some(
@@ -7828,30 +7832,29 @@ impl SqlEditorWidget {
                             },
                         )
                     });
-                pending_partial_multiline_clause_owner = if pending_multiline_clause_owner.is_some()
-                {
-                    None
-                } else {
-                    continued_partial_multiline_clause_owner.or_else(|| {
-                        sql_text::format_indented_paren_pending_header_kind(trimmed).map(|kind| {
-                            PendingPartialMultilineClauseOwnerLayoutFrame {
-                                kind,
-                                owner_depth: effective_depth,
-                            }
+                pending_partial_multiline_clause_owner =
+                    if pending_multiline_clause_owner.is_some() {
+                        None
+                    } else {
+                        continued_partial_multiline_clause_owner.or_else(|| {
+                            sql_text::format_indented_paren_pending_header_kind(structural_trimmed)
+                                .map(|kind| PendingPartialMultilineClauseOwnerLayoutFrame {
+                                    kind,
+                                    owner_depth: effective_depth,
+                                })
                         })
-                    })
-                };
+                    };
             }
             pending_partial_query_owner = if current_line_is_standalone_open_paren {
                 None
             } else {
                 continued_partial_query_owner.or_else(|| {
-                    sql_text::format_query_owner_pending_header_kind(trimmed).map(|kind| {
-                        PendingPartialQueryOwnerLayoutFrame {
+                    sql_text::format_query_owner_pending_header_kind(structural_trimmed).map(
+                        |kind| PendingPartialQueryOwnerLayoutFrame {
                             kind,
                             owner_depth: effective_depth,
-                        }
-                    })
+                        },
+                    )
                 })
             };
             pending_plsql_child_query_owner = if let Some(frame) = continued_plsql_child_query_owner
@@ -7860,7 +7863,9 @@ impl SqlEditorWidget {
             } else {
                 Self::completed_plsql_child_query_owner_frame_kind(&trimmed_upper)
                     .or_else(|| {
-                        sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed)
+                        sql_text::format_plsql_child_query_owner_pending_header_kind(
+                            structural_trimmed,
+                        )
                     })
                     .map(|kind| PendingPlsqlChildQueryOwnerLayoutFrame {
                         kind,
@@ -7905,7 +7910,7 @@ impl SqlEditorWidget {
             if depth == 0
                 && !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
-                && Self::is_create_trigger_statement(trimmed)
+                && Self::is_create_trigger_statement(structural_trimmed)
             {
                 trigger_header_frame = Some(TriggerHeaderLayoutFrame { body_depth: 1 });
             }
@@ -8185,60 +8190,6 @@ impl SqlEditorWidget {
         previous.query_base_depth.is_some()
             && next.query_base_depth.is_some()
             && previous.final_depth <= next.final_depth
-    }
-
-    fn line_is_comment_only_with_block_state(line: &str, in_block_comment: &mut bool) -> bool {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            return false;
-        }
-        if !*in_block_comment && Self::is_sqlplus_comment_line(trimmed) {
-            return true;
-        }
-
-        let bytes = trimmed.as_bytes();
-        let mut idx = 0usize;
-        while idx < bytes.len() {
-            if *in_block_comment {
-                let mut closed = false;
-                while idx + 1 < bytes.len() {
-                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                        *in_block_comment = false;
-                        idx += 2;
-                        closed = true;
-                        break;
-                    }
-                    idx += 1;
-                }
-                if !closed {
-                    return true;
-                }
-                continue;
-            }
-
-            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-                idx += 1;
-            }
-
-            if idx >= bytes.len() {
-                return true;
-            }
-
-            let tail = trimmed.get(idx..).unwrap_or_default();
-            if Self::is_sqlplus_comment_line(tail) {
-                return true;
-            }
-
-            if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
-                *in_block_comment = true;
-                idx += 2;
-                continue;
-            }
-
-            return false;
-        }
-
-        true
     }
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
@@ -8598,7 +8549,7 @@ impl SqlEditorWidget {
     }
 
     fn line_starts_with_using_clause(line: &str) -> bool {
-        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        let trimmed_upper = crate::sql_text::auto_format_structural_tail(line).to_ascii_uppercase();
         crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
     }
 
@@ -12139,7 +12090,9 @@ END;"#;
     fn starts_with_plain_end_excludes_qualified_end_suffixes() {
         assert!(SqlEditorWidget::starts_with_plain_end("END"));
         assert!(SqlEditorWidget::starts_with_plain_end("END pkg;"));
-        assert!(SqlEditorWidget::starts_with_plain_end("END /* keep */ pkg;"));
+        assert!(SqlEditorWidget::starts_with_plain_end(
+            "END /* keep */ pkg;"
+        ));
         assert!(!SqlEditorWidget::starts_with_plain_end("END FOR"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END WHILE"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END IF;"));
@@ -22219,6 +22172,73 @@ AND active = 1;"#;
         assert_eq!(
             reformatted, formatted,
             "comment-prefixed close paren indentation should stay stable"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_treats_comment_prefixed_on_and_order_by_as_structural_heads()
+    {
+        let source = r#"SELECT e.empno
+FROM emp e
+JOIN dept d
+/* keep */ ON e.deptno = d.deptno
+/* keep */ AND d.active = 'Y'
+/* keep */ ORDER BY
+e.empno;"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "JOIN dept d")
+            .expect("should contain JOIN line");
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* keep */ ON "))
+            .expect("should contain comment-prefixed ON line");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* keep */ AND "))
+            .expect("should contain comment-prefixed AND line");
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "/* keep */ ORDER BY")
+            .expect("should contain comment-prefixed ORDER BY line");
+        let item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno;")
+            .expect("should contain ORDER BY item line");
+
+        assert_eq!(
+            indent(lines[on_idx]),
+            indent(lines[join_idx]).saturating_add(4),
+            "comment-prefixed ON should stay on the join-condition depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[on_idx]).saturating_add(4),
+            "comment-prefixed AND should stay one level deeper than ON, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[join_idx]),
+            "comment-prefixed ORDER BY should realign to the query-base clause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[item_idx]),
+            indent(lines[order_idx]).saturating_add(4),
+            "item after comment-prefixed ORDER BY should stay on the clause body depth, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::apply_parser_depth_indentation(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "comment-prefixed structural clause lines should keep stable indentation"
         );
     }
 

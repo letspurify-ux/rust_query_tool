@@ -156,7 +156,10 @@ fn column_load_worker_pool_enqueue_returns_err_when_worker_pool_is_empty() {
 
     let result = pool.enqueue(task.clone());
     assert!(result.is_err());
-    assert_eq!(result.err().map(|value| value.table_key), Some(task.table_key));
+    assert_eq!(
+        result.err().map(|value| value.table_key),
+        Some(task.table_key)
+    );
 }
 
 #[test]
@@ -1453,8 +1456,7 @@ fn outer_cte_in_second_set_operator_operand_keeps_virtual_columns_visible() {
 
 #[test]
 fn lateral_subquery_star_virtual_columns_exclude_outer_scope_columns() {
-    let sql_with_cursor =
-        "SELECT src.__CODEX_CURSOR__id \
+    let sql_with_cursor = "SELECT src.__CODEX_CURSOR__id \
          FROM parent_table p \
          CROSS APPLY (SELECT * FROM child_table c WHERE c.parent_id = p.id) src";
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(sql_with_cursor);
@@ -2166,9 +2168,138 @@ fn collect_context_name_suggestions_in_table_context_keep_only_ctes() {
         SqlEditorWidget::collect_context_name_suggestions("", &deep_ctx, SqlContext::TableName);
     let upper: Vec<String> = suggestions.into_iter().map(|s| s.to_uppercase()).collect();
 
-    assert!(upper.contains(&"RECENT_EMP".to_string()), "suggestions: {:?}", upper);
-    assert!(!upper.contains(&"E".to_string()), "suggestions: {:?}", upper);
-    assert!(!upper.contains(&"SUB".to_string()), "suggestions: {:?}", upper);
+    assert!(
+        upper.contains(&"RECENT_EMP".to_string()),
+        "suggestions: {:?}",
+        upper
+    );
+    assert!(
+        !upper.contains(&"E".to_string()),
+        "suggestions: {:?}",
+        upper
+    );
+    assert!(
+        !upper.contains(&"SUB".to_string()),
+        "suggestions: {:?}",
+        upper
+    );
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_for_select_list_include_star_and_scoped_rowsources() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "WITH recent_emp AS (SELECT empno FROM emp) \
+         SELECT | \
+         FROM emp e \
+         JOIN recent_emp ON recent_emp.empno = e.empno \
+         CROSS JOIN (SELECT deptno FROM dept) sub",
+    );
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let suggestions = SqlEditorWidget::collect_clause_wildcard_suggestions("", None, &deep_ctx);
+
+    assert_eq!(suggestions.first().map(String::as_str), Some("*"));
+    assert_has_case_insensitive(&suggestions, "e.*");
+    assert_has_case_insensitive(&suggestions, "recent_emp.*");
+    assert_has_case_insensitive(&suggestions, "sub.*");
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_for_qualified_select_return_bare_star() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT e.| FROM emp e");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let suggestions =
+        SqlEditorWidget::collect_clause_wildcard_suggestions("", Some("e"), &deep_ctx);
+
+    assert_eq!(suggestions, vec!["*".to_string()]);
+}
+
+#[test]
+fn collect_clause_wildcard_suggestions_outside_select_list_are_empty() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM emp e WHERE |");
+
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::WhereClause);
+
+    let suggestions = SqlEditorWidget::collect_clause_wildcard_suggestions("", None, &deep_ctx);
+
+    assert!(suggestions.is_empty(), "suggestions: {:?}", suggestions);
+}
+
+#[test]
+fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["CONFIG".to_string()];
+    data.views = vec!["COUNTS_VIEW".to_string()];
+    data.rebuild_indices();
+
+    let suggestions = SqlEditorWidget::base_suggestions_for_context(
+        &mut data,
+        "co",
+        None,
+        None,
+        false,
+        SqlContext::TableName,
+        false,
+    );
+
+    assert_has_case_insensitive(&suggestions, "CONFIG");
+    assert_has_case_insensitive(&suggestions, "COUNTS_VIEW");
+    assert!(
+        !suggestions.iter().any(|s| s == "COLUMN"),
+        "table context should not leak SQL keywords: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions.iter().any(|s| s == "COALESCE()"),
+        "table context should not leak Oracle functions: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions.iter().any(|s| s == "COUNT()"),
+        "table context should not leak aggregate functions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn base_suggestions_for_restricted_column_context_with_prefix_stay_column_only() {
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["CONFIG".to_string()];
+    data.views = vec!["COUNTS_VIEW".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("EMP", vec!["CODE".to_string(), "COUNT_TOTAL".to_string()]);
+    let column_scope = vec!["EMP".to_string()];
+
+    let suggestions = SqlEditorWidget::base_suggestions_for_context(
+        &mut data,
+        "co",
+        None,
+        Some(column_scope.as_slice()),
+        true,
+        SqlContext::ColumnName,
+        true,
+    );
+
+    assert_has_case_insensitive(&suggestions, "CODE");
+    assert_has_case_insensitive(&suggestions, "COUNT_TOTAL");
+    assert!(
+        !suggestions.iter().any(|s| s.eq_ignore_ascii_case("CONFIG")),
+        "restricted column context should not leak relation names: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions.iter().any(|s| s == "COLUMN"),
+        "restricted column context should not leak SQL keywords: {:?}",
+        suggestions
+    );
+    assert!(
+        !suggestions.iter().any(|s| s == "COALESCE()"),
+        "restricted column context should not leak Oracle functions: {:?}",
+        suggestions
+    );
 }
 
 #[test]
@@ -3848,7 +3979,9 @@ fn collect_derived_columns_for_nested_subquery_order_by_uses_current_projection_
     assert_has_case_insensitive(&derived, "inner_empno");
     assert_has_case_insensitive(&derived, "inner_name");
     assert!(
-        !derived.iter().any(|c| c.eq_ignore_ascii_case("outer_alias")),
+        !derived
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("outer_alias")),
         "outer query alias must not leak into nested subquery ORDER BY: {:?}",
         derived
     );
@@ -3875,7 +4008,9 @@ fn collect_derived_columns_for_cte_body_order_by_uses_current_cte_projection_onl
     assert_has_case_insensitive(&derived, "cte_empno");
     assert_has_case_insensitive(&derived, "cte_name");
     assert!(
-        !derived.iter().any(|c| c.eq_ignore_ascii_case("outer_alias")),
+        !derived
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("outer_alias")),
         "outer SELECT alias must not leak into CTE body ORDER BY: {:?}",
         derived
     );
@@ -3896,12 +4031,16 @@ fn collect_derived_columns_for_analytic_order_by_excludes_select_aliases() {
 
     let derived = SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx);
     assert!(
-        !derived.iter().any(|c| c.eq_ignore_ascii_case("alias_empno")),
+        !derived
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("alias_empno")),
         "analytic ORDER BY must not suggest select-list aliases: {:?}",
         derived
     );
     assert!(
-        !derived.iter().any(|c| c.eq_ignore_ascii_case("running_sal")),
+        !derived
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("running_sal")),
         "analytic ORDER BY must not suggest sibling analytic aliases: {:?}",
         derived
     );
@@ -4186,11 +4325,7 @@ SELECT detail.| FROM detail
         guard.rebuild_indices();
         guard.set_columns_for_table(
             "EMP",
-            vec![
-                "EMPNO".to_string(),
-                "ENAME".to_string(),
-                "SAL".to_string(),
-            ],
+            vec!["EMPNO".to_string(), "ENAME".to_string(), "SAL".to_string()],
         );
     }
     let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
@@ -4541,6 +4676,94 @@ fn classify_intellisense_context_treats_open_for_using_as_bind_context() {
         deep_ctx.statement_tokens.as_ref(),
     );
     assert_eq!(context, SqlContext::BindValue);
+}
+
+#[test]
+fn classify_intellisense_context_treats_recursive_cte_cycle_set_as_generated_name() {
+    let sql_with_cursor =
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) CYCLE n SET | TO 1 DEFAULT 0 SELECT * FROM t";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::RecursiveCteGeneratedColumnName
+    );
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::GeneratedName);
+}
+
+#[test]
+fn classify_intellisense_context_treats_hierarchical_search_set_as_generated_name() {
+    let sql_with_cursor =
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::HierarchicalGeneratedColumnName
+    );
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::GeneratedName);
+}
+
+#[test]
+fn classify_intellisense_context_treats_hierarchical_cycle_set_as_generated_name() {
+    let sql_with_cursor =
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::HierarchicalGeneratedColumnName
+    );
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_eq!(context, SqlContext::GeneratedName);
+}
+
+#[test]
+fn generated_name_context_suppresses_completion() {
+    assert!(SqlEditorWidget::context_suppresses_completion(
+        SqlContext::GeneratedName
+    ));
+    assert!(!SqlEditorWidget::context_suppresses_completion(
+        SqlContext::ColumnName
+    ));
 }
 
 #[test]
@@ -4906,10 +5129,7 @@ fn collect_common_column_suggestions_for_join_using_intersects_columns() {
 #[test]
 fn collect_common_column_suggestions_include_exact_prefix_match() {
     let mut data = IntellisenseData::new();
-    data.set_columns_for_table(
-        "EMPLOYEES",
-        vec!["EMPNO".to_string(), "DEPTNO".to_string()],
-    );
+    data.set_columns_for_table("EMPLOYEES", vec!["EMPNO".to_string(), "DEPTNO".to_string()]);
     data.set_columns_for_table(
         "DEPARTMENTS",
         vec!["DEPTNO".to_string(), "LOCATION_ID".to_string()],

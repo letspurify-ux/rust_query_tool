@@ -1506,24 +1506,11 @@ impl QueryExecutor {
                 continue;
             }
 
-            let was_in_block_comment = in_block_comment;
-            if in_block_comment {
-                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+            if sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
                 contexts.push(context);
                 continue;
             }
-            if trimmed.starts_with("/*") {
-                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
-                contexts.push(context);
-                continue;
-            }
-            if trimmed.starts_with("--")
-                || sql_text::is_sqlplus_comment_line(trimmed)
-                || (was_in_block_comment && trimmed.starts_with("*/"))
-            {
-                contexts.push(context);
-                continue;
-            }
+            sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
 
             let mut closing_query_close_align_depth = None;
             while query_frames
@@ -1535,16 +1522,12 @@ impl QueryExecutor {
                 }
             }
 
-            let trimmed_upper = trimmed.to_ascii_uppercase();
+            let trimmed_upper = sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase();
             let line_has_leading_close_paren =
                 sql_text::line_has_leading_significant_close_paren(trimmed);
             let leading_close_has_mixed_continuation = line_has_leading_close_paren
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
-            let clause_detection_trimmed = if leading_close_has_mixed_continuation {
-                sql_text::trim_after_leading_close_parens(trimmed)
-            } else {
-                trimmed
-            };
+            let clause_detection_trimmed = sql_text::auto_format_structural_tail(trimmed);
             let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
             let is_trigger_header_begin = trigger_header_frame.is_some()
                 && parser_depth == 0
@@ -1614,7 +1597,7 @@ impl QueryExecutor {
                     )
                 });
             let owner_relative_detection_trimmed =
-                sql_text::trim_after_leading_close_parens(trimmed);
+                sql_text::trim_after_leading_close_parens(clause_detection_trimmed);
             let owner_relative_detection_upper =
                 owner_relative_detection_trimmed.to_ascii_uppercase();
             let closes_multiline_clause_owner_depth =
@@ -1775,7 +1758,7 @@ impl QueryExecutor {
                     && clause_kind == Some(AutoFormatClauseKind::Update);
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
-                    && Self::line_is_cte_definition_header(trimmed)
+                    && Self::line_is_cte_definition_header(clause_detection_trimmed)
                 {
                     let cte_base_depth = frame.query_base_depth;
                     context.auto_depth = cte_base_depth;
@@ -2202,7 +2185,9 @@ impl QueryExecutor {
                 && !owner_relative_body_header_line
                 && !Self::line_ends_with_open_paren_before_inline_comment(trimmed)
             {
-                if let Some(owner_kind) = sql_text::format_query_owner_header_kind(trimmed) {
+                if let Some(owner_kind) =
+                    sql_text::format_query_owner_header_kind(clause_detection_trimmed)
+                {
                     if owner_kind == sql_text::FormatQueryOwnerKind::Condition {
                         if let Some(depth_floor) = owner_kind.header_depth_floor(
                             context.query_base_depth,
@@ -2213,7 +2198,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            if let Some(pending_kind) = sql_text::format_query_owner_pending_header_kind(trimmed) {
+            if let Some(pending_kind) =
+                sql_text::format_query_owner_pending_header_kind(clause_detection_trimmed)
+            {
                 context.auto_depth = pending_kind.normalized_current_line_depth(
                     context.auto_depth,
                     context.query_base_depth,
@@ -2281,15 +2268,16 @@ impl QueryExecutor {
                 pending_partial_query_owner = continued_partial_query_owner;
                 if pending_split_query_owner.is_none() && pending_partial_query_owner.is_none() {
                     pending_partial_query_owner =
-                        sql_text::format_query_owner_pending_header_kind(trimmed).map(|kind| {
-                            let owner_base_depth = context.auto_depth;
-                            PendingPartialQueryOwnerFrame {
-                                kind,
-                                owner_align_depth: owner_base_depth,
-                                owner_base_depth,
-                                next_query_head_depth: owner_base_depth.saturating_add(1),
-                            }
-                        });
+                        sql_text::format_query_owner_pending_header_kind(clause_detection_trimmed)
+                            .map(|kind| {
+                                let owner_base_depth = context.auto_depth;
+                                PendingPartialQueryOwnerFrame {
+                                    kind,
+                                    owner_align_depth: owner_base_depth,
+                                    owner_base_depth,
+                                    next_query_head_depth: owner_base_depth.saturating_add(1),
+                                }
+                            });
                 }
             } else {
                 pending_partial_query_owner = None;
@@ -2301,19 +2289,20 @@ impl QueryExecutor {
                 } else if let Some(frame) = continued_plsql_child_query_owner {
                     Some(frame)
                 } else {
-                    sql_text::format_plsql_child_query_owner_pending_header_kind(trimmed).map(
-                        |kind| PendingPlsqlChildQueryOwnerFrame {
-                            kind,
-                            owner_align_depth: context.auto_depth,
-                            owner_base_depth: context.auto_depth,
-                            next_query_head_depth: context.auto_depth.saturating_add(1),
-                            nested_paren_depth:
-                                Self::pending_plsql_child_query_owner_nested_paren_depth_after_line(
-                                    0,
-                                    &multiline_clause_paren_profile,
-                                ),
-                        },
+                    sql_text::format_plsql_child_query_owner_pending_header_kind(
+                        clause_detection_trimmed,
                     )
+                    .map(|kind| PendingPlsqlChildQueryOwnerFrame {
+                        kind,
+                        owner_align_depth: context.auto_depth,
+                        owner_base_depth: context.auto_depth,
+                        next_query_head_depth: context.auto_depth.saturating_add(1),
+                        nested_paren_depth:
+                            Self::pending_plsql_child_query_owner_nested_paren_depth_after_line(
+                                0,
+                                &multiline_clause_paren_profile,
+                            ),
+                    })
                 };
 
             if let Some(frame) = owner_relative_frames.last_mut() {
@@ -2371,7 +2360,10 @@ impl QueryExecutor {
                     None
                 } else {
                     continued_partial_multiline_clause_owner.or_else(|| {
-                        sql_text::format_indented_paren_pending_header_kind(trimmed).map(|kind| {
+                        sql_text::format_indented_paren_pending_header_kind(
+                            clause_detection_trimmed,
+                        )
+                        .map(|kind| {
                             PendingPartialMultilineClauseOwnerFrame {
                                 kind,
                                 owner_depth: Self::auto_format_multiline_owner_depth(
@@ -2994,28 +2986,15 @@ impl QueryExecutor {
 
         for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
-            let was_in_block_comment = in_block_comment;
-
-            if in_block_comment {
-                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
-                continue;
-            }
 
             if trimmed.is_empty() {
                 continue;
             }
 
-            if trimmed.starts_with("/*") {
-                sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+            if sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
                 continue;
             }
-
-            if trimmed.starts_with("--")
-                || sql_text::is_sqlplus_comment_line(trimmed)
-                || (was_in_block_comment && trimmed.starts_with("*/"))
-            {
-                continue;
-            }
+            sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
 
             is_code_line[idx] = true;
         }
@@ -7515,7 +7494,10 @@ impl QueryExecutor {
 mod tests {
     use crate::sql_text;
 
-    use super::{AutoFormatConditionRole, AutoFormatQueryRole, FormatItem, QueryExecutor};
+    use super::{
+        AutoFormatConditionRole, AutoFormatLineSemantic, AutoFormatQueryRole, FormatItem,
+        QueryExecutor,
+    };
 
     #[test]
     fn strip_extra_trailing_semicolons_preserves_plsql_end_terminator() {
@@ -13448,6 +13430,71 @@ END;"#;
             contexts[and_idx].auto_depth,
             contexts[if_idx].auto_depth.saturating_add(1),
             "AND after a pure close line should return to the condition continuation depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_comment_prefixed_on_and_order_by_as_structural_heads() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+JOIN dept d
+/* keep */ ON e.deptno = d.deptno
+/* keep */ AND d.active = 'Y'
+/* keep */ ORDER BY
+e.empno;"#;
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "JOIN dept d")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* keep */ ON "))
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("/* keep */ AND "))
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "/* keep */ ORDER BY")
+            .unwrap_or(0);
+        let item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[on_idx].line_semantic,
+            AutoFormatLineSemantic::JoinConditionClause,
+            "comment-prefixed ON should still classify as a join-condition clause"
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth,
+            contexts[join_idx].auto_depth.saturating_add(1),
+            "comment-prefixed ON should stay one level deeper than JOIN"
+        );
+        assert_eq!(
+            contexts[and_idx].line_semantic,
+            AutoFormatLineSemantic::ConditionContinuation,
+            "comment-prefixed AND should stay on the join-condition continuation path"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[on_idx].auto_depth.saturating_add(1),
+            "comment-prefixed AND should stay one level deeper than the ON owner line"
+        );
+        assert_eq!(
+            contexts[order_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "comment-prefixed ORDER BY should still classify as a query-base clause"
+        );
+        assert_eq!(
+            contexts[item_idx].auto_depth,
+            contexts[order_idx].auto_depth.saturating_add(1),
+            "item after comment-prefixed ORDER BY should stay on the clause body depth"
         );
     }
 

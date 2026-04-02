@@ -188,6 +188,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "GOTO",
     "GRANT",
     "GROUP",
+    "GROUPS",
     "HASH",
     "HAVING",
     "HEAP",
@@ -261,6 +262,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "MAPPING",
     "MATCH",
     "MATCHED",
+    "MATCHES",
     "MATCH_RECOGNIZE",
     "MATERIALIZED",
     "MAX",
@@ -277,6 +279,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "MODEL",
     "MONITORING",
     "MONTH",
+    "MULTISET",
     "NAME",
     "NATURAL",
     "NAV",
@@ -525,6 +528,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "UNIQUE",
     "UNLIMITED",
     "UNLOCK",
+    "UNMATCHED",
     "UNPIVOT",
     "UNTIL",
     "UPDATE",
@@ -568,6 +572,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "XMLELEMENT",
     "XMLEXISTS",
     "XMLFOREST",
+    "XMLNAMESPACES",
     "XMLPARSE",
     "XMLPI",
     "XMLQUERY",
@@ -1200,6 +1205,105 @@ pub(crate) fn update_block_comment_state(trimmed: &str, in_block_comment: &mut b
             i += 1;
         }
     }
+}
+
+/// Returns the meaningful remainder of `line` after skipping leading
+/// whitespace and comment-only prefixes.
+///
+/// This removes any leading `/* ... */` segments and SQL*Plus / `--`
+/// comment-only prefixes so structural classifiers can reason from the first
+/// significant token instead of the raw visual prefix.
+pub(crate) fn trim_leading_sql_comments(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+
+    loop {
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+        }
+
+        let Some(tail) = line.get(idx..) else {
+            return "";
+        };
+        if tail.is_empty() {
+            return tail;
+        }
+        if is_sqlplus_comment_line(tail) {
+            return "";
+        }
+        if tail.starts_with("*/") {
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if tail.starts_with("/*") {
+            let Some(block_end) = tail.find("*/") else {
+                return "";
+            };
+            idx = idx.saturating_add(block_end.saturating_add(2));
+            continue;
+        }
+
+        return tail;
+    }
+}
+
+/// Returns true when a line has no meaningful SQL tokens outside leading
+/// comments, updating `in_block_comment` as it consumes the prefix.
+pub(crate) fn line_is_comment_only_with_block_state(
+    line: &str,
+    in_block_comment: &mut bool,
+) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !*in_block_comment && is_sqlplus_comment_line(trimmed) {
+        return true;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if *in_block_comment {
+            let mut closed = false;
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    *in_block_comment = false;
+                    idx = idx.saturating_add(2);
+                    closed = true;
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            if !closed {
+                return true;
+            }
+            continue;
+        }
+
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+        }
+
+        if idx >= bytes.len() {
+            return true;
+        }
+
+        let tail = trimmed.get(idx..).unwrap_or_default();
+        if is_sqlplus_comment_line(tail) {
+            return true;
+        }
+
+        if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+            *in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+
+        return false;
+    }
+
+    true
 }
 
 /// Returns the prefix before a trailing inline comment, if the line ends with
@@ -3216,7 +3320,7 @@ pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
 /// surviving structural tail (`) ORDER BY` -> `ORDER BY`, `) FOR UPDATE` ->
 /// `FOR UPDATE`, `) AND EXISTS (` -> `AND EXISTS (`).
 pub(crate) fn auto_format_structural_tail(line: &str) -> &str {
-    let trimmed = line.trim_start();
+    let trimmed = trim_leading_sql_comments(line);
     if trimmed.is_empty() {
         return trimmed;
     }
@@ -3955,6 +4059,20 @@ mod tests {
     }
 
     #[test]
+    fn trim_leading_sql_comments_returns_meaningful_structural_tail() {
+        assert_eq!(
+            trim_leading_sql_comments("/* note */ ORDER BY empno"),
+            "ORDER BY empno"
+        );
+        assert_eq!(
+            trim_leading_sql_comments("/* note */ /* next */ ON e.deptno = d.deptno"),
+            "ON e.deptno = d.deptno"
+        );
+        assert_eq!(trim_leading_sql_comments("/* note only */"), "");
+        assert_eq!(trim_leading_sql_comments("-- line comment"), "");
+    }
+
+    #[test]
     fn line_continues_expression_after_leading_close_distinguishes_mixed_and_pure_close_lines() {
         assert!(line_continues_expression_after_leading_close(
             ") AND EXISTS ("
@@ -4229,6 +4347,10 @@ mod tests {
     fn structural_tail_helpers_consume_mixed_leading_close_before_reclassifying_headers() {
         assert_eq!(
             auto_format_structural_tail(") ORDER BY empno"),
+            "ORDER BY empno"
+        );
+        assert_eq!(
+            auto_format_structural_tail("/*keep*/ ORDER BY empno"),
             "ORDER BY empno"
         );
         assert_eq!(
@@ -5308,8 +5430,11 @@ mod tests {
         for keyword in [
             "CONSTRUCTOR",
             "FINAL",
+            "GROUPS",
             "INSTANTIABLE",
             "MAP",
+            "MATCHES",
+            "MULTISET",
             "OVERRIDING",
             "PACKAGE_BODY",
             "RECOGNIZE",
@@ -5320,8 +5445,10 @@ mod tests {
             "STATIC",
             "SUBMULTISET",
             "TABLESAMPLE",
+            "UNMATCHED",
             "WRAPPED",
             "XML",
+            "XMLNAMESPACES",
         ] {
             assert!(
                 is_oracle_sql_keyword(keyword),

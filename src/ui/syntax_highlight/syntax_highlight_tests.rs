@@ -645,6 +645,45 @@ fn test_match_recognize_keywords_highlighting() {
 }
 
 #[test]
+fn test_additional_oracle_structural_keywords_highlighting() {
+    let highlighter = SqlHighlighter::new();
+
+    for (text, keywords) in [
+        (
+            "SELECT * FROM XMLTABLE('/x' PASSING payload COLUMNS id NUMBER PATH '$.id') t",
+            &["XMLTABLE"][..],
+        ),
+        (
+            "WITH XMLNAMESPACES (DEFAULT 'urn:emp') SELECT * FROM dual",
+            &["XMLNAMESPACES"][..],
+        ),
+        (
+            "SELECT CAST(COLLECT(empno) AS sys.odcinumberlist) MULTISET UNION DISTINCT SELECT CAST(COLLECT(empno) AS sys.odcinumberlist) FROM emp",
+            &["MULTISET"][..],
+        ),
+        (
+            "SELECT sum(sal) OVER (ORDER BY empno GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM emp",
+            &["GROUPS"][..],
+        ),
+        (
+            "SELECT * FROM sales MATCH_RECOGNIZE (WITH UNMATCHED ROWS SHOW EMPTY MATCHES PATTERN (A B+))",
+            &["UNMATCHED", "MATCHES"][..],
+        ),
+    ] {
+        let styles = highlighter.generate_styles(text);
+
+        for keyword in keywords {
+            let start = text.find(keyword).unwrap_or(0);
+            let end = start + keyword.len();
+            assert!(
+                styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+                "{keyword} should be highlighted as keyword in: {text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_path_in_recursive_cte_column_list_is_not_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "WITH r (node_id, parent_id, node_name, lvl, path) AS (\n\

@@ -1081,6 +1081,13 @@ fn should_treat_function_name_as_identifier(
         return false;
     }
 
+    if sql_text::is_oracle_sql_keyword(upper)
+        && next_significant_token_kind(text, bytes, word_end)
+            == Some(SignificantTokenKind::LeftParen)
+    {
+        return false;
+    }
+
     if next_significant_token_is_member_access_dot(text, bytes, word_end) {
         return true;
     }
@@ -1227,6 +1234,7 @@ enum SignificantTokenKind {
     Number,
     String,
     QuotedIdentifier,
+    LeftParen,
     RightParen,
     Comma,
     Dot,
@@ -1268,6 +1276,10 @@ fn next_significant_token(text: &str, bytes: &[u8], mut idx: usize) -> Option<Si
         }
 
         return match byte {
+            b'(' => Some(SignificantToken {
+                kind: SignificantTokenKind::LeftParen,
+                start: idx,
+            }),
             b',' => Some(SignificantToken {
                 kind: SignificantTokenKind::Comma,
                 start: idx,

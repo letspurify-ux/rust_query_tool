@@ -467,6 +467,35 @@ impl IntellisenseData {
         suggestions
     }
 
+    pub fn get_relation_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+
+        let prefix_upper = prefix.to_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        if Self::push_entries(
+            &self.table_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        ) {
+            Self::dedup_suggestions_case_insensitive(&mut suggestions);
+            return suggestions;
+        }
+
+        let _ = Self::push_entries(
+            &self.view_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        );
+
+        Self::dedup_suggestions_case_insensitive(&mut suggestions);
+        suggestions.truncate(MAX_SUGGESTIONS);
+        suggestions
+    }
+
     pub fn get_column_suggestions(
         &mut self,
         prefix: &str,
@@ -1361,7 +1390,7 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
 // Detect context for smarter suggestions (after FROM, after SELECT, etc.)
 // Uses the deep context analyzer for accurate depth-aware detection.
 pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
-    use crate::ui::intellisense_context::{self, SqlPhase};
+    use crate::ui::intellisense_context;
     use crate::ui::sql_editor::query_text::tokenize_sql_spanned;
 
     let end = normalize_cursor_pos(text, cursor_pos);
@@ -1373,7 +1402,27 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         .collect::<Vec<_>>();
     let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-    match ctx.phase {
+    sql_context_for_phase(ctx.phase)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum SqlContext {
+    General,
+    TableName,
+    ColumnName,
+    ColumnOrAll,
+    VariableName,
+    BindValue,
+    GeneratedName,
+}
+
+pub(crate) fn sql_context_for_phase(
+    phase: crate::ui::intellisense_context::SqlPhase,
+) -> SqlContext {
+    use crate::ui::intellisense_context::SqlPhase;
+
+    match phase {
         SqlPhase::FromClause
         | SqlPhase::IntoClause
         | SqlPhase::UpdateTarget
@@ -1393,8 +1442,8 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         | SqlPhase::InsertColumnList
         | SqlPhase::MergeInsertColumnList
         | SqlPhase::DmlReturningList
-        | SqlPhase::LockingColumnList => SqlContext::ColumnName,
-        SqlPhase::WhereClause
+        | SqlPhase::LockingColumnList
+        | SqlPhase::WhereClause
         | SqlPhase::JoinCondition
         | SqlPhase::GroupByClause
         | SqlPhase::HavingClause
@@ -1406,19 +1455,11 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         | SqlPhase::PivotClause
         | SqlPhase::MatchRecognizeClause
         | SqlPhase::ModelClause => SqlContext::ColumnName,
+        SqlPhase::RecursiveCteGeneratedColumnName | SqlPhase::HierarchicalGeneratedColumnName => {
+            SqlContext::GeneratedName
+        }
         _ => SqlContext::General,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-pub enum SqlContext {
-    General,
-    TableName,
-    ColumnName,
-    ColumnOrAll,
-    VariableName,
-    BindValue,
 }
 
 #[cfg(test)]
@@ -1503,6 +1544,22 @@ mod intellisense_tests {
         // prefix, but table names are still returned.
         assert!(suggestions.contains(&"EMP".to_string()));
         assert!(!suggestions.contains(&"SELECT".to_string()));
+    }
+
+    #[test]
+    fn get_relation_suggestions_non_empty_prefix_stays_relation_only() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["CONFIG".to_string()];
+        data.views = vec!["COUNTS_VIEW".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_relation_suggestions("co");
+
+        assert!(suggestions.iter().any(|s| s == "CONFIG"));
+        assert!(suggestions.iter().any(|s| s == "COUNTS_VIEW"));
+        assert!(!suggestions.iter().any(|s| s == "COLUMN"));
+        assert!(!suggestions.iter().any(|s| s == "COALESCE()"));
+        assert!(!suggestions.iter().any(|s| s == "COUNT()"));
     }
 
     #[test]
@@ -1720,6 +1777,51 @@ mod intellisense_tests {
             &sql_with_cursor[cursor + 1..]
         );
         assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_recursive_cte_cycle_set_is_generated_name() {
+        let sql_with_cursor =
+            "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) CYCLE n SET | TO 1 DEFAULT 0 SELECT * FROM t";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::GeneratedName);
+    }
+
+    #[test]
+    fn detect_sql_context_hierarchical_search_set_is_generated_name() {
+        let sql_with_cursor =
+            "SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::GeneratedName);
+    }
+
+    #[test]
+    fn detect_sql_context_hierarchical_cycle_set_is_generated_name() {
+        let sql_with_cursor =
+            "SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::GeneratedName);
     }
 
     #[test]

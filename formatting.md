@@ -76,6 +76,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 주석/문자열/quoted identifier 안의 토큰은 depth event를 만들거나 지우면 안 된다.
 
 - trailing inline comment나 inline block comment가 split owner/open/close recognition을 끊으면 안 된다.
+- leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
 - `END /* gap */ IF`, `END -- gap` 다음 suffix line, `) /* gap */ ORDER BY` 같은 형태도 주석을 제거한 structural token sequence로 판정해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
 
@@ -155,7 +156,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - 일반 괄호 표현식
 - 서브쿼리 소유 괄호
 - `BEGIN … END`, `CASE … END`, `IF … END IF` 블록
-- `OVER (…)`, `WITHIN GROUP (…)`, `MATCH_RECOGNIZE (…)`, `PIVOT (…)` 같은 multiline clause owner
+- `OVER (…)`, `WITHIN GROUP (…)`, `WINDOW (…)`, `MATCH_RECOGNIZE (…)`, `PIVOT (…)`, `UNPIVOT (…)`, `MODEL (…)`, `JSON_TABLE ... NESTED/COLUMNS (...)` 같은 multiline clause owner
+- `CURSOR ... IS`, `OPEN ... FOR`, control-body query owner 같은 PL/SQL child-query owner
 - `THEN`, `ELSE`, `EXCEPTION` body owner
 - `MERGE WHEN ... THEN`, `INSERT ALL/FIRST`, `FORALL` 같은 DML/PLSQL body owner
 - `CREATE TRIGGER` header body owner
