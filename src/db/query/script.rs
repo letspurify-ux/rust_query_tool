@@ -2918,12 +2918,11 @@ impl QueryExecutor {
     }
 
     fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
-        Self::trailing_significant_byte_before_inline_comment(line) == Some(b'(')
+        sql_text::line_ends_with_open_paren_before_inline_comment(line)
     }
 
     fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
-        let prefix = Self::trailing_inline_comment_prefix(line).unwrap_or(line);
-        prefix.trim() == "("
+        sql_text::line_is_standalone_open_paren_before_inline_comment(line)
     }
 
     fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
@@ -3248,7 +3247,7 @@ impl QueryExecutor {
     }
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
-        Self::trailing_significant_byte_before_inline_comment(line) == Some(b',')
+        sql_text::line_ends_with_comma_before_inline_comment(line)
     }
 
     fn line_is_standalone_from_clause_header(trimmed_upper: &str) -> bool {
@@ -3325,7 +3324,7 @@ impl QueryExecutor {
             return None;
         }
 
-        let prefix = Self::trailing_inline_comment_prefix(line)?;
+        let prefix = sql_text::trailing_inline_comment_prefix(line)?;
         let trimmed = prefix.trim_end();
         if trimmed.is_empty() || trimmed.ends_with(';') {
             return None;
@@ -3424,73 +3423,6 @@ impl QueryExecutor {
         )
     }
 
-    fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
-        let bytes = line.as_bytes();
-        let mut idx = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-
-        while idx < bytes.len() {
-            let current = bytes[idx];
-
-            if in_single_quote {
-                if current == b'\'' {
-                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
-                        idx += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if current == b'"' {
-                    in_double_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if current == b'\'' {
-                in_single_quote = true;
-                idx += 1;
-                continue;
-            }
-            if current == b'"' {
-                in_double_quote = true;
-                idx += 1;
-                continue;
-            }
-
-            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-                return line.get(..idx);
-            }
-
-            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-                let comment_start = idx;
-                idx += 2;
-                while idx + 1 < bytes.len() {
-                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                        let comment_end = idx + 2;
-                        let suffix = line.get(comment_end..).unwrap_or_default().trim();
-                        if suffix.is_empty() {
-                            return line.get(..comment_start);
-                        }
-                        return None;
-                    }
-                    idx += 1;
-                }
-                return None;
-            }
-
-            idx += 1;
-        }
-
-        None
-    }
-
     fn trailing_identifier_before_inline_comment(line: &str) -> Option<&str> {
         let bytes = line.as_bytes();
         let mut idx = 0usize;
@@ -3551,62 +3483,6 @@ impl QueryExecutor {
         }
 
         last_identifier.and_then(|(start, end)| line.get(start..end))
-    }
-
-    fn trailing_significant_byte_before_inline_comment(line: &str) -> Option<u8> {
-        let bytes = line.as_bytes();
-        let mut idx = 0usize;
-        let mut last_non_ws: Option<u8> = None;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-
-        while idx < bytes.len() {
-            let current = bytes[idx];
-
-            if in_single_quote {
-                if current == b'\'' {
-                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
-                        idx += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if current == b'"' {
-                    in_double_quote = false;
-                }
-                idx += 1;
-                continue;
-            }
-
-            if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-                break;
-            }
-            if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-                break;
-            }
-            if current == b'\'' {
-                in_single_quote = true;
-                idx += 1;
-                continue;
-            }
-            if current == b'"' {
-                in_double_quote = true;
-                idx += 1;
-                continue;
-            }
-
-            if !current.is_ascii_whitespace() {
-                last_non_ws = Some(current);
-            }
-            idx += 1;
-        }
-
-        last_non_ws
     }
 
     pub fn strip_leading_comments(sql: &str) -> String {
@@ -12121,8 +11997,7 @@ hiredate;"#;
             .unwrap_or(0);
 
         assert_eq!(
-            contexts[order_by_idx].auto_depth,
-            contexts[select_idx].auto_depth,
+            contexts[order_by_idx].auto_depth, contexts[select_idx].auto_depth,
             "mixed leading-close `) ORDER BY` should align with the outer query base depth"
         );
         assert_eq!(
@@ -12131,8 +12006,7 @@ hiredate;"#;
             "ORDER BY item after mixed leading-close header should use the structural header continuation depth"
         );
         assert_eq!(
-            contexts[first_item_idx].query_base_depth,
-            contexts[order_by_idx].query_base_depth,
+            contexts[first_item_idx].query_base_depth, contexts[order_by_idx].query_base_depth,
             "ORDER BY item after mixed leading-close header should preserve the outer query base"
         );
     }
@@ -12164,8 +12038,7 @@ job;"#;
             .unwrap_or(0);
 
         assert_eq!(
-            contexts[group_by_idx].auto_depth,
-            contexts[select_idx].auto_depth,
+            contexts[group_by_idx].auto_depth, contexts[select_idx].auto_depth,
             "mixed leading-close `) GROUP BY` should align with the outer query base depth"
         );
         assert_eq!(
@@ -12174,8 +12047,7 @@ job;"#;
             "GROUP BY item after mixed leading-close header should use the structural header continuation depth"
         );
         assert_eq!(
-            contexts[first_item_idx].query_base_depth,
-            contexts[group_by_idx].query_base_depth,
+            contexts[first_item_idx].query_base_depth, contexts[group_by_idx].query_base_depth,
             "GROUP BY item after mixed leading-close header should preserve the outer query base"
         );
     }

@@ -268,6 +268,14 @@ split owner/header가 다음 줄까지 이어지는 경우:
 
 query/body/continuation depth는 이미 정규화된 구조 컨텍스트(`parser_depth`, `auto_depth`, `query_base_depth`, `next_query_head_depth`, pending/completed owner state, explicit continuation state)로만 전달해야 한다.
 
+lossy pending state는 금지한다.
+
+- deferred query head, completed owner anchor, pure/mixed close align, parenthesized `CASE` close, standalone `(` wrapper carry처럼 다음 code line까지 미뤄지는 구조 상태는
+  "깊이 하나"만 들고 가면 안 된다.
+- 필요한 의미가 `owner align depth`, `owner base depth`, `next query head depth`, `close align depth`, `general paren floor` 중 무엇인지 구분해서 그대로 보존해야 한다.
+- 이 정보가 사라진 뒤 `직전 줄이 '('였다`, `직전 줄 END 뒤에 inline comment가 있었다`, `직전 줄이 CURSOR header였다` 같은 line-shape heuristic로 depth를 복원하면 문서 위반이다.
+- line-shape 정보는 "지금 pending state를 소비할 타이밍인가" 같은 lexical adjacency 판별에만 사용할 수 있다.
+
 새 owner family는 `sql_text` 분류 helper 추가 → analyzer context 반영 → formatter phase 2 반영 순서로 넣고, 세 단계가 동일한 push/pop 의미를 공유해야 한다.
 
 렌더링 단계는 구조 depth를 그대로 공백으로 직렬화하는 단계다.

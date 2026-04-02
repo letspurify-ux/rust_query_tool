@@ -1196,6 +1196,133 @@ pub(crate) fn update_block_comment_state(trimmed: &str, in_block_comment: &mut b
     }
 }
 
+/// Returns the prefix before a trailing inline comment, if the line ends with
+/// `-- ...` or `/* ... */` after skipping quoted SQL literals.
+///
+/// Returns `None` when the line has no trailing inline comment or when a block
+/// comment is followed by additional significant SQL text.
+pub(crate) fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut q_quote_end: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'-') {
+            return line.get(..idx);
+        }
+
+        if current == b'/' && next == Some(b'*') {
+            let comment_start = idx;
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    let comment_end = idx.saturating_add(2);
+                    let suffix = line.get(comment_end..).unwrap_or_default().trim();
+                    if suffix.is_empty() {
+                        return line.get(..comment_start);
+                    }
+                    return None;
+                }
+                idx = idx.saturating_add(1);
+            }
+            return None;
+        }
+
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    None
+}
+
+/// Returns the last non-whitespace ASCII byte before a trailing inline comment.
+pub(crate) fn trailing_significant_byte_before_inline_comment(line: &str) -> Option<u8> {
+    line_trailing_identifiers_before_inline_comment(line, 0).0
+}
+
+pub(crate) fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
+    trailing_significant_byte_before_inline_comment(line) == Some(b'(')
+}
+
+pub(crate) fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+    trailing_significant_byte_before_inline_comment(line) == Some(b',')
+}
+
+pub(crate) fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
+    let prefix = trailing_inline_comment_prefix(line).unwrap_or(line);
+    prefix.trim() == "("
+}
+
 /// Returns true if `word` is one of the shared Oracle SQL keywords.
 #[inline]
 pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {
@@ -2750,24 +2877,6 @@ fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
             .all(|(token, expected)| token.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
 }
 
-fn line_ends_with_identifier_sequence_open_paren(line: &str, sequence: &[&str]) -> bool {
-    let (last_significant_byte, trailing_identifiers) =
-        line_trailing_identifiers_before_inline_comment(line, sequence.len());
-    if last_significant_byte != Some(b'(') {
-        return false;
-    }
-
-    if sequence.is_empty() {
-        return true;
-    }
-
-    trailing_identifiers.len() == sequence.len()
-        && trailing_identifiers
-            .iter()
-            .zip(sequence.iter())
-            .all(|(token, expected)| token.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
-}
-
 fn line_ends_with_pivot_owner(line: &str) -> bool {
     line_ends_with_identifier_sequence(line, &["PIVOT"])
         || line_ends_with_identifier_sequence(line, &["PIVOT", "XML"])
@@ -2803,24 +2912,12 @@ fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
     line_ends_with_identifier_sequence(line, &[keyword])
 }
 
-fn line_ends_with_keyword_open_paren(line: &str, keyword: &str) -> bool {
-    if keyword.is_empty() {
-        return line_ends_with_identifier_sequence_open_paren(line, &[]);
-    }
-
-    line_ends_with_identifier_sequence_open_paren(line, &[keyword])
-}
-
 /// Returns the structured formatter block kind when a line owns a multiline
 /// parenthesized body that should be tracked on a dedicated indentation stack.
 pub(crate) fn format_indented_paren_owner_kind(line: &str) -> Option<FormatIndentedParenOwnerKind> {
     line_ends_with_open_paren_before_inline_comment(line)
         .then(|| format_indented_paren_owner_header_kind(line))
         .flatten()
-}
-
-fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
-    line_ends_with_keyword_open_paren(line, "")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3864,6 +3961,23 @@ mod tests {
     }
 
     #[test]
+    fn trailing_inline_comment_helpers_ignore_q_quotes_and_preserve_structural_tail() {
+        assert_eq!(
+            trailing_inline_comment_prefix("q'[-- kept literal]' -- real comment"),
+            Some("q'[-- kept literal]' ")
+        );
+        assert!(line_ends_with_open_paren_before_inline_comment(
+            "nq'<, )>' ( -- wrapper"
+        ));
+        assert!(line_is_standalone_open_paren_before_inline_comment(
+            "( /* wrap */"
+        ));
+        assert!(line_ends_with_comma_before_inline_comment(
+            "q'[/* literal */]' , -- trailing comma"
+        ));
+    }
+
+    #[test]
     fn format_inline_comment_header_continuation_kind_tracks_clause_and_subclause_headers() {
         assert_eq!(
             format_inline_comment_header_continuation_kind(None, "WITH"),
@@ -3989,8 +4103,14 @@ mod tests {
 
     #[test]
     fn structural_tail_helpers_consume_mixed_leading_close_before_reclassifying_headers() {
-        assert_eq!(auto_format_structural_tail(") ORDER BY empno"), "ORDER BY empno");
-        assert_eq!(auto_format_structural_tail("/*c*/ ) FOR UPDATE"), "FOR UPDATE");
+        assert_eq!(
+            auto_format_structural_tail(") ORDER BY empno"),
+            "ORDER BY empno"
+        );
+        assert_eq!(
+            auto_format_structural_tail("/*c*/ ) FOR UPDATE"),
+            "FOR UPDATE"
+        );
         assert_eq!(
             format_bare_structural_header_continuation_kind(") ORDER BY"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
@@ -4715,9 +4835,7 @@ mod tests {
         assert!(line_is_create_query_body_header(
             "CREATE MATERIALIZED VIEW mv_demo AS"
         ));
-        assert!(line_is_create_query_body_header(
-            "CREATE TABLE t_demo AS"
-        ));
+        assert!(line_is_create_query_body_header("CREATE TABLE t_demo AS"));
         assert!(line_is_create_query_body_header(
             "CREATE GLOBAL TEMPORARY TABLE t_demo AS"
         ));
