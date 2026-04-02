@@ -54,6 +54,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 한 줄에서 끝나지 않는 구조 효과는 "깊이 하나"로 축약하면 안 된다.
 
 - split owner/header
+- split `MERGE WHEN ... THEN` branch header
 - completed owner anchor
 - deferred query head
 - pure/mixed close align
@@ -63,12 +64,16 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 이런 상태는 필요한 의미를 잃지 않는 typed pending state로 유지해야 한다.
 
+- 같은 line이 dedicated pending family와 generic owner/header carry에 동시에 등록되면 안 된다.
+- 예를 들어 active `MERGE` branch header의 `WHEN NOT` / standalone `NOT` fragment는 merge-header pending state로만 남아야지, generic `NOT EXISTS` owner carry로 중복 승격되면 안 된다.
+
 ### 1.6 analyzer와 formatter는 같은 semantics를 공유해야 한다
 
 `auto_format_line_contexts`와 formatter phase 2는 같은 구조 의미를 공유해야 한다.
 
 - 한 phase만 아는 owner/frame은 허용하지 않는다.
 - stable anchor, owner-relative family, continuation boundary도 같은 semantics를 따라야 한다.
+- exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
 - 특정 구문이 애매하면 "같은 semantic decision을 양쪽에서 재현한다"가 원칙이고, helper를 하나로 합칠지 전용 판별식을 둘지는 구현 전략이다.
 
 ### 1.7 comment와 quoted literal은 구조 이벤트가 아니다
@@ -78,8 +83,12 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - trailing inline comment나 inline block comment가 split owner/open/close recognition을 끊으면 안 된다.
 - leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
 - line head prefix 판정도 예외가 아니다. `CREATE /* gap */ MATERIALIZED /* gap */ VIEW ... AS`, `OPEN c /* gap */ FOR`, `CURSOR c /* gap */ IS`, `WHEN /* gap */ NOT /* gap */ MATCHED THEN`, `MATCH /* gap */ RECOGNIZE` 같은 multi-keyword owner/header는 raw prefix string이나 `contains()`가 아니라 comment-stripped meaningful identifier sequence로 판정해야 한다.
+- underscore를 가진 composite keyword(`MATCH_RECOGNIZE`, `DENSE_RANK` 등)도 예외가 아니다. 구현 내부 표현이 단일 identifier이든, comment/whitespace 때문에 여러 identifier segment로 보이든 structural classifier는 같은 keyword sequence로 취급해야 한다.
+- 이 원칙은 leading/trailing header continuation classifier와 owner-relative split body-header matcher에도 동일하게 적용된다. 특정 phase만 raw word pair 비교를 쓰면 같은 composite keyword가 줄 위치에 따라 다른 depth를 만들게 된다.
+- same-line classifier뿐 아니라 next/previous-line lookahead도 예외가 아니다. split owner lookahead, blank-line suppression, case-close alignment, control-condition close 판정처럼 "인접 line의 첫 구조 토큰"을 보는 로직도 raw `trim()`/`starts_with()`가 아니라 comment-stripped structural tail 기준으로 판정해야 한다.
 - `END /* gap */ IF`, `END -- gap` 다음 suffix line, `) /* gap */ ORDER BY` 같은 형태도 주석을 제거한 structural token sequence로 판정해야 한다.
 - line tail/suffix 판정도 예외가 아니다. `GROUP /* gap */ BY -- ...`, `FOR /* gap */ UPDATE -- ...`, `IF ... /* gap */ THEN`처럼 split header나 trailing terminator를 판정할 때도 raw whitespace split이 아니라 comment-stripped meaningful identifier sequence를 사용해야 한다.
+- statement terminator 판정도 예외가 아니다. `OPEN c_emp; -- done`, `CURSOR c_emp IS; /* impossible but lexical */`, `END; -- block close` 같은 line은 raw `trim_end().ends_with(';')`가 아니라 inline comment를 제거한 뒤의 마지막 meaningful token으로 닫힘 여부를 판정해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
 
 ## 2. 구조 계약
@@ -136,6 +145,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - split owner/header chain은 최초 owner line의 구조 depth를 보존한다.
 - split PL/SQL child-query header도 header 완성 전까지 owner depth를 유지한다.
+- split `MERGE WHEN ... THEN` header도 `WHEN`/`WHEN NOT`/`MATCHED` fragment와 standalone `WHEN MATCHED`/`WHEN NOT MATCHED` header line은 owner depth를 유지하고, 그 다음 header condition/standalone `THEN` consuming line만 `owner depth + 1`을 사용한다.
+- split header condition 안에 nested child query/owner가 들어오면 retained header state는 즉시 해제되지 않고 suspend 된다. nested child가 닫힌 뒤 merge-header를 다시 소비하는 line(`THEN`, `) THEN`, 이어지는 condition line)에서 resume 되어야 한다.
 - split plain `END` suffix/label carry도 qualifier/label token이 comment에 가려져도 owner depth를 잃지 않는다.
 - continuation state는 blank/comment-only/comma-only line에서 소비되지 않는다.
 - continuation state는 첫 consuming code line 또는 새 owner/clause/query boundary에서만 소비되거나 해제된다.
@@ -174,26 +185,35 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - join condition boundary: `ON`, `USING`
 - dedicated clause boundary: `FOR UPDATE`
 - owner boundary: shared `sql_text` helper가 인식하는 query owner / multiline owner / PL/SQL child-query owner
+- merge branch header boundary: `WHEN`, `WHEN NOT`, `WHEN MATCHED`, `WHEN NOT MATCHED`
 - standalone `(` wrapper line
 
 주의:
 
 - mixed leading-close line은 raw line이 아니라 close를 소비한 structural tail로 위 taxonomy에 대입한다.
 - `FOR UPDATE`처럼 다른 keyword와 충돌 가능한 구문은 현재 policy상 dedicated handling을 둔다.
+- split `MERGE` branch header는 generic condition continuation이 아니라 dedicated pending merge-branch-header state로 처리한다.
+- incomplete split `MERGE` fragment(`WHEN`, `WHEN NOT`)도 shared structural boundary helper가 먼저 끊어줘야 한다. 그래야 generic continuation carry와 dedicated merge-header state가 충돌하지 않는다.
 
 ### 3.3 current bare header continuation taxonomy
 
 현재 bare header continuation depth 분류:
 
+- bare-header carry는 comment를 제거한 structural tail이 "exact keyword-only line"일 때만 켠다. `SELECT DISTINCT`는 bare header지만 `SELECT DISTINCT empno`는 bare header가 아니다.
 - same-depth header: `WITH` 같은 owner/header chain 조각
+- same-depth merge-header header line: retained `WHEN`, `WHEN NOT`, pending state가 넘겨주는 split `MATCHED`, standalone `WHEN MATCHED`, standalone `WHEN NOT MATCHED`
 - query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
-- current-line+1 generic header: `SELECT`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, split `JOIN/APPLY`, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `WITHIN GROUP`, `DENSE_RANK FIRST/LAST`, `AFTER MATCH`, `MATCH SKIP`, `START WITH`, `CONNECT BY`
+- current-line+1 merge-header condition: retained merge-header state가 소비하는 `AND`/`OR` condition line, standalone `THEN`, mixed close tail `) THEN`
+- current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, exact bare `JOIN/APPLY` modifier chain, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
 - owner-relative body header family: `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`
+- owner-relative split-header state machine: active multiline owner 안에서는 `WITHIN -> GROUP`, `DENSE_RANK -> FIRST/LAST -> ORDER -> BY`, `AFTER -> MATCH SKIP -> TO NEXT ROW`, `ROWS -> BETWEEN ...`, `RETURN -> UPDATED/ALL -> ROWS`, `RULES -> AUTOMATIC/SEQUENTIAL -> ORDER` 같은 multi-step sequence를 dedicated state로 추적한다. 이 family는 bare-header carry가 있더라도 final canonical depth를 active owner body depth 기준으로 다시 snap 할 수 있다.
 
 주의:
 
 - `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `MODEL`은 generic bare-header continuation consumer가 아니라 dedicated owner-relative / subclause family로 관리한다.
 - `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`은 generic query-base carry가 아니라 active owner frame의 body depth에 먼저 snap 되어야 한다.
+- split multiline owner/modifier의 exact bare keyword-only line도 generic carry와 dedicated owner-relative state를 같은 shared prefix taxonomy 위에서 해석해야 한다. 단, 최종 `final depth`는 active owner state가 canonicalize한다.
+- split `MERGE` header의 standalone `THEN`은 generic bare-header consumer가 아니라 retained merge-branch-header condition depth를 그대로 사용한다.
 
 ### 3.4 current operator RHS continuation policy
 
@@ -231,6 +251,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - pending owner는 원래 owner depth를 그대로 들고 간다.
 - owner header가 현재 줄에서 완성되어도 child body/query/open wrapper가 다음 줄에 시작하면 completed owner anchor를 유지한다.
+- `MERGE WHEN ... THEN` split header는 header pending state가 `THEN`에서 body-depth token을 방출하기 전까지 branch body depth를 조기 확정하면 안 된다.
+- `MERGE WHEN ... THEN` split header가 nested child query 안으로 들어가면 merge-header pending state는 child query line에서 line-local heuristic로 재구성하면 안 되고, child query가 닫힐 때까지 유지한 뒤 `THEN` 또는 이어지는 merge-header condition line에서 다시 소비해야 한다.
 - plain `END` 뒤 qualifier/label split도 explicit pending state로 유지한다.
 - qualified `END IF;`/`END LOOP;` 뒤 comment gap이 있어도, 다음 code line을 line-shape으로 추측하지 말고 retained scope state로 정렬한다.
 

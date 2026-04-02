@@ -441,6 +441,12 @@ impl PendingPlsqlChildQueryOwnerLayoutFrame {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingMergeBranchHeaderLayoutFrame {
+    kind: sql_text::PendingFormatMergeBranchHeaderKind,
+    owner_depth: usize,
+}
+
 /// Tracks CREATE TRIGGER header scope (BEFORE/FOR EACH ROW/WHEN/REFERENCING).
 /// Active from the first trigger header line until BEGIN is encountered.
 #[derive(Clone, Copy)]
@@ -2400,11 +2406,7 @@ impl SqlEditorWidget {
         split_points.sort_unstable();
         split_points.dedup();
 
-        let mut out = String::with_capacity(
-            formatted
-                .len()
-                .saturating_add(split_points.len()),
-        );
+        let mut out = String::with_capacity(formatted.len().saturating_add(split_points.len()));
         let mut cursor = 0usize;
 
         for split_at in split_points {
@@ -5792,7 +5794,7 @@ impl SqlEditorWidget {
         let line = layouts[idx].trimmed;
         let open_idx = next_code_indices.get(idx).copied().flatten()?;
         let head_idx = next_code_indices.get(open_idx).copied().flatten()?;
-        let head_upper = layouts[head_idx].trimmed.trim_start().to_ascii_uppercase();
+        let head_upper = Self::structural_line_upper(layouts[head_idx].trimmed);
 
         crate::sql_text::split_query_owner_lookahead_kind(
             line,
@@ -5832,7 +5834,7 @@ impl SqlEditorWidget {
                 return ParenLayoutFrameKind::General;
             }
             if next_code_trimmed
-                .is_some_and(|next| Self::line_starts_query_head(&next.to_ascii_uppercase()))
+                .is_some_and(|next| Self::line_starts_query_head(&Self::structural_line_upper(next)))
             {
                 return if is_condition_query_owner {
                     ParenLayoutFrameKind::ConditionQuery
@@ -6446,7 +6448,7 @@ impl SqlEditorWidget {
         }
 
         next_code_trimmed.is_some_and(|next| {
-            let next_upper = next.to_ascii_uppercase();
+            let next_upper = Self::structural_line_upper(next);
             crate::sql_text::SUBQUERY_HEAD_KEYWORDS
                 .iter()
                 .any(|keyword| crate::sql_text::starts_with_keyword_token(&next_upper, keyword))
@@ -6599,6 +6601,9 @@ impl SqlEditorWidget {
         let mut pending_operator_layout_frames: Vec<PendingOperatorLayoutFrame> = Vec::new();
         let mut pending_plsql_child_query_owner: Option<PendingPlsqlChildQueryOwnerLayoutFrame> =
             None;
+        let mut active_merge_query_base_depths: Vec<(usize, usize)> = Vec::new();
+        let mut pending_merge_branch_header: Option<PendingMergeBranchHeaderLayoutFrame> = None;
+        let mut pending_merge_branch_body_depth: Option<usize> = None;
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
         let mut owner_relative_frames: Vec<OwnerRelativeLayoutFrame> = Vec::new();
         let mut pending_multiline_clause_owner: Option<PendingMultilineClauseOwnerLayoutFrame> =
@@ -6647,6 +6652,16 @@ impl SqlEditorWidget {
                 pending_control_branch_body_depth.take();
             let pending_general_open_paren_for_line = pending_general_open_paren.take();
             let pending_forall_body_head_for_line = pending_forall_body_head;
+            let pending_merge_branch_header_for_line = pending_merge_branch_header;
+            pending_merge_branch_header = None;
+            let pending_merge_branch_body_depth_for_line = pending_merge_branch_body_depth.take();
+
+            while active_merge_query_base_depths
+                .last()
+                .is_some_and(|(_, start_parser_depth)| depth < *start_parser_depth)
+            {
+                active_merge_query_base_depths.pop();
+            }
 
             Self::pop_expired_owner_relative_layout_frames(
                 &mut owner_relative_frames,
@@ -6721,6 +6736,41 @@ impl SqlEditorWidget {
                 });
             let current_query_owner_kind =
                 crate::sql_text::format_query_owner_kind(structural_trimmed);
+            let current_line_has_retained_same_depth_merge_fragment =
+                pending_merge_branch_header_for_line.is_some_and(|frame| {
+                    sql_text::line_is_active_merge_branch_same_depth_header_fragment(
+                        structural_trimmed,
+                        true,
+                        Some(frame.kind),
+                    )
+                });
+            let current_line_is_active_merge_base_line = active_merge_query_base_depths
+                .last()
+                .is_some_and(|(merge_base_depth, _)| {
+                    layouts[idx].query_base_depth == Some(*merge_base_depth)
+                })
+                || current_line_has_retained_same_depth_merge_fragment
+                || (starts_dml
+                    && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE"));
+            let pending_merge_branch_header_progress_for_line =
+                current_line_is_active_merge_base_line
+                    .then_some(pending_merge_branch_header_for_line)
+                    .flatten()
+                    .and_then(|frame| {
+                        frame
+                            .kind
+                            .progress_over_line(trimmed)
+                            .map(|progress| (frame, progress))
+                    });
+            let current_line_pending_merge_branch_header_kind =
+                current_line_is_active_merge_base_line
+                    .then(|| sql_text::format_merge_branch_pending_header_kind(structural_trimmed))
+                    .flatten();
+            let current_line_suspends_merge_branch_condition =
+                sql_text::line_suspends_active_merge_branch_condition_state(
+                    structural_trimmed,
+                    pending_merge_branch_header_for_line.map(|frame| frame.kind),
+                );
             let split_query_owner_lookahead_kind =
                 Self::split_query_owner_lookahead_kind(layouts, idx, next_code_indices);
             let current_line_is_generic_split_query_owner = matches!(
@@ -6746,7 +6796,7 @@ impl SqlEditorWidget {
                 pending_partial_query_owner = None;
             }
             let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
-                let next_upper = next.to_ascii_uppercase();
+                let next_upper = Self::structural_line_upper(next);
                 crate::sql_text::starts_with_format_named_plain_end(&next_upper)
             });
             let force_end_suffix_depth = current_line_starts_end_suffix_terminator;
@@ -6790,7 +6840,7 @@ impl SqlEditorWidget {
                         .condition_header_line
                         .and_then(|header_idx| layouts.get(header_idx))
                         .is_some_and(|header| {
-                            let header_upper = header.trimmed.to_ascii_uppercase();
+                            let header_upper = Self::structural_line_upper(header.trimmed);
                             crate::sql_text::starts_with_keyword_token(&header_upper, "IF")
                                 || crate::sql_text::starts_with_keyword_token(
                                     &header_upper,
@@ -6876,8 +6926,16 @@ impl SqlEditorWidget {
                 Self::active_owner_relative_layout_frame(&owner_relative_frames);
             let current_line_is_pending_partial_multiline_owner =
                 sql_text::format_indented_paren_pending_header_kind(structural_trimmed).is_some();
+            let current_line_is_same_depth_merge_branch_header_fragment =
+                sql_text::line_is_active_merge_branch_same_depth_header_fragment(
+                    structural_trimmed,
+                    current_line_is_active_merge_base_line,
+                    pending_merge_branch_header_for_line.map(|frame| frame.kind),
+                );
             let current_line_is_pending_partial_query_owner =
-                sql_text::format_query_owner_pending_header_kind(structural_trimmed).is_some();
+                !current_line_is_same_depth_merge_branch_header_fragment
+                    && sql_text::format_query_owner_pending_header_kind(structural_trimmed)
+                        .is_some();
             let owner_relative_body_header_depth_for_line =
                 active_owner_relative_frame.and_then(|frame| {
                     frame.formatter_body_header_depth(&owner_relative_detection_upper)
@@ -7218,12 +7276,44 @@ impl SqlEditorWidget {
                 current_line_multiline_clause_owner_kind,
                 active_owner_relative_frame,
             );
-            let effective_depth = Self::normalize_pending_query_owner_header_fragment_depth(
-                trimmed,
-                effective_depth,
-                resolved_query_base_depth.or(layouts[idx].query_base_depth),
-                parenthesized_condition_header_depth,
-            );
+            let effective_depth = if current_line_is_same_depth_merge_branch_header_fragment {
+                effective_depth
+            } else {
+                Self::normalize_pending_query_owner_header_fragment_depth(
+                    trimmed,
+                    effective_depth,
+                    resolved_query_base_depth.or(layouts[idx].query_base_depth),
+                    parenthesized_condition_header_depth,
+                )
+            };
+            let effective_depth =
+                if let Some((frame, progress)) = pending_merge_branch_header_progress_for_line {
+                    if progress.uses_condition_depth {
+                        frame.owner_depth.saturating_add(1)
+                    } else {
+                        frame.owner_depth
+                    }
+                } else if current_line_pending_merge_branch_header_kind.is_some() {
+                    resolved_query_base_depth
+                        .or(layouts[idx].query_base_depth)
+                        .unwrap_or(effective_depth)
+                } else {
+                    effective_depth
+                };
+            let effective_depth = if current_line_is_same_depth_merge_branch_header_fragment {
+                pending_merge_branch_header_for_line
+                    .map(|frame| frame.owner_depth)
+                    .or_else(|| {
+                        current_line_pending_merge_branch_header_kind.map(|_| {
+                            resolved_query_base_depth
+                                .or(layouts[idx].query_base_depth)
+                                .unwrap_or(effective_depth)
+                        })
+                    })
+                    .unwrap_or(effective_depth)
+            } else {
+                effective_depth
+            };
             let effective_depth = if current_line_is_direct_split_from_item_query_owner {
                 Self::normalize_direct_split_from_item_owner_depth(
                     &trimmed_upper,
@@ -7336,6 +7426,14 @@ impl SqlEditorWidget {
             } else {
                 effective_depth
             };
+            let current_line_is_merge_branch_action =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT");
+            let effective_depth = pending_merge_branch_body_depth_for_line
+                .filter(|_| current_line_is_merge_branch_action)
+                .map(|depth| depth.max(parser_depth))
+                .unwrap_or(effective_depth);
             let mut continued_plsql_child_query_owner = None;
             let mut continued_multiline_clause_owner = None;
             let mut continued_partial_multiline_clause_owner = None;
@@ -7811,6 +7909,13 @@ impl SqlEditorWidget {
             if starts_query_head {
                 pending_query_head_frames.clear();
             }
+            if starts_query_head
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE")
+                && layouts[idx].query_base_depth.is_some()
+            {
+                active_merge_query_base_depths
+                    .push((layouts[idx].query_base_depth.unwrap_or(0), depth));
+            }
             if let Some(next_query_head_depth) = layouts[idx].next_query_head_depth {
                 if resolved_query_base_depths.is_empty() && !starts_query_head {
                     pending_query_head_frames.clear();
@@ -7928,7 +8033,9 @@ impl SqlEditorWidget {
                         })
                     };
             }
-            pending_partial_query_owner = if current_line_is_standalone_open_paren {
+            pending_partial_query_owner = if current_line_is_standalone_open_paren
+                || current_line_is_same_depth_merge_branch_header_fragment
+            {
                 None
             } else {
                 continued_partial_query_owner.or_else(|| {
@@ -7963,6 +8070,33 @@ impl SqlEditorWidget {
                         .is_some(),
                     })
             };
+            if let Some((frame, progress)) = pending_merge_branch_header_progress_for_line {
+                pending_merge_branch_header =
+                    progress
+                        .next_kind
+                        .map(|kind| PendingMergeBranchHeaderLayoutFrame {
+                            kind,
+                            owner_depth: frame.owner_depth,
+                        });
+                if progress.completed {
+                    pending_merge_branch_body_depth = Some(frame.owner_depth.saturating_add(1));
+                }
+            } else if let Some(kind) = current_line_pending_merge_branch_header_kind {
+                pending_merge_branch_header = Some(PendingMergeBranchHeaderLayoutFrame {
+                    kind,
+                    owner_depth: layouts[idx].final_depth,
+                });
+            } else if crate::sql_text::starts_with_format_merge_branch_header(&trimmed_upper)
+                && Self::line_ends_with_then_before_inline_comment(trimmed)
+            {
+                pending_merge_branch_body_depth = Some(layouts[idx].final_depth.saturating_add(1));
+            } else if current_line_suspends_merge_branch_condition {
+                pending_merge_branch_header = pending_merge_branch_header_for_line;
+            } else if !current_line_is_active_merge_base_line {
+                // Nested child-query lines inside a split MERGE branch header
+                // must suspend the retained header state, not consume it.
+                pending_merge_branch_header = pending_merge_branch_header_for_line;
+            }
             if pending_operator_for_line.is_some() && !pending_operator_layout_frames.is_empty() {
                 pending_operator_layout_frames.pop();
             }
@@ -7971,6 +8105,7 @@ impl SqlEditorWidget {
                 in_query_statement,
                 current_query_owner_kind,
                 current_line_is_pending_partial_query_owner,
+                current_line_is_same_depth_merge_branch_header_fragment,
                 current_line_is_generic_split_query_owner,
                 current_line_is_direct_split_from_item_query_owner,
                 next_code_trimmed,
@@ -8026,6 +8161,9 @@ impl SqlEditorWidget {
                 pending_query_owner_open_align = None;
                 pending_operator_layout_frames.clear();
                 pending_plsql_child_query_owner = None;
+                active_merge_query_base_depths.clear();
+                pending_merge_branch_header = None;
+                pending_merge_branch_body_depth = None;
                 active_structural_continuation_depth = None;
                 pending_split_plain_end_layout_frame = None;
                 pending_control_branch_body_depth = None;
@@ -8075,7 +8213,7 @@ impl SqlEditorWidget {
             }
 
             let previous_trimmed = layouts[prev_idx].trimmed;
-            let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
+            let next_upper = Self::structural_line_upper(layouts[next_idx].trimmed);
             let next_is_case_branch = Self::starts_with_case_branch_keyword(&next_upper);
             if Self::starts_with_case_terminator(previous_trimmed) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
@@ -8262,7 +8400,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let next_upper = next.trimmed.to_ascii_uppercase();
+        let next_upper = Self::structural_line_upper(next.trimmed);
         if !crate::sql_text::starts_with_keyword_token(&next_upper, "CASE") {
             return false;
         }
@@ -8491,6 +8629,7 @@ impl SqlEditorWidget {
         in_query_statement: bool,
         current_query_owner_kind: Option<FormatQueryOwnerKind>,
         current_line_is_pending_partial_query_owner: bool,
+        current_line_is_same_depth_merge_branch_header_fragment: bool,
         current_line_is_generic_split_query_owner: bool,
         current_line_is_direct_split_from_item_query_owner: bool,
         next_code_trimmed: Option<&str>,
@@ -8499,6 +8638,10 @@ impl SqlEditorWidget {
         let Some(kind) = crate::sql_text::format_trailing_continuation_operator_kind(line) else {
             return false;
         };
+
+        if current_line_is_same_depth_merge_branch_header_fragment {
+            return false;
+        }
 
         if matches!(
             kind,
@@ -8622,8 +8765,12 @@ impl SqlEditorWidget {
         false
     }
 
+    fn structural_line_upper(line: &str) -> String {
+        crate::sql_text::auto_format_structural_tail(line).to_ascii_uppercase()
+    }
+
     fn line_starts_with_using_clause(line: &str) -> bool {
-        let trimmed_upper = crate::sql_text::auto_format_structural_tail(line).to_ascii_uppercase();
+        let trimmed_upper = Self::structural_line_upper(line);
         crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
     }
 
@@ -16266,6 +16413,69 @@ AND e.status = 'A';"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_split_exists_owner_depth_across_standalone_open_paren_with_comment_glued_query_head(
+    ) {
+        let source = r#"SELECT e.empno
+FROM emp e
+WHERE EXISTS
+(
+    /* gap */ SELECT 1
+    FROM bonus b
+    WHERE b.empno = e.empno
+)
+AND e.status = 'A';"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE EXISTS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "(")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "/* gap */ SELECT 1")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.status = 'A';")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[exists_idx]),
+            "standalone open paren after EXISTS should stay aligned with the owner line even when the query head is comment-glued, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[select_idx]) > indent(lines[open_idx]),
+            "comment-glued child SELECT after split EXISTS should stay deeper than the standalone open paren, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[exists_idx]),
+            "split EXISTS closing paren should realign with the EXISTS owner line when the query head is comment-glued, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[exists_idx]).saturating_add(4),
+            "AND after comment-glued split EXISTS should return to the outer condition depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_not_exists_header_on_condition_depth() {
         let source = r#"SELECT e.empno
 FROM emp e
@@ -18079,6 +18289,259 @@ VALUES (s.id, s.name);"#;
         );
     }
 
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_merge_header_fragments_and_then_on_structural_depths(
+    ) {
+        let source = r#"MERGE INTO target_table t
+USING source_table s
+ON (t.id = s.id)
+WHEN
+MATCHED
+AND t.is_active = 'Y'
+THEN
+UPDATE SET t.name = s.name
+WHEN
+NOT
+MATCHED
+THEN
+INSERT (id, name)
+VALUES (s.id, s.name);"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_nth_line = |needle: &str, occurrence: usize| -> usize {
+            lines
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, line)| (line.trim_start() == needle).then_some(idx))
+                .nth(occurrence)
+                .unwrap_or(0)
+        };
+
+        let merge_idx = find_nth_line("MERGE INTO target_table t", 0);
+        let when_idx = find_nth_line("WHEN", 0);
+        let matched_idx = find_nth_line("MATCHED", 0);
+        let and_idx = find_nth_line("AND t.is_active = 'Y'", 0);
+        let then_idx = find_nth_line("THEN", 0);
+        let update_idx = find_nth_line("UPDATE SET t.name = s.name", 0);
+        let when_not_idx = find_nth_line("WHEN", 1);
+        let not_idx = find_nth_line("NOT", 0);
+        let second_matched_idx = find_nth_line("MATCHED", 1);
+        let second_then_idx = find_nth_line("THEN", 1);
+        let insert_idx = find_nth_line("INSERT (id, name)", 0);
+        let values_idx = find_nth_line("VALUES (s.id, s.name);", 0);
+
+        assert_eq!(
+            indent(lines[when_idx]),
+            indent(lines[merge_idx]),
+            "split WHEN fragment should stay on the MERGE base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[matched_idx]),
+            indent(lines[merge_idx]),
+            "MATCHED fragment should stay on the MERGE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[merge_idx]).saturating_add(4),
+            "split MERGE branch condition should be exactly one level deeper than the MERGE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[then_idx]),
+            indent(lines[and_idx]),
+            "split THEN line should stay on the active MERGE branch-header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[update_idx]),
+            indent(lines[then_idx]),
+            "UPDATE after split MERGE header should reuse the shared branch body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_not_idx]),
+            indent(lines[merge_idx]),
+            "second split WHEN fragment should stay on the MERGE base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[not_idx]),
+            indent(lines[merge_idx]),
+            "split NOT fragment should stay on the MERGE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[second_matched_idx]),
+            indent(lines[merge_idx]),
+            "second MATCHED fragment should stay on the MERGE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[second_then_idx]),
+            indent(lines[merge_idx]).saturating_add(4),
+            "split THEN after WHEN/NOT/MATCHED fragments should stay on the branch-header depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[insert_idx]),
+            indent(lines[second_then_idx]),
+            "INSERT after split MERGE header should reuse the shared branch body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[values_idx]),
+            indent(lines[insert_idx]),
+            "VALUES should stay on the MERGE INSERT branch depth after split headers, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_merge_header_state_across_nested_query_condition()
+    {
+        let source = r#"MERGE INTO target_table t
+USING source_table s
+ON (t.id = s.id)
+WHEN MATCHED
+AND EXISTS (
+SELECT 1
+FROM dual
+) THEN
+UPDATE SET t.name = s.name
+WHEN NOT MATCHED THEN
+INSERT (id, name)
+VALUES (s.id, s.name);"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let merge_idx = find_line("MERGE INTO target_table t");
+        let when_matched_idx = find_line("WHEN MATCHED");
+        let and_exists_idx = find_line("AND EXISTS (");
+        let select_idx = find_line("SELECT 1");
+        let close_then_idx = find_line(") THEN");
+        let update_idx = find_line("UPDATE SET t.name = s.name");
+        let when_not_matched_idx = find_line("WHEN NOT MATCHED THEN");
+        let insert_idx = find_line("INSERT (id, name)");
+
+        assert_eq!(
+            indent(lines[when_matched_idx]),
+            indent(lines[merge_idx]),
+            "standalone WHEN MATCHED header should stay on the MERGE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_exists_idx]),
+            indent(lines[merge_idx]).saturating_add(4),
+            "MERGE branch condition should open one level deeper than the MERGE owner, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[select_idx]) > indent(lines[and_exists_idx]),
+            "nested SELECT inside MERGE branch condition should indent deeper than AND EXISTS, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_then_idx]),
+            indent(lines[and_exists_idx]),
+            "mixed close THEN line should resume the retained MERGE branch-header depth after the nested query closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[update_idx]),
+            indent(lines[close_then_idx]),
+            "UPDATE after nested-query MERGE header should reuse the shared branch body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_not_matched_idx]),
+            indent(lines[merge_idx]),
+            "later MERGE branch headers should still return to the MERGE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[insert_idx]),
+            indent(lines[when_not_matched_idx]).saturating_add(4),
+            "INSERT in the following MERGE branch should still open one level deeper than WHEN NOT MATCHED, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_not_exists_inside_merge_branch_condition() {
+        let source = r#"MERGE INTO target_table t
+USING source_table s
+ON (t.id = s.id)
+WHEN MATCHED
+AND NOT
+EXISTS (
+SELECT 1
+FROM audit_log a
+WHERE a.target_id = t.id
+)
+THEN
+UPDATE SET t.name = s.name;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let merge_idx = find_line("MERGE INTO target_table t");
+        let and_not_idx = find_line("AND NOT");
+        let exists_idx = find_line("EXISTS (");
+        let select_idx = find_line("SELECT 1");
+        let close_idx = find_line(")");
+        let then_idx = find_line("THEN");
+
+        assert_eq!(
+            indent(lines[and_not_idx]),
+            indent(lines[merge_idx]).saturating_add(4),
+            "AND NOT inside MERGE branch condition should stay one level deeper than the MERGE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[exists_idx]),
+            indent(lines[and_not_idx]),
+            "split EXISTS after AND NOT should stay aligned with the merge branch condition owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[exists_idx]).saturating_add(4),
+            "child SELECT under split NOT EXISTS should stay one level deeper than EXISTS, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[exists_idx]),
+            "closing paren under split NOT EXISTS should realign with EXISTS, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[then_idx]),
+            indent(lines[and_not_idx]),
+            "THEN after split NOT EXISTS should return to the retained merge branch condition depth, got:\n{}",
+            formatted
+        );
+    }
+
     // ── FETCH INTO inline ──
 
     #[test]
@@ -19542,6 +20005,92 @@ AND d.status = 'A';"#;
             indent(lines[inner_where_idx]),
             indent(lines[from_idx]),
             "query clauses after the split LATERAL subquery should restore the inner query base depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_lateral_owner_depth_with_comment_glued_query_head(
+    ) {
+        let source = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+        SELECT 1
+        FROM emp e,
+                    LATERAL
+                                (
+                                    /* gap */ SELECT MAX (b.sal) AS max_sal
+                                    FROM bonus b
+                                    WHERE b.empno = e.empno
+                                ) bonus_view
+        WHERE e.deptno = d.deptno
+    )
+AND d.status = 'A';"#;
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp e,")
+            .unwrap_or(0);
+        let lateral_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "LATERAL")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(lateral_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("/* gap */ SELECT MAX"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(nested_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") bonus_view"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE e.deptno = d.deptno")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[lateral_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "split LATERAL owner line should stay on the structural FROM-item sibling depth even when the child query head is comment-glued, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[lateral_idx]),
+            "standalone open paren after split LATERAL should stay on the LATERAL owner depth when the child query head is comment-glued, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[nested_select_idx]),
+            indent(lines[lateral_idx]).saturating_add(4),
+            "comment-glued child SELECT under split LATERAL should stay one level deeper than the LATERAL owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[lateral_idx]),
+            "split LATERAL closing paren should realign with the LATERAL owner depth when the child query head is comment-glued, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inner_where_idx]),
+            indent(lines[from_idx]),
+            "query clauses after the comment-glued split LATERAL subquery should restore the inner query base depth, got:\n{}",
             formatted
         );
     }
@@ -27758,6 +28307,94 @@ FROM (
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_comment_split_match_recognize_owner_depth() {
+        let source = r#"SELECT *
+FROM (
+    SELECT *
+    FROM sales
+    MATCH /* gap */ RECOGNIZE (
+        PARTITION BY cust_id
+        ORDER BY sale_date
+        MEASURES MATCH_NUMBER () AS mno
+        PATTERN (A B+)
+        DEFINE A AS amount < 50,
+               B AS amount >= 50
+    )
+    WHERE amount > 0
+) ranked
+WHERE ranked.mno > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let match_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "MATCH /* gap */ RECOGNIZE (")
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PARTITION BY cust_id")
+            .unwrap_or(0);
+        let measures_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("MEASURES MATCH_NUMBER"))
+            .unwrap_or(0);
+        let pattern_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PATTERN (A B+)"))
+            .unwrap_or(0);
+        let define_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("DEFINE A AS amount < 50"))
+            .unwrap_or(0);
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE amount > 0")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE ranked.mno > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[partition_idx]),
+            indent(lines[match_idx]).saturating_add(4),
+            "comment-split MATCH_RECOGNIZE body should stay one level deeper than the owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[measures_idx]),
+            indent(lines[partition_idx]),
+            "comment-split MATCH_RECOGNIZE MEASURES should stay aligned with sibling body headers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[pattern_idx]),
+            indent(lines[partition_idx]),
+            "comment-split MATCH_RECOGNIZE PATTERN should stay aligned with sibling body headers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[define_idx]),
+            indent(lines[partition_idx]),
+            "comment-split MATCH_RECOGNIZE DEFINE should stay aligned with sibling body headers, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inner_where_idx]),
+            indent(lines[match_idx]),
+            "WHERE after comment-split MATCH_RECOGNIZE should realign with the nested query base, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query base after comment-split MATCH_RECOGNIZE closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_analytic_over_owner_depth_relative_to_nested_query_base(
     ) {
         let source = r#"SELECT *
@@ -28857,6 +29494,93 @@ WHERE ranked.top_sal > 0;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_comment_split_dense_rank_header_on_keep_body_depth() {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        MAX (e.sal)
+        KEEP
+        (
+            DENSE /* gap */ RANK
+            LAST
+            ORDER
+            BY e.sal
+        ) AS top_sal
+    FROM emp e
+) ranked
+WHERE ranked.top_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let keep_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "KEEP")
+            .unwrap_or(0);
+        let dense_rank_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DENSE /* gap */ RANK")
+            .unwrap_or(0);
+        let last_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "LAST")
+            .unwrap_or(0);
+        let order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER")
+            .unwrap_or(0);
+        let by_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BY e.sal")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") AS top_sal")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE ranked.top_sal > 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[dense_rank_idx]),
+            indent(lines[keep_idx]).saturating_add(4),
+            "comment-split DENSE_RANK header should stay one level deeper than KEEP, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[last_idx]),
+            indent(lines[dense_rank_idx]),
+            "KEEP LAST after comment-split DENSE_RANK should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[dense_rank_idx]),
+            "KEEP ORDER after comment-split DENSE_RANK should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[by_idx]),
+            indent(lines[dense_rank_idx]),
+            "KEEP BY after comment-split DENSE_RANK should stay aligned with the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[keep_idx]),
+            "KEEP closing line should realign with the owner depth after comment-split DENSE_RANK, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            0,
+            "outer WHERE should return to the top-level query depth after comment-split DENSE_RANK closes, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_pops_nested_multiline_owner_frames_when_close_parens_share_line(
     ) {
         let source = r#"SELECT
@@ -29314,6 +30038,210 @@ WHERE running_sal > 0;"#;
             0,
             "outer WHERE should return to the top-level query depth after the nested WINDOW query closes, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_comment_glued_if_header_structural_close_depth() {
+        let source = r#"BEGIN
+    /* gap */ IF (
+        CASE
+            WHEN flag = 'Y' THEN 1
+            ELSE 0
+        END
+    ) = 1 THEN
+        NULL;
+    END IF;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let if_idx = find_line_starting_with(&lines, "/* gap */ IF (").unwrap_or(0);
+        let case_idx = find_line_starting_with(&lines, "CASE").unwrap_or(0);
+        let close_idx = find_line_starting_with(&lines, ") = 1 THEN").unwrap_or(0);
+
+        assert!(
+            leading_spaces(lines[case_idx]) > leading_spaces(lines[if_idx]),
+            "CASE inside a comment-glued IF condition should stay deeper than the IF header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[if_idx]),
+            "control-condition close after a comment-glued IF header should realign with the IF depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_aligns_case_close_paren_before_comment_glued_next_branch() {
+        let source = r#"SELECT
+    CASE
+        WHEN outer_flag = 'Y' THEN (
+            CASE
+                WHEN inner_flag = 'A' THEN 1
+                ELSE 0
+            END
+        )
+        /* gap */ WHEN outer_flag = 'N' THEN 2
+        ELSE 3
+    END AS result
+FROM dual;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .unwrap_or(0);
+        let when_idx = find_line_starting_with(&lines, "/* gap */ WHEN outer_flag = 'N' THEN 2")
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[when_idx]),
+            "close paren before a comment-glued CASE branch should align with the following branch depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_skips_blank_line_before_comment_glued_case_item() {
+        let source = r#"SELECT
+    col1,
+
+    /* gap */ CASE
+        WHEN flag = 'Y' THEN 1
+        ELSE 0
+    END AS val
+FROM dual;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            !formatted.contains("col1,\n\n    /* gap */ CASE"),
+            "blank line before a comment-glued CASE item should be removed when the previous item ends with a comma, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_exact_keyword_only_select_and_join_headers() {
+        let source = r#"SELECT DISTINCT
+            e.empno
+FROM emp e
+LEFT OUTER JOIN
+            dept d
+    ON d.deptno = e.deptno;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let select_idx = find_line_starting_with(&lines, "SELECT DISTINCT").unwrap_or(0);
+        let item_idx = find_line_starting_with(&lines, "e.empno").unwrap_or(0);
+        let join_idx = find_line_starting_with(&lines, "LEFT OUTER JOIN").unwrap_or(0);
+        let table_idx = find_line_starting_with(&lines, "dept d").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[item_idx]),
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "SELECT DISTINCT operand line should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[table_idx]),
+            leading_spaces(lines[join_idx]).saturating_add(4),
+            "LEFT OUTER JOIN table line should normalize to one level deeper than the exact bare join header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "exact bare SELECT/JOIN header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_exact_owner_relative_header_operands() {
+        let source = r#"SELECT
+    ROW_NUMBER() OVER (
+        PARTITION BY
+                    e.deptno
+        ORDER BY
+                    e.hiredate
+    ) AS rn
+FROM emp e;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let partition_idx = find_line_starting_with(&lines, "PARTITION BY").unwrap_or(0);
+        let partition_expr_idx = find_line_starting_with(&lines, "e.deptno").unwrap_or(0);
+        let order_idx = find_line_starting_with(&lines, "ORDER BY").unwrap_or(0);
+        let order_expr_idx = find_line_starting_with(&lines, "e.hiredate").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[partition_expr_idx]),
+            leading_spaces(lines[partition_idx]).saturating_add(4),
+            "PARTITION BY operand should normalize to one level deeper than the exact bare owner-relative header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[order_expr_idx]),
+            leading_spaces(lines[order_idx]).saturating_add(4),
+            "ORDER BY operand should normalize to one level deeper than the exact bare owner-relative header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "exact bare owner-relative header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_exact_match_recognize_body_header_operands() {
+        let source = r#"SELECT *
+FROM sales MATCH_RECOGNIZE (
+    PARTITION BY cust_id
+    ORDER BY sale_date
+    MEASURES
+                MATCH_NUMBER () AS mno
+    PATTERN
+                (A B+)
+    DEFINE
+                A AS amount < 50,
+                B AS amount >= 50
+)"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let measures_idx = find_line_starting_with(&lines, "MEASURES").unwrap_or(0);
+        let measure_expr_idx = find_line_starting_with(&lines, "MATCH_NUMBER () AS mno").unwrap_or(0);
+        let pattern_idx = find_line_starting_with(&lines, "PATTERN").unwrap_or(0);
+        let pattern_expr_idx = find_line_starting_with(&lines, "(A B+)").unwrap_or(0);
+        let define_idx = find_line_starting_with(&lines, "DEFINE").unwrap_or(0);
+        let define_expr_idx = find_line_starting_with(&lines, "A AS amount < 50,").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[measure_expr_idx]),
+            leading_spaces(lines[measures_idx]).saturating_add(4),
+            "MATCH_RECOGNIZE MEASURES operand should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[pattern_expr_idx]),
+            leading_spaces(lines[pattern_idx]).saturating_add(4),
+            "MATCH_RECOGNIZE PATTERN operand should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[define_expr_idx]),
+            leading_spaces(lines[define_idx]).saturating_add(4),
+            "MATCH_RECOGNIZE DEFINE operand should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "exact bare MATCH_RECOGNIZE body-header normalization should remain stable after reformatting"
         );
     }
 

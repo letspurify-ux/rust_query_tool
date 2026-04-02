@@ -1789,21 +1789,151 @@ fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
     identifiers
 }
 
+fn identifier_sequence_segment_count(sequence: &[&str]) -> usize {
+    sequence
+        .iter()
+        .map(|word| word.split('_').filter(|segment| !segment.is_empty()).count())
+        .sum()
+}
+
+fn identifier_word_matches_keyword_sequence(words: &[&str], sequence: &[&str]) -> bool {
+    let mut expected_segments = sequence
+        .iter()
+        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()));
+
+    for segment in words
+        .iter()
+        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()))
+    {
+        let Some(expected) = expected_segments.next() else {
+            return false;
+        };
+        if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+            return false;
+        }
+    }
+
+    expected_segments.next().is_none()
+}
+
 fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return true;
     }
 
-    let identifiers = leading_identifier_words(line, sequence.len());
-    identifiers.len() == sequence.len()
-        && identifiers
-            .iter()
-            .zip(sequence.iter())
-            .all(|(identifier, expected)| {
-                identifier
-                    .as_bytes()
-                    .eq_ignore_ascii_case(expected.as_bytes())
-            })
+    let expected_segment_count = identifier_sequence_segment_count(sequence);
+    let identifiers = leading_identifier_words(line, expected_segment_count);
+    let mut consumed_identifiers = 0usize;
+    let mut consumed_segments = 0usize;
+
+    while consumed_identifiers < identifiers.len() && consumed_segments < expected_segment_count {
+        let identifier_segment_count = identifiers[consumed_identifiers]
+            .split('_')
+            .filter(|segment| !segment.is_empty())
+            .count();
+        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
+        if consumed_segments > expected_segment_count {
+            return false;
+        }
+        consumed_identifiers = consumed_identifiers.saturating_add(1);
+    }
+
+    consumed_segments == expected_segment_count
+        && identifier_word_matches_keyword_sequence(&identifiers[..consumed_identifiers], sequence)
+}
+
+fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return auto_format_structural_tail(line).trim().is_empty();
+    }
+
+    let expected_segments = sequence
+        .iter()
+        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()))
+        .collect::<Vec<_>>();
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut matched_segments = 0usize;
+
+    while idx < bytes.len() && matched_segments < expected_segments.len() {
+        while idx < bytes.len() {
+            let current = bytes[idx];
+            let next = bytes.get(idx.saturating_add(1)).copied();
+            if current.is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if current == b'-' && next == Some(b'-') {
+                return false;
+            }
+            if current == b'/' && next == Some(b'*') {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+            break;
+        }
+
+        if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+            return false;
+        }
+
+        let start = idx;
+        idx = idx.saturating_add(1);
+        while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+            idx = idx.saturating_add(1);
+        }
+
+        let Some(identifier) = line.get(start..idx) else {
+            return false;
+        };
+
+        for segment in identifier.split('_').filter(|segment| !segment.is_empty()) {
+            let Some(expected) = expected_segments.get(matched_segments) else {
+                return false;
+            };
+            if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+                return false;
+            }
+            matched_segments = matched_segments.saturating_add(1);
+        }
+    }
+
+    if matched_segments != expected_segments.len() {
+        return false;
+    }
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'-' && next == Some(b'-') {
+            return true;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        return false;
+    }
+
+    true
 }
 
 /// Returns true when the leading structural identifier sequence on `line`
@@ -1824,24 +1954,25 @@ pub(crate) fn is_format_plain_end_suffix_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn starts_with_format_end_suffix_terminator(text_upper: &str) -> bool {
-    if !starts_with_keyword_token(text_upper, "END") {
-        return false;
-    }
-
-    let Some(rest) = text_upper.strip_prefix("END") else {
-        return false;
-    };
-
-    let rest = rest.trim_start();
-    FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS
-        .iter()
-        .any(|keyword| starts_with_keyword_token(rest, keyword))
+    let words = leading_identifier_words(text_upper, 3);
+    words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("END"))
+        && words
+            .get(1)
+            .is_some_and(|word| is_format_plain_end_suffix_keyword(word))
 }
 
 pub(crate) fn starts_with_format_plain_end(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "END")
-        && !starts_with_format_end_suffix_terminator(text_upper)
+    let words = leading_identifier_words(text_upper, 2);
+    words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("END"))
+        && !words
+            .get(1)
+            .is_some_and(|word| is_format_plain_end_suffix_keyword(word))
 }
 
 pub(crate) fn starts_with_format_bare_end(text_upper: &str) -> bool {
@@ -1849,12 +1980,61 @@ pub(crate) fn starts_with_format_bare_end(text_upper: &str) -> bool {
         return false;
     }
 
-    let Some(rest) = text_upper.strip_prefix("END") else {
-        return false;
-    };
-    let rest = rest.trim_start();
+    let bytes = text_upper.as_bytes();
+    let mut idx = 0usize;
 
-    rest.is_empty() || rest.starts_with(';')
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        break;
+    }
+
+    if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+        return false;
+    }
+
+    idx = idx.saturating_add(1);
+    while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+        idx = idx.saturating_add(1);
+    }
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        return current == b';';
+    }
+
+    true
 }
 
 pub(crate) fn starts_with_format_named_plain_end(text_upper: &str) -> bool {
@@ -1997,6 +2177,218 @@ pub(crate) fn starts_with_format_merge_branch_condition_clause(text_upper: &str)
         || line_starts_with_identifier_sequence(text_upper, &["OR"])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingFormatMergeBranchHeaderKind {
+    When,
+    WhenNot,
+    Condition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingFormatMergeBranchHeaderProgress {
+    pub(crate) next_kind: Option<PendingFormatMergeBranchHeaderKind>,
+    pub(crate) completed: bool,
+    pub(crate) uses_condition_depth: bool,
+}
+
+impl PendingFormatMergeBranchHeaderKind {
+    pub(crate) fn progress_over_line(
+        self,
+        line: &str,
+    ) -> Option<PendingFormatMergeBranchHeaderProgress> {
+        let structural_tail = auto_format_structural_tail(line);
+
+        match self {
+            Self::When => {
+                if line_starts_with_identifier_sequence(structural_tail, &["NOT", "MATCHED"])
+                    || line_starts_with_identifier_sequence(
+                        structural_tail,
+                        &["WHEN", "NOT", "MATCHED"],
+                    )
+                {
+                    let completed = line_ends_with_identifier_sequence_before_inline_comment(
+                        structural_tail,
+                        &["THEN"],
+                    );
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: (!completed).then_some(Self::Condition),
+                        completed,
+                        uses_condition_depth: false,
+                    });
+                }
+
+                if line_starts_with_identifier_sequence(structural_tail, &["MATCHED"])
+                    || line_starts_with_identifier_sequence(structural_tail, &["WHEN", "MATCHED"])
+                {
+                    let completed = line_ends_with_identifier_sequence_before_inline_comment(
+                        structural_tail,
+                        &["THEN"],
+                    );
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: (!completed).then_some(Self::Condition),
+                        completed,
+                        uses_condition_depth: false,
+                    });
+                }
+
+                if line_starts_with_identifier_sequence(structural_tail, &["NOT"])
+                    || line_starts_with_identifier_sequence(structural_tail, &["WHEN", "NOT"])
+                {
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: Some(Self::WhenNot),
+                        completed: false,
+                        uses_condition_depth: false,
+                    });
+                }
+
+                None
+            }
+            Self::WhenNot => {
+                if line_starts_with_identifier_sequence(structural_tail, &["MATCHED"])
+                    || line_starts_with_identifier_sequence(
+                        structural_tail,
+                        &["WHEN", "NOT", "MATCHED"],
+                    )
+                {
+                    let completed = line_ends_with_identifier_sequence_before_inline_comment(
+                        structural_tail,
+                        &["THEN"],
+                    );
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: (!completed).then_some(Self::Condition),
+                        completed,
+                        uses_condition_depth: false,
+                    });
+                }
+
+                None
+            }
+            Self::Condition => {
+                if structural_tail.is_empty() {
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: Some(Self::Condition),
+                        completed: false,
+                        uses_condition_depth: true,
+                    });
+                }
+
+                if line_starts_with_identifier_sequence(structural_tail, &["THEN"])
+                    || line_ends_with_identifier_sequence_before_inline_comment(
+                        structural_tail,
+                        &["THEN"],
+                    )
+                {
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: None,
+                        completed: true,
+                        uses_condition_depth: true,
+                    });
+                }
+
+                let structural_tail_upper = structural_tail.to_ascii_uppercase();
+                if starts_with_format_merge_branch_condition_clause(&structural_tail_upper) {
+                    return Some(PendingFormatMergeBranchHeaderProgress {
+                        next_kind: Some(Self::Condition),
+                        completed: false,
+                        uses_condition_depth: true,
+                    });
+                }
+
+                if starts_with_auto_format_owner_boundary(structural_tail) {
+                    return None;
+                }
+
+                Some(PendingFormatMergeBranchHeaderProgress {
+                    next_kind: Some(Self::Condition),
+                    completed: false,
+                    uses_condition_depth: true,
+                })
+            }
+        }
+    }
+}
+
+pub(crate) fn format_merge_branch_pending_header_kind(
+    line: &str,
+) -> Option<PendingFormatMergeBranchHeaderKind> {
+    let structural_tail = auto_format_structural_tail(line);
+    if structural_tail.is_empty()
+        || line_ends_with_identifier_sequence_before_inline_comment(structural_tail, &["THEN"])
+    {
+        return None;
+    }
+
+    if line_starts_with_identifier_sequence(structural_tail, &["WHEN", "NOT", "MATCHED"])
+        || line_starts_with_identifier_sequence(structural_tail, &["WHEN", "MATCHED"])
+    {
+        return Some(PendingFormatMergeBranchHeaderKind::Condition);
+    }
+
+    if line_has_exact_identifier_sequence(structural_tail, &["WHEN", "NOT"]) {
+        return Some(PendingFormatMergeBranchHeaderKind::WhenNot);
+    }
+
+    line_has_exact_identifier_sequence(structural_tail, &["WHEN"])
+        .then_some(PendingFormatMergeBranchHeaderKind::When)
+}
+
+/// Returns true when the current line is a same-depth MERGE branch-header
+/// fragment that must stay on the dedicated MERGE pending-header state instead
+/// of being reinterpreted as a generic query-owner fragment such as `NOT`.
+///
+/// This intentionally excludes condition-depth consumers like `AND NOT` inside
+/// `WHEN MATCHED ...` so generic split owners like `NOT EXISTS` can still nest
+/// inside a MERGE branch condition.
+pub(crate) fn line_is_active_merge_branch_same_depth_header_fragment(
+    line: &str,
+    active_merge_base: bool,
+    pending_kind: Option<PendingFormatMergeBranchHeaderKind>,
+) -> bool {
+    if !active_merge_base {
+        return false;
+    }
+
+    if matches!(
+        format_merge_branch_pending_header_kind(line),
+        Some(PendingFormatMergeBranchHeaderKind::When)
+            | Some(PendingFormatMergeBranchHeaderKind::WhenNot)
+    ) {
+        return true;
+    }
+
+    pending_kind
+        .and_then(|kind| kind.progress_over_line(line))
+        .is_some_and(|progress| !progress.uses_condition_depth)
+}
+
+/// Returns true when a retained `MERGE WHEN ... THEN` condition state should
+/// stay suspended across the current line because the line opens or continues
+/// a nested owner/query instead of consuming the branch header itself.
+pub(crate) fn line_suspends_active_merge_branch_condition_state(
+    line: &str,
+    pending_kind: Option<PendingFormatMergeBranchHeaderKind>,
+) -> bool {
+    if pending_kind != Some(PendingFormatMergeBranchHeaderKind::Condition) {
+        return false;
+    }
+
+    let structural_tail = auto_format_structural_tail(line);
+    if structural_tail.is_empty() {
+        return false;
+    }
+
+    let generic_condition_not_fragment = matches!(
+        format_query_owner_pending_header_kind(structural_tail),
+        Some(PendingFormatQueryOwnerHeaderKind::ConditionNot)
+    ) && format_query_owner_header_kind(structural_tail)
+        .is_none()
+        && format_query_owner_kind(structural_tail).is_none();
+
+    line_is_standalone_open_paren_before_inline_comment(structural_tail)
+        || (starts_with_auto_format_owner_boundary(structural_tail)
+            && !generic_condition_not_fragment)
+}
+
 fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
     line: &str,
 ) -> bool {
@@ -2036,8 +2428,9 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
 /// that must terminate carry into the next code line.
 ///
 /// This extends the base boundary taxonomy with standalone wrapper `(` lines
-/// and MERGE branch headers so analyzer and formatter phase 2 can stop
-/// clause/list/operator carry through the same helper.
+/// and both complete and incomplete MERGE branch-header fragments so analyzer
+/// and formatter phase 2 can stop clause/list/operator carry through the same
+/// helper.
 pub(crate) fn starts_with_auto_format_structural_continuation_boundary(line: &str) -> bool {
     let trimmed = auto_format_structural_tail(line);
     if trimmed.is_empty() {
@@ -2046,6 +2439,7 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary(line: &st
 
     let trimmed_upper = trimmed.to_ascii_uppercase();
     starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(trimmed)
+        || format_merge_branch_pending_header_kind(trimmed).is_some()
         || starts_with_format_merge_branch_header(&trimmed_upper)
         || line_is_standalone_open_paren_before_inline_comment(trimmed)
 }
@@ -2383,30 +2777,35 @@ impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
             return true;
         }
 
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.ends_with(';') {
+        let structural_tail = trim_leading_sql_comments(line);
+        if structural_tail.is_empty()
+            || line_ends_with_semicolon_before_inline_comment(structural_tail)
+        {
             return false;
         }
 
-        !starts_with_auto_format_owner_boundary(trimmed)
+        !starts_with_auto_format_owner_boundary(structural_tail)
     }
 }
 
 pub(crate) fn format_plsql_child_query_owner_pending_header_kind(
     line: &str,
 ) -> Option<PendingFormatPlsqlChildQueryOwnerHeaderKind> {
-    if line_starts_with_identifier_sequence(line, &["CURSOR"])
-        && format_plsql_child_query_owner_kind(line)
+    let structural_tail = trim_leading_sql_comments(line);
+    let ends_with_semicolon = line_ends_with_semicolon_before_inline_comment(structural_tail);
+
+    if line_starts_with_identifier_sequence(structural_tail, &["CURSOR"])
+        && format_plsql_child_query_owner_kind(structural_tail)
             != Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
-        && !line.trim_end().ends_with(';')
+        && !ends_with_semicolon
     {
         return Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration);
     }
 
-    (line_starts_with_identifier_sequence(line, &["OPEN"])
-        && format_plsql_child_query_owner_kind(line)
+    (line_starts_with_identifier_sequence(structural_tail, &["OPEN"])
+        && format_plsql_child_query_owner_kind(structural_tail)
             != Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
-        && !line.trim_end().ends_with(';'))
+        && !ends_with_semicolon)
     .then_some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
 }
 
@@ -2534,16 +2933,7 @@ const FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR"]]
 const FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["NESTED"]];
 
 fn starts_with_keyword_sequence(text_upper: &str, sequence: &[&str]) -> bool {
-    if sequence.is_empty() {
-        return false;
-    }
-
-    let words = leading_identifier_words(text_upper, sequence.len());
-    words.len() == sequence.len()
-        && words
-            .iter()
-            .zip(sequence.iter())
-            .all(|(word, keyword)| word.as_bytes().eq_ignore_ascii_case(keyword.as_bytes()))
+    !sequence.is_empty() && line_starts_with_identifier_sequence(text_upper, sequence)
 }
 
 fn starts_with_any_keyword_sequence(text_upper: &str, sequences: &[&[&str]]) -> bool {
@@ -2557,11 +2947,41 @@ fn leading_meaningful_words(line: &str, max_words: usize) -> Vec<&str> {
 }
 
 fn leading_words_match_keyword_prefix(words: &[&str], sequence: &[&str]) -> usize {
-    words
-        .iter()
-        .zip(sequence.iter())
-        .take_while(|(word, expected)| word.eq_ignore_ascii_case(expected))
-        .count()
+    let mut matched_sequence_words = 0usize;
+    let mut consumed_words = 0usize;
+
+    while matched_sequence_words < sequence.len() && consumed_words < words.len() {
+        let expected_word = sequence[matched_sequence_words];
+        let expected_segment_count = identifier_sequence_segment_count(&[expected_word]);
+        let mut candidate_end = consumed_words;
+        let mut consumed_segments = 0usize;
+
+        while candidate_end < words.len() && consumed_segments < expected_segment_count {
+            let identifier_segment_count = words[candidate_end]
+                .split('_')
+                .filter(|segment| !segment.is_empty())
+                .count();
+            consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
+            if consumed_segments > expected_segment_count {
+                return matched_sequence_words;
+            }
+            candidate_end = candidate_end.saturating_add(1);
+        }
+
+        if consumed_segments != expected_segment_count
+            || !identifier_word_matches_keyword_sequence(
+                &words[consumed_words..candidate_end],
+                &[expected_word],
+            )
+        {
+            break;
+        }
+
+        matched_sequence_words = matched_sequence_words.saturating_add(1);
+        consumed_words = candidate_end;
+    }
+
+    matched_sequence_words
 }
 
 fn leading_words_match_keyword_sequence(
@@ -2570,19 +2990,16 @@ fn leading_words_match_keyword_sequence(
     third_word: Option<&str>,
     sequence: &[&str],
 ) -> bool {
-    match sequence {
-        [first] => first_word.eq_ignore_ascii_case(first),
-        [first, second] => {
-            first_word.eq_ignore_ascii_case(first)
-                && second_word.is_some_and(|word| word.eq_ignore_ascii_case(second))
-        }
-        [first, second, third] => {
-            first_word.eq_ignore_ascii_case(first)
-                && second_word.is_some_and(|word| word.eq_ignore_ascii_case(second))
-                && third_word.is_some_and(|word| word.eq_ignore_ascii_case(third))
-        }
-        _ => false,
+    let mut words = Vec::with_capacity(3);
+    words.push(first_word);
+    if let Some(second_word) = second_word {
+        words.push(second_word);
     }
+    if let Some(third_word) = third_word {
+        words.push(third_word);
+    }
+
+    leading_words_match_keyword_prefix(&words, sequence) == sequence.len()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3319,13 +3736,26 @@ fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
         return true;
     }
 
+    let expected_segment_count = identifier_sequence_segment_count(sequence);
     let (_, trailing_identifiers) =
-        line_trailing_identifiers_before_inline_comment(line, sequence.len());
-    trailing_identifiers.len() == sequence.len()
-        && trailing_identifiers
-            .iter()
-            .zip(sequence.iter())
-            .all(|(token, expected)| token.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
+        line_trailing_identifiers_before_inline_comment(line, expected_segment_count);
+    let mut start_idx = trailing_identifiers.len();
+    let mut consumed_segments = 0usize;
+
+    while start_idx > 0 && consumed_segments < expected_segment_count {
+        start_idx = start_idx.saturating_sub(1);
+        let identifier_segment_count = trailing_identifiers[start_idx]
+            .split('_')
+            .filter(|segment| !segment.is_empty())
+            .count();
+        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
+        if consumed_segments > expected_segment_count {
+            return false;
+        }
+    }
+
+    consumed_segments == expected_segment_count
+        && identifier_word_matches_keyword_sequence(&trailing_identifiers[start_idx..], sequence)
 }
 
 fn line_ends_with_pivot_owner(line: &str) -> bool {
@@ -3360,6 +3790,13 @@ pub(crate) fn line_ends_with_format_direct_from_item_query_owner_keyword(line: &
 
 fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
     line_ends_with_identifier_sequence(line, &[keyword])
+}
+
+fn line_ends_with_semicolon_before_inline_comment(line: &str) -> bool {
+    matches!(
+        trailing_meaningful_tokens_before_inline_comment(line).1,
+        Some(FormatTrailingMeaningfulToken::Symbol(symbol)) if symbol == ";"
+    )
 }
 
 /// Returns the structured formatter block kind when a line owns a multiline
@@ -3951,7 +4388,8 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
     if let Some(ref previous_upper) = previous_upper {
         if matches!(
             (previous_upper.as_str(), last_upper.as_str()),
-            ("WITHIN", "GROUP")
+            ("DENSE", "RANK")
+                | ("WITHIN", "GROUP")
                 | ("DENSE_RANK", "FIRST")
                 | ("DENSE_RANK", "LAST")
                 | ("FOR", "UPDATE")
@@ -3981,6 +4419,10 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
             };
             return Some(continuation_kind);
         }
+    }
+
+    if last_upper == "DENSE_RANK" {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
     if matches_keyword(
@@ -4015,6 +4457,14 @@ pub(crate) fn format_inline_comment_header_continuation_kind(
 pub(crate) fn format_leading_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    let trimmed = line.trim_start();
+    if line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK"])
+        || line_starts_with_identifier_sequence(trimmed, &["DENSE_RANK", "FIRST"])
+        || line_starts_with_identifier_sequence(trimmed, &["DENSE_RANK", "LAST"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
     let words = leading_meaningful_words(line.trim_start(), 8);
     let mut continuation_kind = None;
 
@@ -4055,63 +4505,50 @@ pub(crate) fn format_structural_header_continuation_kind(
 pub(crate) fn format_bare_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let words_upper = leading_meaningful_words(auto_format_structural_tail(line), 8)
-        .into_iter()
-        .map(str::to_ascii_uppercase)
-        .collect::<Vec<_>>();
-    if words_upper.is_empty() || !words_upper.iter().all(|word| is_oracle_sql_keyword(word)) {
+    let trimmed = auto_format_structural_tail(line);
+    if line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK"])
+        || line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK", "FIRST"])
+        || line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK", "LAST"])
+        || line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK", "FIRST", "ORDER", "BY"])
+        || line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK", "LAST", "ORDER", "BY"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    let words = meaningful_identifier_words_before_inline_comment(trimmed, 8);
+    if words.is_empty()
+        || !words
+            .iter()
+            .all(|word| is_oracle_sql_keyword(&word.to_ascii_uppercase()))
+    {
         return None;
     }
 
-    let words = words_upper.iter().map(String::as_str).collect::<Vec<_>>();
-    let exact = |expected: &[&str]| words.as_slice() == expected;
-
-    if exact(&["WITH"]) {
-        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
+    if !line_has_exact_identifier_sequence(trimmed, words.as_slice()) {
+        return None;
     }
 
-    if exact(&["SELECT"])
-        || exact(&["VALUES"])
-        || exact(&["SET"])
-        || exact(&["RETURNING"])
-        || exact(&["OFFSET"])
-        || exact(&["FETCH"])
-        || exact(&["LIMIT"])
-        || exact(&["GROUP", "BY"])
-        || exact(&["ORDER", "BY"])
-        || exact(&["START", "WITH"])
-        || exact(&["CONNECT", "BY"])
+    // Dedicated owner/subclause opener lines canonicalize their child/header
+    // depth through explicit owner-relative state instead of generic
+    // bare-header carry. Only exact bare operand headers that truly hand off a
+    // freeform body to the next line (for example MEASURES / SUBSET /
+    // PATTERN / DEFINE) should fall through to the shared taxonomy. Multi-step
+    // owner-relative chains such as REFERENCE / RULES / KEEP still stay on
+    // their retained owner depth and remain excluded here.
+    if line_starts_with_identifier_sequence(trimmed, &["MODEL"])
+        || line_starts_with_identifier_sequence(trimmed, &["WINDOW"])
+        || line_starts_with_identifier_sequence(trimmed, &["MATCH_RECOGNIZE"])
+        || line_starts_with_identifier_sequence(trimmed, &["PIVOT"])
+        || line_starts_with_identifier_sequence(trimmed, &["UNPIVOT"])
+        || line_starts_with_identifier_sequence(trimmed, &["REFERENCE"])
+        || line_starts_with_identifier_sequence(trimmed, &["RULES"])
+        || line_starts_with_identifier_sequence(trimmed, &["COLUMNS"])
+        || line_starts_with_identifier_sequence(trimmed, &["KEEP"])
     {
-        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+        return None;
     }
 
-    if exact(&["FROM"])
-        || exact(&["WHERE"])
-        || exact(&["HAVING"])
-        || exact(&["USING"])
-        || exact(&["INTO"])
-        || exact(&["ON"])
-        || exact(&["UNION"])
-        || exact(&["INTERSECT"])
-        || exact(&["MINUS"])
-        || exact(&["EXCEPT"])
-        || exact(&["QUALIFY"])
-        || exact(&["SEARCH"])
-        || exact(&["CYCLE"])
-        || exact(&["FOR", "UPDATE"])
-    {
-        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase);
-    }
-
-    if words
-        .last()
-        .is_some_and(|last| matches!(*last, "JOIN" | "APPLY"))
-        && starts_with_format_join_clause(&words.join(" "))
-    {
-        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
-    }
-
-    None
+    format_leading_header_continuation_kind(trimmed)
 }
 
 /// Returns true when a token starts a flashback/temporal boundary expression.
@@ -4500,6 +4937,15 @@ mod tests {
             "IF v_ready = /* gap */ 'Y' THEN",
             &["THEN"]
         ));
+        assert!(line_ends_with_semicolon_before_inline_comment(
+            "OPEN c_emp; -- keep terminated"
+        ));
+        assert!(line_ends_with_semicolon_before_inline_comment(
+            "OPEN c_emp /* gap */ ; /* keep */"
+        ));
+        assert!(!line_ends_with_semicolon_before_inline_comment(
+            "OPEN c_emp -- keep comment"
+        ));
     }
 
     #[test]
@@ -4515,11 +4961,35 @@ mod tests {
             "END AFTER STATEMENT"
         ));
         assert!(starts_with_format_end_suffix_terminator("END INSTEAD OF"));
+        assert!(starts_with_format_end_suffix_terminator("END /* gap */ IF"));
         assert!(starts_with_format_plain_end("END trg_pkg;"));
         assert!(!starts_with_format_plain_end("END BEFORE STATEMENT"));
+        assert!(!starts_with_format_plain_end("END /* gap */ IF;"));
         assert!(starts_with_format_bare_end("END;"));
         assert!(starts_with_format_named_plain_end("END trg_pkg;"));
+        assert!(starts_with_format_named_plain_end("END /* gap */ trg_pkg;"));
         assert!(!starts_with_format_named_plain_end("END AFTER STATEMENT"));
+        assert!(!starts_with_format_named_plain_end("END /* gap */ IF;"));
+    }
+
+    #[test]
+    fn identifier_sequence_helpers_treat_composite_keywords_as_comment_stripped_segments() {
+        assert!(line_starts_with_identifier_sequence_before_inline_comment(
+            "MATCH /* gap */ RECOGNIZE (",
+            &["MATCH_RECOGNIZE"]
+        ));
+        assert!(line_ends_with_identifier_sequence_before_inline_comment(
+            "MATCH /* gap */ RECOGNIZE",
+            &["MATCH_RECOGNIZE"]
+        ));
+        assert!(line_has_exact_identifier_sequence(
+            "MATCH /* gap */ RECOGNIZE",
+            &["MATCH_RECOGNIZE"]
+        ));
+        assert_eq!(
+            format_indented_paren_owner_header_kind("MATCH /* gap */ RECOGNIZE"),
+            Some(FormatIndentedParenOwnerKind::MatchRecognize)
+        );
     }
 
     #[test]
@@ -4562,6 +5032,14 @@ mod tests {
         );
         assert_eq!(
             format_inline_comment_header_continuation_kind(Some("WITHIN"), "GROUP"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(Some("DENSE"), "RANK"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "DENSE_RANK"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
@@ -4688,6 +5166,87 @@ mod tests {
     }
 
     #[test]
+    fn format_bare_structural_header_continuation_kind_reuses_shared_prefix_taxonomy_for_exact_keyword_lines(
+    ) {
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("SELECT DISTINCT"),
+            format_structural_header_continuation_kind("SELECT DISTINCT")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("LEFT OUTER JOIN"),
+            format_structural_header_continuation_kind("LEFT OUTER JOIN")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("PARTITION BY"),
+            format_structural_header_continuation_kind("PARTITION BY")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("MEASURES"),
+            format_structural_header_continuation_kind("MEASURES")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("SUBSET"),
+            format_structural_header_continuation_kind("SUBSET")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("PATTERN"),
+            format_structural_header_continuation_kind("PATTERN")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("DEFINE"),
+            format_structural_header_continuation_kind("DEFINE")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("AFTER MATCH SKIP"),
+            format_structural_header_continuation_kind("AFTER MATCH SKIP")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("DENSE_RANK LAST ORDER BY"),
+            format_structural_header_continuation_kind("DENSE_RANK LAST ORDER BY")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("DENSE /* gap */ RANK"),
+            format_structural_header_continuation_kind("DENSE /* gap */ RANK")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("DENSE /* gap */ RANK LAST ORDER BY"),
+            format_structural_header_continuation_kind("DENSE /* gap */ RANK LAST ORDER BY")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("SELECT DISTINCT empno"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("LEFT OUTER JOIN dept d"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("PARTITION BY (deptno)"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("REFERENCE"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("RULES"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("KEEP"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("PIVOT"),
+            None
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("UNPIVOT"),
+            None
+        );
+    }
+
+    #[test]
     fn structural_continuation_boundary_helper_blocks_owner_relative_subclauses() {
         assert!(
             starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
@@ -4710,10 +5269,19 @@ mod tests {
     #[test]
     fn structural_continuation_boundary_helper_covers_merge_branches_and_wrappers() {
         assert!(starts_with_auto_format_structural_continuation_boundary(
+            "WHEN"
+        ));
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            "WHEN NOT"
+        ));
+        assert!(starts_with_auto_format_structural_continuation_boundary(
             "WHEN MATCHED THEN"
         ));
         assert!(starts_with_auto_format_structural_continuation_boundary(
             "WHEN NOT MATCHED THEN"
+        ));
+        assert!(!starts_with_auto_format_structural_continuation_boundary(
+            "MATCHED"
         ));
         assert!(starts_with_auto_format_structural_continuation_boundary(
             "( -- wrapper"
@@ -4729,6 +5297,142 @@ mod tests {
             "OR target.is_active = 1"
         ));
         assert!(!starts_with_format_merge_branch_header("WHENEVER SQLERROR"));
+    }
+
+    #[test]
+    fn format_merge_branch_pending_header_kind_tracks_split_merge_headers() {
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN"),
+            Some(PendingFormatMergeBranchHeaderKind::When)
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN /* gap */ -- keep"),
+            Some(PendingFormatMergeBranchHeaderKind::When)
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN NOT"),
+            Some(PendingFormatMergeBranchHeaderKind::WhenNot)
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN MATCHED"),
+            Some(PendingFormatMergeBranchHeaderKind::Condition)
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN/* gap */NOT/* gap */MATCHED"),
+            Some(PendingFormatMergeBranchHeaderKind::Condition)
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN MATCHED THEN"),
+            None
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN score > 1000 THEN 'HIGH'"),
+            None
+        );
+        assert_eq!(
+            format_merge_branch_pending_header_kind("WHEN NOT score > 1000 THEN 'HIGH'"),
+            None
+        );
+        assert_eq!(
+            PendingFormatMergeBranchHeaderKind::When.progress_over_line("MATCHED"),
+            Some(PendingFormatMergeBranchHeaderProgress {
+                next_kind: Some(PendingFormatMergeBranchHeaderKind::Condition),
+                completed: false,
+                uses_condition_depth: false,
+            })
+        );
+        assert_eq!(
+            PendingFormatMergeBranchHeaderKind::Condition
+                .progress_over_line("AND target.is_active = 'Y'"),
+            Some(PendingFormatMergeBranchHeaderProgress {
+                next_kind: Some(PendingFormatMergeBranchHeaderKind::Condition),
+                completed: false,
+                uses_condition_depth: true,
+            })
+        );
+        assert_eq!(
+            PendingFormatMergeBranchHeaderKind::Condition.progress_over_line("AND EXISTS ("),
+            Some(PendingFormatMergeBranchHeaderProgress {
+                next_kind: Some(PendingFormatMergeBranchHeaderKind::Condition),
+                completed: false,
+                uses_condition_depth: true,
+            })
+        );
+        assert_eq!(
+            PendingFormatMergeBranchHeaderKind::Condition.progress_over_line(") AND EXISTS ("),
+            Some(PendingFormatMergeBranchHeaderProgress {
+                next_kind: Some(PendingFormatMergeBranchHeaderKind::Condition),
+                completed: false,
+                uses_condition_depth: true,
+            })
+        );
+        assert_eq!(
+            PendingFormatMergeBranchHeaderKind::Condition.progress_over_line("THEN"),
+            Some(PendingFormatMergeBranchHeaderProgress {
+                next_kind: None,
+                completed: true,
+                uses_condition_depth: true,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_branch_same_depth_header_fragment_helper_keeps_merge_only_fragments_out_of_generic_not_owner_carry(
+    ) {
+        assert!(line_is_active_merge_branch_same_depth_header_fragment(
+            "WHEN", true, None,
+        ));
+        assert!(line_is_active_merge_branch_same_depth_header_fragment(
+            "WHEN NOT", true, None,
+        ));
+        assert!(line_is_active_merge_branch_same_depth_header_fragment(
+            "NOT",
+            true,
+            Some(PendingFormatMergeBranchHeaderKind::When),
+        ));
+        assert!(line_is_active_merge_branch_same_depth_header_fragment(
+            "MATCHED",
+            true,
+            Some(PendingFormatMergeBranchHeaderKind::When),
+        ));
+        assert!(!line_is_active_merge_branch_same_depth_header_fragment(
+            "AND NOT",
+            true,
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(!line_is_active_merge_branch_same_depth_header_fragment(
+            "THEN",
+            true,
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(!line_is_active_merge_branch_same_depth_header_fragment(
+            "WHEN NOT", false, None,
+        ));
+    }
+
+    #[test]
+    fn merge_branch_condition_suspend_helper_keeps_nested_owner_lines_attached_to_retained_header_state(
+    ) {
+        assert!(line_suspends_active_merge_branch_condition_state(
+            "EXISTS (",
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(line_suspends_active_merge_branch_condition_state(
+            "/* gap */ EXISTS (",
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(line_suspends_active_merge_branch_condition_state(
+            "(",
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(!line_suspends_active_merge_branch_condition_state(
+            "AND NOT",
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
+        assert!(!line_suspends_active_merge_branch_condition_state(
+            "THEN",
+            Some(PendingFormatMergeBranchHeaderKind::Condition),
+        ));
     }
 
     #[test]
@@ -5146,6 +5850,16 @@ mod tests {
 
         let owner = FormatIndentedParenOwnerKind::Keep;
         let dense_rank_state = owner.body_header_line_state("DENSE_RANK", None);
+        assert!(dense_rank_state.is_header);
+        let last_state = owner.body_header_line_state("LAST", dense_rank_state.next_state);
+        assert!(last_state.is_header);
+        let order_state = owner.body_header_line_state("ORDER", last_state.next_state);
+        assert!(order_state.is_header);
+        let by_state = owner.body_header_line_state("BY sal", order_state.next_state);
+        assert!(by_state.is_header);
+        assert_eq!(by_state.next_state, None);
+
+        let dense_rank_state = owner.body_header_line_state("DENSE /* gap */ RANK", None);
         assert!(dense_rank_state.is_header);
         let last_state = owner.body_header_line_state("LAST", dense_rank_state.next_state);
         assert!(last_state.is_header);
@@ -5653,6 +6367,14 @@ mod tests {
             format_plsql_child_query_owner_pending_header_kind("OPEN c_emp FOR"),
             None
         );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("CURSOR c_emp; -- keep"),
+            None
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind("OPEN c_emp; -- keep"),
+            None
+        );
     }
 
     #[test]
@@ -5663,6 +6385,7 @@ mod tests {
         assert!(cursor_kind.line_completes(") AS"));
         assert!(cursor_kind.line_can_continue("(p_deptno NUMBER,"));
         assert!(cursor_kind.line_can_continue("p_ename VARCHAR2(30)"));
+        assert!(!cursor_kind.line_can_continue("c_emp; -- already terminated"));
         assert!(!cursor_kind.line_can_continue("SELECT empno"));
 
         let open_kind = PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor;
@@ -5670,6 +6393,7 @@ mod tests {
         assert!(open_kind.line_completes("/* gap */FOR"));
         assert!(open_kind.line_completes("FOR /* owner */"));
         assert!(open_kind.line_can_continue("c_emp"));
+        assert!(!open_kind.line_can_continue("c_emp; -- already terminated"));
         assert!(!open_kind.line_can_continue("SELECT empno"));
     }
 
