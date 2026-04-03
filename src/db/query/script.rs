@@ -2546,7 +2546,9 @@ impl QueryExecutor {
             let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
             });
-            if trimmed.ends_with(';') && semicolon_closes_active_query_frame {
+            if sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
+                && semicolon_closes_active_query_frame
+            {
                 query_frames.pop();
                 pending_query_bases.clear();
                 pending_split_query_owner = None;
@@ -3038,7 +3040,7 @@ impl QueryExecutor {
     }
 
     fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
-        let trimmed = line.trim_start();
+        let trimmed = sql_text::trim_leading_sql_comments(line);
         let bytes = trimmed.as_bytes();
         let mut idx = 0usize;
 
@@ -3316,8 +3318,7 @@ impl QueryExecutor {
                     // not collapse back to the earlier condition header depth.
                     return structural_owner_base;
                 }
-                if Self::line_ends_with_open_paren_before_inline_comment(normalized)
-                    && normalized == "("
+                if sql_text::line_is_standalone_open_paren_before_inline_comment(normalized)
                     && structural_owner_base > header_depth
                 {
                     return structural_owner_base;
@@ -3375,7 +3376,7 @@ impl QueryExecutor {
     }
 
     fn line_is_standalone_from_clause_header(trimmed_upper: &str) -> bool {
-        trimmed_upper.trim() == "FROM"
+        sql_text::line_has_exact_identifier_sequence_before_inline_comment(trimmed_upper, &["FROM"])
     }
 
     fn line_starts_with_bare_direct_from_item_query_owner(trimmed_upper: &str) -> bool {
@@ -3394,7 +3395,7 @@ impl QueryExecutor {
         next_code_trimmed: Option<&str>,
     ) -> Option<InlineCommentLineContinuation> {
         let trimmed = line.trim_end();
-        if trimmed.is_empty() || trimmed.ends_with(';') {
+        if trimmed.is_empty() || sql_text::line_ends_with_semicolon_before_inline_comment(trimmed) {
             return None;
         }
 
@@ -3440,7 +3441,7 @@ impl QueryExecutor {
 
         let prefix = sql_text::trailing_inline_comment_prefix(line)?;
         let trimmed = prefix.trim_end();
-        if trimmed.is_empty() || trimmed.ends_with(';') {
+        if trimmed.is_empty() || sql_text::line_ends_with_semicolon_before_inline_comment(trimmed) {
             return None;
         }
 
@@ -5610,7 +5611,7 @@ impl QueryExecutor {
                     );
 
                     if let Some(FormatItem::Statement(statement)) = line_items.last_mut() {
-                        if !statement.trim_end().ends_with(';') {
+                        if !sql_text::line_ends_with_semicolon_before_inline_comment(statement) {
                             statement.push(';');
                         }
                         if !statement.ends_with(' ') {
@@ -8969,6 +8970,35 @@ UPDATE OF e.sal NOWAIT;"#;
     }
 
     #[test]
+    fn line_continuation_helpers_stop_at_semicolon_before_inline_comment() {
+        assert!(
+            QueryExecutor::line_continuation_for_line("SELECT", 0, Some(0), Some("empno"))
+                .is_some()
+        );
+        assert!(QueryExecutor::line_continuation_for_line(
+            "SELECT; -- done",
+            0,
+            Some(0),
+            Some("empno"),
+        )
+        .is_none());
+        assert!(QueryExecutor::inline_comment_line_continuation_for_line(
+            "SELECT -- done",
+            0,
+            Some(0),
+            Some("empno"),
+        )
+        .is_some());
+        assert!(QueryExecutor::inline_comment_line_continuation_for_line(
+            "SELECT; -- done",
+            0,
+            Some(0),
+            Some("empno"),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_for_update_inline_comment_body_on_shared_clause_depth() {
         let sql = r#"SELECT e.empno
 FROM emp e
@@ -9035,6 +9065,41 @@ SKIP LOCKED;"#;
             contexts[skip_locked_idx].query_role,
             AutoFormatQueryRole::Continuation,
             "FOR /* ... */ UPDATE -- ... continuation should stay marked as continuation"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_comment_glued_from_as_standalone_header() {
+        let sql = r#"SELECT
+    e.empno
+FROM /* source rows */
+    emp e
+WHERE e.empno = 1;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM /* source rows */"))
+            .unwrap_or(0);
+        let from_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "emp e")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[from_item_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "line after comment-glued bare FROM should stay on the FROM body depth"
+        );
+        assert_eq!(
+            contexts[from_item_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "line after comment-glued bare FROM should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[from_item_idx].query_base_depth, contexts[from_idx].query_base_depth,
+            "comment-glued bare FROM should preserve the active query base depth"
         );
     }
 
@@ -11116,6 +11181,73 @@ AND e.status = 'A';"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_split_exists_owner_depth_across_standalone_open_paren_with_inline_block_comment_before_line_comment(
+    ) {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE EXISTS
+( /* wrapper */ -- keep owner anchor
+    SELECT 1
+    FROM bonus b
+    WHERE b.empno = e.empno
+)
+AND e.status = 'A';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE EXISTS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "( /* wrapper */ -- keep owner anchor")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.status = 'A';")
+            .unwrap_or(0);
+        let expected_select_depth = sql_text::FormatQueryOwnerKind::Condition
+            .auto_format_child_query_owner_base_depth(
+                contexts[exists_idx].auto_depth,
+                contexts[exists_idx].query_base_depth,
+            )
+            .saturating_add(1);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[exists_idx].auto_depth,
+            "wrapper line with inline block comment before line comment should still stay aligned with the split EXISTS owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].next_query_head_depth,
+            Some(expected_select_depth),
+            "wrapper line with inline block comment before line comment should still preserve the owner's promoted child-query head depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth, expected_select_depth,
+            "SELECT under comment-decorated standalone wrapper should stay on the promoted child-query depth"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[exists_idx].auto_depth,
+            "close paren after comment-decorated standalone wrapper should realign with the EXISTS owner depth"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[exists_idx].auto_depth.saturating_add(1),
+            "AND after comment-decorated standalone wrapper should return to the outer condition depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_lateral_owner_depth_with_comment_glued_query_head() {
         let sql = r#"SELECT *
 FROM dept d
@@ -12107,6 +12239,68 @@ WHERE modeled.amount > 0;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_treat_same_line_close_and_reference_on_as_new_model_owner() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits ON
+        (
+            SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno
+        ) REFERENCE ref_fallback ON
+        (
+            SELECT fallback_amt
+            FROM fallback_limits f
+            WHERE f.deptno = sales.deptno
+        )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") REFERENCE ref_fallback ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(reference_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT fallback_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "mixed leading-close MODEL REFERENCE wrapper should stay aligned with the new owner depth"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[reference_idx].auto_depth.saturating_add(1),
+            "mixed leading-close MODEL REFERENCE child SELECT should stay one level deeper than the new owner"
+        );
+        assert_eq!(
+            contexts[dimension_idx].auto_depth, contexts[reference_idx].auto_depth,
+            "DIMENSION BY after mixed leading-close MODEL REFERENCE should realign with the retained owner depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_normalize_overindented_split_model_reference_on_chain_to_structural_owner_depth(
     ) {
         let sql = r#"SELECT *
@@ -12915,6 +13109,61 @@ FROM dual;"#;
             contexts[close_then_idx].condition_role,
             AutoFormatConditionRole::Closer,
             "outer close-paren THEN line should still be treated as the condition closer"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_comment_glued_wrapper_under_when_exists_condition() {
+        let sql = r#"SELECT
+    CASE
+        WHEN EXISTS (
+            ( -- wrapper
+                SELECT 1
+                FROM dual
+            )
+        ) THEN 'Y'
+        ELSE 'N'
+    END AS flag
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN EXISTS (")
+            .unwrap_or(0);
+        let wrapper_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("( -- wrapper"))
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") THEN 'Y'")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[wrapper_idx].condition_header_line,
+            Some(when_idx),
+            "comment-glued wrapper paren should stay attached to the outer WHEN EXISTS owner"
+        );
+        assert_eq!(
+            contexts[select_idx].condition_header_line,
+            Some(when_idx),
+            "nested SELECT under a comment-glued wrapper should remain attached to the outer WHEN EXISTS owner"
+        );
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[wrapper_idx].auto_depth.saturating_add(1),
+            "nested SELECT should stay one level deeper than the comment-glued wrapper owner depth"
+        );
+        assert_eq!(
+            contexts[close_then_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "outer close-paren THEN line should still close the retained WHEN EXISTS condition"
         );
     }
 

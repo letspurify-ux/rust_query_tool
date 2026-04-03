@@ -2502,7 +2502,9 @@ impl SqlEditorWidget {
 
     fn should_merge_order_modifier_fragment(previous: &str, fragment: &str) -> bool {
         let previous_trimmed = previous.trim_end();
-        if previous_trimmed.is_empty() || previous_trimmed.ends_with(';') {
+        if previous_trimmed.is_empty()
+            || Self::line_ends_with_semicolon_before_inline_comment(previous_trimmed)
+        {
             return false;
         }
 
@@ -6407,8 +6409,7 @@ impl SqlEditorWidget {
         header_continuation_depth: Option<usize>,
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
     ) -> Option<usize> {
-        let ends_with_trailing_comma = Self::line_ends_with_comma_before_inline_comment(line)
-            || line.trim_end().ends_with(',');
+        let ends_with_trailing_comma = Self::line_ends_with_comma_before_inline_comment(line);
         if !ends_with_trailing_comma {
             return None;
         }
@@ -6714,7 +6715,6 @@ impl SqlEditorWidget {
             };
             let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
-                    || layouts[prev_idx].trimmed.trim_end().ends_with(',')
             });
             let control_branch_body_depth_for_line = pending_control_branch_body_depth_for_line;
             let current_line_branch_body_depth =
@@ -15303,6 +15303,14 @@ WHERE F IN (
     }
 
     #[test]
+    fn should_not_merge_order_modifier_fragment_after_semicolon_before_inline_comment() {
+        assert!(!SqlEditorWidget::should_merge_order_modifier_fragment(
+            "ORDER BY sal; -- done",
+            "DESC"
+        ));
+    }
+
+    #[test]
     fn open_for_with_inline_block_comment_keeps_comment_inline_and_subquery_indented() {
         let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
     l_rc t_refcur;
@@ -15432,8 +15440,7 @@ WHERE /*+ 이건 힌트가 아닌 주석 */
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(sql, false);
         let lines: Vec<&str> = formatted.lines().collect();
-        let leading_spaces =
-            |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
         let select_idx = lines
             .iter()
@@ -16727,6 +16734,69 @@ AND e.status = 'A';"#;
             indent(lines[and_idx]),
             indent(lines[exists_idx]).saturating_add(4),
             "AND after comment-glued split EXISTS should return to the outer condition depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_exists_owner_depth_across_standalone_open_paren_with_inline_block_comment_before_line_comment(
+    ) {
+        let source = r#"SELECT e.empno
+FROM emp e
+WHERE EXISTS
+( /* wrapper */ -- keep owner anchor
+    SELECT 1
+    FROM bonus b
+    WHERE b.empno = e.empno
+)
+AND e.status = 'A';"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let exists_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE EXISTS")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "( /* wrapper */ -- keep owner anchor")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND e.status = 'A';")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[exists_idx]),
+            "comment-decorated standalone wrapper after EXISTS should stay aligned with the owner line, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[select_idx]) > indent(lines[open_idx]),
+            "SELECT after comment-decorated standalone wrapper should stay deeper than the wrapper line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[exists_idx]),
+            "close paren after comment-decorated standalone wrapper should realign with the EXISTS owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_idx]),
+            indent(lines[exists_idx]).saturating_add(4),
+            "AND after comment-decorated standalone wrapper should return to the outer condition depth, got:\n{}",
             formatted
         );
     }
@@ -18089,6 +18159,40 @@ mod format_indent_gap_tests {
     }
 
     // ── CURSOR IS/AS SELECT body indent ──
+
+    #[test]
+    fn format_for_auto_formatting_treats_comment_glued_from_as_standalone_header() {
+        let source = r#"select
+    e.empno
+from /* source rows */
+    emp e
+where e.empno = 1;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let from_idx =
+            find_line_starting_with(&lines, "FROM /* source rows */").expect("FROM line");
+        let from_item_idx = find_line_starting_with(&lines, "emp e").expect("FROM item line");
+        let where_idx = find_line_starting_with(&lines, "WHERE e.empno = 1;").expect("WHERE line");
+
+        assert_eq!(
+            leading_spaces(lines[from_item_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "line after comment-glued bare FROM should render one level deeper than FROM, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[where_idx]),
+            leading_spaces(lines[from_idx]),
+            "WHERE after comment-glued bare FROM should return to the query base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "formatting should stay stable for comment-glued bare FROM headers"
+        );
+    }
 
     #[test]
     fn format_sql_basic_indents_cursor_is_select_body() {
@@ -28026,6 +28130,74 @@ WHERE modeled.amount > 0;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_treats_same_line_close_and_reference_on_as_new_model_owner() {
+        let source = r#"SELECT *
+FROM (
+    SELECT deptno,
+        amount
+    FROM sales
+    MODEL
+        REFERENCE ref_limits ON
+        (
+            SELECT limit_amt
+            FROM limits l
+            WHERE l.deptno = sales.deptno
+        ) REFERENCE ref_fallback ON
+        (
+            SELECT fallback_amt
+            FROM fallback_limits f
+            WHERE f.deptno = sales.deptno
+        )
+        DIMENSION BY (month_key)
+        MEASURES (amount)
+        RULES UPDATE (amount[ANY] = amount[CV()] + 1)
+) modeled
+WHERE modeled.amount > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let reference_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") REFERENCE ref_fallback ON")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(reference_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT fallback_amt")
+            .unwrap_or(0);
+        let dimension_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DIMENSION BY (month_key)")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[reference_idx]),
+            "mixed leading-close MODEL REFERENCE opener should stay aligned with the new REFERENCE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[reference_idx]).saturating_add(4),
+            "mixed leading-close MODEL REFERENCE child SELECT should stay one level deeper than the new owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[dimension_idx]),
+            indent(lines[reference_idx]),
+            "DIMENSION BY after mixed leading-close MODEL REFERENCE should realign with the retained owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_normalizes_extended_model_subclauses_relative_to_nested_query_base(
     ) {
         let source = r#"SELECT *
@@ -29621,6 +29793,52 @@ WHERE grouped.names IS NOT NULL;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_comment_between_within_group_header_and_wrapper_on_owner_depth(
+    ) {
+        let source = r#"SELECT *
+FROM (
+    SELECT LISTAGG (e.ename, ',')
+    WITHIN GROUP
+    -- keep wrapper attached to the owner header
+    (
+        ORDER
+        BY e.ename
+    ) AS names
+    FROM emp e
+) grouped
+WHERE grouped.names IS NOT NULL;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let within_idx =
+            find_line_starting_with(&lines, "WITHIN GROUP").expect("WITHIN GROUP line");
+        let comment_idx =
+            find_line_starting_with(&lines, "-- keep wrapper attached to the owner header")
+                .expect("comment line");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(comment_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[comment_idx]),
+            indent(lines[within_idx]),
+            "comment between exact WITHIN GROUP header and wrapper should stay on the owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[within_idx]),
+            "wrapper after exact WITHIN GROUP header should stay on the owner depth even across a comment gap, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_partial_within_group_owner_chain_relative_to_nested_query_base(
     ) {
         let source = r#"SELECT *
@@ -30801,6 +31019,47 @@ MATCH_RECOGNIZE (
             indent(lines[pattern_idx]),
             indent(lines[one_row_idx]),
             "MATCH_RECOGNIZE PATTERN should stay aligned with sibling owner-relative modifiers, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_comment_between_exact_match_recognize_modifier_and_continuation_on_owner_depth(
+    ) {
+        let source = r#"SELECT *
+FROM sales
+MATCH_RECOGNIZE (
+    PARTITION BY cust_id
+    ORDER BY sale_date
+    AFTER MATCH SKIP
+    -- keep the skip strategy chain on the owner-relative depth
+    TO NEXT ROW
+    PATTERN (A)
+    DEFINE A AS amount > 0
+) mr;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let after_skip_idx =
+            find_line_starting_with(&lines, "AFTER MATCH SKIP").expect("AFTER MATCH SKIP line");
+        let comment_idx = find_line_starting_with(
+            &lines,
+            "-- keep the skip strategy chain on the owner-relative depth",
+        )
+        .expect("comment line");
+        let to_idx = find_line_starting_with(&lines, "TO NEXT ROW").expect("TO NEXT ROW line");
+
+        assert_eq!(
+            indent(lines[comment_idx]),
+            indent(lines[after_skip_idx]),
+            "comment between exact AFTER MATCH SKIP and TO NEXT ROW should stay on the owner-relative depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[to_idx]),
+            indent(lines[after_skip_idx]),
+            "TO NEXT ROW after an exact AFTER MATCH SKIP line should stay on the owner-relative depth across a comment gap, got:\n{}",
             formatted
         );
     }

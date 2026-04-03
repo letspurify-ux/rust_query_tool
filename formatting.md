@@ -48,6 +48,8 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - `) ORDER BY ...` 는 raw line 전체가 아니라 `ORDER BY ...`를 구조 tail로 분류한다.
 - `) AND ...`, `) OR ...`, `) FOR UPDATE ...`도 같은 규칙을 따른다.
 - mixed leading-close line은 close align과 final depth를 구분해서 해석해야 한다.
+- 이 정규화는 caller 습관이 아니라 shared owner/header helper의 책임이어야 한다. caller 한 곳만 `structural tail`로 전처리하고 helper 본문이 raw line을 가정하면 `) REFERENCE ... ON`, `) WINDOW ... AS`, `) OPEN ... FOR` 같은 mixed leading-close owner/header가 phase마다 다른 depth를 만들게 된다.
+- 단, close를 소비한 뒤 structural tail이 비었다고 해서 close event 자체가 사라지는 것은 아니다. nested paren을 추적하는 pending header/owner는 pure `)` line을 "빈 줄"이 아니라 "wrapper close continuation step"으로 해석해야 한다.
 
 ### 1.5 deferred structural effect는 typed pending state로 유지한다
 
@@ -74,6 +76,8 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 한 phase만 아는 owner/frame은 허용하지 않는다.
 - stable anchor, owner-relative family, continuation boundary도 같은 semantics를 따라야 한다.
 - exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
+- 다만 "같은 prefix taxonomy를 쓴다"가 "inline comment split과 exact bare line이 항상 같은 continuation depth를 가진다"를 의미하지는 않는다. exact bare line이 여전히 dedicated same-depth owner/header chain fragment라면 (`WITHIN GROUP`, `DENSE_RANK LAST`, `AFTER MATCH SKIP`, `LEFT OUTER`, `REFERENCE`, `CURSOR` 등) bare carry는 same-depth여야 하고, inline comment split만 body depth를 빌릴 수 있다.
+- same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
 - 특정 구문이 애매하면 "같은 semantic decision을 양쪽에서 재현한다"가 원칙이고, helper를 하나로 합칠지 전용 판별식을 둘지는 구현 전략이다.
 
 ### 1.7 comment와 quoted literal은 구조 이벤트가 아니다
@@ -90,6 +94,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - `END /* gap */ IF`, `END -- gap` 다음 suffix line, `) /* gap */ ORDER BY` 같은 형태도 주석을 제거한 structural token sequence로 판정해야 한다.
 - line tail/suffix 판정도 예외가 아니다. `GROUP /* gap */ BY -- ...`, `FOR /* gap */ UPDATE -- ...`, `IF ... /* gap */ THEN`처럼 split header나 trailing terminator를 판정할 때도 raw whitespace split이 아니라 comment-stripped meaningful identifier sequence를 사용해야 한다.
 - statement terminator 판정도 예외가 아니다. `OPEN c_emp; -- done`, `CURSOR c_emp IS; /* impossible but lexical */`, `END; -- block close` 같은 line은 raw `trim_end().ends_with(';')`가 아니라 inline comment를 제거한 뒤의 마지막 meaningful token으로 닫힘 여부를 판정해야 한다.
+- exact bare header / standalone wrapper 판정도 예외가 아니다. `FROM /* gap */`, `WHERE /* gap */`, `ON /* gap */`, `( -- wrapper` 같은 line은 raw `trim()` / `==` 비교가 아니라 shared structural token / wrapper helper로 판정해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
 
 ## 2. 구조 계약
