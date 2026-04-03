@@ -1966,6 +1966,140 @@ fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     true
 }
 
+fn line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
+    line: &str,
+    sequence: &[&str],
+) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+
+    let trimmed = trim_leading_sql_comments(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let expected_segments = sequence
+        .iter()
+        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()))
+        .collect::<Vec<_>>();
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    let mut matched_segments = 0usize;
+
+    while idx < bytes.len() && matched_segments < expected_segments.len() {
+        while idx < bytes.len() {
+            let current = bytes[idx];
+            let next = bytes.get(idx.saturating_add(1)).copied();
+            if current.is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if current == b'-' && next == Some(b'-') {
+                return false;
+            }
+            if current == b'/' && next == Some(b'*') {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+            break;
+        }
+
+        if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+            return false;
+        }
+
+        let start = idx;
+        idx = idx.saturating_add(1);
+        while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+            idx = idx.saturating_add(1);
+        }
+
+        let Some(identifier) = trimmed.get(start..idx) else {
+            return false;
+        };
+
+        for segment in identifier.split('_').filter(|segment| !segment.is_empty()) {
+            let Some(expected) = expected_segments.get(matched_segments) else {
+                return false;
+            };
+            if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+                return false;
+            }
+            matched_segments = matched_segments.saturating_add(1);
+        }
+    }
+
+    if matched_segments != expected_segments.len() {
+        return false;
+    }
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'-' && next == Some(b'-') {
+            return false;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        if current != b'(' {
+            return false;
+        }
+        idx = idx.saturating_add(1);
+        break;
+    }
+
+    if idx == 0 || bytes.get(idx.saturating_sub(1)) != Some(&b'(') {
+        return false;
+    }
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'-' && next == Some(b'-') {
+            return true;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        return false;
+    }
+
+    true
+}
+
 /// Returns true when the leading structural identifier sequence on `line`
 /// matches `sequence`, skipping only whitespace and block comments between
 /// identifiers.
@@ -1981,6 +2115,32 @@ pub(crate) fn line_has_exact_identifier_sequence_before_inline_comment(
     sequence: &[&str],
 ) -> bool {
     line_has_exact_identifier_sequence(line, sequence)
+}
+
+/// Returns true when `line` is an exact bare control-condition header whose
+/// only structural token after the header sequence is a standalone `(`.
+///
+/// This lets analyzer and formatter lookahead logic treat `IF (`, `ELSIF (`,
+/// `ELSEIF (`, `WHILE (`, and `WHEN (` the same way even when whitespace or
+/// inline block comments split the header from the opening paren.
+pub(crate) fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
+    line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(line, &["IF"])
+        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
+            line,
+            &["ELSIF"],
+        )
+        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
+            line,
+            &["ELSEIF"],
+        )
+        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
+            line,
+            &["WHILE"],
+        )
+        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
+            line,
+            &["WHEN"],
+        )
 }
 
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
@@ -2479,6 +2639,19 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary(line: &st
         || format_merge_branch_pending_header_kind(trimmed).is_some()
         || starts_with_format_merge_branch_header(&trimmed_upper)
         || line_is_standalone_open_paren_before_inline_comment(trimmed)
+}
+
+/// Returns true when a line is a CTE definition header that owns a following
+/// query body through a trailing `AS (`.
+///
+/// This helper normalizes the shared structural tail first so analyzer-side
+/// WITH sibling detection stays on the same taxonomy as formatter structural
+/// helpers.
+pub(crate) fn line_is_format_cte_definition_header(line: &str) -> bool {
+    let structural_tail = auto_format_structural_tail(line);
+    !structural_tail.is_empty()
+        && line_ends_with_open_paren_before_inline_comment(structural_tail)
+        && line_ends_with_identifier_sequence_before_inline_comment(structural_tail, &["AS"])
 }
 
 /// Returns true when a CREATE query-body DDL header line owns the following
@@ -3632,7 +3805,7 @@ pub(crate) fn starts_with_format_model_multiline_owner_tail(text_upper: &str) ->
 pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
     let structural_tail = owner_header_structural_tail(line);
 
-    if line_ends_with_format_direct_from_item_query_owner_keyword(structural_tail)
+    if line_ends_with_format_split_direct_from_item_query_owner_keyword(structural_tail)
         || line_ends_with_keyword(structural_tail, "APPLY")
     {
         return Some(FormatQueryOwnerKind::FromItem);
@@ -3690,6 +3863,10 @@ pub(crate) fn format_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind
 /// The formatter's analyzer and indentation phases both use this helper so the
 /// owner-family classification stays consistent for nested wrapper/query-owner
 /// constructs such as `CURSOR`, `MULTISET`, `LATERAL`, and `TABLE`.
+///
+/// Exact completed owner anchors like `CROSS APPLY` / `OUTER APPLY` are
+/// intentionally resolved through `format_query_owner_header_kind(...)`
+/// instead of this narrower split-lookahead helper.
 pub(crate) fn split_query_owner_lookahead_kind(
     line: &str,
     next_code_is_standalone_open_paren: bool,
@@ -3711,7 +3888,7 @@ pub(crate) fn split_query_owner_lookahead_kind(
         return Some(SplitQueryOwnerLookaheadKind::GenericExpression);
     }
 
-    (line_ends_with_format_direct_from_item_query_owner_keyword(line)
+    (line_ends_with_format_split_direct_from_item_query_owner_keyword(line)
         && format_query_owner_pending_header_kind(line).is_none()
         && format_indented_paren_pending_header_kind(line).is_none())
     .then_some(SplitQueryOwnerLookaheadKind::DirectFromItem)
@@ -3961,9 +4138,30 @@ fn line_ends_with_format_table_from_item_query_owner_keyword(line: &str) -> bool
         && line_ends_with_identifier_sequence(line, &["TABLE"])
 }
 
-pub(crate) fn line_ends_with_format_direct_from_item_query_owner_keyword(line: &str) -> bool {
+/// Returns true for direct FROM-item owner headers that are safe to treat as
+/// split-owner lookahead when a standalone `(` and child query head follow.
+///
+/// Exact completed owners like `CROSS APPLY` / `OUTER APPLY` intentionally do
+/// not participate here; they stay on the completed-owner-anchor path.
+pub(crate) fn line_ends_with_format_split_direct_from_item_query_owner_keyword(line: &str) -> bool {
     line_ends_with_identifier_sequence(line, &["LATERAL"])
         || line_ends_with_format_table_from_item_query_owner_keyword(line)
+}
+
+/// Returns true when the structural tail starts with an exact bare direct
+/// FROM-item owner (`LATERAL`, `TABLE`) that should keep the sibling item
+/// depth even if leading comments are glued onto the line.
+pub(crate) fn line_starts_with_format_bare_direct_from_item_query_owner(line: &str) -> bool {
+    let structural_tail = auto_format_structural_tail(line);
+    line_starts_with_identifier_sequence(structural_tail, &["LATERAL"])
+        || line_starts_with_identifier_sequence(structural_tail, &["TABLE"])
+}
+
+fn line_is_format_same_depth_deferred_wrapper_owner(line: &str) -> bool {
+    matches!(
+        format_query_owner_header_kind(line),
+        Some(FormatQueryOwnerKind::Condition | FormatQueryOwnerKind::FromItem)
+    ) || line_ends_with_format_expression_query_owner_keyword(line)
 }
 
 fn line_ends_with_keyword(line: &str, keyword: &str) -> bool {
@@ -4733,6 +4931,10 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
         return None;
     }
 
+    if line_is_format_same_depth_deferred_wrapper_owner(trimmed) {
+        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
+    }
+
     if format_indented_paren_owner_header_kind(trimmed)
         .is_some_and(|kind| kind != FormatIndentedParenOwnerKind::ModelSubclause)
         || format_indented_paren_pending_header_kind(trimmed).is_some()
@@ -4985,6 +5187,29 @@ mod tests {
         );
         assert_eq!(trim_leading_sql_comments("/* note only */"), "");
         assert_eq!(trim_leading_sql_comments("-- line comment"), "");
+    }
+
+    #[test]
+    fn bare_parenthesized_condition_header_helper_tracks_comment_glued_control_headers() {
+        assert!(line_is_bare_parenthesized_condition_header(
+            "/* lead */ IF /* gap */ ("
+        ));
+        assert!(line_is_bare_parenthesized_condition_header(
+            "ELSIF /* gap */ ("
+        ));
+        assert!(line_is_bare_parenthesized_condition_header(
+            "WHEN /* gap */ ( -- trailing"
+        ));
+
+        assert!(!line_is_bare_parenthesized_condition_header(
+            "IF ready_flag = 'Y' THEN"
+        ));
+        assert!(!line_is_bare_parenthesized_condition_header(
+            "WHILE total_count > 0 LOOP"
+        ));
+        assert!(!line_is_bare_parenthesized_condition_header(
+            "IF /* gap */ ready_flag"
+        ));
     }
 
     #[test]
@@ -5487,6 +5712,66 @@ mod tests {
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("LEFT OUTER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("EXISTS"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("IN"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("NOT EXISTS"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("NOT IN"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("ANY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("SOME"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("ALL"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("LATERAL"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("CROSS APPLY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("/* owner */ CROSS APPLY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("OUTER APPLY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("TABLE"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("/* owner */ TABLE"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("MULTISET"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("CURSOR"),
             Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
         );
         assert_eq!(
@@ -6433,6 +6718,19 @@ mod tests {
     }
 
     #[test]
+    fn cte_definition_header_helper_tracks_column_lists_and_comment_glued_headers() {
+        assert!(line_is_format_cte_definition_header("WITH base_emp AS ("));
+        assert!(line_is_format_cte_definition_header("base_emp AS ("));
+        assert!(line_is_format_cte_definition_header("b (a, b, c) AS ("));
+        assert!(line_is_format_cte_definition_header(
+            "/* owner */ b (a, b, c) AS ("
+        ));
+        assert!(line_is_format_cte_definition_header(") b (a, b, c) AS ("));
+        assert!(!line_is_format_cte_definition_header("SELECT empno AS salary"));
+        assert!(!line_is_format_cte_definition_header("b (a, b, c)"));
+    }
+
+    #[test]
     fn split_query_owner_lookahead_kind_detects_safe_split_owner_headers() {
         assert_eq!(
             split_query_owner_lookahead_kind("CURSOR", true, Some("SELECT empno")),
@@ -6483,6 +6781,28 @@ mod tests {
         ));
         assert!(!line_ends_with_format_expression_query_owner_keyword(
             "SELECT e.empno,"
+        ));
+    }
+
+    #[test]
+    fn line_starts_with_format_bare_direct_from_item_query_owner_ignores_leading_comments() {
+        assert!(line_starts_with_format_bare_direct_from_item_query_owner(
+            "LATERAL"
+        ));
+        assert!(line_starts_with_format_bare_direct_from_item_query_owner(
+            "TABLE"
+        ));
+        assert!(line_starts_with_format_bare_direct_from_item_query_owner(
+            "/* owner */ LATERAL"
+        ));
+        assert!(line_starts_with_format_bare_direct_from_item_query_owner(
+            "/* owner */ TABLE"
+        ));
+        assert!(!line_starts_with_format_bare_direct_from_item_query_owner(
+            "FROM TABLE"
+        ));
+        assert!(!line_starts_with_format_bare_direct_from_item_query_owner(
+            "CROSS APPLY"
         ));
     }
 
@@ -6539,35 +6859,35 @@ mod tests {
     }
 
     #[test]
-    fn format_direct_from_item_query_owner_keywords_cover_safe_split_lateral_headers() {
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+    fn format_split_direct_from_item_query_owner_keywords_cover_safe_split_lateral_headers() {
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "LATERAL"
         ));
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "LATERAL -- derived rows"
         ));
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "TABLE"
         ));
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "TABLE -- derived rows"
         ));
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "FROM TABLE"
         ));
-        assert!(line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "LEFT JOIN TABLE"
         ));
-        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "OUTER APPLY"
         ));
-        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "TABLE collection_expr"
         ));
-        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "CREATE TABLE"
         ));
-        assert!(!line_ends_with_format_direct_from_item_query_owner_keyword(
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
             "JOIN"
         ));
     }

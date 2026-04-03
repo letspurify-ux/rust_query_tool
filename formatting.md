@@ -47,6 +47,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 - `) ORDER BY ...` 는 raw line 전체가 아니라 `ORDER BY ...`를 구조 tail로 분류한다.
 - `) AND ...`, `) OR ...`, `) FOR UPDATE ...`도 같은 규칙을 따른다.
+- `) FROM`, `) GROUP BY`, `) ORDER BY`, `) WINDOW ... AS (` 같은 exact bare clause/header line도 close를 소비한 structural tail 기준으로 bare-header family를 판정해야 한다.
 - mixed leading-close line은 close align과 final depth를 구분해서 해석해야 한다.
 - 이 정규화는 caller 습관이 아니라 shared owner/header helper의 책임이어야 한다. caller 한 곳만 `structural tail`로 전처리하고 helper 본문이 raw line을 가정하면 `) REFERENCE ... ON`, `) WINDOW ... AS`, `) OPEN ... FOR` 같은 mixed leading-close owner/header가 phase마다 다른 depth를 만들게 된다.
 - 단, close를 소비한 뒤 structural tail이 비었다고 해서 close event 자체가 사라지는 것은 아니다. nested paren을 추적하는 pending header/owner는 pure `)` line을 "빈 줄"이 아니라 "wrapper close continuation step"으로 해석해야 한다.
@@ -58,6 +59,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - split owner/header
 - split `MERGE WHEN ... THEN` branch header
 - completed owner anchor
+- completed deferred-wrapper owner anchor (same-line condition owner `EXISTS`/`IN`/`ANY`/`SOME`/`ALL`, same-line retained unary modifier가 붙은 `NOT EXISTS`/`NOT IN`, direct from-item owner `LATERAL`/`TABLE`/`CROSS|OUTER APPLY`, generic expression owner `CURSOR`/`MULTISET`, PL/SQL child-query owner `CURSOR ... IS|AS` / `OPEN ... FOR`)
 - deferred query head
 - pure/mixed close align
 - split plain `END` suffix/label carry
@@ -77,7 +79,9 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - stable anchor, owner-relative family, continuation boundary도 같은 semantics를 따라야 한다.
 - exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
 - 다만 "같은 prefix taxonomy를 쓴다"가 "inline comment split과 exact bare line이 항상 같은 continuation depth를 가진다"를 의미하지는 않는다. exact bare line이 여전히 dedicated same-depth owner/header chain fragment라면 (`WITHIN GROUP`, `DENSE_RANK LAST`, `AFTER MATCH SKIP`, `LEFT OUTER`, `REFERENCE`, `CURSOR` 등) bare carry는 same-depth여야 하고, inline comment split만 body depth를 빌릴 수 있다.
+- exact bare line이 "다음 code line에서 wrapper/query head를 받을 completed owner anchor"인 경우도 예외가 아니다. `EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`처럼 standalone `(` 또는 child query가 뒤로 밀린 owner line은 generic `FROM`/`WHERE` body header처럼 다시 +1 하지 말고 same-depth owner family로 유지해야 한다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
+- `WITH` sibling CTE definition header 판정도 예외가 아니다. `cte_name AS (`와 `cte_name (col1, ...) AS (`는 local analyzer heuristic가 아니라 shared structural helper로 분류해야 다음 CTE/main query가 continuation state를 잘못 상속하지 않는다.
 - 특정 구문이 애매하면 "같은 semantic decision을 양쪽에서 재현한다"가 원칙이고, helper를 하나로 합칠지 전용 판별식을 둘지는 구현 전략이다.
 
 ### 1.7 comment와 quoted literal은 구조 이벤트가 아니다
@@ -88,6 +92,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
 - line head prefix 판정도 예외가 아니다. `CREATE /* gap */ MATERIALIZED /* gap */ VIEW ... AS`, `OPEN c /* gap */ FOR`, `CURSOR c /* gap */ IS`, `WHEN /* gap */ NOT /* gap */ MATCHED THEN`, `MATCH /* gap */ RECOGNIZE` 같은 multi-keyword owner/header는 raw prefix string이나 `contains()`가 아니라 comment-stripped meaningful identifier sequence로 판정해야 한다.
 - control-branch owner/header 판정도 예외가 아니다. exact `ELSE`, exact `EXCEPTION`, `ELSIF ... THEN`, `ELSEIF ... THEN`, `CASE` 같은 PL/SQL branch header는 `ELSE/* gap */`, `EXCEPTION/* gap */`, `ELSIF/* gap */ cond THEN` 형태여도 raw `trim()`/`starts_with()`가 아니라 comment-stripped structural token sequence로 판정해야 한다.
+- bare control-condition header lookahead도 예외가 아니다. `IF /* gap */ (`, `ELSIF /* gap */ (`, `ELSEIF /* gap */ (`, `WHILE /* gap */ (`, `WHEN /* gap */ (` 같은 exact bare header는 다음 pure `)` / `AND` / `OR` line이 retained condition state를 정확히 복원할 수 있도록 shared structural helper로 판정해야 한다.
 - underscore를 가진 composite keyword(`MATCH_RECOGNIZE`, `DENSE_RANK` 등)도 예외가 아니다. 구현 내부 표현이 단일 identifier이든, comment/whitespace 때문에 여러 identifier segment로 보이든 structural classifier는 같은 keyword sequence로 취급해야 한다.
 - 이 원칙은 leading/trailing header continuation classifier와 owner-relative split body-header matcher에도 동일하게 적용된다. 특정 phase만 raw word pair 비교를 쓰면 같은 composite keyword가 줄 위치에 따라 다른 depth를 만들게 된다.
 - same-line classifier뿐 아니라 next/previous-line lookahead도 예외가 아니다. split owner lookahead, blank-line suppression, case-close alignment, control-condition close 판정처럼 "인접 line의 첫 구조 토큰"을 보는 로직도 raw `trim()`/`starts_with()`가 아니라 comment-stripped structural tail 기준으로 판정해야 한다.
@@ -140,6 +145,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 split owner/header가 현재 줄에서 완성됐더라도, child body/query/open wrapper가 다음 code line에서 시작하면 owner를 즉시 잊으면 안 된다.
 
 - completed owner anchor는 완성된 owner line의 `owner depth`를 유지하는 pending state다.
+- exact bare deferred-wrapper owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`)와 completed PL/SQL child-query owner line(`CURSOR ... IS|AS`, `OPEN ... FOR`)도 동일한 completed owner anchor family다.
 - child query용 `owner base depth` 또는 `next_query_head_depth`를 추가로 들고 갈 수 있다.
 - 하지만 wrapper line 정렬 기준은 항상 `owner depth`다.
 - comment-only / blank / comma-only line은 anchor를 소비하지 않는다.
@@ -174,6 +180,9 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - 일반 괄호 표현식
 - 서브쿼리 소유 괄호
+- condition-owned child-query owner (`EXISTS`, `IN`, `ANY/SOME/ALL`, split `NOT ...`)
+- direct from-item child-query owner (`LATERAL`, `TABLE`, `APPLY` child-query branch)
+- generic expression child-query owner (`CURSOR`, `MULTISET`)
 - `BEGIN … END`, `CASE … END`, `IF … END IF` 블록
 - `OVER (…)`, `WITHIN GROUP (…)`, `WINDOW (…)`, `MATCH_RECOGNIZE (…)`, `PIVOT (…)`, `UNPIVOT (…)`, `MODEL (…)`, `JSON_TABLE ... NESTED/COLUMNS (...)` 같은 multiline clause owner
 - `CURSOR ... IS`, `OPEN ... FOR`, control-body query owner 같은 PL/SQL child-query owner
@@ -186,7 +195,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 현재 continuation/operator RHS/header carry를 끊는 boundary는 다음 taxonomy를 사용한다.
 
-- stable clause/query anchor: `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL`, `VALUES`, `TABLE`, `FROM`, `WHERE`, `GROUP`, `HAVING`, `ORDER`, `SET`, `INTO`, `USING`, `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `SEARCH`, `CYCLE`, `RETURNING`, `OFFSET`, `FETCH`, `LIMIT`, `QUALIFY`
+- stable clause/query anchor: `SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL`, `VALUES`, `TABLE`, `FROM`, `WHERE`, `GROUP`, `HAVING`, `ORDER`, `SET`, `INTO`, `USING`, `CONNECT`, `START`, `MODEL`, `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `SEARCH`, `CYCLE`, `RETURNING`, `OFFSET`, `FETCH`, `LIMIT`, `QUALIFY`
 - join boundary: `JOIN`, `APPLY`, `LEFT/RIGHT/FULL/CROSS/NATURAL/OUTER ... JOIN|APPLY`
 - join condition boundary: `ON`, `USING`
 - dedicated clause boundary: `FOR UPDATE`
@@ -200,22 +209,29 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - `FOR UPDATE`처럼 다른 keyword와 충돌 가능한 구문은 현재 policy상 dedicated handling을 둔다.
 - split `MERGE` branch header는 generic condition continuation이 아니라 dedicated pending merge-branch-header state로 처리한다.
 - incomplete split `MERGE` fragment(`WHEN`, `WHEN NOT`)도 shared structural boundary helper가 먼저 끊어줘야 한다. 그래야 generic continuation carry와 dedicated merge-header state가 충돌하지 않는다.
+- active `WITH` frame 안의 sibling CTE definition header(`cte_name AS (` 뿐 아니라 `cte_name (col1, ...) AS (` 형태 포함)는 generic list/item continuation이 아니라 `WITH` owner depth의 stable base line이다. column list identifier 때문에 trailing `AS`를 놓치면 다음 CTE/main query가 잘못 continuation depth를 상속한다.
 
 ### 3.3 current bare header continuation taxonomy
 
 현재 bare header continuation depth 분류:
 
 - bare-header carry는 comment를 제거한 structural tail이 "exact keyword-only line"일 때만 켠다. `SELECT DISTINCT`는 bare header지만 `SELECT DISTINCT empno`는 bare header가 아니다.
-- same-depth header: `WITH` 같은 owner/header chain 조각
+- same-depth header: `WITH` 같은 owner/header chain 조각, terminal `JOIN/APPLY` 전의 incomplete modifier fragment (`LEFT OUTER`, `CROSS`, `OUTER`)
 - same-depth merge-header header line: retained `WHEN`, `WHEN NOT`, pending state가 넘겨주는 split `MATCHED`, standalone `WHEN MATCHED`, standalone `WHEN NOT MATCHED`
+- same-depth deferred-wrapper owner line: exact bare condition-owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`), exact bare direct from-item owner(`LATERAL`, `TABLE`, `CROSS/OUTER APPLY`), exact bare generic expression owner(`CURSOR`, `MULTISET`)
 - query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
 - current-line+1 merge-header condition: retained merge-header state가 소비하는 `AND`/`OR` condition line, standalone `THEN`, mixed close tail `) THEN`
-- current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, exact bare `JOIN/APPLY` modifier chain, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
+- current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, exact bare `... JOIN` header line, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
 - owner-relative body header family: `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`
 - owner-relative split-header state machine: active multiline owner 안에서는 `WITHIN -> GROUP`, `DENSE_RANK -> FIRST/LAST -> ORDER -> BY`, `AFTER -> MATCH SKIP -> TO NEXT ROW`, `ROWS -> BETWEEN ...`, `RETURN -> UPDATED/ALL -> ROWS`, `RULES -> AUTOMATIC/SEQUENTIAL -> ORDER` 같은 multi-step sequence를 dedicated state로 추적한다. 이 family는 bare-header carry가 있더라도 final canonical depth를 active owner body depth 기준으로 다시 snap 할 수 있다.
 
 주의:
 
+- exact bare deferred-wrapper owner line은 same-depth family다. `FROM`/`WHERE`/`JOIN`처럼 다음 operand/item body를 여는 generic clause header와 섞으면 wrapper line depth가 불안정해진다.
+- 단, low-level split-owner lookahead helper는 semantic family 전체와 1:1이 아닐 수 있다. 예를 들어 exact `CROSS/OUTER APPLY` owner line은 same-depth deferred-wrapper owner family에는 속하지만, 구현에서는 completed owner anchor path를 통해 처리하고 split `LATERAL`/`TABLE` lookahead helper에 억지로 넣지 않는다.
+- 이 family는 literal 마지막 token이 아니라 owner family로 분류한다. 따라서 `TABLE`은 generic stable anchor taxonomy에도 등장하지만, exact bare `TABLE` owner line에서는 deferred-wrapper owner family가 우선한다. 같은 이유로 same-line `NOT EXISTS`/`NOT IN`도 generic `NOT` fragment가 아니라 completed owner anchor로 본다.
+- `... APPLY` terminal line은 같은 `JOIN/APPLY` modifier family라도 generic bare header가 아니라 completed deferred-wrapper owner anchor다. 반대로 terminal `APPLY` 전의 fragment (`CROSS`, `OUTER`)는 pending header chain으로 same-depth를 유지한다.
+- `/* gap */ LATERAL`, `/* gap */ TABLE` 같은 comment-glued exact bare direct from-item owner도 동일한 same-depth deferred-wrapper family다. raw `starts_with("LATERAL"|"TABLE")`로 판정하면 shared structural tail 규칙을 깨고 FROM-item body depth로 잘못 강등된다.
 - `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `MODEL`은 generic bare-header continuation consumer가 아니라 dedicated owner-relative / subclause family로 관리한다.
 - `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`은 generic query-base carry가 아니라 active owner frame의 body depth에 먼저 snap 되어야 한다.
 - split multiline owner/modifier의 exact bare keyword-only line도 generic carry와 dedicated owner-relative state를 같은 shared prefix taxonomy 위에서 해석해야 한다. 단, 최종 `final depth`는 active owner state가 canonicalize한다.

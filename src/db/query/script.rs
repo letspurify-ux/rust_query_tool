@@ -1769,7 +1769,9 @@ impl QueryExecutor {
                     .unwrap_or_else(|| frame.query_base_depth.saturating_add(1));
                 let current_line_is_bare_direct_from_item_query_owner =
                     current_line_is_direct_split_from_item_query_owner
-                        && Self::line_starts_with_bare_direct_from_item_query_owner(&trimmed_upper);
+                        && sql_text::line_starts_with_format_bare_direct_from_item_query_owner(
+                            trimmed,
+                        );
                 let current_line_is_pending_from_item_body = frame.pending_from_item_body
                     && matches!(clause_kind, None | Some(AutoFormatClauseKind::Table))
                     && !sql_text::line_has_leading_significant_close_paren(trimmed);
@@ -2272,7 +2274,7 @@ impl QueryExecutor {
                     .condition_header_line
                     .and_then(|header_idx| lines.get(header_idx))
                     .is_some_and(|header_line| {
-                        Self::line_is_bare_parenthesized_condition_header(header_line)
+                        sql_text::line_is_bare_parenthesized_condition_header(header_line)
                     });
 
             if context.condition_role == AutoFormatConditionRole::Closer {
@@ -2332,7 +2334,7 @@ impl QueryExecutor {
                 }
             }
             if current_line_is_direct_split_from_item_query_owner
-                && !Self::line_starts_with_bare_direct_from_item_query_owner(&trimmed_upper)
+                && !sql_text::line_starts_with_format_bare_direct_from_item_query_owner(trimmed)
             {
                 if let Some(query_base_depth) = context.query_base_depth {
                     context.auto_depth = query_base_depth;
@@ -3039,60 +3041,6 @@ impl QueryExecutor {
         sql_text::line_is_standalone_open_paren_before_inline_comment(line)
     }
 
-    fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
-        let trimmed = sql_text::trim_leading_sql_comments(line);
-        let bytes = trimmed.as_bytes();
-        let mut idx = 0usize;
-
-        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-            idx += 1;
-        }
-
-        let start = idx;
-        while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
-            idx += 1;
-        }
-
-        if start == idx {
-            return false;
-        }
-
-        let leading_word = trimmed[start..idx].to_ascii_uppercase();
-        if !matches!(
-            leading_word.as_str(),
-            "IF" | "ELSIF" | "ELSEIF" | "WHILE" | "WHEN"
-        ) {
-            return false;
-        }
-
-        while idx < bytes.len() {
-            if bytes[idx].is_ascii_whitespace() {
-                idx += 1;
-                continue;
-            }
-
-            if bytes[idx] == b'-' && bytes.get(idx + 1) == Some(&b'-') {
-                return false;
-            }
-
-            if bytes[idx] == b'/' && bytes.get(idx + 1) == Some(&b'*') {
-                idx += 2;
-                while idx + 1 < bytes.len() {
-                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                        idx += 2;
-                        break;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-
-            return bytes[idx] == b'(';
-        }
-
-        false
-    }
-
     fn line_multiline_clause_owner_kind(
         line: &str,
     ) -> Option<sql_text::FormatIndentedParenOwnerKind> {
@@ -3352,23 +3300,7 @@ impl QueryExecutor {
     }
 
     fn line_is_cte_definition_header(line: &str) -> bool {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
-            return false;
-        }
-
-        let words = sql_text::meaningful_identifier_words_before_inline_comment(trimmed, 4);
-        if words
-            .first()
-            .is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
-        {
-            return words
-                .iter()
-                .skip(1)
-                .any(|word| word.eq_ignore_ascii_case("AS"));
-        }
-
-        words.iter().any(|word| word.eq_ignore_ascii_case("AS"))
+        sql_text::line_is_format_cte_definition_header(line)
     }
 
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
@@ -3377,11 +3309,6 @@ impl QueryExecutor {
 
     fn line_is_standalone_from_clause_header(trimmed_upper: &str) -> bool {
         sql_text::line_has_exact_identifier_sequence_before_inline_comment(trimmed_upper, &["FROM"])
-    }
-
-    fn line_starts_with_bare_direct_from_item_query_owner(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_keyword_token(trimmed_upper, "LATERAL")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "TABLE")
     }
 
     fn line_starts_continuation_boundary(line: &str) -> bool {
@@ -3493,6 +3420,35 @@ impl QueryExecutor {
     ) -> Option<InlineCommentContinuationKind> {
         if Self::line_has_trailing_continuation_operator(trimmed_prefix) {
             return Some(InlineCommentContinuationKind::SameDepth);
+        }
+
+        if let Some(kind) = sql_text::format_structural_header_continuation_kind(trimmed_prefix) {
+            return Some(match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
+                    InlineCommentContinuationKind::SameDepth
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    InlineCommentContinuationKind::OneDeeperThanQueryBase
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+                }
+            });
+        }
+
+        if let Some(kind) = sql_text::format_bare_structural_header_continuation_kind(trimmed_prefix)
+        {
+            return Some(match kind {
+                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
+                    InlineCommentContinuationKind::SameDepth
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
+                    InlineCommentContinuationKind::OneDeeperThanQueryBase
+                }
+                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
+                }
+            });
         }
 
         let words = sql_text::trailing_identifier_words_before_inline_comment(trimmed_prefix, 2);
@@ -7590,7 +7546,7 @@ mod tests {
 
     use super::{
         AutoFormatConditionRole, AutoFormatLineSemantic, AutoFormatQueryRole, FormatItem,
-        QueryExecutor,
+        InlineCommentContinuationKind, QueryExecutor,
     };
 
     #[test]
@@ -9104,6 +9060,41 @@ WHERE e.empno = 1;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_treat_mixed_close_from_as_standalone_header() {
+        let sql = r#"SELECT (
+    SELECT MAX (sal)
+    FROM emp
+) FROM
+    dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") FROM")
+            .unwrap_or(0);
+        let from_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "dual;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[from_item_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "line after mixed leading-close bare FROM should stay on the FROM body depth"
+        );
+        assert_eq!(
+            contexts[from_item_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "line after mixed leading-close bare FROM should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[from_item_idx].query_base_depth, contexts[from_idx].query_base_depth,
+            "mixed leading-close bare FROM should preserve the active query base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_mixed_close_for_update_comment_body_on_structural_tail_depth()
     {
         let sql = r#"SELECT e.empno
@@ -9458,6 +9449,123 @@ ORDER BY rt.PATH;"#;
             contexts[aggregated_select_idx].auto_depth,
             contexts[aggregated_cte_idx].auto_depth.saturating_add(1),
             "aggregated CTE body SELECT should stay exactly one level deeper than the CTE header"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_column_list_cte_sibling_on_with_depth() {
+        let sql = r#"WITH a AS (
+    SELECT 1
+    FROM dual
+),
+b (a, b, c) AS (
+    SELECT 1
+    FROM dual
+)
+SELECT 1
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH a AS (");
+        let sibling_cte_idx = find_line("b (a, b, c) AS (");
+        let sibling_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sibling_cte_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = find_line(")");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "CTE sibling with a column list should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[sibling_cte_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "CTE sibling with a column list should be treated as a stable base line, not a generic continuation"
+        );
+        assert_eq!(
+            contexts[sibling_select_idx].auto_depth,
+            contexts[sibling_cte_idx].auto_depth.saturating_add(1),
+            "column-list CTE body SELECT should stay exactly one level deeper than its CTE header"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after a column-list sibling CTE should return to the WITH base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_comment_glued_column_list_cte_sibling_on_with_depth() {
+        let sql = r#"WITH a AS (
+    SELECT 1
+    FROM dual
+),
+/* owner */ b (a, b, c) AS (
+    SELECT 1
+    FROM dual
+)
+SELECT 1
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH a AS (");
+        let sibling_cte_idx = find_line("/* owner */ b (a, b, c) AS (");
+        let sibling_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sibling_cte_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sibling_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "comment-glued sibling CTE header with a column list should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[sibling_cte_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "comment-glued sibling CTE header with a column list should remain a stable base line"
+        );
+        assert_eq!(
+            contexts[sibling_select_idx].auto_depth,
+            contexts[sibling_cte_idx].auto_depth.saturating_add(1),
+            "comment-glued column-list CTE body SELECT should stay exactly one level deeper than its header"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after a comment-glued column-list sibling CTE should return to the WITH base depth"
         );
     }
 
@@ -11527,6 +11635,35 @@ deptno;"#;
     }
 
     #[test]
+    fn inline_comment_line_continuation_kind_reuses_exact_bare_owner_taxonomy() {
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("CROSS APPLY"),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "exact APPLY owner line should keep same-depth continuation kind across inline comments"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("LATERAL"),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "exact LATERAL owner line should keep same-depth continuation kind across inline comments"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("TABLE"),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "exact TABLE owner line should keep same-depth continuation kind across inline comments"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("NOT EXISTS"),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "exact NOT EXISTS owner line should keep same-depth continuation kind across inline comments"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("NOT IN"),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "exact NOT IN owner line should keep same-depth continuation kind across inline comments"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_ignore_existing_indent_for_inline_comment_header_continuation() {
         let sql = r#"SELECT deptno,
     COUNT(*) AS cnt
@@ -12297,6 +12434,91 @@ WHERE modeled.amount > 0;"#;
         assert_eq!(
             contexts[dimension_idx].auto_depth, contexts[reference_idx].auto_depth,
             "DIMENSION BY after mixed leading-close MODEL REFERENCE should realign with the retained owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_same_line_close_and_outer_apply_as_new_from_item_owner() {
+        let sql = r#"SELECT *
+FROM dept d
+CROSS APPLY (
+    SELECT MAX (e.sal) AS max_sal
+    FROM emp e
+    WHERE e.deptno = d.deptno
+) OUTER APPLY (
+    SELECT MAX (b.amt) AS max_bonus
+    FROM bonus b
+    WHERE b.deptno = d.deptno
+) bonus_view
+WHERE bonus_view.max_bonus IS NOT NULL;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let apply_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") OUTER APPLY (")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT MAX (b.amt) AS max_bonus")
+            .unwrap_or(0);
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE bonus_view.max_bonus IS NOT NULL;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[apply_idx].auto_depth.saturating_add(1),
+            "mixed leading-close OUTER APPLY child SELECT should stay one level deeper than the new owner"
+        );
+        assert_eq!(
+            contexts[select_idx].query_base_depth,
+            Some(contexts[apply_idx].auto_depth.saturating_add(1)),
+            "mixed leading-close OUTER APPLY child SELECT should anchor its query base from the new owner depth"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, 0,
+            "outer WHERE should return to the outer query base after mixed leading-close OUTER APPLY closes"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_treat_same_line_close_and_window_as_new_owner() {
+        let sql = r#"SELECT *
+FROM (
+    SELECT deptno,
+        SUM (sal) AS total_sal
+    FROM emp
+) WINDOW w_dept AS (
+    PARTITION BY deptno
+    ORDER BY total_sal DESC
+)
+QUALIFY ROW_NUMBER() OVER w_dept = 1;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") WINDOW w_dept AS (")
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PARTITION BY deptno")
+            .unwrap_or(0);
+        let qualify_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "QUALIFY ROW_NUMBER() OVER w_dept = 1;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[partition_idx].auto_depth,
+            contexts[window_idx].auto_depth.saturating_add(1),
+            "mixed leading-close WINDOW body should stay one level deeper than the new owner"
+        );
+        assert_eq!(
+            contexts[qualify_idx].auto_depth, contexts[window_idx].auto_depth,
+            "QUALIFY after mixed leading-close WINDOW should realign with the outer query base"
         );
     }
 
@@ -14885,6 +15107,95 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_condition_keyword_after_pure_close_line_with_comment_glued_if_header(
+    ) {
+        let sql = r#"BEGIN
+    /* gap */ IF /* gap */ (
+        v_ready = 'Y'
+    )
+    AND v_dept = 10 THEN
+        NULL;
+    END IF;
+END;"#;
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "/* gap */ IF /* gap */ (")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND v_dept = 10 THEN")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "pure close line should still close the comment-glued IF condition"
+        );
+        assert_eq!(
+            contexts[and_idx].condition_role,
+            AutoFormatConditionRole::Continuation,
+            "AND after a pure close line should continue the comment-glued IF condition"
+        );
+        assert_eq!(
+            contexts[and_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "AND after a comment-glued IF pure close should return to the condition continuation depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_case_condition_keyword_after_pure_close_line_with_comment_glued_when_header(
+    ) {
+        let sql = r#"SELECT
+    CASE
+        /* gap */ WHEN /* gap */ (
+            score > 10
+        )
+        OR flag = 'Y' THEN 'HIGH'
+        ELSE 'LOW'
+    END AS bucket
+FROM dual;"#;
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "/* gap */ WHEN /* gap */ (")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .unwrap_or(0);
+        let or_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OR flag = 'Y' THEN 'HIGH'")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "pure close line should still close the comment-glued WHEN condition"
+        );
+        assert_eq!(
+            contexts[or_idx].condition_role,
+            AutoFormatConditionRole::Continuation,
+            "OR after a pure close line should continue the comment-glued WHEN condition"
+        );
+        assert_eq!(
+            contexts[or_idx].auto_depth,
+            contexts[when_idx].auto_depth.saturating_add(1),
+            "OR after a comment-glued WHEN pure close should return to the condition continuation depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_treat_comment_prefixed_on_and_order_by_as_structural_heads() {
         let sql = r#"SELECT e.empno
 FROM emp e
@@ -15507,6 +15818,231 @@ AND d.status = 'A';"#;
         assert_eq!(
             contexts[close_idx].auto_depth, contexts[apply_idx].auto_depth,
             "split APPLY closing paren should realign with the APPLY owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_exact_apply_owner_depth_across_standalone_open_paren() {
+        let sql = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+    SELECT 1
+    FROM emp e
+    CROSS APPLY
+    (
+        SELECT MAX (b.sal) AS max_sal
+        FROM bonus b
+        WHERE b.empno = e.empno
+    ) bonus_view
+)
+AND d.status = 'A';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let from_idx = find_line("FROM emp e");
+        let apply_idx = find_line("CROSS APPLY");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(apply_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT MAX (b.sal) AS max_sal")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(nested_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") bonus_view"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[apply_idx].auto_depth, contexts[from_idx].auto_depth,
+            "exact CROSS APPLY owner line should stay on the nested FROM-item owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[apply_idx].auto_depth,
+            "standalone open paren after exact CROSS APPLY should stay on the APPLY owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].query_base_depth,
+            Some(contexts[apply_idx].auto_depth.saturating_add(1)),
+            "child SELECT under exact CROSS APPLY should anchor its query base from the APPLY owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[apply_idx].auto_depth.saturating_add(1),
+            "child SELECT under exact CROSS APPLY should stay exactly one level deeper than the APPLY owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[apply_idx].auto_depth,
+            "exact CROSS APPLY closing paren should realign with the APPLY owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_comment_glued_exact_apply_owner_depth_across_standalone_open_paren(
+    ) {
+        let sql = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+    SELECT 1
+    FROM emp e
+    /* owner */ CROSS APPLY
+    (
+        SELECT MAX (b.sal) AS max_sal
+        FROM bonus b
+        WHERE b.empno = e.empno
+    ) bonus_view
+)
+AND d.status = 'A';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let from_idx = find_line("FROM emp e");
+        let apply_idx = find_line("/* owner */ CROSS APPLY");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(apply_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT MAX (b.sal) AS max_sal")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(nested_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") bonus_view"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[apply_idx].auto_depth, contexts[from_idx].auto_depth,
+            "comment-glued exact CROSS APPLY owner line should stay on the nested FROM-item owner depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[apply_idx].auto_depth,
+            "standalone open paren after a comment-glued exact CROSS APPLY should stay on the APPLY owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].query_base_depth,
+            Some(contexts[apply_idx].auto_depth.saturating_add(1)),
+            "child SELECT under a comment-glued exact CROSS APPLY should anchor its query base from the APPLY owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[apply_idx].auto_depth.saturating_add(1),
+            "child SELECT under a comment-glued exact CROSS APPLY should stay exactly one level deeper than the APPLY owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[apply_idx].auto_depth,
+            "comment-glued exact CROSS APPLY closing paren should realign with the APPLY owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_comment_glued_exact_lateral_owner_depth_across_standalone_open_paren(
+    ) {
+        let sql = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+    SELECT 1
+    FROM emp e,
+    /* owner */ LATERAL
+    (
+        SELECT MAX (b.sal) AS max_sal
+        FROM bonus b
+        WHERE b.empno = e.empno
+    ) bonus_view
+    WHERE e.deptno = d.deptno
+)
+AND d.status = 'A';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let from_idx = find_line("FROM emp e,");
+        let lateral_idx = find_line("/* owner */ LATERAL");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(lateral_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT MAX (b.sal) AS max_sal")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(nested_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") bonus_view"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inner_where_idx = find_line("WHERE e.deptno = d.deptno");
+
+        assert_eq!(
+            contexts[lateral_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "comment-glued exact LATERAL owner line should stay on the FROM-item sibling depth"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[lateral_idx].auto_depth,
+            "standalone open paren after a comment-glued exact LATERAL owner should stay on the owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].query_base_depth,
+            Some(contexts[lateral_idx].auto_depth.saturating_add(1)),
+            "child SELECT under a comment-glued exact LATERAL owner should anchor its query base from the owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[lateral_idx].auto_depth.saturating_add(1),
+            "child SELECT under a comment-glued exact LATERAL owner should stay exactly one level deeper than the owner"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[lateral_idx].auto_depth,
+            "comment-glued exact LATERAL closing paren should realign with the owner depth"
+        );
+        assert_eq!(
+            contexts[inner_where_idx].auto_depth, contexts[from_idx].auto_depth,
+            "query clauses after a comment-glued exact LATERAL subquery should restore the inner query base depth"
         );
     }
 
