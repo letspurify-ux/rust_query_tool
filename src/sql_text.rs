@@ -4117,6 +4117,7 @@ fn line_trailing_identifiers_before_inline_comment(
 
 /// Returns the trailing identifier words before an inline comment or end of
 /// line, skipping quoted literals and inline block comments.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn trailing_identifier_words_before_inline_comment(
     line: &str,
     max_identifiers: usize,
@@ -5123,11 +5124,33 @@ fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed: &str)
         || line_is_format_same_depth_deferred_wrapper_owner(trimmed)
 }
 
-#[cfg(test)]
-fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
     line_is_exact_bare_owner_or_pending_header_for_structural_tail(auto_format_structural_tail(
         line,
     ))
+}
+
+pub(crate) fn format_inline_comment_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    let trimmed = auto_format_structural_tail(line);
+
+    if line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed) {
+        if let Some(kind) =
+            format_bare_structural_header_continuation_kind_for_structural_tail(trimmed)
+        {
+            return Some(kind);
+        }
+    }
+
+    if format_trailing_continuation_operator_kind(trimmed).is_some() {
+        return format_structural_header_continuation_kind_for_structural_tail(trimmed).or(Some(
+            FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+        ));
+    }
+
+    format_inline_comment_structural_header_continuation_kind(trimmed)
 }
 
 pub(crate) fn format_inline_comment_structural_header_continuation_kind(
@@ -6139,6 +6162,77 @@ mod tests {
                 format_inline_comment_structural_header_continuation_kind(line),
                 Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
                 "expected `{line}` to keep the exact bare body-header operand depth"
+            );
+        }
+    }
+
+    #[test]
+    fn format_inline_comment_continuation_kind_prioritizes_exact_bare_deferred_wrapper_owners_over_operator_fallback(
+    ) {
+        for line in [
+            "EXISTS -- keep",
+            "NOT EXISTS -- keep",
+            "IN -- keep",
+            "NOT IN -- keep",
+            "ANY -- keep",
+            "SOME -- keep",
+            "ALL -- keep",
+        ] {
+            assert_eq!(
+                format_inline_comment_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+                "expected `{line}` to preserve same-depth deferred-wrapper owner carry"
+            );
+        }
+    }
+
+    #[test]
+    fn format_inline_comment_continuation_kind_prioritizes_structural_header_family_over_trailing_operator_for_header_lines(
+    ) {
+        for (line, expected) in [
+            (
+                "WHERE e.emp_id = -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase),
+            ),
+            (
+                "WHERE e.member_col MEMBER OF -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase),
+            ),
+            (
+                "ON e.emp_id = -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase),
+            ),
+            (
+                "AND e.status_cd = -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+            ),
+            (
+                "v_total := -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+            ),
+        ] {
+            assert_eq!(
+                format_inline_comment_continuation_kind(line),
+                expected,
+                "expected `{line}` to prefer structural header carry before pure RHS fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn format_inline_comment_continuation_kind_keeps_rhs_operator_fallback_for_non_header_lines() {
+        for line in [
+            "AND e.member_col MEMBER OF -- keep",
+            "AND e.num_nt SUBMULTISET OF -- keep",
+            "AND e.ename LIKE4 -- keep",
+            "AND e.ename LIKE 'A%' ESCAPE -- keep",
+            "v_total := -- keep",
+            "pkg_lock.request => -- keep",
+        ] {
+            assert_eq!(
+                format_inline_comment_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+                "expected `{line}` to use RHS-operator continuation depth"
             );
         }
     }

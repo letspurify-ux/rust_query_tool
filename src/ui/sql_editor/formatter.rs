@@ -9031,6 +9031,22 @@ impl SqlEditorWidget {
         Some(prefix)
     }
 
+    fn non_comment_tokens_prefix_text(tokens: &[SqlToken], idx: usize) -> Option<String> {
+        let mut prefix = String::new();
+
+        for token in tokens[..idx]
+            .iter()
+            .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        {
+            if !prefix.is_empty() {
+                prefix.push(' ');
+            }
+            prefix.push_str(&Self::token_text(token));
+        }
+
+        (!prefix.is_empty()).then_some(prefix)
+    }
+
     fn comment_keeps_next_line_continuation(tokens: &[SqlToken], idx: usize) -> bool {
         let significant_tokens: Vec<&SqlToken> = tokens[..idx]
             .iter()
@@ -9096,34 +9112,8 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         idx: usize,
     ) -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
-        let significant_tokens: Vec<&SqlToken> = tokens[..idx]
-            .iter()
-            .filter(|token| !matches!(token, SqlToken::Comment(_)))
-            .collect();
-        let previous_token = significant_tokens
-            .get(significant_tokens.len().saturating_sub(2))
-            .copied();
-        let previous_token =
-            previous_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
-        let last_token = significant_tokens.last().copied()?;
-        let last_meaningful_token =
-            Self::format_trailing_meaningful_token_from_sql_token(last_token)?;
-        if crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
-            previous_token,
-            last_meaningful_token,
-        )
-        .is_some()
-        {
-            return None;
-        }
-
-        Self::significant_tokens_structural_prefix(&significant_tokens).and_then(
-            |structural_prefix| {
-                crate::sql_text::format_inline_comment_structural_header_continuation_kind(
-                    &structural_prefix,
-                )
-            },
-        )
+        Self::non_comment_tokens_prefix_text(tokens, idx)
+            .and_then(|prefix| crate::sql_text::format_inline_comment_continuation_kind(&prefix))
     }
 
     #[cfg(test)]
@@ -10811,6 +10801,69 @@ AND e.status_cd =
             indent(lines[and_value_idx]),
             indent(lines[and_idx]).saturating_add(4),
             "AND item operand should remain one level deeper than the AND line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_inline_where_header_operator_comment_matches_and_item_depth()
+    {
+        let source = r#"SELECT *
+FROM qt_fmt_emp e
+WHERE e.emp_id = -- keep header depth
+1
+AND e.status_cd = -- keep rhs depth
+'ACTIVE';"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let where_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("WHERE e.emp_id = -- keep header depth")
+            })
+            .expect("WHERE = comment line");
+        let where_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(where_idx + 1)
+            .find(|(_, line)| line.trim_start() == "1")
+            .map(|(idx, _)| idx)
+            .expect("WHERE value line");
+        let and_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("AND e.status_cd = -- keep rhs depth")
+            })
+            .expect("AND = comment line");
+        let and_value_idx = lines
+            .iter()
+            .enumerate()
+            .skip(and_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'ACTIVE';")
+            .map(|(idx, _)| idx)
+            .expect("AND value line");
+
+        assert_eq!(
+            indent(lines[where_value_idx]),
+            indent(lines[and_value_idx]),
+            "inline WHERE header operand after a trailing inline comment should align with later AND item operands, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[where_value_idx]),
+            indent(lines[where_idx]).saturating_add(8),
+            "inline WHERE header operand after a trailing inline comment should indent one level below the semantic condition owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[and_value_idx]),
+            indent(lines[and_idx]).saturating_add(4),
+            "AND item operand after a trailing inline comment should remain one level deeper than the AND line, got:\n{}",
             formatted
         );
     }
@@ -31907,6 +31960,169 @@ JOIN -- joined rows
         assert_eq!(
             continuation_kind("LEFT JOIN TABLE -- collection rows"),
             Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("EXISTS -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("NOT EXISTS -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("IN -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("NOT IN -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("ANY -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("SOME -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("ALL -- deferred wrapper"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+    }
+
+    #[test]
+    fn comment_header_continuation_kind_keeps_rhs_operator_precedence_for_non_owner_lines() {
+        let continuation_kind =
+            |line: &str| -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
+                let tokens = SqlEditorWidget::tokenize_sql(line);
+                let comment_idx = tokens
+                    .iter()
+                    .position(|token| matches!(token, SqlToken::Comment(_)))
+                    .unwrap_or(0);
+                SqlEditorWidget::comment_header_continuation_kind(&tokens, comment_idx)
+            };
+
+        for line in [
+            "AND e.member_col MEMBER OF -- type filter",
+            "AND e.num_nt SUBMULTISET OF -- subset filter",
+            "AND e.ename LIKE4 -- pattern",
+            "AND e.ename LIKE 'A%' ESCAPE -- esc",
+            "v_total := -- assign",
+            "pkg_lock.request => -- named arg",
+        ] {
+            assert_eq!(
+                continuation_kind(line),
+                Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+                "expected `{line}` to keep RHS operator continuation depth"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_header_continuation_kind_prioritizes_structural_header_family_over_trailing_operator_for_header_lines(
+    ) {
+        let continuation_kind =
+            |line: &str| -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
+                let tokens = SqlEditorWidget::tokenize_sql(line);
+                let comment_idx = tokens
+                    .iter()
+                    .position(|token| matches!(token, SqlToken::Comment(_)))
+                    .unwrap_or(0);
+                SqlEditorWidget::comment_header_continuation_kind(&tokens, comment_idx)
+            };
+
+        for (line, expected) in [
+            (
+                "WHERE e.emp_id = -- keep",
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                ),
+            ),
+            (
+                "WHERE e.member_col MEMBER OF -- keep",
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                ),
+            ),
+            (
+                "ON e.emp_id = -- keep",
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                ),
+            ),
+            (
+                "AND e.status_cd = -- keep",
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                ),
+            ),
+            (
+                "v_total := -- keep",
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                ),
+            ),
+        ] {
+            assert_eq!(
+                continuation_kind(line),
+                expected,
+                "expected `{line}` to prefer structural header carry before pure RHS fallback",
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_inline_comment_split_not_exists_owner_depth_across_standalone_open_paren(
+    ) {
+        let source = r#"SELECT d.deptno
+FROM dept d
+WHERE
+NOT EXISTS -- owner
+(
+    SELECT 1
+    FROM emp e
+    WHERE e.deptno = d.deptno
+)
+AND d.active = 'Y';"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let owner_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NOT EXISTS -- owner")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "(")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[owner_idx]),
+            "standalone open paren after inline-comment split NOT EXISTS should stay on owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[owner_idx]).saturating_add(4),
+            "child SELECT under inline-comment split NOT EXISTS should stay one level deeper than owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[owner_idx]),
+            "inline-comment split NOT EXISTS closing paren should realign with owner depth, got:\n{}",
+            formatted
         );
     }
 

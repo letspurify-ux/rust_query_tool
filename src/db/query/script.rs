@@ -3485,43 +3485,13 @@ impl QueryExecutor {
         trimmed_prefix: &str,
     ) -> Option<InlineCommentContinuationKind> {
         if Self::line_has_trailing_continuation_operator(trimmed_prefix) {
-            return Some(InlineCommentContinuationKind::SameDepth);
+            return Some(
+                Self::leading_header_line_continuation_kind(trimmed_prefix)
+                    .unwrap_or(InlineCommentContinuationKind::SameDepth),
+            );
         }
 
-        if let Some(kind) = sql_text::format_structural_header_continuation_kind(trimmed_prefix) {
-            return Some(match kind {
-                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
-                    InlineCommentContinuationKind::SameDepth
-                }
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                    InlineCommentContinuationKind::OneDeeperThanQueryBase
-                }
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
-                }
-            });
-        }
-
-        if let Some(kind) =
-            sql_text::format_bare_structural_header_continuation_kind(trimmed_prefix)
-        {
-            return Some(match kind {
-                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
-                    InlineCommentContinuationKind::SameDepth
-                }
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                    InlineCommentContinuationKind::OneDeeperThanQueryBase
-                }
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                    InlineCommentContinuationKind::OneDeeperThanCurrentDepth
-                }
-            });
-        }
-
-        let words = sql_text::trailing_identifier_words_before_inline_comment(trimmed_prefix, 2);
-        let last_word = words.last().copied()?;
-        let previous_word = words.get(words.len().saturating_sub(2)).copied();
-        sql_text::format_inline_comment_header_continuation_kind(previous_word, last_word).map(
+        sql_text::format_inline_comment_structural_header_continuation_kind(trimmed_prefix).map(
             |kind| match kind {
                 sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
                     InlineCommentContinuationKind::SameDepth
@@ -11741,6 +11711,34 @@ deptno;"#;
     }
 
     #[test]
+    fn inline_comment_line_continuation_kind_combines_header_and_operator_families() {
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("WHERE e.empno ="),
+            Some(InlineCommentContinuationKind::OneDeeperThanQueryBase),
+            "WHERE header plus trailing operator should keep the operand on the shared WHERE body depth"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind(
+                "WHERE e.member_col MEMBER OF"
+            ),
+            Some(InlineCommentContinuationKind::OneDeeperThanQueryBase),
+            "header + keyword operator lines should reuse the shared WHERE continuation depth"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind(
+                "AND e.member_col MEMBER OF"
+            ),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "plain condition-continuation operators should stay on the current continuation depth"
+        );
+        assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("v_total :="),
+            Some(InlineCommentContinuationKind::SameDepth),
+            "non-header operators should keep the generic current-depth continuation"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_ignore_existing_indent_for_inline_comment_header_continuation() {
         let sql = r#"SELECT deptno,
     COUNT(*) AS cnt
@@ -11883,6 +11881,62 @@ WHERE e.empno =
         assert_eq!(
             contexts[operand_idx].query_base_depth, contexts[where_idx].query_base_depth,
             "split WHERE rhs should preserve the active query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_inline_where_operator_comment_uses_shared_header_depth() {
+        let sql = r#"SELECT e.empno
+FROM emp e
+WHERE e.empno = /* keep owner depth */
+10
+AND e.status_cd = /* keep operator depth */
+'ACTIVE';"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE e.empno ="))
+            .unwrap_or(0);
+        let where_operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "10")
+            .unwrap_or(0);
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("AND e.status_cd ="))
+            .unwrap_or(0);
+        let and_operand_idx = lines
+            .iter()
+            .position(|line| line.trim() == "'ACTIVE';")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[where_operand_idx].auto_depth,
+            contexts[where_idx]
+                .query_base_depth
+                .unwrap_or(contexts[where_idx].auto_depth)
+                .saturating_add(1),
+            "inline-comment split WHERE rhs should stay on the shared WHERE body depth"
+        );
+        assert_eq!(
+            contexts[where_operand_idx].auto_depth, contexts[and_operand_idx].auto_depth,
+            "WHERE header operator and AND item operator should land on the same canonical operand depth"
+        );
+        assert_eq!(
+            contexts[and_operand_idx].auto_depth,
+            contexts[and_idx].auto_depth,
+            "plain AND operator split should keep the operand on the active condition depth"
+        );
+        assert_eq!(
+            contexts[where_operand_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "inline-comment split WHERE rhs should stay marked as continuation"
+        );
+        assert_eq!(
+            contexts[where_operand_idx].query_base_depth, contexts[where_idx].query_base_depth,
+            "inline-comment split WHERE rhs should preserve the active query base depth"
         );
     }
 

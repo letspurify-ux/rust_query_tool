@@ -89,6 +89,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - overloaded keyword prefix도 exact structural sequence로 끊어야 한다. dedicated family가 `FOR UPDATE`라면 exact structural token sequence `FOR UPDATE`와 exact bare split `FOR`만 그 family다. `FOR ORDINALITY`, `FOR rec IN`, table-function/item syntax처럼 같은 `FOR` prefix를 쓰는 다른 구문은 dedicated `FOR UPDATE` rule에 들어가면 안 된다.
 - condition/operator RHS continuation taxonomy도 shared semantic family여야 한다. trailing RHS operator, mixed leading-close expression continuation, trailing inline-comment continuation은 서로 다른 ad-hoc keyword table을 가지면 안 되며, `MEMBER OF`, `SUBMULTISET OF`, `LIKEC/LIKE2/LIKE4`, `ESCAPE`, `:=`, `=>` 같은 family를 한 phase만 알게 두면 안 된다.
 - trailing inline-comment continuation은 "operator RHS family" 하나로 축약하면 안 된다. structural header carry가 필요한 family(`JOIN`, `ON`, `USING`, `WINDOW`, `SELECT`, `SET` 등)는 shared bare/header taxonomy에서 파생된 header family로, `AND`, `LIKE4`, `MEMBER OF`, `:=` 같은 RHS family는 shared operator taxonomy로 판정해야 한다.
+- 같은 trailing token이 lexical하게는 operator RHS처럼 보여도 structural owner family와 충돌하면 structural owner가 우선한다. 예를 들어 exact bare / completed deferred-wrapper owner line인 `EXISTS`, `IN`, `ANY/SOME/ALL`, `NOT EXISTS`, `NOT IN` 뒤 inline comment는 generic operator `+1` fallback으로 처리하면 안 되고, shared owner classifier가 산출한 same-depth owner carry를 먼저 유지해야 한다.
 - exact bare line이 "다음 code line에서 wrapper/query head를 받을 completed owner anchor"인 경우도 예외가 아니다. `EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`처럼 standalone `(` 또는 child query가 뒤로 밀린 owner line은 generic `FROM`/`WHERE` body header처럼 다시 +1 하지 말고 same-depth owner family로 유지해야 한다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
 - `WITH` sibling CTE definition header 판정도 예외가 아니다. `cte_name AS (`와 `cte_name (col1, ...) AS (`는 local analyzer heuristic가 아니라 shared structural helper로 분류해야 다음 CTE/main query가 continuation state를 잘못 상속하지 않는다.
@@ -266,6 +267,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - single-keyword family: `AND`, `OR`, `IN`, `IS`, `LIKE`, `LIKEC`, `LIKE2`, `LIKE4`, `BETWEEN`, `NOT`, `EXISTS`, `MEMBER`, `SUBMULTISET`, `ESCAPE`
 - paired keyword family: `IS OF`, `MEMBER OF`, `SUBMULTISET OF`
 - trailing inline-comment continuation consumer는 별도 ad-hoc keyword list가 아니라 `structural header family ∪ operator RHS family`다. 즉 `JOIN`/`ON`/`USING`/`WINDOW`/`SELECT`/`SET` 같은 header carry와 `AND`/`LIKE4`/`MEMBER OF`/`:=` 같은 RHS carry를 같은 shared taxonomy 위에서 본다.
+- 단, union이라고 해서 precedence가 없는 것은 아니다. exact bare / completed owner anchor family와 operator RHS family가 같은 trailing token에서 충돌하면 owner anchor가 먼저고, generic operator RHS depth는 그 다음 fallback이다.
+- header line이 trailing operator도 함께 가지는 경우(`WHERE col =`, `SET col =`, `SELECT expr +`, `RETURNING col =` 등)는 operator family만 따로 해석하면 안 된다. analyzer의 line-level continuation depth는 shared structural header family를 먼저 반영하고, 그 header family가 없을 때만 pure operator current-depth fallback(`AND col =`, `v_total :=`)을 쓴다.
 
 주의:
 
