@@ -3274,7 +3274,59 @@ pub(crate) struct FormatBodyHeaderLineState {
     pub(crate) next_state: Option<FormatBodyHeaderContinuationState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactBareSplitBodyHeaderMatch {
+    sequence_idx: usize,
+    matched_words: usize,
+    sequence_len: usize,
+    line_word_count: usize,
+}
+
 impl FormatIndentedParenOwnerKind {
+    fn exact_bare_split_body_header_match(
+        self,
+        line: &str,
+    ) -> Option<ExactBareSplitBodyHeaderMatch> {
+        let trimmed = auto_format_structural_tail(line);
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let max_words = self
+            .split_body_header_sequences()
+            .iter()
+            .fold(8usize, |acc, sequence| {
+                acc.max(identifier_sequence_segment_count(sequence))
+            });
+        let words = leading_meaningful_words(trimmed, max_words);
+        if words.is_empty() || !line_has_exact_identifier_sequence(trimmed, words.as_slice()) {
+            return None;
+        }
+
+        let line_word_count = words.len();
+        let mut best_match = None;
+        let mut best_matched_words = 0usize;
+
+        for (idx, sequence) in self.split_body_header_sequences().iter().enumerate() {
+            let matched_words = leading_words_match_keyword_prefix(&words, sequence);
+            if matched_words == 0 {
+                continue;
+            }
+
+            if matched_words > best_matched_words {
+                best_matched_words = matched_words;
+                best_match = Some(ExactBareSplitBodyHeaderMatch {
+                    sequence_idx: idx,
+                    matched_words,
+                    sequence_len: sequence.len(),
+                    line_word_count,
+                });
+            }
+        }
+
+        best_match
+    }
+
     fn body_header_sequences(self) -> &'static [&'static [&'static str]] {
         match self {
             Self::AnalyticOver | Self::Window => FORMAT_ANALYTIC_OVER_SUBCLAUSE_KEYWORD_SEQUENCES,
@@ -3519,55 +3571,45 @@ impl FormatIndentedParenOwnerKind {
         self,
         line: &str,
     ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-        let trimmed = auto_format_structural_tail(line);
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let max_words = self
-            .split_body_header_sequences()
-            .iter()
-            .fold(0usize, |acc, sequence| {
-                acc.max(identifier_sequence_segment_count(sequence))
-            });
-        if max_words == 0 {
-            return None;
-        }
-
-        let words = leading_meaningful_words(trimmed, max_words);
-        if words.is_empty() || !line_has_exact_identifier_sequence(trimmed, words.as_slice()) {
-            return None;
-        }
-
-        let mut best_matched_words = 0usize;
-        let mut continuation_kind = None;
-
-        for (idx, sequence) in self.split_body_header_sequences().iter().enumerate() {
-            let matched_words = leading_words_match_keyword_prefix(&words, sequence);
-            if matched_words == 0 {
-                continue;
-            }
-
-            let candidate_kind = if matched_words < sequence.len() {
-                FormatInlineCommentHeaderContinuationKind::SameDepth
-            } else {
-                self.complete_split_body_header_continuation_kind(idx)
-            };
-
-            if matched_words > best_matched_words {
-                best_matched_words = matched_words;
-                continuation_kind = Some(candidate_kind);
-            } else if matched_words == best_matched_words
-                && matches!(
-                    candidate_kind,
+        self.exact_bare_split_body_header_match(line)
+            .map(|matched| {
+                if matched.matched_words < matched.sequence_len {
                     FormatInlineCommentHeaderContinuationKind::SameDepth
-                )
-            {
-                continuation_kind = Some(candidate_kind);
-            }
-        }
+                } else {
+                    self.complete_split_body_header_continuation_kind(matched.sequence_idx)
+                }
+            })
+    }
 
-        continuation_kind
+    fn exact_bare_split_body_header_inline_comment_collision_kind(
+        self,
+        line: &str,
+    ) -> Option<FormatInlineCommentHeaderContinuationKind> {
+        let matched = self.exact_bare_split_body_header_match(line)?;
+        let matched_sequence = self
+            .split_body_header_sequences()
+            .get(matched.sequence_idx)
+            .copied();
+
+        match self {
+            Self::Keep if matched.matched_words < matched.sequence_len => {
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+            }
+            Self::MatchRecognize
+                if matched_sequence == Some(&["AFTER", "MATCH", "SKIP"][..])
+                    && (matched.matched_words < matched.sequence_len
+                        || matched.line_word_count > matched.sequence_len) =>
+            {
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+            }
+            Self::ModelSubclause
+                if matched_sequence == Some(&["UNIQUE", "SINGLE", "REFERENCE"][..])
+                    && matched.matched_words == matched.sequence_len =>
+            {
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+            }
+            _ => None,
+        }
     }
 
     fn complete_split_body_header_continuation_kind(
@@ -4886,6 +4928,15 @@ pub(crate) fn format_leading_header_continuation_kind(
     continuation_kind
 }
 
+fn line_is_exact_bare_structural_keyword_line(trimmed: &str) -> bool {
+    let words = meaningful_identifier_words_before_inline_comment(trimmed, 8);
+    !words.is_empty()
+        && line_has_exact_identifier_sequence(trimmed, words.as_slice())
+        && words
+            .iter()
+            .all(|word| is_oracle_sql_keyword(&word.to_ascii_uppercase()))
+}
+
 /// Returns the shared structural continuation kind for a bare header line or
 /// inline first-item prefix.
 ///
@@ -4900,18 +4951,36 @@ pub(crate) fn format_leading_header_continuation_kind(
 pub(crate) fn format_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    format_leading_header_continuation_kind(auto_format_structural_tail(line))
+    let trimmed = auto_format_structural_tail(line);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["SELECT"])
+        || line_has_exact_identifier_sequence(trimmed, &["JOIN"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
+    let trimmed_upper = trimmed.to_ascii_uppercase();
+    if !line_is_exact_bare_structural_keyword_line(trimmed)
+        && (format_query_owner_header_kind(trimmed).is_some()
+            || format_query_owner_pending_header_kind(trimmed).is_some()
+            || format_indented_paren_owner_header_kind(trimmed).is_some()
+            || format_indented_paren_pending_header_kind(trimmed).is_some()
+            || format_plsql_child_query_owner_kind(&trimmed_upper).is_some()
+            || format_plsql_child_query_owner_pending_header_kind(trimmed).is_some())
+    {
+        return None;
+    }
+
+    format_leading_header_continuation_kind(trimmed)
 }
 
 pub(crate) fn format_bare_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
     let trimmed = auto_format_structural_tail(line);
-    let words = meaningful_identifier_words_before_inline_comment(trimmed, 8);
-    if words.is_empty() || !line_has_exact_identifier_sequence(trimmed, words.as_slice()) {
-        return None;
-    }
-
     for owner_kind in [
         FormatIndentedParenOwnerKind::AnalyticOver,
         FormatIndentedParenOwnerKind::WithinGroup,
@@ -4928,11 +4997,14 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
         }
     }
 
-    if !words
-        .iter()
-        .all(|word| is_oracle_sql_keyword(&word.to_ascii_uppercase()))
-    {
+    if !line_is_exact_bare_structural_keyword_line(trimmed) {
         return None;
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["SELECT"])
+        || line_has_exact_identifier_sequence(trimmed, &["JOIN"])
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
     if line_is_format_same_depth_deferred_wrapper_owner(trimmed) {
@@ -4949,6 +5021,57 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
     }
 
     format_leading_header_continuation_kind(trimmed)
+}
+
+fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
+    let trimmed = auto_format_structural_tail(line);
+    if !line_is_exact_bare_structural_keyword_line(trimmed) {
+        return false;
+    }
+
+    matches!(
+        format_query_owner_header_kind(trimmed),
+        Some(FormatQueryOwnerKind::FromItem | FormatQueryOwnerKind::Condition)
+    ) || format_query_owner_pending_header_kind(trimmed).is_some()
+        || format_indented_paren_owner_header_kind(trimmed)
+            .is_some_and(|kind| kind != FormatIndentedParenOwnerKind::ModelSubclause)
+        || format_indented_paren_pending_header_kind(trimmed).is_some()
+        || format_plsql_child_query_owner_pending_header_kind(trimmed).is_some()
+        || line_is_format_same_depth_deferred_wrapper_owner(trimmed)
+}
+
+pub(crate) fn format_inline_comment_structural_header_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    if line_is_exact_bare_owner_or_pending_header(line) {
+        if let Some(kind) = format_bare_structural_header_continuation_kind(line) {
+            return Some(kind);
+        }
+    }
+
+    let trimmed = auto_format_structural_tail(line);
+    if line_is_exact_bare_structural_keyword_line(trimmed) {
+        for owner_kind in [
+            FormatIndentedParenOwnerKind::AnalyticOver,
+            FormatIndentedParenOwnerKind::WithinGroup,
+            FormatIndentedParenOwnerKind::Keep,
+            FormatIndentedParenOwnerKind::ModelSubclause,
+            FormatIndentedParenOwnerKind::Window,
+            FormatIndentedParenOwnerKind::MatchRecognize,
+            FormatIndentedParenOwnerKind::Pivot,
+            FormatIndentedParenOwnerKind::Unpivot,
+            FormatIndentedParenOwnerKind::StructuredColumns,
+        ] {
+            if let Some(kind) =
+                owner_kind.exact_bare_split_body_header_inline_comment_collision_kind(trimmed)
+            {
+                return Some(kind);
+            }
+        }
+    }
+
+    format_structural_header_continuation_kind(line)
+        .or_else(|| format_bare_structural_header_continuation_kind(line))
 }
 
 /// Returns true when a token starts a flashback/temporal boundary expression.
@@ -5561,6 +5684,14 @@ mod tests {
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
         assert_eq!(
+            format_structural_header_continuation_kind("SELECT"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
             format_structural_header_continuation_kind("ON"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
@@ -5576,6 +5707,243 @@ mod tests {
             format_structural_header_continuation_kind("LEFT OUTER JOIN"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
+    }
+
+    #[test]
+    fn format_structural_header_continuation_kind_preserves_bare_specificity_and_skips_named_owners(
+    ) {
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("WITHIN GROUP -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("REFERENCE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("WINDOW -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("FROM TABLE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("LEFT JOIN TABLE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("SELECT -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("JOIN -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("WINDOW w_dept AS -- named window"),
+            None
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("REFERENCE ref_limits ON -- named ref"),
+            None
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("OPEN c_emp FOR -- cursor query"),
+            None
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("CURSOR c_emp IS -- cursor query"),
+            None
+        );
+    }
+
+    #[test]
+    fn format_inline_comment_structural_header_continuation_kind_overrides_only_collision_families()
+    {
+        for line in [
+            "WITHIN GROUP -- keep",
+            "KEEP -- keep",
+            "MATCH_RECOGNIZE -- keep",
+            "PIVOT -- keep",
+            "UNPIVOT -- keep",
+            "FROM TABLE -- keep",
+            "USING TABLE -- keep",
+            "JOIN TABLE -- keep",
+            "LEFT JOIN TABLE -- keep",
+            "LEFT OUTER JOIN TABLE -- keep",
+            "RIGHT JOIN TABLE -- keep",
+            "RIGHT OUTER JOIN TABLE -- keep",
+            "FULL JOIN TABLE -- keep",
+            "FULL OUTER JOIN TABLE -- keep",
+            "INNER JOIN TABLE -- keep",
+            "CROSS JOIN TABLE -- keep",
+            "NATURAL JOIN TABLE -- keep",
+            "NATURAL LEFT JOIN TABLE -- keep",
+            "NATURAL LEFT OUTER JOIN TABLE -- keep",
+            "NATURAL RIGHT JOIN TABLE -- keep",
+            "NATURAL RIGHT OUTER JOIN TABLE -- keep",
+            "NATURAL FULL JOIN TABLE -- keep",
+            "NATURAL FULL OUTER JOIN TABLE -- keep",
+            "EXISTS -- keep",
+            "NOT EXISTS -- keep",
+            "IN -- keep",
+            "NOT IN -- keep",
+            "ANY -- keep",
+            "SOME -- keep",
+            "ALL -- keep",
+            "LATERAL -- keep",
+            "TABLE -- keep",
+            "CROSS APPLY -- keep",
+            "OUTER APPLY -- keep",
+            "CURSOR -- keep",
+            "MULTISET -- keep",
+        ] {
+            assert!(
+                line_is_exact_bare_owner_or_pending_header(line),
+                "expected shared owner/pending classifier to recognize `{line}`"
+            );
+            assert_eq!(
+                format_inline_comment_structural_header_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+                "expected `{line}` to keep exact bare owner/header depth after inline comments"
+            );
+        }
+
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("JOIN -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("REFERENCE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("WINDOW -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("FROM TABLE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("LEFT JOIN TABLE -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind(
+                "/* owner */ RIGHT OUTER JOIN TABLE -- keep",
+            ),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("/* owner */ KEEP -- keep"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind(
+                "FOR UPDATE -- keep lock depth",
+            ),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind(
+                "RULES -- keep model body depth",
+            ),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind(
+                "AFTER MATCH SKIP -- keep row-pattern body depth",
+            ),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+    }
+
+    #[test]
+    fn format_inline_comment_structural_header_continuation_kind_normalizes_mixed_leading_close_owner_header_lines(
+    ) {
+        for (line, expected) in [
+            (
+                ") RIGHT OUTER JOIN TABLE -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+            ),
+            (
+                ") KEEP -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+            ),
+            (
+                ") WINDOW -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+            ),
+            (
+                ") JOIN -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+            ),
+            (
+                ") FOR UPDATE -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase),
+            ),
+            (") WINDOW w_dept AS -- named owner", None),
+            (
+                ") REFERENCE ref_limits ON -- named owner",
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+            ),
+            (") OPEN c_emp FOR -- cursor query", None),
+        ] {
+            assert_eq!(
+                format_inline_comment_structural_header_continuation_kind(line),
+                expected,
+                "mixed leading-close structural tail should preserve shared owner/header semantics for `{line}`",
+            );
+        }
+    }
+
+    #[test]
+    fn format_inline_comment_structural_header_continuation_kind_uses_owner_relative_sequence_policy_for_exact_bare_split_prefixes(
+    ) {
+        for line in [
+            "DENSE_RANK -- keep",
+            "DENSE_RANK FIRST -- keep",
+            "DENSE_RANK LAST -- keep",
+            "DENSE_RANK FIRST ORDER -- keep",
+            "DENSE_RANK LAST ORDER -- keep",
+            "AFTER MATCH -- keep",
+            "AFTER MATCH SKIP TO -- keep",
+            "AFTER MATCH SKIP TO NEXT -- keep",
+            "AFTER MATCH SKIP TO NEXT ROW -- keep",
+            "ONE ROW PER -- keep",
+            "ALL ROWS PER -- keep",
+            "WITH UNMATCHED -- keep",
+            "WITHOUT UNMATCHED -- keep",
+            "SHOW EMPTY -- keep",
+            "OMIT EMPTY -- keep",
+            "RETURN ALL -- keep",
+            "RETURN UPDATED -- keep",
+            "AUTOMATIC ORDER -- keep",
+            "SEQUENTIAL ORDER -- keep",
+            "UNIQUE SINGLE REFERENCE -- keep",
+        ] {
+            assert_eq!(
+                format_inline_comment_structural_header_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+                "expected `{line}` to preserve the exact bare owner-relative split-header depth"
+            );
+        }
+
+        for line in [
+            "RULES -- keep model body depth",
+            "AFTER MATCH SKIP -- keep row-pattern body depth",
+            "PARTITION BY -- keep analytic body depth",
+            "ORDER BY -- keep analytic body depth",
+            "MEASURES -- keep row-pattern body depth",
+        ] {
+            assert_eq!(
+                format_inline_comment_structural_header_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+                "expected `{line}` to keep the exact bare body-header operand depth"
+            );
+        }
     }
 
     #[test]

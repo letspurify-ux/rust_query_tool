@@ -448,11 +448,18 @@ struct PendingMergeBranchHeaderLayoutFrame {
 }
 
 /// Tracks CREATE TRIGGER header scope (BEFORE/FOR EACH ROW/WHEN/REFERENCING).
-/// Active from the first trigger header line until BEGIN is encountered.
+/// Active from the first trigger header line until the trigger body opener
+/// (`DECLARE` or `BEGIN`) is encountered.
 #[derive(Clone, Copy)]
 struct TriggerHeaderLayoutFrame {
     /// Structural depth for trigger header body lines (always 1).
     body_depth: usize,
+}
+
+impl TriggerHeaderLayoutFrame {
+    fn owner_depth(self) -> usize {
+        self.body_depth.saturating_sub(1)
+    }
 }
 
 /// Tracks FORALL body scope.
@@ -7103,16 +7110,15 @@ impl SqlEditorWidget {
             let query_condition_depth =
                 Self::query_condition_body_depth(resolved_query_base_depth, parser_depth);
             let mut current_line_dml_case_expression_close_depth = None;
-            // BEGIN after trigger header (WHEN/FOR EACH ROW) should stay at
-            // parser_depth (base indent), not inherit the trigger header's +1 depth.
-            // BEGIN after trigger header closes the trigger header frame
-            // and stays at parser_depth (base indent).
-            let is_trigger_header_begin = trigger_header_frame.is_some()
+            // Trigger body openers close the retained header frame and return
+            // to the trigger owner's structural depth.
+            let trigger_header_owner_depth = trigger_header_frame.map(|frame| frame.owner_depth());
+            let is_trigger_header_body_start = trigger_header_frame.is_some()
                 && !in_dml_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                && depth == 0;
-            let mut effective_depth = if is_trigger_header_begin {
-                parser_depth
+                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE"));
+            let mut effective_depth = if is_trigger_header_body_start {
+                trigger_header_owner_depth.unwrap_or(parser_depth)
             } else if is_trigger_header_body_line {
                 // Trigger header lines (BEFORE, REFERENCING, FOR EACH ROW,
                 // WHEN) are structurally at body_depth of the CREATE TRIGGER
@@ -8132,8 +8138,8 @@ impl SqlEditorWidget {
             {
                 trigger_header_frame = Some(TriggerHeaderLayoutFrame { body_depth: 1 });
             }
-            // Deactivate on BEGIN (the trigger body starts).
-            if is_trigger_header_begin {
+            // Deactivate when the trigger declaration/body starts.
+            if is_trigger_header_body_start {
                 trigger_header_frame = None;
             }
 
@@ -9051,36 +9057,14 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let significant_words: Vec<&str> = significant_tokens
-            .iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.as_str()),
-                _ => None,
-            })
-            .collect();
-        let previous_word = significant_words
-            .get(significant_words.len().saturating_sub(2))
-            .copied();
-        if crate::sql_text::format_inline_comment_header_continuation_kind(
-            previous_word,
-            last_upper.as_str(),
-        )
-        .is_some()
-        {
-            return true;
-        }
-
-        if let Some(structural_prefix) =
-            Self::significant_tokens_structural_prefix(&significant_tokens)
-        {
-            if crate::sql_text::format_bare_structural_header_continuation_kind(&structural_prefix)
+        Self::significant_tokens_structural_prefix(&significant_tokens).is_some_and(
+            |structural_prefix| {
+                crate::sql_text::format_inline_comment_structural_header_continuation_kind(
+                    &structural_prefix,
+                )
                 .is_some()
-            {
-                return true;
-            }
-        }
-
-        false
+            },
+        )
     }
 
     fn format_trailing_meaningful_token_from_sql_token(
@@ -9124,31 +9108,11 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let SqlToken::Word(last_word) = last_token else {
-            return None;
-        };
-        let last_upper = last_word.to_ascii_uppercase();
-
-        let significant_words: Vec<&str> = significant_tokens
-            .iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.as_str()),
-                _ => None,
-            })
-            .collect();
-        let previous_word = significant_words
-            .get(significant_words.len().saturating_sub(2))
-            .copied();
-        if let Some(kind) = crate::sql_text::format_inline_comment_header_continuation_kind(
-            previous_word,
-            last_upper.as_str(),
-        ) {
-            return Some(kind);
-        }
-
         Self::significant_tokens_structural_prefix(&significant_tokens).and_then(
             |structural_prefix| {
-                crate::sql_text::format_bare_structural_header_continuation_kind(&structural_prefix)
+                crate::sql_text::format_inline_comment_structural_header_continuation_kind(
+                    &structural_prefix,
+                )
             },
         )
     }
@@ -18278,6 +18242,7 @@ ORDER BY v.amt DESC;"#;
 #[cfg(test)]
 mod format_indent_gap_tests {
     use crate::ui::sql_editor::SqlEditorWidget;
+    use crate::ui::SqlToken;
 
     fn leading_spaces(line: &str) -> usize {
         line.len().saturating_sub(line.trim_start().len())
@@ -25897,6 +25862,33 @@ from (a
         );
     }
 
+    #[test]
+    fn apply_parser_depth_indentation_trigger_declare_returns_to_trigger_owner_depth() {
+        let source = "CREATE OR REPLACE TRIGGER oqt_trg_test_bi
+    BEFORE INSERT
+    ON oqt_t_test
+    FOR EACH ROW
+    DECLARE
+    v_tag VARCHAR2(30) := 'TRG';
+BEGIN
+    NULL;
+END;";
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let expected = "CREATE OR REPLACE TRIGGER oqt_trg_test_bi
+    BEFORE INSERT
+    ON oqt_t_test
+    FOR EACH ROW
+DECLARE
+    v_tag VARCHAR2(30) := 'TRG';
+BEGIN
+    NULL;
+END;";
+        assert_eq!(
+            formatted, expected,
+            "trigger DECLARE should close the retained header frame and return to trigger owner depth"
+        );
+    }
+
     // ── MATCH_RECOGNIZE ONE ROW PER MATCH ──
 
     #[test]
@@ -26869,6 +26861,35 @@ FOR /* keep */ UPDATE -- lock mode
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_match_recognize_after_match_inline_comment_on_owner_depth(
+    ) {
+        let source = "SELECT *\nFROM sales\nMATCH_RECOGNIZE (\n    AFTER MATCH -- keep row-pattern chain depth\n            SKIP TO NEXT ROW\n    PATTERN (A+)\n    DEFINE A AS amount < 100\n);";
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let after_match_idx =
+            find_line_starting_with(&lines, "AFTER MATCH -- keep row-pattern chain depth")
+                .expect("MATCH_RECOGNIZE AFTER MATCH line");
+        let skip_to_idx =
+            find_line_starting_with(&lines, "SKIP TO NEXT ROW").expect("MATCH_RECOGNIZE SKIP line");
+        let pattern_idx =
+            find_line_starting_with(&lines, "PATTERN (A+)").expect("MATCH_RECOGNIZE PATTERN line");
+
+        assert_eq!(
+            leading_spaces(lines[skip_to_idx]),
+            leading_spaces(lines[after_match_idx]),
+            "MATCH_RECOGNIZE split AFTER MATCH/SKIP chain should stay on the owner-relative depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[pattern_idx]),
+            leading_spaces(lines[after_match_idx]),
+            "MATCH_RECOGNIZE PATTERN should stay aligned with the split AFTER MATCH chain, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_model_measures_or_rules_comment_continuation_keeps_subclause_indent() {
         let source = "SELECT *\nFROM sales\nMODEL\n    PARTITION BY (deptno)\n    DIMENSION BY (month_key)\n    MEASURES -- model metrics\n    (amt)\n    RULES UPDATE (amt[1] = amt[CV(month_key)] * 1.1);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -26890,6 +26911,26 @@ FOR /* keep */ UPDATE -- lock mode
         assert!(
             leading_spaces(lines[measures_body_idx]) > leading_spaces(lines[measures_idx]),
             "MODEL MEASURES body should stay deeper than the header line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_model_unique_single_reference_inline_comment_on_owner_depth(
+    ) {
+        let source = "SELECT *\nFROM sales\nMODEL (\n    PARTITION BY (deptno)\n    DIMENSION BY (month_key)\n    MEASURES (amount)\n    UNIQUE SINGLE REFERENCE -- keep modifier depth\n            RULES (\n        amount[ANY] = amount[CV()]\n    )\n) modeled\nWHERE modeled.amount > 0;";
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let unique_idx =
+            find_line_starting_with(&lines, "UNIQUE SINGLE REFERENCE -- keep modifier depth")
+                .expect("MODEL UNIQUE SINGLE REFERENCE line");
+        let rules_idx = find_line_starting_with(&lines, "RULES (").expect("MODEL RULES line");
+
+        assert_eq!(
+            leading_spaces(lines[rules_idx]),
+            leading_spaces(lines[unique_idx]),
+            "MODEL RULES should stay aligned with the UNIQUE SINGLE REFERENCE modifier chain, got:\n{}",
             formatted
         );
     }
@@ -31638,6 +31679,303 @@ LEFT OUTER JOIN
             SqlEditorWidget::apply_parser_depth_indentation(&formatted),
             formatted,
             "exact bare SELECT/JOIN header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_comment_split_plain_select_and_join_headers() {
+        let source = r#"SELECT -- projected cols
+            e.empno
+FROM emp e
+JOIN -- joined rows
+            dept d
+    ON d.deptno = e.deptno;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let select_idx = find_line_starting_with(&lines, "SELECT -- projected cols").unwrap_or(0);
+        let item_idx = find_line_starting_with(&lines, "e.empno").unwrap_or(0);
+        let join_idx = find_line_starting_with(&lines, "JOIN -- joined rows").unwrap_or(0);
+        let table_idx = find_line_starting_with(&lines, "dept d").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[item_idx]),
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "comment-split plain SELECT operand should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[table_idx]),
+            leading_spaces(lines[join_idx]).saturating_add(4),
+            "comment-split plain JOIN table line should normalize to one level deeper than the exact bare header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "comment-split plain SELECT/JOIN header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
+    fn comment_header_continuation_kind_reuses_exact_bare_structural_taxonomy_and_skips_named_owners(
+    ) {
+        let continuation_kind =
+            |line: &str| -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
+                let tokens = SqlEditorWidget::tokenize_sql(line);
+                let comment_idx = tokens
+                    .iter()
+                    .position(|token| matches!(token, SqlToken::Comment(_)))
+                    .unwrap_or(0);
+                SqlEditorWidget::comment_header_continuation_kind(&tokens, comment_idx)
+            };
+
+        for line in [
+            "WITHIN GROUP -- analytic owner",
+            "KEEP -- analytic owner",
+            "MATCH_RECOGNIZE -- row pattern",
+            "PIVOT -- rotated rows",
+            "UNPIVOT -- rotated rows",
+            "FROM TABLE -- collection rows",
+            "USING TABLE -- collection rows",
+            "JOIN TABLE -- collection rows",
+            "LEFT JOIN TABLE -- collection rows",
+            "LEFT OUTER JOIN TABLE -- collection rows",
+            "RIGHT JOIN TABLE -- collection rows",
+            "RIGHT OUTER JOIN TABLE -- collection rows",
+            "FULL JOIN TABLE -- collection rows",
+            "FULL OUTER JOIN TABLE -- collection rows",
+            "INNER JOIN TABLE -- collection rows",
+            "CROSS JOIN TABLE -- collection rows",
+            "NATURAL JOIN TABLE -- collection rows",
+            "NATURAL LEFT JOIN TABLE -- collection rows",
+            "NATURAL LEFT OUTER JOIN TABLE -- collection rows",
+            "NATURAL RIGHT JOIN TABLE -- collection rows",
+            "NATURAL RIGHT OUTER JOIN TABLE -- collection rows",
+            "NATURAL FULL JOIN TABLE -- collection rows",
+            "NATURAL FULL OUTER JOIN TABLE -- collection rows",
+        ] {
+            assert_eq!(
+                continuation_kind(line),
+                Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth),
+                "expected `{line}` to reuse exact bare owner/header continuation depth"
+            );
+        }
+
+        assert_eq!(
+            continuation_kind("JOIN -- joined rows"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            continuation_kind("REFERENCE -- model ref"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("WINDOW -- named window"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("MATCH_RECOGNIZE -- row pattern"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("PIVOT -- rotated rows"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("UNPIVOT -- rotated rows"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("FROM TABLE -- collection rows"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            continuation_kind("LEFT JOIN TABLE -- collection rows"),
+            Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_join_inline_comment_keeps_next_table_one_level_deeper_than_join() {
+        let source = r#"SELECT e.empno
+FROM emp e
+JOIN -- joined rows
+dept d
+ON d.deptno = e.deptno;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let join_idx = find_line_starting_with(&lines, "JOIN -- joined rows").unwrap_or(0);
+        let table_idx = find_line_starting_with(&lines, "dept d").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[table_idx]),
+            leading_spaces(lines[join_idx]).saturating_add(4),
+            "comment-split JOIN item should stay one level deeper than the JOIN header, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keep_inline_comment_keeps_wrapper_on_exact_owner_depth() {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        MAX (e.sal) KEEP -- owner
+        (
+            DENSE_RANK LAST ORDER BY (
+                SELECT MAX (b.sal)
+                FROM bonus b
+                WHERE b.empno = e.empno
+            ),
+            e.empno
+        ) AS top_sal
+    FROM emp e
+) ranked
+WHERE ranked.top_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let keep_idx =
+            find_line_starting_with(&lines, "SELECT MAX (e.sal) KEEP -- owner").unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(keep_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let dense_rank_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("DENSE_RANK"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(dense_rank_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") AS top_sal"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[open_idx]),
+            leading_spaces(lines[keep_idx]),
+            "standalone open paren after inline-comment split KEEP should stay on the owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[dense_rank_idx]),
+            leading_spaces(lines[keep_idx]).saturating_add(4),
+            "KEEP body header should stay one level deeper than the exact owner line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[keep_idx]),
+            "KEEP close line should realign with the owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_keep_dense_rank_inline_comment_on_owner_body_depth() {
+        let source = r#"SELECT *
+FROM (
+    SELECT
+        MAX (e.sal) KEEP (
+            DENSE_RANK -- keep rank-chain depth
+                    LAST
+                    ORDER BY e.sal
+        ) AS top_sal
+    FROM emp e
+) ranked
+WHERE ranked.top_sal > 0;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let dense_rank_idx =
+            find_line_starting_with(&lines, "DENSE_RANK -- keep rank-chain depth").unwrap_or(0);
+        let last_idx = find_line_starting_with(&lines, "LAST").unwrap_or(0);
+        let order_by_idx = find_line_starting_with(&lines, "ORDER BY e.sal").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[last_idx]),
+            leading_spaces(lines[dense_rank_idx]),
+            "KEEP split DENSE_RANK/LAST chain should stay on the owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[order_by_idx]),
+            leading_spaces(lines[dense_rank_idx]),
+            "KEEP split DENSE_RANK/ORDER BY chain should stay on the owner-relative body depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_right_outer_join_table_inline_comment_keeps_exact_owner_depth() {
+        let source = r#"SELECT *
+FROM dept d
+WHERE EXISTS (
+    SELECT 1
+    FROM emp e
+    RIGHT OUTER JOIN TABLE -- owner
+    (
+        SELECT b.empno
+        FROM bonus b
+        WHERE b.empno = e.empno
+    ) bonus_rows
+    ON bonus_rows.empno = e.empno
+)
+AND d.status = 'A';"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let owner_idx =
+            find_line_starting_with(&lines, "RIGHT OUTER JOIN TABLE -- owner").unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(owner_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT b.empno"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with(") bonus_rows"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[open_idx]),
+            leading_spaces(lines[owner_idx]),
+            "standalone open paren after inline-comment split JOIN TABLE owner should stay on the owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[owner_idx]).saturating_add(4),
+            "child SELECT under inline-comment split JOIN TABLE owner should stay one level deeper than the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[owner_idx]),
+            "JOIN TABLE close line should realign with the owner depth, got:\n{}",
+            formatted
         );
     }
 

@@ -77,7 +77,13 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 - 한 phase만 아는 owner/frame은 허용하지 않는다.
 - stable anchor, owner-relative family, continuation boundary도 같은 semantics를 따라야 한다.
+- exact bare header classifier와 generic leading-prefix continuation은 같은 consumer가 아니다. `WITHIN GROUP`, `REFERENCE`, `WINDOW`, `FROM TABLE`, `LEFT JOIN TABLE`처럼 bare exact line 자체가 same-depth owner/header family인 경우는 dedicated bare-header taxonomy로 판정해야 하고, inline comment split용 generic prefix carry와 같은 함수에서 같은 depth 규칙으로 뭉개면 안 된다.
+- 따라서 "inline comment가 붙은 structural prefix"에서도 exact bare owner/header line과 generic last-keyword consumer가 충돌하는 family(`JOIN`, `REFERENCE`, `WINDOW`, `FROM TABLE`, `... JOIN TABLE` 등)는 dedicated bare-header taxonomy를 먼저 참조할 수 있어야 한다. 다만 이 우선순위를 모든 exact bare line에 일괄 적용하면 `FOR UPDATE`, `RULES`, `AFTER MATCH SKIP`처럼 inline comment에서 body depth를 유지해야 하는 family까지 깨지므로, owner/header collision family로 범위를 한정해야 한다.
+- inline comment용 exact bare owner/header collision family는 별도 문자열 목록으로 유지하면 안 된다. shared owner/pending classifier 결과에서 파생돼야 하며, `RIGHT/FULL/... JOIN TABLE`, `WITHIN GROUP`, `KEEP` 같은 modifier/owner variant가 새로 생겨도 같은 semantic family면 자동으로 같은 우선순위를 따라야 한다.
+- 반대로 named owner line(`WINDOW w_sales AS`, `OPEN c_emp FOR`, `CURSOR c_emp IS`)은 generic header consumer가 아니다. 이런 line은 owner/pending-owner family로만 해석하고, generic leading-prefix continuation은 owner/header classifier가 모두 아니라고 판정된 뒤의 fallback이어야 한다.
+- 이때 "named owner line이 generic header consumer가 아니다"는 "항상 inline-comment header continuation kind를 반환하지 않는다"와 동치다. standalone wrapper/query head를 다음 line에서 same-depth로 붙이는 책임은 generic prefix carry가 아니라 pending owner anchor/state machine이 질 수 있다. 예를 들어 `REFERENCE ref ON`처럼 surviving tail이 exact owner token으로 닫히는 family와 `WINDOW w_sales AS`, `OPEN c_emp FOR`처럼 named owner anchor가 다음 `(` / child query를 직접 이어야 하는 family는 같은 named-owner 계열이어도 continuation helper의 반환값이 같을 필요가 없다.
 - exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
+- 특히 exact bare owner-relative split-body-header fragment(`DENSE_RANK`, `DENSE_RANK FIRST`, `AFTER MATCH`, `AFTER MATCH SKIP TO`, `UNIQUE SINGLE REFERENCE` 등)는 trailing 마지막 keyword만 보고 generic body-depth로 분류하면 안 된다. 이런 line은 shared owner-relative sequence matcher가 "아직 같은 header chain 안인지 / 이미 body operand를 여는 complete header인지"를 먼저 판정해야 한다.
 - 다만 "같은 prefix taxonomy를 쓴다"가 "inline comment split과 exact bare line이 항상 같은 continuation depth를 가진다"를 의미하지는 않는다. exact bare line이 여전히 dedicated same-depth owner/header chain fragment라면 (`WITHIN GROUP`, `DENSE_RANK LAST`, `AFTER MATCH SKIP`, `LEFT OUTER`, `REFERENCE`, `CURSOR` 등) bare carry는 same-depth여야 하고, inline comment split만 body depth를 빌릴 수 있다.
 - exact bare line이 "다음 code line에서 wrapper/query head를 받을 completed owner anchor"인 경우도 예외가 아니다. `EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`처럼 standalone `(` 또는 child query가 뒤로 밀린 owner line은 generic `FROM`/`WHERE` body header처럼 다시 +1 하지 말고 same-depth owner family로 유지해야 한다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
@@ -195,6 +201,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 주의:
 
 - bare `IF`/`ELSIF`/`ELSEIF` condition header는 owner family가 아니라 condition-header / wrapper family다. body owner는 `THEN`이 완료된 시점부터 열린다.
+- `CREATE TRIGGER` header body owner도 "header body line"과 "body opener"를 섞으면 안 된다. `BEFORE/AFTER`, `ON`, `REFERENCING`, `FOR EACH ROW`, `WHEN`은 owner depth + 1이지만, 그 다음 `DECLARE`/`BEGIN`은 retained trigger-header state를 종료하고 owner depth로 복귀해야 한다.
 
 ### 3.2 current structural continuation boundary taxonomy
 
@@ -223,12 +230,14 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - bare-header carry는 comment를 제거한 structural tail이 "exact keyword-only line"일 때만 켠다. `SELECT DISTINCT`는 bare header지만 `SELECT DISTINCT empno`는 bare header가 아니다.
 - same-depth header: `WITH` 같은 owner/header chain 조각, terminal `JOIN/APPLY` 전의 incomplete modifier fragment (`LEFT OUTER`, `CROSS`, `OUTER`)
 - same-depth merge-header header line: retained `WHEN`, `WHEN NOT`, pending state가 넘겨주는 split `MATCHED`, standalone `WHEN MATCHED`, standalone `WHEN NOT MATCHED`
-- same-depth deferred-wrapper owner line: exact bare condition-owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`), exact bare direct from-item owner(`LATERAL`, `TABLE`, `CROSS/OUTER APPLY`), exact bare generic expression owner(`CURSOR`, `MULTISET`)
+- same-depth deferred-wrapper owner line: exact bare condition-owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`), exact bare direct from-item owner(`LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `FROM/USING/... JOIN TABLE` variants), exact bare generic expression owner(`CURSOR`, `MULTISET`)
+- same-depth exact bare multiline/query owner header line: `WITHIN GROUP`, `KEEP`, `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `REFERENCE`, `JOIN TABLE`/`USING TABLE` 계열처럼 generic last-keyword consumer와 충돌할 수 있는 owner/pending-owner family
 - query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
 - current-line+1 merge-header condition: retained merge-header state가 소비하는 `AND`/`OR` condition line, standalone `THEN`, mixed close tail `) THEN`
 - current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, exact bare `... JOIN` header line, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
 - owner-relative body header family: `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`
 - owner-relative split-header state machine: active multiline owner 안에서는 `WITHIN -> GROUP`, `DENSE_RANK -> FIRST/LAST -> ORDER -> BY`, `AFTER -> MATCH SKIP -> TO NEXT ROW`, `ROWS -> BETWEEN ...`, `RETURN -> UPDATED/ALL -> ROWS`, `RULES -> AUTOMATIC/SEQUENTIAL -> ORDER` 같은 multi-step sequence를 dedicated state로 추적한다. 이 family는 bare-header carry가 있더라도 final canonical depth를 active owner body depth 기준으로 다시 snap 할 수 있다.
+- inline comment split도 위 state machine의 예외가 아니다. exact bare split-body-header가 sequence 중간 단계인지, freeform suffix를 더 받아야 하는지, 이미 operand/body를 여는 complete header인지 판정하는 책임은 generic last-keyword table이 아니라 shared sequence matcher에 있다.
 
 주의:
 
@@ -237,6 +246,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - 이 family는 literal 마지막 token이 아니라 owner family로 분류한다. 따라서 `TABLE`은 generic stable anchor taxonomy에도 등장하지만, exact bare `TABLE` owner line에서는 deferred-wrapper owner family가 우선한다. 같은 이유로 same-line `NOT EXISTS`/`NOT IN`도 generic `NOT` fragment가 아니라 completed owner anchor로 본다.
 - `... APPLY` terminal line은 같은 `JOIN/APPLY` modifier family라도 generic bare header가 아니라 completed deferred-wrapper owner anchor다. 반대로 terminal `APPLY` 전의 fragment (`CROSS`, `OUTER`)는 pending header chain으로 same-depth를 유지한다.
 - `/* gap */ LATERAL`, `/* gap */ TABLE` 같은 comment-glued exact bare direct from-item owner도 동일한 same-depth deferred-wrapper family다. raw `starts_with("LATERAL"|"TABLE")`로 판정하면 shared structural tail 규칙을 깨고 FROM-item body depth로 잘못 강등된다.
+- inline comment split에서 same-depth exact bare owner/header line을 먼저 고르는 기준도 literal phrase table이 아니라 shared owner/pending classifier다. `RIGHT/FULL/... JOIN TABLE`, `WITHIN GROUP`, `KEEP`처럼 modifier/owner variant를 따로 누락시키면 근본 원칙 1.6을 깨게 된다.
 - `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `MODEL`은 generic bare-header continuation consumer가 아니라 dedicated owner-relative / subclause family로 관리한다.
 - `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`은 generic query-base carry가 아니라 active owner frame의 body depth에 먼저 snap 되어야 한다.
 - split multiline owner/modifier의 exact bare keyword-only line도 generic carry와 dedicated owner-relative state를 같은 shared prefix taxonomy 위에서 해석해야 한다. 단, 최종 `final depth`는 active owner state가 canonicalize한다.
@@ -270,7 +280,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 1. 의미 있는 open / close event를 lexical하게 식별한다.
 2. 선두 close event를 먼저 소비한다.
-3. 남은 토큰으로 owner/body/header/continuation을 분류한다.
+3. 남은 토큰으로 owner/body/header/continuation을 분류한다. exact bare owner/header family와 inline comment split continuation은 별도 consumer로 다루고, generic leading-prefix classifier와 충돌하는 owner/header family에서만 bare taxonomy를 우선 참조한다.
 4. 분류 결과를 활성 owner stack과 pending state 위에 투영한다.
 5. 줄 끝에서 새 open event와 새 pending state를 반영한다.
 
