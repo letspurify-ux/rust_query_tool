@@ -2137,10 +2137,7 @@ pub(crate) fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
             line,
             &["WHILE"],
         )
-        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
-            line,
-            &["WHEN"],
-        )
+        || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(line, &["WHEN"])
 }
 
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
@@ -2980,11 +2977,18 @@ pub(crate) fn format_plsql_child_query_owner_kind(
     let structural_tail = owner_header_structural_tail(text_upper);
     let words = meaningful_identifier_words_before_inline_comment(structural_tail, 8);
     let first_word = words.first().copied()?;
+    let first_word_upper = first_word.to_ascii_uppercase();
 
-    if matches!(
-        first_word.to_ascii_uppercase().as_str(),
-        "BEGIN" | "EXCEPTION" | "ELSE" | "ELSIF" | "ELSEIF"
-    ) {
+    if matches!(first_word_upper.as_str(), "BEGIN" | "EXCEPTION" | "ELSE") {
+        return Some(FormatPlsqlChildQueryOwnerKind::ControlBody);
+    }
+
+    if matches!(first_word_upper.as_str(), "ELSIF" | "ELSEIF")
+        && words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("THEN"))
+    {
         return Some(FormatPlsqlChildQueryOwnerKind::ControlBody);
     }
 
@@ -6726,7 +6730,9 @@ mod tests {
             "/* owner */ b (a, b, c) AS ("
         ));
         assert!(line_is_format_cte_definition_header(") b (a, b, c) AS ("));
-        assert!(!line_is_format_cte_definition_header("SELECT empno AS salary"));
+        assert!(!line_is_format_cte_definition_header(
+            "SELECT empno AS salary"
+        ));
         assert!(!line_is_format_cte_definition_header("b (a, b, c)"));
     }
 
@@ -6860,36 +6866,30 @@ mod tests {
 
     #[test]
     fn format_split_direct_from_item_query_owner_keywords_cover_safe_split_lateral_headers() {
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "LATERAL"
-        ));
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "LATERAL -- derived rows"
-        ));
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "TABLE"
-        ));
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "TABLE -- derived rows"
-        ));
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "FROM TABLE"
-        ));
-        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "LEFT JOIN TABLE"
-        ));
-        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "OUTER APPLY"
-        ));
-        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "TABLE collection_expr"
-        ));
-        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "CREATE TABLE"
-        ));
-        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword(
-            "JOIN"
-        ));
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword("LATERAL"));
+        assert!(
+            line_ends_with_format_split_direct_from_item_query_owner_keyword(
+                "LATERAL -- derived rows"
+            )
+        );
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword("TABLE"));
+        assert!(
+            line_ends_with_format_split_direct_from_item_query_owner_keyword(
+                "TABLE -- derived rows"
+            )
+        );
+        assert!(line_ends_with_format_split_direct_from_item_query_owner_keyword("FROM TABLE"));
+        assert!(
+            line_ends_with_format_split_direct_from_item_query_owner_keyword("LEFT JOIN TABLE")
+        );
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword("OUTER APPLY"));
+        assert!(
+            !line_ends_with_format_split_direct_from_item_query_owner_keyword(
+                "TABLE collection_expr"
+            )
+        );
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword("CREATE TABLE"));
+        assert!(!line_ends_with_format_split_direct_from_item_query_owner_keyword("JOIN"));
     }
 
     #[test]
@@ -6912,6 +6912,15 @@ mod tests {
         );
         assert_eq!(
             format_plsql_child_query_owner_kind("ELSEIF v_ready THEN"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(format_plsql_child_query_owner_kind("ELSIF v_ready"), None);
+        assert_eq!(
+            format_plsql_child_query_owner_kind("ELSEIF /* gap */ v_ready"),
+            None
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("ELSIF v_ready THEN OPEN c_emp FOR"),
             Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
         );
         assert_eq!(
@@ -6938,6 +6947,14 @@ mod tests {
             format_plsql_child_query_owner_kind("OPEN/* gap */c_emp/* gap */FOR"),
             Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
         );
+        assert_eq!(
+            format_plsql_child_query_owner_kind(") CURSOR c_emp IS"),
+            Some(FormatPlsqlChildQueryOwnerKind::CursorDeclaration)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind(") OPEN c_emp FOR"),
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
         assert_eq!(format_plsql_child_query_owner_kind("LOOP"), None);
         assert_eq!(format_plsql_child_query_owner_kind("END IF;"), None);
         assert_eq!(format_plsql_child_query_owner_kind("FOR rec IN ("), None);
@@ -6959,6 +6976,14 @@ mod tests {
         );
         assert_eq!(
             format_plsql_child_query_owner_pending_header_kind("/* gap */OPEN c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind(") CURSOR c_emp"),
+            Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::CursorDeclaration)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_pending_header_kind(") OPEN c_emp"),
             Some(PendingFormatPlsqlChildQueryOwnerHeaderKind::OpenCursorFor)
         );
         assert_eq!(

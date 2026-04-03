@@ -9148,9 +9148,7 @@ impl SqlEditorWidget {
 
         Self::significant_tokens_structural_prefix(&significant_tokens).and_then(
             |structural_prefix| {
-                crate::sql_text::format_bare_structural_header_continuation_kind(
-                    &structural_prefix,
-                )
+                crate::sql_text::format_bare_structural_header_continuation_kind(&structural_prefix)
             },
         )
     }
@@ -12229,6 +12227,64 @@ END;"#;
         assert!(
             !formatted.contains("        ELSIF v_col1 = 1 THEN"),
             "ELSIF should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_split_elsif_then_opens_body_only_after_then() {
+        let sql = r#"BEGIN
+  IF v_ready = 'N' THEN
+    NULL;
+  ELSIF v_ready = 'Y'
+  THEN
+    OPEN c_emp FOR
+    SELECT empno
+    FROM emp;
+  END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let elsif_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ELSIF v_ready = 'Y'"))
+            .expect("ELSIF line");
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "THEN")
+            .unwrap_or(elsif_idx);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OPEN c_emp FOR")
+            .expect("OPEN cursor line");
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT empno")
+            .map(|(idx, _)| idx)
+            .expect("SELECT line");
+
+        if then_idx != elsif_idx {
+            assert_eq!(
+                indent(lines[then_idx]),
+                indent(lines[elsif_idx]),
+                "split THEN should stay aligned with the ELSIF owner depth, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            indent(lines[open_idx]),
+            indent(lines[then_idx]).saturating_add(4),
+            "OPEN cursor after split THEN should use the THEN body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_idx]),
+            indent(lines[open_idx]).saturating_add(4),
+            "SELECT after OPEN cursor should stay one level deeper than OPEN, got:\n{}",
             formatted
         );
     }
@@ -18658,6 +18714,74 @@ WHEN NOT MATCHED THEN
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_merge_on_one_level_deeper_than_merge_base() {
+        let source = r#"MERGE INTO test_target t
+USING test_source s
+ON (t.id = s.id)
+WHEN MATCHED THEN
+UPDATE
+SET t.name = s.name
+WHEN NOT MATCHED THEN
+INSERT (id, name)
+VALUES (s.id, s.name);"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let merge_idx = find_line("MERGE INTO test_target t");
+        let using_idx = find_line("USING test_source s");
+        let on_idx = find_line("ON (t.id = s.id)");
+        let when_matched_idx = find_line("WHEN MATCHED THEN");
+        let update_idx = find_line("UPDATE");
+        let when_not_matched_idx = find_line("WHEN NOT MATCHED THEN");
+        let insert_idx = find_line("INSERT (id, name)");
+
+        assert_eq!(
+            indent(lines[using_idx]),
+            indent(lines[merge_idx]),
+            "USING should stay on the MERGE base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[on_idx]),
+            indent(lines[merge_idx]).saturating_add(4),
+            "ON should stay one structural level deeper than the MERGE base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_matched_idx]),
+            indent(lines[merge_idx]),
+            "WHEN MATCHED should return to the MERGE base depth after ON, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[update_idx]),
+            indent(lines[when_matched_idx]).saturating_add(4),
+            "UPDATE should stay one structural level deeper than WHEN MATCHED, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_not_matched_idx]),
+            indent(lines[merge_idx]),
+            "WHEN NOT MATCHED should return to the MERGE base depth after ON, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[insert_idx]),
+            indent(lines[when_not_matched_idx]).saturating_add(4),
+            "INSERT should stay one structural level deeper than WHEN NOT MATCHED, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_normalizes_overindented_merge_branch_headers_to_merge_base() {
         let source = r#"MERGE INTO target_table t
 USING source_table s
@@ -20586,8 +20710,7 @@ AND d.status = 'A';"#;
     }
 
     #[test]
-    fn apply_parser_depth_indentation_keeps_exact_apply_owner_depth_across_standalone_open_paren()
-    {
+    fn apply_parser_depth_indentation_keeps_exact_apply_owner_depth_across_standalone_open_paren() {
         let source = r#"SELECT *
 FROM dept d
 WHERE EXISTS (
@@ -27931,10 +28054,24 @@ FROM r;"#;
         };
 
         // USING should be present and at base depth (same as MERGE)
+        let merge_line = find_line("MERGE INTO").unwrap_or("");
         let using_line = find_line("USING");
+        let on_line = find_line("ON (").unwrap_or("");
         assert!(
-            using_line.is_some(),
-            "USING should appear on its own line, got:\n{}",
+            !merge_line.is_empty() && using_line.is_some() && !on_line.is_empty(),
+            "MERGE/USING/ON lines should all be present, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(using_line.unwrap_or("")),
+            leading(merge_line),
+            "USING should stay on the MERGE base depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(on_line),
+            leading(merge_line).saturating_add(4),
+            "ON should stay one level deeper than the MERGE base depth, got:\n{}",
             formatted
         );
 
@@ -27950,6 +28087,12 @@ FROM r;"#;
             leading(when_matched),
             leading(when_not_matched),
             "WHEN MATCHED and WHEN NOT MATCHED should be at same depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(when_matched),
+            leading(merge_line),
+            "WHEN branches should return to the MERGE base depth after ON, got:\n{}",
             formatted
         );
 

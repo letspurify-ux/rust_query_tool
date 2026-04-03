@@ -1490,6 +1490,7 @@ impl QueryExecutor {
             None;
         let mut trigger_header_frame: Option<TriggerHeaderDepthFrame> = None;
         let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
+        let mut pending_control_branch_body_depth: Option<usize> = None;
 
         for (idx, line) in lines.iter().enumerate() {
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
@@ -1516,6 +1517,8 @@ impl QueryExecutor {
                 continue;
             }
             sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+            let pending_control_branch_body_depth_for_line =
+                pending_control_branch_body_depth.take();
 
             let mut closing_query_close_align_depth = None;
             while query_frames
@@ -1534,6 +1537,31 @@ impl QueryExecutor {
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
             let clause_detection_trimmed = sql_text::auto_format_structural_tail(trimmed);
             let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
+            let current_line_starts_elsif =
+                sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["ELSIF"],
+                );
+            let current_line_starts_elseif =
+                sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["ELSEIF"],
+                );
+            let current_line_is_exact_else =
+                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["ELSE"],
+                );
+            let current_line_is_exact_then =
+                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["THEN"],
+                );
+            let current_line_is_exact_exception =
+                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["EXCEPTION"],
+                );
             let is_trigger_header_begin = trigger_header_frame.is_some()
                 && parser_depth == 0
                 && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN");
@@ -1812,9 +1840,13 @@ impl QueryExecutor {
                         AutoFormatQueryRole::Base
                     };
                     context.query_base_depth = Some(frame.query_base_depth);
-                } else if is_merge_using_clause || is_merge_on_clause || is_merge_branch_header {
+                } else if is_merge_using_clause || is_merge_branch_header {
                     context.auto_depth = frame.query_base_depth;
                     context.query_role = AutoFormatQueryRole::Base;
+                    context.query_base_depth = Some(frame.query_base_depth);
+                } else if is_merge_on_clause {
+                    context.auto_depth = frame.query_base_depth.saturating_add(1);
+                    context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
                 } else if is_merge_branch_action_clause || is_merge_branch_base_clause {
                     context.auto_depth = merge_branch_body_depth;
@@ -1903,6 +1935,17 @@ impl QueryExecutor {
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth =
                         context.query_base_depth.or(continuation.query_base_depth);
+                }
+            }
+
+            if let Some(branch_body_depth) = pending_control_branch_body_depth_for_line {
+                if !current_line_starts_elsif
+                    && !current_line_starts_elseif
+                    && !current_line_is_exact_else
+                    && !current_line_is_exact_exception
+                    && !sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                {
+                    context.auto_depth = context.auto_depth.max(branch_body_depth);
                 }
             }
 
@@ -2512,6 +2555,15 @@ impl QueryExecutor {
                     parser_depth,
                 ));
             }
+
+            let opens_split_control_body =
+                current_line_is_exact_then && active_merge_branch_header.is_none();
+            pending_control_branch_body_depth =
+                (!sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
+                    && (opens_split_control_body
+                        || current_line_is_exact_else
+                        || current_line_is_exact_exception))
+                    .then_some(context.auto_depth.saturating_add(1));
 
             pending_line_continuation = if current_line_is_same_depth_merge_branch_header_fragment {
                 None
@@ -3436,7 +3488,8 @@ impl QueryExecutor {
             });
         }
 
-        if let Some(kind) = sql_text::format_bare_structural_header_continuation_kind(trimmed_prefix)
+        if let Some(kind) =
+            sql_text::format_bare_structural_header_continuation_kind(trimmed_prefix)
         {
             return Some(match kind {
                 sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => {
@@ -8512,8 +8565,18 @@ WHEN NOT MATCHED THEN
             "MERGE USING should stay on the MERGE base depth"
         );
         assert_eq!(
-            contexts[on_idx].auto_depth, contexts[merge_idx].auto_depth,
-            "MERGE ON should stay on the MERGE base depth"
+            contexts[on_idx].auto_depth,
+            contexts[merge_idx].auto_depth.saturating_add(1),
+            "MERGE ON should stay one level deeper than the MERGE base depth"
+        );
+        assert_eq!(
+            contexts[on_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "MERGE ON should be modeled as a continuation header, not a base clause"
+        );
+        assert!(
+            contexts[on_idx].line_semantic.is_join_condition_clause(),
+            "MERGE ON should reuse the shared ON/USING condition taxonomy"
         );
         assert_eq!(
             contexts[when_matched_idx].auto_depth, contexts[merge_idx].auto_depth,
@@ -13457,6 +13520,50 @@ END;"#;
             contexts[begin_idx].auto_depth,
             contexts[if_idx].auto_depth.saturating_add(1),
             "inline block comment inside the IF condition must not stop THEN body depth carry"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_split_elsif_does_not_open_control_body_until_then() {
+        let sql = r#"BEGIN
+    IF v_ready = 'N' THEN
+        NULL;
+    ELSIF v_ready = 'Y'
+    THEN
+        OPEN c_emp FOR
+            SELECT empno
+            FROM emp;
+    END IF;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let elsif_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ELSIF v_ready = 'Y'")
+            .unwrap_or(0);
+        let then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "THEN")
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "OPEN c_emp FOR")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[elsif_idx].next_query_head_depth, None,
+            "split ELSIF condition line must not open the control-body query owner before THEN"
+        );
+        assert_eq!(
+            contexts[then_idx].next_query_head_depth,
+            Some(contexts[then_idx].auto_depth.saturating_add(1)),
+            "split THEN line should open the control-body owner depth for the following statement"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth,
+            contexts[then_idx].auto_depth.saturating_add(1),
+            "OPEN cursor after split THEN should use the THEN body depth"
         );
     }
 

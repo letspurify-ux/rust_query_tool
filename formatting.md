@@ -92,6 +92,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
 - line head prefix 판정도 예외가 아니다. `CREATE /* gap */ MATERIALIZED /* gap */ VIEW ... AS`, `OPEN c /* gap */ FOR`, `CURSOR c /* gap */ IS`, `WHEN /* gap */ NOT /* gap */ MATCHED THEN`, `MATCH /* gap */ RECOGNIZE` 같은 multi-keyword owner/header는 raw prefix string이나 `contains()`가 아니라 comment-stripped meaningful identifier sequence로 판정해야 한다.
 - control-branch owner/header 판정도 예외가 아니다. exact `ELSE`, exact `EXCEPTION`, `ELSIF ... THEN`, `ELSEIF ... THEN`, `CASE` 같은 PL/SQL branch header는 `ELSE/* gap */`, `EXCEPTION/* gap */`, `ELSIF/* gap */ cond THEN` 형태여도 raw `trim()`/`starts_with()`가 아니라 comment-stripped structural token sequence로 판정해야 한다.
+- control-body owner와 control-condition header는 별도 family다. bare `IF`/`ELSIF`/`ELSEIF` condition line은 `THEN`이 structural token sequence에 나타나기 전까지 body owner가 아니며, exact bare `IF (`/`ELSIF (`/`ELSEIF (`는 condition-header lookahead로만 다뤄야 한다.
 - bare control-condition header lookahead도 예외가 아니다. `IF /* gap */ (`, `ELSIF /* gap */ (`, `ELSEIF /* gap */ (`, `WHILE /* gap */ (`, `WHEN /* gap */ (` 같은 exact bare header는 다음 pure `)` / `AND` / `OR` line이 retained condition state를 정확히 복원할 수 있도록 shared structural helper로 판정해야 한다.
 - underscore를 가진 composite keyword(`MATCH_RECOGNIZE`, `DENSE_RANK` 등)도 예외가 아니다. 구현 내부 표현이 단일 identifier이든, comment/whitespace 때문에 여러 identifier segment로 보이든 structural classifier는 같은 keyword sequence로 취급해야 한다.
 - 이 원칙은 leading/trailing header continuation classifier와 owner-relative split body-header matcher에도 동일하게 적용된다. 특정 phase만 raw word pair 비교를 쓰면 같은 composite keyword가 줄 위치에 따라 다른 depth를 만들게 된다.
@@ -190,6 +191,10 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - `MERGE WHEN ... THEN`, `INSERT ALL/FIRST`, `FORALL` 같은 DML/PLSQL body owner
 - `CREATE TRIGGER` header body owner
 - `CREATE TABLE ... AS`, `CREATE [MATERIALIZED] VIEW ... AS` 같은 DDL header body owner
+
+주의:
+
+- bare `IF`/`ELSIF`/`ELSEIF` condition header는 owner family가 아니라 condition-header / wrapper family다. body owner는 `THEN`이 완료된 시점부터 열린다.
 
 ### 3.2 current structural continuation boundary taxonomy
 
