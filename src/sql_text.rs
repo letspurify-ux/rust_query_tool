@@ -3112,6 +3112,18 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     StructuredColumns,
 }
 
+const FORMAT_ALL_INDENTED_PAREN_OWNER_KINDS: &[FormatIndentedParenOwnerKind] = &[
+    FormatIndentedParenOwnerKind::AnalyticOver,
+    FormatIndentedParenOwnerKind::WithinGroup,
+    FormatIndentedParenOwnerKind::Keep,
+    FormatIndentedParenOwnerKind::ModelSubclause,
+    FormatIndentedParenOwnerKind::Window,
+    FormatIndentedParenOwnerKind::MatchRecognize,
+    FormatIndentedParenOwnerKind::Pivot,
+    FormatIndentedParenOwnerKind::Unpivot,
+    FormatIndentedParenOwnerKind::StructuredColumns,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingFormatIndentedParenOwnerHeaderKind {
     WindowAs,
@@ -4873,6 +4885,44 @@ pub(crate) enum FormatInlineCommentHeaderContinuationKind {
     OneDeeperThanCurrentLine,
 }
 
+/// Resolves a shared structural continuation kind into the canonical
+/// structural depth for the consuming line.
+///
+/// Keeping this translation in one place prevents analyzer- and
+/// formatter-specific match arms from drifting when new continuation families
+/// are added. The query-base input is an anchor, not necessarily the raw
+/// stored query-frame depth; renderer-only callers may supply a synthetic base
+/// that represents the same structural role.
+pub(crate) fn resolve_format_header_continuation_depth_with_anchors(
+    kind: FormatInlineCommentHeaderContinuationKind,
+    same_depth_anchor: usize,
+    current_line_depth: usize,
+    query_base_anchor: Option<usize>,
+) -> usize {
+    match kind {
+        FormatInlineCommentHeaderContinuationKind::SameDepth => same_depth_anchor,
+        FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => query_base_anchor
+            .unwrap_or(same_depth_anchor)
+            .saturating_add(1),
+        FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
+            current_line_depth.saturating_add(1)
+        }
+    }
+}
+
+pub(crate) fn resolve_format_header_continuation_depth(
+    kind: FormatInlineCommentHeaderContinuationKind,
+    line_depth: usize,
+    query_base_depth: Option<usize>,
+) -> usize {
+    resolve_format_header_continuation_depth_with_anchors(
+        kind,
+        line_depth,
+        line_depth,
+        query_base_depth,
+    )
+}
+
 /// Returns the continuation kind when an inline comment splits a clause or
 /// subclause header and the next line should stay attached to that header.
 pub(crate) fn format_inline_comment_header_continuation_kind(
@@ -4958,11 +5008,8 @@ pub(crate) fn format_leading_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
     let trimmed = line.trim_start();
-    if line_has_exact_identifier_sequence(trimmed, &["DENSE_RANK"])
-        || line_starts_with_identifier_sequence(trimmed, &["DENSE_RANK", "FIRST"])
-        || line_starts_with_identifier_sequence(trimmed, &["DENSE_RANK", "LAST"])
-    {
-        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    if let Some(kind) = leading_structural_prefix_override_kind(trimmed) {
+        return Some(kind);
     }
 
     let words = leading_meaningful_words(line.trim_start(), 8);
@@ -4983,6 +5030,34 @@ pub(crate) fn format_leading_header_continuation_kind(
     }
 
     continuation_kind
+}
+
+fn leading_structural_prefix_override_kind(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    // `KEEP DENSE_RANK ...` is structurally one owner-relative body family
+    // even when comments split `DENSE` / `RANK`, so reuse the shared matcher
+    // instead of maintaining raw literal variants here.
+    FormatIndentedParenOwnerKind::Keep
+        .exact_bare_split_body_header_match(trimmed)
+        .map(|_| FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+}
+
+fn exact_bare_join_clause_continuation_kind(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    if !line_is_exact_bare_structural_keyword_line(trimmed)
+        || format_query_owner_header_kind(trimmed) != Some(FormatQueryOwnerKind::Clause)
+        || !line_ends_with_keyword(trimmed, "JOIN")
+    {
+        return None;
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["JOIN"]) {
+        Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+    } else {
+        Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+    }
 }
 
 fn line_is_exact_bare_structural_keyword_line(trimmed: &str) -> bool {
@@ -5022,9 +5097,11 @@ fn format_structural_header_continuation_kind_for_structural_tail(
         return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
     }
 
-    if line_has_exact_identifier_sequence(trimmed, &["SELECT"])
-        || line_has_exact_identifier_sequence(trimmed, &["JOIN"])
-    {
+    if let Some(kind) = exact_bare_join_clause_continuation_kind(trimmed) {
+        return Some(kind);
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["SELECT"]) {
         return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
@@ -5054,20 +5131,8 @@ pub(crate) fn format_structural_header_continuation_kind(
 fn format_bare_structural_header_continuation_kind_for_structural_tail(
     trimmed: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    for owner_kind in [
-        FormatIndentedParenOwnerKind::AnalyticOver,
-        FormatIndentedParenOwnerKind::WithinGroup,
-        FormatIndentedParenOwnerKind::Keep,
-        FormatIndentedParenOwnerKind::ModelSubclause,
-        FormatIndentedParenOwnerKind::Window,
-        FormatIndentedParenOwnerKind::MatchRecognize,
-        FormatIndentedParenOwnerKind::Pivot,
-        FormatIndentedParenOwnerKind::Unpivot,
-        FormatIndentedParenOwnerKind::StructuredColumns,
-    ] {
-        if let Some(kind) = owner_kind.exact_bare_split_body_header_continuation_kind(trimmed) {
-            return Some(kind);
-        }
+    if let Some(kind) = exact_bare_indented_paren_owner_continuation_kind(trimmed) {
+        return Some(kind);
     }
 
     if line_is_exact_bare_split_for_update_header(trimmed) {
@@ -5078,9 +5143,11 @@ fn format_bare_structural_header_continuation_kind_for_structural_tail(
         return None;
     }
 
-    if line_has_exact_identifier_sequence(trimmed, &["SELECT"])
-        || line_has_exact_identifier_sequence(trimmed, &["JOIN"])
-    {
+    if let Some(kind) = exact_bare_join_clause_continuation_kind(trimmed) {
+        return Some(kind);
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["SELECT"]) {
         return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
@@ -5167,27 +5234,31 @@ pub(crate) fn format_inline_comment_structural_header_continuation_kind(
     }
 
     if line_is_exact_bare_structural_keyword_line(trimmed) {
-        for owner_kind in [
-            FormatIndentedParenOwnerKind::AnalyticOver,
-            FormatIndentedParenOwnerKind::WithinGroup,
-            FormatIndentedParenOwnerKind::Keep,
-            FormatIndentedParenOwnerKind::ModelSubclause,
-            FormatIndentedParenOwnerKind::Window,
-            FormatIndentedParenOwnerKind::MatchRecognize,
-            FormatIndentedParenOwnerKind::Pivot,
-            FormatIndentedParenOwnerKind::Unpivot,
-            FormatIndentedParenOwnerKind::StructuredColumns,
-        ] {
-            if let Some(kind) =
-                owner_kind.exact_bare_split_body_header_inline_comment_collision_kind(trimmed)
-            {
-                return Some(kind);
-            }
+        if let Some(kind) = exact_bare_indented_paren_owner_inline_comment_collision_kind(trimmed) {
+            return Some(kind);
         }
     }
 
     format_structural_header_continuation_kind_for_structural_tail(trimmed)
         .or_else(|| format_bare_structural_header_continuation_kind_for_structural_tail(trimmed))
+}
+
+fn exact_bare_indented_paren_owner_continuation_kind(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    FORMAT_ALL_INDENTED_PAREN_OWNER_KINDS
+        .iter()
+        .find_map(|owner_kind| owner_kind.exact_bare_split_body_header_continuation_kind(trimmed))
+}
+
+fn exact_bare_indented_paren_owner_inline_comment_collision_kind(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    FORMAT_ALL_INDENTED_PAREN_OWNER_KINDS
+        .iter()
+        .find_map(|owner_kind| {
+            owner_kind.exact_bare_split_body_header_inline_comment_collision_kind(trimmed)
+        })
 }
 
 /// Returns true when a token starts a flashback/temporal boundary expression.
@@ -5927,6 +5998,14 @@ mod tests {
             format_structural_header_continuation_kind("LEFT OUTER JOIN"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
+        assert_eq!(
+            format_structural_header_continuation_kind("INNER JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("NATURAL LEFT JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
     }
 
     #[test]
@@ -5976,6 +6055,23 @@ mod tests {
             format_structural_header_continuation_kind("CURSOR c_emp IS -- cursor query"),
             None
         );
+    }
+
+    #[test]
+    fn format_leading_header_continuation_kind_uses_shared_keep_sequence_matcher_for_dense_rank_prefixes(
+    ) {
+        for line in [
+            "DENSE_RANK",
+            "DENSE_RANK LAST",
+            "DENSE /* gap */ RANK",
+            "DENSE /* gap */ RANK LAST",
+        ] {
+            assert_eq!(
+                format_leading_header_continuation_kind(line),
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
+                "leading structural prefix helper should route `{line}` through the shared KEEP sequence matcher"
+            );
+        }
     }
 
     #[test]
@@ -6077,6 +6173,74 @@ mod tests {
                 "AFTER MATCH SKIP -- keep row-pattern body depth",
             ),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+    }
+
+    #[test]
+    fn resolve_format_header_continuation_depth_matches_shared_kind_semantics() {
+        assert_eq!(
+            resolve_format_header_continuation_depth(
+                FormatInlineCommentHeaderContinuationKind::SameDepth,
+                3,
+                Some(1),
+            ),
+            3
+        );
+        assert_eq!(
+            resolve_format_header_continuation_depth(
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                3,
+                Some(5),
+            ),
+            6
+        );
+        assert_eq!(
+            resolve_format_header_continuation_depth(
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                3,
+                None,
+            ),
+            4
+        );
+        assert_eq!(
+            resolve_format_header_continuation_depth(
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                3,
+                Some(1),
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn resolve_format_header_continuation_depth_with_anchors_respects_distinct_same_depth_and_current_line_inputs(
+    ) {
+        assert_eq!(
+            resolve_format_header_continuation_depth_with_anchors(
+                FormatInlineCommentHeaderContinuationKind::SameDepth,
+                2,
+                5,
+                Some(1),
+            ),
+            2
+        );
+        assert_eq!(
+            resolve_format_header_continuation_depth_with_anchors(
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                2,
+                5,
+                Some(3),
+            ),
+            4
+        );
+        assert_eq!(
+            resolve_format_header_continuation_depth_with_anchors(
+                FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                2,
+                5,
+                Some(3),
+            ),
+            6
         );
     }
 
@@ -6215,6 +6379,27 @@ mod tests {
                 format_inline_comment_continuation_kind(line),
                 expected,
                 "expected `{line}` to prefer structural header carry before pure RHS fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn format_inline_comment_continuation_kind_preserves_exact_bare_structural_family_semantics_before_lexical_fallback(
+    ) {
+        for (line, expected) in [
+            (
+                "INNER JOIN -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase),
+            ),
+            (
+                "RETURN UPDATED -- keep",
+                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+            ),
+        ] {
+            assert_eq!(
+                format_inline_comment_continuation_kind(line),
+                expected,
+                "expected `{line}` to keep the exact bare structural family semantics instead of a lexical fallback"
             );
         }
     }
@@ -6504,6 +6689,14 @@ mod tests {
             format_structural_header_continuation_kind("LEFT OUTER JOIN")
         );
         assert_eq!(
+            format_bare_structural_header_continuation_kind("INNER JOIN"),
+            format_structural_header_continuation_kind("INNER JOIN")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("NATURAL LEFT JOIN"),
+            format_structural_header_continuation_kind("NATURAL LEFT JOIN")
+        );
+        assert_eq!(
             format_bare_structural_header_continuation_kind("PARTITION BY"),
             format_structural_header_continuation_kind("PARTITION BY")
         );
@@ -6598,6 +6791,14 @@ mod tests {
         assert_eq!(
             format_bare_structural_header_continuation_kind("LEFT OUTER"),
             Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("INNER JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("NATURAL LEFT JOIN"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("EXISTS"),

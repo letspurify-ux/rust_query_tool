@@ -385,6 +385,21 @@ struct PendingPlsqlChildQueryOwnerLineProgress {
     completed_owner_anchor: bool,
 }
 
+#[derive(Clone, Copy)]
+enum PendingPlsqlChildQueryOwnerLineAlignment {
+    Exact(usize),
+    Floor(usize),
+}
+
+impl PendingPlsqlChildQueryOwnerLineAlignment {
+    fn apply_to_effective_depth(self, effective_depth: usize) -> usize {
+        match self {
+            Self::Exact(depth) => depth,
+            Self::Floor(depth) => effective_depth.max(depth),
+        }
+    }
+}
+
 impl PendingPlsqlChildQueryOwnerLayoutFrame {
     fn progress_over_line(
         self,
@@ -415,29 +430,37 @@ impl PendingPlsqlChildQueryOwnerLayoutFrame {
         self,
         line: &str,
         progress: PendingPlsqlChildQueryOwnerLineProgress,
-    ) -> Option<usize> {
+    ) -> Option<PendingPlsqlChildQueryOwnerLineAlignment> {
         let trimmed = line.trim_start();
         if self.kind.line_completes(line)
             || SqlEditorWidget::line_is_standalone_open_paren_before_inline_comment(trimmed)
             || crate::sql_text::line_has_leading_significant_close_paren(trimmed)
         {
-            return Some(self.owner_depth);
+            return Some(PendingPlsqlChildQueryOwnerLineAlignment::Exact(
+                self.owner_depth,
+            ));
         }
 
         if self.header_completed {
-            return Some(self.owner_depth.saturating_add(1));
+            return Some(PendingPlsqlChildQueryOwnerLineAlignment::Floor(
+                self.owner_depth.saturating_add(1),
+            ));
         }
 
         if self.nested_paren_depth == 0 {
             // Split PL/SQL child-query headers (`OPEN` -> cursor name -> `FOR`,
             // `CURSOR` -> name -> `IS`) must keep every incomplete header
             // fragment on the stored owner depth until the header completes.
-            return Some(self.owner_depth);
+            return Some(PendingPlsqlChildQueryOwnerLineAlignment::Exact(
+                self.owner_depth,
+            ));
         }
 
         let closes_nested_wrapper =
             self.nested_paren_depth > 0 && progress.continued_frame.nested_paren_depth == 0;
-        closes_nested_wrapper.then_some(self.owner_depth)
+        closes_nested_wrapper.then_some(PendingPlsqlChildQueryOwnerLineAlignment::Exact(
+            self.owner_depth,
+        ))
     }
 }
 
@@ -4957,21 +4980,15 @@ impl SqlEditorWidget {
                                 )
                             } else {
                                 let base = base_indent(indent_level, open_cursor_state);
-                                let min_indent = match comment_header_continuation_kind {
-                                    Some(
-                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
-                                    ) => base,
-                                    Some(
-                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
-                                    ) => base.saturating_add(1),
-                                    Some(
-                                        crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
-                                    ) => line_indent.saturating_add(1),
-                                    None => base.saturating_add(usize::from(
-                                        current_clause.is_some()
-                                            || suppress_comma_break_depth > 0,
+                                let min_indent = Self::resolve_comment_header_continuation_indent(
+                                    comment_header_continuation_kind,
+                                    line_indent,
+                                    base,
+                                    line_indent,
+                                    base.saturating_add(usize::from(
+                                        current_clause.is_some() || suppress_comma_break_depth > 0,
                                     )),
-                                };
+                                );
                                 line_indent.max(min_indent)
                             };
                             inline_comment_continuation_state =
@@ -5034,21 +5051,17 @@ impl SqlEditorWidget {
                                     )
                                 } else {
                                     let base = base_indent(indent_level, open_cursor_state);
-                                    let min_indent = match comment_header_continuation_kind {
-                                        Some(
-                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
-                                        ) => base,
-                                        Some(
-                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
-                                        ) => base.saturating_add(1),
-                                        Some(
-                                            crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
-                                        ) => line_indent.saturating_add(1),
-                                        None => base.saturating_add(usize::from(
-                                            current_clause.is_some()
-                                                || suppress_comma_break_depth > 0,
-                                        )),
-                                    };
+                                    let min_indent =
+                                        Self::resolve_comment_header_continuation_indent(
+                                            comment_header_continuation_kind,
+                                            line_indent,
+                                            base,
+                                            line_indent,
+                                            base.saturating_add(usize::from(
+                                                current_clause.is_some()
+                                                    || suppress_comma_break_depth > 0,
+                                            )),
+                                        );
                                     line_indent.max(min_indent)
                                 };
                                 newline_with(
@@ -6315,14 +6328,12 @@ impl SqlEditorWidget {
         let query_base_depth = resolved_query_base_depth.or(query_base_depth);
 
         sql_text::format_structural_header_continuation_kind(line)
-            .map(|kind| match kind {
-                sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => line_depth,
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                    query_base_depth.unwrap_or(line_depth).saturating_add(1)
-                }
-                sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                    line_depth.saturating_add(1)
-                }
+            .map(|kind| {
+                sql_text::resolve_format_header_continuation_depth(
+                    kind,
+                    line_depth,
+                    query_base_depth,
+                )
             })
             .unwrap_or(line_depth)
     }
@@ -6335,14 +6346,8 @@ impl SqlEditorWidget {
     ) -> Option<usize> {
         let query_base_depth = resolved_query_base_depth.or(query_base_depth);
 
-        sql_text::format_structural_header_continuation_kind(line).map(|kind| match kind {
-            sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => line_depth,
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                query_base_depth.unwrap_or(line_depth).saturating_add(1)
-            }
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                line_depth.saturating_add(1)
-            }
+        sql_text::format_structural_header_continuation_kind(line).map(|kind| {
+            sql_text::resolve_format_header_continuation_depth(kind, line_depth, query_base_depth)
         })
     }
 
@@ -6354,14 +6359,8 @@ impl SqlEditorWidget {
     ) -> Option<usize> {
         let query_base_depth = resolved_query_base_depth.or(query_base_depth);
 
-        sql_text::format_bare_structural_header_continuation_kind(line).map(|kind| match kind {
-            sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth => line_depth,
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase => {
-                query_base_depth.unwrap_or(line_depth).saturating_add(1)
-            }
-            sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine => {
-                line_depth.saturating_add(1)
-            }
+        sql_text::format_bare_structural_header_continuation_kind(line).map(|kind| {
+            sql_text::resolve_format_header_continuation_depth(kind, line_depth, query_base_depth)
         })
     }
 
@@ -7366,7 +7365,19 @@ impl SqlEditorWidget {
             ) {
                 frame
                     .alignment_depth_for_line_progress(trimmed, progress)
-                    .map(|depth| effective_depth.max(depth))
+                    // Split/completed PL/SQL child-query owners carry two
+                    // kinds of structural depth:
+                    // - exact owner alignment for wrapper opens/closes and
+                    //   incomplete header fragments
+                    // - body-depth floors for ordinary statement lines after
+                    //   the owner completes
+                    //
+                    // Mixed leading-close owners such as `) OPEN c FOR` and
+                    // `) CURSOR c IS` must snap the following standalone `(`
+                    // back to the owner depth, but comment/comma continuation
+                    // inside the completed body must still be allowed to stay
+                    // deeper than the owner-relative floor.
+                    .map(|alignment| alignment.apply_to_effective_depth(effective_depth))
                     .unwrap_or(effective_depth)
             } else {
                 effective_depth
@@ -9114,6 +9125,25 @@ impl SqlEditorWidget {
     ) -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
         Self::non_comment_tokens_prefix_text(tokens, idx)
             .and_then(|prefix| crate::sql_text::format_inline_comment_continuation_kind(&prefix))
+    }
+
+    fn resolve_comment_header_continuation_indent(
+        continuation_kind: Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind>,
+        same_depth_anchor: usize,
+        query_base_anchor: usize,
+        current_line_depth: usize,
+        fallback_indent: usize,
+    ) -> usize {
+        continuation_kind
+            .map(|kind| {
+                crate::sql_text::resolve_format_header_continuation_depth_with_anchors(
+                    kind,
+                    same_depth_anchor,
+                    current_line_depth,
+                    Some(query_base_anchor),
+                )
+            })
+            .unwrap_or(fallback_indent)
     }
 
     #[cfg(test)]
@@ -27040,6 +27070,32 @@ FOR /* keep */ UPDATE -- lock mode
     }
 
     #[test]
+    fn format_sql_basic_model_reference_comment_continuation_keeps_owner_depth() {
+        let source = "SELECT *\nFROM sales\nMODEL\n    PARTITION BY (deptno)\n    DIMENSION BY (month_key)\n    REFERENCE -- model ref\n    ref_limits ON (\n        SELECT limit_amt\n        FROM limits l\n        WHERE l.deptno = sales.deptno\n    )\n    MEASURES (amount)\n    RULES UPDATE (amount[ANY] = amount[CV()] + 1)\nORDER BY deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let reference_idx =
+            find_line_starting_with(&lines, "REFERENCE -- model ref").expect("REFERENCE line");
+        let reference_on_idx =
+            find_line_starting_with(&lines, "ref_limits ON (").expect("REFERENCE ON line");
+        let child_select_idx =
+            find_line_starting_with(&lines, "SELECT limit_amt").expect("child SELECT line");
+
+        assert_eq!(
+            leading_spaces(lines[reference_on_idx]),
+            leading_spaces(lines[reference_idx]),
+            "split MODEL REFERENCE owner text should stay aligned with the exact bare REFERENCE line, got:\n{}",
+            formatted
+        );
+        assert!(
+            leading_spaces(lines[child_select_idx]) > leading_spaces(lines[reference_on_idx]),
+            "nested SELECT under comment-split MODEL REFERENCE should stay deeper than the owner line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_model_unique_single_reference_inline_comment_on_owner_depth(
     ) {
         let source = "SELECT *\nFROM sales\nMODEL (\n    PARTITION BY (deptno)\n    DIMENSION BY (month_key)\n    MEASURES (amount)\n    UNIQUE SINGLE REFERENCE -- keep modifier depth\n            RULES (\n        amount[ANY] = amount[CV()]\n    )\n) modeled\nWHERE modeled.amount > 0;";
@@ -31934,6 +31990,18 @@ JOIN -- joined rows
             Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
+            continuation_kind("INNER JOIN -- joined rows"),
+            Some(
+                crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase
+            )
+        );
+        assert_eq!(
+            continuation_kind("NATURAL LEFT JOIN -- joined rows"),
+            Some(
+                crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase
+            )
+        );
+        assert_eq!(
             continuation_kind("REFERENCE -- model ref"),
             Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
         );
@@ -32017,6 +32085,48 @@ JOIN -- joined rows
                 "expected `{line}` to keep RHS operator continuation depth"
             );
         }
+    }
+
+    #[test]
+    fn resolve_comment_header_continuation_indent_reuses_shared_anchor_resolver() {
+        assert_eq!(
+            SqlEditorWidget::resolve_comment_header_continuation_indent(
+                Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth),
+                5,
+                2,
+                5,
+                9,
+            ),
+            5
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_comment_header_continuation_indent(
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase,
+                ),
+                5,
+                2,
+                5,
+                9,
+            ),
+            3
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_comment_header_continuation_indent(
+                Some(
+                    crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine,
+                ),
+                5,
+                2,
+                5,
+                9,
+            ),
+            6
+        );
+        assert_eq!(
+            SqlEditorWidget::resolve_comment_header_continuation_indent(None, 5, 2, 5, 9),
+            9
+        );
     }
 
     #[test]
@@ -33729,6 +33839,76 @@ END;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_mixed_close_open_for_owner_anchor_across_wrapper_parens(
+    ) {
+        let source = r#"BEGIN
+IF l_ready THEN
+(
+SELECT 1
+FROM dual
+) OPEN c_emp FOR
+(
+SELECT empno
+FROM emp
+);
+END IF;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx = find_line_starting_with(&lines, "IF l_ready THEN").expect("IF line");
+        let open_idx =
+            find_line_starting_with(&lines, ") OPEN c_emp FOR").expect("OPEN owner line");
+        let paren_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .expect("wrapper open paren line");
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(paren_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT empno")
+            .map(|(idx, _)| idx)
+            .expect("SELECT line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ");")
+            .map(|(idx, _)| idx)
+            .expect("wrapper close line");
+
+        assert_eq!(
+            leading_spaces(lines[open_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "mixed leading-close OPEN ... FOR should realign with the IF body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[paren_idx]),
+            leading_spaces(lines[open_idx]),
+            "standalone wrapper after mixed leading-close OPEN ... FOR should stay on the owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[open_idx]).saturating_add(4),
+            "SELECT after mixed leading-close OPEN ... FOR should stay one level deeper than the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[open_idx]),
+            "wrapper close after mixed leading-close OPEN ... FOR should return to the owner depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_keeps_split_cursor_owner_name_fragment_on_owner_depth() {
         let source = r#"DECLARE
 CURSOR
@@ -33764,6 +33944,76 @@ END;"#;
             leading_spaces(lines[select_idx]),
             leading_spaces(lines[is_idx]).saturating_add(4),
             "SELECT after split CURSOR ... IS should stay one level deeper than the completed owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_mixed_close_cursor_is_owner_anchor_across_wrapper_parens(
+    ) {
+        let source = r#"DECLARE
+(
+SELECT 1
+FROM dual
+) CURSOR c_emp IS
+(
+SELECT empno
+FROM emp
+);
+BEGIN
+NULL;
+END;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let declare_idx = find_line_starting_with(&lines, "DECLARE").expect("DECLARE line");
+        let cursor_idx =
+            find_line_starting_with(&lines, ") CURSOR c_emp IS").expect("CURSOR owner line");
+        let paren_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .expect("wrapper open paren line");
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(paren_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT empno")
+            .map(|(idx, _)| idx)
+            .expect("SELECT line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ");")
+            .map(|(idx, _)| idx)
+            .expect("wrapper close line");
+
+        assert_eq!(
+            leading_spaces(lines[cursor_idx]),
+            leading_spaces(lines[declare_idx]).saturating_add(4),
+            "mixed leading-close CURSOR ... IS should realign with the DECLARE body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[paren_idx]),
+            leading_spaces(lines[cursor_idx]),
+            "standalone wrapper after mixed leading-close CURSOR ... IS should stay on the owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "SELECT after mixed leading-close CURSOR ... IS should stay one level deeper than the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[cursor_idx]),
+            "wrapper close after mixed leading-close CURSOR ... IS should return to the owner depth, got:\n{}",
             formatted
         );
     }

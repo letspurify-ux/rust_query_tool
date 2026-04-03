@@ -1,5 +1,7 @@
 # SQL Auto Formatting Depth Principles
 
+> 최종 업데이트: 2026-04-03 (`JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영)
+
 ## 0. 이 문서의 역할
 
 이 문서는 아래 3층을 구분해서 적는다.
@@ -20,6 +22,7 @@
 
 depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
+- 여기서 "모든 구문이 depth +- 규칙을 따른다"는 말은 "모든 토큰마다 전용 예외를 만든다"는 뜻이 아니다. 대상은 open/close/anchor/query-head/continuation carry처럼 structural event를 만드는 syntax family이며, 구조 이벤트를 만들지 않는 토큰은 shared lexical/operator taxonomy로 처리해야 한다.
 - depth는 기존 공백 수, hanging indent, 수동 정렬에서 역산하면 안 된다.
 - `existing_indent`는 구조 계산의 fallback, soft floor, tie-breaker가 될 수 없다.
 - 이전 줄 정보를 쓰더라도 반드시 이름 붙은 pending/active structural state로 승격된 값만 써야 한다.
@@ -83,6 +86,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 반대로 named owner line(`WINDOW w_sales AS`, `OPEN c_emp FOR`, `CURSOR c_emp IS`)은 generic header consumer가 아니다. 이런 line은 owner/pending-owner family로만 해석하고, generic leading-prefix continuation은 owner/header classifier가 모두 아니라고 판정된 뒤의 fallback이어야 한다.
 - 이때 "named owner line이 generic header consumer가 아니다"는 "항상 inline-comment header continuation kind를 반환하지 않는다"와 동치다. standalone wrapper/query head를 다음 line에서 same-depth로 붙이는 책임은 generic prefix carry가 아니라 pending owner anchor/state machine이 질 수 있다. 예를 들어 `REFERENCE ref ON`처럼 surviving tail이 exact owner token으로 닫히는 family와 `WINDOW w_sales AS`, `OPEN c_emp FOR`처럼 named owner anchor가 다음 `(` / child query를 직접 이어야 하는 family는 같은 named-owner 계열이어도 continuation helper의 반환값이 같을 필요가 없다.
 - exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
+- 특히 leading prefix continuation helper가 일부 owner-relative family를 raw literal 예외로 따로 들고 있으면 안 된다. `KEEP`의 `DENSE_RANK` / `DENSE_RANK LAST` / comment-glued `DENSE /* ... */ RANK`처럼 lexical shape가 달라도 같은 semantic family면 shared owner-relative sequence matcher로 먼저 판정해야 한다. 그 다음에야 "bare carry는 same-depth, structural prefix carry는 body depth" 같은 depth mapping 차이를 별도 단계에서 적용할 수 있다.
 - 특히 exact bare owner-relative split-body-header fragment(`DENSE_RANK`, `DENSE_RANK FIRST`, `AFTER MATCH`, `AFTER MATCH SKIP TO`, `UNIQUE SINGLE REFERENCE` 등)는 trailing 마지막 keyword만 보고 generic body-depth로 분류하면 안 된다. 이런 line은 shared owner-relative sequence matcher가 "아직 같은 header chain 안인지 / 이미 body operand를 여는 complete header인지"를 먼저 판정해야 한다.
 - 다만 "같은 prefix taxonomy를 쓴다"가 "inline comment split과 exact bare line이 항상 같은 continuation depth를 가진다"를 의미하지는 않는다. exact bare line이 여전히 dedicated same-depth owner/header chain fragment라면 (`WITHIN GROUP`, `DENSE_RANK LAST`, `AFTER MATCH SKIP`, `LEFT OUTER`, `REFERENCE`, `CURSOR` 등) bare carry는 same-depth여야 하고, inline comment split만 body depth를 빌릴 수 있다.
 - split `FOR UPDATE`도 같은 원칙을 따른다. exact bare `FOR`는 same-depth pending header fragment이고, completed `FOR UPDATE`는 query-base+1 body-carry header다. 두 phase를 같은 literal `FOR` rule로 뭉개면 `FOR -- ...` / `UPDATE ...` 와 `FOR UPDATE -- ...` / `SKIP LOCKED`가 서로 다른 semantic state를 잃는다.
@@ -94,12 +98,28 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
 - `WITH` sibling CTE definition header 판정도 예외가 아니다. `cte_name AS (`와 `cte_name (col1, ...) AS (`는 local analyzer heuristic가 아니라 shared structural helper로 분류해야 다음 CTE/main query가 continuation state를 잘못 상속하지 않는다.
 - 특정 구문이 애매하면 "같은 semantic decision을 양쪽에서 재현한다"가 원칙이고, helper를 하나로 합칠지 전용 판별식을 둘지는 구현 전략이다.
+- shared classifier가 반환한 continuation kind를 실제 numeric depth로 바꾸는 단계도 예외가 아니다. `SameDepth` / `OneDeeperThanQueryBase` / `OneDeeperThanCurrentLine` 해석을 analyzer, formatter, operator-RHS carry가 각자 hand-written match arm으로 복제하면 새 family 추가 시 phase drift가 생기므로 공용 resolver를 사용해야 한다.
+- 이 resolver는 최소한 `same-depth anchor`, `current-line anchor`, `query-base anchor`를 구분할 수 있어야 한다. comment split renderer처럼 `SameDepth`는 owner/header line에 snap 해야 하지만 `OneDeeperThanCurrentLine`은 이미 증가된 현재 줄 depth에서 한 단계 더 가야 하는 경로가 있기 때문이다.
+- 여기서 `query-base anchor`는 항상 active query frame의 저장 depth와 동일한 값일 필요는 없다. renderer처럼 local formatting context만 가진 caller는 semantic query base를 나타내는 synthetic anchor를 전달할 수 있어야 하며, resolver는 그 차이를 이름과 계약 수준에서 드러내야 한다.
+- renderer/helper wrapper도 이 세 anchor를 하나의 `base indent`로 뭉개면 안 된다. exact bare owner/header family(`REFERENCE`, `WITHIN GROUP`, deferred-wrapper owner 등)에서 `SameDepth`는 현재 owner/header line depth를 써야 하고, clause family(`WHERE`, `FOR UPDATE` 등)의 `query-base+1`만 semantic query base anchor를 써야 한다.
+- raw previous/last-word 기반 continuation helper는 lexical fallback일 뿐이다. exact bare owner/header/pending classifier가 semantic family를 이미 판정한 line(`AFTER MATCH SKIP -- ...`, `DENSE_RANK LAST -- ...`, `INNER JOIN -- ...` 등)에서는 이 fallback이 depth를 덮어쓰면 안 된다.
 
-### 1.7 comment와 quoted literal은 구조 이벤트가 아니다
+### 1.7 formatter output은 canonical하고 idempotent해야 한다
+
+자동 포맷팅의 목표는 "지금 보이는 공백을 그럴듯하게 손본다"가 아니라 같은 구조 의미를 같은 canonical layout으로 수렴시키는 것이다.
+
+- 같은 structural state를 가진 line은 입력 공백/주석 gap/history와 무관하게 같은 canonical depth로 수렴해야 한다.
+- 한번 canonical form으로 정규화된 결과에 다시 formatter를 적용해도 depth/line break/anchor 선택이 바뀌면 안 된다.
+- 따라서 formatter는 입력의 기존 indent를 "유지할지 말지" 결정하는 도구가 아니라, shared structural semantics를 canonical layout으로 투영하는 renderer여야 한다.
+- idempotence는 별도 미적 요구가 아니라 근본 검증 규칙이다. 새 family를 추가할 때는 "semantic family 판정", "typed pending state 유지", "anchor resolver 적용"뿐 아니라 "두 번 돌려도 같은 결과인지"까지 확인해야 한다.
+- mixed leading-close, owner-relative header chain, comment-glued split owner처럼 phase drift가 잘 생기는 family는 canonical form이 한 번에 고정되어야 한다. 첫 번째 포맷에서 임시 보정하고 두 번째 포맷에서 다시 depth가 바뀌는 구조는 허용하지 않는다.
+
+### 1.8 comment와 quoted literal은 구조 이벤트가 아니다
 
 주석/문자열/quoted identifier 안의 토큰은 depth event를 만들거나 지우면 안 된다.
 
 - trailing inline comment나 inline block comment가 split owner/open/close recognition을 끊으면 안 된다.
+- inline comment를 넣었다고 continuation semantic family가 바뀌면 안 된다. `AND a =` 와 `AND a = /* gap */`, `v_total :=` 와 `v_total := /* gap */`처럼 comment 유무만 다른 line은 같은 shared continuation classifier를 써야 한다.
 - leading block comment가 붙은 code line도 comment-only line으로 취급하면 안 된다. `/* note */ ON ...`, `/* note */ ORDER BY ...`, `/* note */ BEGIN ...` 같은 line은 첫 meaningful structural token부터 다시 분류해야 한다.
 - line head prefix 판정도 예외가 아니다. `CREATE /* gap */ MATERIALIZED /* gap */ VIEW ... AS`, `OPEN c /* gap */ FOR`, `CURSOR c /* gap */ IS`, `WHEN /* gap */ NOT /* gap */ MATCHED THEN`, `MATCH /* gap */ RECOGNIZE` 같은 multi-keyword owner/header는 raw prefix string이나 `contains()`가 아니라 comment-stripped meaningful identifier sequence로 판정해야 한다.
 - control-branch owner/header 판정도 예외가 아니다. exact `ELSE`, exact `EXCEPTION`, `ELSIF ... THEN`, `ELSEIF ... THEN`, `CASE` 같은 PL/SQL branch header는 `ELSE/* gap */`, `EXCEPTION/* gap */`, `ELSIF/* gap */ cond THEN` 형태여도 raw `trim()`/`starts_with()`가 아니라 comment-stripped structural token sequence로 판정해야 한다.
@@ -158,6 +178,7 @@ split owner/header가 현재 줄에서 완성됐더라도, child body/query/open
 
 - completed owner anchor는 완성된 owner line의 `owner depth`를 유지하는 pending state다.
 - exact bare deferred-wrapper owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`)와 completed PL/SQL child-query owner line(`CURSOR ... IS|AS`, `OPEN ... FOR`)도 동일한 completed owner anchor family다.
+- 단, completed owner anchor가 다음 줄에 전달하는 효과는 단일 숫자 하나가 아니다. standalone `(` / leading `)` / header completion fragment처럼 owner line에 정확히 snap 해야 하는 소비와, ordinary child body line처럼 `owner depth + 1`을 floor로만 요구하는 소비를 typed state로 구분해야 한다.
 - child query용 `owner base depth` 또는 `next_query_head_depth`를 추가로 들고 갈 수 있다.
 - 하지만 wrapper line 정렬 기준은 항상 `owner depth`다.
 - comment-only / blank / comma-only line은 anchor를 소비하지 않는다.
@@ -241,7 +262,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - same-depth dedicated pending fragment: exact bare split `FOR` when it is still waiting for `UPDATE`
 - query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
 - current-line+1 merge-header condition: retained merge-header state가 소비하는 `AND`/`OR` condition line, standalone `THEN`, mixed close tail `) THEN`
-- current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, exact bare `... JOIN` header line, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
+- current-line+1 generic header: `SELECT`, `SELECT DISTINCT/UNIQUE/ALL`, `VALUES`, `SET`, `RETURNING`, `OFFSET/FETCH/LIMIT`, plain exact bare `JOIN`, `GROUP BY`, `ORDER BY`, `PARTITION BY`, `START WITH`, `CONNECT BY`
+- query-base+1 exact bare modifier-completed join header: `LEFT/RIGHT/FULL/INNER/CROSS/NATURAL ... JOIN`
 - owner-relative body header family: `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`
 - owner-relative split-header state machine: active multiline owner 안에서는 `WITHIN -> GROUP`, `DENSE_RANK -> FIRST/LAST -> ORDER -> BY`, `AFTER -> MATCH SKIP -> TO NEXT ROW`, `ROWS -> BETWEEN ...`, `RETURN -> UPDATED/ALL -> ROWS`, `RULES -> AUTOMATIC/SEQUENTIAL -> ORDER` 같은 multi-step sequence를 dedicated state로 추적한다. 이 family는 bare-header carry가 있더라도 final canonical depth를 active owner body depth 기준으로 다시 snap 할 수 있다.
 - inline comment split도 위 state machine의 예외가 아니다. exact bare split-body-header가 sequence 중간 단계인지, freeform suffix를 더 받아야 하는지, 이미 operand/body를 여는 complete header인지 판정하는 책임은 generic last-keyword table이 아니라 shared sequence matcher에 있다.
@@ -252,6 +274,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - 단, low-level split-owner lookahead helper는 semantic family 전체와 1:1이 아닐 수 있다. 예를 들어 exact `CROSS/OUTER APPLY` owner line은 same-depth deferred-wrapper owner family에는 속하지만, 구현에서는 completed owner anchor path를 통해 처리하고 split `LATERAL`/`TABLE` lookahead helper에 억지로 넣지 않는다.
 - 이 family는 literal 마지막 token이 아니라 owner family로 분류한다. 따라서 `TABLE`은 generic stable anchor taxonomy에도 등장하지만, exact bare `TABLE` owner line에서는 deferred-wrapper owner family가 우선한다. 같은 이유로 same-line `NOT EXISTS`/`NOT IN`도 generic `NOT` fragment가 아니라 completed owner anchor로 본다.
 - `... APPLY` terminal line은 같은 `JOIN/APPLY` modifier family라도 generic bare header가 아니라 completed deferred-wrapper owner anchor다. 반대로 terminal `APPLY` 전의 fragment (`CROSS`, `OUTER`)는 pending header chain으로 same-depth를 유지한다.
+- `... JOIN` terminal line도 동일하게 semantic family를 나눠야 한다. plain exact bare `JOIN`은 current-line+1 generic header지만, modifier-completed exact bare `LEFT/RIGHT/FULL/INNER/CROSS/NATURAL ... JOIN`은 query-base+1 clause header다. 둘을 단순히 "마지막 token이 JOIN"인 literal rule로 뭉개면 mixed leading-close / comment-gap에서 wrong anchor를 타게 된다.
 - `/* gap */ LATERAL`, `/* gap */ TABLE` 같은 comment-glued exact bare direct from-item owner도 동일한 same-depth deferred-wrapper family다. raw `starts_with("LATERAL"|"TABLE")`로 판정하면 shared structural tail 규칙을 깨고 FROM-item body depth로 잘못 강등된다.
 - inline comment split에서 same-depth exact bare owner/header line을 먼저 고르는 기준도 literal phrase table이 아니라 shared owner/pending classifier다. `RIGHT/FULL/... JOIN TABLE`, `WITHIN GROUP`, `KEEP`처럼 modifier/owner variant를 따로 누락시키면 근본 원칙 1.6을 깨게 된다.
 - `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `MODEL`은 generic bare-header continuation consumer가 아니라 dedicated owner-relative / subclause family로 관리한다.

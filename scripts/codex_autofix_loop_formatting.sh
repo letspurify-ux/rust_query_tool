@@ -50,7 +50,7 @@ COMMIT_PREFIX="${COMMIT_PREFIX:-fix: auto-fix}"
 run_codex_fix() {
   local prompt model reasoning_effort
   local -a cmd_args=()
-  prompt=rompt="자동 포멧팅 기능에서 중첩 가능성 있는 구문인데 스택으로 처리 안되어있어서 indent 문제 가능성 있는 구문 전체 목록 정리해주고 전체 수정 개선해줘. 중첩 가능성 있는 구문인데 중첩문 안에서 사용을 고려하지 않아서 depth가 base depth 기준으로 상대적으로 구하지 못하여 틀어지는 문제 있는 구문 있을지 검토해줘. 지엽적 해결이 아니라 근본적으로 수정해줘. 수정 이후에 cargo test 전체 검증해줘."
+  prompt=rompt="자동 포멧팅 기능에서 1. 자동 포멧팅 depth 증감 규칙이 formatting.md에 정리되어있는데 수정해야할 부분 있을지 검토해줘. 근본 원칙을 세워서 완벽한 자동 포멧팅 기능을 만들려고 해. 맞는 원칙인지도 고민해줘야해. 2. 모든 구문들이 1번 formatting.md 근본 원칙에 따라 depth +- 되어야하는데 원칙에 어긋나게 구현된 부분 찾아서 근본적으로 수정해줘. 3. 수정이후 cargo test 전체 검증 해줘. 4. 수정 내용은 fix.md에 간단히 요약해서 추가해줘."
   if [[ -n "$CODEX_MODEL" ]]; then
     if [[ "$CODEX_MODEL" == *" "* ]]; then
       model="${CODEX_MODEL%% *}"
