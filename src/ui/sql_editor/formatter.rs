@@ -20367,11 +20367,11 @@ FROM dept d;"#;
             "    (",
             "        SELECT e.empno,",
             "            (",
-                "                SELECT 1",
-                "                FROM DUAL",
+            "                SELECT 1",
+            "                FROM DUAL",
             "            ) MULTISET -- bonuses",
             "            (",
-                "                SELECT b.bonus",
+            "                SELECT b.bonus",
             "                FROM bonus b",
             "                WHERE b.empno = e.empno",
             "            ) AS bonus_list",
@@ -30245,6 +30245,49 @@ FROM (
             indent(lines[sku_idx]),
             indent(lines[nested_columns_idx]).saturating_add(4),
             "nested COLUMNS body should stay one level deeper than the nested owner, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_does_not_treat_for_ordinality_as_for_update_clause() {
+        let source = r#"SELECT *
+FROM JSON_TABLE(
+    payload,
+    '$' COLUMNS
+    (
+        ord
+        FOR ORDINALITY,
+        val PATH '$.val'
+    )
+) jt;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let ord_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ord")
+            .unwrap_or(0);
+        let for_ordinality_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FOR ORDINALITY,")
+            .unwrap_or(0);
+        let value_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("val PATH"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[for_ordinality_idx]),
+            indent(lines[ord_idx]),
+            "FOR ORDINALITY should stay aligned with sibling JSON_TABLE COLUMNS items instead of being normalized as FOR UPDATE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[value_idx]),
+            indent(lines[for_ordinality_idx]),
+            "JSON_TABLE column items after FOR ORDINALITY should stay on the same owner-relative body depth, got:\n{}",
             formatted
         );
     }

@@ -150,6 +150,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "END",
     "ERROR",
     "ERRORS",
+    "ESCAPE",
     "EVENTS",
     "EXCEPT",
     "EXCEPTION",
@@ -245,6 +246,9 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "LEVEL",
     "LIBRARY",
     "LIKE",
+    "LIKE2",
+    "LIKE4",
+    "LIKEC",
     "LIMIT",
     "LINK",
     "LIST",
@@ -654,11 +658,28 @@ pub(crate) const FORMAT_LAYOUT_CLAUSE_START_KEYWORDS: &[&str] = &[
 
 pub(crate) const FORMAT_SET_OPERATOR_KEYWORDS: &[&str] = &["UNION", "INTERSECT", "MINUS", "EXCEPT"];
 
-/// Leading keywords that keep the following line on the same continuation
-/// depth when a comment splits the expression or clause body.
-pub(crate) const FORMAT_COMMENT_CONTINUATION_KEYWORDS: &[&str] = &[
-    "AND", "OR", "IN", "IS", "LIKE", "BETWEEN", "NOT", "EXISTS", "USING", "INTO", "ON", "JOIN",
+/// Leading expression/condition keywords that keep the following line on the
+/// same continuation depth when a comment splits the RHS body.
+pub(crate) const FORMAT_EXPRESSION_CONTINUATION_KEYWORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "IN",
+    "IS",
+    "LIKE",
+    "LIKE2",
+    "LIKE4",
+    "LIKEC",
+    "BETWEEN",
+    "NOT",
+    "EXISTS",
+    "MEMBER",
+    "SUBMULTISET",
+    "ESCAPE",
 ];
+
+/// Prefix keywords whose trailing `OF` still belongs to the same RHS
+/// continuation family (`IS OF`, `MEMBER OF`, `SUBMULTISET OF`).
+const FORMAT_EXPRESSION_CONTINUATION_OF_PREFIX_KEYWORDS: &[&str] = &["IS", "MEMBER", "SUBMULTISET"];
 
 /// Clause/subclause headers that should keep the next line at the same depth
 /// after an inline comment split.
@@ -2330,35 +2351,15 @@ pub(crate) fn is_format_join_condition_clause(text_upper: &str) -> bool {
 }
 
 pub(crate) fn starts_with_format_for_update_split_header(text_upper: &str) -> bool {
-    let words = leading_identifier_words(text_upper, 8);
-    words
-        .first()
-        .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
-        && !words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("LOOP"))
-        && !words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("IN"))
-        && !words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("UPDATE"))
+    line_has_exact_identifier_sequence(owner_header_structural_tail(text_upper), &["FOR"])
 }
 
 pub(crate) fn starts_with_format_for_update_clause(text_upper: &str) -> bool {
-    starts_with_format_for_update_split_header(text_upper) || {
-        let words = leading_identifier_words(text_upper, 8);
-        words
-            .first()
-            .is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
-            && words
-                .iter()
-                .skip(1)
-                .any(|word| word.eq_ignore_ascii_case("UPDATE"))
-    }
+    starts_with_format_for_update_split_header(text_upper)
+        || line_starts_with_identifier_sequence(
+            owner_header_structural_tail(text_upper),
+            &["FOR", "UPDATE"],
+        )
 }
 
 pub(crate) fn starts_with_format_merge_branch_header(text_upper: &str) -> bool {
@@ -4498,12 +4499,8 @@ pub(crate) fn line_continues_expression_after_leading_close(line: &str) -> bool 
             let remainder = trimmed.get(first_token.len()..).unwrap_or("");
             first_meaningful_word(remainder).is_some()
         }
-        "+" | "-" | "*" | "/" | "%" | "^" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "||"
-        | "|" => true,
-        _ => matches!(
-            first_token.to_ascii_uppercase().as_str(),
-            "AND" | "OR" | "IS" | "IN" | "LIKE" | "BETWEEN" | "NOT"
-        ),
+        symbol if is_format_expression_continuation_symbol(symbol) => true,
+        _ => starts_with_format_expression_continuation_sequence(trimmed),
     }
 }
 
@@ -4537,8 +4534,7 @@ pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
 /// Returns true when a leading keyword should preserve the next line as a
 /// continuation after a comment split.
 pub(crate) fn is_format_comment_continuation_keyword(word: &str) -> bool {
-    matches_keyword(word, FORMAT_LAYOUT_CLAUSE_START_KEYWORDS)
-        || matches_keyword(word, FORMAT_COMMENT_CONTINUATION_KEYWORDS)
+    is_format_comment_header_keyword(word) || is_format_expression_continuation_keyword(word)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4773,19 +4769,71 @@ fn trailing_meaningful_tokens_before_inline_comment(
     (previous, last)
 }
 
+fn is_format_expression_continuation_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_EXPRESSION_CONTINUATION_KEYWORDS)
+}
+
+fn is_format_comment_header_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_LAYOUT_CLAUSE_START_KEYWORDS)
+        || matches_keyword(word, FORMAT_INLINE_COMMENT_HEADER_SAME_DEPTH_KEYWORDS)
+        || matches_keyword(word, FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS)
+        || matches_keyword(word, FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS)
+        || matches_keyword(word, FORMAT_CONDITION_KEYWORDS)
+        || matches_keyword(word, FORMAT_JOIN_MODIFIER_KEYWORDS)
+}
+
+fn is_format_expression_continuation_of_prefix_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_EXPRESSION_CONTINUATION_OF_PREFIX_KEYWORDS)
+}
+
+fn starts_with_format_expression_continuation_sequence(text: &str) -> bool {
+    line_starts_with_identifier_sequence(text, &["IS", "OF"])
+        || line_starts_with_identifier_sequence(text, &["MEMBER", "OF"])
+        || line_starts_with_identifier_sequence(text, &["SUBMULTISET", "OF"])
+        || FORMAT_EXPRESSION_CONTINUATION_KEYWORDS
+            .iter()
+            .any(|keyword| line_starts_with_identifier_sequence(text, &[*keyword]))
+}
+
+fn is_format_expression_continuation_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        ":=" | "=>"
+            | "="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "<>"
+            | "!="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "||"
+            | "|"
+            | "^"
+    )
+}
+
 pub(crate) fn format_trailing_continuation_operator_kind_from_token_pair(
     previous: Option<FormatTrailingMeaningfulToken<'_>>,
     last: FormatTrailingMeaningfulToken<'_>,
 ) -> Option<FormatTrailingContinuationOperatorKind> {
     match last {
-        FormatTrailingMeaningfulToken::Word(word) => matches!(
-            word.to_ascii_uppercase().as_str(),
-            "AND" | "OR" | "IN" | "IS" | "LIKE" | "BETWEEN" | "NOT" | "EXISTS"
-        )
-        .then_some(FormatTrailingContinuationOperatorKind::Keyword),
+        FormatTrailingMeaningfulToken::Word(word) => {
+            let word_upper = word.to_ascii_uppercase();
+            (is_format_expression_continuation_keyword(word_upper.as_str())
+                || (word_upper == "OF"
+                    && matches!(
+                        previous,
+                        Some(FormatTrailingMeaningfulToken::Word(previous_word))
+                            if is_format_expression_continuation_of_prefix_keyword(previous_word)
+                    )))
+            .then_some(FormatTrailingContinuationOperatorKind::Keyword)
+        }
         FormatTrailingMeaningfulToken::Symbol(symbol) => match symbol {
-            ":=" | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "+" | "-" | "||" | "%" | "^"
-            | "|" | "=>" => Some(FormatTrailingContinuationOperatorKind::Symbol),
             "*" => (!matches!(
                 previous,
                 Some(FormatTrailingMeaningfulToken::Word(word))
@@ -4795,7 +4843,8 @@ pub(crate) fn format_trailing_continuation_operator_kind_from_token_pair(
             "/" => previous
                 .is_some()
                 .then_some(FormatTrailingContinuationOperatorKind::Symbol),
-            _ => None,
+            _ => is_format_expression_continuation_symbol(symbol)
+                .then_some(FormatTrailingContinuationOperatorKind::Symbol),
         },
         FormatTrailingMeaningfulToken::Other => None,
     }
@@ -5053,9 +5102,9 @@ fn format_bare_structural_header_continuation_kind_for_structural_tail(
 pub(crate) fn format_bare_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    format_bare_structural_header_continuation_kind_for_structural_tail(auto_format_structural_tail(
-        line,
-    ))
+    format_bare_structural_header_continuation_kind_for_structural_tail(
+        auto_format_structural_tail(line),
+    )
 }
 
 fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed: &str) -> bool {
@@ -5087,9 +5136,9 @@ pub(crate) fn format_inline_comment_structural_header_continuation_kind(
     let trimmed = auto_format_structural_tail(line);
 
     if line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed) {
-        if let Some(kind) = format_bare_structural_header_continuation_kind_for_structural_tail(
-            trimmed,
-        ) {
+        if let Some(kind) =
+            format_bare_structural_header_continuation_kind_for_structural_tail(trimmed)
+        {
             return Some(kind);
         }
     }
@@ -5208,7 +5257,7 @@ mod tests {
         assert!(FORMAT_CONDITION_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
-        assert!(FORMAT_COMMENT_CONTINUATION_KEYWORDS
+        assert!(FORMAT_EXPRESSION_CONTINUATION_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
         assert!(FORMAT_BLOCK_START_KEYWORDS
@@ -5264,6 +5313,10 @@ mod tests {
             "FOR/* gap */UPDATE SKIP LOCKED"
         ));
         assert!(starts_with_format_for_update_split_header("FOR/* gap */"));
+        assert!(!starts_with_format_for_update_clause("FOR ORDINALITY"));
+        assert!(!starts_with_format_for_update_split_header(
+            "FOR /* ord */ ORDINALITY"
+        ));
         assert!(starts_with_format_merge_branch_header(
             "WHEN/* gap */NOT/* gap */MATCHED/* gap */THEN"
         ));
@@ -5392,6 +5445,25 @@ mod tests {
             ") /* gap */ IS NULL"
         ));
         assert!(line_continues_expression_after_leading_close("), 0"));
+        assert!(line_continues_expression_after_leading_close(
+            ") MEMBER OF deptno_nt"
+        ));
+        assert!(line_continues_expression_after_leading_close(
+            ") SUBMULTISET OF num_nt"
+        ));
+        assert!(line_continues_expression_after_leading_close(
+            ") LIKEC 'A%'"
+        ));
+        assert!(line_continues_expression_after_leading_close(
+            ") LIKE2 'A%'"
+        ));
+        assert!(line_continues_expression_after_leading_close(
+            ") LIKE4 'A%'"
+        ));
+        assert!(line_continues_expression_after_leading_close(") := 1"));
+        assert!(line_continues_expression_after_leading_close(
+            ") => p_value"
+        ));
 
         assert!(!line_continues_expression_after_leading_close(")"));
         assert!(!line_continues_expression_after_leading_close("),"));
@@ -5403,6 +5475,13 @@ mod tests {
     #[test]
     fn line_has_mixed_leading_close_continuation_covers_clause_and_query_head_reclassification() {
         assert!(line_has_mixed_leading_close_continuation(") AND EXISTS ("));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") MEMBER OF deptno_nt"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") SUBMULTISET OF num_nt"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(") LIKE4 'A%'"));
         assert!(line_has_mixed_leading_close_continuation(
             ") ORDER BY empno"
         ));
@@ -5421,12 +5500,23 @@ mod tests {
 
     #[test]
     fn format_comment_continuation_keywords_cover_clause_and_condition_heads() {
+        assert!(is_format_comment_continuation_keyword("SELECT"));
+        assert!(is_format_comment_continuation_keyword("SET"));
         assert!(is_format_comment_continuation_keyword("WINDOW"));
         assert!(is_format_comment_continuation_keyword("QUALIFY"));
         assert!(is_format_comment_continuation_keyword("FETCH"));
         assert!(is_format_comment_continuation_keyword("LIMIT"));
+        assert!(is_format_comment_continuation_keyword("ON"));
+        assert!(is_format_comment_continuation_keyword("USING"));
+        assert!(is_format_comment_continuation_keyword("LEFT"));
         assert!(is_format_comment_continuation_keyword("AND"));
         assert!(is_format_comment_continuation_keyword("JOIN"));
+        assert!(is_format_comment_continuation_keyword("MEMBER"));
+        assert!(is_format_comment_continuation_keyword("SUBMULTISET"));
+        assert!(is_format_comment_continuation_keyword("LIKEC"));
+        assert!(is_format_comment_continuation_keyword("LIKE2"));
+        assert!(is_format_comment_continuation_keyword("LIKE4"));
+        assert!(is_format_comment_continuation_keyword("ESCAPE"));
         assert!(!is_format_comment_continuation_keyword("DUAL"));
     }
 
@@ -5442,8 +5532,36 @@ mod tests {
             "WHERE e.sal BETWEEN"
         ));
         assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.member_col MEMBER"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.num_nt SUBMULTISET"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.ename LIKEC"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.ename LIKE2"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.ename LIKE4"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.ename LIKE 'A%' ESCAPE"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.payload IS OF"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.member_col MEMBER OF"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
+            "WHERE e.num_nt SUBMULTISET OF"
+        ));
+        assert!(line_has_trailing_format_continuation_operator(
             "WHERE e.empno ="
         ));
+        assert!(line_has_trailing_format_continuation_operator("v_total :="));
         assert!(line_has_trailing_format_continuation_operator(
             "pkg_lock.request =>"
         ));
@@ -5483,6 +5601,41 @@ mod tests {
                 FormatTrailingMeaningfulToken::Symbol("/"),
             ),
             None
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                Some(FormatTrailingMeaningfulToken::Word("IS")),
+                FormatTrailingMeaningfulToken::Word("OF"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Keyword)
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                Some(FormatTrailingMeaningfulToken::Word("MEMBER")),
+                FormatTrailingMeaningfulToken::Word("OF"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Keyword)
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                Some(FormatTrailingMeaningfulToken::Word("SUBMULTISET")),
+                FormatTrailingMeaningfulToken::Word("OF"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Keyword)
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                None,
+                FormatTrailingMeaningfulToken::Word("LIKE4"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Keyword)
+        );
+        assert_eq!(
+            format_trailing_continuation_operator_kind_from_token_pair(
+                None,
+                FormatTrailingMeaningfulToken::Word("ESCAPE"),
+            ),
+            Some(FormatTrailingContinuationOperatorKind::Keyword)
         );
     }
 
@@ -6041,10 +6194,7 @@ mod tests {
             auto_format_structural_tail(") AFTER MATCH SKIP TO NEXT"),
             "AFTER MATCH SKIP TO NEXT"
         );
-        assert_eq!(
-            auto_format_structural_tail(") ONE ROW PER"),
-            "ONE ROW PER"
-        );
+        assert_eq!(auto_format_structural_tail(") ONE ROW PER"), "ONE ROW PER");
         assert_eq!(
             auto_format_structural_tail(") ALL ROWS PER"),
             "ALL ROWS PER"
@@ -6084,10 +6234,7 @@ mod tests {
             auto_format_structural_tail(") RETURN ALL ROWS"),
             "RETURN ALL ROWS"
         );
-        assert_eq!(
-            auto_format_structural_tail(") UPSERT ALL"),
-            "UPSERT ALL"
-        );
+        assert_eq!(auto_format_structural_tail(") UPSERT ALL"), "UPSERT ALL");
         assert_eq!(
             auto_format_structural_tail(") UNIQUE SINGLE REFERENCE"),
             "UNIQUE SINGLE REFERENCE"
@@ -6245,7 +6392,9 @@ mod tests {
         assert!(line_has_mixed_leading_close_continuation(") CURSOR"));
         assert!(!line_has_mixed_leading_close_continuation("MULTISET"));
         assert!(!line_has_mixed_leading_close_continuation("CURSOR"));
-        assert!(!line_has_mixed_leading_close_continuation("DENSE_RANK LAST"));
+        assert!(!line_has_mixed_leading_close_continuation(
+            "DENSE_RANK LAST"
+        ));
         assert!(!line_has_mixed_leading_close_continuation("FOR"));
     }
 

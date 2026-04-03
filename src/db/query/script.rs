@@ -15000,6 +15000,45 @@ FROM JSON_TABLE(
     }
 
     #[test]
+    fn auto_format_line_contexts_do_not_treat_for_ordinality_as_for_update_clause() {
+        let sql = r#"SELECT jt.ord,
+    jt.val
+FROM JSON_TABLE(
+    payload,
+    '$' COLUMNS
+    (
+        ord
+        FOR ORDINALITY,
+        val PATH '$.val'
+    )
+) jt;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let ord_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ord")
+            .unwrap_or(0);
+        let for_ordinality_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FOR ORDINALITY,")
+            .unwrap_or(0);
+        let value_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("val PATH"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[for_ordinality_idx].auto_depth, contexts[ord_idx].auto_depth,
+            "FOR ORDINALITY should stay aligned with sibling JSON_TABLE COLUMNS items instead of being reclassified as FOR UPDATE"
+        );
+        assert_eq!(
+            contexts[value_idx].auto_depth, contexts[for_ordinality_idx].auto_depth,
+            "following JSON_TABLE column item should stay on the same COLUMNS body depth after FOR ORDINALITY"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_nested_path_columns_header_chain_on_owner_stack() {
         let sql = r#"SELECT jt.order_id,
     jt.sku

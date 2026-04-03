@@ -86,6 +86,9 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 특히 exact bare owner-relative split-body-header fragment(`DENSE_RANK`, `DENSE_RANK FIRST`, `AFTER MATCH`, `AFTER MATCH SKIP TO`, `UNIQUE SINGLE REFERENCE` 등)는 trailing 마지막 keyword만 보고 generic body-depth로 분류하면 안 된다. 이런 line은 shared owner-relative sequence matcher가 "아직 같은 header chain 안인지 / 이미 body operand를 여는 complete header인지"를 먼저 판정해야 한다.
 - 다만 "같은 prefix taxonomy를 쓴다"가 "inline comment split과 exact bare line이 항상 같은 continuation depth를 가진다"를 의미하지는 않는다. exact bare line이 여전히 dedicated same-depth owner/header chain fragment라면 (`WITHIN GROUP`, `DENSE_RANK LAST`, `AFTER MATCH SKIP`, `LEFT OUTER`, `REFERENCE`, `CURSOR` 등) bare carry는 same-depth여야 하고, inline comment split만 body depth를 빌릴 수 있다.
 - split `FOR UPDATE`도 같은 원칙을 따른다. exact bare `FOR`는 same-depth pending header fragment이고, completed `FOR UPDATE`는 query-base+1 body-carry header다. 두 phase를 같은 literal `FOR` rule로 뭉개면 `FOR -- ...` / `UPDATE ...` 와 `FOR UPDATE -- ...` / `SKIP LOCKED`가 서로 다른 semantic state를 잃는다.
+- overloaded keyword prefix도 exact structural sequence로 끊어야 한다. dedicated family가 `FOR UPDATE`라면 exact structural token sequence `FOR UPDATE`와 exact bare split `FOR`만 그 family다. `FOR ORDINALITY`, `FOR rec IN`, table-function/item syntax처럼 같은 `FOR` prefix를 쓰는 다른 구문은 dedicated `FOR UPDATE` rule에 들어가면 안 된다.
+- condition/operator RHS continuation taxonomy도 shared semantic family여야 한다. trailing RHS operator, mixed leading-close expression continuation, trailing inline-comment continuation은 서로 다른 ad-hoc keyword table을 가지면 안 되며, `MEMBER OF`, `SUBMULTISET OF`, `LIKEC/LIKE2/LIKE4`, `ESCAPE`, `:=`, `=>` 같은 family를 한 phase만 알게 두면 안 된다.
+- trailing inline-comment continuation은 "operator RHS family" 하나로 축약하면 안 된다. structural header carry가 필요한 family(`JOIN`, `ON`, `USING`, `WINDOW`, `SELECT`, `SET` 등)는 shared bare/header taxonomy에서 파생된 header family로, `AND`, `LIKE4`, `MEMBER OF`, `:=` 같은 RHS family는 shared operator taxonomy로 판정해야 한다.
 - exact bare line이 "다음 code line에서 wrapper/query head를 받을 completed owner anchor"인 경우도 예외가 아니다. `EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`처럼 standalone `(` 또는 child query가 뒤로 밀린 owner line은 generic `FROM`/`WHERE` body header처럼 다시 +1 하지 말고 same-depth owner family로 유지해야 한다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
 - `WITH` sibling CTE definition header 판정도 예외가 아니다. `cte_name AS (`와 `cte_name (col1, ...) AS (`는 local analyzer heuristic가 아니라 shared structural helper로 분류해야 다음 CTE/main query가 continuation state를 잘못 상속하지 않는다.
@@ -220,6 +223,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - mixed leading-close line은 raw line이 아니라 close를 소비한 structural tail로 위 taxonomy에 대입한다.
 - `FOR UPDATE`처럼 다른 keyword와 충돌 가능한 구문은 현재 policy상 dedicated handling을 둔다. exact bare split `FOR` fragment도 같은 dedicated family에서 해석해야 한다.
+- 이때 dedicated `FOR UPDATE` family는 exact structural token sequence `FOR UPDATE`일 때만 성립한다. `FOR ORDINALITY` 같은 다른 `FOR ...` family를 prefix match로 섞으면 안 된다.
 - split `MERGE` branch header는 generic condition continuation이 아니라 dedicated pending merge-branch-header state로 처리한다.
 - incomplete split `MERGE` fragment(`WHEN`, `WHEN NOT`)도 shared structural boundary helper가 먼저 끊어줘야 한다. 그래야 generic continuation carry와 dedicated merge-header state가 충돌하지 않는다.
 - active `WITH` frame 안의 sibling CTE definition header(`cte_name AS (` 뿐 아니라 `cte_name (col1, ...) AS (` 형태 포함)는 generic list/item continuation이 아니라 `WITH` owner depth의 stable base line이다. column list identifier 때문에 trailing `AS`를 놓치면 다음 CTE/main query가 잘못 continuation depth를 상속한다.
@@ -256,13 +260,17 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 ### 3.4 current operator RHS continuation policy
 
-현재 trailing operator set:
+현재 trailing operator / continuation set:
 
-- `:=`, `=>`, `=`, `<`, `>`, `<=`, `>=`, `<>`, `!=`, `+`, `-`, `*`, `/`, `%`, `||`, `|`, `^`, `AND`, `OR`, `IN`, `IS`, `LIKE`, `BETWEEN`, `NOT`, `EXISTS`
+- symbols: `:=`, `=>`, `=`, `<`, `>`, `<=`, `>=`, `<>`, `!=`, `+`, `-`, `*`, `/`, `%`, `||`, `|`, `^`
+- single-keyword family: `AND`, `OR`, `IN`, `IS`, `LIKE`, `LIKEC`, `LIKE2`, `LIKE4`, `BETWEEN`, `NOT`, `EXISTS`, `MEMBER`, `SUBMULTISET`, `ESCAPE`
+- paired keyword family: `IS OF`, `MEMBER OF`, `SUBMULTISET OF`
+- trailing inline-comment continuation consumer는 별도 ad-hoc keyword list가 아니라 `structural header family ∪ operator RHS family`다. 즉 `JOIN`/`ON`/`USING`/`WINDOW`/`SELECT`/`SET` 같은 header carry와 `AND`/`LIKE4`/`MEMBER OF`/`:=` 같은 RHS carry를 같은 shared taxonomy 위에서 본다.
 
 주의:
 
 - `SELECT *`의 `*`는 projection marker이므로 operator RHS continuation으로 보면 안 된다.
+- `MEMBER`/`SUBMULTISET`는 exact same-depth deferred-wrapper owner family가 아니라 generic operator RHS continuation family다. child query owner family(`IN`, `EXISTS`, `ANY/SOME/ALL`)와 같은 table에 뭉개면 안 된다.
 - `MULTISET` 같은 generic expression owner는 현재 policy상 boundary helper 기본 집합에 넣지 않는다.
 
 ### 3.5 current render policy
