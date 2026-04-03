@@ -4514,16 +4514,23 @@ pub(crate) fn line_continues_expression_after_leading_close(line: &str) -> bool 
 /// clause/query-header transitions such as `) ORDER BY ...` or
 /// `) UPDATE demo ...`.
 pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
-    if line_continues_expression_after_leading_close(line) {
+    let trimmed_line = trim_leading_sql_comments(line);
+    if !line_has_leading_significant_close_paren(trimmed_line) {
+        return false;
+    }
+
+    if line_continues_expression_after_leading_close(trimmed_line) {
         return true;
     }
 
-    let trimmed = trim_after_leading_close_parens(line);
+    let trimmed = trim_after_leading_close_parens(trimmed_line);
     let Some(first_token) = first_meaningful_word(trimmed) else {
         return false;
     };
 
     starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(trimmed)
+        || starts_with_auto_format_owner_boundary(trimmed)
+        || format_bare_structural_header_continuation_kind_for_structural_tail(trimmed).is_some()
         || is_format_comment_continuation_keyword(first_token)
 }
 
@@ -4948,12 +4955,21 @@ fn line_is_exact_bare_structural_keyword_line(trimmed: &str) -> bool {
 /// header chains such as `WINDOW ... AS`, `PIVOT XML`, `RULES AUTOMATIC`, and
 /// `MATCH_RECOGNIZE` subclauses are stopped there instead of being treated as
 /// generic continuation consumers.
-pub(crate) fn format_structural_header_continuation_kind(
-    line: &str,
+fn line_is_exact_bare_split_for_update_header(line: &str) -> bool {
+    let trimmed_upper = line.to_ascii_uppercase();
+    line_is_exact_bare_structural_keyword_line(line)
+        && starts_with_format_for_update_split_header(&trimmed_upper)
+}
+
+fn format_structural_header_continuation_kind_for_structural_tail(
+    trimmed: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let trimmed = auto_format_structural_tail(line);
     if trimmed.is_empty() {
         return None;
+    }
+
+    if line_is_exact_bare_split_for_update_header(trimmed) {
+        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
     }
 
     if line_has_exact_identifier_sequence(trimmed, &["SELECT"])
@@ -4977,10 +4993,17 @@ pub(crate) fn format_structural_header_continuation_kind(
     format_leading_header_continuation_kind(trimmed)
 }
 
-pub(crate) fn format_bare_structural_header_continuation_kind(
+pub(crate) fn format_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let trimmed = auto_format_structural_tail(line);
+    format_structural_header_continuation_kind_for_structural_tail(auto_format_structural_tail(
+        line,
+    ))
+}
+
+fn format_bare_structural_header_continuation_kind_for_structural_tail(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
     for owner_kind in [
         FormatIndentedParenOwnerKind::AnalyticOver,
         FormatIndentedParenOwnerKind::WithinGroup,
@@ -4995,6 +5018,10 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
         if let Some(kind) = owner_kind.exact_bare_split_body_header_continuation_kind(trimmed) {
             return Some(kind);
         }
+    }
+
+    if line_is_exact_bare_split_for_update_header(trimmed) {
+        return Some(FormatInlineCommentHeaderContinuationKind::SameDepth);
     }
 
     if !line_is_exact_bare_structural_keyword_line(trimmed) {
@@ -5023,8 +5050,15 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
     format_leading_header_continuation_kind(trimmed)
 }
 
-fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
-    let trimmed = auto_format_structural_tail(line);
+pub(crate) fn format_bare_structural_header_continuation_kind(
+    line: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
+    format_bare_structural_header_continuation_kind_for_structural_tail(auto_format_structural_tail(
+        line,
+    ))
+}
+
+fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed: &str) -> bool {
     if !line_is_exact_bare_structural_keyword_line(trimmed) {
         return false;
     }
@@ -5040,16 +5074,26 @@ fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
         || line_is_format_same_depth_deferred_wrapper_owner(trimmed)
 }
 
+#[cfg(test)]
+fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
+    line_is_exact_bare_owner_or_pending_header_for_structural_tail(auto_format_structural_tail(
+        line,
+    ))
+}
+
 pub(crate) fn format_inline_comment_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    if line_is_exact_bare_owner_or_pending_header(line) {
-        if let Some(kind) = format_bare_structural_header_continuation_kind(line) {
+    let trimmed = auto_format_structural_tail(line);
+
+    if line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed) {
+        if let Some(kind) = format_bare_structural_header_continuation_kind_for_structural_tail(
+            trimmed,
+        ) {
             return Some(kind);
         }
     }
 
-    let trimmed = auto_format_structural_tail(line);
     if line_is_exact_bare_structural_keyword_line(trimmed) {
         for owner_kind in [
             FormatIndentedParenOwnerKind::AnalyticOver,
@@ -5070,8 +5114,8 @@ pub(crate) fn format_inline_comment_structural_header_continuation_kind(
         }
     }
 
-    format_structural_header_continuation_kind(line)
-        .or_else(|| format_bare_structural_header_continuation_kind(line))
+    format_structural_header_continuation_kind_for_structural_tail(trimmed)
+        .or_else(|| format_bare_structural_header_continuation_kind_for_structural_tail(trimmed))
 }
 
 /// Returns true when a token starts a flashback/temporal boundary expression.
@@ -5960,6 +6004,94 @@ mod tests {
             auto_format_structural_tail("/*c*/ ) FOR UPDATE"),
             "FOR UPDATE"
         );
+        assert_eq!(auto_format_structural_tail(") MULTISET"), "MULTISET");
+        assert_eq!(auto_format_structural_tail(") CURSOR"), "CURSOR");
+        assert_eq!(
+            auto_format_structural_tail(") WITHIN GROUP"),
+            "WITHIN GROUP"
+        );
+        assert_eq!(auto_format_structural_tail(") KEEP"), "KEEP");
+        assert_eq!(auto_format_structural_tail(") DENSE_RANK"), "DENSE_RANK");
+        assert_eq!(
+            auto_format_structural_tail(") DENSE_RANK FIRST"),
+            "DENSE_RANK FIRST"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") DENSE_RANK LAST"),
+            "DENSE_RANK LAST"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") DENSE_RANK FIRST ORDER"),
+            "DENSE_RANK FIRST ORDER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") DENSE_RANK LAST ORDER BY"),
+            "DENSE_RANK LAST ORDER BY"
+        );
+        assert_eq!(auto_format_structural_tail(") AFTER MATCH"), "AFTER MATCH");
+        assert_eq!(
+            auto_format_structural_tail(") AFTER MATCH SKIP"),
+            "AFTER MATCH SKIP"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") AFTER MATCH SKIP TO"),
+            "AFTER MATCH SKIP TO"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") AFTER MATCH SKIP TO NEXT"),
+            "AFTER MATCH SKIP TO NEXT"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") ONE ROW PER"),
+            "ONE ROW PER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") ALL ROWS PER"),
+            "ALL ROWS PER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") AFTER MATCH SKIP TO NEXT ROW"),
+            "AFTER MATCH SKIP TO NEXT ROW"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") WITH UNMATCHED"),
+            "WITH UNMATCHED"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") WITHOUT UNMATCHED"),
+            "WITHOUT UNMATCHED"
+        );
+        assert_eq!(auto_format_structural_tail(") SHOW EMPTY"), "SHOW EMPTY");
+        assert_eq!(auto_format_structural_tail(") OMIT EMPTY"), "OMIT EMPTY");
+        assert_eq!(auto_format_structural_tail(") RETURN ALL"), "RETURN ALL");
+        assert_eq!(
+            auto_format_structural_tail(") RETURN UPDATED"),
+            "RETURN UPDATED"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") AUTOMATIC ORDER"),
+            "AUTOMATIC ORDER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") SEQUENTIAL ORDER"),
+            "SEQUENTIAL ORDER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") ALL ROWS PER MATCH"),
+            "ALL ROWS PER MATCH"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") RETURN ALL ROWS"),
+            "RETURN ALL ROWS"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") UPSERT ALL"),
+            "UPSERT ALL"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") UNIQUE SINGLE REFERENCE"),
+            "UNIQUE SINGLE REFERENCE"
+        );
         assert_eq!(
             format_bare_structural_header_continuation_kind(") ORDER BY"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
@@ -5969,8 +6101,132 @@ mod tests {
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
+            format_bare_structural_header_continuation_kind(") MULTISET"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") CURSOR"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") WITHIN GROUP"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") KEEP"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") DENSE_RANK"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") DENSE_RANK FIRST"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") DENSE_RANK LAST"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") DENSE_RANK FIRST ORDER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") DENSE_RANK LAST ORDER BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AFTER MATCH"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AFTER MATCH SKIP"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AFTER MATCH SKIP TO"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AFTER MATCH SKIP TO NEXT"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") ONE ROW PER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") ALL ROWS PER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AFTER MATCH SKIP TO NEXT ROW"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") WITH UNMATCHED"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") WITHOUT UNMATCHED"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") SHOW EMPTY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") OMIT EMPTY"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") RETURN ALL"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") RETURN UPDATED"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") AUTOMATIC ORDER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") SEQUENTIAL ORDER"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") ALL ROWS PER MATCH"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") RETURN ALL ROWS"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") UPSERT ALL"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") UNIQUE SINGLE REFERENCE"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
             format_structural_header_continuation_kind(") FOR UPDATE -- lock"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind(") FOR"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind("FOR -- lock"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_inline_comment_structural_header_continuation_kind(") FOR -- lock"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
         );
         assert!(
             starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
@@ -5985,6 +6241,12 @@ mod tests {
         assert!(starts_with_auto_format_structural_continuation_boundary(
             ") FOR UPDATE"
         ));
+        assert!(line_has_mixed_leading_close_continuation(") MULTISET"));
+        assert!(line_has_mixed_leading_close_continuation(") CURSOR"));
+        assert!(!line_has_mixed_leading_close_continuation("MULTISET"));
+        assert!(!line_has_mixed_leading_close_continuation("CURSOR"));
+        assert!(!line_has_mixed_leading_close_continuation("DENSE_RANK LAST"));
+        assert!(!line_has_mixed_leading_close_continuation("FOR"));
     }
 
     #[test]
@@ -6057,6 +6319,14 @@ mod tests {
         assert_eq!(
             format_bare_structural_header_continuation_kind("GROUP BY /* keep carrying"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("FOR"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("FOR /* keep carrying"),
+            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("SELECT DISTINCT empno"),

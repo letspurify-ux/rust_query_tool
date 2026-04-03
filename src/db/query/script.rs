@@ -2095,6 +2095,20 @@ impl QueryExecutor {
                 }
             }
 
+            if line_has_leading_close_paren && leading_close_has_mixed_continuation {
+                if let Some(close_align_depth) = closing_query_close_align_depth {
+                    if sql_text::format_bare_structural_header_continuation_kind(
+                        clause_detection_trimmed,
+                    )
+                    .is_some()
+                        || current_line_is_generic_split_query_owner
+                        || current_line_is_direct_split_from_item_query_owner
+                    {
+                        context.auto_depth = close_align_depth;
+                    }
+                }
+            }
+
             if let Some(frame) = pending_split_query_owner_for_line {
                 // A standalone `(` after a split owner such as `WHERE EXISTS`
                 // or `FROM` remains part of that owner context, not the child
@@ -15766,6 +15780,104 @@ FROM dept d;"#;
             contexts[deepest_select_idx].auto_depth,
             contexts[multiset_idx].auto_depth.saturating_add(1),
             "SELECT under split MULTISET should stay exactly one level deeper than the MULTISET owner"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_mixed_close_generic_expression_query_owners_relative_to_each_owner(
+    ) {
+        let sql = r#"SELECT
+    d.deptno,
+    (
+        SELECT 1
+        FROM dual
+    ) CURSOR -- employees
+    (
+        SELECT
+            e.empno,
+            (
+                SELECT 1
+                FROM dual
+            ) MULTISET -- bonuses
+            (
+                SELECT
+                    b.bonus
+                FROM bonus b
+                WHERE b.empno = e.empno
+            ) AS bonus_list
+        FROM emp e
+        WHERE e.deptno = d.deptno
+    ) AS emp_cur
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let cursor_idx = find_line(") CURSOR -- employees");
+        let outer_item_idx = find_line("d.deptno,");
+        let cursor_open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let multiset_idx = find_line(") MULTISET -- bonuses");
+        let multiset_open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(multiset_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let deepest_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(multiset_open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let multiset_parent_idx = find_line("e.empno,");
+
+        assert_eq!(
+            contexts[cursor_idx].auto_depth,
+            contexts[outer_item_idx].auto_depth,
+            "mixed leading-close CURSOR owner should realign with the surrounding SELECT-item depth"
+        );
+        assert_eq!(
+            contexts[cursor_open_idx].auto_depth, contexts[cursor_idx].auto_depth,
+            "mixed leading-close CURSOR opener should stay aligned with the CURSOR owner depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[cursor_idx].auto_depth.saturating_add(1),
+            "SELECT under mixed leading-close CURSOR should stay exactly one level deeper than the CURSOR owner"
+        );
+        assert_eq!(
+            contexts[multiset_open_idx].auto_depth, contexts[multiset_idx].auto_depth,
+            "mixed leading-close MULTISET opener should stay aligned with the MULTISET owner depth"
+        );
+        assert_eq!(
+            contexts[multiset_idx].auto_depth,
+            contexts[multiset_parent_idx].auto_depth,
+            "mixed leading-close MULTISET owner should stay aligned with the sibling SELECT-item depth"
+        );
+        assert_eq!(
+            contexts[deepest_select_idx].auto_depth,
+            contexts[multiset_idx].auto_depth.saturating_add(1),
+            "SELECT under mixed leading-close MULTISET should stay exactly one level deeper than the MULTISET owner"
         );
     }
 

@@ -7210,6 +7210,15 @@ impl SqlEditorWidget {
                     &join_on_condition_and_depth,
                     active_general_paren_is_split_condition_group,
                 )
+            } else if starts_with_close_paren && leading_close_has_mixed_continuation {
+                // Mixed leading-close lines already have a canonical
+                // structural depth from the analyzer after the close event is
+                // consumed and the surviving tail is reclassified. Treating
+                // them like pure close lines would collapse owner/header lines
+                // such as `) CURSOR`, `) MULTISET`, or `) WITHIN GROUP` back
+                // to parser_depth before phase 2 can reuse the shared tail
+                // taxonomy for the following wrapper/query body.
+                analyzer_query_depth.max(parser_depth)
             } else if starts_with_close_paren {
                 parser_depth
             } else if in_dml_statement {
@@ -20319,6 +20328,68 @@ FROM dept d;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             expected,
             "generic split expression-query owners should remain stable after formatting"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mixed_close_generic_split_expression_query_owners_use_owner_relative_depth(
+    ) {
+        let source = r#"SELECT
+    d.deptno,
+    (
+        SELECT 1
+        FROM dual
+    ) CURSOR -- employees
+    (
+        SELECT
+            e.empno,
+            (
+                SELECT 1
+                FROM dual
+            ) MULTISET -- bonuses
+            (
+                SELECT
+                    b.bonus
+                FROM bonus b
+                WHERE b.empno = e.empno
+            ) AS bonus_list
+        FROM emp e
+        WHERE e.deptno = d.deptno
+    ) AS emp_cur
+FROM dept d;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = [
+            "SELECT d.deptno,",
+            "    (",
+            "        SELECT 1",
+            "        FROM DUAL",
+            "    ) CURSOR -- employees",
+            "    (",
+            "        SELECT e.empno,",
+            "            (",
+                "                SELECT 1",
+                "                FROM DUAL",
+            "            ) MULTISET -- bonuses",
+            "            (",
+                "                SELECT b.bonus",
+            "                FROM bonus b",
+            "                WHERE b.empno = e.empno",
+            "            ) AS bonus_list",
+            "        FROM emp e",
+            "        WHERE e.deptno = d.deptno",
+            "    ) AS emp_cur",
+            "FROM dept d;",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            formatted, expected,
+            "mixed leading-close CURSOR/MULTISET owners should keep child queries one level deeper than each owner"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            expected,
+            "mixed leading-close generic expression-query owners should remain stable after formatting"
         );
     }
 
