@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-03 (`JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영)
+> 최종 업데이트: 2026-04-05 (split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header owner chain 명시, `JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영)
 
 ## 0. 이 문서의 역할
 
@@ -228,6 +228,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - bare `IF`/`ELSIF`/`ELSEIF` condition header는 owner family가 아니라 condition-header / wrapper family다. body owner는 `THEN`이 완료된 시점부터 열린다.
 - `CREATE TRIGGER` header body owner도 "header body line"과 "body opener"를 섞으면 안 된다. `BEFORE/AFTER`, `ON`, `REFERENCING`, `FOR EACH ROW`, `WHEN`은 owner depth + 1이지만, 그 다음 `DECLARE`/`BEGIN`은 retained trigger-header state를 종료하고 owner depth로 복귀해야 한다.
+- split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header chain은 trigger header body와 다르다. `BUILD DEFERRED`, `REFRESH FAST`, `ON DEMAND`, `ENABLE QUERY REWRITE`, storage/property option 같은 `AS` 이전 fragment는 최초 `CREATE ...` owner depth를 유지하고, trailing `AS`가 완료된 뒤의 query head (`WITH`/`SELECT`/`VALUES`)만 owner depth + 1에서 시작한다.
 
 ### 3.2 current structural continuation boundary taxonomy
 

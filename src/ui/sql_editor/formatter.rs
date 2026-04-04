@@ -27,6 +27,7 @@ enum LineLayoutKind {
 struct LineLayout<'a> {
     raw: &'a str,
     trimmed: &'a str,
+    analysis_trimmed: &'a str,
     has_leading_close_paren: bool,
     kind: LineLayoutKind,
     preserve_raw: bool,
@@ -327,6 +328,12 @@ struct ResolvedQueryBaseLayoutFrame {
     resolved_base_depth: usize,
     start_parser_depth: usize,
     close_align_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct WithDefinitionLayoutFrame {
+    start_parser_depth: usize,
+    main_query_started: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2447,6 +2454,7 @@ impl SqlEditorWidget {
         }
 
         out.push_str(&formatted[cursor..]);
+
         out
     }
 
@@ -5659,10 +5667,10 @@ impl SqlEditorWidget {
             return formatted.to_string();
         }
 
-        let multiline_string_continuation_lines =
-            Self::multiline_string_continuation_lines(formatted, line_count);
+        let multiline_string_prefix_lengths =
+            Self::multiline_string_continuation_prefix_lengths(formatted, line_count);
         let mut layouts =
-            Self::build_line_layouts(formatted, &contexts, &multiline_string_continuation_lines);
+            Self::build_line_layouts(formatted, &contexts, &multiline_string_prefix_lengths);
         let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
 
         Self::resolve_code_line_layouts(&mut layouts, &next_code_indices);
@@ -5683,7 +5691,7 @@ impl SqlEditorWidget {
     fn build_line_layouts<'a>(
         formatted: &'a str,
         contexts: &[AutoFormatLineContext],
-        multiline_string_continuation_lines: &[bool],
+        multiline_string_prefix_lengths: &[Option<usize>],
     ) -> Vec<LineLayout<'a>> {
         let lines: Vec<&'a str> = formatted.lines().collect();
         let mut layouts = Vec::with_capacity(lines.len());
@@ -5692,45 +5700,58 @@ impl SqlEditorWidget {
         for (idx, line) in lines.iter().enumerate() {
             let raw = *line;
             let trimmed = raw.trim_start();
-            let continuation_line = multiline_string_continuation_lines
+            let analysis_raw = multiline_string_prefix_lengths
                 .get(idx)
                 .copied()
-                .unwrap_or(false);
-            let (kind, preserve_raw) = if continuation_line {
+                .flatten()
+                .and_then(|prefix_len| raw.get(prefix_len..))
+                .unwrap_or(raw);
+            let analysis_trimmed = analysis_raw.trim_start();
+            let continuation_line = multiline_string_prefix_lengths
+                .get(idx)
+                .copied()
+                .flatten()
+                .is_some();
+            let continuation_line_is_payload_only = continuation_line && analysis_trimmed.is_empty();
+            let (kind, preserve_raw) = if continuation_line_is_payload_only {
                 (LineLayoutKind::Verbatim, true)
             } else {
                 let was_in_block_comment = in_block_comment;
-                let is_comment_only = if was_in_block_comment && trimmed.is_empty() {
+                let is_comment_only = if was_in_block_comment && analysis_trimmed.is_empty() {
                     true
-                } else if trimmed.is_empty() {
+                } else if analysis_trimmed.is_empty() {
                     false
                 } else {
                     crate::sql_text::line_is_comment_only_with_block_state(
-                        raw,
+                        analysis_raw,
                         &mut in_block_comment,
                     )
                 };
-                if !is_comment_only && !trimmed.is_empty() {
-                    crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+                if !is_comment_only && !analysis_trimmed.is_empty() {
+                    crate::sql_text::update_block_comment_state(
+                        analysis_trimmed,
+                        &mut in_block_comment,
+                    );
                 }
 
                 if is_comment_only {
                     (LineLayoutKind::CommentOnly, was_in_block_comment)
-                } else if trimmed.is_empty() {
+                } else if analysis_trimmed.is_empty() {
                     (LineLayoutKind::Blank, false)
-                } else if trimmed == "," {
+                } else if analysis_trimmed == "," {
                     (LineLayoutKind::CommaOnly, false)
                 } else {
-                    (LineLayoutKind::Code, false)
+                    (LineLayoutKind::Code, continuation_line)
                 }
             };
 
             let has_leading_close_paren =
-                crate::sql_text::line_has_leading_significant_close_paren(trimmed);
+                crate::sql_text::line_has_leading_significant_close_paren(analysis_trimmed);
 
             layouts.push(LineLayout {
                 raw,
                 trimmed,
+                analysis_trimmed,
                 has_leading_close_paren,
                 kind,
                 preserve_raw,
@@ -5808,14 +5829,16 @@ impl SqlEditorWidget {
         idx: usize,
         next_code_indices: &[Option<usize>],
     ) -> Option<sql_text::SplitQueryOwnerLookaheadKind> {
-        let line = layouts[idx].trimmed;
+        let line = layouts[idx].analysis_trimmed;
         let open_idx = next_code_indices.get(idx).copied().flatten()?;
         let head_idx = next_code_indices.get(open_idx).copied().flatten()?;
-        let head_upper = Self::structural_line_upper(layouts[head_idx].trimmed);
+        let head_upper = Self::structural_line_upper(layouts[head_idx].analysis_trimmed);
 
         crate::sql_text::split_query_owner_lookahead_kind(
             line,
-            Self::line_is_standalone_open_paren_before_inline_comment(layouts[open_idx].trimmed),
+            Self::line_is_standalone_open_paren_before_inline_comment(
+                layouts[open_idx].analysis_trimmed,
+            ),
             Some(&head_upper),
         )
     }
@@ -6005,7 +6028,7 @@ impl SqlEditorWidget {
         current_condition_header_depth: Option<usize>,
         _current_general_paren_frame_count: usize,
     ) -> Option<usize> {
-        if !Self::line_ends_with_open_paren_before_inline_comment(layout.trimmed) {
+        if !Self::line_ends_with_open_paren_before_inline_comment(layout.analysis_trimmed) {
             return None;
         }
 
@@ -6047,7 +6070,7 @@ impl SqlEditorWidget {
         trimmed_upper: &str,
     ) -> Option<usize> {
         (Self::line_starts_plsql_query_owner(trimmed_upper)
-            || Self::line_ends_with_then_before_inline_comment(layout.trimmed))
+            || Self::line_ends_with_then_before_inline_comment(layout.analysis_trimmed))
         .then(|| layout.final_depth.saturating_add(1))
     }
 
@@ -6608,6 +6631,7 @@ impl SqlEditorWidget {
         let mut pending_merge_branch_header: Option<PendingMergeBranchHeaderLayoutFrame> = None;
         let mut pending_merge_branch_body_depth: Option<usize> = None;
         let mut resolved_query_base_depths: Vec<ResolvedQueryBaseLayoutFrame> = Vec::new();
+        let mut with_definition_frames: Vec<WithDefinitionLayoutFrame> = Vec::new();
         let mut owner_relative_frames: Vec<OwnerRelativeLayoutFrame> = Vec::new();
         let mut pending_multiline_clause_owner: Option<PendingMultilineClauseOwnerLayoutFrame> =
             None;
@@ -6642,8 +6666,17 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            let trimmed = layouts[idx].trimmed;
+            let trimmed = layouts[idx].analysis_trimmed;
             let depth = layouts[idx].parser_depth;
+            while with_definition_frames
+                .last()
+                .is_some_and(|frame| depth < frame.start_parser_depth)
+            {
+                with_definition_frames.pop();
+            }
+            let active_with_definition_scope = with_definition_frames.last().is_some_and(|frame| {
+                !frame.main_query_started && depth >= frame.start_parser_depth
+            });
             let structural_trimmed = crate::sql_text::auto_format_structural_tail(trimmed);
             let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
@@ -6715,16 +6748,22 @@ impl SqlEditorWidget {
                 0
             };
             let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
+                Self::line_ends_with_comma_before_inline_comment(
+                    layouts[prev_idx].analysis_trimmed,
+                )
             });
             let control_branch_body_depth_for_line = pending_control_branch_body_depth_for_line;
             let current_line_branch_body_depth =
                 control_branch_body_depth_for_line.or(pending_case_branch_body_depth_for_line);
             let next_code_trimmed =
-                next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
+                next_code_indices[idx].map(|next_idx| layouts[next_idx].analysis_trimmed);
+            let current_line_is_standalone_query_head_open = current_line_is_standalone_open_paren
+                && next_code_trimmed.is_some_and(|next| {
+                    Self::line_starts_query_head(&Self::structural_line_upper(next))
+                });
             let next_next_code_trimmed = next_code_indices[idx]
                 .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten())
-                .map(|next_idx| layouts[next_idx].trimmed);
+                .map(|next_idx| layouts[next_idx].analysis_trimmed);
             let line_tokens = Self::tokenize_sql(trimmed);
             let current_line_starts_end_suffix_terminator =
                 Self::starts_with_end_suffix_terminator_tokens(&line_tokens);
@@ -6792,12 +6831,17 @@ impl SqlEditorWidget {
             } else {
                 None
             };
-            let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren {
+            let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren
+                && !current_line_is_standalone_query_head_open
+            {
                 pending_multiline_clause_owner.take()
             } else {
                 None
             };
             if current_line_is_standalone_open_paren {
+                if current_line_is_standalone_query_head_open {
+                    pending_multiline_clause_owner = None;
+                }
                 pending_partial_multiline_clause_owner = None;
                 pending_partial_query_owner = None;
             }
@@ -6854,6 +6898,8 @@ impl SqlEditorWidget {
 
             let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = layouts[idx].has_leading_close_paren;
+            let has_structural_tail_after_leading_close = starts_with_close_paren
+                && !crate::sql_text::trim_after_leading_close_parens(trimmed).is_empty();
             let current_line_is_parenthesized_condition =
                 layouts[idx].condition_header_line.is_some();
             let current_line_is_parenthesized_condition_header =
@@ -7035,17 +7081,24 @@ impl SqlEditorWidget {
                 && !pending_forall_body_head_for_line;
             let current_line_is_structural_continuation_boundary =
                 crate::sql_text::starts_with_auto_format_structural_continuation_boundary(trimmed);
+            let current_line_is_non_expression_structural_boundary =
+                crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed);
             let current_line_structural_header_continuation_kind =
                 sql_text::format_structural_header_continuation_kind(trimmed);
             let current_line_bare_structural_header_continuation_kind =
                 sql_text::format_bare_structural_header_continuation_kind(trimmed);
+            let current_line_is_exact_bare_owner_or_pending_header =
+                crate::sql_text::line_is_exact_bare_owner_or_pending_header(trimmed);
+            let current_line_query_owner_keeps_continuation_target = current_query_owner_kind
+                .is_some()
+                && !current_line_is_non_expression_structural_boundary;
             let current_line_is_structural_continuation_target =
                 current_line_is_standalone_open_paren
                     || current_line_starts_multiline_clause
-                    || current_query_owner_kind.is_some()
+                    || current_line_query_owner_keeps_continuation_target
                     || current_line_is_pending_partial_multiline_owner
                     || current_line_is_pending_partial_query_owner
-                    || current_line_bare_structural_header_continuation_kind.is_some();
+                    || current_line_is_exact_bare_owner_or_pending_header;
             let current_line_rejects_structural_continuation_depth =
                 (current_line_is_structural_continuation_boundary
                     && !current_line_is_structural_continuation_target)
@@ -7078,9 +7131,15 @@ impl SqlEditorWidget {
                 active_general_paren_frame.is_some_and(|frame| frame.split_condition_group);
             let resolved_query_base_frame =
                 layouts[idx].query_base_depth.and_then(|query_base_depth| {
+                    let closing_query_frame_skip = if has_structural_tail_after_leading_close {
+                        closing_query_frame_count
+                    } else {
+                        0
+                    };
                     resolved_query_base_depths
                         .iter()
                         .rev()
+                        .skip(closing_query_frame_skip)
                         .find(|frame| frame.raw_base_depth == query_base_depth)
                         .copied()
                 });
@@ -7099,9 +7158,13 @@ impl SqlEditorWidget {
             let structural_body_depth_for_line = active_owner_relative_frame
                 .map(OwnerRelativeLayoutFrame::body_depth)
                 .or_else(|| {
+                    let structural_query_base_depth = if has_structural_tail_after_leading_close {
+                        layouts[idx].query_base_depth
+                    } else {
+                        resolved_query_base_depth.or(layouts[idx].query_base_depth)
+                    };
                     in_query_statement.then(|| {
-                        resolved_query_base_depth
-                            .or(layouts[idx].query_base_depth)
+                        structural_query_base_depth
                             .unwrap_or(parser_depth)
                             .saturating_add(1)
                     })
@@ -7152,7 +7215,13 @@ impl SqlEditorWidget {
                     .max(parser_depth)
             } else if let Some(continuation_depth) = active_structural_continuation_depth_for_line {
                 if uses_analyzer_query_depth {
-                    analyzer_query_depth
+                    // Shared structural continuation state (for example
+                    // `UPDATE SET item,` carrying the next list item depth)
+                    // is a typed semantic anchor, not visual residue. When
+                    // it is active, canonical query/DML layout must honor at
+                    // least that carried depth instead of collapsing back to
+                    // the analyzer's line-local query role.
+                    analyzer_query_depth.max(continuation_depth)
                 } else {
                     continuation_depth.max(parser_depth)
                 }
@@ -7173,6 +7242,13 @@ impl SqlEditorWidget {
                 parenthesized_condition_header_depth.unwrap_or(parser_depth)
             } else if force_block_depth {
                 parser_depth
+            } else if current_line_is_standalone_query_head_open {
+                // Standalone `(` lines that already carry a deferred child
+                // query head must stay on the analyzer's structural owner
+                // depth. Reusing a previously carried list/header continuation
+                // depth here leaks inner multiline-query state into the outer
+                // select-item anchor after nested scalar subqueries.
+                analyzer_query_depth.max(parser_depth)
             } else if current_line_is_pending_partial_multiline_owner
                 || current_line_is_standalone_open_paren
             {
@@ -7257,6 +7333,18 @@ impl SqlEditorWidget {
                     if current_line_dml_case_expression_close_depth.is_none() {
                         effective_depth = effective_depth.max(frame.continuation_depth);
                     }
+                }
+            }
+            if active_with_definition_scope {
+                // WITH local FUNCTION/PROCEDURE definitions already have a
+                // canonical owner/body depth from the analyzer. Reusing that
+                // structural depth here keeps routine body statements such as
+                // RETURN on the body floor and labeled END on the owner depth
+                // instead of collapsing back to the raw parser depth.
+                if crate::sql_text::line_is_format_cte_definition_header(structural_trimmed) {
+                    effective_depth = layouts[idx].auto_depth;
+                } else {
+                    effective_depth = effective_depth.max(layouts[idx].auto_depth);
                 }
             }
 
@@ -7564,7 +7652,19 @@ impl SqlEditorWidget {
                     let should_store_resolved_query_base = active_pending_query_head.is_some()
                         || resolved_base_depth != query_base_depth;
                     if should_store_resolved_query_base {
-                        if let Some(frame) = resolved_query_base_depths
+                        let should_push_nested_query_base_frame = resolved_query_base_depths
+                            .iter()
+                            .rev()
+                            .find(|frame| frame.raw_base_depth == query_base_depth)
+                            .is_some_and(|frame| frame.start_parser_depth < depth);
+                        if should_push_nested_query_base_frame {
+                            resolved_query_base_depths.push(ResolvedQueryBaseLayoutFrame {
+                                raw_base_depth: query_base_depth,
+                                resolved_base_depth,
+                                start_parser_depth: depth,
+                                close_align_depth,
+                            });
+                        } else if let Some(frame) = resolved_query_base_depths
                             .iter_mut()
                             .rev()
                             .find(|frame| frame.raw_base_depth == query_base_depth)
@@ -8180,6 +8280,27 @@ impl SqlEditorWidget {
                 pending_forall_body_head = false;
             }
 
+            if starts_query_head
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH")
+            {
+                with_definition_frames.push(WithDefinitionLayoutFrame {
+                    start_parser_depth: depth,
+                    main_query_started: false,
+                });
+            } else if let Some(frame) = with_definition_frames.last_mut() {
+                if !frame.main_query_started
+                    && depth == frame.start_parser_depth
+                    && starts_query_head
+                    && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH")
+                    && !crate::sql_text::line_is_format_cte_definition_header(structural_trimmed)
+                {
+                    frame.main_query_started = true;
+                }
+            }
+
+            let semicolon_closes_with_definition_scope = with_definition_frames
+                .last()
+                .is_none_or(|frame| frame.main_query_started);
             if crate::sql_text::line_ends_with_semicolon_before_inline_comment(trimmed) {
                 in_dml_statement = false;
                 pending_query_head_frames.clear();
@@ -8209,6 +8330,9 @@ impl SqlEditorWidget {
                 pending_forall_body_head = false;
                 // Trigger header frame also clears on `;` (safety).
                 trigger_header_frame = None;
+                if semicolon_closes_with_definition_scope {
+                    with_definition_frames.clear();
+                }
             } else {
                 for _ in 0..closing_query_frame_count {
                     resolved_query_base_depths.pop();
@@ -8238,8 +8362,8 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            let previous_trimmed = layouts[prev_idx].trimmed;
-            let next_upper = Self::structural_line_upper(layouts[next_idx].trimmed);
+            let previous_trimmed = layouts[prev_idx].analysis_trimmed;
+            let next_upper = Self::structural_line_upper(layouts[next_idx].analysis_trimmed);
             let next_is_case_branch = Self::starts_with_case_branch_keyword(&next_upper);
             if Self::starts_with_case_terminator(previous_trimmed) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
@@ -8277,15 +8401,15 @@ impl SqlEditorWidget {
             let next_code_idx = next_code_indices[start];
             let previous_code_is_using_continuation_anchor =
                 previous_code_idx.is_some_and(|prev_idx| {
-                    Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
+                    Self::line_starts_with_using_clause(layouts[prev_idx].analysis_trimmed)
                         && Self::line_ends_with_comma_before_inline_comment(
-                            layouts[prev_idx].trimmed,
+                            layouts[prev_idx].analysis_trimmed,
                         )
                 });
             let previous_code_is_case_terminator_before_close_paren_gap =
                 match (previous_code_idx, next_code_idx) {
                     (Some(prev_idx), Some(next_idx)) => {
-                        Self::starts_with_case_terminator(layouts[prev_idx].trimmed)
+                        Self::starts_with_case_terminator(layouts[prev_idx].analysis_trimmed)
                             && layouts[next_idx].has_leading_close_paren
                     }
                     _ => false,
@@ -8480,162 +8604,11 @@ impl SqlEditorWidget {
         false
     }
 
-    fn multiline_string_continuation_lines(formatted: &str, line_count: usize) -> Vec<bool> {
-        let mut continuation_lines = vec![false; line_count];
-        if line_count == 0 {
-            return continuation_lines;
-        }
-
-        // Use byte-based scanning per Rust String Policy.
-        // All delimiters checked here are ASCII, so byte comparison is safe.
-        let bytes = formatted.as_bytes();
-        let mut i = 0usize;
-        let mut line = 0usize;
-
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut in_q_quote = false;
-        let mut q_quote_end: Option<u8> = None;
-
-        while i < bytes.len() {
-            let c = bytes[i];
-            let next = bytes.get(i + 1).copied();
-
-            if in_line_comment {
-                if c == b'\n' {
-                    in_line_comment = false;
-                    line += 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if c == b'*' && next == Some(b'/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                if c == b'\n' {
-                    line += 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_q_quote {
-                if Some(c) == q_quote_end && next == Some(b'\'') {
-                    in_q_quote = false;
-                    q_quote_end = None;
-                    i += 2;
-                    continue;
-                }
-                if c == b'\n' {
-                    if line + 1 < line_count {
-                        continuation_lines[line + 1] = true;
-                    }
-                    line += 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == b'\'' {
-                    if next == Some(b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                    i += 1;
-                    continue;
-                }
-                if c == b'\n' {
-                    if line + 1 < line_count {
-                        continuation_lines[line + 1] = true;
-                    }
-                    line += 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == b'"' {
-                    if next == Some(b'"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                    i += 1;
-                    continue;
-                }
-                if c == b'\n' {
-                    if line + 1 < line_count {
-                        continuation_lines[line + 1] = true;
-                    }
-                    line += 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == b'\n' {
-                line += 1;
-                i += 1;
-                continue;
-            }
-
-            if c == b'-' && next == Some(b'-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if c == b'/' && next == Some(b'*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if (c == b'n' || c == b'N')
-                && matches!(next, Some(b'q') | Some(b'Q'))
-                && bytes.get(i + 2) == Some(&b'\'')
-                && bytes.get(i + 3).is_some()
-            {
-                let delimiter = bytes[i + 3];
-                in_q_quote = true;
-                q_quote_end = Some(sql_text::q_quote_closing(delimiter as char) as u8);
-                i += 4;
-                continue;
-            }
-
-            if (c == b'q' || c == b'Q') && next == Some(b'\'') && bytes.get(i + 2).is_some() {
-                let delimiter = bytes[i + 2];
-                in_q_quote = true;
-                q_quote_end = Some(sql_text::q_quote_closing(delimiter as char) as u8);
-                i += 3;
-                continue;
-            }
-
-            if c == b'\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == b'"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            i += 1;
-        }
-
-        continuation_lines
+    fn multiline_string_continuation_prefix_lengths(
+        formatted: &str,
+        line_count: usize,
+    ) -> Vec<Option<usize>> {
+        sql_text::multiline_string_continuation_prefix_lengths(formatted, line_count)
     }
 
     fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
@@ -9895,12 +9868,12 @@ FROM a;"#;
 
         let line_count = sql.lines().count();
         let contexts = QueryExecutor::auto_format_line_contexts(sql);
-        let multiline_string_continuation_lines =
-            SqlEditorWidget::multiline_string_continuation_lines(sql, line_count);
+        let multiline_string_prefix_lengths =
+            SqlEditorWidget::multiline_string_continuation_prefix_lengths(sql, line_count);
         let mut layouts = SqlEditorWidget::build_line_layouts(
             sql,
             &contexts,
-            &multiline_string_continuation_lines,
+            &multiline_string_prefix_lengths,
         );
         let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
         SqlEditorWidget::resolve_code_line_layouts(&mut layouts, &next_code_indices);
@@ -18383,6 +18356,175 @@ where e.empno = 1;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_clears_select_list_carry_before_final_from_dual() {
+        let source = r#"SELECT 'INSERT INTO t VALUES (1; 2; 3);' AS fake_sql,
+    'END; / BEGIN' AS trap1,
+    'CREATE OR REPLACE PROCEDURE test IS BEGIN NULL; END;' AS trap2,
+    q'[She said "it's done"; then left/]' AS trap3
+    FROM DUAL;"#;
+
+        let expected = r#"SELECT 'INSERT INTO t VALUES (1; 2; 3);' AS fake_sql,
+    'END; / BEGIN' AS trap1,
+    'CREATE OR REPLACE PROCEDURE test IS BEGIN NULL; END;' AS trap2,
+    q'[She said "it's done"; then left/]' AS trap3
+FROM DUAL;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted, expected,
+            "final FROM DUAL should realign to the query base after the last SELECT item, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "formatting should remain idempotent for SELECT items containing statement-like text"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_with_function_return_in_body_and_end_on_owner_depth() {
+        let source = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let begin_idx = find_line_starting_with(&lines, "BEGIN").expect("BEGIN line");
+        let return_idx = find_line_starting_with(&lines, "RETURN v_depth;").expect("RETURN line");
+        let end_idx = find_line_starting_with(&lines, "END calc_depth;").expect("END line");
+
+        assert_eq!(
+            leading_spaces(lines[return_idx]),
+            leading_spaces(lines[begin_idx]).saturating_add(4),
+            "WITH FUNCTION RETURN should stay on the routine body depth under BEGIN, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[begin_idx]),
+            "WITH FUNCTION END should realign with the routine owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "WITH FUNCTION routine body formatting should remain idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_trailing_with_function_sibling_cte_on_with_depth() {
+        let source = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+    aggregated AS (
+        SELECT
+            parent_id,
+            COUNT (*) AS child_count,
+            MAX (DEPTH) AS max_depth,
+            LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+        FROM recursive_tree
+        WHERE DEPTH > 1
+        GROUP BY parent_id
+    );"#;
+
+        let expected = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+        RETURN v_depth;
+    END calc_depth;
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+aggregated AS (
+    SELECT
+        parent_id,
+        COUNT (*) AS child_count,
+        MAX (DEPTH) AS max_depth,
+        LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+    FROM recursive_tree
+    WHERE DEPTH > 1
+    GROUP BY parent_id
+);"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted, expected,
+            "Trailing sibling CTE headers after a WITH FUNCTION body should realign to the WITH owner depth even when no main query follows, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "Trailing sibling CTE formatting after WITH FUNCTION should remain stable after re-formatting"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_indents_cursor_is_select_body() {
         let source = "declare\ncursor c1 is\nselect col1, col2\nfrom t1\nwhere col1 > 0;\nbegin\nnull;\nend;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -20183,6 +20325,84 @@ ORDER BY d.dept_id;"#;
             SqlEditorWidget::format_for_auto_formatting(expected, false),
             expected,
             "JSON_OBJECT VALUE scalar subquery formatting should remain stable"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_restores_outer_select_clause_after_nested_json_xml_select_item() {
+        let source = r#"SELECT x.employee_id,
+    XMLQUERY ('for $i in /employees/employee
+         where $i/salary > 5000
+         return <result>
+             <name>{$i/name/text()}</name>
+             <bonus>{$i/salary * 0.1}</bonus>
+         </result>' PASSING x.xml_data RETURNING CONTENT) AS xml_result,
+        JSON_OBJECT (KEY 'id' VALUE x.employee_id, KEY 'name' VALUE x.emp_name, KEY 'details' VALUE JSON_OBJECT (KEY 'salary' VALUE x.salary, KEY 'department' VALUE x.dept_name, KEY 'skills' VALUE (
+                SELECT JSON_ARRAYAGG (JSON_OBJECT (KEY 'skill' VALUE s.skill_name, KEY 'level' VALUE s.proficiency) ORDER BY s.proficiency DESC
+                    RETURNING CLOB)
+                FROM employee_skills s
+                WHERE s.employee_id = x.employee_id
+            )), KEY 'metadata' VALUE JSON_OBJECT (KEY 'generated' VALUE TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF3\"Z\"'), KEY 'version' VALUE '2.0') RETURNING CLOB) AS json_output
+        FROM (
+            SELECT e.employee_id,
+        e.first_name || ' ' || e.last_name AS emp_name,
+        e.salary,
+        d.department_name AS dept_name,
+        XMLTYPE ('<employees><employee><name>' || e.first_name || '</name>' || '<salary>' || e.salary || '</salary></employee></employees>') AS xml_data
+            FROM employees e
+        JOIN departments d
+                ON e.department_id = d.department_id
+            WHERE e.salary > (
+        SELECT AVG (salary)
+        FROM employees
+    )
+        ) x
+        WHERE XMLEXISTS ('/employees/employee[salary > 10000]' PASSING x.xml_data)
+        ORDER BY x.salary DESC
+        FETCH FIRST 20 ROWS ONLY;"#;
+
+        let expected = r#"SELECT x.employee_id,
+    XMLQUERY ('for $i in /employees/employee
+         where $i/salary > 5000
+         return <result>
+             <name>{$i/name/text()}</name>
+             <bonus>{$i/salary * 0.1}</bonus>
+         </result>' PASSING x.xml_data RETURNING CONTENT) AS xml_result,
+    JSON_OBJECT (KEY 'id' VALUE x.employee_id, KEY 'name' VALUE x.emp_name, KEY 'details' VALUE JSON_OBJECT (KEY 'salary' VALUE x.salary, KEY 'department' VALUE x.dept_name, KEY 'skills' VALUE (
+            SELECT JSON_ARRAYAGG (JSON_OBJECT (KEY 'skill' VALUE s.skill_name, KEY 'level' VALUE s.proficiency) ORDER BY s.proficiency DESC
+                RETURNING CLOB)
+            FROM employee_skills s
+            WHERE s.employee_id = x.employee_id
+            )), KEY 'metadata' VALUE JSON_OBJECT (KEY 'generated' VALUE TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF3\"Z\"'), KEY 'version' VALUE '2.0') RETURNING CLOB) AS json_output
+FROM (
+        SELECT e.employee_id,
+            e.first_name || ' ' || e.last_name AS emp_name,
+            e.salary,
+            d.department_name AS dept_name,
+            XMLTYPE ('<employees><employee><name>' || e.first_name || '</name>' || '<salary>' || e.salary || '</salary></employee></employees>') AS xml_data
+        FROM employees e
+        JOIN departments d
+            ON e.department_id = d.department_id
+        WHERE e.salary > (
+            SELECT AVG (salary)
+            FROM employees
+        )
+    ) x
+WHERE XMLEXISTS ('/employees/employee[salary > 10000]' PASSING x.xml_data)
+ORDER BY x.salary DESC
+FETCH FIRST 20 ROWS ONLY;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted, expected,
+            "nested JSON/XML select items should not leak list/body depth into the outer FROM/WHERE/ORDER/FETCH clauses, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "nested JSON/XML select-item formatting should remain idempotent"
         );
     }
 
@@ -23159,6 +23379,98 @@ FROM t1;"#;
             leading_spaces(lines[outer_else_idx]).saturating_add(4),
             "CASE after ELSE should indent one level deeper than the ELSE branch header, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_order_siblings_by_case_uses_clause_body_depth() {
+        let source = r#"SELECT CONNECT_BY_ROOT o.node_name AS root_name,
+    o.node_id,
+    o.parent_id,
+    o.node_name,
+    LEVEL AS lvl,
+    SYS_CONNECT_BY_PATH (o.node_name, ' > ') AS node_path,
+    CONNECT_BY_ISLEAF AS is_leaf,
+    (
+        SELECT SUM (x.node_val)
+        FROM org_tree x
+        START WITH x.node_id = o.node_id
+        CONNECT BY PRIOR x.node_id = x.parent_id
+    ) AS subtree_sum,
+    CASE
+        WHEN CONNECT_BY_ISLEAF = 1 THEN (
+            SELECT MAX (y.node_val)
+            FROM org_tree y
+            WHERE y.parent_id = o.parent_id
+        )
+        ELSE (
+            SELECT COUNT (*)
+            FROM org_tree c
+            WHERE c.parent_id = o.node_id
+        )
+    END AS compare_metric
+FROM org_tree o
+START WITH o.parent_id IS NULL
+CONNECT BY PRIOR o.node_id = o.parent_id
+ORDER SIBLINGS BY
+CASE
+    WHEN o.parent_id IS NULL THEN 0
+    ELSE 1
+END,
+    o.node_name;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let order_idx = find_line_starting_with(&lines, "ORDER SIBLINGS BY")
+            .expect("ORDER SIBLINGS BY line should exist");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("ORDER SIBLINGS BY CASE line should exist");
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx.saturating_add(1))
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with("WHEN o.parent_id IS NULL THEN")
+            })
+            .map(|(idx, _)| idx)
+            .expect("ORDER SIBLINGS BY CASE WHEN line should exist");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END,")
+            .map(|(idx, _)| idx)
+            .expect("ORDER SIBLINGS BY CASE END line should exist");
+
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[order_idx]).saturating_add(4),
+            "CASE after ORDER SIBLINGS BY should indent one level deeper than the clause header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[when_idx]),
+            leading_spaces(lines[case_idx]).saturating_add(4),
+            "WHEN inside ORDER SIBLINGS BY CASE should indent one level deeper than CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "END in ORDER SIBLINGS BY CASE should align with CASE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "ORDER SIBLINGS BY CASE formatting should stay stable after reformatting"
         );
     }
 
@@ -28340,6 +28652,75 @@ FROM r;"#;
         );
     }
 
+    #[test]
+    fn format_sql_basic_merge_update_set_continuation_uses_branch_body_depth() {
+        let source = r#"MERGE INTO qt_fmt_emp t
+USING (
+        WITH recent_sales AS (
+            SELECT
+                s.emp_id,
+                SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt) AS recent_amt
+            FROM qt_fmt_sales s
+            WHERE s.sale_date >= DATE '2024-03-01'
+            GROUP BY s.emp_id
+        ),
+        scored AS (
+            SELECT
+                e.emp_id,
+                e.note_text,
+                rs.recent_amt,
+                CASE
+                    WHEN NVL (rs.recent_amt, 0) >= 50000 THEN ' | HOT'
+                    WHEN NVL (rs.recent_amt, 0) >= 20000 THEN ' | WARM'
+                    ELSE ' | COLD'
+                END AS score_tag
+            FROM qt_fmt_emp e
+            LEFT JOIN recent_sales rs
+                ON rs.emp_id = e.emp_id
+            WHERE e.dept_id = 30
+        )
+        SELECT
+            s.emp_id,
+            SUBSTR (NVL (s.note_text, 'sales-profile') || s.score_tag || ' | recent=' || TO_CHAR (NVL (s.recent_amt, 0)), 1, 4000) AS new_note_text
+        FROM scored s
+    ) src
+    ON (t.emp_id = src.emp_id)
+WHEN MATCHED THEN
+    UPDATE SET t.note_text = src.new_note_text,
+        t.updated_at = SYSTIMESTAMP;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let leading = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line = |prefix: &str| -> Option<&str> {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.trim_start().starts_with(prefix))
+        };
+
+        let when_matched = find_line("WHEN MATCHED THEN").unwrap_or("");
+        let update_line = find_line("UPDATE SET t.note_text = src.new_note_text,").unwrap_or("");
+        let updated_at_line = find_line("t.updated_at = SYSTIMESTAMP;").unwrap_or("");
+
+        assert!(
+            !when_matched.is_empty() && !update_line.is_empty() && !updated_at_line.is_empty(),
+            "expected MERGE branch lines to be present, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(update_line),
+            leading(when_matched).saturating_add(4),
+            "UPDATE SET should stay one structural level deeper than WHEN MATCHED, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(updated_at_line),
+            leading(update_line).saturating_add(4),
+            "MERGE UPDATE SET continuation should use the branch body list depth, got:\n{}",
+            formatted
+        );
+    }
+
     // Bug candidate 4: JOIN ... USING (...) alignment
     #[test]
     fn format_sql_basic_join_using_same_depth_as_join_on() {
@@ -28792,6 +29173,356 @@ FROM r;"#;
 
         assert_eq!(formatted, expected);
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), expected);
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_restores_select_item_depth_after_scalar_subquery_before_over_clause(
+    ) {
+        let source = r#"SELECT
+    e.emp_id,
+    (
+        SELECT SUM (b.amount)
+        FROM qt_fmt_bonus b
+        WHERE b.emp_id = e.emp_id
+            AND b.bonus_year = 2024
+    ) AS bonus_2024,
+            ROW_NUMBER () OVER (
+                        PARTITION BY e.dept_id
+                        ORDER BY e.salary DESC NULLS LAST,
+                        e.emp_id
+                    ) AS rn_in_dept,
+    e.salary
+FROM qt_fmt_emp e;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let first_item_idx = find_line_starting_with(&lines, "e.emp_id").unwrap_or(0);
+        let bonus_idx = find_line_starting_with(&lines, ") AS bonus_2024,").unwrap_or(0);
+        let rn_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (").unwrap_or(0);
+        let partition_idx = find_line_starting_with(&lines, "PARTITION BY e.dept_id").unwrap_or(0);
+        let order_idx =
+            find_line_starting_with(&lines, "ORDER BY e.salary DESC NULLS LAST,").unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ") AS rn_in_dept,")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let trailing_item_idx = find_line_starting_with(&lines, "e.salary").unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[bonus_idx]),
+            indent(lines[first_item_idx]),
+            "scalar subquery select item should realign with sibling SELECT items, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rn_idx]),
+            indent(lines[first_item_idx]),
+            "analytic item after scalar subquery should return to the SELECT item depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[partition_idx]),
+            indent(lines[rn_idx]).saturating_add(4),
+            "OVER PARTITION BY should stay one level deeper than the analytic owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[partition_idx]),
+            "OVER ORDER BY should stay aligned with the analytic owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[rn_idx]),
+            "OVER closing line should realign with the analytic owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[trailing_item_idx]),
+            indent(lines[first_item_idx]),
+            "SELECT item after analytic owner should return to the sibling item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_restores_select_item_depth_after_scalar_subquery_before_over_clause() {
+        let source = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
+        SELECT
+            d.dept_id,
+            d.parent_dept_id,
+            TO_CHAR (d.dept_name) AS dept_path_txt,
+            1 AS lvl
+        FROM qt_fmt_dept d
+        WHERE d.parent_dept_id IS NULL
+        UNION ALL
+        SELECT
+            c.dept_id,
+            c.parent_dept_id,
+            p.dept_path_txt || ' > ' || c.dept_name,
+            p.lvl + 1
+        FROM qt_fmt_dept c
+        JOIN dept_path p
+            ON p.dept_id = c.parent_dept_id
+    ),
+    skill_rows AS (
+        SELECT
+            e.emp_id,
+            jt.skill,
+            jt.grade,
+            jt.remote_yn
+        FROM qt_fmt_emp e,
+            JSON_TABLE (e.json_doc, '$' COLUMNS (
+                grade VARCHAR2 (10) PATH '$.meta.grade',
+                remote_yn VARCHAR2 (5) PATH '$.meta.remote',
+                NESTED PATH '$.skills[*]' COLUMNS (
+                    skill VARCHAR2 (100) PATH '$'
+                )
+            )) jt
+    ),
+    xml_rows AS (
+        SELECT
+            e.emp_id,
+            x.flag_txt
+        FROM qt_fmt_emp e,
+            XMLTABLE ('/emp/flags/flag' PASSING e.xml_doc COLUMNS flag_txt VARCHAR2 (100) PATH '.') x
+    )
+    SELECT
+        e.emp_id,
+        e.emp_name,
+        e.login_name,
+        e.email_addr,
+        e.salary,
+        e.bonus_pct,
+        e.hire_dt,
+        e.status_cd,
+        e.job_title,
+        d.dept_id,
+        d.dept_code,
+        d.dept_name,
+        dp.dept_path_txt,
+        (
+            SELECT LISTAGG (sr.skill, ', ') WITHIN GROUP (ORDER BY sr.skill)
+            FROM skill_rows sr
+            WHERE sr.emp_id = e.emp_id
+        ) AS skill_list,
+        (
+            SELECT LISTAGG (xr.flag_txt, ', ') WITHIN GROUP (ORDER BY xr.flag_txt)
+            FROM xml_rows xr
+            WHERE xr.emp_id = e.emp_id
+        ) AS flag_list,
+                (
+                    SELECT SUM (b.amount)
+                    FROM qt_fmt_bonus b
+                    WHERE b.emp_id = e.emp_id
+                        AND b.bonus_year = 2024
+                ) AS bonus_2024,
+                        ROW_NUMBER () OVER (
+                            PARTITION BY e.dept_id
+                            ORDER BY e.salary DESC NULLS LAST,
+                            e.emp_id
+                        ) AS rn_in_dept,
+        DENSE_RANK () OVER (
+            ORDER BY e.salary DESC NULLS LAST
+        ) AS salary_rank_all,
+        AVG (e.salary) OVER (
+            PARTITION BY e.dept_id
+        ) AS dept_avg_salary,
+        SUM (
+            CASE
+                WHEN e.status_cd = 'ACTIVE' THEN NVL (e.salary, 0)
+                ELSE 0
+            END
+        ) OVER (
+            PARTITION BY e.dept_id
+        ) AS active_salary_sum
+    FROM qt_fmt_emp e
+    JOIN qt_fmt_dept d
+        ON d.dept_id = e.dept_id
+    LEFT JOIN dept_path dp
+        ON dp.dept_id = d.dept_id;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let bonus_idx = find_line_starting_with(&lines, ") AS bonus_2024,").unwrap_or(0);
+        let rn_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (").unwrap_or(0);
+        let partition_idx = find_line_starting_with(&lines, "PARTITION BY e.dept_id").unwrap_or(0);
+        let order_idx =
+            find_line_starting_with(&lines, "ORDER BY e.salary DESC NULLS LAST,").unwrap_or(0);
+        let rank_idx = find_line_starting_with(&lines, "DENSE_RANK () OVER (").unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ") AS rn_in_dept,")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[bonus_idx]),
+            indent(lines[rank_idx]),
+            "scalar subquery select item should realign with sibling SELECT items, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rn_idx]),
+            indent(lines[rank_idx]),
+            "analytic item after scalar subquery should return to the SELECT item depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[partition_idx]),
+            indent(lines[rn_idx]).saturating_add(4),
+            "OVER PARTITION BY should stay one level deeper than the analytic owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[order_idx]),
+            indent(lines[partition_idx]),
+            "OVER ORDER BY should stay aligned with the analytic owner-relative body depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[rn_idx]),
+            "OVER closing line should realign with the analytic owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rank_idx]),
+            indent(lines[bonus_idx]),
+            "sibling analytic items should share the same SELECT item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_restores_bonus_and_row_number_depth_in_full_view_query() {
+        let source = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
+        SELECT
+            d.dept_id,
+            d.parent_dept_id,
+            TO_CHAR (d.dept_name) AS dept_path_txt,
+            1 AS lvl
+        FROM qt_fmt_dept d
+        WHERE d.parent_dept_id IS NULL
+        UNION ALL
+        SELECT
+            c.dept_id,
+            c.parent_dept_id,
+            p.dept_path_txt || ' > ' || c.dept_name,
+            p.lvl + 1
+        FROM qt_fmt_dept c
+        JOIN dept_path p
+            ON p.dept_id = c.parent_dept_id
+    ),
+    skill_rows AS (
+        SELECT
+            e.emp_id,
+            jt.skill,
+            jt.grade,
+            jt.remote_yn
+        FROM qt_fmt_emp e,
+            JSON_TABLE (e.json_doc, '$' COLUMNS (
+                grade VARCHAR2 (10) PATH '$.meta.grade',
+                remote_yn VARCHAR2 (5) PATH '$.meta.remote',
+                NESTED PATH '$.skills[*]' COLUMNS (
+                    skill VARCHAR2 (100) PATH '$'
+                )
+            )) jt
+    ),
+    xml_rows AS (
+        SELECT
+            e.emp_id,
+            x.flag_txt
+        FROM qt_fmt_emp e,
+            XMLTABLE ('/emp/flags/flag' PASSING e.xml_doc COLUMNS flag_txt VARCHAR2 (100) PATH '.') x
+    )
+    SELECT
+        e.emp_id,
+        e.emp_name,
+        e.login_name,
+        e.email_addr,
+        e.salary,
+        e.bonus_pct,
+        e.hire_dt,
+        e.status_cd,
+        e.job_title,
+        d.dept_id,
+        d.dept_code,
+        d.dept_name,
+        dp.dept_path_txt,
+        (
+            SELECT LISTAGG (sr.skill, ', ') WITHIN GROUP (ORDER BY sr.skill)
+            FROM skill_rows sr
+            WHERE sr.emp_id = e.emp_id
+        ) AS skill_list,
+        (
+            SELECT LISTAGG (xr.flag_txt, ', ') WITHIN GROUP (ORDER BY xr.flag_txt)
+            FROM xml_rows xr
+            WHERE xr.emp_id = e.emp_id
+        ) AS flag_list,
+                (
+                    SELECT SUM (b.amount)
+                    FROM qt_fmt_bonus b
+                    WHERE b.emp_id = e.emp_id
+                        AND b.bonus_year = 2024
+                ) AS bonus_2024,
+                        ROW_NUMBER () OVER (
+                            PARTITION BY e.dept_id
+                            ORDER BY e.salary DESC NULLS LAST,
+                            e.emp_id
+                        ) AS rn_in_dept,
+        DENSE_RANK () OVER (
+            ORDER BY e.salary DESC NULLS LAST
+        ) AS salary_rank_all,
+        AVG (e.salary) OVER (
+            PARTITION BY e.dept_id
+        ) AS dept_avg_salary,
+        SUM (
+            CASE
+                WHEN e.status_cd = 'ACTIVE' THEN NVL (e.salary, 0)
+                ELSE 0
+            END
+        ) OVER (
+            PARTITION BY e.dept_id
+        ) AS active_salary_sum
+    FROM qt_fmt_emp e
+    JOIN qt_fmt_dept d
+        ON d.dept_id = e.dept_id
+    LEFT JOIN dept_path dp
+        ON dp.dept_id = d.dept_id;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let bonus_idx = find_line_starting_with(&lines, ") AS bonus_2024,").unwrap_or(0);
+        let rn_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (").unwrap_or(0);
+        let rank_idx = find_line_starting_with(&lines, "DENSE_RANK () OVER (").unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[bonus_idx]),
+            indent(lines[rank_idx]),
+            "parser-depth normalization should realign bonus_2024 with sibling SELECT items, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[rn_idx]),
+            indent(lines[rank_idx]),
+            "parser-depth normalization should realign rn_in_dept with sibling SELECT items, got:\n{}",
+            formatted
+        );
     }
 
     #[test]
@@ -34104,6 +34835,92 @@ FROM emp;"#;
             leading_spaces(lines[from_idx]),
             leading_spaces(lines[select_idx]),
             "FROM under comment-gapped CREATE ... AS should stay on the same query base as SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_split_materialized_view_header_on_owner_depth() {
+        let source = r#"CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST
+ON DEMAND ENABLE QUERY REWRITE AS
+WITH date_dim AS (
+    SELECT
+        cal_date
+    FROM dual
+)
+SELECT
+    cal_date
+FROM date_dim;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let expected = r#"CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST
+ON DEMAND ENABLE QUERY REWRITE AS
+    WITH date_dim AS (
+        SELECT cal_date
+        FROM DUAL
+    )
+    SELECT cal_date
+    FROM date_dim;"#;
+
+        assert_eq!(
+            formatted, expected,
+            "split materialized-view headers should keep BUILD/ON fragments on the owner depth and indent the owned WITH query one level deeper"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_split_materialized_view_header_on_owner_depth() {
+        let source = r#"CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST
+        ON DEMAND ENABLE QUERY REWRITE AS
+WITH date_dim AS (
+SELECT cal_date
+FROM dual
+)
+SELECT cal_date
+FROM date_dim;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE MATERIALIZED VIEW mv_sales_dashboard")
+                .expect("CREATE MATERIALIZED VIEW line");
+        let as_idx = find_line_starting_with(&lines, "ON DEMAND ENABLE QUERY REWRITE AS")
+            .expect("AS completion line");
+        let with_idx = find_line_starting_with(&lines, "WITH date_dim AS (").expect("WITH line");
+        let cte_select_idx =
+            find_line_starting_with(&lines, "SELECT cal_date").expect("CTE SELECT line");
+        let close_idx = find_line_starting_with(&lines, ")").expect("CTE close line");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT cal_date")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[as_idx]),
+            leading_spaces(lines[create_idx]),
+            "split CREATE MATERIALIZED VIEW header fragments should stay aligned with the DDL owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[with_idx]),
+            leading_spaces(lines[as_idx]).saturating_add(4),
+            "WITH after split CREATE MATERIALIZED VIEW ... AS should stay one level deeper than the DDL owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[cte_select_idx]),
+            leading_spaces(lines[with_idx]).saturating_add(4),
+            "CTE body SELECT under the split materialized-view header should stay one level deeper than the CTE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[main_select_idx]),
+            leading_spaces(lines[with_idx]),
+            "main SELECT after the split materialized-view CTE should return to the WITH base depth, got:\n{}",
             formatted
         );
     }

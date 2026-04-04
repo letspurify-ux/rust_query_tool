@@ -130,6 +130,35 @@ struct InlineCommentLineContinuation {
     query_base_depth: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WithPlsqlAutoBodyFrameKind {
+    Routine,
+    Block,
+    Case,
+    If,
+    Loop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WithPlsqlAutoBodyFrame {
+    kind: WithPlsqlAutoBodyFrameKind,
+    owner_depth: usize,
+    awaiting_begin: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingWithPlsqlAutoDeclaration {
+    starts_body: bool,
+    owner_depth: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WithPlsqlAutoFormatState {
+    active_body_frames: Vec<WithPlsqlAutoBodyFrame>,
+    pending_routine_declaration: Option<PendingWithPlsqlAutoDeclaration>,
+    pending_end: bool,
+}
+
 type InlineCommentContinuationKind = sql_text::FormatInlineCommentHeaderContinuationKind;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1464,7 +1493,12 @@ impl QueryExecutor {
                 .collect();
         }
 
-        let next_code_indices = Self::auto_format_next_code_line_indices(&lines);
+        let multiline_string_prefix_lengths =
+            sql_text::multiline_string_continuation_prefix_lengths(sql, lines.len());
+        let next_code_indices = Self::auto_format_next_code_line_indices(
+            &lines,
+            &multiline_string_prefix_lengths,
+        );
         let mut contexts = Vec::with_capacity(lines.len());
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
         let mut pending_query_bases: Vec<PendingQueryBaseFrame> = Vec::new();
@@ -1486,10 +1520,17 @@ impl QueryExecutor {
         let mut trigger_header_frame: Option<TriggerHeaderDepthFrame> = None;
         let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
         let mut pending_control_branch_body_depth: Option<usize> = None;
+        let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
 
         for (idx, line) in lines.iter().enumerate() {
+            let analysis_line = multiline_string_prefix_lengths
+                .get(idx)
+                .copied()
+                .flatten()
+                .and_then(|prefix_len| line.get(prefix_len..))
+                .unwrap_or(line);
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
-            let trimmed = line.trim_start();
+            let trimmed = analysis_line.trim_start();
             let mut context = AutoFormatLineContext {
                 parser_depth,
                 auto_depth: parser_depth,
@@ -1507,7 +1548,8 @@ impl QueryExecutor {
                 continue;
             }
 
-            if sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
+            if sql_text::line_is_comment_only_with_block_state(analysis_line, &mut in_block_comment)
+            {
                 contexts.push(context);
                 continue;
             }
@@ -1586,6 +1628,11 @@ impl QueryExecutor {
                 &trimmed_upper,
             );
             let active_frame = query_frames.last().copied();
+            let active_with_plsql_scope = active_frame.is_some_and(|frame| {
+                frame.head_kind == Some(AutoFormatClauseKind::With)
+                    && !frame.with_main_query_started
+                    && parser_depth >= frame.start_parser_depth
+            });
             let active_line_continuation = pending_line_continuation.take();
             let active_inline_comment_line_continuation =
                 pending_inline_comment_line_continuation.take();
@@ -1944,6 +1991,17 @@ impl QueryExecutor {
                 }
             }
 
+            if let Some(with_plsql_body_depth) = Self::with_plsql_auto_body_depth_for_line(
+                &with_plsql_auto_format_state,
+                &trimmed_upper,
+                current_line_starts_elsif,
+                current_line_starts_elseif,
+                current_line_is_exact_else,
+                current_line_is_exact_exception,
+            ) {
+                context.auto_depth = context.auto_depth.max(with_plsql_body_depth);
+            }
+
             context.line_semantic = AutoFormatLineSemantic::from_analysis(
                 clause_kind,
                 context.query_role,
@@ -2292,7 +2350,7 @@ impl QueryExecutor {
             }
 
             let condition_annotation = Self::annotate_parenthesized_condition_line(
-                line,
+                analysis_line,
                 idx,
                 context.auto_depth,
                 owner_relative_frames.last().is_some_and(|frame| {
@@ -2605,6 +2663,13 @@ impl QueryExecutor {
                     owner_depth: context.auto_depth,
                 });
             }
+
+            Self::advance_with_plsql_auto_format_state(
+                &mut with_plsql_auto_format_state,
+                active_with_plsql_scope,
+                clause_detection_trimmed,
+                context.auto_depth,
+            );
 
             let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
@@ -3124,18 +3189,28 @@ impl QueryExecutor {
                 || sql_text::line_is_create_query_body_header(line))
     }
 
-    fn auto_format_next_code_line_indices(lines: &[&str]) -> Vec<Option<usize>> {
+    fn auto_format_next_code_line_indices(
+        lines: &[&str],
+        multiline_string_prefix_lengths: &[Option<usize>],
+    ) -> Vec<Option<usize>> {
         let mut is_code_line = vec![false; lines.len()];
         let mut in_block_comment = false;
 
         for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
+            let analysis_line = multiline_string_prefix_lengths
+                .get(idx)
+                .copied()
+                .flatten()
+                .and_then(|prefix_len| line.get(prefix_len..))
+                .unwrap_or(line);
+            let trimmed = analysis_line.trim_start();
 
             if trimmed.is_empty() {
                 continue;
             }
 
-            if sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
+            if sql_text::line_is_comment_only_with_block_state(analysis_line, &mut in_block_comment)
+            {
                 continue;
             }
             sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
@@ -3374,6 +3449,219 @@ impl QueryExecutor {
 
     fn line_starts_continuation_boundary(line: &str) -> bool {
         sql_text::starts_with_auto_format_structural_continuation_boundary(line)
+    }
+
+    fn pop_with_plsql_auto_body_frame(
+        active_body_frames: &mut Vec<WithPlsqlAutoBodyFrame>,
+        expected_kind: Option<WithPlsqlAutoBodyFrameKind>,
+    ) {
+        if let Some(expected_kind) = expected_kind {
+            if active_body_frames
+                .last()
+                .is_some_and(|frame| frame.kind == expected_kind)
+            {
+                let _ = active_body_frames.pop();
+                return;
+            }
+
+            if let Some(frame_idx) = active_body_frames
+                .iter()
+                .rposition(|frame| frame.kind == expected_kind)
+            {
+                active_body_frames.remove(frame_idx);
+                return;
+            }
+        }
+
+        let _ = active_body_frames.pop();
+    }
+
+    fn with_plsql_auto_end_frame_kind(trimmed_upper: &str) -> Option<WithPlsqlAutoBodyFrameKind> {
+        if sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+            trimmed_upper,
+            &["END", "CASE"],
+        ) {
+            Some(WithPlsqlAutoBodyFrameKind::Case)
+        } else if sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+            trimmed_upper,
+            &["END", "IF"],
+        ) {
+            Some(WithPlsqlAutoBodyFrameKind::If)
+        } else if sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+            trimmed_upper,
+            &["END", "LOOP"],
+        ) {
+            Some(WithPlsqlAutoBodyFrameKind::Loop)
+        } else {
+            None
+        }
+    }
+
+    fn with_plsql_auto_body_depth_for_line(
+        state: &WithPlsqlAutoFormatState,
+        trimmed_upper: &str,
+        current_line_starts_elsif: bool,
+        current_line_starts_elseif: bool,
+        current_line_is_exact_else: bool,
+        current_line_is_exact_exception: bool,
+    ) -> Option<usize> {
+        let frame = state.active_body_frames.last().copied()?;
+
+        if state.pending_end
+            || sql_text::starts_with_keyword_token(trimmed_upper, "END")
+            || current_line_starts_elsif
+            || current_line_starts_elseif
+            || current_line_is_exact_else
+            || current_line_is_exact_exception
+            || (sql_text::starts_with_keyword_token(trimmed_upper, "BEGIN")
+                && frame.kind == WithPlsqlAutoBodyFrameKind::Routine
+                && frame.awaiting_begin)
+        {
+            Some(frame.owner_depth)
+        } else {
+            Some(frame.owner_depth.saturating_add(1))
+        }
+    }
+
+    fn advance_with_plsql_auto_format_state(
+        state: &mut WithPlsqlAutoFormatState,
+        active_with_plsql_scope: bool,
+        trimmed_upper: &str,
+        owner_depth: usize,
+    ) {
+        if !(active_with_plsql_scope
+            || !state.active_body_frames.is_empty()
+            || state.pending_routine_declaration.is_some()
+            || state.pending_end)
+        {
+            return;
+        }
+
+        if state.pending_end {
+            Self::pop_with_plsql_auto_body_frame(
+                &mut state.active_body_frames,
+                Self::with_plsql_auto_end_frame_kind(trimmed_upper),
+            );
+            state.pending_end = false;
+        }
+
+        let words = sql_text::meaningful_identifier_words_before_inline_comment(trimmed_upper, 16);
+        let Some(first_word) = words.first().copied() else {
+            return;
+        };
+        let first_upper = first_word.to_ascii_uppercase();
+
+        if active_with_plsql_scope && sql_text::is_with_plsql_declaration_keyword(&first_upper) {
+            let pending_declaration = PendingWithPlsqlAutoDeclaration {
+                starts_body: sql_text::with_plsql_declaration_starts_routine_body(&first_upper),
+                owner_depth,
+            };
+            state.pending_routine_declaration = Some(pending_declaration);
+
+            if pending_declaration.starts_body
+                && words
+                    .iter()
+                    .skip(1)
+                    .any(|word| word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS"))
+            {
+                state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                    kind: WithPlsqlAutoBodyFrameKind::Routine,
+                    owner_depth: pending_declaration.owner_depth,
+                    awaiting_begin: true,
+                });
+                state.pending_routine_declaration = None;
+            }
+            return;
+        }
+
+        if matches!(first_upper.as_str(), "AS" | "IS")
+            && state
+                .pending_routine_declaration
+                .is_some_and(|declaration| declaration.starts_body)
+        {
+            let owner_depth = state
+                .pending_routine_declaration
+                .map(|declaration| declaration.owner_depth)
+                .unwrap_or(owner_depth);
+            state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                kind: WithPlsqlAutoBodyFrameKind::Routine,
+                owner_depth,
+                awaiting_begin: true,
+            });
+            state.pending_routine_declaration = None;
+            return;
+        }
+
+        match first_upper.as_str() {
+            "BEGIN" => {
+                if let Some(frame) = state.active_body_frames.last_mut() {
+                    if frame.kind == WithPlsqlAutoBodyFrameKind::Routine && frame.awaiting_begin {
+                        frame.awaiting_begin = false;
+                    } else {
+                        state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                            kind: WithPlsqlAutoBodyFrameKind::Block,
+                            owner_depth,
+                            awaiting_begin: false,
+                        });
+                    }
+                }
+            }
+            "DECLARE" => {
+                if !state.active_body_frames.is_empty() {
+                    state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                        kind: WithPlsqlAutoBodyFrameKind::Block,
+                        owner_depth,
+                        awaiting_begin: false,
+                    });
+                }
+            }
+            "CASE" => {
+                if !state.active_body_frames.is_empty() {
+                    state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                        kind: WithPlsqlAutoBodyFrameKind::Case,
+                        owner_depth,
+                        awaiting_begin: false,
+                    });
+                }
+            }
+            "IF" => {
+                if !state.active_body_frames.is_empty() {
+                    state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                        kind: WithPlsqlAutoBodyFrameKind::If,
+                        owner_depth,
+                        awaiting_begin: false,
+                    });
+                }
+            }
+            "LOOP" => {
+                if !state.active_body_frames.is_empty() {
+                    state.active_body_frames.push(WithPlsqlAutoBodyFrame {
+                        kind: WithPlsqlAutoBodyFrameKind::Loop,
+                        owner_depth,
+                        awaiting_begin: false,
+                    });
+                }
+            }
+            "END" => {
+                if state.active_body_frames.is_empty() {
+                    return;
+                }
+
+                if sql_text::starts_with_format_end_suffix_terminator(trimmed_upper) {
+                    Self::pop_with_plsql_auto_body_frame(
+                        &mut state.active_body_frames,
+                        Self::with_plsql_auto_end_frame_kind(trimmed_upper),
+                    );
+                } else if sql_text::starts_with_format_named_plain_end(trimmed_upper)
+                    || sql_text::starts_with_format_bare_end(trimmed_upper)
+                {
+                    Self::pop_with_plsql_auto_body_frame(&mut state.active_body_frames, None);
+                } else {
+                    state.pending_end = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn line_continuation_for_line(
@@ -9453,6 +9741,123 @@ ORDER BY rt.PATH;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_with_function_return_in_body_and_end_on_owner_depth() {
+        let sql = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let begin_idx = find_line("BEGIN");
+        let return_idx = find_line("RETURN v_depth;");
+        let end_idx = find_line("END calc_depth;");
+
+        assert_eq!(
+            contexts[return_idx].auto_depth,
+            contexts[begin_idx].auto_depth.saturating_add(1),
+            "WITH FUNCTION RETURN should stay one level deeper than BEGIN in auto-format contexts"
+        );
+        assert_eq!(
+            contexts[end_idx].auto_depth, contexts[begin_idx].auto_depth,
+            "WITH FUNCTION END should realign with the BEGIN owner depth in auto-format contexts"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_trailing_with_function_sibling_cte_on_with_depth() {
+        let sql = r#"WITH
+    FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
+        v_depth NUMBER;
+    BEGIN
+        SELECT MAX (LEVEL)
+        INTO v_depth
+        FROM org_tree
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR node_id = parent_id;
+    RETURN v_depth;
+END calc_depth;
+recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
+    SELECT
+        node_id,
+        parent_id,
+        node_name,
+        1 AS DEPTH,
+        CAST (node_name AS VARCHAR2 (4000)) AS PATH
+    FROM org_tree
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT
+        t.node_id,
+        t.parent_id,
+        t.node_name,
+        rt.DEPTH + 1,
+        rt.PATH || ' > ' || t.node_name
+    FROM org_tree t
+    JOIN recursive_tree rt
+        ON t.parent_id = rt.node_id
+    WHERE rt.DEPTH < calc_depth (t.node_id)
+),
+    aggregated AS (
+        SELECT
+            parent_id,
+            COUNT (*) AS child_count,
+            MAX (DEPTH) AS max_depth,
+            LISTAGG (node_name, ', ') WITHIN GROUP (ORDER BY node_name) AS children
+        FROM recursive_tree
+        WHERE DEPTH > 1
+        GROUP BY parent_id
+    );"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+        let with_idx = find_line("WITH");
+        let recursive_cte_idx =
+            find_line("recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (");
+        let aggregated_cte_idx = find_line("aggregated AS (");
+        let aggregated_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(aggregated_cte_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[recursive_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "first trailing CTE after WITH FUNCTION body should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[aggregated_cte_idx].auto_depth, contexts[with_idx].auto_depth,
+            "sibling trailing CTE after WITH FUNCTION body should stay on the WITH owner depth"
+        );
+        assert_eq!(
+            contexts[aggregated_select_idx].auto_depth,
+            contexts[aggregated_cte_idx].auto_depth.saturating_add(1),
+            "trailing aggregated CTE body SELECT should stay exactly one level deeper than the CTE header"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_column_list_cte_sibling_on_with_depth() {
         let sql = r#"WITH a AS (
     SELECT 1
@@ -11598,6 +12003,60 @@ FROM emp;"#;
         assert_eq!(
             contexts[from_idx].query_base_depth, contexts[select_idx].query_base_depth,
             "FROM under comment-gapped CREATE ... AS should keep the same query base as SELECT"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_split_materialized_view_header_on_owner_depth() {
+        let sql = r#"CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST
+ON DEMAND ENABLE QUERY REWRITE AS
+WITH date_dim AS (
+SELECT cal_date
+FROM dual
+)
+SELECT cal_date
+FROM date_dim;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let create_idx =
+            find_line("CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST");
+        let as_idx = find_line("ON DEMAND ENABLE QUERY REWRITE AS");
+        let with_idx = find_line("WITH date_dim AS (");
+        let cte_select_idx = find_line("SELECT cal_date");
+        let close_idx = find_line(")");
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT cal_date")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[as_idx].auto_depth, contexts[create_idx].auto_depth,
+            "split CREATE MATERIALIZED VIEW header fragments should stay on the original owner depth"
+        );
+        assert_eq!(
+            contexts[with_idx].auto_depth,
+            contexts[as_idx].auto_depth.saturating_add(1),
+            "WITH after split CREATE MATERIALIZED VIEW ... AS should start exactly one level deeper than the DDL owner"
+        );
+        assert_eq!(
+            contexts[cte_select_idx].auto_depth,
+            contexts[with_idx].auto_depth.saturating_add(1),
+            "CTE body SELECT under the split materialized-view header should stay one level deeper than the CTE owner"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after the split materialized-view CTE should return to the WITH base depth"
         );
     }
 
@@ -16719,6 +17178,287 @@ WHERE d.deptno > 0;"#;
         assert_eq!(
             contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
             "WHERE after the comma sibling should return to the FROM owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_restore_select_item_depth_after_nested_scalar_queries() {
+        let sql = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
+        SELECT
+            d.dept_id,
+            d.parent_dept_id,
+            TO_CHAR (d.dept_name) AS dept_path_txt,
+            1 AS lvl
+        FROM qt_fmt_dept d
+        WHERE d.parent_dept_id IS NULL
+        UNION ALL
+        SELECT
+            c.dept_id,
+            c.parent_dept_id,
+            p.dept_path_txt || ' > ' || c.dept_name,
+            p.lvl + 1
+        FROM qt_fmt_dept c
+        JOIN dept_path p
+            ON p.dept_id = c.parent_dept_id
+    ),
+    skill_rows AS (
+        SELECT
+            e.emp_id,
+            jt.skill,
+            jt.grade,
+            jt.remote_yn
+        FROM qt_fmt_emp e,
+            JSON_TABLE (e.json_doc, '$' COLUMNS (
+                grade VARCHAR2 (10) PATH '$.meta.grade',
+                remote_yn VARCHAR2 (5) PATH '$.meta.remote',
+                NESTED PATH '$.skills[*]' COLUMNS (
+                    skill VARCHAR2 (100) PATH '$'
+                )
+            )) jt
+    ),
+    xml_rows AS (
+        SELECT
+            e.emp_id,
+            x.flag_txt
+        FROM qt_fmt_emp e,
+            XMLTABLE ('/emp/flags/flag' PASSING e.xml_doc COLUMNS flag_txt VARCHAR2 (100) PATH '.') x
+    )
+    SELECT
+        e.emp_id,
+        e.emp_name,
+        e.login_name,
+        e.email_addr,
+        e.salary,
+        e.bonus_pct,
+        e.hire_dt,
+        e.status_cd,
+        e.job_title,
+        d.dept_id,
+        d.dept_code,
+        d.dept_name,
+        dp.dept_path_txt,
+        (
+            SELECT LISTAGG (sr.skill, ', ') WITHIN GROUP (ORDER BY sr.skill)
+            FROM skill_rows sr
+            WHERE sr.emp_id = e.emp_id
+        ) AS skill_list,
+        (
+            SELECT LISTAGG (xr.flag_txt, ', ') WITHIN GROUP (ORDER BY xr.flag_txt)
+            FROM xml_rows xr
+            WHERE xr.emp_id = e.emp_id
+        ) AS flag_list,
+                (
+                    SELECT SUM (b.amount)
+                    FROM qt_fmt_bonus b
+                    WHERE b.emp_id = e.emp_id
+                        AND b.bonus_year = 2024
+                ) AS bonus_2024,
+                        ROW_NUMBER () OVER (
+                            PARTITION BY e.dept_id
+                            ORDER BY e.salary DESC NULLS LAST,
+                            e.emp_id
+                        ) AS rn_in_dept,
+        DENSE_RANK () OVER (
+            ORDER BY e.salary DESC NULLS LAST
+        ) AS salary_rank_all,
+        AVG (e.salary) OVER (
+            PARTITION BY e.dept_id
+        ) AS dept_avg_salary,
+        SUM (
+            CASE
+                WHEN e.status_cd = 'ACTIVE' THEN NVL (e.salary, 0)
+                ELSE 0
+            END
+        ) OVER (
+            PARTITION BY e.dept_id
+        ) AS active_salary_sum
+    FROM qt_fmt_emp e
+    JOIN qt_fmt_dept d
+        ON d.dept_id = e.dept_id
+    LEFT JOIN dept_path dp
+        ON dp.dept_id = d.dept_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let bonus_idx = find_line(") AS bonus_2024,");
+        let rn_idx = find_line("ROW_NUMBER () OVER (");
+        let rank_idx = find_line("DENSE_RANK () OVER (");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(find_line(") AS flag_list,").saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(open_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT SUM (b.amount)")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[bonus_idx].auto_depth, contexts[rank_idx].auto_depth,
+            "bonus_2024 should restore the surrounding SELECT item depth after the nested scalar query closes"
+        );
+        assert_eq!(
+            contexts[rn_idx].auto_depth, contexts[rank_idx].auto_depth,
+            "rn_in_dept should start on the same SELECT item depth as sibling analytic items"
+        );
+        assert_eq!(
+            contexts[open_idx].auto_depth, contexts[rank_idx].auto_depth,
+            "standalone open paren for bonus_2024 should stay on the sibling SELECT item depth"
+        );
+        assert_eq!(
+            contexts[open_idx].next_query_head_depth,
+            Some(contexts[rank_idx].auto_depth.saturating_add(1)),
+            "standalone open paren for bonus_2024 should carry the nested SELECT head depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[rank_idx].auto_depth.saturating_add(1),
+            "child SELECT under bonus_2024 should stay exactly one level deeper than the SELECT item depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_restore_outer_query_depth_after_nested_json_xml_select_item() {
+        let sql = r#"SELECT x.employee_id,
+    XMLQUERY ('for $i in /employees/employee
+         where $i/salary > 5000
+         return <result>
+             <name>{$i/name/text()}</name>
+             <bonus>{$i/salary * 0.1}</bonus>
+         </result>' PASSING x.xml_data RETURNING CONTENT) AS xml_result,
+        JSON_OBJECT (KEY 'id' VALUE x.employee_id, KEY 'name' VALUE x.emp_name, KEY 'details' VALUE JSON_OBJECT (KEY 'salary' VALUE x.salary, KEY 'department' VALUE x.dept_name, KEY 'skills' VALUE (
+                SELECT JSON_ARRAYAGG (JSON_OBJECT (KEY 'skill' VALUE s.skill_name, KEY 'level' VALUE s.proficiency) ORDER BY s.proficiency DESC
+                    RETURNING CLOB)
+                FROM employee_skills s
+                WHERE s.employee_id = x.employee_id
+            )), KEY 'metadata' VALUE JSON_OBJECT (KEY 'generated' VALUE TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD\"T\"HH24:MI:SS.FF3\"Z\"'), KEY 'version' VALUE '2.0') RETURNING CLOB) AS json_output
+        FROM (
+            SELECT e.employee_id,
+        e.first_name || ' ' || e.last_name AS emp_name,
+        e.salary,
+        d.department_name AS dept_name,
+        XMLTYPE ('<employees><employee><name>' || e.first_name || '</name>' || '<salary>' || e.salary || '</salary></employee></employees>') AS xml_data
+            FROM employees e
+        JOIN departments d
+                ON e.department_id = d.department_id
+            WHERE e.salary > (
+        SELECT AVG (salary)
+        FROM employees
+    )
+        ) x
+        WHERE XMLEXISTS ('/employees/employee[salary > 10000]' PASSING x.xml_data)
+        ORDER BY x.salary DESC
+        FETCH FIRST 20 ROWS ONLY;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or_else(|| panic!("missing line: {needle}"))
+        };
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let xmlquery_idx = find_line_starting_with("XMLQUERY ('for $i in /employees/employee");
+        let json_object_idx =
+            find_line_starting_with("JSON_OBJECT (KEY 'id' VALUE x.employee_id");
+        let skills_select_idx = find_line_starting_with("SELECT JSON_ARRAYAGG");
+        let skills_from_idx = find_line("FROM employee_skills s");
+        let skills_where_idx = find_line("WHERE s.employee_id = x.employee_id");
+        let outer_from_idx = find_line("FROM (");
+        let inner_select_idx = find_line("SELECT e.employee_id,");
+        let inner_from_idx = find_line("FROM employees e");
+        let inner_join_idx = find_line("JOIN departments d");
+        let inner_where_idx = find_line("WHERE e.salary > (");
+        let avg_select_idx = find_line("SELECT AVG (salary)");
+        let outer_where_idx =
+            find_line("WHERE XMLEXISTS ('/employees/employee[salary > 10000]' PASSING x.xml_data)");
+        let outer_order_idx = find_line("ORDER BY x.salary DESC");
+        let outer_fetch_idx = find_line("FETCH FIRST 20 ROWS ONLY;");
+
+        assert_eq!(
+            contexts[json_object_idx].auto_depth, contexts[xmlquery_idx].auto_depth,
+            "JSON_OBJECT select item should restore the surrounding SELECT item depth after the nested skills subquery"
+        );
+        assert_eq!(
+            contexts[json_object_idx].next_query_head_depth,
+            Some(contexts[json_object_idx].auto_depth.saturating_add(1)),
+            "KEY 'skills' VALUE ( owner line should carry the child SELECT head depth"
+        );
+        assert_eq!(
+            contexts[skills_select_idx].query_base_depth,
+            Some(contexts[json_object_idx].auto_depth.saturating_add(1)),
+            "child SELECT under KEY 'skills' VALUE ( should inherit the carried query-base depth"
+        );
+        assert_eq!(
+            contexts[skills_select_idx].auto_depth,
+            contexts[json_object_idx].auto_depth.saturating_add(1),
+            "child SELECT under KEY 'skills' VALUE ( should stay exactly one level deeper than the surrounding JSON_OBJECT select item"
+        );
+        assert_eq!(
+            contexts[skills_from_idx].auto_depth, contexts[skills_select_idx].auto_depth,
+            "skills subquery FROM should stay on the child SELECT base depth"
+        );
+        assert_eq!(
+            contexts[skills_where_idx].auto_depth, contexts[skills_select_idx].auto_depth,
+            "skills subquery WHERE should stay on the child SELECT base depth"
+        );
+        assert!(
+            contexts[outer_from_idx].auto_depth < contexts[json_object_idx].auto_depth,
+            "outer FROM should clear the select-list continuation depth after the nested JSON/XML select item"
+        );
+        assert_eq!(
+            contexts[inner_select_idx].auto_depth,
+            contexts[outer_from_idx].auto_depth.saturating_add(1),
+            "derived-table SELECT should start exactly one level deeper than FROM ("
+        );
+        assert_eq!(
+            contexts[inner_from_idx].auto_depth, contexts[inner_select_idx].auto_depth,
+            "inner FROM should stay on the derived query base depth"
+        );
+        assert_eq!(
+            contexts[inner_join_idx].auto_depth, contexts[inner_from_idx].auto_depth,
+            "inner JOIN should stay on the derived query base depth"
+        );
+        assert_eq!(
+            contexts[inner_where_idx].auto_depth, contexts[inner_from_idx].auto_depth,
+            "inner WHERE should stay on the derived query base depth"
+        );
+        assert_eq!(
+            contexts[avg_select_idx].auto_depth,
+            contexts[inner_where_idx].auto_depth.saturating_add(1),
+            "scalar SELECT under the derived-table WHERE should stay exactly one level deeper than the WHERE owner"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].auto_depth, contexts[outer_from_idx].auto_depth,
+            "outer WHERE should return to the outer query base depth after the derived table closes"
+        );
+        assert_eq!(
+            contexts[outer_order_idx].auto_depth, contexts[outer_from_idx].auto_depth,
+            "outer ORDER BY should stay on the outer query base depth"
+        );
+        assert_eq!(
+            contexts[outer_fetch_idx].auto_depth, contexts[outer_from_idx].auto_depth,
+            "outer FETCH should stay on the outer query base depth"
         );
     }
 

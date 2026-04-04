@@ -731,6 +731,11 @@ const FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS: &[&str] = &[
     "KEEP",
 ];
 
+/// Exact leading header sequences whose body should continue one level deeper
+/// than the current header line.
+const FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_SEQUENCES: &[&[&str]] =
+    &[&["ORDER", "SIBLINGS", "BY"]];
+
 /// `CREATE TABLE ...` suffix keywords used by formatter to split storage clauses.
 pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
     "PCTFREE",
@@ -1468,6 +1473,200 @@ pub(crate) fn line_is_standalone_open_paren_before_inline_comment(line: &str) ->
             Some(FormatTrailingMeaningfulToken::Symbol(symbol))
         ) if symbol == "("
     )
+}
+
+/// Returns the leading byte length that belongs to an already-open multiline
+/// string / quoted identifier / q-quote for each line.
+///
+/// `Some(prefix_len)` means the line starts inside a multiline quoted payload.
+/// If `prefix_len == line.len()`, the whole line belongs to the payload.
+/// Otherwise the quoted payload closes on that line and structural SQL starts
+/// again at `line[prefix_len..]`.
+pub(crate) fn multiline_string_continuation_prefix_lengths(
+    text: &str,
+    line_count: usize,
+) -> Vec<Option<usize>> {
+    let mut prefix_lengths = vec![None; line_count];
+    if line_count == 0 {
+        return prefix_lengths;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let mut line = 0usize;
+    let mut line_start = 0usize;
+    let mut line_starts_in_multiline_string = false;
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_q_quote = false;
+    let mut q_quote_end: Option<u8> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        if in_line_comment {
+            if c == b'\n' {
+                in_line_comment = false;
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            if c == b'\n' {
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_q_quote {
+            if Some(c) == q_quote_end && next == Some(b'\'') {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(i.saturating_add(2).saturating_sub(line_start));
+                }
+                in_q_quote = false;
+                q_quote_end = None;
+                i += 2;
+                continue;
+            }
+            if c == b'\n' {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(lines[line].len());
+                }
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_single_quote {
+            if c == b'\'' {
+                if next == Some(b'\'') {
+                    i += 2;
+                    continue;
+                }
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(i.saturating_add(1).saturating_sub(line_start));
+                }
+                in_single_quote = false;
+                i += 1;
+                continue;
+            }
+            if c == b'\n' {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(lines[line].len());
+                }
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if c == b'"' {
+                if next == Some(b'"') {
+                    i += 2;
+                    continue;
+                }
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(i.saturating_add(1).saturating_sub(line_start));
+                }
+                in_double_quote = false;
+                i += 1;
+                continue;
+            }
+            if c == b'\n' {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(lines[line].len());
+                }
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == b'\n' {
+            line += 1;
+            line_start = i.saturating_add(1);
+            line_starts_in_multiline_string = false;
+            i += 1;
+            continue;
+        }
+
+        if c == b'-' && next == Some(b'-') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if c == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if (c == b'n' || c == b'N')
+            && matches!(next, Some(b'q') | Some(b'Q'))
+            && bytes.get(i + 2) == Some(&b'\'')
+            && bytes.get(i + 3).is_some()
+        {
+            let delimiter = bytes[i + 3];
+            in_q_quote = true;
+            q_quote_end = Some(q_quote_closing(delimiter as char) as u8);
+            i += 4;
+            continue;
+        }
+
+        if (c == b'q' || c == b'Q') && next == Some(b'\'') && bytes.get(i + 2).is_some() {
+            let delimiter = bytes[i + 2];
+            in_q_quote = true;
+            q_quote_end = Some(q_quote_closing(delimiter as char) as u8);
+            i += 3;
+            continue;
+        }
+
+        if c == b'\'' {
+            in_single_quote = true;
+            i += 1;
+            continue;
+        }
+
+        if c == b'"' {
+            in_double_quote = true;
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if (in_single_quote || in_double_quote || in_q_quote) && line_starts_in_multiline_string && line < line_count {
+        prefix_lengths[line] = Some(lines[line].len());
+    }
+
+    prefix_lengths
 }
 
 /// Returns true if `word` is one of the shared Oracle SQL keywords.
@@ -2654,12 +2853,9 @@ pub(crate) fn line_is_format_cte_definition_header(line: &str) -> bool {
 
 /// Returns true when a CREATE query-body DDL header line owns the following
 /// query body through a trailing `AS`.
-pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
-    if !line_ends_with_keyword(line, "AS") {
-        return false;
-    }
-
-    let words = meaningful_identifier_words_before_inline_comment(line, 8);
+fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
+    let structural_tail = owner_header_structural_tail(line);
+    let words = meaningful_identifier_words_before_inline_comment(structural_tail, 8);
     if !words
         .first()
         .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
@@ -2733,6 +2929,18 @@ pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
             .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
 }
 
+fn line_completes_create_query_body_pending_header(line: &str) -> bool {
+    let structural_tail = owner_header_structural_tail(line);
+    !structural_tail.is_empty()
+        && !line_ends_with_open_paren_before_inline_comment(structural_tail)
+        && line_ends_with_keyword(structural_tail, "AS")
+}
+
+pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
+    line_starts_create_query_body_header_prefix(line)
+        && line_completes_create_query_body_pending_header(line)
+}
+
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
     leading_identifier_words(trimmed_upper, 1)
         .first()
@@ -2746,6 +2954,7 @@ pub(crate) enum FormatQueryOwnerKind {
     FromItem,
     Condition,
     Operator,
+    DdlBody,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2766,6 +2975,7 @@ pub(crate) enum PendingFormatQueryOwnerHeaderKind {
     ReferenceOn,
     JoinLike,
     ConditionNot,
+    CreateQueryBody,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2786,7 +2996,7 @@ impl FormatQueryOwnerKind {
             Self::Clause | Self::FromItem => query_base_depth,
             Self::Condition => condition_header_depth
                 .or_else(|| query_base_depth.map(|depth| depth.saturating_add(1))),
-            Self::Operator => None,
+            Self::Operator | Self::DdlBody => None,
         }
     }
 
@@ -2801,7 +3011,7 @@ impl FormatQueryOwnerKind {
             Self::Condition => query_base_depth
                 .map(|depth| resolved_owner_depth.max(depth.saturating_add(1)))
                 .unwrap_or(resolved_owner_depth.saturating_add(1)),
-            Self::Clause | Self::FromItem | Self::Operator => resolved_owner_depth,
+            Self::Clause | Self::FromItem | Self::Operator | Self::DdlBody => resolved_owner_depth,
         }
     }
 
@@ -2817,7 +3027,9 @@ impl FormatQueryOwnerKind {
                 .map(|depth| depth.saturating_add(2))
                 .map(|depth| depth.max(resolved_owner_depth.saturating_add(1)))
                 .unwrap_or(resolved_owner_depth.saturating_add(1)),
-            Self::FromItem | Self::Operator => resolved_owner_depth.saturating_add(1),
+            Self::FromItem | Self::Operator | Self::DdlBody => {
+                resolved_owner_depth.saturating_add(1)
+            }
         }
     }
 }
@@ -2878,6 +3090,9 @@ impl PendingFormatQueryOwnerHeaderKind {
                     || line_ends_with_keyword(structural_tail, "IN"))
                 .then_some(FormatQueryOwnerKind::Condition)
             }
+            Self::CreateQueryBody => self
+                .line_completes(line)
+                .then_some(FormatQueryOwnerKind::DdlBody),
         }
     }
 
@@ -2890,6 +3105,7 @@ impl PendingFormatQueryOwnerHeaderKind {
                     || line_ends_with_keyword(structural_tail, "APPLY")
             }
             Self::ConditionNot => self.owner_kind_for_line(line).is_some(),
+            Self::CreateQueryBody => line_completes_create_query_body_pending_header(line),
         }
     }
 
@@ -2907,6 +3123,36 @@ impl PendingFormatQueryOwnerHeaderKind {
             // Everything else must terminate the pending header immediately.
             Self::JoinLike => starts_with_pending_query_owner_join_modifier(&trimmed_upper),
             Self::ConditionNot => self.line_completes(line),
+            Self::CreateQueryBody => {
+                if structural_tail.is_empty() {
+                    return owner_header_has_only_leading_close_parens(line);
+                }
+
+                if line_ends_with_semicolon_before_inline_comment(structural_tail)
+                    || line_starts_query_head(&trimmed_upper)
+                {
+                    return false;
+                }
+
+                let first_word = leading_meaningful_words(structural_tail, 1)
+                    .first()
+                    .copied()
+                    .map(str::to_ascii_uppercase);
+                !matches!(
+                    first_word.as_deref(),
+                    Some(
+                        "CREATE"
+                            | "ALTER"
+                            | "DROP"
+                            | "TRUNCATE"
+                            | "COMMENT"
+                            | "GRANT"
+                            | "REVOKE"
+                            | "BEGIN"
+                            | "DECLARE"
+                    )
+                )
+            }
         }
     }
 
@@ -2923,6 +3169,7 @@ impl PendingFormatQueryOwnerHeaderKind {
                 .header_depth_floor(query_base_depth, condition_header_depth)
                 .map(|depth_floor| current_depth.max(depth_floor))
                 .unwrap_or(current_depth),
+            Self::CreateQueryBody => current_depth,
         }
     }
 }
@@ -3071,6 +3318,13 @@ pub(crate) fn format_query_owner_pending_header_kind(
 ) -> Option<PendingFormatQueryOwnerHeaderKind> {
     let structural_tail = owner_header_structural_tail(line);
     let trimmed_upper = structural_tail.to_ascii_uppercase();
+    if line_starts_create_query_body_header_prefix(structural_tail)
+        && !line_completes_create_query_body_pending_header(structural_tail)
+        && !line_ends_with_semicolon_before_inline_comment(structural_tail)
+    {
+        return Some(PendingFormatQueryOwnerHeaderKind::CreateQueryBody);
+    }
+
     if line_starts_with_identifier_sequence(structural_tail, &["REFERENCE"])
         && !line_ends_with_keyword(structural_tail, "ON")
         && !line_ends_with_open_paren_before_inline_comment(structural_tail)
@@ -3317,12 +3571,31 @@ impl FormatIndentedParenOwnerKind {
         }
 
         let line_word_count = words.len();
+        let line_segment_count = words
+            .iter()
+            .map(|word| {
+                word.split('_')
+                    .filter(|segment| !segment.is_empty())
+                    .count()
+            })
+            .sum::<usize>();
         let mut best_match = None;
         let mut best_matched_words = 0usize;
 
         for (idx, sequence) in self.split_body_header_sequences().iter().enumerate() {
             let matched_words = leading_words_match_keyword_prefix(&words, sequence);
             if matched_words == 0 {
+                continue;
+            }
+
+            // Exact bare split-header carry is only valid when the entire
+            // line is itself a prefix of the owner-relative keyword chain.
+            // Otherwise overloaded clause heads like `ORDER SIBLINGS BY`
+            // would get hijacked by the generic owner-relative `ORDER BY`
+            // matcher and lose their clause-body depth.
+            let matched_segment_count =
+                identifier_sequence_segment_count(&sequence[..matched_words]);
+            if matched_words < sequence.len() && matched_segment_count != line_segment_count {
                 continue;
             }
 
@@ -3863,6 +4136,10 @@ pub(crate) fn starts_with_format_model_multiline_owner_tail(text_upper: &str) ->
 /// token itself and the opening parenthesis starts on a later line.
 pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
     let structural_tail = owner_header_structural_tail(line);
+
+    if line_is_create_query_body_header(structural_tail) {
+        return Some(FormatQueryOwnerKind::DdlBody);
+    }
 
     if line_ends_with_format_split_direct_from_item_query_owner_keyword(structural_tail)
         || line_ends_with_keyword(structural_tail, "APPLY")
@@ -5012,6 +5289,13 @@ pub(crate) fn format_leading_header_continuation_kind(
         return Some(kind);
     }
 
+    if FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_SEQUENCES
+        .iter()
+        .any(|sequence| line_starts_with_identifier_sequence(trimmed, sequence))
+    {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
+    }
+
     let words = leading_meaningful_words(line.trim_start(), 8);
     let mut continuation_kind = None;
 
@@ -5293,6 +5577,30 @@ mod tests {
         assert!(is_statement_head_keyword("REVOKE"));
         assert!(is_statement_head_keyword("COMMIT"));
         assert!(is_statement_head_keyword("ROLLBACK"));
+    }
+
+    #[test]
+    fn multiline_string_prefix_lengths_ignore_same_line_literals() {
+        let sql = "SELECT JSON_ARRAYAGG (JSON_OBJECT (KEY 'skill' VALUE s.skill_name, KEY 'level' VALUE s.proficiency) ORDER BY s.proficiency DESC\nRETURNING CLOB)";
+
+        assert_eq!(
+            multiline_string_continuation_prefix_lengths(sql, sql.lines().count()),
+            vec![None, None],
+            "same-line literals inside a code line must not hide the structural head of that line"
+        );
+    }
+
+    #[test]
+    fn multiline_string_prefix_lengths_keep_only_the_tail_after_a_multiline_literal_closes() {
+        let sql = "XMLQUERY ('for $i in /employees/employee\n</result>' PASSING x.xml_data RETURNING CONTENT)";
+        let prefixes = multiline_string_continuation_prefix_lengths(sql, sql.lines().count());
+
+        assert_eq!(prefixes[0], None);
+        assert_eq!(
+            prefixes[1],
+            Some("</result>'".len()),
+            "the closing line of a multiline literal should expose only the structural SQL tail"
+        );
     }
 
     #[test]
@@ -5963,6 +6271,10 @@ mod tests {
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
+            format_leading_header_continuation_kind("ORDER SIBLINGS BY salary DESC"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
             format_leading_header_continuation_kind("e.job_title ="),
             None
         );
@@ -6006,6 +6318,10 @@ mod tests {
             format_structural_header_continuation_kind("NATURAL LEFT JOIN"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanQueryBase)
         );
+        assert_eq!(
+            format_structural_header_continuation_kind("ORDER SIBLINGS BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
     }
 
     #[test]
@@ -6030,6 +6346,10 @@ mod tests {
         assert_eq!(
             format_bare_structural_header_continuation_kind("LEFT JOIN TABLE -- keep"),
             Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("ORDER SIBLINGS BY"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
             format_structural_header_continuation_kind("SELECT -- keep"),
@@ -7592,6 +7912,12 @@ mod tests {
             format_indented_paren_owner_header_kind("NESTED '$.items[*]' COLUMNS"),
             Some(FormatIndentedParenOwnerKind::StructuredColumns)
         );
+        assert_eq!(
+            format_indented_paren_owner_header_kind(
+                "SELECT LISTAGG (xr.flag_txt, ', ') WITHIN GROUP (ORDER BY xr.flag_txt)"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -7698,6 +8024,10 @@ mod tests {
             format_query_owner_header_kind("WHERE score < SOME"),
             Some(FormatQueryOwnerKind::Condition)
         );
+        assert_eq!(
+            format_query_owner_header_kind("CREATE MATERIALIZED VIEW mv_demo AS"),
+            Some(FormatQueryOwnerKind::DdlBody)
+        );
         assert_eq!(format_query_owner_header_kind("INSERT ALL"), None);
         assert_eq!(format_query_owner_header_kind("UPSERT ALL"), None);
         assert_eq!(format_query_owner_header_kind("RETURN ALL ROWS"), None);
@@ -7772,6 +8102,25 @@ mod tests {
             Some(FormatQueryOwnerKind::Condition)
         );
         assert!(!not_pending.line_can_continue("SELECT"));
+    }
+
+    #[test]
+    fn format_query_owner_pending_header_kind_tracks_split_create_query_body_headers() {
+        let ddl_pending = format_query_owner_pending_header_kind(
+            "CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST",
+        )
+        .expect("pending CREATE MATERIALIZED VIEW owner");
+
+        assert!(ddl_pending.line_can_continue("BUILD IMMEDIATE"));
+        assert!(ddl_pending.line_can_continue("ON DEMAND ENABLE QUERY REWRITE AS"));
+        assert!(ddl_pending.line_completes("ON DEMAND ENABLE QUERY REWRITE AS"));
+        assert_eq!(
+            ddl_pending.owner_kind_for_line("ON DEMAND ENABLE QUERY REWRITE AS"),
+            Some(FormatQueryOwnerKind::DdlBody)
+        );
+        assert!(!ddl_pending.line_can_continue("WITH date_dim AS ("));
+        assert!(!ddl_pending.line_can_continue("SELECT * FROM dual"));
+        assert!(!ddl_pending.line_can_continue("ALTER MATERIALIZED VIEW mv_sales_dashboard"));
     }
 
     #[test]
@@ -8131,6 +8480,10 @@ mod tests {
             None
         );
         assert_eq!(
+            FormatQueryOwnerKind::DdlBody.header_depth_floor(Some(2), None),
+            None
+        );
+        assert_eq!(
             FormatQueryOwnerKind::Clause.auto_format_child_query_owner_base_depth(2, Some(2)),
             2
         );
@@ -8151,6 +8504,10 @@ mod tests {
             4
         );
         assert_eq!(
+            FormatQueryOwnerKind::DdlBody.auto_format_child_query_owner_base_depth(3, None),
+            3
+        );
+        assert_eq!(
             FormatQueryOwnerKind::Clause.formatter_child_query_head_depth(2, Some(2)),
             4
         );
@@ -8169,6 +8526,10 @@ mod tests {
         assert_eq!(
             FormatQueryOwnerKind::Operator.formatter_child_query_head_depth(4, Some(2)),
             5
+        );
+        assert_eq!(
+            FormatQueryOwnerKind::DdlBody.formatter_child_query_head_depth(3, None),
+            4
         );
     }
 
