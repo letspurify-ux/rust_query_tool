@@ -7365,6 +7365,100 @@ fn delete_with_from_collects_target_table() {
     );
 }
 
+#[test]
+fn delete_from_returning_has_focused_target_table() {
+    // DELETE FROM t RETURNING should focus on the target table for column suggestions.
+    let ctx = analyze("DELETE FROM employees WHERE id > 0 RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["employees".to_string()],
+        "DELETE FROM target should record target table for RETURNING: focused={:?}",
+        ctx.focused_tables
+    );
+}
+
+#[test]
+fn delete_from_with_alias_returning_has_focused_target_table() {
+    let ctx = analyze("DELETE FROM employees e WHERE e.id > 0 RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["employees".to_string()],
+        "focused: {:?}",
+        ctx.focused_tables
+    );
+}
+
+#[test]
+fn delete_without_from_returning_has_focused_target_table() {
+    // Oracle-style DELETE table_name (without FROM).
+    let ctx = analyze("DELETE employees WHERE id > 0 RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["employees".to_string()],
+        "focused: {:?}",
+        ctx.focused_tables
+    );
+}
+
+#[test]
+fn delete_from_using_returning_focuses_target_table() {
+    // PostgreSQL DELETE ... USING: RETURNING should still focus the target table.
+    let ctx = analyze(
+        "DELETE FROM target_table t USING source_table s \
+         WHERE t.id = s.id RETURNING |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::DmlReturningList);
+    assert_eq!(
+        ctx.focused_tables,
+        vec!["target_table".to_string()],
+        "DELETE USING should focus target, not source: focused={:?}",
+        ctx.focused_tables
+    );
+}
+
+#[test]
+fn cross_join_table_position_is_table_context() {
+    let ctx = analyze("SELECT * FROM t1 CROSS JOIN |");
+    assert!(
+        ctx.phase.is_table_context(),
+        "CROSS JOIN target should be table context, got {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
+fn natural_join_table_position_is_table_context() {
+    let ctx = analyze("SELECT * FROM t1 NATURAL JOIN |");
+    assert!(
+        ctx.phase.is_table_context(),
+        "NATURAL JOIN target should be table context, got {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
+fn left_outer_join_table_position_is_table_context() {
+    let ctx = analyze("SELECT * FROM t1 LEFT OUTER JOIN |");
+    assert!(
+        ctx.phase.is_table_context(),
+        "LEFT OUTER JOIN target should be table context, got {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
+fn full_join_table_position_is_table_context() {
+    let ctx = analyze("SELECT * FROM t1 FULL JOIN |");
+    assert!(
+        ctx.phase.is_table_context(),
+        "FULL JOIN target should be table context, got {:?}",
+        ctx.phase
+    );
+}
+
 // ─── State machine regression tests ─────────────────────────────────────
 
 #[test]

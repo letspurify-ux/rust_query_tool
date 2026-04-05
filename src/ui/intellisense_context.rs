@@ -3203,7 +3203,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                             current_statement_kind,
                                             StatementKind::Insert | StatementKind::Merge
                                         )
-                                        && !is_log_errors_table_target(tokens, idx));
+                                        && !is_log_errors_table_target(tokens, idx))
+                                        || (matches!(current_phase, SqlPhase::FromClause)
+                                            && matches!(
+                                                current_statement_kind,
+                                                StatementKind::Delete
+                                            )
+                                            && depth_frames
+                                                .get(depth)
+                                                .and_then(|f| f.current_target_table.as_ref())
+                                                .is_none());
                                 if should_record_target_table {
                                     depth_frames[depth].current_target_table =
                                         Some(table_name.clone());
