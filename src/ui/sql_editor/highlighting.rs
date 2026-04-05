@@ -420,6 +420,13 @@ impl SqlEditorWidget {
         self.highlighter.clone()
     }
 
+    pub fn set_db_type(&self, db_type: crate::db::connection::DatabaseType) {
+        match self.highlighter.lock() {
+            Ok(mut h) => h.set_db_type(db_type),
+            Err(poisoned) => poisoned.into_inner().set_db_type(db_type),
+        }
+    }
+
     fn handle_buffer_highlight_update(
         &self,
         buf: &TextBuffer,

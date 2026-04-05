@@ -2751,6 +2751,12 @@ impl MainWindow {
                     s.set_status_message(&message);
                     s.refresh_result_edit_controls();
                 }
+                QueryProgress::MetadataRefreshNeeded => {
+                    MainWindow::start_connection_metadata_refresh(
+                        &mut s,
+                        &schema_sender_for_progress,
+                    );
+                }
                 QueryProgress::BatchFinished => {
                     s.progress_contexts.remove(&tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()
@@ -3997,8 +4003,10 @@ impl MainWindow {
                                 ConnectionResult::Success(info) => {
                                     crate::utils::logging::log_info(
                                         "connection",
-                                        &format!("Connected to {}", info.name),
+                                        &format!("Connected to {} ({})", info.name, info.db_type),
                                     );
+                                    // Set db_type on active SQL editor highlighter
+                                    s.sql_editor.set_db_type(info.db_type);
                                     *s.connection_info
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -4006,7 +4014,7 @@ impl MainWindow {
                                     s.has_live_connection = true;
                                     s.pending_connection_metadata_refresh = false;
                                     s.status_bar
-                                        .set_label(&format!("Connected | {}", info.name));
+                                        .set_label(&format!("Connected | {} ({})", info.name, info.db_type));
                                     MainWindow::start_connection_metadata_refresh(
                                         &mut s,
                                         &schema_sender,

@@ -2181,48 +2181,77 @@ impl ObjectBrowserWidget {
     }
 
     fn load_metadata_cache(connection: &SharedConnection) -> Option<ObjectCache> {
+        use crate::db::connection::DatabaseType;
+        use crate::db::query::mysql_executor::MysqlObjectBrowser;
+
         // Acquire connection lock and hold it during all queries.
         let mut conn_guard =
             lock_connection_with_activity(connection, "Refreshing object browser metadata");
-        let Ok(db_conn) = conn_guard.require_live_connection() else {
-            return None;
-        };
 
-        let mut cache = ObjectCache::default();
+        let db_type = conn_guard.db_type();
 
-        if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
-            cache.tables = tables;
+        match db_type {
+            DatabaseType::Oracle => {
+                let Ok(db_conn) = conn_guard.require_live_connection() else {
+                    return None;
+                };
+
+                let mut cache = ObjectCache::default();
+
+                if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
+                    cache.tables = tables;
+                }
+                if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
+                    cache.views = views;
+                }
+                if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
+                    cache.procedures = procedures;
+                }
+                if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
+                    cache.functions = functions;
+                }
+                if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
+                    cache.sequences = sequences;
+                }
+                if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
+                    cache.triggers = triggers;
+                }
+                if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
+                    cache.synonyms = synonyms;
+                }
+                if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
+                    cache.packages = packages;
+                }
+
+                Some(cache)
+            }
+            DatabaseType::MySQL => {
+                let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() else {
+                    return None;
+                };
+
+                let mut cache = ObjectCache::default();
+
+                if let Ok(tables) = MysqlObjectBrowser::get_tables(mysql_conn) {
+                    cache.tables = tables;
+                }
+                if let Ok(views) = MysqlObjectBrowser::get_views(mysql_conn) {
+                    cache.views = views;
+                }
+                if let Ok(procedures) = MysqlObjectBrowser::get_procedures(mysql_conn) {
+                    cache.procedures = procedures;
+                }
+                if let Ok(functions) = MysqlObjectBrowser::get_functions(mysql_conn) {
+                    cache.functions = functions;
+                }
+                if let Ok(triggers) = MysqlObjectBrowser::get_triggers(mysql_conn) {
+                    cache.triggers = triggers;
+                }
+                // MySQL doesn't have sequences, synonyms, or packages
+
+                Some(cache)
+            }
         }
-
-        if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
-            cache.views = views;
-        }
-
-        if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
-            cache.procedures = procedures;
-        }
-
-        if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
-            cache.functions = functions;
-        }
-
-        if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
-            cache.sequences = sequences;
-        }
-
-        if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
-            cache.triggers = triggers;
-        }
-
-        if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
-            cache.synonyms = synonyms;
-        }
-
-        if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
-            cache.packages = packages;
-        }
-
-        Some(cache)
     }
 
     fn clear_items(&mut self) {

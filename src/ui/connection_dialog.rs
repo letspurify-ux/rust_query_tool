@@ -6,6 +6,7 @@ use fltk::{
     frame::Frame,
     group::Flex,
     input::{Input, SecretInput},
+    menu::Choice,
     prelude::*,
     window::Window,
 };
@@ -13,13 +14,28 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::db::{ConnectionInfo, DatabaseConnection};
+use crate::db::{ConnectionInfo, DatabaseConnection, DatabaseType};
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
 use crate::utils::AppConfig;
 
 pub struct ConnectionDialog;
+
+fn db_type_from_choice_index(idx: i32) -> DatabaseType {
+    if idx == 1 {
+        DatabaseType::MySQL
+    } else {
+        DatabaseType::Oracle
+    }
+}
+
+fn choice_index_from_db_type(db_type: DatabaseType) -> i32 {
+    match db_type {
+        DatabaseType::Oracle => 0,
+        DatabaseType::MySQL => 1,
+    }
+}
 
 fn build_connection_info(
     name: &str,
@@ -28,6 +44,7 @@ fn build_connection_info(
     host: &str,
     port_text: &str,
     service_name: &str,
+    db_type: DatabaseType,
 ) -> Result<ConnectionInfo, String> {
     fn is_valid_host(host: &str) -> bool {
         if host.is_empty() {
@@ -75,11 +92,15 @@ fn build_connection_info(
     if !is_valid_host(host) {
         return Err("Host contains invalid characters".to_string());
     }
+    let svc_label = match db_type {
+        DatabaseType::Oracle => "Service name",
+        DatabaseType::MySQL => "Database name",
+    };
     if service_name.is_empty() {
-        return Err("Service name is required".to_string());
+        return Err(format!("{} is required", svc_label));
     }
     if !is_valid_service_name(service_name) {
-        return Err("Service name contains invalid characters".to_string());
+        return Err(format!("{} contains invalid characters", svc_label));
     }
 
     let port = port_text
@@ -90,13 +111,14 @@ fn build_connection_info(
         return Err("Port must be between 1 and 65535".to_string());
     }
 
-    Ok(ConnectionInfo::new(
+    Ok(ConnectionInfo::new_with_type(
         name,
         username,
         password,
         host,
         port,
         service_name,
+        db_type,
     ))
 }
 
@@ -143,7 +165,7 @@ impl ConnectionDialog {
         let dialog_h = 400;
         let mut dialog = Window::default()
             .with_size(dialog_w, dialog_h)
-            .with_label("Connect to Oracle Database");
+            .with_label("Connect to Database");
         center_on_main(&mut dialog);
         dialog.set_color(theme::panel_raised());
         dialog.make_modal(true);
@@ -195,6 +217,20 @@ impl ConnectionDialog {
         let mut details_header = Frame::default().with_label("Connection Details");
         details_header.set_label_color(theme::text_secondary());
         right_col.fixed(&details_header, LABEL_ROW_HEIGHT);
+
+        // Database Type selector
+        let mut dbtype_flex = Flex::default();
+        dbtype_flex.set_type(fltk::group::FlexType::Row);
+        let mut dbtype_label = Frame::default().with_label("DB Type:");
+        dbtype_label.set_label_color(theme::text_primary());
+        dbtype_flex.fixed(&dbtype_label, FORM_LABEL_WIDTH);
+        let mut dbtype_choice = Choice::default();
+        dbtype_choice.add_choice("Oracle|MySQL / MariaDB");
+        dbtype_choice.set_value(0); // Oracle by default
+        dbtype_choice.set_color(theme::input_bg());
+        dbtype_choice.set_text_color(theme::text_primary());
+        dbtype_flex.end();
+        right_col.fixed(&dbtype_flex, INPUT_ROW_HEIGHT);
 
         // Connection Name
         let mut name_flex = Flex::default();
@@ -333,6 +369,35 @@ impl ConnectionDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
+        // DB Type change callback: update port and service_name label/defaults
+        {
+            let mut port_input_dt = port_input.clone();
+            let mut service_input_dt = service_input.clone();
+            let mut svc_label_dt = svc_label.clone();
+            dbtype_choice.set_callback(move |choice| {
+                let idx = choice.value();
+                if idx == 0 {
+                    // Oracle
+                    svc_label_dt.set_label("Service:");
+                    if port_input_dt.value() == "3306" {
+                        port_input_dt.set_value("1521");
+                    }
+                    if service_input_dt.value() == "mysql" {
+                        service_input_dt.set_value("ORCL");
+                    }
+                } else {
+                    // MySQL
+                    svc_label_dt.set_label("Database:");
+                    if port_input_dt.value() == "1521" {
+                        port_input_dt.set_value("3306");
+                    }
+                    if service_input_dt.value() == "ORCL" {
+                        service_input_dt.set_value("mysql");
+                    }
+                }
+            });
+        }
+
         let mut connect_btn_for_enter = connect_btn.clone();
         dialog.handle(move |_, ev| match ev {
             Event::KeyDown => {
@@ -359,6 +424,8 @@ impl ConnectionDialog {
         let mut host_input_cb = host_input.clone();
         let mut port_input_cb = port_input.clone();
         let mut service_input_cb = service_input.clone();
+        let mut dbtype_choice_cb = dbtype_choice.clone();
+        let mut svc_label_cb = svc_label.clone();
         let sender_for_click = sender.clone();
 
         saved_browser.set_callback(move |browser| {
@@ -393,6 +460,8 @@ impl ConnectionDialog {
                     host_input_cb.set_value(&conn.host);
                     port_input_cb.set_value(&conn.port.to_string());
                     service_input_cb.set_value(&conn.service_name);
+                    dbtype_choice_cb.set_value(choice_index_from_db_type(conn.db_type));
+                    svc_label_cb.set_label(conn.service_name_label());
 
                     // Double click to connect immediately
                     if app::event_clicks() && !keyring_load_failed {
@@ -402,13 +471,14 @@ impl ConnectionDialog {
                             );
                             return;
                         }
-                        let info = ConnectionInfo::new(
+                        let info = ConnectionInfo::new_with_type(
                             &conn.name,
                             &conn.username,
                             &password,
                             &conn.host,
                             conn.port,
                             &conn.service_name,
+                            conn.db_type,
                         );
                         let _ = sender_for_click.send(DialogMessage::Connect(info, false));
                         app::awake();
@@ -432,6 +502,7 @@ impl ConnectionDialog {
         let host_input_save = host_input.clone();
         let port_input_save = port_input.clone();
         let service_input_save = service_input.clone();
+        let dbtype_choice_save = dbtype_choice.clone();
 
         save_btn.set_callback(move |_| {
             let info = match build_connection_info(
@@ -441,6 +512,7 @@ impl ConnectionDialog {
                 &host_input_save.value(),
                 &port_input_save.value(),
                 &service_input_save.value(),
+                db_type_from_choice_index(dbtype_choice_save.value()),
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -463,6 +535,7 @@ impl ConnectionDialog {
         let host_input_test = host_input.clone();
         let port_input_test = port_input.clone();
         let service_input_test = service_input.clone();
+        let dbtype_choice_test = dbtype_choice.clone();
 
         test_btn.set_callback(move |_| {
             {
@@ -482,6 +555,7 @@ impl ConnectionDialog {
                 &host_input_test.value(),
                 &port_input_test.value(),
                 &service_input_test.value(),
+                db_type_from_choice_index(dbtype_choice_test.value()),
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -507,6 +581,7 @@ impl ConnectionDialog {
         let host_input_conn = host_input.clone();
         let port_input_conn = port_input.clone();
         let service_input_conn = service_input.clone();
+        let dbtype_choice_conn = dbtype_choice.clone();
 
         connect_btn.set_callback(move |_| {
             let info = match build_connection_info(
@@ -516,6 +591,7 @@ impl ConnectionDialog {
                 &host_input_conn.value(),
                 &port_input_conn.value(),
                 &service_input_conn.value(),
+                db_type_from_choice_index(dbtype_choice_conn.value()),
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -581,8 +657,7 @@ impl ConnectionDialog {
                     DialogMessage::Test(info) => {
                         let sender = sender.clone();
                         thread::spawn(move || {
-                            let result = DatabaseConnection::test_connection(&info)
-                                .map_err(|e| e.to_string());
+                            let result = DatabaseConnection::test_connection(&info);
                             let _ = sender.send(DialogMessage::TestResult(result));
                             let _ = sender.send(DialogMessage::SetTestInProgress(false));
                             app::awake();
@@ -696,39 +771,40 @@ impl ConnectionDialog {
 #[cfg(test)]
 mod tests {
     use super::build_connection_info;
+    use crate::db::DatabaseType;
 
     #[test]
     fn build_connection_info_rejects_empty_required_fields() {
-        let result = build_connection_info(" ", "scott", "tiger", "localhost", "1521", "ORCL");
+        let result = build_connection_info(" ", "scott", "tiger", "localhost", "1521", "ORCL", DatabaseType::Oracle);
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "", "tiger", "localhost", "1521", "ORCL");
+        let result = build_connection_info("local", "", "tiger", "localhost", "1521", "ORCL", DatabaseType::Oracle);
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "", "1521", "ORCL");
+        let result = build_connection_info("local", "scott", "tiger", "", "1521", "ORCL", DatabaseType::Oracle);
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "1521", "");
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "1521", "", DatabaseType::Oracle);
         assert!(result.is_err());
     }
 
     #[test]
     fn build_connection_info_rejects_invalid_port() {
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "abc", "ORCL");
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "abc", "ORCL", DatabaseType::Oracle);
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "0", "ORCL");
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "0", "ORCL", DatabaseType::Oracle);
         assert!(result.is_err());
     }
 
     #[test]
     fn build_connection_info_rejects_invalid_host_and_service_characters() {
         let invalid_host =
-            build_connection_info("local", "scott", "tiger", "local host", "1521", "ORCL");
+            build_connection_info("local", "scott", "tiger", "local host", "1521", "ORCL", DatabaseType::Oracle);
         assert!(invalid_host.is_err());
 
         let invalid_service =
-            build_connection_info("local", "scott", "tiger", "localhost", "1521", "ORCL!");
+            build_connection_info("local", "scott", "tiger", "localhost", "1521", "ORCL!", DatabaseType::Oracle);
         assert!(invalid_service.is_err());
     }
 
@@ -741,6 +817,7 @@ mod tests {
             " localhost ",
             " 1521 ",
             " ORCL ",
+            DatabaseType::Oracle,
         )
         .expect("should build valid connection info");
 
@@ -749,6 +826,7 @@ mod tests {
         assert_eq!(info.host, "localhost");
         assert_eq!(info.port, 1521);
         assert_eq!(info.service_name, "ORCL");
+        assert_eq!(info.db_type, DatabaseType::Oracle);
     }
 
     #[test]

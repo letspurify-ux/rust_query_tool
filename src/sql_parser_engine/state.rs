@@ -3,6 +3,12 @@
 
 #[derive(Default)]
 pub(crate) struct SplitState {
+    /// When true, enables MySQL-specific lexer behavior:
+    /// - `#` starts line comments
+    /// - Backtick (`` ` ``) is an identifier quote character
+    /// - No PL/SQL block depth tracking (uses DELIMITER for stored routines)
+    pub(crate) mysql_mode: bool,
+
     // -- Lexer state (was 6 booleans + 2 associated fields) --
     pub(crate) lex_mode: LexMode,
 

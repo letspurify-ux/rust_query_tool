@@ -789,6 +789,102 @@ const FORMAT_PLAIN_END_SUFFIX_LEADING_KEYWORDS: &[&str] = &[
 pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
 
+// ---------------------------------------------------------------------------
+// MySQL / MariaDB keywords (sorted, uppercase, excludes words already in ORACLE_SQL_KEYWORDS)
+// ---------------------------------------------------------------------------
+pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
+    "ACCESSIBLE", "ACTION", "ADD", "AFTER", "AGAINST", "ALGORITHM", "ALL", "ALTER", "ANALYZE",
+    "AND", "AS", "ASC", "AUTO_INCREMENT", "AVG_ROW_LENGTH",
+    "BEFORE", "BEGIN", "BETWEEN", "BIGINT", "BINARY", "BIT", "BLOB", "BOOL", "BOOLEAN",
+    "BY",
+    "CALL", "CASCADE", "CASE", "CHANGE", "CHAR", "CHARACTER", "CHARSET", "CHECK",
+    "COLLATE", "COLUMN", "COLUMNS", "COMMENT", "COMMIT", "COMPACT", "COMPRESSED",
+    "CONDITION", "CONNECTION", "CONSTRAINT", "CONTINUE", "CONVERT", "CREATE",
+    "CROSS", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER",
+    "CURSOR",
+    "DATA", "DATABASE", "DATABASES", "DATE", "DATETIME", "DAY", "DAY_HOUR",
+    "DAY_MICROSECOND", "DAY_MINUTE", "DAY_SECOND", "DEC", "DECIMAL", "DECLARE",
+    "DEFAULT", "DELAYED", "DELETE", "DELIMITER", "DESC", "DESCRIBE", "DETERMINISTIC",
+    "DISABLE", "DISCARD", "DISTINCT", "DISTINCTROW", "DIV", "DOUBLE", "DROP", "DUAL",
+    "DUMP", "DUPLICATE", "DYNAMIC",
+    "EACH", "ELSE", "ELSEIF", "ENABLE", "ENCLOSED", "END", "ENGINE", "ENGINES",
+    "ENUM", "ESCAPED", "EVENT", "EVENTS", "EXECUTE", "EXISTS", "EXIT", "EXPLAIN",
+    "EXTENDED", "EXTENT_SIZE",
+    "FALSE", "FETCH", "FIELDS", "FILE", "FIRST", "FIXED", "FLOAT", "FLUSH",
+    "FOR", "FORCE", "FOREIGN", "FORMAT", "FROM", "FULL", "FULLTEXT", "FUNCTION",
+    "GENERAL", "GEOMETRY", "GEOMETRYCOLLECTION", "GET", "GLOBAL", "GRANT", "GRANTS",
+    "GROUP",
+    "HANDLER", "HASH", "HAVING", "HELP", "HIGH_PRIORITY", "HOST", "HOUR",
+    "HOUR_MICROSECOND", "HOUR_MINUTE", "HOUR_SECOND",
+    "IDENTIFIED", "IF", "IGNORE", "IMPORT", "IN", "INDEX", "INDEXES", "INFILE",
+    "INNER", "INOUT", "INSENSITIVE", "INSERT", "INT", "INT1", "INT2", "INT3",
+    "INT4", "INT8", "INTEGER", "INTERVAL", "INTO", "INVOKER", "IO_THREAD",
+    "IS", "ISOLATION", "ITERATE",
+    "JOIN", "JSON",
+    "KEY", "KEYS", "KILL",
+    "LANGUAGE", "LAST", "LEADING", "LEAVE", "LEFT", "LEVEL", "LIKE", "LIMIT",
+    "LINEAR", "LINES", "LINESTRING", "LIST", "LOAD", "LOCAL", "LOCALTIME",
+    "LOCALTIMESTAMP", "LOCK", "LOCKS", "LOGFILE", "LOGS", "LONG", "LONGBLOB",
+    "LONGTEXT", "LOOP", "LOW_PRIORITY",
+    "MASTER", "MATCH", "MAX_ROWS", "MAXVALUE", "MEDIUMBLOB", "MEDIUMINT",
+    "MEDIUMTEXT", "MEMORY", "MERGE", "MICROSECOND", "MIDDLEINT", "MIN_ROWS",
+    "MINUTE", "MINUTE_MICROSECOND", "MINUTE_SECOND", "MOD", "MODE", "MODIFY",
+    "MONTH", "MULTILINESTRING", "MULTIPOINT", "MULTIPOLYGON", "MUTEX",
+    "NAMES", "NATIONAL", "NATURAL", "NCHAR", "NDB", "NDBCLUSTER", "NEW", "NEXT",
+    "NO", "NONE", "NOT", "NULL", "NUMERIC", "NVARCHAR",
+    "OFFSET", "ON", "ONE", "OPEN", "OPTIMIZE", "OPTION", "OPTIONALLY", "OR",
+    "ORDER", "OUT", "OUTER", "OUTFILE",
+    "PACK_KEYS", "PARSER", "PARTIAL", "PARTITION", "PARTITIONS", "PASSWORD",
+    "PLUGIN", "PLUGINS", "POINT", "POLYGON", "PORT", "PRECISION", "PREPARE",
+    "PRESERVE", "PRIMARY", "PRIVILEGES", "PROCEDURE", "PROCESSLIST", "PROFILE",
+    "PROFILES", "PURGE",
+    "QUARTER", "QUERY",
+    "RANGE", "READ", "READS", "REAL", "REDUNDANT", "REFERENCES", "REGEXP",
+    "RELAY_LOG", "RELEASE", "RENAME", "REORGANIZE", "REPAIR", "REPEAT",
+    "REPEATABLE", "REPLACE", "REQUIRE", "RESET", "RESIGNAL", "RESTRICT",
+    "RETURN", "RETURNS", "REVOKE", "RIGHT", "RLIKE", "ROLLBACK", "ROLLUP",
+    "ROUTINE", "ROW", "ROW_FORMAT", "ROWS",
+    "SAVEPOINT", "SCHEDULE", "SCHEMA", "SCHEMAS", "SECOND", "SECOND_MICROSECOND",
+    "SECURITY", "SELECT", "SENSITIVE", "SEPARATOR", "SERIAL", "SERIALIZABLE",
+    "SERVER", "SESSION", "SET", "SHARE", "SHOW", "SHUTDOWN", "SIGNAL",
+    "SIMPLE", "SLAVE", "SMALLINT", "SNAPSHOT", "SOME", "SONAME", "SOUNDS",
+    "SPATIAL", "SPECIFIC", "SQL", "SQL_BIG_RESULT", "SQL_BUFFER_RESULT",
+    "SQL_CACHE", "SQL_CALC_FOUND_ROWS", "SQL_NO_CACHE", "SQL_SMALL_RESULT",
+    "SQL_THREAD", "SQLEXCEPTION", "SQLSTATE", "SQLWARNING",
+    "SSL", "START", "STARTING", "STATUS", "STOP", "STORAGE",
+    "STRAIGHT_JOIN", "SUBJECT", "SUBPARTITION", "SUBPARTITIONS", "SUPER",
+    "TABLE", "TABLES", "TABLESPACE", "TEMPORARY", "TEMPTABLE", "TERMINATED",
+    "TEXT", "THAN", "THEN", "TIME", "TIMESTAMP", "TINYBLOB", "TINYINT",
+    "TINYTEXT", "TO", "TRAILING", "TRANSACTION", "TRIGGER", "TRIGGERS",
+    "TRUE", "TRUNCATE", "TYPE",
+    "UNCOMMITTED", "UNDEFINED", "UNDO", "UNICODE", "UNION", "UNIQUE",
+    "UNLOCK", "UNSIGNED", "UPDATE", "UPGRADE", "USAGE", "USE", "USER",
+    "USING", "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP",
+    "VALUE", "VALUES", "VARBINARY", "VARCHAR", "VARCHARACTER", "VARIABLES",
+    "VARYING", "VIEW",
+    "WAIT", "WARNINGS", "WEEK", "WHEN", "WHERE", "WHILE", "WITH", "WORK", "WRITE",
+    "XA", "XOR",
+    "YEAR", "YEAR_MONTH",
+    "ZEROFILL",
+];
+
+pub static MYSQL_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| MYSQL_SQL_KEYWORDS.iter().copied().collect());
+
+/// Returns true if `word` (uppercase) is a MySQL/MariaDB keyword.
+#[inline]
+pub(crate) fn is_mysql_sql_keyword(word: &str) -> bool {
+    MYSQL_SQL_KEYWORDS_SET.contains(word)
+}
+
+/// Database-type-aware keyword check.
+pub(crate) fn is_sql_keyword_for_db(word: &str, db_type: crate::db::connection::DatabaseType) -> bool {
+    match db_type {
+        crate::db::connection::DatabaseType::Oracle => is_oracle_sql_keyword(word),
+        crate::db::connection::DatabaseType::MySQL => is_mysql_sql_keyword(word),
+    }
+}
+
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] = &[
     "WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES", "TABLE",
     // Recursive subquery factoring clauses that can appear before the main query

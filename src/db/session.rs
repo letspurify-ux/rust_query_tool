@@ -2,6 +2,8 @@ use oracle::sql_type::OracleType;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::db::connection::DatabaseType;
+
 #[derive(Debug, Clone)]
 pub enum BindDataType {
     Number,
@@ -58,6 +60,7 @@ pub struct ComputeConfig {
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
+    pub db_type: DatabaseType,
     pub binds: HashMap<String, BindVar>,
     pub define_vars: HashMap<String, String>,
     pub column_new_values: HashMap<String, String>,
@@ -84,6 +87,8 @@ pub struct SessionState {
     pub compute: Option<ComputeConfig>,
     pub spool_path: Option<PathBuf>,
     pub spool_truncate: bool,
+    /// MySQL DELIMITER state — custom statement terminator for stored routines.
+    pub mysql_delimiter: Option<String>,
 }
 
 impl Default for ServerOutputConfig {
@@ -98,6 +103,7 @@ impl Default for ServerOutputConfig {
 impl Default for SessionState {
     fn default() -> Self {
         Self {
+            db_type: DatabaseType::Oracle,
             binds: HashMap::new(),
             define_vars: HashMap::new(),
             column_new_values: HashMap::new(),
@@ -124,6 +130,7 @@ impl Default for SessionState {
             compute: None,
             spool_path: None,
             spool_truncate: false,
+            mysql_delimiter: None,
         }
     }
 }

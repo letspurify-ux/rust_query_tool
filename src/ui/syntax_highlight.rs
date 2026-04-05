@@ -6,7 +6,8 @@ use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use super::intellisense::ORACLE_FUNCTIONS;
+use super::intellisense::{MYSQL_FUNCTIONS_SET, ORACLE_FUNCTIONS};
+use crate::db::connection::DatabaseType;
 use crate::sql_text;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
@@ -270,6 +271,7 @@ pub struct SqlHighlighter {
     highlight_data: HighlightData,
     relation_lookup: HashSet<String>,
     column_lookup: HashSet<String>,
+    db_type: DatabaseType,
 }
 
 /// Maximum backward probe distance to determine lexer state at a window boundary.
@@ -281,7 +283,12 @@ impl SqlHighlighter {
             highlight_data: HighlightData::new(),
             relation_lookup: HashSet::new(),
             column_lookup: HashSet::new(),
+            db_type: DatabaseType::Oracle,
         }
+    }
+
+    pub fn set_db_type(&mut self, db_type: DatabaseType) {
+        self.db_type = db_type;
     }
 
     pub fn set_highlight_data(&mut self, data: HighlightData) {
@@ -839,13 +846,13 @@ impl SqlHighlighter {
             return self.classify_non_keyword_word(upper);
         }
 
-        // Check if it's a SQL keyword
-        if sql_text::is_oracle_sql_keyword(upper) {
+        // Check if it's a SQL keyword (db-type-aware)
+        if sql_text::is_sql_keyword_for_db(upper, self.db_type) {
             return TokenType::Keyword;
         }
 
-        // Check if it's an Oracle function
-        if ORACLE_FUNCTIONS_SET.contains(upper) {
+        // Check if it's a built-in function (db-type-aware)
+        if self.is_function(upper) {
             return TokenType::Function;
         }
 
@@ -868,7 +875,7 @@ impl SqlHighlighter {
         };
         let upper = upper.as_ref();
 
-        if ORACLE_FUNCTIONS_SET.contains(upper) {
+        if self.is_function(upper) {
             return TokenType::Function;
         }
         if self.relation_lookup.contains(upper) {
@@ -879,6 +886,13 @@ impl SqlHighlighter {
         }
 
         TokenType::Default
+    }
+
+    fn is_function(&self, upper: &str) -> bool {
+        match self.db_type {
+            DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper),
+            DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper),
+        }
     }
 
     fn classify_identifier_like_word(&self, word: &str) -> TokenType {
@@ -1077,11 +1091,11 @@ fn should_treat_function_name_as_identifier(
     };
     let upper = upper.as_ref();
 
-    if !ORACLE_FUNCTIONS_SET.contains(upper) {
+    if !ORACLE_FUNCTIONS_SET.contains(upper) && !MYSQL_FUNCTIONS_SET.contains(upper) {
         return false;
     }
 
-    if sql_text::is_oracle_sql_keyword(upper)
+    if (sql_text::is_oracle_sql_keyword(upper) || sql_text::is_mysql_sql_keyword(upper))
         && next_significant_token_kind(text, bytes, word_end)
             == Some(SignificantTokenKind::LeftParen)
     {
@@ -1113,7 +1127,9 @@ fn should_treat_keyword_as_identifier_context(
         Cow::Borrowed(word)
     };
 
-    if !sql_text::is_oracle_sql_keyword(upper.as_ref()) {
+    if !sql_text::is_oracle_sql_keyword(upper.as_ref())
+        && !sql_text::is_mysql_sql_keyword(upper.as_ref())
+    {
         return false;
     }
 
@@ -1308,7 +1324,9 @@ fn next_significant_token(text: &str, bytes: &[u8], mut idx: usize) -> Option<Si
                 let word = text.get(start..idx)?;
                 let upper = word.to_ascii_uppercase();
                 Some(SignificantToken {
-                    kind: if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                    kind: if sql_text::is_oracle_sql_keyword(upper.as_str())
+                        || sql_text::is_mysql_sql_keyword(upper.as_str())
+                    {
                         SignificantTokenKind::ClauseWord
                     } else {
                         SignificantTokenKind::Identifier
@@ -1450,7 +1468,9 @@ fn prev_significant_token(text: &str, bytes: &[u8], mut idx: usize) -> Option<Si
             let word = text.get(start..idx)?;
             let upper = word.to_ascii_uppercase();
             return Some(SignificantToken {
-                kind: if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                kind: if sql_text::is_oracle_sql_keyword(upper.as_str())
+                    || sql_text::is_mysql_sql_keyword(upper.as_str())
+                {
                     SignificantTokenKind::ClauseWord
                 } else {
                     SignificantTokenKind::Identifier

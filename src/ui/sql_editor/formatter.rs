@@ -3280,6 +3280,25 @@ impl SqlEditorWidget {
                 )
             }
             ToolCommand::Disconnect => "DISCONNECT".to_string(),
+            // MySQL-specific commands — format as-is
+            ToolCommand::Use { database } => format!("USE {}", database),
+            ToolCommand::ShowDatabases => "SHOW DATABASES".to_string(),
+            ToolCommand::ShowTables => "SHOW TABLES".to_string(),
+            ToolCommand::ShowColumns { table } => format!("SHOW COLUMNS FROM {}", table),
+            ToolCommand::ShowCreateTable { table } => format!("SHOW CREATE TABLE {}", table),
+            ToolCommand::ShowProcessList => "SHOW PROCESSLIST".to_string(),
+            ToolCommand::ShowVariables { filter } => match filter {
+                Some(f) => format!("SHOW VARIABLES LIKE '{}'", f),
+                None => "SHOW VARIABLES".to_string(),
+            },
+            ToolCommand::ShowStatus { filter } => match filter {
+                Some(f) => format!("SHOW STATUS LIKE '{}'", f),
+                None => "SHOW STATUS".to_string(),
+            },
+            ToolCommand::MysqlDelimiter { delimiter } => format!("DELIMITER {}", delimiter),
+            ToolCommand::ShowWarnings => "SHOW WARNINGS".to_string(),
+            ToolCommand::MysqlShowErrors => "SHOW ERRORS".to_string(),
+            ToolCommand::MysqlSource { path } => format!("SOURCE {}", path),
             ToolCommand::Unsupported { raw, .. } => raw.clone(),
         }
     }
