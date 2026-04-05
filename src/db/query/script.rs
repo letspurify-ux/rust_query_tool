@@ -2110,8 +2110,7 @@ impl QueryExecutor {
                             frame.pending_for_update_clause_update_line = true;
                         } else if (frame.pending_for_update_clause_update_line
                             && clause_kind == Some(AutoFormatClauseKind::Update))
-                            || (!trimmed.starts_with("--")
-                                && !sql_text::is_sqlplus_comment_line(trimmed))
+                            || !sql_text::is_sqlplus_comment_line(trimmed)
                         {
                             frame.pending_for_update_clause_update_line = false;
                         }
