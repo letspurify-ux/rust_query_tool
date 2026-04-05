@@ -7057,6 +7057,11 @@ impl SqlEditorWidget {
                         && frame.counts_for_condition_continuation
                 })
                 .count();
+            let suppress_non_subquery_paren_layout_clause = paren_layout_frames
+                .last()
+                .is_some_and(|frame| frame.kind == ParenLayoutFrameKind::General)
+                && active_owner_relative_frame.is_none()
+                && crate::sql_text::is_non_subquery_paren_suppressed_layout_clause(&trimmed_upper);
             let paren_case_close_frame_depth =
                 pending_paren_case_closer_depth_for_line.or_else(|| {
                     last_popped_general_paren_frame.map(|frame| {
@@ -7080,13 +7085,21 @@ impl SqlEditorWidget {
                 && !current_line_is_match_recognize_subclause
                 && !pending_forall_body_head_for_line;
             let current_line_is_structural_continuation_boundary =
-                crate::sql_text::starts_with_auto_format_structural_continuation_boundary(trimmed);
+                !suppress_non_subquery_paren_layout_clause
+                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary(
+                        trimmed,
+                    );
             let current_line_is_non_expression_structural_boundary =
-                crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed);
+                !suppress_non_subquery_paren_layout_clause
+                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed);
             let current_line_structural_header_continuation_kind =
-                sql_text::format_structural_header_continuation_kind(trimmed);
+                (!suppress_non_subquery_paren_layout_clause)
+                    .then(|| sql_text::format_structural_header_continuation_kind(trimmed))
+                    .flatten();
             let current_line_bare_structural_header_continuation_kind =
-                sql_text::format_bare_structural_header_continuation_kind(trimmed);
+                (!suppress_non_subquery_paren_layout_clause)
+                    .then(|| sql_text::format_bare_structural_header_continuation_kind(trimmed))
+                    .flatten();
             let current_line_is_exact_bare_owner_or_pending_header =
                 crate::sql_text::line_is_exact_bare_owner_or_pending_header(trimmed);
             let current_line_query_owner_keeps_continuation_target = current_query_owner_kind
@@ -23966,6 +23979,38 @@ FROM emp;"#;
         assert!(
             indent(lines[from_idx]) < indent(lines[first_item_idx]),
             "FROM should clear the carried SELECT list continuation depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_realigns_multiline_json_value_select_siblings() {
+        let source = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH base_emp AS (
+        SELECT
+            e.emp_id,
+            JSON_VALUE (e.json_profile, '$.level'
+                RETURNING VARCHAR2 (30)) AS profile_level,
+                    JSON_VALUE (e.json_profile, '$.flags.remote'
+                        RETURNING VARCHAR2 (10)) AS remote_flag
+        FROM qt_fmt_emp e
+    );"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let expected = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH base_emp AS (
+        SELECT
+            e.emp_id,
+            JSON_VALUE (e.json_profile, '$.level'
+                RETURNING VARCHAR2 (30)) AS profile_level,
+            JSON_VALUE (e.json_profile, '$.flags.remote'
+                RETURNING VARCHAR2 (10)) AS remote_flag
+        FROM qt_fmt_emp e
+    );"#;
+
+        assert_eq!(
+            formatted, expected,
+            "multiline JSON_VALUE select items should snap back to the canonical SELECT list depth after a sibling comma, got:\n{}",
             formatted
         );
     }

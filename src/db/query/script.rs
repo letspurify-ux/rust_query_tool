@@ -90,6 +90,13 @@ pub(crate) struct AutoFormatLineContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoFormatSubqueryParenKind {
+    NonSubquery,
+    Pending,
+    Subquery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutoFormatConditionTerminator {
     Then,
     Loop,
@@ -1480,6 +1487,108 @@ impl QueryExecutor {
     /// continuation depth while normalizing query base depth from parent
     /// query ancestry instead of context-specific formatter heuristics.
     pub(crate) fn auto_format_line_contexts(sql: &str) -> Vec<AutoFormatLineContext> {
+        fn bytes_word_eq_ignore_ascii_case(
+            bytes: &[u8],
+            start: usize,
+            end: usize,
+            keyword: &str,
+        ) -> bool {
+            let span = end.saturating_sub(start);
+            if span != keyword.len() {
+                return false;
+            }
+
+            bytes[start..end]
+                .iter()
+                .zip(keyword.as_bytes())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        }
+
+        fn bytes_word_is_subquery_head_keyword(bytes: &[u8], start: usize, end: usize) -> bool {
+            sql_text::SUBQUERY_HEAD_KEYWORDS
+                .iter()
+                .any(|keyword| bytes_word_eq_ignore_ascii_case(bytes, start, end, keyword))
+        }
+
+        fn skip_ws_and_comments_bytes(bytes: &[u8], mut idx: usize) -> usize {
+            loop {
+                while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                    idx += 1;
+                }
+
+                if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+                    idx += 2;
+                    while idx + 1 < bytes.len() {
+                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
+                    idx += 2;
+                    while idx < bytes.len() && bytes[idx] != b'\n' {
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                if idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+                    let start = idx;
+                    while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+                        idx += 1;
+                    }
+                    if bytes_word_eq_ignore_ascii_case(bytes, start, idx, "REM")
+                        || bytes_word_eq_ignore_ascii_case(bytes, start, idx, "REMARK")
+                    {
+                        while idx < bytes.len() && bytes[idx] != b'\n' {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    idx = start;
+                }
+
+                break;
+            }
+
+            idx
+        }
+
+        fn resolve_pending_auto_format_subquery_parens(
+            paren_stack: &mut [AutoFormatSubqueryParenKind],
+            pending_count: &mut usize,
+            trimmed_upper: &str,
+        ) {
+            if *pending_count == 0 {
+                return;
+            }
+
+            let promote_to_subquery = sql_text::SUBQUERY_HEAD_KEYWORDS
+                .iter()
+                .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword));
+            let mut unresolved = *pending_count;
+
+            for paren_kind in paren_stack.iter_mut().rev() {
+                if unresolved == 0 {
+                    break;
+                }
+                if *paren_kind == AutoFormatSubqueryParenKind::Pending {
+                    *paren_kind = if promote_to_subquery {
+                        AutoFormatSubqueryParenKind::Subquery
+                    } else {
+                        AutoFormatSubqueryParenKind::NonSubquery
+                    };
+                    unresolved = unresolved.saturating_sub(1);
+                }
+            }
+
+            *pending_count = 0;
+        }
+
         let parser_depths = Self::line_block_depths(sql);
         let lines: Vec<&str> = sql.lines().collect();
         if parser_depths.len() != lines.len() {
@@ -1521,6 +1630,9 @@ impl QueryExecutor {
         let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
         let mut pending_control_branch_body_depth: Option<usize> = None;
         let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
+        let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
+        let mut pending_auto_format_subquery_paren_count = 0usize;
+        let mut auto_format_paren_observer = SqlParserEngine::new();
 
         for (idx, line) in lines.iter().enumerate() {
             let analysis_line = multiline_string_prefix_lengths
@@ -1568,12 +1680,25 @@ impl QueryExecutor {
             }
 
             let trimmed_upper = sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase();
+            resolve_pending_auto_format_subquery_parens(
+                &mut auto_format_subquery_paren_stack,
+                &mut pending_auto_format_subquery_paren_count,
+                &trimmed_upper,
+            );
             let line_has_leading_close_paren =
                 sql_text::line_has_leading_significant_close_paren(trimmed);
             let leading_close_has_mixed_continuation = line_has_leading_close_paren
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
             let clause_detection_trimmed = sql_text::auto_format_structural_tail(trimmed);
             let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
+            let inside_non_subquery_paren_context = auto_format_subquery_paren_stack
+                .last()
+                .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery);
+            let suppress_non_subquery_paren_layout_clause =
+                inside_non_subquery_paren_context
+                    && sql_text::is_non_subquery_paren_suppressed_layout_clause(
+                        &clause_detection_upper,
+                    );
             let current_line_starts_elsif =
                 sql_text::line_starts_with_identifier_sequence_before_inline_comment(
                     clause_detection_trimmed,
@@ -1610,7 +1735,11 @@ impl QueryExecutor {
                 && !sql_text::starts_with_keyword_token(&trimmed_upper, "END");
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
-            let clause_kind = Self::auto_format_clause_kind(&clause_detection_upper);
+            let clause_kind = if suppress_non_subquery_paren_layout_clause {
+                None
+            } else {
+                Self::auto_format_clause_kind(&clause_detection_upper)
+            };
             let split_query_owner_lookahead_kind =
                 Self::split_query_owner_lookahead_kind(&lines, idx, &next_code_indices, trimmed);
             let current_line_is_generic_split_query_owner = matches!(
@@ -1644,8 +1773,10 @@ impl QueryExecutor {
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
             let blocks_structural_line_continuation =
-                (Self::line_starts_continuation_boundary(trimmed)
+                ((!suppress_non_subquery_paren_layout_clause
+                    && Self::line_starts_continuation_boundary(trimmed))
                     || (leading_close_has_mixed_continuation
+                        && !suppress_non_subquery_paren_layout_clause
                         && Self::line_starts_continuation_boundary(clause_detection_trimmed)))
                     && !current_line_is_standalone_open_paren;
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
@@ -2631,7 +2762,9 @@ impl QueryExecutor {
                         || current_line_is_exact_exception))
                     .then_some(context.auto_depth.saturating_add(1));
 
-            pending_line_continuation = if current_line_is_same_depth_merge_branch_header_fragment {
+            pending_line_continuation = if suppress_non_subquery_paren_layout_clause {
+                None
+            } else if current_line_is_same_depth_merge_branch_header_fragment {
                 None
             } else if context.query_base_depth.is_some() || clause_kind.is_some() {
                 Self::line_continuation_for_line(
@@ -2643,13 +2776,17 @@ impl QueryExecutor {
             } else {
                 None
             };
-            pending_inline_comment_line_continuation =
+            pending_inline_comment_line_continuation = if suppress_non_subquery_paren_layout_clause
+            {
+                None
+            } else {
                 Self::inline_comment_line_continuation_for_line(
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
                     next_code_trimmed,
-                );
+                )
+            };
 
             if parser_depth == 0 && Self::is_create_trigger(trimmed) {
                 trigger_header_frame = Some(TriggerHeaderDepthFrame { body_depth: 1 });
@@ -2688,8 +2825,53 @@ impl QueryExecutor {
                 pending_inline_comment_line_continuation = None;
                 trigger_header_frame = None;
                 forall_body_frame = None;
+                auto_format_subquery_paren_stack.clear();
+                pending_auto_format_subquery_paren_count = 0;
             }
 
+            auto_format_paren_observer.process_line_with_byte_observer(
+                analysis_line,
+                |bytes, byte_idx, symbol| {
+                    if symbol == b'(' {
+                        let lookahead =
+                            skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
+                        let mut word_end = lookahead;
+                        let mut paren_kind = AutoFormatSubqueryParenKind::NonSubquery;
+
+                        while word_end < bytes.len()
+                            && (bytes[word_end].is_ascii_alphanumeric() || bytes[word_end] == b'_')
+                        {
+                            word_end += 1;
+                        }
+
+                        if word_end > lookahead {
+                            if bytes_word_is_subquery_head_keyword(bytes, lookahead, word_end) {
+                                paren_kind = AutoFormatSubqueryParenKind::Subquery;
+                            }
+                        } else if lookahead >= bytes.len()
+                            || (bytes[lookahead] == b'-'
+                                && lookahead + 1 < bytes.len()
+                                && bytes[lookahead + 1] == b'-')
+                            || (bytes[lookahead] == b'/'
+                                && lookahead + 1 < bytes.len()
+                                && bytes[lookahead + 1] == b'*')
+                        {
+                            paren_kind = AutoFormatSubqueryParenKind::Pending;
+                            pending_auto_format_subquery_paren_count =
+                                pending_auto_format_subquery_paren_count.saturating_add(1);
+                        }
+
+                        auto_format_subquery_paren_stack.push(paren_kind);
+                    } else if symbol == b')' {
+                        if let Some(closed_kind) = auto_format_subquery_paren_stack.pop() {
+                            if closed_kind == AutoFormatSubqueryParenKind::Pending {
+                                pending_auto_format_subquery_paren_count =
+                                    pending_auto_format_subquery_paren_count.saturating_sub(1);
+                            }
+                        }
+                    }
+                },
+            );
             contexts.push(context);
         }
 
@@ -17458,6 +17640,66 @@ WHERE d.deptno > 0;"#;
         assert_eq!(
             contexts[outer_fetch_idx].auto_depth, contexts[outer_from_idx].auto_depth,
             "outer FETCH should stay on the outer query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_restore_select_item_depth_after_multiline_json_value_item() {
+        let sql = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH base_emp AS (
+        SELECT
+            e.emp_id,
+            JSON_VALUE (e.json_profile, '$.level'
+                RETURNING VARCHAR2 (30)) AS profile_level,
+                    JSON_VALUE (e.json_profile, '$.flags.remote'
+                        RETURNING VARCHAR2 (10)) AS remote_flag
+        FROM qt_fmt_emp e
+    );"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or(0)
+        };
+
+        let profile_idx = find_line_starting_with("JSON_VALUE (e.json_profile, '$.level'");
+        let profile_returning_idx =
+            find_line_starting_with("RETURNING VARCHAR2 (30)) AS profile_level,");
+        let remote_idx = find_line_starting_with("JSON_VALUE (e.json_profile, '$.flags.remote'");
+        let remote_returning_idx =
+            find_line_starting_with("RETURNING VARCHAR2 (10)) AS remote_flag");
+        let from_idx = find_line_starting_with("FROM qt_fmt_emp e");
+
+        assert_eq!(
+            contexts[profile_idx].auto_depth, contexts[remote_idx].auto_depth,
+            "next multiline JSON_VALUE select item should restore the sibling SELECT-item depth after the previous item closes"
+        );
+        assert_eq!(
+            contexts[profile_returning_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "JSON_VALUE RETURNING inside function parens should not advertise a structural clause semantic"
+        );
+        assert_eq!(
+            contexts[remote_returning_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "split sibling JSON_VALUE RETURNING inside function parens should stay non-structural"
+        );
+        assert_ne!(
+            contexts[profile_returning_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "JSON_VALUE RETURNING inside function parens must not reset to the query-base clause role"
+        );
+        assert_ne!(
+            contexts[remote_returning_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "split sibling JSON_VALUE RETURNING inside function parens must not reopen query-base clause state"
+        );
+        assert!(
+            contexts[from_idx].auto_depth < contexts[remote_idx].auto_depth,
+            "FROM should clear the carried SELECT-item depth after multiline JSON_VALUE siblings"
         );
     }
 

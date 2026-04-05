@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-05 (split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header owner chain 명시, `JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영)
+> 최종 업데이트: 2026-04-05 (split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header owner chain 명시, `JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영, non-subquery paren 내부 function-local `RETURNING` suppress 및 multiline list sibling 복귀 규칙 명시)
 
 ## 0. 이 문서의 역할
 
@@ -103,6 +103,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 여기서 `query-base anchor`는 항상 active query frame의 저장 depth와 동일한 값일 필요는 없다. renderer처럼 local formatting context만 가진 caller는 semantic query base를 나타내는 synthetic anchor를 전달할 수 있어야 하며, resolver는 그 차이를 이름과 계약 수준에서 드러내야 한다.
 - renderer/helper wrapper도 이 세 anchor를 하나의 `base indent`로 뭉개면 안 된다. exact bare owner/header family(`REFERENCE`, `WITHIN GROUP`, deferred-wrapper owner 등)에서 `SameDepth`는 현재 owner/header line depth를 써야 하고, clause family(`WHERE`, `FOR UPDATE` 등)의 `query-base+1`만 semantic query base anchor를 써야 한다.
 - raw previous/last-word 기반 continuation helper는 lexical fallback일 뿐이다. exact bare owner/header/pending classifier가 semantic family를 이미 판정한 line(`AFTER MATCH SKIP -- ...`, `DENSE_RANK LAST -- ...`, `INNER JOIN -- ...` 등)에서는 이 fallback이 depth를 덮어쓰면 안 된다.
+- non-subquery 일반 괄호 내부의 function-local `RETURNING`은 구조 clause가 아니다. `JSON_VALUE(... RETURNING VARCHAR2 (...))`, `XMLQUERY(... RETURNING CONTENT)` 같은 line은 function-local option으로만 해석해야 하며, analyzer/query-role/structural-boundary/header-carry helper 중 한 phase라도 이를 top-level clause로 승격하면 다음 sibling list item까지 잘못된 carry가 누수된다.
 
 ### 1.7 formatter output은 canonical하고 idempotent해야 한다
 
@@ -113,6 +114,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 따라서 formatter는 입력의 기존 indent를 "유지할지 말지" 결정하는 도구가 아니라, shared structural semantics를 canonical layout으로 투영하는 renderer여야 한다.
 - idempotence는 별도 미적 요구가 아니라 근본 검증 규칙이다. 새 family를 추가할 때는 "semantic family 판정", "typed pending state 유지", "anchor resolver 적용"뿐 아니라 "두 번 돌려도 같은 결과인지"까지 확인해야 한다.
 - mixed leading-close, owner-relative header chain, comment-glued split owner처럼 phase drift가 잘 생기는 family는 canonical form이 한 번에 고정되어야 한다. 첫 번째 포맷에서 임시 보정하고 두 번째 포맷에서 다시 depth가 바뀌는 구조는 허용하지 않는다.
+- sibling list도 같은 원칙을 따른다. 하나의 list item 안에서 general paren / owner-relative body / function option line 때문에 임시로 더 깊어질 수는 있지만, trailing comma가 item을 닫은 순간 다음 sibling은 항상 stable `list body depth`로 복귀해야 한다. 이전 item의 function-local `RETURNING` carry나 visual hanging indent가 다음 sibling의 anchor가 되면 canonical form이 아니다.
 
 ### 1.8 comment와 quoted literal은 구조 이벤트가 아니다
 
