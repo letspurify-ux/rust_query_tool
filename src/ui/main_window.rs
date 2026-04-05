@@ -2751,6 +2751,12 @@ impl MainWindow {
                     s.set_status_message(&message);
                     s.refresh_result_edit_controls();
                 }
+                QueryProgress::MetadataRefreshNeeded => {
+                    MainWindow::start_connection_metadata_refresh(
+                        &mut s,
+                        &schema_sender_for_progress,
+                    );
+                }
                 QueryProgress::BatchFinished => {
                     s.progress_contexts.remove(&tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()

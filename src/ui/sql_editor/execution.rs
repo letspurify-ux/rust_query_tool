@@ -2835,9 +2835,46 @@ impl SqlEditorWidget {
                                         );
                                     }
                                 }
+                                // MySQL USE command — switch database and refresh metadata
+                                ToolCommand::Use { ref database } => {
+                                    let use_result = {
+                                        let mut cg = lock_connection_with_activity(
+                                            &shared_connection,
+                                            db_activity.clone(),
+                                        );
+                                        if let Some(mysql_conn) = cg.get_mysql_connection_mut() {
+                                            let use_sql = format!("USE `{}`", database);
+                                            match crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, &use_sql) {
+                                                Ok(_) => Ok(()),
+                                                Err(e) => Err(format!("Error: {}", e)),
+                                            }
+                                        } else {
+                                            Err("Error: USE command is only supported for MySQL/MariaDB connections".to_string())
+                                        }
+                                    };
+                                    match use_result {
+                                        Ok(()) => {
+                                            SqlEditorWidget::emit_script_output(
+                                                &sender,
+                                                &session,
+                                                vec![format!("Database changed to '{}'", database)],
+                                            );
+                                            let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
+                                            app::awake();
+                                        }
+                                        Err(msg) => {
+                                            SqlEditorWidget::emit_script_message(
+                                                &sender,
+                                                &session,
+                                                "USE",
+                                                &msg,
+                                            );
+                                            command_error = true;
+                                        }
+                                    }
+                                }
                                 // MySQL-specific commands — execute as raw SQL via the connection
-                                ToolCommand::Use { .. }
-                                | ToolCommand::ShowDatabases
+                                ToolCommand::ShowDatabases
                                 | ToolCommand::ShowTables
                                 | ToolCommand::ShowColumns { .. }
                                 | ToolCommand::ShowCreateTable { .. }

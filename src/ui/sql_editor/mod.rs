@@ -224,6 +224,7 @@ pub enum QueryProgress {
         timed_out: bool,
     },
     BatchFinished,
+    MetadataRefreshNeeded,
 }
 
 #[derive(Clone)]
