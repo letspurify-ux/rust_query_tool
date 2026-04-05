@@ -90,13 +90,13 @@ fn build_about_dialog_content() -> String {
         "SPACE Query\n\
 Version {version}\n\
 \n\
-Desktop Oracle SQL client built with Rust and FLTK.\n\
+Desktop SQL client for Oracle and MySQL/MariaDB built with Rust and FLTK.\n\
 \n\
 Highlights\n\
 - Multi-tab SQL editor with execution history and result/message tabs\n\
-- Oracle object browser, syntax highlighting, and IntelliSense\n\
-- Automatic SQL formatting for Oracle SQL and PL/SQL scripts\n\
-- Explain Plan, DBMS Output, and SQL*Plus-style script execution\n\
+- Oracle and MySQL/MariaDB object browser, syntax highlighting, and IntelliSense\n\
+- Automatic SQL formatting for Oracle SQL, PL/SQL, and MySQL scripts\n\
+- Explain Plan / EXPLAIN, SQL*Plus-style script execution, and transaction controls\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
 \n\
 Runtime\n\
@@ -105,7 +105,8 @@ Runtime\n\
 - Splash screen: {splash_status}\n\
 \n\
 Notes\n\
-- Oracle Instant Client is required for database connectivity.\n\
+- Oracle connections require Oracle Instant Client.\n\
+- MySQL/MariaDB connections do not require Oracle Instant Client.\n\
 - See Help > Keyboard Shortcuts for editor and execution shortcuts."
     )
 }

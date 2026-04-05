@@ -16,16 +16,11 @@ const ORACLE_CLIENT_LOAD_HELP_URL: &str =
     "https://oracle.github.io/odpi/doc/installation.html#macos";
 const ORACLE_CLIENT_LIB_ENV_VAR: &str = "ORACLE_CLIENT_LIB_DIR";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DatabaseType {
+    #[default]
     Oracle,
     MySQL,
-}
-
-impl Default for DatabaseType {
-    fn default() -> Self {
-        DatabaseType::Oracle
-    }
 }
 
 impl fmt::Display for DatabaseType {
@@ -94,7 +89,12 @@ impl ConnectionInfo {
         match self.db_type {
             DatabaseType::Oracle => format!("//{}:{}/{}", self.host, self.port, self.service_name),
             DatabaseType::MySQL => {
-                format!("mysql://{}:{}/{}", self.host, self.port, self.service_name)
+                let database = self.service_name.trim();
+                if database.is_empty() {
+                    format!("mysql://{}:{}", self.host, self.port)
+                } else {
+                    format!("mysql://{}:{}/{}", self.host, self.port, database)
+                }
             }
         }
     }
@@ -108,7 +108,7 @@ impl ConnectionInfo {
                 password: String::new(),
                 host: "localhost".to_string(),
                 port: 3306,
-                service_name: "mysql".to_string(),
+                service_name: String::new(),
                 db_type: DatabaseType::MySQL,
             },
         }
@@ -169,6 +169,21 @@ pub struct DatabaseConnection {
 }
 
 impl DatabaseConnection {
+    fn build_mysql_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
+        let mut opts = mysql::OptsBuilder::new()
+            .ip_or_hostname(Some(&info.host))
+            .tcp_port(info.port)
+            .user(Some(&info.username))
+            .pass(Some(&info.password));
+
+        let database = info.service_name.trim();
+        if !database.is_empty() {
+            opts = opts.db_name(Some(database));
+        }
+
+        opts
+    }
+
     pub fn new() -> Self {
         Self {
             connection: None,
@@ -187,27 +202,24 @@ impl DatabaseConnection {
                 ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
                 let conn_str = info.connection_string();
                 let connection = Arc::new(
-                    Connection::connect(&info.username, &info.password, &conn_str)
-                        .map_err(|err| {
+                    Connection::connect(&info.username, &info.password, &conn_str).map_err(
+                        |err| {
                             eprintln!("Connection error: {err}");
                             err.to_string()
-                        })?,
+                        },
+                    )?,
                 );
                 Self::apply_oracle_default_session_settings(connection.as_ref());
                 DbConnection::Oracle(connection)
             }
             DatabaseType::MySQL => {
-                let opts = mysql::OptsBuilder::new()
-                    .ip_or_hostname(Some(&info.host))
-                    .tcp_port(info.port)
-                    .user(Some(&info.username))
-                    .pass(Some(&info.password))
-                    .db_name(Some(&info.service_name));
+                let opts = Self::build_mysql_opts(&info);
                 let mut conn = mysql::Conn::new(opts).map_err(|err| {
                     eprintln!("MySQL connection error: {err}");
                     err.to_string()
                 })?;
                 Self::apply_mysql_default_session_settings(&mut conn);
+                Self::apply_mysql_autocommit_setting(&mut conn, self.auto_commit);
                 DbConnection::MySQL(conn)
             }
         };
@@ -220,6 +232,11 @@ impl DatabaseConnection {
         self.info = info;
         // Clear password from memory now that the connection is established
         self.info.clear_password();
+        if db_type == DatabaseType::MySQL {
+            if let Err(err) = self.sync_mysql_current_database_name() {
+                eprintln!("Warning: failed to sync MySQL current database after connect: {err}");
+            }
+        }
         self.connected = true;
         self.last_disconnect_reason = None;
         self.connection_generation = self.connection_generation.wrapping_add(1);
@@ -257,6 +274,18 @@ impl DatabaseConnection {
             if let Err(err) = conn.query_drop(statement) {
                 eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
             }
+        }
+    }
+
+    fn apply_mysql_autocommit_setting(conn: &mut mysql::Conn, enabled: bool) {
+        let statement = if enabled {
+            "SET autocommit = 1"
+        } else {
+            "SET autocommit = 0"
+        };
+
+        if let Err(err) = conn.query_drop(statement) {
+            eprintln!("Warning: failed to apply MySQL autocommit setting `{statement}`: {err}");
         }
     }
 
@@ -321,6 +350,10 @@ impl DatabaseConnection {
         self.connected
     }
 
+    pub fn has_connection_handle(&self) -> bool {
+        self.connection.is_some()
+    }
+
     /// Returns the Oracle connection (backward compat).
     pub fn get_connection(&self) -> Option<Arc<Connection>> {
         match &self.connection {
@@ -364,10 +397,28 @@ impl DatabaseConnection {
 
     pub fn set_auto_commit(&mut self, enabled: bool) {
         self.auto_commit = enabled;
+        if let Some(DbConnection::MySQL(conn)) = self.connection.as_mut() {
+            Self::apply_mysql_autocommit_setting(conn, enabled);
+        }
     }
 
     pub fn auto_commit(&self) -> bool {
         self.auto_commit
+    }
+
+    pub fn sync_mysql_current_database_name(&mut self) -> Result<String, String> {
+        let Some(conn) = self.get_mysql_connection_mut() else {
+            return Err("Expected MySQL connection but none is active".to_string());
+        };
+
+        let current_database = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .map_err(|err| err.to_string())?
+            .flatten()
+            .map(|database| database.trim().to_string())
+            .unwrap_or_default();
+        self.info.service_name = current_database.clone();
+        Ok(current_database)
     }
 
     pub fn session_state(&self) -> Arc<Mutex<SessionState>> {
@@ -379,20 +430,14 @@ impl DatabaseConnection {
             DatabaseType::Oracle => {
                 ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
                 let conn_str = info.connection_string();
-                Connection::connect(&info.username, &info.password, &conn_str)
-                    .map_err(|err| {
-                        eprintln!("Connection error: {err}");
-                        err.to_string()
-                    })?;
+                Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
+                    eprintln!("Connection error: {err}");
+                    err.to_string()
+                })?;
                 Ok(())
             }
             DatabaseType::MySQL => {
-                let opts = mysql::OptsBuilder::new()
-                    .ip_or_hostname(Some(&info.host))
-                    .tcp_port(info.port)
-                    .user(Some(&info.username))
-                    .pass(Some(&info.password))
-                    .db_name(Some(&info.service_name));
+                let opts = Self::build_mysql_opts(info);
                 mysql::Conn::new(opts).map_err(|err| {
                     eprintln!("MySQL connection error: {err}");
                     err.to_string()
@@ -769,6 +814,21 @@ mod tests {
         };
         assert!(!continue_on_error);
         assert_eq!(colsep, " | ");
+    }
+
+    #[test]
+    fn mysql_connection_string_omits_database_segment_when_empty() {
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            "root",
+            "pw",
+            "localhost",
+            3306,
+            "",
+            DatabaseType::MySQL,
+        );
+
+        assert_eq!(info.connection_string(), "mysql://localhost:3306");
     }
 
     #[test]

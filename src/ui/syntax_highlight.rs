@@ -169,6 +169,7 @@ pub enum LexerState {
         depth: usize,
     },
     InDoubleQuote,
+    InBacktickQuote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,6 +579,16 @@ impl SqlHighlighter {
                     return (style_bytes_to_string(styles), state);
                 }
             },
+            LexerState::InBacktickQuote => match scan_until_backtick_quote_end(bytes, idx) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                    return (style_bytes_to_string(styles), state);
+                }
+            },
             LexerState::Normal => {}
         }
 
@@ -625,6 +636,22 @@ impl SqlHighlighter {
             if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
                 let start = idx;
                 idx += 2;
+                while let Some(&b) = bytes.get(idx) {
+                    if is_line_terminator(b) {
+                        break;
+                    }
+                    idx += 1;
+                }
+                styles[start..idx].fill(STYLE_COMMENT as u8);
+                expect_alias_identifier = false;
+                continue;
+            }
+
+            if self.db_type == DatabaseType::MySQL
+                && sql_text::is_mysql_hash_comment_start(bytes, idx)
+            {
+                let start = idx;
+                idx += 1;
                 while let Some(&b) = bytes.get(idx) {
                     if is_line_terminator(b) {
                         break;
@@ -728,6 +755,25 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 1;
                 let scan_result = scan_until_double_quote_end(bytes, idx);
+                idx = match scan_result {
+                    ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
+                        next_idx
+                    }
+                };
+                styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                if let ScanResult::Unterminated { state, .. } = scan_result {
+                    exit_state = state;
+                }
+                if expect_alias_identifier {
+                    expect_alias_identifier = false;
+                }
+                continue;
+            }
+
+            if self.db_type == DatabaseType::MySQL && byte == b'`' {
+                let start = idx;
+                idx += 1;
+                let scan_result = scan_until_backtick_quote_end(bytes, idx);
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -1635,6 +1681,28 @@ fn scan_until_double_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
                 return ScanResult::Unterminated {
                     next_idx: idx,
                     state: LexerState::InDoubleQuote,
+                };
+            }
+        }
+    }
+}
+
+fn scan_until_backtick_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+    loop {
+        match bytes.get(idx) {
+            Some(&b'`') => {
+                if bytes.get(idx + 1) == Some(&b'`') {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                    return ScanResult::Closed { next_idx: idx };
+                }
+            }
+            Some(_) => idx += 1,
+            None => {
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state: LexerState::InBacktickQuote,
                 };
             }
         }

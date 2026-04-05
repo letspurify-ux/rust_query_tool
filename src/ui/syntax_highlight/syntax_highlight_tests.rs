@@ -1,4 +1,13 @@
 use super::*;
+use std::fs;
+use std::path::PathBuf;
+
+fn load_mariadb_highlight_test_file(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test_mariadb");
+    path.push(name);
+    fs::read_to_string(path).unwrap_or_default()
+}
 
 #[test]
 fn test_number_highlighting_supports_single_decimal_point() {
@@ -2232,5 +2241,103 @@ fn test_incremental_highlight_stops_when_style_tail_matches() {
     assert_eq!(
         updated.styles.len(),
         updated.end.saturating_sub(updated.start)
+    );
+}
+
+#[test]
+fn test_mysql_hash_comment_highlighting_marks_comment_tail() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let text = "SELECT 1 # line comment torture: ; ; ; DELIMITER $$ should not matter here.....";
+    let styles = highlighter.generate_styles(text);
+
+    let comment_start = text.find('#').unwrap_or(0);
+    assert!(
+        styles[comment_start..]
+            .chars()
+            .all(|style| style == STYLE_COMMENT),
+        "MySQL hash comment tail should stay comment-highlighted"
+    );
+}
+
+#[test]
+fn test_mysql_backtick_identifier_highlighting_uses_quoted_identifier_style() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let text = "SELECT `order`, `complex``name` FROM `sales`";
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["`order`", "`complex``name`", "`sales`"] {
+        let start = text.find(token).unwrap_or(0);
+        let end = start + token.len();
+        assert!(
+            styles[start..end]
+                .chars()
+                .all(|style| style == STYLE_QUOTED_IDENTIFIER),
+            "{token} should use quoted identifier highlighting"
+        );
+    }
+}
+
+#[test]
+fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
+    let text = load_mariadb_highlight_test_file("test1.txt");
+    assert!(
+        !text.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let styles = highlighter.generate_styles(&text);
+
+    assert_eq!(
+        styles.len(),
+        text.len(),
+        "highlight output must stay byte-aligned with the source text"
+    );
+
+    let comment_line = "# line comment torture: ; ; ; DELIMITER $$ should not matter here";
+    let comment_start = text.find(comment_line).unwrap_or(0);
+    let comment_end = comment_start + comment_line.len();
+    assert!(
+        styles[comment_start..comment_end]
+            .chars()
+            .all(|style| style == STYLE_COMMENT),
+        "MariaDB hash comment line should remain fully comment-highlighted"
+    );
+
+    let quoted_identifier = "`group`";
+    let quoted_start = text.find(quoted_identifier).unwrap_or(0);
+    let quoted_end = quoted_start + quoted_identifier.len();
+    assert!(
+        styles[quoted_start..quoted_end]
+            .chars()
+            .all(|style| style == STYLE_QUOTED_IDENTIFIER),
+        "backtick identifier should use quoted-identifier highlighting"
+    );
+
+    let string_literal =
+        r#"'contains ; semicolon, ''quote'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, emoji 😊'"#;
+    let string_start = text.find(string_literal).unwrap_or(0);
+    let string_end = string_start + string_literal.len();
+    assert!(
+        styles[string_start..string_end]
+            .chars()
+            .all(|style| style == STYLE_STRING),
+        "delimiters and comment markers inside a MariaDB string literal must stay string-highlighted"
+    );
+
+    assert!(
+        text.contains("RESIGNAL"),
+        "test_mariadb/test1.txt should contain RESIGNAL"
+    );
+    let resignal_start = text.find("RESIGNAL").unwrap_or(0);
+    let resignal_end = resignal_start + "RESIGNAL".len();
+    assert!(
+        styles[resignal_start..resignal_end]
+            .chars()
+            .all(|style| style == STYLE_KEYWORD),
+        "MariaDB RESIGNAL should be highlighted as a keyword"
     );
 }

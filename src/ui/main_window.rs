@@ -257,6 +257,7 @@ impl AppState {
         let tab = self.editor_tabs[index].clone();
         self.active_editor_tab_id = tab_id;
         self.sql_editor = tab.sql_editor;
+        self.sql_editor.sync_db_type_from_connection();
         self.sql_editor.stabilize_display_metrics();
         self.sql_buffer = tab.sql_buffer;
         *self
@@ -2366,29 +2367,68 @@ impl MainWindow {
     ) -> Option<SchemaUpdate> {
         let mut conn_guard = lock_connection_with_activity(connection, "Loading schema metadata");
         let connection_generation = conn_guard.connection_generation();
-        let Ok(conn) = conn_guard.require_live_connection() else {
-            return None;
-        };
+        let (tables, views, procedures, functions) = match conn_guard.db_type() {
+            crate::db::DatabaseType::Oracle => {
+                let Ok(conn) = conn_guard.require_live_connection() else {
+                    return None;
+                };
 
-        let tables = match ObjectBrowser::get_tables(conn.as_ref()) {
-            Ok(tables) => tables,
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    "schema",
-                    &format!("failed to load tables for intellisense schema update: {err}"),
-                );
-                return None;
+                let tables = match ObjectBrowser::get_tables(conn.as_ref()) {
+                    Ok(tables) => tables,
+                    Err(err) => {
+                        crate::utils::logging::log_error(
+                            "schema",
+                            &format!("failed to load tables for intellisense schema update: {err}"),
+                        );
+                        return None;
+                    }
+                };
+
+                let views = match ObjectBrowser::get_views(conn.as_ref()) {
+                    Ok(views) => views,
+                    Err(err) => {
+                        crate::utils::logging::log_error(
+                            "schema",
+                            &format!("failed to load views for intellisense schema update: {err}"),
+                        );
+                        Vec::new()
+                    }
+                };
+
+                let procedures = ObjectBrowser::get_procedures(conn.as_ref()).unwrap_or_default();
+                let functions = ObjectBrowser::get_functions(conn.as_ref()).unwrap_or_default();
+                (tables, views, procedures, functions)
             }
-        };
+            crate::db::DatabaseType::MySQL => {
+                let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 
-        let views = match ObjectBrowser::get_views(conn.as_ref()) {
-            Ok(views) => views,
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    "schema",
-                    &format!("failed to load views for intellisense schema update: {err}"),
-                );
-                Vec::new()
+                let tables = match crate::db::query::mysql_executor::MysqlObjectBrowser::get_tables(
+                    mysql_conn,
+                ) {
+                    Ok(tables) => tables,
+                    Err(err) => {
+                        crate::utils::logging::log_error(
+                            "schema",
+                            &format!(
+                                "failed to load MySQL tables for intellisense schema update: {err}"
+                            ),
+                        );
+                        return None;
+                    }
+                };
+
+                let views =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_views(mysql_conn)
+                        .unwrap_or_default();
+                let procedures =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_procedures(
+                        mysql_conn,
+                    )
+                    .unwrap_or_default();
+                let functions =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_functions(mysql_conn)
+                        .unwrap_or_default();
+                (tables, views, procedures, functions)
             }
         };
 
@@ -2398,6 +2438,8 @@ impl MainWindow {
         data.tables = tables;
         highlight_data.views = views.clone();
         data.views = views;
+        data.procedures = procedures;
+        data.functions = functions;
         data.rebuild_indices();
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);
 
@@ -4005,7 +4047,9 @@ impl MainWindow {
                                         "connection",
                                         &format!("Connected to {} ({})", info.name, info.db_type),
                                     );
-                                    // Set db_type on active SQL editor highlighter
+                                    for tab in &s.editor_tabs {
+                                        tab.sql_editor.set_db_type(info.db_type);
+                                    }
                                     s.sql_editor.set_db_type(info.db_type);
                                     *s.connection_info
                                         .lock()
@@ -4013,8 +4057,10 @@ impl MainWindow {
                                         Some(info.clone());
                                     s.has_live_connection = true;
                                     s.pending_connection_metadata_refresh = false;
-                                    s.status_bar
-                                        .set_label(&format!("Connected | {} ({})", info.name, info.db_type));
+                                    s.status_bar.set_label(&format!(
+                                        "Connected | {} ({})",
+                                        info.name, info.db_type
+                                    ));
                                     MainWindow::start_connection_metadata_refresh(
                                         &mut s,
                                         &schema_sender,

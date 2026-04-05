@@ -425,6 +425,7 @@ impl SqlEditorWidget {
             Ok(mut h) => h.set_db_type(db_type),
             Err(poisoned) => poisoned.into_inner().set_db_type(db_type),
         }
+        self.rehighlight_full_buffer();
     }
 
     fn handle_buffer_highlight_update(

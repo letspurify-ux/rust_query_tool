@@ -129,6 +129,20 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
 }
 
 pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
+    tokenize_sql_spanned_with_mysql_compat(sql, sql_text::mysql_compatibility_for_sql(sql, None))
+}
+
+pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) -> Vec<SqlToken> {
+    tokenize_sql_spanned_with_mysql_compat(sql, mysql_compatible)
+        .into_iter()
+        .map(|span| span.token)
+        .collect()
+}
+
+pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
+    sql: &str,
+    mysql_compatible: bool,
+) -> Vec<SqlTokenSpan> {
     let mut tokens = Vec::new();
     let mut iter = sql.char_indices().peekable();
     let sql_bytes = sql.as_bytes();
@@ -340,6 +354,28 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::BacktickQuote
+        ) {
+            current.push(c);
+            if c == '`' {
+                if next == Some('`') {
+                    iter.next();
+                    current.push('`');
+                    continue;
+                }
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::Word(std::mem::take(&mut current)),
+                    start: current_start,
+                    end: idx + 1,
+                });
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
+                continue;
+            }
+            continue;
+        }
+
         if c.is_whitespace() {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             if c == '\n' {
@@ -359,6 +395,18 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                 current.push('\n');
             }
             current.push(c);
+            pending_newline = false;
+            continue;
+        }
+
+        if mysql_compatible && sql_text::is_mysql_hash_comment_start(sql_bytes, idx) {
+            flush_word(&mut current, &mut current_start, idx, &mut tokens);
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
+            current_start = idx;
+            if pending_newline {
+                current.push('\n');
+            }
+            current.push('#');
             pending_newline = false;
             continue;
         }
@@ -487,6 +535,14 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
+        if mysql_compatible && c == '`' {
+            flush_word(&mut current, &mut current_start, idx, &mut tokens);
+            current_start = idx;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::BacktickQuote;
+            current.push('`');
+            continue;
+        }
+
         if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
@@ -527,6 +583,21 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                 start: idx,
                 end,
             });
+            continue;
+        }
+
+        if mysql_compatible
+            && c == '<'
+            && next == Some('=')
+            && sql_bytes.get(idx + 2) == Some(&b'>')
+        {
+            tokens.push(SqlTokenSpan {
+                token: SqlToken::Symbol("<=>".to_string()),
+                start: idx,
+                end: idx + 3,
+            });
+            let _ = iter.next();
+            let _ = iter.next();
             continue;
         }
 
@@ -887,7 +958,8 @@ mod tests {
     use super::{
         can_execute_while_disconnected, clamp_cursor_to_char_boundary,
         has_connection_bootstrap_command, statement_at_cursor, statement_bounds_in_text,
-        tokenize_sql, tokenize_sql_spanned, DollarQuoteState, PendingTailTokenKind,
+        tokenize_sql, tokenize_sql_spanned, tokenize_sql_with_mysql_compat, DollarQuoteState,
+        PendingTailTokenKind,
     };
     use crate::db::SplitState;
     use crate::sql_text;
@@ -936,6 +1008,7 @@ mod tests {
         let mut current = String::new();
         let mut scan_state = SplitState::default();
         let mut pending_newline = true;
+        let mysql_compatible = sql_text::mysql_compatibility_for_sql(sql, None);
 
         let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
             if !current.is_empty() {
@@ -1190,6 +1263,13 @@ mod tests {
                 continue;
             }
 
+            if mysql_compatible && c == '<' && next == Some('=') && chars.get(i + 2) == Some(&'>')
+            {
+                tokens.push(SqlToken::Symbol("<=>".to_string()));
+                i += 3;
+                continue;
+            }
+
             let sym = match (c, next) {
                 ('<', Some('=')) => Some("<=".to_string()),
                 ('>', Some('=')) => Some(">=".to_string()),
@@ -1336,6 +1416,59 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_mysql_hash_comment_as_comment_token() {
+        let sql = "SELECT 1 # line comment torture: ; ; ; DELIMITER $$ should not matter";
+        let tokens = tokenize_sql(sql);
+
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, SqlToken::Comment(comment) if comment.contains("DELIMITER $$"))));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_mysql_backtick_identifier_as_single_word() {
+        let sql = "SELECT `order`, `complex``name` FROM `sales`";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+        let words = tokens
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(words.iter().any(|word| word == "`order`"));
+        assert!(words.iter().any(|word| word == "`complex``name`"));
+        assert!(words.iter().any(|word| word == "`sales`"));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_mysql_null_safe_equal_as_single_symbol() {
+        let sql = "SELECT OLD.order_status <=> NEW.order_status FROM dual";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "<=>")),
+            "mysql null-safe equality should stay a single symbol token: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_auto_detects_mysql_null_safe_equal() {
+        let sql = "SELECT OLD.order_status <=> NEW.order_status FROM dual";
+        let tokens = tokenize_sql(sql);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "<=>")),
+            "shared mysql detection should keep null-safe equality as one token: {tokens:?}"
+        );
     }
 
     #[test]

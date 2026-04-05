@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-05 (split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header owner chain 명시, `JOIN`/`APPLY` semantic split, shared continuation kind → depth mapping 공용화, canonical/idempotent formatter 원칙 반영, non-subquery paren 내부 function-local `RETURNING` suppress 및 multiline list sibling 복귀 규칙 명시)
+> 최종 업데이트: 2026-04-06 (`WINDOW` clause를 named definition list header로 명시, bare `WINDOW` 다음 named window sibling depth 규칙 추가, exact bare `WINDOW` continuation taxonomy를 clause-body carry로 조정)
 
 ## 0. 이 문서의 역할
 
@@ -261,7 +261,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - same-depth header: `WITH` 같은 owner/header chain 조각, terminal `JOIN/APPLY` 전의 incomplete modifier fragment (`LEFT OUTER`, `CROSS`, `OUTER`)
 - same-depth merge-header header line: retained `WHEN`, `WHEN NOT`, pending state가 넘겨주는 split `MATCHED`, standalone `WHEN MATCHED`, standalone `WHEN NOT MATCHED`
 - same-depth deferred-wrapper owner line: exact bare condition-owner line(`EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`), exact bare direct from-item owner(`LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `FROM/USING/... JOIN TABLE` variants), exact bare generic expression owner(`CURSOR`, `MULTISET`)
-- same-depth exact bare multiline/query owner header line: `WITHIN GROUP`, `KEEP`, `WINDOW`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `REFERENCE`, `JOIN TABLE`/`USING TABLE` 계열처럼 generic last-keyword consumer와 충돌할 수 있는 owner/pending-owner family
+- same-depth exact bare multiline/query owner header line: `WITHIN GROUP`, `KEEP`, `MATCH_RECOGNIZE`, `PIVOT`, `UNPIVOT`, `REFERENCE`, `JOIN TABLE`/`USING TABLE` 계열처럼 generic last-keyword consumer와 충돌할 수 있는 owner/pending-owner family
+- current-line+1 dedicated clause-list header: exact bare `WINDOW` when it opens a named window definition list; 이 line 자체는 dedicated `WINDOW` family로 분류하되, 다음 named window sibling은 generic same-depth가 아니라 clause body depth를 받는다
 - same-depth dedicated pending fragment: exact bare split `FOR` when it is still waiting for `UPDATE`
 - query-base+1 header: `FROM`, `WHERE`, `HAVING`, `USING`, `INTO`, `ON`, `UNION/INTERSECT/MINUS/EXCEPT`, `QUALIFY`, `SEARCH`, `CYCLE`, `FOR UPDATE`
 - current-line+1 merge-header condition: retained merge-header state가 소비하는 `AND`/`OR` condition line, standalone `THEN`, mixed close tail `) THEN`
@@ -284,6 +285,9 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - `MEASURES`, `REFERENCE`, `SUBSET`, `PATTERN`, `DEFINE`, `RULES`, `COLUMNS`, `KEEP`은 generic query-base carry가 아니라 active owner frame의 body depth에 먼저 snap 되어야 한다.
 - split multiline owner/modifier의 exact bare keyword-only line도 generic carry와 dedicated owner-relative state를 같은 shared prefix taxonomy 위에서 해석해야 한다. 단, 최종 `final depth`는 active owner state가 canonicalize한다.
 - split `MERGE` header의 standalone `THEN`은 generic bare-header consumer가 아니라 retained merge-branch-header condition depth를 그대로 사용한다.
+- bare `WINDOW`는 `WINDOW w_name AS (...)` named owner의 일부가 아니라, named window definition list를 여는 clause header다. 따라서 multiline `WINDOW` clause에서 bare `WINDOW` 다음 `w_name AS (` sibling header는 `WINDOW` line과 same-depth가 아니라 clause body depth(`current-line + 1`)를 받아야 한다.
+- 이때 `w_name AS (` / `w_running AS (` / `w_global AS (` 같은 named window definition sibling은 모두 같은 `WINDOW` clause body depth를 공유하고, 각 definition 내부의 `PARTITION BY` / `ORDER BY` / `ROWS|RANGE|GROUPS|EXCLUDE`는 그보다 다시 한 단계 deeper여야 한다.
+- `),` 뒤 다음 named window sibling은 이전 definition body depth나 visual hanging indent를 상속하지 않고, 항상 `WINDOW` clause body depth로 복귀해야 한다. 그래야 multiline named window list가 canonical / idempotent 하다.
 
 ### 3.4 current operator RHS continuation policy
 

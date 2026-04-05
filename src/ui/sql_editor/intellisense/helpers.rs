@@ -22,18 +22,20 @@ impl SqlEditorWidget {
             deep_ctx.statement_tokens.as_ref(),
             cte.body_range,
         );
-        let recursive_generated_columns = intellisense_context::extract_recursive_cte_generated_columns(
-            deep_ctx.statement_tokens.as_ref(),
-            cte.body_range.end,
-        );
+        let recursive_generated_columns =
+            intellisense_context::extract_recursive_cte_generated_columns(
+                deep_ctx.statement_tokens.as_ref(),
+                cte.body_range.end,
+            );
         let cursor_in_explicit_list =
             Self::is_cursor_inside_cte_explicit_column_list(deep_ctx, cte);
         let prefer_body_projection = cursor_in_explicit_list && !cte.body_range.is_empty();
-        let should_infer_from_body =
-            !cte.body_range.is_empty() && (cte.explicit_columns.is_empty() || prefer_body_projection);
+        let should_infer_from_body = !cte.body_range.is_empty()
+            && (cte.explicit_columns.is_empty() || prefer_body_projection);
 
         if should_infer_from_body {
-            let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
+            let body_tables_in_scope =
+                intellisense_context::collect_tables_in_statement(body_tokens);
             let (mut columns, wildcard_tables) = Self::collect_virtual_query_projection_columns(
                 body_tokens,
                 &body_tables_in_scope,
@@ -173,14 +175,44 @@ impl SqlEditorWidget {
             return;
         };
 
-        let (columns, cache_columns) = match conn_guard.require_live_connection() {
-            Ok(conn) => {
-                match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key) {
+        let schema_and_table = table_key.rsplit_once('.').map(|(schema, table)| {
+            (
+                schema.trim_matches(&['`', '"'][..]).to_string(),
+                table.trim_matches(&['`', '"'][..]).to_string(),
+            )
+        });
+
+        let (columns, cache_columns) = match conn_guard.db_type() {
+            crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+                Ok(conn) => match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key)
+                {
                     Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
                     Err(_) => (Vec::new(), false),
-                }
-            }
-            Err(_) => (Vec::new(), false),
+                },
+                Err(_) => (Vec::new(), false),
+            },
+            crate::db::DatabaseType::MySQL => conn_guard
+                .get_mysql_connection_mut()
+                .map(|mysql_conn| {
+                    let result = if let Some((schema, table)) = schema_and_table.as_ref() {
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_columns_in_schema(
+                            mysql_conn,
+                            Some(schema.as_str()),
+                            table.as_str(),
+                        )
+                    } else {
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_columns(
+                            mysql_conn,
+                            table_key.as_str(),
+                        )
+                    };
+
+                    match result {
+                        Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                        Err(_) => (Vec::new(), false),
+                    }
+                })
+                .unwrap_or((Vec::new(), false)),
         };
 
         let _ = sender.send(ColumnLoadUpdate {
@@ -266,7 +298,8 @@ impl SqlEditorWidget {
             .unwrap_or(insert_pos)
             .max(0);
         let line_start = text_buffer_access::line_start(buffer, Some(text_shadow), anchor).max(0);
-        let line_text = text_buffer_access::text_range(buffer, Some(text_shadow), line_start, anchor);
+        let line_text =
+            text_buffer_access::text_range(buffer, Some(text_shadow), line_start, anchor);
         let indent = Self::leading_indent_prefix(&line_text);
         let inserted = format!("\n{indent}");
 
@@ -304,9 +337,7 @@ impl SqlEditorWidget {
             .take()
     }
 
-    pub(super) fn invalidate_keyup_debounce(
-        runtime: &Arc<IntellisenseRuntimeState>,
-    ) -> u64 {
+    pub(super) fn invalidate_keyup_debounce(runtime: &Arc<IntellisenseRuntimeState>) -> u64 {
         runtime.invalidate_keyup_debounce(false)
     }
 
@@ -321,9 +352,7 @@ impl SqlEditorWidget {
         Self::invalidate_keyup_debounce_with_parse_generation(runtime, true);
     }
 
-    fn finalize_completion_after_selection(
-        runtime: &Arc<IntellisenseRuntimeState>,
-    ) {
+    fn finalize_completion_after_selection(runtime: &Arc<IntellisenseRuntimeState>) {
         runtime.clear_ui_tracking();
         Self::invalidate_keyup_debounce_with_parse_generation(runtime, true);
     }
@@ -398,6 +427,4 @@ impl SqlEditorWidget {
     fn is_same_raw_cursor_offset(current_raw: i32, scheduled_raw: i32) -> bool {
         current_raw == scheduled_raw
     }
-
-
 }

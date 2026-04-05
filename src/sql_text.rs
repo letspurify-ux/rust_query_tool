@@ -793,78 +793,408 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 // MySQL / MariaDB keywords (sorted, uppercase, excludes words already in ORACLE_SQL_KEYWORDS)
 // ---------------------------------------------------------------------------
 pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
-    "ACCESSIBLE", "ACTION", "ADD", "AFTER", "AGAINST", "ALGORITHM", "ALL", "ALTER", "ANALYZE",
-    "AND", "AS", "ASC", "AUTO_INCREMENT", "AVG_ROW_LENGTH",
-    "BEFORE", "BEGIN", "BETWEEN", "BIGINT", "BINARY", "BIT", "BLOB", "BOOL", "BOOLEAN",
+    "ACCESSIBLE",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "AGAINST",
+    "ALGORITHM",
+    "ALL",
+    "ALTER",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "AUTO_INCREMENT",
+    "AVG_ROW_LENGTH",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BIGINT",
+    "BINARY",
+    "BIT",
+    "BLOB",
+    "BOOL",
+    "BOOLEAN",
     "BY",
-    "CALL", "CASCADE", "CASE", "CHANGE", "CHAR", "CHARACTER", "CHARSET", "CHECK",
-    "COLLATE", "COLUMN", "COLUMNS", "COMMENT", "COMMIT", "COMPACT", "COMPRESSED",
-    "CONDITION", "CONNECTION", "CONSTRAINT", "CONTINUE", "CONVERT", "CREATE",
-    "CROSS", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER",
+    "CALL",
+    "CASCADE",
+    "CASE",
+    "CHANGE",
+    "CHAR",
+    "CHARACTER",
+    "CHARSET",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COLUMNS",
+    "COMMENT",
+    "COMMIT",
+    "COMPACT",
+    "COMPRESSED",
+    "CONDITION",
+    "CONNECTION",
+    "CONSTRAINT",
+    "CONTINUE",
+    "CONVERT",
+    "CREATE",
+    "CROSS",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
     "CURSOR",
-    "DATA", "DATABASE", "DATABASES", "DATE", "DATETIME", "DAY", "DAY_HOUR",
-    "DAY_MICROSECOND", "DAY_MINUTE", "DAY_SECOND", "DEC", "DECIMAL", "DECLARE",
-    "DEFAULT", "DELAYED", "DELETE", "DELIMITER", "DESC", "DESCRIBE", "DETERMINISTIC",
-    "DISABLE", "DISCARD", "DISTINCT", "DISTINCTROW", "DIV", "DOUBLE", "DROP", "DUAL",
-    "DUMP", "DUPLICATE", "DYNAMIC",
-    "EACH", "ELSE", "ELSEIF", "ENABLE", "ENCLOSED", "END", "ENGINE", "ENGINES",
-    "ENUM", "ESCAPED", "EVENT", "EVENTS", "EXECUTE", "EXISTS", "EXIT", "EXPLAIN",
-    "EXTENDED", "EXTENT_SIZE",
-    "FALSE", "FETCH", "FIELDS", "FILE", "FIRST", "FIXED", "FLOAT", "FLUSH",
-    "FOR", "FORCE", "FOREIGN", "FORMAT", "FROM", "FULL", "FULLTEXT", "FUNCTION",
-    "GENERAL", "GEOMETRY", "GEOMETRYCOLLECTION", "GET", "GLOBAL", "GRANT", "GRANTS",
+    "DATA",
+    "DATABASE",
+    "DATABASES",
+    "DATE",
+    "DATETIME",
+    "DAY",
+    "DAY_HOUR",
+    "DAY_MICROSECOND",
+    "DAY_MINUTE",
+    "DAY_SECOND",
+    "DEC",
+    "DECIMAL",
+    "DECLARE",
+    "DEFAULT",
+    "DELAYED",
+    "DELETE",
+    "DELIMITER",
+    "DESC",
+    "DESCRIBE",
+    "DETERMINISTIC",
+    "DISABLE",
+    "DISCARD",
+    "DISTINCT",
+    "DISTINCTROW",
+    "DIV",
+    "DOUBLE",
+    "DROP",
+    "DUAL",
+    "DUMP",
+    "DUPLICATE",
+    "DYNAMIC",
+    "EACH",
+    "ELSE",
+    "ELSEIF",
+    "ENABLE",
+    "ENCLOSED",
+    "END",
+    "ENGINE",
+    "ENGINES",
+    "ENUM",
+    "ESCAPED",
+    "EVENT",
+    "EVENTS",
+    "EXECUTE",
+    "EXISTS",
+    "EXIT",
+    "EXPLAIN",
+    "EXTENDED",
+    "EXTENT_SIZE",
+    "FALSE",
+    "FETCH",
+    "FIELDS",
+    "FILE",
+    "FIRST",
+    "FIXED",
+    "FLOAT",
+    "FLUSH",
+    "FOR",
+    "FORCE",
+    "FOREIGN",
+    "FORMAT",
+    "FROM",
+    "FULL",
+    "FULLTEXT",
+    "FUNCTION",
+    "GENERAL",
+    "GEOMETRY",
+    "GEOMETRYCOLLECTION",
+    "GET",
+    "GLOBAL",
+    "GRANT",
+    "GRANTS",
     "GROUP",
-    "HANDLER", "HASH", "HAVING", "HELP", "HIGH_PRIORITY", "HOST", "HOUR",
-    "HOUR_MICROSECOND", "HOUR_MINUTE", "HOUR_SECOND",
-    "IDENTIFIED", "IF", "IGNORE", "IMPORT", "IN", "INDEX", "INDEXES", "INFILE",
-    "INNER", "INOUT", "INSENSITIVE", "INSERT", "INT", "INT1", "INT2", "INT3",
-    "INT4", "INT8", "INTEGER", "INTERVAL", "INTO", "INVOKER", "IO_THREAD",
-    "IS", "ISOLATION", "ITERATE",
-    "JOIN", "JSON",
-    "KEY", "KEYS", "KILL",
-    "LANGUAGE", "LAST", "LEADING", "LEAVE", "LEFT", "LEVEL", "LIKE", "LIMIT",
-    "LINEAR", "LINES", "LINESTRING", "LIST", "LOAD", "LOCAL", "LOCALTIME",
-    "LOCALTIMESTAMP", "LOCK", "LOCKS", "LOGFILE", "LOGS", "LONG", "LONGBLOB",
-    "LONGTEXT", "LOOP", "LOW_PRIORITY",
-    "MASTER", "MATCH", "MAX_ROWS", "MAXVALUE", "MEDIUMBLOB", "MEDIUMINT",
-    "MEDIUMTEXT", "MEMORY", "MERGE", "MICROSECOND", "MIDDLEINT", "MIN_ROWS",
-    "MINUTE", "MINUTE_MICROSECOND", "MINUTE_SECOND", "MOD", "MODE", "MODIFY",
-    "MONTH", "MULTILINESTRING", "MULTIPOINT", "MULTIPOLYGON", "MUTEX",
-    "NAMES", "NATIONAL", "NATURAL", "NCHAR", "NDB", "NDBCLUSTER", "NEW", "NEXT",
-    "NO", "NONE", "NOT", "NULL", "NUMERIC", "NVARCHAR",
-    "OFFSET", "ON", "ONE", "OPEN", "OPTIMIZE", "OPTION", "OPTIONALLY", "OR",
-    "ORDER", "OUT", "OUTER", "OUTFILE",
-    "PACK_KEYS", "PARSER", "PARTIAL", "PARTITION", "PARTITIONS", "PASSWORD",
-    "PLUGIN", "PLUGINS", "POINT", "POLYGON", "PORT", "PRECISION", "PREPARE",
-    "PRESERVE", "PRIMARY", "PRIVILEGES", "PROCEDURE", "PROCESSLIST", "PROFILE",
-    "PROFILES", "PURGE",
-    "QUARTER", "QUERY",
-    "RANGE", "READ", "READS", "REAL", "REDUNDANT", "REFERENCES", "REGEXP",
-    "RELAY_LOG", "RELEASE", "RENAME", "REORGANIZE", "REPAIR", "REPEAT",
-    "REPEATABLE", "REPLACE", "REQUIRE", "RESET", "RESIGNAL", "RESTRICT",
-    "RETURN", "RETURNS", "REVOKE", "RIGHT", "RLIKE", "ROLLBACK", "ROLLUP",
-    "ROUTINE", "ROW", "ROW_FORMAT", "ROWS",
-    "SAVEPOINT", "SCHEDULE", "SCHEMA", "SCHEMAS", "SECOND", "SECOND_MICROSECOND",
-    "SECURITY", "SELECT", "SENSITIVE", "SEPARATOR", "SERIAL", "SERIALIZABLE",
-    "SERVER", "SESSION", "SET", "SHARE", "SHOW", "SHUTDOWN", "SIGNAL",
-    "SIMPLE", "SLAVE", "SMALLINT", "SNAPSHOT", "SOME", "SONAME", "SOUNDS",
-    "SPATIAL", "SPECIFIC", "SQL", "SQL_BIG_RESULT", "SQL_BUFFER_RESULT",
-    "SQL_CACHE", "SQL_CALC_FOUND_ROWS", "SQL_NO_CACHE", "SQL_SMALL_RESULT",
-    "SQL_THREAD", "SQLEXCEPTION", "SQLSTATE", "SQLWARNING",
-    "SSL", "START", "STARTING", "STATUS", "STOP", "STORAGE",
-    "STRAIGHT_JOIN", "SUBJECT", "SUBPARTITION", "SUBPARTITIONS", "SUPER",
-    "TABLE", "TABLES", "TABLESPACE", "TEMPORARY", "TEMPTABLE", "TERMINATED",
-    "TEXT", "THAN", "THEN", "TIME", "TIMESTAMP", "TINYBLOB", "TINYINT",
-    "TINYTEXT", "TO", "TRAILING", "TRANSACTION", "TRIGGER", "TRIGGERS",
-    "TRUE", "TRUNCATE", "TYPE",
-    "UNCOMMITTED", "UNDEFINED", "UNDO", "UNICODE", "UNION", "UNIQUE",
-    "UNLOCK", "UNSIGNED", "UPDATE", "UPGRADE", "USAGE", "USE", "USER",
-    "USING", "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP",
-    "VALUE", "VALUES", "VARBINARY", "VARCHAR", "VARCHARACTER", "VARIABLES",
-    "VARYING", "VIEW",
-    "WAIT", "WARNINGS", "WEEK", "WHEN", "WHERE", "WHILE", "WITH", "WORK", "WRITE",
-    "XA", "XOR",
-    "YEAR", "YEAR_MONTH",
+    "HANDLER",
+    "HASH",
+    "HAVING",
+    "HELP",
+    "HIGH_PRIORITY",
+    "HOST",
+    "HOUR",
+    "HOUR_MICROSECOND",
+    "HOUR_MINUTE",
+    "HOUR_SECOND",
+    "IDENTIFIED",
+    "IF",
+    "IGNORE",
+    "IMPORT",
+    "IN",
+    "INDEX",
+    "INDEXES",
+    "INFILE",
+    "INNER",
+    "INOUT",
+    "INSENSITIVE",
+    "INSERT",
+    "INT",
+    "INT1",
+    "INT2",
+    "INT3",
+    "INT4",
+    "INT8",
+    "INTEGER",
+    "INTERVAL",
+    "INTO",
+    "INVOKER",
+    "IO_THREAD",
+    "IS",
+    "ISOLATION",
+    "ITERATE",
+    "JOIN",
+    "JSON",
+    "KEY",
+    "KEYS",
+    "KILL",
+    "LANGUAGE",
+    "LAST",
+    "LEADING",
+    "LEAVE",
+    "LEFT",
+    "LEVEL",
+    "LIKE",
+    "LIMIT",
+    "LINEAR",
+    "LINES",
+    "LINESTRING",
+    "LIST",
+    "LOAD",
+    "LOCAL",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "LOCK",
+    "LOCKS",
+    "LOGFILE",
+    "LOGS",
+    "LONG",
+    "LONGBLOB",
+    "LONGTEXT",
+    "LOOP",
+    "LOW_PRIORITY",
+    "MASTER",
+    "MATCH",
+    "MAX_ROWS",
+    "MAXVALUE",
+    "MEDIUMBLOB",
+    "MEDIUMINT",
+    "MEDIUMTEXT",
+    "MEMORY",
+    "MERGE",
+    "MICROSECOND",
+    "MIDDLEINT",
+    "MIN_ROWS",
+    "MINUTE",
+    "MINUTE_MICROSECOND",
+    "MINUTE_SECOND",
+    "MOD",
+    "MODE",
+    "MODIFY",
+    "MONTH",
+    "MULTILINESTRING",
+    "MULTIPOINT",
+    "MULTIPOLYGON",
+    "MUTEX",
+    "NAMES",
+    "NATIONAL",
+    "NATURAL",
+    "NCHAR",
+    "NDB",
+    "NDBCLUSTER",
+    "NEW",
+    "NEXT",
+    "NO",
+    "NONE",
+    "NOT",
+    "NULL",
+    "NUMERIC",
+    "NVARCHAR",
+    "OFFSET",
+    "ON",
+    "ONE",
+    "OPEN",
+    "OPTIMIZE",
+    "OPTION",
+    "OPTIONALLY",
+    "OR",
+    "ORDER",
+    "OUT",
+    "OUTER",
+    "OUTFILE",
+    "PACK_KEYS",
+    "PARSER",
+    "PARTIAL",
+    "PARTITION",
+    "PARTITIONS",
+    "PASSWORD",
+    "PLUGIN",
+    "PLUGINS",
+    "POINT",
+    "POLYGON",
+    "PORT",
+    "PRECISION",
+    "PREPARE",
+    "PRESERVE",
+    "PRIMARY",
+    "PRIVILEGES",
+    "PROCEDURE",
+    "PROCESSLIST",
+    "PROFILE",
+    "PROFILES",
+    "PURGE",
+    "QUARTER",
+    "QUERY",
+    "RANGE",
+    "READ",
+    "READS",
+    "REAL",
+    "REDUNDANT",
+    "REFERENCES",
+    "REGEXP",
+    "RELAY_LOG",
+    "RELEASE",
+    "RENAME",
+    "REORGANIZE",
+    "REPAIR",
+    "REPEAT",
+    "REPEATABLE",
+    "REPLACE",
+    "REQUIRE",
+    "RESET",
+    "RESIGNAL",
+    "RESTRICT",
+    "RETURN",
+    "RETURNS",
+    "REVOKE",
+    "RIGHT",
+    "RLIKE",
+    "ROLLBACK",
+    "ROLLUP",
+    "ROUTINE",
+    "ROW",
+    "ROW_FORMAT",
+    "ROWS",
+    "SAVEPOINT",
+    "SCHEDULE",
+    "SCHEMA",
+    "SCHEMAS",
+    "SECOND",
+    "SECOND_MICROSECOND",
+    "SECURITY",
+    "SELECT",
+    "SENSITIVE",
+    "SEPARATOR",
+    "SERIAL",
+    "SERIALIZABLE",
+    "SERVER",
+    "SESSION",
+    "SET",
+    "SHARE",
+    "SHOW",
+    "SHUTDOWN",
+    "SIGNAL",
+    "SIMPLE",
+    "SLAVE",
+    "SMALLINT",
+    "SNAPSHOT",
+    "SOME",
+    "SONAME",
+    "SOUNDS",
+    "SPATIAL",
+    "SPECIFIC",
+    "SQL",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+    "SQL_CACHE",
+    "SQL_CALC_FOUND_ROWS",
+    "SQL_NO_CACHE",
+    "SQL_SMALL_RESULT",
+    "SQL_THREAD",
+    "SQLEXCEPTION",
+    "SQLSTATE",
+    "SQLWARNING",
+    "SSL",
+    "START",
+    "STARTING",
+    "STATUS",
+    "STOP",
+    "STORAGE",
+    "STRAIGHT_JOIN",
+    "SUBJECT",
+    "SUBPARTITION",
+    "SUBPARTITIONS",
+    "SUPER",
+    "TABLE",
+    "TABLES",
+    "TABLESPACE",
+    "TEMPORARY",
+    "TEMPTABLE",
+    "TERMINATED",
+    "TEXT",
+    "THAN",
+    "THEN",
+    "TIME",
+    "TIMESTAMP",
+    "TINYBLOB",
+    "TINYINT",
+    "TINYTEXT",
+    "TO",
+    "TRAILING",
+    "TRANSACTION",
+    "TRIGGER",
+    "TRIGGERS",
+    "TRUE",
+    "TRUNCATE",
+    "TYPE",
+    "UNCOMMITTED",
+    "UNDEFINED",
+    "UNDO",
+    "UNICODE",
+    "UNION",
+    "UNIQUE",
+    "UNLOCK",
+    "UNSIGNED",
+    "UPDATE",
+    "UPGRADE",
+    "USAGE",
+    "USE",
+    "USER",
+    "USING",
+    "UTC_DATE",
+    "UTC_TIME",
+    "UTC_TIMESTAMP",
+    "VALUE",
+    "VALUES",
+    "VARBINARY",
+    "VARCHAR",
+    "VARCHARACTER",
+    "VARIABLES",
+    "VARYING",
+    "VIEW",
+    "WAIT",
+    "WARNINGS",
+    "WEEK",
+    "WHEN",
+    "WHERE",
+    "WHILE",
+    "WITH",
+    "WORK",
+    "WRITE",
+    "XA",
+    "XOR",
+    "YEAR",
+    "YEAR_MONTH",
     "ZEROFILL",
 ];
 
@@ -878,7 +1208,10 @@ pub(crate) fn is_mysql_sql_keyword(word: &str) -> bool {
 }
 
 /// Database-type-aware keyword check.
-pub(crate) fn is_sql_keyword_for_db(word: &str, db_type: crate::db::connection::DatabaseType) -> bool {
+pub(crate) fn is_sql_keyword_for_db(
+    word: &str,
+    db_type: crate::db::connection::DatabaseType,
+) -> bool {
     match db_type {
         crate::db::connection::DatabaseType::Oracle => is_oracle_sql_keyword(word),
         crate::db::connection::DatabaseType::MySQL => is_mysql_sql_keyword(word),
@@ -1243,7 +1576,7 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
     let Some(rest) = text_upper.strip_prefix(keyword) else {
         return false;
     };
-    if rest.starts_with("/*") || rest.starts_with("--") {
+    if rest.starts_with("/*") || rest.starts_with("--") || rest.starts_with('#') {
         return true;
     }
     match rest.as_bytes().first() {
@@ -1273,15 +1606,217 @@ pub(crate) fn is_sqlplus_remark_comment_line(line: &str) -> bool {
     )
 }
 
+#[inline]
+pub(crate) fn is_mysql_hash_comment_start(bytes: &[u8], idx: usize) -> bool {
+    bytes.get(idx) == Some(&b'#')
+        && idx
+            .checked_sub(1)
+            .and_then(|prev_idx| bytes.get(prev_idx))
+            .is_none_or(|prev| !is_identifier_byte(*prev))
+}
+
+#[inline]
+pub(crate) fn is_mysql_executable_comment_start(bytes: &[u8], idx: usize) -> bool {
+    bytes.get(idx) == Some(&b'/')
+        && bytes.get(idx + 1) == Some(&b'*')
+        && bytes.get(idx + 2) == Some(&b'!')
+}
+
+#[inline]
+pub(crate) fn is_mysql_hash_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    is_mysql_hash_comment_start(trimmed.as_bytes(), 0)
+}
+
+#[inline]
+pub(crate) fn is_mysql_block_label_target(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "BEGIN" | "LOOP" | "REPEAT" | "WHILE"
+    )
+}
+
+#[inline]
+pub(crate) fn sql_line_comment_prefix_len(bytes: &[u8], idx: usize) -> Option<usize> {
+    if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-') {
+        Some(2)
+    } else if is_mysql_hash_comment_start(bytes, idx) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_block_comment = false;
+    let mut q_quote_end: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if sql_line_comment_prefix_len(bytes, idx).is_some_and(|prefix_len| prefix_len == 2) {
+            break;
+        }
+        if is_mysql_hash_comment_start(bytes, idx) {
+            return true;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(3);
+                    continue;
+                }
+            }
+        }
+        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
+            && matches!(next, Some(b'q' | b'Q'))
+            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
+        {
+            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
+                if is_valid_q_quote_delimiter_byte(delimiter) {
+                    q_quote_end = Some(q_quote_closing_byte(delimiter));
+                    idx = idx.saturating_add(4);
+                    continue;
+                }
+            }
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    false
+}
+
+pub(crate) fn parse_mysql_delimiter_directive(line: &str) -> Option<String> {
+    let (word, start) = next_meaningful_word(line, 0)?;
+    if !word.eq_ignore_ascii_case("DELIMITER") {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let mut idx = start.saturating_add(word.len());
+    let mut trailing = String::new();
+
+    while idx < line.len() {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
+            break;
+        }
+
+        if line[idx..].starts_with("/*") {
+            let block_start = idx.saturating_add(2);
+            let block_end = line.get(block_start..)?.find("*/")?;
+            idx = block_start.saturating_add(block_end).saturating_add(2);
+            continue;
+        }
+
+        let ch = line.get(idx..)?.chars().next()?;
+        trailing.push(ch);
+        idx = idx.saturating_add(ch.len_utf8());
+    }
+
+    let delimiter = trailing.trim();
+    Some(if delimiter.is_empty() {
+        ";".to_string()
+    } else {
+        delimiter.to_string()
+    })
+}
+
+pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
+    sql.as_bytes().contains(&b'`')
+        || sql.contains("<=>")
+        || sql.contains("/*!")
+        || sql.lines().any(|line| {
+            line_has_mysql_hash_comment(line) || parse_mysql_delimiter_directive(line).is_some()
+        })
+}
+
+pub(crate) fn mysql_compatibility_for_sql(
+    sql: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> bool {
+    match preferred_db_type {
+        Some(crate::db::connection::DatabaseType::MySQL) => true,
+        Some(crate::db::connection::DatabaseType::Oracle) => false,
+        None => sql_uses_mysql_compatible_syntax(sql),
+    }
+}
+
 /// Returns true when a line is a SQL*Plus-style comment-only line.
 ///
 /// Recognizes:
 /// - `-- ...`
+/// - `# ...`
 /// - `REM ...`
 /// - `REMARK ...`
 pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.starts_with("--") || is_sqlplus_remark_comment_line(trimmed)
+    trimmed.starts_with("--") || trimmed.starts_with('#') || is_sqlplus_remark_comment_line(trimmed)
 }
 
 /// Updates `in_block_comment` state for a single trimmed line.
@@ -1308,7 +1843,7 @@ pub(crate) fn update_block_comment_state(trimmed: &str, in_block_comment: &mut b
                 continue;
             }
             // Stop scanning at line comment
-            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            if sql_line_comment_prefix_len(bytes, i).is_some() {
                 break;
             }
             // Skip string literals to avoid false matches on /* */ inside strings
@@ -1483,7 +2018,7 @@ pub(crate) fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
             continue;
         }
 
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             return line.get(..idx);
         }
 
@@ -1711,9 +2246,9 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
             continue;
         }
 
-        if c == b'-' && next == Some(b'-') {
+        if let Some(prefix_len) = sql_line_comment_prefix_len(bytes, i) {
             in_line_comment = true;
-            i += 2;
+            i += prefix_len;
             continue;
         }
 
@@ -1758,7 +2293,10 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
         i += 1;
     }
 
-    if (in_single_quote || in_double_quote || in_q_quote) && line_starts_in_multiline_string && line < line_count {
+    if (in_single_quote || in_double_quote || in_q_quote)
+        && line_starts_in_multiline_string
+        && line < line_count
+    {
         prefix_lengths[line] = Some(lines[line].len());
     }
 
@@ -1896,7 +2434,7 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
     let mut seen_words = 0usize;
 
     while idx < line.len() {
-        if line[idx..].starts_with("--") {
+        if sql_line_comment_prefix_len(line.as_bytes(), idx).is_some() {
             return None;
         }
 
@@ -1918,10 +2456,10 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
         let mut end = idx;
         while end < line.len() {
             let word_ch = line[end..].chars().next()?;
-            if word_ch.is_whitespace()
-                || line[end..].starts_with("/*")
-                || line[end..].starts_with("--")
-            {
+            if word_ch.is_whitespace() || line[end..].starts_with("/*") {
+                break;
+            }
+            if sql_line_comment_prefix_len(line.as_bytes(), end).is_some() {
                 break;
             }
             end += word_ch.len_utf8();
@@ -2006,7 +2544,7 @@ pub(crate) fn meaningful_identifier_words_before_inline_comment(
             continue;
         }
 
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
         if current == b'/' && next == Some(b'*') {
@@ -2084,7 +2622,7 @@ fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
                 idx = idx.saturating_add(1);
                 continue;
             }
-            if current == b'-' && next == Some(b'-') {
+            if sql_line_comment_prefix_len(bytes, idx).is_some() {
                 return identifiers;
             }
             if current == b'/' && next == Some(b'*') {
@@ -2204,7 +2742,7 @@ fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
                 idx = idx.saturating_add(1);
                 continue;
             }
-            if current == b'-' && next == Some(b'-') {
+            if sql_line_comment_prefix_len(bytes, idx).is_some() {
                 return false;
             }
             if current == b'/' && next == Some(b'*') {
@@ -2257,7 +2795,7 @@ fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
             idx = idx.saturating_add(1);
             continue;
         }
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             return true;
         }
         if current == b'/' && next == Some(b'*') {
@@ -2311,7 +2849,7 @@ fn line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
                 idx = idx.saturating_add(1);
                 continue;
             }
-            if current == b'-' && next == Some(b'-') {
+            if sql_line_comment_prefix_len(bytes, idx).is_some() {
                 return false;
             }
             if current == b'/' && next == Some(b'*') {
@@ -2364,7 +2902,7 @@ fn line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
             idx = idx.saturating_add(1);
             continue;
         }
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             return false;
         }
         if current == b'/' && next == Some(b'*') {
@@ -2396,7 +2934,7 @@ fn line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
             idx = idx.saturating_add(1);
             continue;
         }
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             return true;
         }
         if current == b'/' && next == Some(b'*') {
@@ -2955,6 +3493,27 @@ pub(crate) fn line_is_format_cte_definition_header(line: &str) -> bool {
         && line_ends_with_identifier_sequence_before_inline_comment(structural_tail, &["AS"])
 }
 
+/// Returns true when a line is a named WINDOW definition header that owns a
+/// following window specification through a trailing `AS (`.
+///
+/// Callers should only use this while a surrounding bare `WINDOW` clause is
+/// active. The classifier itself stays lexical so analyzer and formatter share
+/// one byte-safe rule.
+pub(crate) fn line_is_format_window_definition_header(line: &str) -> bool {
+    let structural_tail = auto_format_structural_tail(line);
+    if structural_tail.is_empty()
+        || !line_ends_with_open_paren_before_inline_comment(structural_tail)
+        || !line_ends_with_identifier_sequence_before_inline_comment(structural_tail, &["AS"])
+    {
+        return false;
+    }
+
+    let first_word = next_meaningful_word(structural_tail.trim_start(), 0).map(|(word, _)| word);
+    first_word.is_some_and(|word| {
+        !word.eq_ignore_ascii_case("WINDOW") && !word.eq_ignore_ascii_case("WITH")
+    })
+}
+
 /// Returns true when a CREATE query-body DDL header line owns the following
 /// query body through a trailing `AS`.
 fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
@@ -3139,7 +3698,7 @@ impl FormatQueryOwnerKind {
 }
 
 fn is_format_operator_query_owner_symbol(symbol: &str) -> bool {
-    matches!(symbol, "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=")
+    matches!(symbol, "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "<=>")
 }
 
 fn format_condition_operator_query_owner_kind(line: &str) -> Option<FormatQueryOwnerKind> {
@@ -4105,9 +4664,10 @@ impl FormatIndentedParenOwnerKind {
         general_paren_continuation_depth: Option<usize>,
     ) -> usize {
         match self {
-            Self::Window | Self::MatchRecognize | Self::Pivot | Self::Unpivot => {
+            Self::MatchRecognize | Self::Pivot | Self::Unpivot => {
                 query_base_depth.unwrap_or(fallback_depth)
             }
+            Self::Window => fallback_depth,
             Self::ModelSubclause => query_base_depth
                 .map(|depth| depth.saturating_add(1))
                 .unwrap_or(fallback_depth),
@@ -4185,6 +4745,7 @@ pub(crate) fn format_indented_paren_pending_header_kind(
     }
 
     if line_starts_with_identifier_sequence(structural_tail, &["WINDOW"])
+        && !line_has_exact_identifier_sequence(structural_tail, &["WINDOW"])
         && !line_ends_with_keyword(structural_tail, "AS")
         && !line_ends_with_open_paren_before_inline_comment(structural_tail)
     {
@@ -4438,7 +4999,7 @@ fn line_trailing_identifiers_before_inline_comment(
             continue;
         }
 
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
         if current == b'/' && next == Some(b'*') {
@@ -4700,7 +5261,7 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
             continue;
         }
 
-        if current == b'-' && next == Some(b'-') {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
         if current == b'/' && next == Some(b'*') {
@@ -4977,7 +5538,7 @@ fn trailing_meaningful_tokens_before_inline_comment(
             break;
         };
 
-        if remaining.starts_with("--") {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
 
@@ -5200,6 +5761,7 @@ fn is_format_expression_continuation_symbol(symbol: &str) -> bool {
             | ">="
             | "<>"
             | "!="
+            | "<=>"
             | "+"
             | "-"
             | "*"
@@ -5529,6 +6091,10 @@ fn format_bare_structural_header_continuation_kind_for_structural_tail(
 
     if !line_is_exact_bare_structural_keyword_line(trimmed) {
         return None;
+    }
+
+    if line_has_exact_identifier_sequence(trimmed, &["WINDOW"]) {
+        return Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine);
     }
 
     if let Some(kind) = exact_bare_join_clause_continuation_kind(trimmed) {
@@ -6172,6 +6738,10 @@ mod tests {
             Some("q'[-- kept literal]' ")
         );
         assert_eq!(
+            trailing_inline_comment_prefix("SELECT 1 # real comment"),
+            Some("SELECT 1 ")
+        );
+        assert_eq!(
             trailing_inline_comment_prefix("FOR /* keep */ UPDATE -- real comment"),
             Some("FOR /* keep */ UPDATE ")
         );
@@ -6236,9 +6806,46 @@ mod tests {
         assert!(line_ends_with_semicolon_before_inline_comment(
             "VALUES (1); -- keep terminated"
         ));
+        assert!(line_ends_with_semicolon_before_inline_comment(
+            "VALUES (1); # keep terminated"
+        ));
         assert!(!line_ends_with_semicolon_before_inline_comment(
             "OPEN c_emp -- keep comment"
         ));
+    }
+
+    #[test]
+    fn mysql_hash_comment_helpers_treat_hash_as_comment_boundary() {
+        assert!(line_has_mysql_hash_comment("SELECT 1 # trailing"));
+        assert_eq!(trim_leading_sql_comments("  # comment only"), "");
+        assert!(!line_has_mysql_hash_comment("SELECT col#suffix FROM demo"));
+    }
+
+    #[test]
+    fn mysql_delimiter_directive_skips_leading_block_comment_and_inline_comment() {
+        assert_eq!(
+            parse_mysql_delimiter_directive("/* note */ DELIMITER /* gap */ $$ -- keep"),
+            Some("$$".to_string())
+        );
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER"),
+            Some(";".to_string())
+        );
+    }
+
+    #[test]
+    fn mysql_compatibility_helper_respects_preferred_db_type() {
+        let mysql_sql = "DROP TABLE IF EXISTS demo";
+
+        assert!(mysql_compatibility_for_sql(
+            mysql_sql,
+            Some(crate::db::connection::DatabaseType::MySQL)
+        ));
+        assert!(!mysql_compatibility_for_sql(
+            mysql_sql,
+            Some(crate::db::connection::DatabaseType::Oracle)
+        ));
+        assert!(sql_uses_mysql_compatible_syntax("SELECT OLD.c <=> NEW.c"));
     }
 
     #[test]
@@ -6454,7 +7061,7 @@ mod tests {
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("WINDOW -- keep"),
-            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("FROM TABLE -- keep"),
@@ -6573,7 +7180,7 @@ mod tests {
         );
         assert_eq!(
             format_inline_comment_structural_header_continuation_kind("WINDOW -- keep"),
-            Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
             format_inline_comment_structural_header_continuation_kind("FROM TABLE -- keep"),
@@ -6695,7 +7302,7 @@ mod tests {
             ),
             (
                 ") WINDOW -- keep",
-                Some(FormatInlineCommentHeaderContinuationKind::SameDepth),
+                Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine),
             ),
             (
                 ") JOIN -- keep",
@@ -7936,6 +8543,7 @@ mod tests {
             format_indented_paren_pending_header_kind("WITHIN"),
             Some(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup)
         );
+        assert_eq!(format_indented_paren_pending_header_kind("WINDOW"), None);
         assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup.line_can_continue("GROUP"));
         assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup.line_completes("GROUP"));
         assert!(PendingFormatIndentedParenOwnerHeaderKind::WithinGroup
@@ -8282,6 +8890,21 @@ mod tests {
             "SELECT empno AS salary"
         ));
         assert!(!line_is_format_cte_definition_header("b (a, b, c)"));
+    }
+
+    #[test]
+    fn window_definition_header_helper_tracks_named_window_items_only() {
+        assert!(line_is_format_window_definition_header("w_emp AS ("));
+        assert!(line_is_format_window_definition_header(
+            "/* owner */ w_emp_running AS ("
+        ));
+        assert!(!line_is_format_window_definition_header(
+            "WINDOW w_emp AS ("
+        ));
+        assert!(!line_is_format_window_definition_header(
+            "WITH base_emp AS ("
+        ));
+        assert!(!line_is_format_window_definition_header("w_emp AS"));
     }
 
     #[test]

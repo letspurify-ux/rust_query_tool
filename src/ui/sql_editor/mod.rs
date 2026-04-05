@@ -9,6 +9,7 @@ use fltk::{
     text::{TextBuffer, TextEditor, WrapMode},
     window::Window,
 };
+use mysql::prelude::Queryable;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
@@ -679,6 +680,7 @@ impl SqlEditorWidget {
         widget.setup_intellisense();
         widget.setup_word_undo_redo();
         widget.setup_syntax_highlighting();
+        widget.sync_db_type_from_connection();
         widget.setup_progress_handler(progress_receiver, progress_callback, query_running);
         widget.setup_column_loader(column_receiver);
         widget.setup_ui_action_handler(ui_action_receiver);
@@ -1035,15 +1037,83 @@ impl SqlEditorWidget {
             return;
         };
 
-        self.spawn_tracked_db_action(
-            "Generating explain plan",
-            "sql_editor::explain",
-            UiActionResult::ExplainPlan,
-            move |db_conn| {
-                QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
-                    .map_err(|err| err.to_string())
-            },
-        );
+        if !try_mark_query_running(&self.query_running) {
+            let _ = self
+                .ui_action_sender
+                .send(UiActionResult::QueryAlreadyRunning);
+            app::awake();
+            return;
+        }
+
+        store_mutex_bool(&self.cancel_flag, false);
+
+        let connection = self.connection.clone();
+        let sender = self.ui_action_sender.clone();
+        let query_running = self.query_running.clone();
+        let current_query_connection = self.current_query_connection.clone();
+        let cancel_flag = self.cancel_flag.clone();
+
+        set_cursor(Cursor::Wait);
+        app::flush();
+
+        thread::spawn(move || {
+            let sender_fallback = sender.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
+                    &connection,
+                    "Generating explain plan",
+                ) else {
+                    let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                };
+
+                let result = match conn_guard.db_type() {
+                    crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+                        Ok(db_conn) => {
+                            SqlEditorWidget::set_current_query_connection(
+                                &current_query_connection,
+                                Some(Arc::clone(&db_conn)),
+                            );
+                            if load_mutex_bool(&cancel_flag) {
+                                let _ = db_conn.break_execution();
+                            }
+                            QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
+                                .map_err(|err| err.to_string())
+                        }
+                        Err(message) => Err(message),
+                    },
+                    crate::db::DatabaseType::MySQL => conn_guard
+                        .get_mysql_connection_mut()
+                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                        .and_then(|mysql_conn| {
+                            crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
+                                mysql_conn, &sql,
+                            )
+                            .map_err(|err| err.to_string())
+                        }),
+                };
+
+                let _ = sender.send(UiActionResult::ExplainPlan(result));
+                app::awake();
+            }));
+
+            SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
+
+            if let Err(payload) = result {
+                let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "sql_editor::explain",
+                    &format!("sql_editor::explain thread panicked: {panic_msg}"),
+                );
+                let _ = sender_fallback.send(UiActionResult::ExplainPlan(Err(format!(
+                    "Internal error: {}",
+                    panic_msg
+                ))));
+                app::awake();
+            }
+        });
     }
 
     fn render_explain_plan(plan_lines: &[String]) -> String {
@@ -1202,15 +1272,19 @@ impl SqlEditorWidget {
         Window::delete(dialog);
     }
 
-    fn spawn_tracked_db_action<T, F>(
+    fn emit_status(&self, message: &str) {
+        Self::invoke_status_callback(&self.status_callback, message);
+    }
+
+    fn spawn_tracked_transaction_action<F>(
         &self,
         activity_label: &'static str,
         panic_context: &'static str,
-        make_ui_result: fn(Result<T, String>) -> UiActionResult,
-        action: F,
+        make_ui_result: fn(Result<(), String>) -> UiActionResult,
+        oracle_action: F,
+        mysql_sql: &'static str,
     ) where
-        T: Send + 'static,
-        F: FnOnce(Arc<Connection>) -> Result<T, String> + Send + 'static,
+        F: FnOnce(Arc<Connection>) -> Result<(), String> + Send + 'static,
     {
         if !try_mark_query_running(&self.query_running) {
             let _ = self
@@ -1242,18 +1316,28 @@ impl SqlEditorWidget {
                     return;
                 };
 
-                let result = match conn_guard.require_live_connection() {
-                    Ok(db_conn) => {
-                        SqlEditorWidget::set_current_query_connection(
-                            &current_query_connection,
-                            Some(Arc::clone(&db_conn)),
-                        );
-                        if load_mutex_bool(&cancel_flag) {
-                            let _ = db_conn.break_execution();
+                let result = match conn_guard.db_type() {
+                    crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+                        Ok(db_conn) => {
+                            SqlEditorWidget::set_current_query_connection(
+                                &current_query_connection,
+                                Some(Arc::clone(&db_conn)),
+                            );
+                            if load_mutex_bool(&cancel_flag) {
+                                let _ = db_conn.break_execution();
+                            }
+                            oracle_action(db_conn)
                         }
-                        action(db_conn)
-                    }
-                    Err(message) => Err(message),
+                        Err(message) => Err(message),
+                    },
+                    crate::db::DatabaseType::MySQL => conn_guard
+                        .get_mysql_connection_mut()
+                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                        .and_then(|mysql_conn| {
+                            mysql_conn
+                                .query_drop(mysql_sql)
+                                .map_err(|err| err.to_string())
+                        }),
                 };
 
                 let _ = sender.send(make_ui_result(result));
@@ -1278,10 +1362,6 @@ impl SqlEditorWidget {
         });
     }
 
-    fn emit_status(&self, message: &str) {
-        Self::invoke_status_callback(&self.status_callback, message);
-    }
-
     pub fn clear(&self) {
         let mut buffer = self.buffer.clone();
         let len = buffer.length();
@@ -1295,20 +1375,22 @@ impl SqlEditorWidget {
     }
 
     pub fn commit(&self) {
-        self.spawn_tracked_db_action(
+        self.spawn_tracked_transaction_action(
             "Commit transaction",
             "sql_editor::commit",
             UiActionResult::Commit,
             |db_conn| db_conn.commit().map_err(|err| err.to_string()),
+            "COMMIT",
         );
     }
 
     pub fn rollback(&self) {
-        self.spawn_tracked_db_action(
+        self.spawn_tracked_transaction_action(
             "Rollback transaction",
             "sql_editor::rollback",
             UiActionResult::Rollback,
             |db_conn| db_conn.rollback().map_err(|err| err.to_string()),
+            "ROLLBACK",
         );
     }
 
@@ -1504,6 +1586,17 @@ impl SqlEditorWidget {
 
     pub fn get_buffer(&self) -> TextBuffer {
         self.buffer.clone()
+    }
+
+    fn current_db_type(&self) -> crate::db::connection::DatabaseType {
+        match self.connection.lock() {
+            Ok(conn_guard) => conn_guard.db_type(),
+            Err(poisoned) => poisoned.into_inner().db_type(),
+        }
+    }
+
+    pub(crate) fn sync_db_type_from_connection(&self) {
+        self.set_db_type(self.current_db_type());
     }
 
     pub fn stabilize_display_metrics(&mut self) {

@@ -15,6 +15,13 @@ fn load_test_file(name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn load_mariadb_test_file(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test_mariadb");
+    path.push(name);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
 fn count_slash_lines(text: &str) -> usize {
     text.lines().filter(|line| line.trim() == "/").count()
 }
@@ -675,6 +682,79 @@ fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test19.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_mariadb_final_boss_script() {
+    let input = load_mariadb_test_file("test1.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "USE qt_mysql_final_boss",
+            "DELIMITER $$",
+            "CREATE PROCEDURE sp_run_final_boss ()",
+            "read_loop: LOOP",
+            "END$$",
+            "DELIMITER ;",
+            "`group`",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test1.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test1.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("/*!80000 SET @versioned_comment_executed = 1 */")
+        }),
+        "Formatting should preserve the MariaDB executable comment statement: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_final_boss")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR 1062")
+                && stmt.contains("read_loop: LOOP")
+                && stmt.contains("END LOOP;")
+                && stmt.contains("END")
+        }),
+        "Formatting should preserve the main MariaDB procedure execution unit: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("summary_key")
+                && stmt.contains("ORDER BY summary_key")
+        }),
+        "Formatting should preserve the final summary query: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test1.txt"
     );
 }
 

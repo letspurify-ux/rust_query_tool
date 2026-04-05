@@ -82,9 +82,9 @@ fn detect_q_quote_start(chars: &[char], start: usize) -> Option<(usize, char)> {
 
 fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
     while idx < line.len() {
-        if line[idx..].starts_with("--") {
-            let line_comment_end = line[idx..].find('\n')?;
-            idx += line_comment_end + 1;
+        if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(line.as_bytes(), idx) {
+            let line_comment_end = line[idx + prefix_len..].find('\n')?;
+            idx += prefix_len + line_comment_end + 1;
             continue;
         }
 
@@ -106,10 +106,10 @@ fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
             let Some(word_ch) = line[end..].chars().next() else {
                 break;
             };
-            if word_ch.is_whitespace()
-                || line[end..].starts_with("/*")
-                || line[end..].starts_with("--")
-            {
+            if word_ch.is_whitespace() || line[end..].starts_with("/*") {
+                break;
+            }
+            if sql_text::sql_line_comment_prefix_len(line.as_bytes(), end).is_some() {
                 break;
             }
             end += word_ch.len_utf8();
@@ -191,6 +191,14 @@ impl SqlParserEngine {
             scratch_chars: Vec::new(),
             preview_identifier_upper_buf: String::new(),
         }
+    }
+
+    pub(crate) fn set_mysql_mode(&mut self, enabled: bool) {
+        self.state.mysql_mode = enabled;
+    }
+
+    pub(crate) fn mysql_mode(&self) -> bool {
+        self.state.mysql_mode
     }
 
     pub(crate) fn is_idle(&self) -> bool {

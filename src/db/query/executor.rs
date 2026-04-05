@@ -1641,6 +1641,9 @@ impl QueryExecutor {
             current_start: None,
             current_end: 0,
         };
+        collector
+            .builder
+            .set_mysql_mode(sql_text::mysql_compatibility_for_sql(sql, None));
         let mut sqlblanklines_enabled = true;
         let mut line_start = 0usize;
 

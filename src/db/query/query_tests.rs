@@ -20,6 +20,13 @@ fn load_query_test_file(name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn load_mariadb_query_test_file(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test_mariadb");
+    path.push(name);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
 #[test]
 fn test_statement_bounds_at_cursor_ignores_string_literal_with_previous_statement_text() {
     let sql = "SELECT 1 FROM dual;
@@ -8101,6 +8108,250 @@ END IF;"#;
 }
 
 #[test]
+fn test_split_script_items_mysql_delimiter_keeps_routine_body_intact() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+  SELECT 1;
+  SELECT 2;
+END$$
+DELIMITER ;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    assert!(matches!(
+        items.first(),
+        Some(crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::MysqlDelimiter {
+            delimiter
+        })) if delimiter == "$$"
+    ));
+    assert!(matches!(
+        items.get(2),
+        Some(crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::MysqlDelimiter {
+            delimiter
+        })) if delimiter == ";"
+    ));
+
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "delimiter script should yield two statements: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("SELECT 1;") && stmts[0].contains("SELECT 2;"),
+        "procedure body should keep internal semicolons: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_parse_tool_command_mysql_delimiter_accepts_leading_block_comment() {
+    let command = QueryExecutor::parse_tool_command("/* note */ DELIMITER /* gap */ $$ -- keep");
+
+    assert!(matches!(
+        command,
+        Some(crate::db::ToolCommand::MysqlDelimiter { delimiter }) if delimiter == "$$"
+    ));
+}
+
+#[test]
+fn test_split_script_items_mysql_delimiter_ignores_delimiter_inside_trailing_comment() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+  SELECT 1; -- $$ must stay inside the procedure body
+  SELECT 2;
+END$$
+DELIMITER ;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "delimiter text inside trailing comments must not terminate the routine early: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("SELECT 2;") && stmts[0].contains("END"),
+        "routine body should stay intact until the real END delimiter: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_script_items_mysql_delimiter_allows_inline_comment_after_terminator() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+  SELECT 1;
+END$$ -- routine end marker
+DELIMITER ;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "inline comments after the delimiter should still terminate the routine: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("routine end marker"),
+        "comment after the delimiter should be preserved with the statement: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_script_items_mysql_delimiter_ignores_hash_comment_torture_text() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+# line comment torture: ; ; ; DELIMITER $$ should not matter here.....
+SELECT 1;
+END$$
+DELIMITER ;
+SELECT 2;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "hash-comment delimiter script should yield two statements: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("# line comment torture: ; ; ; DELIMITER $$ should not matter here....."),
+        "hash comment text should stay inside the routine body: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT 1;"),
+        "routine body should preserve statements after the hash comment: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 2");
+}
+
+#[test]
+fn test_split_script_items_mysql_hash_comment_ignores_semicolon_inside_comment() {
+    let sql = r#"SELECT 1 # keep ; inside comment
++ 2;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "semicolon inside MySQL # comment must not terminate the statement early: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("+ 2"),
+        "continued arithmetic line should stay in the first statement: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_format_items_mysql_hash_comment_ignores_semicolon_inside_comment() {
+    let sql = r#"SELECT 1 # keep ; inside comment
++ 2;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(statement) => Some(statement.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "format split should ignore semicolons inside MySQL # comments: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("+ 2"),
+        "formatter split should keep the continued line with the first statement: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_tables_is_mysql_command() {
+    let command = QueryExecutor::parse_tool_command("SHOW TABLES")
+        .expect("SHOW TABLES should parse as a MySQL tool command");
+
+    assert!(matches!(command, crate::db::ToolCommand::ShowTables));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_errors_without_args_prefers_mysql_variant() {
+    let command = QueryExecutor::parse_tool_command("SHOW ERRORS")
+        .expect("SHOW ERRORS should parse as a MySQL command when no object is specified");
+
+    assert!(matches!(command, crate::db::ToolCommand::MysqlShowErrors));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_columns_with_schema_round_trips() {
+    let command = QueryExecutor::parse_tool_command("SHOW COLUMNS FROM orders FROM sales")
+        .expect("SHOW COLUMNS ... FROM <schema> should parse as a MySQL tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::ShowColumns {
+            table,
+            schema: Some(schema_name)
+        } if table == "orders" && schema_name == "sales"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_columns_with_like_stays_raw_statement() {
+    let command = QueryExecutor::parse_tool_command("SHOW COLUMNS FROM orders LIKE 'id%'");
+
+    assert!(
+        command.is_none(),
+        "SHOW COLUMNS ... LIKE must stay as raw SQL so the filter clause is preserved"
+    );
+}
+
+#[test]
+fn test_parse_tool_command_show_errors_with_object_keeps_oracle_variant() {
+    let command = QueryExecutor::parse_tool_command("SHOW ERRORS PROCEDURE demo_proc")
+        .expect("SHOW ERRORS <type> <name> should remain the Oracle client command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::ShowErrors {
+            object_type: Some(_),
+            object_name: Some(_)
+        }
+    ));
+}
+
+#[test]
 fn test_select_with_case_expressions_separated_by_plus() {
     let sql = "SELECT CASE WHEN a=1 THEN 1 ELSE 0 END + CASE WHEN b=2 THEN 1 ELSE 0 END FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
@@ -10243,6 +10494,173 @@ fn test_split_script_items_mysql_backtick_identifier_with_semicolon_stays_single
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_mariadb_final_boss_regression() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let items = QueryExecutor::split_script_items(&sql);
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        tool_command_count, 3,
+        "MariaDB final boss script should keep USE + both DELIMITER commands as tool commands: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 23,
+        "MariaDB final boss script execution split changed unexpectedly: {items:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("/*!80000 SET @versioned_comment_executed = 1 */")
+                && stmt.trim_end().ends_with("*/")
+        }),
+        "versioned comment statement should stay executable: {statements:?}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|stmt| {
+                let trimmed = stmt.trim_start();
+                trimmed.starts_with('#')
+                    || (trimmed.starts_with("/*")
+                        && !trimmed.starts_with("/*!")
+                        && !trimmed.starts_with("/**"))
+            }),
+        "plain MariaDB comments should not become standalone execution units: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE FUNCTION fn_currency_rate")
+                && stmt.contains("WHEN 'KRW' THEN 0.00075")
+                && stmt.contains("END")
+        }),
+        "function body should remain one execution unit: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_final_boss")
+                && stmt.contains("read_loop: LOOP")
+                && stmt.contains("GET DIAGNOSTICS CONDITION 1")
+                && stmt.contains("JSON_TABLE(")
+                && stmt.contains("COMMIT")
+        }),
+        "main stored procedure should remain intact as a single execution unit: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("'PASS' AS status")
+                && stmt.contains("expected_duplicate_errors")
+        }),
+        "post-run verification query should remain independently executable: {statements:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_emp_table_regression() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let emp_statement_start = sql.find("CREATE TABLE emp").unwrap_or(0);
+    let emp_statement_end = sql
+        .get(emp_statement_start..)
+        .and_then(|tail| tail.find(") ENGINE = InnoDB;"))
+        .map(|offset| emp_statement_start + offset + ") ENGINE = InnoDB;".len())
+        .unwrap_or(sql.len());
+    for cursor in [
+        emp_statement_end.saturating_sub(1),
+        emp_statement_end.min(sql.len()),
+    ] {
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&sql, cursor)
+            .expect("expected emp CREATE TABLE bounds in MariaDB regression file");
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with("CREATE TABLE emp"),
+            "cursor near emp CREATE TABLE tail should resolve emp statement, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("CONSTRAINT chk_emp_salary"),
+            "emp statement bounds should keep the full emp DDL, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("CREATE TABLE dept"),
+            "previous dept statement must not leak into emp bounds"
+        );
+        assert!(
+            !statement.contains("CREATE TABLE orders"),
+            "next orders statement must not leak into emp bounds"
+        );
+    }
+}
+
+#[test]
+fn test_split_format_items_mariadb_final_boss_regression() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let items = QueryExecutor::split_format_items(&sql);
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::ToolCommand(_)))
+        .count();
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(statement) => Some(statement.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        tool_command_count, 3,
+        "format split should preserve USE + DELIMITER commands for MariaDB final boss: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 28,
+        "format split should preserve executable statements plus standalone comments for MariaDB final boss: {items:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.trim_start()
+                .starts_with("/*!80000 SET @versioned_comment_executed = 1 */")
+        }),
+        "format split should keep MariaDB executable comments as runnable statements: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_final_boss")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR 1062")
+                && stmt.contains("ROLLBACK TO SAVEPOINT sp_before_rollback_test")
+                && stmt.contains("WINDOW")
+                && stmt.contains("END")
+        }),
+        "format split should keep the main stored procedure as one statement: {statements:?}"
+    );
 }
 
 #[test]

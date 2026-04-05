@@ -23,10 +23,10 @@ use crate::utils::AppConfig;
 pub struct ConnectionDialog;
 
 fn db_type_from_choice_index(idx: i32) -> DatabaseType {
-    if idx == 1 {
-        DatabaseType::MySQL
-    } else {
+    if idx <= 0 {
         DatabaseType::Oracle
+    } else {
+        DatabaseType::MySQL
     }
 }
 
@@ -96,10 +96,11 @@ fn build_connection_info(
         DatabaseType::Oracle => "Service name",
         DatabaseType::MySQL => "Database name",
     };
-    if service_name.is_empty() {
+    let requires_service_name = matches!(db_type, DatabaseType::Oracle);
+    if requires_service_name && service_name.is_empty() {
         return Err(format!("{} is required", svc_label));
     }
-    if !is_valid_service_name(service_name) {
+    if !service_name.is_empty() && !is_valid_service_name(service_name) {
         return Err(format!("{} contains invalid characters", svc_label));
     }
 
@@ -162,7 +163,7 @@ impl ConnectionDialog {
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
         let dialog_w = 620;
-        let dialog_h = 400;
+        let dialog_h = 412;
         let mut dialog = Window::default()
             .with_size(dialog_w, dialog_h)
             .with_label("Connect to Database");
@@ -225,7 +226,7 @@ impl ConnectionDialog {
         dbtype_label.set_label_color(theme::text_primary());
         dbtype_flex.fixed(&dbtype_label, FORM_LABEL_WIDTH);
         let mut dbtype_choice = Choice::default();
-        dbtype_choice.add_choice("Oracle|MySQL / MariaDB");
+        dbtype_choice.add_choice("Oracle|MySQL or MariaDB");
         dbtype_choice.set_value(0); // Oracle by default
         dbtype_choice.set_color(theme::input_bg());
         dbtype_choice.set_text_color(theme::text_primary());
@@ -382,17 +383,18 @@ impl ConnectionDialog {
                     if port_input_dt.value() == "3306" {
                         port_input_dt.set_value("1521");
                     }
-                    if service_input_dt.value() == "mysql" {
+                    let service_value = service_input_dt.value();
+                    if service_value.trim().is_empty() || service_value == "mysql" {
                         service_input_dt.set_value("ORCL");
                     }
                 } else {
-                    // MySQL
+                    // MySQL-compatible (MariaDB uses the same connection path)
                     svc_label_dt.set_label("Database:");
                     if port_input_dt.value() == "1521" {
                         port_input_dt.set_value("3306");
                     }
                     if service_input_dt.value() == "ORCL" {
-                        service_input_dt.set_value("mysql");
+                        service_input_dt.set_value("");
                     }
                 }
             });
@@ -775,36 +777,98 @@ mod tests {
 
     #[test]
     fn build_connection_info_rejects_empty_required_fields() {
-        let result = build_connection_info(" ", "scott", "tiger", "localhost", "1521", "ORCL", DatabaseType::Oracle);
+        let result = build_connection_info(
+            " ",
+            "scott",
+            "tiger",
+            "localhost",
+            "1521",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "", "tiger", "localhost", "1521", "ORCL", DatabaseType::Oracle);
+        let result = build_connection_info(
+            "local",
+            "",
+            "tiger",
+            "localhost",
+            "1521",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "", "1521", "ORCL", DatabaseType::Oracle);
+        let result = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "",
+            "1521",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "1521", "", DatabaseType::Oracle);
+        let result = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "localhost",
+            "1521",
+            "",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn build_connection_info_rejects_invalid_port() {
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "abc", "ORCL", DatabaseType::Oracle);
+        let result = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "localhost",
+            "abc",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
 
-        let result = build_connection_info("local", "scott", "tiger", "localhost", "0", "ORCL", DatabaseType::Oracle);
+        let result = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "localhost",
+            "0",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn build_connection_info_rejects_invalid_host_and_service_characters() {
-        let invalid_host =
-            build_connection_info("local", "scott", "tiger", "local host", "1521", "ORCL", DatabaseType::Oracle);
+        let invalid_host = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "local host",
+            "1521",
+            "ORCL",
+            DatabaseType::Oracle,
+        );
         assert!(invalid_host.is_err());
 
-        let invalid_service =
-            build_connection_info("local", "scott", "tiger", "localhost", "1521", "ORCL!", DatabaseType::Oracle);
+        let invalid_service = build_connection_info(
+            "local",
+            "scott",
+            "tiger",
+            "localhost",
+            "1521",
+            "ORCL!",
+            DatabaseType::Oracle,
+        );
         assert!(invalid_service.is_err());
     }
 
@@ -827,6 +891,34 @@ mod tests {
         assert_eq!(info.port, 1521);
         assert_eq!(info.service_name, "ORCL");
         assert_eq!(info.db_type, DatabaseType::Oracle);
+    }
+
+    #[test]
+    fn build_connection_info_allows_empty_mysql_database_name() {
+        let info = build_connection_info(
+            " local ",
+            " root ",
+            "secret",
+            " localhost ",
+            " 3306 ",
+            "   ",
+            DatabaseType::MySQL,
+        )
+        .expect("should allow MySQL connection without default database");
+
+        assert_eq!(info.name, "local");
+        assert_eq!(info.username, "root");
+        assert_eq!(info.host, "localhost");
+        assert_eq!(info.port, 3306);
+        assert!(info.service_name.is_empty());
+        assert_eq!(info.db_type, DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn db_type_choice_indexes_treat_any_non_oracle_item_as_mysql() {
+        assert_eq!(super::db_type_from_choice_index(0), DatabaseType::Oracle);
+        assert_eq!(super::db_type_from_choice_index(1), DatabaseType::MySQL);
+        assert_eq!(super::db_type_from_choice_index(2), DatabaseType::MySQL);
     }
 
     #[test]

@@ -174,6 +174,25 @@ impl SqlEditorWidget {
         sanitized
     }
 
+    fn sync_mysql_connection_info_for_ui(
+        shared_connection: &crate::db::SharedConnection,
+        db_activity: &str,
+    ) -> Option<ConnectionInfo> {
+        let mut conn_guard =
+            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        if conn_guard.db_type() != crate::db::DatabaseType::MySQL {
+            return None;
+        }
+
+        match conn_guard.sync_mysql_current_database_name() {
+            Ok(_) => Some(Self::connection_info_for_ui(conn_guard.get_info())),
+            Err(err) => {
+                eprintln!("Warning: failed to sync MySQL current database metadata: {err}");
+                None
+            }
+        }
+    }
+
     fn db_activity_label_for_sql(sql: &str, script_mode: bool) -> String {
         let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
         let preview = if compact.is_empty() {
@@ -287,7 +306,12 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_for_auto_formatting(&source, select_formatted);
+        let preferred_db_type = Some(self.current_db_type());
+        let formatted = Self::format_for_auto_formatting_with_db_type(
+            &source,
+            select_formatted,
+            preferred_db_type,
+        );
         if formatted == source {
             return;
         }
@@ -299,11 +323,12 @@ impl SqlEditorWidget {
         if select_formatted {
             let original_within_selection =
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
-            let mapped_within_selection = Self::map_cursor_after_format_with_policy(
+            let mapped_within_selection = Self::map_cursor_after_format_with_policy_for_db_type(
                 &source,
                 &formatted,
                 original_within_selection,
                 true,
+                preferred_db_type,
             );
             let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
             let mapped_cursor =
@@ -311,7 +336,13 @@ impl SqlEditorWidget {
             buffer.select(start as i32, selection_end as i32);
             editor.set_insert_position(mapped_cursor as i32);
         } else {
-            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos as i32);
+            let new_pos = Self::map_cursor_after_format_with_policy_for_db_type(
+                &source,
+                &formatted,
+                original_pos as i32,
+                false,
+                preferred_db_type,
+            );
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
@@ -552,7 +583,7 @@ impl SqlEditorWidget {
             match conn_guard.require_live_connection() {
                 Ok(conn) => Ok(Some(conn)),
                 Err(message) => {
-                    if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                    if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
                         let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                         app::awake();
                     }
@@ -589,6 +620,1047 @@ impl SqlEditorWidget {
         app::awake();
     }
 
+    fn mysql_result_requires_transaction_feedback(sql: &str, result: &QueryResult) -> bool {
+        if result.is_select || !result.success || result.row_count == 0 {
+            return false;
+        }
+
+        matches!(
+            QueryExecutor::leading_keyword(sql.trim()).as_deref(),
+            Some("INSERT")
+                | Some("UPDATE")
+                | Some("DELETE")
+                | Some("REPLACE")
+                | Some("WITH")
+                | Some("CALL")
+        )
+    }
+
+    fn apply_mysql_transaction_feedback(result: &mut QueryResult, sql: &str, auto_commit: bool) {
+        if !Self::mysql_result_requires_transaction_feedback(sql, result) {
+            return;
+        }
+
+        if auto_commit {
+            result.message = format!("{} | Auto-commit applied", result.message);
+        } else {
+            result.message = format!("{} | Commit required", result.message);
+        }
+    }
+
+    fn execute_mysql_batch(
+        shared_connection: &crate::db::SharedConnection,
+        sender: &mpsc::Sender<QueryProgress>,
+        sql_text: &str,
+        conn_name: &str,
+        session: &Arc<Mutex<SessionState>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        script_mode: bool,
+        _query_timeout: Option<Duration>,
+        initial_auto_commit: bool,
+        db_activity: &str,
+    ) {
+        let items = super::query_text::split_script_items(sql_text);
+        if items.is_empty() {
+            return;
+        }
+
+        let _ = sender.send(QueryProgress::BatchStart);
+        app::awake();
+
+        let mut conn_name = conn_name.to_string();
+        let mut result_index = 0usize;
+        let mut auto_commit = initial_auto_commit;
+        let mut continue_on_error = match session.lock() {
+            Ok(guard) => guard.continue_on_error,
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                poisoned.into_inner().continue_on_error
+            }
+        };
+        let mut stop_execution = false;
+        let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut frames = vec![ScriptExecutionFrame {
+            items,
+            index: 0,
+            base_dir: working_dir.clone(),
+            source_path: None,
+        }];
+
+        let execute_mysql_sql = |sql: &str| -> Result<Vec<QueryResult>, String> {
+            let mut conn_guard =
+                lock_connection_with_activity(shared_connection, db_activity.to_string());
+            let mysql_conn = conn_guard
+                .get_mysql_connection_mut()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())?;
+            crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
+                .map_err(|err| err.to_string())
+        };
+
+        while !frames.is_empty() {
+            if stop_execution || load_mutex_bool(cancel_flag) {
+                break;
+            }
+
+            let Some((item, current_frame_base_dir)) = ({
+                let frame = match frames.last_mut() {
+                    Some(frame) => frame,
+                    None => break,
+                };
+
+                if frame.index >= frame.items.len() {
+                    None
+                } else {
+                    let item = frame.items[frame.index].clone();
+                    frame.index += 1;
+                    Some((item, frame.base_dir.clone()))
+                }
+            }) else {
+                frames.pop();
+                continue;
+            };
+
+            let echo_enabled = match session.lock() {
+                Ok(guard) => guard.echo_enabled,
+                Err(poisoned) => {
+                    eprintln!("Warning: session state lock was poisoned; recovering.");
+                    poisoned.into_inner().echo_enabled
+                }
+            };
+            if echo_enabled {
+                let echo_line = match &item {
+                    ScriptItem::Statement(statement) => statement.trim().to_string(),
+                    ScriptItem::ToolCommand(command) => {
+                        SqlEditorWidget::format_tool_command(command)
+                    }
+                };
+                if !echo_line.trim().is_empty() {
+                    SqlEditorWidget::emit_script_output(sender, session, vec![echo_line]);
+                }
+            }
+
+            match item {
+                ScriptItem::ToolCommand(command) => {
+                    let mut command_error = false;
+                    match command {
+                        ToolCommand::Prompt { text } => {
+                            SqlEditorWidget::emit_script_output(sender, session, vec![text]);
+                        }
+                        ToolCommand::Pause { message } => {
+                            let prompt_text = message
+                                .filter(|text| !text.trim().is_empty())
+                                .unwrap_or_else(|| "Press ENTER to continue.".to_string());
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "PAUSE",
+                                &prompt_text,
+                            );
+                            if SqlEditorWidget::prompt_for_input_with_sender(sender, &prompt_text)
+                                .is_err()
+                            {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "PAUSE",
+                                    "Error: PAUSE cancelled.",
+                                );
+                                command_error = true;
+                            }
+                        }
+                        ToolCommand::Accept { name, prompt } => {
+                            let prompt_text =
+                                prompt.unwrap_or_else(|| format!("Enter value for {}:", name));
+                            match SqlEditorWidget::prompt_for_input_with_sender(
+                                sender,
+                                &prompt_text,
+                            ) {
+                                Ok(value) => {
+                                    let key = SessionState::normalize_name(&name);
+                                    match session.lock() {
+                                        Ok(mut guard) => {
+                                            guard.define_vars.insert(key.clone(), value);
+                                        }
+                                        Err(poisoned) => {
+                                            eprintln!(
+                                                "Warning: session state lock was poisoned; recovering."
+                                            );
+                                            poisoned
+                                                .into_inner()
+                                                .define_vars
+                                                .insert(key.clone(), value);
+                                        }
+                                    }
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("ACCEPT {}", key),
+                                        &format!("Value assigned to {}", key),
+                                    );
+                                }
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("ACCEPT {}", name),
+                                        &format!("Error: {}", message),
+                                    );
+                                    command_error = true;
+                                }
+                            }
+                        }
+                        ToolCommand::Define { name, value } => {
+                            let key = SessionState::normalize_name(&name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.define_vars.insert(key.clone(), value.clone());
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned
+                                        .into_inner()
+                                        .define_vars
+                                        .insert(key.clone(), value.clone());
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("DEFINE {}", key),
+                                &format!("Defined {} = {}", key, value),
+                            );
+                        }
+                        ToolCommand::Undefine { name } => {
+                            let key = SessionState::normalize_name(&name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.define_vars.remove(&key);
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().define_vars.remove(&key);
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("UNDEFINE {}", key),
+                                &format!("Undefined {}", key),
+                            );
+                        }
+                        ToolCommand::ColumnNewValue {
+                            column_name,
+                            variable_name,
+                        } => {
+                            let column_key = SessionState::normalize_name(&column_name);
+                            let variable_key = SessionState::normalize_name(&variable_name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard
+                                        .column_new_values
+                                        .insert(column_key.clone(), variable_key.clone());
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned
+                                        .into_inner()
+                                        .column_new_values
+                                        .insert(column_key.clone(), variable_key.clone());
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("COLUMN {} NEW_VALUE {}", column_key, variable_key),
+                                &format!(
+                                    "Registered NEW_VALUE mapping: {} -> {}",
+                                    column_key, variable_key
+                                ),
+                            );
+                        }
+                        ToolCommand::BreakOn { column_name } => {
+                            let key = SessionState::normalize_name(&column_name);
+                            match session.lock() {
+                                Ok(mut guard) => guard.break_column = Some(key.clone()),
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().break_column = Some(key.clone());
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "BREAK",
+                                &format!("BREAK ON {}", key),
+                            );
+                        }
+                        ToolCommand::BreakOff | ToolCommand::ClearBreaks => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.break_column = None,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().break_column = None;
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "BREAK",
+                                "BREAK OFF",
+                            );
+                        }
+                        ToolCommand::Compute {
+                            mode,
+                            of_column,
+                            on_column,
+                        } => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.compute = Some(crate::db::ComputeConfig {
+                                        mode,
+                                        of_column: of_column.clone(),
+                                        on_column: on_column.clone(),
+                                    });
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().compute =
+                                        Some(crate::db::ComputeConfig {
+                                            mode,
+                                            of_column: of_column.clone(),
+                                            on_column: on_column.clone(),
+                                        });
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "COMPUTE",
+                                "COMPUTE configured",
+                            );
+                        }
+                        ToolCommand::ComputeOff | ToolCommand::ClearComputes => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.compute = None,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().compute = None;
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "COMPUTE",
+                                "COMPUTE OFF",
+                            );
+                        }
+                        ToolCommand::ClearBreaksComputes => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.break_column = None;
+                                    guard.compute = None;
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    let mut guard = poisoned.into_inner();
+                                    guard.break_column = None;
+                                    guard.compute = None;
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "CLEAR",
+                                "BREAKS and COMPUTES cleared",
+                            );
+                        }
+                        ToolCommand::SetErrorContinue { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.continue_on_error = enabled,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().continue_on_error = enabled;
+                                }
+                            }
+                            continue_on_error = enabled;
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET ERRORCONTINUE",
+                                &format!("ERRORCONTINUE {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetAutoCommit { enabled } => {
+                            {
+                                let mut conn_guard = lock_connection_with_activity(
+                                    shared_connection,
+                                    db_activity.to_string(),
+                                );
+                                conn_guard.set_auto_commit(enabled);
+                            }
+                            auto_commit = enabled;
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET AUTOCOMMIT",
+                                if enabled {
+                                    "Auto-commit enabled"
+                                } else {
+                                    "Auto-commit disabled"
+                                },
+                            );
+                            let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
+                            app::awake();
+                        }
+                        ToolCommand::SetDefine {
+                            enabled,
+                            define_char,
+                        } => match session.lock() {
+                            Ok(mut guard) => {
+                                guard.define_enabled = enabled;
+                                if let Some(ch) = define_char {
+                                    guard.define_char = ch;
+                                }
+                            }
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                let mut guard = poisoned.into_inner();
+                                guard.define_enabled = enabled;
+                                if let Some(ch) = define_char {
+                                    guard.define_char = ch;
+                                }
+                            }
+                        },
+                        ToolCommand::SetScan { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.scan_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().scan_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetVerify { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.verify_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().verify_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetEcho { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.echo_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().echo_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetTiming { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.timing_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().timing_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetFeedback { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.feedback_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().feedback_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetHeading { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.heading_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().heading_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetPageSize { size } => match session.lock() {
+                            Ok(mut guard) => guard.pagesize = size,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().pagesize = size;
+                            }
+                        },
+                        ToolCommand::SetLineSize { size } => match session.lock() {
+                            Ok(mut guard) => guard.linesize = size,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().linesize = size;
+                            }
+                        },
+                        ToolCommand::SetTrimSpool { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.trimspool_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().trimspool_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetTrimOut { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.trimout_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().trimout_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetSqlBlankLines { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.sqlblanklines_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().sqlblanklines_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetTab { enabled } => match session.lock() {
+                            Ok(mut guard) => guard.tab_enabled = enabled,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().tab_enabled = enabled;
+                            }
+                        },
+                        ToolCommand::SetColSep { separator } => match session.lock() {
+                            Ok(mut guard) => guard.colsep = separator,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().colsep = separator;
+                            }
+                        },
+                        ToolCommand::SetNull { null_text } => match session.lock() {
+                            Ok(mut guard) => guard.null_text = null_text,
+                            Err(poisoned) => {
+                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                poisoned.into_inner().null_text = null_text;
+                            }
+                        },
+                        ToolCommand::Spool { path, append } => match path {
+                            Some(path) => {
+                                let target_path = if Path::new(&path).is_absolute() {
+                                    PathBuf::from(&path)
+                                } else {
+                                    current_frame_base_dir.join(&path)
+                                };
+                                match session.lock() {
+                                    Ok(mut guard) => {
+                                        guard.spool_path = Some(target_path.clone());
+                                        guard.spool_truncate = !append;
+                                    }
+                                    Err(poisoned) => {
+                                        eprintln!(
+                                            "Warning: session state lock was poisoned; recovering."
+                                        );
+                                        let mut guard = poisoned.into_inner();
+                                        guard.spool_path = Some(target_path.clone());
+                                        guard.spool_truncate = !append;
+                                    }
+                                }
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SPOOL",
+                                    &format!(
+                                        "Spooling output to {} ({})",
+                                        target_path.display(),
+                                        if append { "append" } else { "replace" }
+                                    ),
+                                );
+                            }
+                            None if append => match SqlEditorWidget::has_spool_target(session) {
+                                true => SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SPOOL",
+                                    "Spool switched to append mode",
+                                ),
+                                false => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SPOOL",
+                                        "Error: SPOOL APPEND requires an active spool target.",
+                                    );
+                                    command_error = true;
+                                }
+                            },
+                            None => match session.lock() {
+                                Ok(mut guard) => guard.spool_path = None,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().spool_path = None;
+                                }
+                            },
+                        },
+                        ToolCommand::WheneverSqlError { exit, .. } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.continue_on_error = !exit,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().continue_on_error = !exit;
+                                }
+                            }
+                            continue_on_error = !exit;
+                        }
+                        ToolCommand::WheneverOsError { exit } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.continue_on_error = !exit,
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    poisoned.into_inner().continue_on_error = !exit;
+                                }
+                            }
+                            continue_on_error = !exit;
+                        }
+                        ToolCommand::Exit | ToolCommand::Quit => {
+                            stop_execution = true;
+                        }
+                        ToolCommand::Disconnect => {
+                            let had_connection = {
+                                let mut conn_guard = lock_connection_with_activity(
+                                    shared_connection,
+                                    db_activity.to_string(),
+                                );
+                                let had_connection =
+                                    conn_guard.is_connected() || conn_guard.has_connection_handle();
+                                conn_guard.disconnect();
+                                had_connection
+                            };
+                            conn_name.clear();
+                            let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                            app::awake();
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "DISCONNECT",
+                                if had_connection {
+                                    "Disconnected from database"
+                                } else {
+                                    "Not connected to any database"
+                                },
+                            );
+                        }
+                        ToolCommand::RunScript {
+                            path,
+                            relative_to_caller,
+                        } => {
+                            let include_base_dir = if relative_to_caller {
+                                current_frame_base_dir.as_path()
+                            } else {
+                                working_dir.as_path()
+                            };
+                            let (target_path, normalized_target_path) =
+                                SqlEditorWidget::resolve_script_include_path(
+                                    &path,
+                                    relative_to_caller,
+                                    current_frame_base_dir.as_path(),
+                                    working_dir.as_path(),
+                                );
+                            match SqlEditorWidget::validate_script_include_target(
+                                &frames,
+                                normalized_target_path.as_path(),
+                            ) {
+                                Ok(()) => match SqlEditorWidget::load_script_include(
+                                    target_path.as_path(),
+                                    normalized_target_path.as_path(),
+                                    include_base_dir,
+                                ) {
+                                    Ok(resolved_include) => {
+                                        frames.push(ScriptExecutionFrame {
+                                            items: resolved_include.items,
+                                            index: 0,
+                                            base_dir: resolved_include.script_dir,
+                                            source_path: Some(resolved_include.source_path),
+                                        });
+                                    }
+                                    Err(message) => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            if relative_to_caller { "@@" } else { "@" },
+                                            &format!("Error: {}", message),
+                                        );
+                                        command_error = true;
+                                    }
+                                },
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        if relative_to_caller { "@@" } else { "@" },
+                                        &format!("Error: {}", message),
+                                    );
+                                    command_error = true;
+                                }
+                            }
+                        }
+                        ToolCommand::MysqlSource { path } => {
+                            frames.push(ScriptExecutionFrame {
+                                items: vec![ScriptItem::ToolCommand(ToolCommand::RunScript {
+                                    path,
+                                    relative_to_caller: false,
+                                })],
+                                index: 0,
+                                base_dir: current_frame_base_dir,
+                                source_path: None,
+                            });
+                        }
+                        ToolCommand::Use { database } => {
+                            let use_sql = format!("USE {}", database);
+                            match execute_mysql_sql(use_sql.as_str()) {
+                                Ok(_) => {
+                                    let info = SqlEditorWidget::sync_mysql_connection_info_for_ui(
+                                        shared_connection,
+                                        db_activity,
+                                    );
+                                    SqlEditorWidget::emit_script_output(
+                                        sender,
+                                        session,
+                                        vec![format!("Database changed to {}", database)],
+                                    );
+                                    if let Some(info) = info {
+                                        let _ = sender.send(QueryProgress::ConnectionChanged {
+                                            info: Some(info),
+                                        });
+                                    } else {
+                                        let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
+                                    }
+                                    app::awake();
+                                }
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "USE",
+                                        &format!("Error: {}", message),
+                                    );
+                                    command_error = true;
+                                }
+                            }
+                        }
+                        ToolCommand::MysqlDelimiter { delimiter } => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.mysql_delimiter = if delimiter == ";" {
+                                        None
+                                    } else {
+                                        Some(delimiter.clone())
+                                    };
+                                }
+                                Err(poisoned) => {
+                                    eprintln!(
+                                        "Warning: session state lock was poisoned; recovering."
+                                    );
+                                    let mut guard = poisoned.into_inner();
+                                    guard.mysql_delimiter = if delimiter == ";" {
+                                        None
+                                    } else {
+                                        Some(delimiter.clone())
+                                    };
+                                }
+                            }
+                            SqlEditorWidget::emit_script_output(
+                                sender,
+                                session,
+                                vec![format!("Delimiter set to '{}'", delimiter)],
+                            );
+                        }
+                        ref mysql_command @ (ToolCommand::Describe { .. }
+                        | ToolCommand::ShowDatabases
+                        | ToolCommand::ShowTables
+                        | ToolCommand::ShowColumns { .. }
+                        | ToolCommand::ShowCreateTable { .. }
+                        | ToolCommand::ShowProcessList
+                        | ToolCommand::ShowVariables { .. }
+                        | ToolCommand::ShowStatus { .. }
+                        | ToolCommand::ShowWarnings
+                        | ToolCommand::MysqlShowErrors) => {
+                            let sql = SqlEditorWidget::format_tool_command(mysql_command);
+                            match execute_mysql_sql(sql.as_str()) {
+                                Ok(results) => {
+                                    let Some(result) = results.into_iter().next() else {
+                                        let _ = SqlEditorWidget::emit_non_select_result(
+                                            sender,
+                                            session,
+                                            &conn_name,
+                                            result_index,
+                                            sql.as_str(),
+                                            "Command produced no result.".to_string(),
+                                            false,
+                                            false,
+                                            script_mode,
+                                        );
+                                        result_index += 1;
+                                        continue;
+                                    };
+                                    let (heading_enabled, feedback_enabled) =
+                                        SqlEditorWidget::current_output_settings(session);
+                                    let column_names = SqlEditorWidget::apply_heading_setting(
+                                        result
+                                            .columns
+                                            .iter()
+                                            .map(|column| column.name.clone())
+                                            .collect(),
+                                        heading_enabled,
+                                    );
+                                    SqlEditorWidget::emit_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        sql.as_str(),
+                                        column_names,
+                                        result.rows.clone(),
+                                        result.success,
+                                        feedback_enabled,
+                                    );
+                                    SqlEditorWidget::apply_column_new_value_from_row(
+                                        session,
+                                        &result
+                                            .columns
+                                            .iter()
+                                            .map(|column| column.name.clone())
+                                            .collect::<Vec<String>>(),
+                                        result.rows.last().map(Vec::as_slice),
+                                    );
+                                    result_index += 1;
+                                }
+                                Err(message) => {
+                                    let emitted = SqlEditorWidget::emit_non_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        sql.as_str(),
+                                        format!("Error: {}", message),
+                                        false,
+                                        false,
+                                        script_mode,
+                                    );
+                                    if emitted || script_mode {
+                                        result_index += 1;
+                                    }
+                                    command_error = true;
+                                }
+                            }
+                        }
+                        ToolCommand::Unsupported {
+                            raw,
+                            message,
+                            is_error,
+                        } => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &raw,
+                                &format!(
+                                    "{}: {}",
+                                    if is_error { "Error" } else { "Warning" },
+                                    message
+                                ),
+                            );
+                            command_error = is_error;
+                        }
+                        ToolCommand::Var { .. }
+                        | ToolCommand::Print { .. }
+                        | ToolCommand::SetServerOutput { .. }
+                        | ToolCommand::ShowErrors { .. }
+                        | ToolCommand::ShowUser
+                        | ToolCommand::ShowAll
+                        | ToolCommand::Connect { .. } => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &SqlEditorWidget::format_tool_command(&command),
+                                "Error: This command is only supported for Oracle connections.",
+                            );
+                            command_error = true;
+                        }
+                    }
+
+                    if command_error && !continue_on_error {
+                        stop_execution = true;
+                    }
+                }
+                ScriptItem::Statement(statement) => {
+                    let trimmed = statement.trim_start_matches(';').trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let mut sql_text = trimmed.to_string();
+                    let (define_enabled, scan_enabled, verify_enabled) = match session.lock() {
+                        Ok(guard) => (
+                            guard.define_enabled,
+                            guard.scan_enabled,
+                            guard.verify_enabled,
+                        ),
+                        Err(poisoned) => {
+                            eprintln!("Warning: session state lock was poisoned; recovering.");
+                            let guard = poisoned.into_inner();
+                            (
+                                guard.define_enabled,
+                                guard.scan_enabled,
+                                guard.verify_enabled,
+                            )
+                        }
+                    };
+                    if define_enabled && scan_enabled {
+                        let sql_before = sql_text.clone();
+                        match SqlEditorWidget::apply_define_substitution(&sql_text, session, sender)
+                        {
+                            Ok(updated) => {
+                                if verify_enabled && updated != sql_before {
+                                    SqlEditorWidget::emit_script_output(
+                                        sender,
+                                        session,
+                                        vec![
+                                            format!("old: {}", sql_before),
+                                            format!("new: {}", updated),
+                                        ],
+                                    );
+                                }
+                                sql_text = updated;
+                            }
+                            Err(message) => {
+                                let emitted = SqlEditorWidget::emit_non_select_result(
+                                    sender,
+                                    session,
+                                    &conn_name,
+                                    result_index,
+                                    trimmed,
+                                    format!("Error: {}", message),
+                                    false,
+                                    false,
+                                    script_mode,
+                                );
+                                if emitted || script_mode {
+                                    result_index += 1;
+                                }
+                                if !continue_on_error {
+                                    stop_execution = true;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    let statement_start = Instant::now();
+                    match execute_mysql_sql(sql_text.as_str()) {
+                        Ok(results) => {
+                            if load_mutex_bool(cancel_flag) {
+                                stop_execution = true;
+                            }
+
+                            for mut result in results {
+                                SqlEditorWidget::apply_mysql_transaction_feedback(
+                                    &mut result,
+                                    &sql_text,
+                                    auto_commit,
+                                );
+
+                                if result.is_select {
+                                    let (heading_enabled, feedback_enabled) =
+                                        SqlEditorWidget::current_output_settings(session);
+                                    let raw_column_names = result
+                                        .columns
+                                        .iter()
+                                        .map(|column| column.name.clone())
+                                        .collect::<Vec<String>>();
+                                    let column_names = SqlEditorWidget::apply_heading_setting(
+                                        raw_column_names.clone(),
+                                        heading_enabled,
+                                    );
+                                    SqlEditorWidget::emit_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        &sql_text,
+                                        column_names,
+                                        result.rows.clone(),
+                                        result.success,
+                                        feedback_enabled,
+                                    );
+                                    SqlEditorWidget::apply_column_new_value_from_row(
+                                        session,
+                                        &raw_column_names,
+                                        result.rows.last().map(Vec::as_slice),
+                                    );
+                                } else {
+                                    let _ = SqlEditorWidget::emit_non_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        &sql_text,
+                                        result.message.clone(),
+                                        result.success,
+                                        false,
+                                        script_mode,
+                                    );
+                                }
+
+                                result_index += 1;
+                                if !result.success && !continue_on_error {
+                                    stop_execution = true;
+                                    break;
+                                }
+                            }
+                            SqlEditorWidget::emit_timing_if_enabled(
+                                sender,
+                                session,
+                                statement_start.elapsed(),
+                            );
+                        }
+                        Err(message) => {
+                            let emitted = SqlEditorWidget::emit_non_select_result(
+                                sender,
+                                session,
+                                &conn_name,
+                                result_index,
+                                &sql_text,
+                                format!("Error: {}", message),
+                                false,
+                                false,
+                                script_mode,
+                            );
+                            if emitted || script_mode {
+                                result_index += 1;
+                            }
+                            SqlEditorWidget::emit_timing_if_enabled(
+                                sender,
+                                session,
+                                statement_start.elapsed(),
+                            );
+                            if !continue_on_error {
+                                stop_execution = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn execute_sql(&self, sql: &str, script_mode: bool) {
         if sql.trim().is_empty() {
             return;
@@ -622,7 +1694,7 @@ impl SqlEditorWidget {
             // Regression guard: scripts that contain CONNECT/@START must pass this gate
             // even when disconnected, so CONNECT can establish a session for later SQL.
             if startup_policy.requires_connected_session
-                && (!conn_guard.is_connected() || conn_guard.get_connection().is_none())
+                && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
             {
                 SqlEditorWidget::show_alert_dialog("Not connected to database");
                 return;
@@ -666,6 +1738,50 @@ impl SqlEditorWidget {
                     String::new()
                 };
 
+                let db_type = conn_guard.db_type();
+                let auto_commit = conn_guard.auto_commit();
+                let session = conn_guard.session_state();
+
+                if db_type == crate::db::DatabaseType::MySQL {
+                    if startup_policy.requires_connected_session
+                        && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
+                    {
+                        let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &message,
+                            None,
+                        );
+                        return;
+                    }
+
+                    if conn_guard.is_connected() {
+                        conn_name = conn_guard.get_info().name.clone();
+                    } else {
+                        conn_name.clear();
+                    }
+
+                    drop(conn_guard);
+                    SqlEditorWidget::execute_mysql_batch(
+                        &shared_connection,
+                        &sender,
+                        &sql_text,
+                        &conn_name,
+                        &session,
+                        &cancel_flag,
+                        script_mode,
+                        query_timeout,
+                        auto_commit,
+                        &db_activity,
+                    );
+                    return;
+                }
+
                 let mut conn_opt = match Self::acquire_execution_connection(
                     &mut conn_guard,
                     &sender,
@@ -705,9 +1821,6 @@ impl SqlEditorWidget {
                     );
                     return;
                 }
-                let auto_commit = conn_guard.auto_commit();
-                let session = conn_guard.session_state();
-
                 // Store connection for cancel operation (separate from mutex)
                 if let Some(ref conn) = conn_opt {
                     SqlEditorWidget::set_current_query_connection(
@@ -2703,7 +3816,7 @@ impl SqlEditorWidget {
                                             db_activity.clone(),
                                         );
                                         let had_connection = conn_guard.is_connected()
-                                            || conn_guard.get_connection().is_some();
+                                            || conn_guard.has_connection_handle();
                                         conn_guard.disconnect();
                                         conn_guard.refresh_tracked_connection();
                                         let next_conn_opt = conn_guard.get_connection();
@@ -2854,20 +3967,30 @@ impl SqlEditorWidget {
                                     };
                                     match use_result {
                                         Ok(()) => {
+                                            let info =
+                                                SqlEditorWidget::sync_mysql_connection_info_for_ui(
+                                                    &shared_connection,
+                                                    &db_activity,
+                                                );
                                             SqlEditorWidget::emit_script_output(
                                                 &sender,
                                                 &session,
                                                 vec![format!("Database changed to '{}'", database)],
                                             );
-                                            let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
+                                            if let Some(info) = info {
+                                                let _ =
+                                                    sender.send(QueryProgress::ConnectionChanged {
+                                                        info: Some(info),
+                                                    });
+                                            } else {
+                                                let _ = sender
+                                                    .send(QueryProgress::MetadataRefreshNeeded);
+                                            }
                                             app::awake();
                                         }
                                         Err(msg) => {
                                             SqlEditorWidget::emit_script_message(
-                                                &sender,
-                                                &session,
-                                                "USE",
-                                                &msg,
+                                                &sender, &session, "USE", &msg,
                                             );
                                             command_error = true;
                                         }
@@ -6940,5 +8063,43 @@ mod query_running_reservation_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(*running);
+    }
+}
+
+#[cfg(test)]
+mod mysql_transaction_feedback_tests {
+    use super::SqlEditorWidget;
+    use crate::db::QueryResult;
+    use std::time::Duration;
+
+    #[test]
+    fn mysql_result_requires_transaction_feedback_for_call_dml_results() {
+        let result = QueryResult::new_dml("CALL sync_users()", 3, Duration::from_secs(0), "CALL");
+
+        assert!(SqlEditorWidget::mysql_result_requires_transaction_feedback(
+            "CALL sync_users()",
+            &result
+        ));
+    }
+
+    #[test]
+    fn apply_mysql_transaction_feedback_marks_call_results_for_manual_commit() {
+        let mut result =
+            QueryResult::new_dml("CALL sync_users()", 3, Duration::from_secs(0), "CALL");
+
+        SqlEditorWidget::apply_mysql_transaction_feedback(&mut result, "CALL sync_users()", false);
+
+        assert_eq!(result.message, "CALL 3 row(s) affected | Commit required");
+    }
+
+    #[test]
+    fn apply_mysql_transaction_feedback_ignores_select_results() {
+        let mut result =
+            QueryResult::new_select("SELECT 1", Vec::new(), Vec::new(), Duration::from_secs(0));
+        let original_message = result.message.clone();
+
+        SqlEditorWidget::apply_mysql_transaction_feedback(&mut result, "SELECT 1", false);
+
+        assert_eq!(result.message, original_message);
     }
 }

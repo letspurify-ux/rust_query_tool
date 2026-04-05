@@ -180,11 +180,9 @@ impl SqlEditorWidget {
 
     pub fn quick_describe_at_cursor(&self) {
         let (cursor_pos, _) = Self::editor_cursor_position(&self.editor, &self.buffer);
-        let Some((word, start, _)) = Self::identifier_at_position(
-            &self.buffer,
-            &self.highlight_shadow,
-            cursor_pos,
-        ) else {
+        let Some((word, start, _)) =
+            Self::identifier_at_position(&self.buffer, &self.highlight_shadow, cursor_pos)
+        else {
             return;
         };
         let qualifier =
@@ -218,12 +216,11 @@ impl SqlEditorWidget {
                         return;
                     };
 
-                    let result = match conn_guard.require_live_connection() {
-                        Ok(db_conn) => {
-                            Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
-                        }
-                        Err(message) => Err(message),
-                    };
+                    let result = Self::describe_object_for_current_db(
+                        &mut conn_guard,
+                        &word,
+                        qualifier.as_deref(),
+                    );
 
                     let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
                         object_name: object_name_for_thread,
@@ -254,5 +251,115 @@ impl SqlEditorWidget {
             });
             app::awake();
         }
+    }
+
+    fn describe_object_for_current_db(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        object_name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<QuickDescribeData, String> {
+        match conn_guard.db_type() {
+            crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+                Ok(db_conn) => Self::describe_object(db_conn.as_ref(), object_name, qualifier),
+                Err(message) => Err(message),
+            },
+            crate::db::DatabaseType::MySQL => conn_guard
+                .get_mysql_connection_mut()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                .and_then(|mysql_conn| {
+                    Self::describe_mysql_object(mysql_conn, object_name, qualifier)
+                }),
+        }
+    }
+
+    fn describe_mysql_object(
+        conn: &mut mysql::Conn,
+        object_name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<QuickDescribeData, String> {
+        use crate::db::query::mysql_executor::MysqlObjectBrowser;
+
+        let qualified_name = qualifier
+            .map(|schema| format!("{schema}.{object_name}"))
+            .unwrap_or_else(|| object_name.to_string());
+
+        if let Ok(columns) =
+            MysqlObjectBrowser::get_table_structure_in_schema(conn, qualifier, object_name)
+        {
+            if !columns.is_empty() {
+                return Ok(QuickDescribeData::TableColumns(columns));
+            }
+        }
+
+        let mut object_types =
+            MysqlObjectBrowser::get_object_types_in_schema(conn, qualifier, object_name)
+                .map_err(|err| err.to_string())?;
+        if object_types.is_empty() {
+            return Err(format!(
+                "Object not found or not accessible: {}",
+                qualified_name.to_uppercase()
+            ));
+        }
+
+        object_types.sort_by_key(|object_type| Self::quick_describe_type_priority(object_type));
+
+        for object_type in object_types {
+            let object_type_upper = object_type.to_uppercase();
+            match object_type_upper.as_str() {
+                "TABLE" | "VIEW" => {
+                    if let Ok(columns) = MysqlObjectBrowser::get_table_structure_in_schema(
+                        conn,
+                        qualifier,
+                        object_name,
+                    ) {
+                        if !columns.is_empty() {
+                            return Ok(QuickDescribeData::TableColumns(columns));
+                        }
+                    }
+                }
+                "FUNCTION" | "PROCEDURE" => {
+                    let args = MysqlObjectBrowser::get_routine_arguments_in_schema(
+                        conn,
+                        qualifier,
+                        object_name,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    let content =
+                        Self::format_routine_details(&qualified_name, &object_type_upper, &args);
+                    return Ok(QuickDescribeData::Text {
+                        title: format!(
+                            "Describe: {} ({})",
+                            qualified_name.to_uppercase(),
+                            object_type_upper
+                        ),
+                        content,
+                    });
+                }
+                _ => {
+                    let ddl = MysqlObjectBrowser::get_create_object_in_schema(
+                        conn,
+                        qualifier,
+                        &object_type_upper,
+                        object_name,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    if !ddl.trim().is_empty() {
+                        return Ok(QuickDescribeData::Text {
+                            title: format!(
+                                "Describe: {} ({})",
+                                qualified_name.to_uppercase(),
+                                object_type_upper
+                            ),
+                            content: ddl,
+                        });
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "Object not found or not accessible: {}",
+            qualified_name.to_uppercase()
+        ))
     }
 }

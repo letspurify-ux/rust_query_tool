@@ -288,7 +288,7 @@ impl Default for QueryHistory {
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
-    use crate::db::ConnectionInfo;
+    use crate::db::{ConnectionInfo, DatabaseType};
 
     fn sample_connection(name: &str) -> ConnectionInfo {
         ConnectionInfo {
@@ -341,5 +341,27 @@ mod tests {
         assert!(result.is_ok());
         assert!(!delete_called);
         assert_eq!(config.recent_connections.len(), 1);
+    }
+
+    #[test]
+    fn app_config_serialization_preserves_mysql_db_type() {
+        let mut config = AppConfig::new();
+        config.recent_connections.push(ConnectionInfo {
+            name: "maria".to_string(),
+            host: "localhost".to_string(),
+            port: 3306,
+            service_name: String::new(),
+            username: "root".to_string(),
+            password: String::new(),
+            db_type: DatabaseType::MySQL,
+        });
+
+        let serialized =
+            serde_json::to_string(&config).expect("config with MySQL db_type should serialize");
+        let restored: AppConfig =
+            serde_json::from_str(&serialized).expect("serialized config should deserialize");
+
+        assert_eq!(restored.recent_connections.len(), 1);
+        assert_eq!(restored.recent_connections[0].db_type, DatabaseType::MySQL);
     }
 }

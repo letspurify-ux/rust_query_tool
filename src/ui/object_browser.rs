@@ -64,7 +64,10 @@ struct ObjectCache {
 
 #[derive(Clone)]
 enum RefreshEvent {
-    Finished(ObjectCache),
+    Finished {
+        cache: ObjectCache,
+        db_type: crate::db::DatabaseType,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +101,7 @@ enum ObjectActionResult {
     RoutineScript {
         qualified_name: String,
         routine_type: String,
+        db_type: crate::db::DatabaseType,
         result: Result<String, String>,
     },
     PackageRoutines {
@@ -122,6 +126,7 @@ pub struct ObjectBrowserWidget {
     status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
+    current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
@@ -195,6 +200,11 @@ impl ObjectBrowserWidget {
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
+        let current_db_type = Arc::new(Mutex::new(
+            crate::db::try_lock_connection(&connection)
+                .map(|guard| guard.db_type())
+                .unwrap_or(crate::db::DatabaseType::Oracle),
+        ));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
 
@@ -211,6 +221,7 @@ impl ObjectBrowserWidget {
             connection,
             filter_input,
             object_cache,
+            current_db_type,
             pending_tree_refresh,
             poll_lifecycle,
             sql_callback,
@@ -287,6 +298,7 @@ impl ObjectBrowserWidget {
     fn setup_refresh_handler(&mut self, refresh_receiver: std::sync::mpsc::Receiver<RefreshEvent>) {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
+        let current_db_type = self.current_db_type.clone();
         let filter_input = self.filter_input.clone();
         let pending_tree_refresh = self.pending_tree_refresh.clone();
 
@@ -300,6 +312,7 @@ impl ObjectBrowserWidget {
             receiver: Arc<Mutex<Receiver<RefreshEvent>>>,
             mut tree: Tree,
             object_cache: Arc<Mutex<ObjectCache>>,
+            current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
             filter_input: Input,
             pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
             status_callback: StatusCallback,
@@ -324,8 +337,12 @@ impl ObjectBrowserWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
-                        Ok(RefreshEvent::Finished(cache)) => {
+                        Ok(RefreshEvent::Finished { cache, db_type }) => {
                             latest_cache = Some(cache);
+                            match current_db_type.lock() {
+                                Ok(mut guard) => *guard = db_type,
+                                Err(poisoned) => *poisoned.into_inner() = db_type,
+                            }
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
@@ -406,6 +423,7 @@ impl ObjectBrowserWidget {
                     receiver.clone(),
                     tree.clone(),
                     object_cache.clone(),
+                    current_db_type.clone(),
                     filter_input.clone(),
                     pending_tree_refresh.clone(),
                     status_callback.clone(),
@@ -419,6 +437,7 @@ impl ObjectBrowserWidget {
             receiver,
             tree,
             object_cache,
+            current_db_type,
             filter_input,
             pending_tree_refresh,
             self.status_callback.clone(),
@@ -631,6 +650,7 @@ impl ObjectBrowserWidget {
                         ObjectActionResult::RoutineScript {
                             qualified_name,
                             routine_type,
+                            db_type,
                             result,
                         } => {
                             let sql = match result {
@@ -640,15 +660,11 @@ impl ObjectBrowserWidget {
                                         "Failed to load routine arguments: {}",
                                         err
                                     ));
-                                    if routine_type.eq_ignore_ascii_case("FUNCTION") {
-                                        ObjectBrowserWidget::build_simple_function_script(
-                                            &qualified_name,
-                                        )
-                                    } else {
-                                        ObjectBrowserWidget::build_simple_procedure_script(
-                                            &qualified_name,
-                                        )
-                                    }
+                                    ObjectBrowserWidget::build_simple_routine_script_for_db(
+                                        db_type,
+                                        &qualified_name,
+                                        &routine_type,
+                                    )
                                 }
                             };
                             ObjectBrowserWidget::emit_sql_callback(
@@ -772,6 +788,7 @@ impl ObjectBrowserWidget {
         let status_callback = self.status_callback.clone();
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
+        let current_db_type = self.current_db_type.clone();
 
         self.tree.handle(move |t, ev| {
             if !t.active() {
@@ -791,6 +808,7 @@ impl ObjectBrowserWidget {
                             t.set_item_focus(&item);
                             Self::show_context_menu(
                                 &connection,
+                                &current_db_type,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -799,6 +817,7 @@ impl ObjectBrowserWidget {
                         } else if let Some(item) = t.first_selected_item() {
                             Self::show_context_menu(
                                 &connection,
+                                &current_db_type,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -912,9 +931,29 @@ impl ObjectBrowserWidget {
                             }) = Self::get_item_info(&item)
                             {
                                 if object_type == "TABLES" || object_type == "VIEWS" {
-                                    let sql = format!(
-                                        "SELECT * FROM {} WHERE ROWNUM <= 100",
-                                        object_name
+                                    let db_type = if let Some(conn_guard) =
+                                        try_lock_connection_with_activity(
+                                            &connection,
+                                            format!("Preparing preview SQL for {}", object_name),
+                                        ) {
+                                        if !conn_guard.is_connected()
+                                            || !conn_guard.has_connection_handle()
+                                        {
+                                            fltk::dialog::alert_default(
+                                                "Not connected to database",
+                                            );
+                                            return true;
+                                        }
+                                        conn_guard.db_type()
+                                    } else {
+                                        fltk::dialog::alert_default(
+                                            &format_connection_busy_message(),
+                                        );
+                                        return true;
+                                    };
+                                    let sql = ObjectBrowserWidget::preview_select_sql(
+                                        db_type,
+                                        &object_name,
                                     );
                                     ObjectBrowserWidget::emit_sql_callback(
                                         &sql_callback,
@@ -1015,6 +1054,37 @@ impl ObjectBrowserWidget {
             })
     }
 
+    fn quote_mysql_identifier_path(identifier: &str) -> String {
+        identifier
+            .split('.')
+            .filter_map(|segment| {
+                let trimmed = segment.trim().trim_matches('`');
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(format!("`{}`", trimmed.replace('`', "``")))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn preview_select_sql(db_type: crate::db::DatabaseType, object_name: &str) -> String {
+        match db_type {
+            crate::db::DatabaseType::Oracle => {
+                format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name)
+            }
+            crate::db::DatabaseType::MySQL => format!(
+                "SELECT * FROM {} LIMIT 100",
+                Self::quote_mysql_identifier_path(object_name)
+            ),
+        }
+    }
+
+    fn quote_mysql_alias(alias: &str) -> String {
+        format!("`{}`", alias.trim().trim_matches('`').replace('`', "``"))
+    }
+
     fn build_simple_procedure_script(qualified_name: &str) -> String {
         format!("BEGIN\n  {};\nEND;\n/\n", qualified_name)
     }
@@ -1028,6 +1098,206 @@ impl ObjectBrowserWidget {
                 format!("{}()", qualified_name)
             }
         )
+    }
+
+    fn build_simple_procedure_script_for_db(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+    ) -> String {
+        match db_type {
+            crate::db::DatabaseType::Oracle => Self::build_simple_procedure_script(qualified_name),
+            crate::db::DatabaseType::MySQL => {
+                format!(
+                    "CALL {}();\n",
+                    Self::quote_mysql_identifier_path(qualified_name)
+                )
+            }
+        }
+    }
+
+    fn build_simple_function_script_for_db(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+    ) -> String {
+        match db_type {
+            crate::db::DatabaseType::Oracle => Self::build_simple_function_script(qualified_name),
+            crate::db::DatabaseType::MySQL => format!(
+                "SELECT {} AS result;\n",
+                if qualified_name.contains('(') {
+                    qualified_name.to_string()
+                } else {
+                    format!("{}()", Self::quote_mysql_identifier_path(qualified_name))
+                }
+            ),
+        }
+    }
+
+    fn build_simple_routine_script_for_db(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+        routine_type: &str,
+    ) -> String {
+        if routine_type.eq_ignore_ascii_case("FUNCTION") {
+            Self::build_simple_function_script_for_db(db_type, qualified_name)
+        } else {
+            Self::build_simple_procedure_script_for_db(db_type, qualified_name)
+        }
+    }
+
+    fn default_value_for_mysql_argument(arg: &ProcedureArgument, type_str: &str) -> String {
+        if let Some(default_value) = arg.default_value.as_deref() {
+            let trimmed = default_value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        let base = Self::normalize_type_base(type_str);
+        match base.as_str() {
+            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "DECIMAL"
+            | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" | "BIT" => "0".to_string(),
+            "DATE" => "CURRENT_DATE".to_string(),
+            "DATETIME" | "TIMESTAMP" => "CURRENT_TIMESTAMP".to_string(),
+            "TIME" => "CURRENT_TIME".to_string(),
+            "BOOLEAN" | "BOOL" => "FALSE".to_string(),
+            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
+            | "SET" | "JSON" => "''".to_string(),
+            _ => "NULL".to_string(),
+        }
+    }
+
+    fn build_mysql_routine_script(
+        qualified_name: &str,
+        routine_type: &str,
+        arguments: &[ProcedureArgument],
+    ) -> String {
+        let selected_args = Self::select_overload_arguments(arguments);
+        if selected_args.is_empty() {
+            return Self::build_simple_routine_script_for_db(
+                crate::db::DatabaseType::MySQL,
+                qualified_name,
+                routine_type,
+            );
+        }
+
+        let target = Self::quote_mysql_identifier_path(qualified_name);
+        let mut used_names: HashSet<String> = HashSet::new();
+        let mut prelude_lines: Vec<String> = Vec::new();
+        let mut call_args: Vec<String> = Vec::new();
+        let mut post_lines: Vec<String> = Vec::new();
+
+        for arg in &selected_args {
+            if arg.position == 0 && arg.name.is_none() {
+                continue;
+            }
+
+            let arg_label = arg
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("arg{}", arg.position.max(1)));
+            let direction = arg
+                .in_out
+                .clone()
+                .unwrap_or_else(|| "IN".to_string())
+                .replace('/', " ")
+                .to_uppercase();
+            let type_str = Self::format_argument_type(arg);
+
+            if direction.contains("OUT") && !direction.contains("IN") {
+                let session_var = format!(
+                    "@{}",
+                    Self::unique_var_name(&arg_label, arg.position, &mut used_names)
+                );
+                call_args.push(session_var.clone());
+                post_lines.push(format!(
+                    "SELECT {} AS {};",
+                    session_var,
+                    Self::quote_mysql_alias(&arg_label)
+                ));
+                continue;
+            }
+
+            if direction.contains("IN") && direction.contains("OUT") {
+                let session_var = format!(
+                    "@{}",
+                    Self::unique_var_name(&arg_label, arg.position, &mut used_names)
+                );
+                prelude_lines.push(format!(
+                    "SET {} = {};",
+                    session_var,
+                    Self::default_value_for_mysql_argument(arg, &type_str)
+                ));
+                call_args.push(session_var.clone());
+                post_lines.push(format!(
+                    "SELECT {} AS {};",
+                    session_var,
+                    Self::quote_mysql_alias(&arg_label)
+                ));
+                continue;
+            }
+
+            call_args.push(Self::default_value_for_mysql_argument(arg, &type_str));
+        }
+
+        let multiline_args = if call_args.is_empty() {
+            String::new()
+        } else {
+            let mut args_sql = String::from("(\n");
+            for (index, arg) in call_args.iter().enumerate() {
+                let suffix = if index + 1 == call_args.len() {
+                    ""
+                } else {
+                    ","
+                };
+                args_sql.push_str(&format!("    {}{}\n", arg, suffix));
+            }
+            args_sql.push(')');
+            args_sql
+        };
+
+        let mut script = String::new();
+        for line in prelude_lines {
+            script.push_str(&line);
+            script.push('\n');
+        }
+
+        if routine_type.eq_ignore_ascii_case("FUNCTION") {
+            if multiline_args.is_empty() {
+                script.push_str(&format!("SELECT {}() AS result;\n", target));
+            } else {
+                script.push_str(&format!("SELECT {}{} AS result;\n", target, multiline_args));
+            }
+            return script;
+        }
+
+        if multiline_args.is_empty() {
+            script.push_str(&format!("CALL {}();\n", target));
+        } else {
+            script.push_str(&format!("CALL {}{};\n", target, multiline_args));
+        }
+
+        for line in post_lines {
+            script.push_str(&line);
+            script.push('\n');
+        }
+
+        script
+    }
+
+    fn build_routine_script_for_db(
+        db_type: crate::db::DatabaseType,
+        qualified_name: &str,
+        routine_type: &str,
+        arguments: &[ProcedureArgument],
+    ) -> String {
+        match db_type {
+            crate::db::DatabaseType::Oracle => {
+                Self::build_procedure_script(qualified_name, arguments)
+            }
+            crate::db::DatabaseType::MySQL => {
+                Self::build_mysql_routine_script(qualified_name, routine_type, arguments)
+            }
+        }
     }
 
     fn build_procedure_script(qualified_name: &str, arguments: &[ProcedureArgument]) -> String {
@@ -1382,12 +1652,17 @@ impl ObjectBrowserWidget {
 
     fn show_context_menu(
         connection: &SharedConnection,
+        current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
     ) {
         if let Some(item_info) = Self::get_item_info(item) {
+            let db_type = match current_db_type.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
             let menu_choices = match &item_info {
                 ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => {
                     "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL"
@@ -1398,7 +1673,13 @@ impl ObjectBrowserWidget {
                 ObjectItem::Simple { object_type, .. }
                     if object_type == "PROCEDURES" || object_type == "FUNCTIONS" =>
                 {
-                    if object_type == "PROCEDURES" {
+                    if db_type == crate::db::DatabaseType::MySQL {
+                        if object_type == "PROCEDURES" {
+                            "Execute Procedure|Generate DDL"
+                        } else {
+                            "Execute Function|Generate DDL"
+                        }
+                    } else if object_type == "PROCEDURES" {
                         "Execute Procedure|Check Compilation|Generate DDL"
                     } else {
                         "Execute Function|Check Compilation|Generate DDL"
@@ -1408,7 +1689,11 @@ impl ObjectBrowserWidget {
                     "View Info|Generate DDL"
                 }
                 ObjectItem::Simple { object_type, .. } if object_type == "TRIGGERS" => {
+                    if db_type == crate::db::DatabaseType::MySQL {
+                        "Generate DDL"
+                    } else {
                     "Check Compilation|Generate DDL"
+                    }
                 }
                 ObjectItem::Simple { object_type, .. } if object_type == "SYNONYMS" => {
                     "View Info|Generate DDL"
@@ -1461,13 +1746,14 @@ impl ObjectBrowserWidget {
                                 app::awake();
                                 return;
                             };
-                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                            if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
                                 drop(conn_guard);
                                 fltk::dialog::alert_default("Not connected to database");
                                 return;
                             }
+                            let db_type = conn_guard.db_type();
                             drop(conn_guard);
-                            let sql = format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name);
+                            let sql = ObjectBrowserWidget::preview_select_sql(db_type, object_name);
                             ObjectBrowserWidget::emit_sql_callback(
                                 sql_callback,
                                 SqlAction::Execute(sql),
@@ -1509,24 +1795,50 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
-                                        db_conn.as_ref(),
-                                        &object_name,
-                                    )
-                                    .map(|arguments| {
-                                        ObjectBrowserWidget::build_procedure_script(
-                                            &object_name,
-                                            &arguments,
-                                        )
-                                    })
-                                    .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message),
+                                let db_type = conn_guard.db_type();
+                                let result = match db_type {
+                                    crate::db::DatabaseType::Oracle => {
+                                        match conn_guard.require_live_connection() {
+                                            Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            )
+                                            .map(|arguments| {
+                                                ObjectBrowserWidget::build_routine_script_for_db(
+                                                    db_type,
+                                                    &object_name,
+                                                    &routine_type,
+                                                    &arguments,
+                                                )
+                                            })
+                                            .map_err(|err| err.to_string()),
+                                            Err(message) => Err(message),
+                                        }
+                                    }
+                                    crate::db::DatabaseType::MySQL => conn_guard
+                                        .get_mysql_connection_mut()
+                                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                        .and_then(|mysql_conn| {
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments(
+                                                mysql_conn,
+                                                &object_name,
+                                            )
+                                            .map(|arguments| {
+                                                ObjectBrowserWidget::build_routine_script_for_db(
+                                                    db_type,
+                                                    &object_name,
+                                                    &routine_type,
+                                                    &arguments,
+                                                )
+                                            })
+                                            .map_err(|err| err.to_string())
+                                        }),
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
                                     qualified_name: object_name,
                                     routine_type,
+                                    db_type,
                                     result,
                                 });
                                 app::awake();
@@ -1578,8 +1890,10 @@ impl ObjectBrowserWidget {
                                         &routine_name,
                                     )
                                     .map(|arguments| {
-                                        ObjectBrowserWidget::build_procedure_script(
+                                        ObjectBrowserWidget::build_routine_script_for_db(
+                                            crate::db::DatabaseType::Oracle,
                                             &qualified_name,
+                                            &routine_type,
                                             &arguments,
                                         )
                                     })
@@ -1590,6 +1904,7 @@ impl ObjectBrowserWidget {
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
                                     qualified_name,
                                     routine_type,
+                                    db_type: crate::db::DatabaseType::Oracle,
                                     result,
                                 });
                                 app::awake();
@@ -1630,7 +1945,15 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                if conn_guard.db_type() == crate::db::DatabaseType::MySQL {
+                                    let _ = sender.send(ObjectActionResult::CompilationErrors {
+                                        object_name,
+                                        object_type,
+                                        status: String::new(),
+                                        result: Err("Compilation status is only supported for Oracle objects.".to_string()),
+                                    });
+                                    app::awake();
+                                } else if let Ok(db_conn) = conn_guard.require_live_connection() {
                                     let status = ObjectBrowser::get_object_status(
                                         db_conn.as_ref(),
                                         &object_name,
@@ -1716,13 +2039,27 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => ObjectBrowser::get_table_structure(
-                                        db_conn.as_ref(),
-                                        &table_name,
-                                    )
-                                    .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message),
+                                let result = match conn_guard.db_type() {
+                                    crate::db::DatabaseType::Oracle => {
+                                        match conn_guard.require_live_connection() {
+                                            Ok(db_conn) => ObjectBrowser::get_table_structure(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string()),
+                                            Err(message) => Err(message),
+                                        }
+                                    }
+                                    crate::db::DatabaseType::MySQL => conn_guard
+                                        .get_mysql_connection_mut()
+                                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                        .and_then(|mysql_conn| {
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_structure(
+                                                mysql_conn,
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string())
+                                        }),
                                 };
                                 let _ = sender.send(ObjectActionResult::TableStructure {
                                     table_name,
@@ -1752,13 +2089,27 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => ObjectBrowser::get_table_indexes(
-                                        db_conn.as_ref(),
-                                        &table_name,
-                                    )
-                                    .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message),
+                                let result = match conn_guard.db_type() {
+                                    crate::db::DatabaseType::Oracle => {
+                                        match conn_guard.require_live_connection() {
+                                            Ok(db_conn) => ObjectBrowser::get_table_indexes(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string()),
+                                            Err(message) => Err(message),
+                                        }
+                                    }
+                                    crate::db::DatabaseType::MySQL => conn_guard
+                                        .get_mysql_connection_mut()
+                                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                        .and_then(|mysql_conn| {
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_index_details(
+                                                mysql_conn,
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string())
+                                        }),
                                 };
                                 let _ = sender
                                     .send(ObjectActionResult::TableIndexes { table_name, result });
@@ -1786,13 +2137,27 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => ObjectBrowser::get_table_constraints(
-                                        db_conn.as_ref(),
-                                        &table_name,
-                                    )
-                                    .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message),
+                                let result = match conn_guard.db_type() {
+                                    crate::db::DatabaseType::Oracle => {
+                                        match conn_guard.require_live_connection() {
+                                            Ok(db_conn) => ObjectBrowser::get_table_constraints(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string()),
+                                            Err(message) => Err(message),
+                                        }
+                                    }
+                                    crate::db::DatabaseType::MySQL => conn_guard
+                                        .get_mysql_connection_mut()
+                                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                        .and_then(|mysql_conn| {
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_constraints(
+                                                mysql_conn,
+                                                &table_name,
+                                            )
+                                            .map_err(|err| err.to_string())
+                                        }),
                                 };
                                 let _ = sender.send(ObjectActionResult::TableConstraints {
                                     table_name,
@@ -1925,45 +2290,69 @@ impl ObjectBrowserWidget {
                                         return;
                                     };
 
-                                    let result = match conn_guard.require_live_connection() {
-                                        Ok(db_conn) => match object_type.as_str() {
-                                            "TABLE" => ObjectBrowser::get_table_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "VIEW" => ObjectBrowser::get_view_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "PROCEDURE" => ObjectBrowser::get_procedure_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "FUNCTION" => ObjectBrowser::get_function_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "SEQUENCE" => ObjectBrowser::get_sequence_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "TRIGGER" => ObjectBrowser::get_object_ddl(
-                                                db_conn.as_ref(),
-                                                "TRIGGER",
-                                                &object_name,
-                                            ),
-                                            "SYNONYM" => ObjectBrowser::get_synonym_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            "PACKAGE" => ObjectBrowser::get_package_spec_ddl(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                            ),
-                                            _ => return,
+                                    let result = match conn_guard.db_type() {
+                                        crate::db::DatabaseType::Oracle => {
+                                            match conn_guard.require_live_connection() {
+                                                Ok(db_conn) => match object_type.as_str() {
+                                                    "TABLE" => ObjectBrowser::get_table_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "VIEW" => ObjectBrowser::get_view_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "PROCEDURE" => ObjectBrowser::get_procedure_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "FUNCTION" => ObjectBrowser::get_function_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "SEQUENCE" => ObjectBrowser::get_sequence_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "TRIGGER" => ObjectBrowser::get_object_ddl(
+                                                        db_conn.as_ref(),
+                                                        "TRIGGER",
+                                                        &object_name,
+                                                    ),
+                                                    "SYNONYM" => ObjectBrowser::get_synonym_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "PACKAGE" => ObjectBrowser::get_package_spec_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    _ => return,
+                                                }
+                                                .map_err(|err| err.to_string()),
+                                                Err(message) => Err(message),
+                                            }
                                         }
-                                        .map_err(|err| err.to_string()),
-                                        Err(message) => Err(message),
+                                        crate::db::DatabaseType::MySQL => match object_type.as_str()
+                                        {
+                                            "SEQUENCE" | "SYNONYM" | "PACKAGE" => Err(format!(
+                                                "{} DDL is not supported for MySQL/MariaDB connections",
+                                                object_type
+                                            )),
+                                            _ => conn_guard
+                                                .get_mysql_connection_mut()
+                                                .ok_or_else(|| {
+                                                    crate::db::NOT_CONNECTED_MESSAGE.to_string()
+                                                })
+                                                .and_then(|mysql_conn| {
+                                                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_create_object(
+                                                        mysql_conn,
+                                                        object_type.as_str(),
+                                                        &object_name,
+                                                    )
+                                                    .map_err(|err| err.to_string())
+                                                }),
+                                        },
                                     };
                                     let _ = sender.send(ObjectActionResult::Ddl(result));
                                     app::awake();
@@ -2155,8 +2544,8 @@ impl ObjectBrowserWidget {
             while let Ok(request) = Self::recv_latest_refresh_request(&refresh_request_receiver) {
                 match request {
                     RefreshRequest::Metadata => {
-                        if let Some(cache) = Self::load_metadata_cache(&connection) {
-                            let _ = refresh_sender.send(RefreshEvent::Finished(cache));
+                        if let Some((db_type, cache)) = Self::load_metadata_cache(&connection) {
+                            let _ = refresh_sender.send(RefreshEvent::Finished { cache, db_type });
                             app::awake();
                         }
                     }
@@ -2180,7 +2569,9 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn load_metadata_cache(connection: &SharedConnection) -> Option<ObjectCache> {
+    fn load_metadata_cache(
+        connection: &SharedConnection,
+    ) -> Option<(crate::db::DatabaseType, ObjectCache)> {
         use crate::db::connection::DatabaseType;
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
@@ -2223,12 +2614,10 @@ impl ObjectBrowserWidget {
                     cache.packages = packages;
                 }
 
-                Some(cache)
+                Some((db_type, cache))
             }
             DatabaseType::MySQL => {
-                let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() else {
-                    return None;
-                };
+                let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 
                 let mut cache = ObjectCache::default();
 
@@ -2249,7 +2638,7 @@ impl ObjectBrowserWidget {
                 }
                 // MySQL doesn't have sequences, synonyms, or packages
 
-                Some(cache)
+                Some((db_type, cache))
             }
         }
     }
@@ -2475,7 +2864,8 @@ fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_text_for_object_item, ObjectItem};
+    use super::{copy_text_for_object_item, ObjectBrowserWidget, ObjectItem};
+    use crate::db::ProcedureArgument;
 
     #[test]
     fn copy_text_for_package_routine_uses_qualified_name() {
@@ -2486,5 +2876,59 @@ mod tests {
         };
 
         assert_eq!(copy_text_for_object_item(&item), "DEMO_PKG.RUN_JOB");
+    }
+
+    #[test]
+    fn preview_select_sql_uses_mysql_limit_and_identifier_quotes() {
+        let sql =
+            ObjectBrowserWidget::preview_select_sql(crate::db::DatabaseType::MySQL, "order.items");
+
+        assert_eq!(sql, "SELECT * FROM `order`.`items` LIMIT 100");
+    }
+
+    #[test]
+    fn build_mysql_routine_script_uses_call_and_session_variables() {
+        let arguments = vec![
+            ProcedureArgument {
+                name: Some("p_id".to_string()),
+                position: 1,
+                sequence: 1,
+                data_type: Some("INT".to_string()),
+                in_out: Some("IN".to_string()),
+                data_length: None,
+                data_precision: Some(10),
+                data_scale: Some(0),
+                type_owner: None,
+                type_name: None,
+                pls_type: None,
+                overload: None,
+                default_value: None,
+            },
+            ProcedureArgument {
+                name: Some("p_status".to_string()),
+                position: 2,
+                sequence: 2,
+                data_type: Some("VARCHAR(32)".to_string()),
+                in_out: Some("OUT".to_string()),
+                data_length: Some(32),
+                data_precision: None,
+                data_scale: None,
+                type_owner: None,
+                type_name: None,
+                pls_type: None,
+                overload: None,
+                default_value: None,
+            },
+        ];
+
+        let sql =
+            ObjectBrowserWidget::build_mysql_routine_script("demo_proc", "PROCEDURE", &arguments);
+
+        assert!(sql.contains("CALL `demo_proc`("));
+        assert!(sql.contains("0,"));
+        assert!(sql.contains("@v_p_status"));
+        assert!(sql.contains("SELECT @v_p_status AS `p_status`;"));
+        assert!(!sql.contains("FROM dual"));
+        assert!(!sql.contains("BEGIN\n"));
     }
 }

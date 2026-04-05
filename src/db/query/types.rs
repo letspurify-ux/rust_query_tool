@@ -196,6 +196,7 @@ pub enum ToolCommand {
     ShowTables,
     ShowColumns {
         table: String,
+        schema: Option<String>,
     },
     ShowCreateTable {
         table: String,

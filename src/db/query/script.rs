@@ -314,6 +314,18 @@ struct PendingPartialMultilineClauseOwnerFrame {
     owner_depth: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowClauseDefinitionListFrame {
+    clause_parser_depth: usize,
+    clause_depth: usize,
+}
+
+impl WindowClauseDefinitionListFrame {
+    fn body_depth(self) -> usize {
+        self.clause_depth.saturating_add(1)
+    }
+}
+
 impl OwnerRelativeDepthFrame {
     fn model_clause(owner_depth: usize, start_parser_depth: usize) -> Self {
         Self {
@@ -532,8 +544,8 @@ impl<'a> TopLevelScanner<'a> {
         self.pos = self.bytes.len();
     }
 
-    fn skip_line_comment(&mut self) {
-        self.pos += 2;
+    fn skip_line_comment(&mut self, prefix_len: usize) {
+        self.pos += prefix_len;
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
             self.pos += 1;
         }
@@ -583,8 +595,8 @@ impl<'a> Iterator for TopLevelScanner<'a> {
                 }
             }
 
-            if b == b'-' && self.bytes.get(self.pos + 1) == Some(&b'-') {
-                self.skip_line_comment();
+            if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(self.bytes, self.pos) {
+                self.skip_line_comment(prefix_len);
                 continue;
             }
             if b == b'/' && self.bytes.get(self.pos + 1) == Some(&b'*') {
@@ -1163,6 +1175,9 @@ impl QueryExecutor {
         let mut exception_handler_body_stack: Vec<bool> = Vec::new();
         let mut case_branch_stack: Vec<bool> = Vec::new();
         let mut in_leading_block_comment = false;
+        let mut mysql_delimiter = ";".to_string();
+        let mut mysql_routine_body_pending = false;
+        let mut mysql_routine_body_active = false;
 
         for line in sql.lines() {
             let was_in_leading_block_comment = in_leading_block_comment;
@@ -1190,6 +1205,33 @@ impl QueryExecutor {
             };
 
             let trimmed_start = line.trim_start();
+            if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
+                Self::parse_mysql_delimiter_command(trimmed_start)
+            {
+                depths.push(builder.block_depth());
+                mysql_delimiter = delimiter;
+                if mysql_delimiter == ";" {
+                    mysql_routine_body_pending = false;
+                    mysql_routine_body_active = false;
+                }
+                continue;
+            }
+            let mysql_routine_header_line = mysql_delimiter != ";" && {
+                let words =
+                    sql_text::meaningful_identifier_words_before_inline_comment(trimmed_start, 8);
+                words
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+                    && words.iter().skip(1).any(|word| {
+                        word.eq_ignore_ascii_case("PROCEDURE")
+                            || word.eq_ignore_ascii_case("FUNCTION")
+                            || word.eq_ignore_ascii_case("TRIGGER")
+                            || word.eq_ignore_ascii_case("EVENT")
+                    })
+            };
+            if mysql_routine_header_line {
+                mysql_routine_body_pending = true;
+            }
             let in_leading_block_comment_line = leading_word.is_none()
                 && (was_in_leading_block_comment || in_leading_block_comment);
             let is_comment_or_blank = trimmed_start.is_empty()
@@ -1435,7 +1477,21 @@ impl QueryExecutor {
                 }
             }
 
-            builder.process_line_with_byte_observer(line, |bytes, byte_idx, symbol| {
+            let mysql_compound_declare = mysql_routine_body_active && leading_is("DECLARE");
+            let sanitized_line = if mysql_compound_declare {
+                let trimmed = line.trim_start();
+                let leading_ws_len = line.len().saturating_sub(trimmed.len());
+                let mut rewritten = String::with_capacity(line.len().saturating_add(8));
+                rewritten.push_str(&line[..leading_ws_len]);
+                rewritten.push_str("MYSQL_DECLARE");
+                rewritten.push_str(&trimmed["DECLARE".len()..]);
+                Some(rewritten)
+            } else {
+                None
+            };
+            let parser_line = sanitized_line.as_deref().unwrap_or(line);
+
+            builder.process_line_with_byte_observer(parser_line, |bytes, byte_idx, symbol| {
                 if symbol == b'(' {
                     let j = skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
                     let mut k = j;
@@ -1476,6 +1532,21 @@ impl QueryExecutor {
                     }
                 }
             });
+
+            if mysql_routine_body_pending && leading_is("BEGIN") {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
+            }
+            if mysql_routine_body_active
+                && leading_is("END")
+                && Self::statement_ends_with_mysql_delimiter(
+                    trimmed_start,
+                    mysql_delimiter.as_str(),
+                )
+            {
+                mysql_routine_body_active = false;
+                mysql_routine_body_pending = false;
+            }
         }
 
         depths
@@ -1604,10 +1675,8 @@ impl QueryExecutor {
 
         let multiline_string_prefix_lengths =
             sql_text::multiline_string_continuation_prefix_lengths(sql, lines.len());
-        let next_code_indices = Self::auto_format_next_code_line_indices(
-            &lines,
-            &multiline_string_prefix_lengths,
-        );
+        let next_code_indices =
+            Self::auto_format_next_code_line_indices(&lines, &multiline_string_prefix_lengths);
         let mut contexts = Vec::with_capacity(lines.len());
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
         let mut pending_query_bases: Vec<PendingQueryBaseFrame> = Vec::new();
@@ -1623,6 +1692,7 @@ impl QueryExecutor {
         let mut pending_partial_multiline_clause_owner: Option<
             PendingPartialMultilineClauseOwnerFrame,
         > = None;
+        let mut window_clause_definition_list: Option<WindowClauseDefinitionListFrame> = None;
         let mut pending_line_continuation: Option<InlineCommentLineContinuation> = None;
         let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
             None;
@@ -1633,6 +1703,9 @@ impl QueryExecutor {
         let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
         let mut pending_auto_format_subquery_paren_count = 0usize;
         let mut auto_format_paren_observer = SqlParserEngine::new();
+        let mut mysql_delimiter = ";".to_string();
+        let mut mysql_routine_body_pending = false;
+        let mut mysql_routine_body_active = false;
 
         for (idx, line) in lines.iter().enumerate() {
             let analysis_line = multiline_string_prefix_lengths
@@ -1658,6 +1731,33 @@ impl QueryExecutor {
             if trimmed.is_empty() {
                 contexts.push(context);
                 continue;
+            }
+
+            if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
+                Self::parse_mysql_delimiter_command(trimmed)
+            {
+                mysql_delimiter = delimiter;
+                if mysql_delimiter == ";" {
+                    mysql_routine_body_pending = false;
+                    mysql_routine_body_active = false;
+                }
+                contexts.push(context);
+                continue;
+            }
+            let mysql_routine_header_line = mysql_delimiter != ";" && {
+                let words = sql_text::meaningful_identifier_words_before_inline_comment(trimmed, 8);
+                words
+                    .first()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+                    && words.iter().skip(1).any(|word| {
+                        word.eq_ignore_ascii_case("PROCEDURE")
+                            || word.eq_ignore_ascii_case("FUNCTION")
+                            || word.eq_ignore_ascii_case("TRIGGER")
+                            || word.eq_ignore_ascii_case("EVENT")
+                    })
+            };
+            if mysql_routine_header_line {
+                mysql_routine_body_pending = true;
             }
 
             if sql_text::line_is_comment_only_with_block_state(analysis_line, &mut in_block_comment)
@@ -1691,14 +1791,15 @@ impl QueryExecutor {
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
             let clause_detection_trimmed = sql_text::auto_format_structural_tail(trimmed);
             let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
+            let mysql_compound_declare = mysql_routine_body_active
+                && sql_text::starts_with_keyword_token(&clause_detection_upper, "DECLARE");
             let inside_non_subquery_paren_context = auto_format_subquery_paren_stack
                 .last()
                 .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery);
-            let suppress_non_subquery_paren_layout_clause =
-                inside_non_subquery_paren_context
-                    && sql_text::is_non_subquery_paren_suppressed_layout_clause(
-                        &clause_detection_upper,
-                    );
+            let suppress_non_subquery_paren_layout_clause = inside_non_subquery_paren_context
+                && sql_text::is_non_subquery_paren_suppressed_layout_clause(
+                    &clause_detection_upper,
+                );
             let current_line_starts_elsif =
                 sql_text::line_starts_with_identifier_sequence_before_inline_comment(
                     clause_detection_trimmed,
@@ -1740,6 +1841,41 @@ impl QueryExecutor {
             } else {
                 Self::auto_format_clause_kind(&clause_detection_upper)
             };
+            let previous_window_definition_depth_anchor = idx.checked_sub(1).and_then(|prev_idx| {
+                let previous_line = lines.get(prev_idx)?.trim_start();
+                let previous_context = contexts.get(prev_idx)?;
+                if sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    previous_line,
+                    &["WINDOW"],
+                ) {
+                    Some(previous_context.auto_depth.saturating_add(1))
+                } else if sql_text::line_has_leading_significant_close_paren(previous_line)
+                    && sql_text::line_ends_with_comma_before_inline_comment(previous_line)
+                {
+                    Some(previous_context.auto_depth)
+                } else {
+                    None
+                }
+            });
+            let current_line_is_exact_bare_window_clause_header = clause_kind
+                == Some(AutoFormatClauseKind::Window)
+                && sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    clause_detection_trimmed,
+                    &["WINDOW"],
+                );
+            let current_line_is_window_clause_definition_header = (window_clause_definition_list
+                .is_some()
+                || previous_window_definition_depth_anchor.is_some())
+                && Self::line_is_window_clause_definition_header(trimmed);
+            if window_clause_definition_list.is_some_and(|frame| {
+                parser_depth < frame.clause_parser_depth
+                    || (parser_depth == frame.clause_parser_depth
+                        && clause_kind.is_some()
+                        && !current_line_is_exact_bare_window_clause_header
+                        && !current_line_is_window_clause_definition_header)
+            }) {
+                window_clause_definition_list = None;
+            }
             let split_query_owner_lookahead_kind =
                 Self::split_query_owner_lookahead_kind(&lines, idx, &next_code_indices, trimmed);
             let current_line_is_generic_split_query_owner = matches!(
@@ -1772,13 +1908,12 @@ impl QueryExecutor {
                 .and_then(|next_idx| lines.get(next_idx).copied());
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
-            let blocks_structural_line_continuation =
-                ((!suppress_non_subquery_paren_layout_clause
-                    && Self::line_starts_continuation_boundary(trimmed))
-                    || (leading_close_has_mixed_continuation
-                        && !suppress_non_subquery_paren_layout_clause
-                        && Self::line_starts_continuation_boundary(clause_detection_trimmed)))
-                    && !current_line_is_standalone_open_paren;
+            let blocks_structural_line_continuation = ((!suppress_non_subquery_paren_layout_clause
+                && Self::line_starts_continuation_boundary(trimmed))
+                || (leading_close_has_mixed_continuation
+                    && !suppress_non_subquery_paren_layout_clause
+                    && Self::line_starts_continuation_boundary(clause_detection_trimmed)))
+                && !current_line_is_standalone_open_paren;
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
                 pending_split_query_owner.take()
             } else {
@@ -1811,9 +1946,12 @@ impl QueryExecutor {
                     &mut owner_relative_frames,
                     &multiline_clause_paren_profile,
                 );
-            let multiline_clause_owner_kind =
-                Self::line_multiline_clause_owner_kind(owner_relative_detection_trimmed)
-                    .or(pending_multiline_clause_for_line.map(|frame| frame.kind));
+            let multiline_clause_owner_kind = ((window_clause_definition_list.is_some()
+                || previous_window_definition_depth_anchor.is_some())
+                && Self::line_is_window_clause_definition_header(owner_relative_detection_trimmed))
+            .then_some(sql_text::FormatIndentedParenOwnerKind::Window)
+            .or_else(|| Self::line_multiline_clause_owner_kind(owner_relative_detection_trimmed))
+            .or(pending_multiline_clause_for_line.map(|frame| frame.kind));
             let starts_multiline_clause = multiline_clause_owner_kind.is_some();
             let active_owner_relative_frame =
                 Self::active_owner_relative_depth_frame(&owner_relative_frames);
@@ -2082,6 +2220,18 @@ impl QueryExecutor {
             } else if let Some(body_depth) = forall_body_depth {
                 if clause_kind.is_some_and(AutoFormatClauseKind::is_query_head) {
                     context.auto_depth = body_depth;
+                }
+            }
+
+            if let Some(frame) = window_clause_definition_list {
+                if current_line_is_window_clause_definition_header {
+                    context.auto_depth = frame.body_depth();
+                    context.query_role = AutoFormatQueryRole::Continuation;
+                }
+            } else if let Some(anchor_depth) = previous_window_definition_depth_anchor {
+                if current_line_is_window_clause_definition_header {
+                    context.auto_depth = context.auto_depth.max(anchor_depth);
+                    context.query_role = AutoFormatQueryRole::Continuation;
                 }
             }
 
@@ -2746,6 +2896,13 @@ impl QueryExecutor {
                 };
             }
 
+            if current_line_is_exact_bare_window_clause_header {
+                window_clause_definition_list = Some(WindowClauseDefinitionListFrame {
+                    clause_parser_depth: parser_depth,
+                    clause_depth: context.auto_depth,
+                });
+            }
+
             if sql_text::starts_with_keyword_token(&owner_relative_detection_upper, "MODEL") {
                 owner_relative_frames.push(OwnerRelativeDepthFrame::model_clause(
                     context.auto_depth,
@@ -2762,9 +2919,9 @@ impl QueryExecutor {
                         || current_line_is_exact_exception))
                     .then_some(context.auto_depth.saturating_add(1));
 
-            pending_line_continuation = if suppress_non_subquery_paren_layout_clause {
-                None
-            } else if current_line_is_same_depth_merge_branch_header_fragment {
+            let suppress_line_continuation = suppress_non_subquery_paren_layout_clause
+                || current_line_is_same_depth_merge_branch_header_fragment;
+            pending_line_continuation = if suppress_line_continuation {
                 None
             } else if context.query_base_depth.is_some() || clause_kind.is_some() {
                 Self::line_continuation_for_line(
@@ -2805,7 +2962,22 @@ impl QueryExecutor {
                 active_with_plsql_scope,
                 clause_detection_trimmed,
                 context.auto_depth,
+                mysql_compound_declare,
             );
+
+            if mysql_routine_body_pending
+                && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+            {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
+            }
+            if mysql_routine_body_active
+                && sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                && Self::statement_ends_with_mysql_delimiter(trimmed, mysql_delimiter.as_str())
+            {
+                mysql_routine_body_active = false;
+                mysql_routine_body_pending = false;
+            }
 
             let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
@@ -3620,6 +3792,10 @@ impl QueryExecutor {
         sql_text::line_is_format_cte_definition_header(line)
     }
 
+    fn line_is_window_clause_definition_header(line: &str) -> bool {
+        sql_text::line_is_format_window_definition_header(line)
+    }
+
     fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
         sql_text::line_ends_with_comma_before_inline_comment(line)
     }
@@ -3709,6 +3885,7 @@ impl QueryExecutor {
         active_with_plsql_scope: bool,
         trimmed_upper: &str,
         owner_depth: usize,
+        mysql_compound_declare: bool,
     ) {
         if !(active_with_plsql_scope
             || !state.active_body_frames.is_empty()
@@ -3788,7 +3965,7 @@ impl QueryExecutor {
                 }
             }
             "DECLARE" => {
-                if !state.active_body_frames.is_empty() {
+                if !mysql_compound_declare && !state.active_body_frames.is_empty() {
                     state.active_body_frames.push(WithPlsqlAutoBodyFrame {
                         kind: WithPlsqlAutoBodyFrameKind::Block,
                         owner_depth,
@@ -3956,7 +4133,9 @@ impl QueryExecutor {
         loop {
             let trimmed = remaining.trim_start();
 
-            if sql_text::is_sqlplus_comment_line(trimmed) {
+            if sql_text::is_sqlplus_comment_line(trimmed)
+                || sql_text::is_mysql_hash_comment_line(trimmed)
+            {
                 if let Some(line_end) = trimmed.find('\n') {
                     remaining = &trimmed[line_end + 1..];
                     continue;
@@ -3964,7 +4143,9 @@ impl QueryExecutor {
                 return String::new();
             }
 
-            if trimmed.starts_with("/*") {
+            if trimmed.starts_with("/*")
+                && !sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
+            {
                 if let Some(block_end) = trimmed.find("*/") {
                     remaining = &trimmed[block_end + 2..];
                     continue;
@@ -3989,19 +4170,25 @@ impl QueryExecutor {
             // Find the last line and check if it's only a comment
             if let Some(last_newline) = trimmed.rfind('\n') {
                 let last_line = trimmed[last_newline + 1..].trim();
-                if sql_text::is_sqlplus_comment_line(last_line) {
+                if sql_text::is_sqlplus_comment_line(last_line)
+                    || sql_text::is_mysql_hash_comment_line(last_line)
+                {
                     result = trimmed[..last_newline].to_string();
                     continue;
                 }
             } else {
                 // Single line - check if entire thing is a line comment
-                if sql_text::is_sqlplus_comment_line(trimmed) {
+                if sql_text::is_sqlplus_comment_line(trimmed)
+                    || sql_text::is_mysql_hash_comment_line(trimmed)
+                {
                     return String::new();
                 }
             }
 
             // Check for trailing block comment
-            if trimmed.ends_with("*/") {
+            if trimmed.ends_with("*/")
+                && !sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
+            {
                 // Find matching /*
                 // Need to scan backwards to find the opening /*
                 let bytes = trimmed.as_bytes();
@@ -5896,6 +6083,8 @@ impl QueryExecutor {
         let mut items: Vec<FormatItem> = Vec::new();
         let mut builder = SqlParserEngine::new();
         let mut sqlblanklines_enabled = true;
+        let mut mysql_delimiter = ";".to_string();
+        let mut mysql_raw_statement = String::new();
 
         let mut add_statement = |stmt: String, items: &mut Vec<FormatItem>| {
             let cleaned = stmt.trim();
@@ -5906,13 +6095,58 @@ impl QueryExecutor {
 
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
-            let logical_line = if Self::can_collect_multiline_tool_command(&builder) {
+            let logical_line = if mysql_delimiter == ";"
+                && mysql_raw_statement.is_empty()
+                && Self::can_collect_multiline_tool_command(&builder)
+            {
                 Self::collect_multiline_tool_command(line, &mut lines)
             } else {
                 None
             };
             let line = logical_line.as_deref().unwrap_or(line);
             let trimmed = line.trim();
+            Self::maybe_enable_mysql_parser_mode(
+                &mut builder,
+                line,
+                trimmed,
+                Some(mysql_delimiter.as_str()),
+            );
+
+            if builder.is_idle() && builder.current_is_empty() {
+                if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
+                    Self::parse_mysql_delimiter_command(trimmed)
+                {
+                    mysql_delimiter = delimiter.clone();
+                    items.push(FormatItem::ToolCommand(ToolCommand::MysqlDelimiter {
+                        delimiter,
+                    }));
+                    continue;
+                }
+            }
+
+            if mysql_delimiter != ";" {
+                if trimmed.is_empty() && mysql_raw_statement.is_empty() {
+                    continue;
+                }
+
+                if !mysql_raw_statement.is_empty() {
+                    mysql_raw_statement.push('\n');
+                }
+                mysql_raw_statement.push_str(line);
+
+                if Self::statement_ends_with_mysql_delimiter(
+                    mysql_raw_statement.as_str(),
+                    mysql_delimiter.as_str(),
+                ) {
+                    let statement = Self::strip_trailing_mysql_delimiter(
+                        mysql_raw_statement.as_str(),
+                        mysql_delimiter.as_str(),
+                    );
+                    add_statement(statement, &mut items);
+                    mysql_raw_statement.clear();
+                }
+                continue;
+            }
 
             // Blank-line termination
             if Self::should_force_terminate_on_blank_line(
@@ -5930,11 +6164,22 @@ impl QueryExecutor {
 
             // Standalone comment handling (format mode only)
             if builder.is_idle() && builder.current_is_empty() {
-                if trimmed.starts_with("--") || sql_text::is_sqlplus_comment_line(trimmed) {
+                if trimmed.starts_with("--")
+                    || sql_text::is_sqlplus_comment_line(trimmed)
+                    || trimmed.starts_with('#')
+                {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }
-                if trimmed.starts_with("/*") {
+                if sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
+                    && trimmed.ends_with("*/")
+                {
+                    items.push(FormatItem::Statement(line.to_string()));
+                    continue;
+                }
+                if trimmed.starts_with("/*")
+                    && !sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
+                {
                     let mut comment = String::new();
                     let mut trailing_after_comment: Option<String> = None;
                     let extract_trailing_segment = |trailing_raw: &str| {
@@ -6064,6 +6309,9 @@ impl QueryExecutor {
             );
         }
 
+        if !mysql_raw_statement.trim().is_empty() {
+            add_statement(mysql_raw_statement, &mut items);
+        }
         for stmt in builder.finalize_and_take_statements() {
             add_statement(stmt, &mut items);
         }
@@ -6131,6 +6379,15 @@ impl QueryExecutor {
             }
 
             if current == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+                let semicolon_idx = last_semicolon_idx?;
+                let between = line.get(semicolon_idx + 1..idx)?;
+                if between.trim().is_empty() {
+                    return Some((line.get(..=semicolon_idx)?, line.get(idx..)?));
+                }
+                return None;
+            }
+
+            if sql_text::is_mysql_hash_comment_start(bytes, idx) {
                 let semicolon_idx = last_semicolon_idx?;
                 let between = line.get(semicolon_idx + 1..idx)?;
                 if between.trim().is_empty() {
@@ -6249,6 +6506,29 @@ impl QueryExecutor {
             .is_none_or(|word| !sql_text::is_statement_head_keyword(word))
     }
 
+    fn should_enable_mysql_parser_mode(
+        line: &str,
+        trimmed: &str,
+        mysql_delimiter: Option<&str>,
+    ) -> bool {
+        mysql_delimiter.is_some_and(|delimiter| delimiter != ";")
+            || Self::parse_mysql_tool_command(trimmed).is_some()
+            || sql_text::sql_uses_mysql_compatible_syntax(line)
+    }
+
+    fn maybe_enable_mysql_parser_mode(
+        builder: &mut SqlParserEngine,
+        line: &str,
+        trimmed: &str,
+        mysql_delimiter: Option<&str>,
+    ) {
+        if !builder.mysql_mode()
+            && Self::should_enable_mysql_parser_mode(line, trimmed, mysql_delimiter)
+        {
+            builder.set_mysql_mode(true);
+        }
+    }
+
     fn merge_fragmented_standalone_routine_format_items(items: Vec<FormatItem>) -> Vec<FormatItem> {
         let mut merged: Vec<FormatItem> = Vec::with_capacity(items.len());
         let mut index = 0usize;
@@ -6348,16 +6628,61 @@ impl QueryExecutor {
     ) {
         let mut builder = SqlParserEngine::new();
         let mut sqlblanklines_enabled = true;
+        let mut mysql_delimiter = ";".to_string();
+        let mut mysql_raw_statement = String::new();
 
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
-            let logical_line = if Self::can_collect_multiline_tool_command(&builder) {
+            let logical_line = if mysql_delimiter == ";"
+                && mysql_raw_statement.is_empty()
+                && Self::can_collect_multiline_tool_command(&builder)
+            {
                 Self::collect_multiline_tool_command(line, &mut lines)
             } else {
                 None
             };
             let line = logical_line.as_deref().unwrap_or(line);
             let trimmed = line.trim();
+            Self::maybe_enable_mysql_parser_mode(
+                &mut builder,
+                line,
+                trimmed,
+                Some(mysql_delimiter.as_str()),
+            );
+
+            if builder.is_idle() && builder.current_is_empty() {
+                if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
+                    Self::parse_mysql_delimiter_command(trimmed)
+                {
+                    mysql_delimiter = delimiter.clone();
+                    on_tool_command(ToolCommand::MysqlDelimiter { delimiter }, line, items);
+                    continue;
+                }
+            }
+
+            if mysql_delimiter != ";" {
+                if trimmed.is_empty() && mysql_raw_statement.is_empty() {
+                    continue;
+                }
+
+                if !mysql_raw_statement.is_empty() {
+                    mysql_raw_statement.push('\n');
+                }
+                mysql_raw_statement.push_str(line);
+
+                if Self::statement_ends_with_mysql_delimiter(
+                    mysql_raw_statement.as_str(),
+                    mysql_delimiter.as_str(),
+                ) {
+                    let statement = Self::strip_trailing_mysql_delimiter(
+                        mysql_raw_statement.as_str(),
+                        mysql_delimiter.as_str(),
+                    );
+                    add_statement(statement, items);
+                    mysql_raw_statement.clear();
+                }
+                continue;
+            }
 
             // Blank-line termination (SET SQLBLANKLINES OFF)
             if Self::should_force_terminate_on_blank_line(
@@ -6385,6 +6710,9 @@ impl QueryExecutor {
             );
         }
 
+        if !mysql_raw_statement.trim().is_empty() {
+            add_statement(mysql_raw_statement, items);
+        }
         for stmt in builder.finalize_and_take_statements() {
             add_statement(stmt, items);
         }
@@ -6519,6 +6847,169 @@ impl QueryExecutor {
         }
     }
 
+    fn is_mysql_dash_comment_start(bytes: &[u8], index: usize) -> bool {
+        bytes.get(index) == Some(&b'-')
+            && bytes.get(index + 1) == Some(&b'-')
+            && bytes
+                .get(index + 2)
+                .is_none_or(|byte| byte.is_ascii_whitespace())
+    }
+
+    fn skip_mysql_line_comment(bytes: &[u8], mut index: usize) -> usize {
+        while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+            index += 1;
+        }
+        index
+    }
+
+    fn skip_mysql_block_comment(bytes: &[u8], mut index: usize) -> usize {
+        index = index.saturating_add(2);
+        while index + 1 < bytes.len() {
+            if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                return index + 2;
+            }
+            index += 1;
+        }
+        bytes.len()
+    }
+
+    fn skip_mysql_quoted_literal(
+        bytes: &[u8],
+        mut index: usize,
+        quote: u8,
+        doubled_quote_escape: bool,
+    ) -> usize {
+        index = index.saturating_add(1);
+        while index < bytes.len() {
+            if bytes[index] == b'\\' {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if bytes[index] == quote {
+                if doubled_quote_escape && bytes.get(index + 1) == Some(&quote) {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                return index + 1;
+            }
+            index += 1;
+        }
+        bytes.len()
+    }
+
+    fn skip_mysql_backtick_identifier(bytes: &[u8], mut index: usize) -> usize {
+        index = index.saturating_add(1);
+        while index < bytes.len() {
+            if bytes[index] == b'`' {
+                if bytes.get(index + 1) == Some(&b'`') {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+                return index + 1;
+            }
+            index += 1;
+        }
+        bytes.len()
+    }
+
+    fn mysql_delimiter_suffix_is_ignorable(statement: &str, mut index: usize) -> bool {
+        let bytes = statement.as_bytes();
+        while index < bytes.len() {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+            if index >= bytes.len() {
+                return true;
+            }
+
+            if bytes[index] == b'#' {
+                index = Self::skip_mysql_line_comment(bytes, index + 1);
+                continue;
+            }
+            if Self::is_mysql_dash_comment_start(bytes, index) {
+                index = Self::skip_mysql_line_comment(bytes, index + 2);
+                continue;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+
+            return false;
+        }
+
+        true
+    }
+
+    fn mysql_trailing_delimiter_range(statement: &str, delimiter: &str) -> Option<(usize, usize)> {
+        let delimiter_bytes = delimiter.as_bytes();
+        if delimiter_bytes.is_empty() {
+            return None;
+        }
+
+        let bytes = statement.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == b'#' {
+                index = Self::skip_mysql_line_comment(bytes, index + 1);
+                continue;
+            }
+            if Self::is_mysql_dash_comment_start(bytes, index) {
+                index = Self::skip_mysql_line_comment(bytes, index + 2);
+                continue;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+            if bytes[index] == b'\'' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'\'', true);
+                continue;
+            }
+            if bytes[index] == b'"' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'"', true);
+                continue;
+            }
+            if bytes[index] == b'`' {
+                index = Self::skip_mysql_backtick_identifier(bytes, index);
+                continue;
+            }
+
+            let delimiter_end = index.saturating_add(delimiter_bytes.len());
+            if statement
+                .as_bytes()
+                .get(index..delimiter_end)
+                .is_some_and(|segment| segment == delimiter_bytes)
+                && Self::mysql_delimiter_suffix_is_ignorable(statement, delimiter_end)
+            {
+                return Some((index, delimiter_end));
+            }
+
+            index += 1;
+        }
+
+        None
+    }
+
+    fn statement_ends_with_mysql_delimiter(statement: &str, delimiter: &str) -> bool {
+        Self::mysql_trailing_delimiter_range(statement, delimiter).is_some()
+    }
+
+    fn strip_trailing_mysql_delimiter(statement: &str, delimiter: &str) -> String {
+        let Some((start, end)) = Self::mysql_trailing_delimiter_range(statement, delimiter) else {
+            return statement.trim_end().to_string();
+        };
+
+        let mut stripped =
+            String::with_capacity(statement.len().saturating_sub(end.saturating_sub(start)));
+        stripped.push_str(statement.get(..start).unwrap_or_default());
+        stripped.push_str(statement.get(end..).unwrap_or_default());
+        stripped.trim_end().to_string()
+    }
+
     pub fn parse_tool_command(line: &str) -> Option<ToolCommand> {
         let trimmed_line = line.trim();
         if trimmed_line.is_empty() {
@@ -6557,12 +7048,16 @@ impl QueryExecutor {
             return Some(Self::parse_serveroutput_command(trimmed));
         }
 
+        if let Some(command) = Self::parse_mysql_tool_command(trimmed) {
+            return Some(command);
+        }
+
         if upper.starts_with("SHOW ERRORS") {
             return Some(Self::parse_show_errors_command(trimmed));
         }
 
         if upper.starts_with("SHOW ") || upper == "SHOW" {
-            return Some(Self::parse_show_command(trimmed));
+            return Self::parse_show_command(trimmed);
         }
 
         if upper == "DESC"
@@ -6928,26 +7423,148 @@ impl QueryExecutor {
         }
     }
 
-    fn parse_show_command(raw: &str) -> ToolCommand {
+    fn parse_show_command(raw: &str) -> Option<ToolCommand> {
         let tokens: Vec<&str> = raw.split_whitespace().collect();
         if tokens.len() < 2 {
-            return ToolCommand::Unsupported {
+            return Some(ToolCommand::Unsupported {
                 raw: raw.to_string(),
                 message: "SHOW requires a topic (USER, ALL, ERRORS).".to_string(),
                 is_error: true,
-            };
+            });
         }
 
         let topic = tokens[1].to_ascii_uppercase();
         match topic.as_str() {
-            "USER" => ToolCommand::ShowUser,
-            "ALL" => ToolCommand::ShowAll,
-            "ERRORS" => Self::parse_show_errors_command(raw),
-            _ => ToolCommand::Unsupported {
+            "USER" => Some(ToolCommand::ShowUser),
+            "ALL" => Some(ToolCommand::ShowAll),
+            "ERRORS" => Some(Self::parse_show_errors_command(raw)),
+            _ => None,
+        }
+    }
+
+    fn parse_mysql_tool_command(raw: &str) -> Option<ToolCommand> {
+        let upper = raw.to_ascii_uppercase();
+
+        if let Some(command) = Self::parse_mysql_delimiter_command(raw) {
+            return Some(command);
+        }
+
+        if upper == "SOURCE" || upper.starts_with("SOURCE ") {
+            return Some(Self::parse_mysql_source_command(raw));
+        }
+
+        if upper == "USE" || upper.starts_with("USE ") {
+            return Some(Self::parse_mysql_use_command(raw));
+        }
+
+        if upper.starts_with("SHOW ") || upper == "SHOW" {
+            return Self::parse_mysql_show_command(raw);
+        }
+
+        None
+    }
+
+    fn parse_mysql_delimiter_command(raw: &str) -> Option<ToolCommand> {
+        let delimiter = sql_text::parse_mysql_delimiter_directive(raw)?;
+        Some(ToolCommand::MysqlDelimiter { delimiter })
+    }
+
+    fn parse_mysql_source_command(raw: &str) -> ToolCommand {
+        let rest = raw.get(6..).unwrap_or_default().trim();
+        let path = Self::extract_script_path(rest);
+        if path.is_empty() {
+            return ToolCommand::Unsupported {
                 raw: raw.to_string(),
-                message: "SHOW supports USER, ALL, or ERRORS.".to_string(),
+                message: "SOURCE requires a path.".to_string(),
                 is_error: true,
-            },
+            };
+        }
+
+        ToolCommand::MysqlSource {
+            path: path.trim_matches('"').trim_matches('\'').to_string(),
+        }
+    }
+
+    fn parse_mysql_use_command(raw: &str) -> ToolCommand {
+        let rest = raw.get(3..).unwrap_or_default().trim();
+        if rest.is_empty() {
+            return ToolCommand::Unsupported {
+                raw: raw.to_string(),
+                message: "USE requires a database name.".to_string(),
+                is_error: true,
+            };
+        }
+
+        ToolCommand::Use {
+            database: rest.to_string(),
+        }
+    }
+
+    fn parse_mysql_show_command(raw: &str) -> Option<ToolCommand> {
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        if tokens.len() < 2 {
+            return None;
+        }
+
+        let topic = tokens[1].to_ascii_uppercase();
+        match topic.as_str() {
+            "DATABASES" if tokens.len() == 2 => Some(ToolCommand::ShowDatabases),
+            "TABLES" if tokens.len() == 2 => Some(ToolCommand::ShowTables),
+            "COLUMNS"
+                if tokens.len() == 4
+                    && (tokens[2].eq_ignore_ascii_case("FROM")
+                        || tokens[2].eq_ignore_ascii_case("IN")) =>
+            {
+                Some(ToolCommand::ShowColumns {
+                    table: tokens[3].to_string(),
+                    schema: None,
+                })
+            }
+            "COLUMNS"
+                if tokens.len() == 6
+                    && (tokens[2].eq_ignore_ascii_case("FROM")
+                        || tokens[2].eq_ignore_ascii_case("IN"))
+                    && (tokens[4].eq_ignore_ascii_case("FROM")
+                        || tokens[4].eq_ignore_ascii_case("IN")) =>
+            {
+                Some(ToolCommand::ShowColumns {
+                    table: tokens[3].to_string(),
+                    schema: Some(tokens[5].to_string()),
+                })
+            }
+            "CREATE" if tokens.len() == 4 && tokens[2].eq_ignore_ascii_case("TABLE") => {
+                Some(ToolCommand::ShowCreateTable {
+                    table: tokens[3].to_string(),
+                })
+            }
+            "PROCESSLIST" if tokens.len() == 2 => Some(ToolCommand::ShowProcessList),
+            "VARIABLES" if tokens.len() == 2 => Some(ToolCommand::ShowVariables { filter: None }),
+            "VARIABLES" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
+                Some(ToolCommand::ShowVariables {
+                    filter: Some(
+                        tokens[3..]
+                            .join(" ")
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    ),
+                })
+            }
+            "STATUS" if tokens.len() == 2 => Some(ToolCommand::ShowStatus { filter: None }),
+            "STATUS" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
+                Some(ToolCommand::ShowStatus {
+                    filter: Some(
+                        tokens[3..]
+                            .join(" ")
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string(),
+                    ),
+                })
+            }
+            "WARNINGS" if tokens.len() == 2 => Some(ToolCommand::ShowWarnings),
+            "ERRORS" if tokens.len() == 2 => Some(ToolCommand::MysqlShowErrors),
+            _ => None,
         }
     }
 
@@ -14923,6 +15540,100 @@ WHERE ranked.dept_sum > 0;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_indent_named_window_siblings_one_level_under_bare_window_clause() {
+        let sql = r#"SELECT ob.*,
+    ROW_NUMBER () OVER w_emp AS rn_in_emp,
+    DENSE_RANK () OVER w_global AS global_rank,
+    SUM (ob.total_usd) OVER w_emp_running AS running_emp_total
+FROM order_base AS ob
+WINDOW
+    w_emp AS (
+        PARTITION BY ob.emp_id
+        ORDER BY ob.created_at,
+        ob.order_id
+    ),
+    w_emp_running AS (
+        PARTITION BY ob.emp_id
+        ORDER BY ob.created_at,
+        ob.order_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ),
+    w_global AS (
+        ORDER BY ob.total_usd DESC
+    );"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let rendered_depths = lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                format!("{}:{}:{}", idx, contexts[idx].auto_depth, line.trim_start())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WINDOW")
+            .unwrap_or(0);
+        let first_named_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "w_emp AS (")
+            .unwrap_or(0);
+        let second_named_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "w_emp_running AS (")
+            .unwrap_or(0);
+        let third_named_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "w_global AS (")
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PARTITION BY ob.emp_id")
+            .unwrap_or(0);
+        let rows_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start() == "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            })
+            .unwrap_or(0);
+        let global_order_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ORDER BY ob.total_usd DESC")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[first_named_idx].auto_depth,
+            contexts[window_idx].auto_depth.saturating_add(1),
+            "first named WINDOW definition should stay one level deeper than bare WINDOW"
+        );
+        assert_eq!(
+            contexts[second_named_idx].auto_depth, contexts[first_named_idx].auto_depth,
+            "named WINDOW siblings should share the same clause-body depth, got:\n{}",
+            rendered_depths
+        );
+        assert_eq!(
+            contexts[third_named_idx].auto_depth, contexts[first_named_idx].auto_depth,
+            "all named WINDOW siblings should stay aligned under bare WINDOW, got:\n{}",
+            rendered_depths
+        );
+        assert_eq!(
+            contexts[partition_idx].auto_depth,
+            contexts[first_named_idx].auto_depth.saturating_add(1),
+            "named WINDOW body headers should stay one level deeper than the named WINDOW owner"
+        );
+        assert_eq!(
+            contexts[rows_idx].auto_depth, contexts[partition_idx].auto_depth,
+            "ROWS frame clause should stay aligned with sibling WINDOW body headers"
+        );
+        assert_eq!(
+            contexts[global_order_idx].auto_depth, contexts[partition_idx].auto_depth,
+            "later named WINDOW bodies should reuse the same owner-relative body depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_analytic_over_body_on_owner_stack_after_nested_over() {
         let sql = r#"SELECT
     SUM (sal) OVER (
@@ -17560,8 +18271,7 @@ WHERE d.deptno > 0;"#;
         };
 
         let xmlquery_idx = find_line_starting_with("XMLQUERY ('for $i in /employees/employee");
-        let json_object_idx =
-            find_line_starting_with("JSON_OBJECT (KEY 'id' VALUE x.employee_id");
+        let json_object_idx = find_line_starting_with("JSON_OBJECT (KEY 'id' VALUE x.employee_id");
         let skills_select_idx = find_line_starting_with("SELECT JSON_ARRAYAGG");
         let skills_from_idx = find_line("FROM employee_skills s");
         let skills_where_idx = find_line("WHERE s.employee_id = x.employee_id");
