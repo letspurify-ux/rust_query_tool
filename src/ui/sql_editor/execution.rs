@@ -2581,6 +2581,7 @@ impl SqlEditorWidget {
                                         host,
                                         port,
                                         service_name,
+                                        db_type: crate::db::DatabaseType::Oracle,
                                     };
 
                                     let connect_result = {
@@ -2833,6 +2834,45 @@ impl SqlEditorWidget {
                                             &format!("Warning: {}", message),
                                         );
                                     }
+                                }
+                                // MySQL-specific commands — execute as raw SQL via the connection
+                                ToolCommand::Use { .. }
+                                | ToolCommand::ShowDatabases
+                                | ToolCommand::ShowTables
+                                | ToolCommand::ShowColumns { .. }
+                                | ToolCommand::ShowCreateTable { .. }
+                                | ToolCommand::ShowProcessList
+                                | ToolCommand::ShowVariables { .. }
+                                | ToolCommand::ShowStatus { .. }
+                                | ToolCommand::ShowWarnings
+                                | ToolCommand::MysqlShowErrors
+                                | ToolCommand::MysqlSource { .. } => {
+                                    // These are handled as regular SQL statements
+                                    // for MySQL connections; no special script handling needed.
+                                }
+                                ToolCommand::MysqlDelimiter { ref delimiter } => {
+                                    match session.lock() {
+                                        Ok(mut guard) => {
+                                            if delimiter == ";" {
+                                                guard.mysql_delimiter = None;
+                                            } else {
+                                                guard.mysql_delimiter = Some(delimiter.clone());
+                                            }
+                                        }
+                                        Err(poisoned) => {
+                                            let mut guard = poisoned.into_inner();
+                                            if delimiter == ";" {
+                                                guard.mysql_delimiter = None;
+                                            } else {
+                                                guard.mysql_delimiter = Some(delimiter.clone());
+                                            }
+                                        }
+                                    }
+                                    SqlEditorWidget::emit_script_output(
+                                        &sender,
+                                        &session,
+                                        vec![format!("Delimiter set to '{}'", delimiter)],
+                                    );
                                 }
                             }
 

@@ -188,6 +188,33 @@ pub enum ToolCommand {
         service_name: String,
     },
     Disconnect,
+    // MySQL-specific commands
+    Use {
+        database: String,
+    },
+    ShowDatabases,
+    ShowTables,
+    ShowColumns {
+        table: String,
+    },
+    ShowCreateTable {
+        table: String,
+    },
+    ShowProcessList,
+    ShowVariables {
+        filter: Option<String>,
+    },
+    ShowStatus {
+        filter: Option<String>,
+    },
+    MysqlDelimiter {
+        delimiter: String,
+    },
+    ShowWarnings,
+    MysqlShowErrors,
+    MysqlSource {
+        path: String,
+    },
     Unsupported {
         raw: String,
         message: String,

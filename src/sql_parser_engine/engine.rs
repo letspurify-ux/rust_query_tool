@@ -600,6 +600,15 @@ impl SqlParserEngine {
                 continue;
             }
 
+            // MySQL: # starts a line comment
+            if c == '#' && self.state.mysql_mode {
+                self.state.flush_token();
+                self.state.lex_mode = LexMode::LineComment;
+                self.current.push('#');
+                i += 1;
+                continue;
+            }
+
             if c == '/' && next == Some('*') {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split

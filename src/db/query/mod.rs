@@ -1,4 +1,5 @@
 mod executor;
+pub mod mysql_executor;
 mod script;
 mod types;
 

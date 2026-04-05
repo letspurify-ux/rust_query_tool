@@ -298,6 +298,7 @@ mod tests {
             service_name: "orcl".to_string(),
             username: "scott".to_string(),
             password: String::new(),
+            db_type: crate::db::DatabaseType::Oracle,
         }
     }
 

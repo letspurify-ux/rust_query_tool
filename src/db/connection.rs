@@ -1,6 +1,8 @@
+use mysql::prelude::*;
 use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind, InitParams};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,27 @@ const ORACLE_CLIENT_LOAD_HELP_URL: &str =
     "https://oracle.github.io/odpi/doc/installation.html#macos";
 const ORACLE_CLIENT_LIB_ENV_VAR: &str = "ORACLE_CLIENT_LIB_DIR";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatabaseType {
+    Oracle,
+    MySQL,
+}
+
+impl Default for DatabaseType {
+    fn default() -> Self {
+        DatabaseType::Oracle
+    }
+}
+
+impl fmt::Display for DatabaseType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DatabaseType::Oracle => write!(f, "Oracle"),
+            DatabaseType::MySQL => write!(f, "MySQL"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub name: String,
@@ -23,6 +46,8 @@ pub struct ConnectionInfo {
     pub host: String,
     pub port: u16,
     pub service_name: String,
+    #[serde(default)]
+    pub db_type: DatabaseType,
 }
 
 impl ConnectionInfo {
@@ -41,11 +66,60 @@ impl ConnectionInfo {
             host: host.to_string(),
             port,
             service_name: service_name.to_string(),
+            db_type: DatabaseType::Oracle,
+        }
+    }
+
+    pub fn new_with_type(
+        name: &str,
+        username: &str,
+        password: &str,
+        host: &str,
+        port: u16,
+        service_name: &str,
+        db_type: DatabaseType,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+            host: host.to_string(),
+            port,
+            service_name: service_name.to_string(),
+            db_type,
         }
     }
 
     pub fn connection_string(&self) -> String {
-        format!("//{}:{}/{}", self.host, self.port, self.service_name)
+        match self.db_type {
+            DatabaseType::Oracle => format!("//{}:{}/{}", self.host, self.port, self.service_name),
+            DatabaseType::MySQL => {
+                format!("mysql://{}:{}/{}", self.host, self.port, self.service_name)
+            }
+        }
+    }
+
+    pub fn default_for(db_type: DatabaseType) -> Self {
+        match db_type {
+            DatabaseType::Oracle => Self::default(),
+            DatabaseType::MySQL => Self {
+                name: String::new(),
+                username: String::new(),
+                password: String::new(),
+                host: "localhost".to_string(),
+                port: 3306,
+                service_name: "mysql".to_string(),
+                db_type: DatabaseType::MySQL,
+            },
+        }
+    }
+
+    /// The label used for the service_name field depending on database type.
+    pub fn service_name_label(&self) -> &'static str {
+        match self.db_type {
+            DatabaseType::Oracle => "Service Name",
+            DatabaseType::MySQL => "Database",
+        }
     }
 
     /// Securely clear the password from memory by overwriting with zeros
@@ -74,12 +148,18 @@ impl Default for ConnectionInfo {
             host: "localhost".to_string(),
             port: 1521,
             service_name: "ORCL".to_string(),
+            db_type: DatabaseType::Oracle,
         }
     }
 }
 
+pub enum DbConnection {
+    Oracle(Arc<Connection>),
+    MySQL(mysql::Conn),
+}
+
 pub struct DatabaseConnection {
-    connection: Option<Arc<Connection>>,
+    connection: Option<DbConnection>,
     info: ConnectionInfo,
     connected: bool,
     auto_commit: bool,
@@ -101,25 +181,42 @@ impl DatabaseConnection {
         }
     }
 
-    pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), OracleError> {
-        ensure_oracle_client_initialized()?;
-        let conn_str = info.connection_string();
-        let connection = Arc::new(
-            match Connection::connect(&info.username, &info.password, &conn_str) {
-                Ok(connection) => connection,
-                Err(err) => {
-                    eprintln!("Connection error: {err}");
-                    return Err(err);
-                }
-            },
-        );
-
-        Self::apply_default_session_settings(connection.as_ref());
+    pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), String> {
+        let db_conn = match info.db_type {
+            DatabaseType::Oracle => {
+                ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
+                let conn_str = info.connection_string();
+                let connection = Arc::new(
+                    Connection::connect(&info.username, &info.password, &conn_str)
+                        .map_err(|err| {
+                            eprintln!("Connection error: {err}");
+                            err.to_string()
+                        })?,
+                );
+                Self::apply_oracle_default_session_settings(connection.as_ref());
+                DbConnection::Oracle(connection)
+            }
+            DatabaseType::MySQL => {
+                let opts = mysql::OptsBuilder::new()
+                    .ip_or_hostname(Some(&info.host))
+                    .tcp_port(info.port)
+                    .user(Some(&info.username))
+                    .pass(Some(&info.password))
+                    .db_name(Some(&info.service_name));
+                let mut conn = mysql::Conn::new(opts).map_err(|err| {
+                    eprintln!("MySQL connection error: {err}");
+                    err.to_string()
+                })?;
+                Self::apply_mysql_default_session_settings(&mut conn);
+                DbConnection::MySQL(conn)
+            }
+        };
 
         // Swap in the new connection only after a successful handshake.
         // This preserves the active session when users mistype credentials
         // during reconnect attempts.
-        self.connection = Some(connection);
+        self.connection = Some(db_conn);
+        let db_type = info.db_type;
         self.info = info;
         // Clear password from memory now that the connection is established
         self.info.clear_password();
@@ -127,10 +224,16 @@ impl DatabaseConnection {
         self.last_disconnect_reason = None;
         self.connection_generation = self.connection_generation.wrapping_add(1);
 
+        // Update session state with the database type
+        match self.session.lock() {
+            Ok(mut guard) => guard.db_type = db_type,
+            Err(poisoned) => poisoned.into_inner().db_type = db_type,
+        }
+
         Ok(())
     }
 
-    fn apply_default_session_settings(conn: &Connection) {
+    fn apply_oracle_default_session_settings(conn: &Connection) {
         let statements = [
             "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'yyyy-mm-dd hh24:mi:ss.ff6'",
             "ALTER SESSION SET NLS_DATE_FORMAT = 'yyyy-mm-dd hh24:mi:ss'",
@@ -139,6 +242,20 @@ impl DatabaseConnection {
         for statement in statements {
             if let Err(err) = conn.execute(statement, &[]) {
                 eprintln!("Warning: failed to apply default session setting `{statement}`: {err}");
+            }
+        }
+    }
+
+    fn apply_mysql_default_session_settings(conn: &mut mysql::Conn) {
+        let statements = [
+            "SET SESSION sql_mode = 'TRADITIONAL'",
+            "SET SESSION time_zone = '+00:00'",
+            "SET NAMES utf8mb4",
+        ];
+
+        for statement in statements {
+            if let Err(err) = conn.query_drop(statement) {
+                eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
             }
         }
     }
@@ -169,7 +286,18 @@ impl DatabaseConnection {
             .unwrap_or_else(|| NOT_CONNECTED_MESSAGE.to_string())
     }
 
+    /// Returns the Oracle connection if connected to Oracle.
+    /// For backward compatibility with existing Oracle-specific code paths.
     pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
+        let db_conn = self.require_live_db_connection()?;
+        match db_conn {
+            DbConnection::Oracle(conn) => Ok(conn),
+            DbConnection::MySQL(_) => Err("Expected Oracle connection but found MySQL".to_string()),
+        }
+    }
+
+    /// Returns the underlying DbConnection enum for dispatch-based code.
+    pub fn require_live_db_connection(&mut self) -> Result<DbConnection, String> {
         if !self.connected {
             if self.connection.is_some() {
                 self.clear_connection_state(Some(NOT_CONNECTED_MESSAGE.to_string()));
@@ -185,7 +313,7 @@ impl DatabaseConnection {
             return Err(self.disconnect_message());
         }
 
-        self.get_connection()
+        self.get_db_connection()
             .ok_or_else(|| self.disconnect_message())
     }
 
@@ -193,8 +321,37 @@ impl DatabaseConnection {
         self.connected
     }
 
+    /// Returns the Oracle connection (backward compat).
     pub fn get_connection(&self) -> Option<Arc<Connection>> {
-        self.connection.clone()
+        match &self.connection {
+            Some(DbConnection::Oracle(conn)) => Some(Arc::clone(conn)),
+            _ => None,
+        }
+    }
+
+    /// Returns the DbConnection enum clone.
+    pub fn get_db_connection(&self) -> Option<DbConnection> {
+        match &self.connection {
+            Some(DbConnection::Oracle(conn)) => Some(DbConnection::Oracle(Arc::clone(conn))),
+            Some(DbConnection::MySQL(_)) => {
+                // MySQL connections are not Arc-wrapped; return None here.
+                // Use get_mysql_connection_mut() via mutable access instead.
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Returns a mutable reference to the MySQL connection, if connected to MySQL.
+    pub fn get_mysql_connection_mut(&mut self) -> Option<&mut mysql::Conn> {
+        match &mut self.connection {
+            Some(DbConnection::MySQL(conn)) => Some(conn),
+            _ => None,
+        }
+    }
+
+    pub fn db_type(&self) -> DatabaseType {
+        self.info.db_type
     }
 
     pub fn get_info(&self) -> &ConnectionInfo {
@@ -217,17 +374,32 @@ impl DatabaseConnection {
         Arc::clone(&self.session)
     }
 
-    pub fn test_connection(info: &ConnectionInfo) -> Result<(), OracleError> {
-        ensure_oracle_client_initialized()?;
-        let conn_str = info.connection_string();
-        match Connection::connect(&info.username, &info.password, &conn_str) {
-            Ok(_connection) => {}
-            Err(err) => {
-                eprintln!("Connection error: {err}");
-                return Err(err);
+    pub fn test_connection(info: &ConnectionInfo) -> Result<(), String> {
+        match info.db_type {
+            DatabaseType::Oracle => {
+                ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
+                let conn_str = info.connection_string();
+                Connection::connect(&info.username, &info.password, &conn_str)
+                    .map_err(|err| {
+                        eprintln!("Connection error: {err}");
+                        err.to_string()
+                    })?;
+                Ok(())
+            }
+            DatabaseType::MySQL => {
+                let opts = mysql::OptsBuilder::new()
+                    .ip_or_hostname(Some(&info.host))
+                    .tcp_port(info.port)
+                    .user(Some(&info.username))
+                    .pass(Some(&info.password))
+                    .db_name(Some(&info.service_name));
+                mysql::Conn::new(opts).map_err(|err| {
+                    eprintln!("MySQL connection error: {err}");
+                    err.to_string()
+                })?;
+                Ok(())
             }
         }
-        Ok(())
     }
 }
 
