@@ -1639,11 +1639,7 @@ pub(crate) fn is_mysql_dash_comment_start(bytes: &[u8], idx: usize) -> bool {
 }
 
 #[inline]
-pub(crate) fn is_dash_line_comment_start(
-    bytes: &[u8],
-    idx: usize,
-    mysql_compatible: bool,
-) -> bool {
+pub(crate) fn is_dash_line_comment_start(bytes: &[u8], idx: usize, mysql_compatible: bool) -> bool {
     if mysql_compatible {
         is_mysql_dash_comment_start(bytes, idx)
     } else {
@@ -1862,13 +1858,25 @@ pub(crate) fn parse_mysql_delimiter_directive(line: &str) -> Option<String> {
     })
 }
 
+pub(crate) fn line_has_mysql_begin_not_atomic(line: &str) -> bool {
+    meaningful_identifier_words_before_inline_comment(line.trim_start(), 6)
+        .windows(3)
+        .any(|window| {
+            window[0].eq_ignore_ascii_case("BEGIN")
+                && window[1].eq_ignore_ascii_case("NOT")
+                && window[2].eq_ignore_ascii_case("ATOMIC")
+        })
+}
+
 pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
     sql.as_bytes().contains(&b'`')
         || sql.contains("<=>")
         || sql.contains("/*!")
         || sql.contains("/*M!")
         || sql.lines().any(|line| {
-            line_has_mysql_hash_comment(line) || parse_mysql_delimiter_directive(line).is_some()
+            line_has_mysql_hash_comment(line)
+                || parse_mysql_delimiter_directive(line).is_some()
+                || line_has_mysql_begin_not_atomic(line)
         })
 }
 
@@ -6924,7 +6932,9 @@ mod tests {
         assert!(line_has_mysql_hash_comment("SELECT 1 # trailing"));
         assert_eq!(trim_leading_sql_comments("  # comment only"), "");
         assert!(line_has_mysql_hash_comment("SELECT col#suffix"));
-        assert!(!line_has_mysql_hash_comment("SELECT `col#suffix` FROM demo"));
+        assert!(!line_has_mysql_hash_comment(
+            "SELECT `col#suffix` FROM demo"
+        ));
         assert!(!line_has_mysql_hash_comment("SELECT 'abc\\'#still string'"));
     }
 

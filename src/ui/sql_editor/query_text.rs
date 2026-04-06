@@ -688,17 +688,35 @@ fn is_dollar_quote_tag_char(ch: u8) -> bool {
 /// 실제 구문 경계 계산은 실행기 쪽 규칙을 그대로 사용해 동작 일관성을 유지합니다.
 #[allow(dead_code)]
 pub(crate) fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String> {
+    statement_at_cursor_for_db_type(sql, cursor_pos, None)
+}
+
+pub(crate) fn statement_at_cursor_for_db_type(
+    sql: &str,
+    cursor_pos: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> Option<String> {
     let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
-    QueryExecutor::statement_at_cursor(sql, safe_cursor)
+    QueryExecutor::statement_at_cursor_for_db_type(sql, safe_cursor, preferred_db_type)
 }
 
 /// 현재 커서 위치가 속한 문장의 바이트 범위를 반환합니다.
 ///
 /// SQL*Plus 스타일 단독 `/` 구분자, tool command 문맥까지 포함한 경계 판정은
 /// `QueryExecutor`의 기존 규칙을 재사용합니다.
+#[cfg(test)]
 pub(crate) fn statement_bounds_in_text(sql: &str, cursor_pos: usize) -> (usize, usize) {
+    statement_bounds_in_text_for_db_type(sql, cursor_pos, None)
+}
+
+pub(crate) fn statement_bounds_in_text_for_db_type(
+    sql: &str,
+    cursor_pos: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> (usize, usize) {
     let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
-    QueryExecutor::statement_bounds_at_cursor(sql, safe_cursor).unwrap_or((0, sql.len()))
+    QueryExecutor::statement_bounds_at_cursor_for_db_type(sql, safe_cursor, preferred_db_type)
+        .unwrap_or((0, sql.len()))
 }
 
 /// SQL 텍스트를 실행 단위(`ScriptItem`)로 분해합니다.
@@ -987,8 +1005,9 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
 mod tests {
     use super::{
         can_execute_while_disconnected, clamp_cursor_to_char_boundary,
-        has_connection_bootstrap_command, statement_at_cursor, statement_bounds_in_text,
-        tokenize_sql, tokenize_sql_spanned, tokenize_sql_with_mysql_compat, DollarQuoteState,
+        has_connection_bootstrap_command, statement_at_cursor, statement_at_cursor_for_db_type,
+        statement_bounds_in_text, statement_bounds_in_text_for_db_type, tokenize_sql,
+        tokenize_sql_spanned, tokenize_sql_with_mysql_compat, DollarQuoteState,
         PendingTailTokenKind,
     };
     use crate::db::SplitState;
@@ -1021,6 +1040,40 @@ mod tests {
         let sql = "SELECT 1 FROM dual;";
         let result = statement_at_cursor(sql, usize::MAX);
         assert_eq!(result.as_deref(), Some("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn statement_bounds_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+        let sql = "SELECT 5--2;\nSELECT 9;\n";
+        let cursor = sql.find("5--2").unwrap_or(0);
+        let (start, end) = statement_bounds_in_text_for_db_type(
+            sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+
+        assert_eq!(
+            sql.get(start..end).unwrap_or(""),
+            "SELECT 5--2",
+            "query_text statement bounds must honor MySQL `--<non-space>` arithmetic when DB type is known"
+        );
+    }
+
+    #[test]
+    fn statement_at_cursor_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+        let sql = "SELECT 5--2;\nSELECT 9;\n";
+        let cursor = sql.find("5--2").unwrap_or(0);
+        let result = statement_at_cursor_for_db_type(
+            sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+
+        assert_eq!(
+            result.as_deref(),
+            Some("SELECT 5--2"),
+            "query_text statement extraction must honor MySQL `--<non-space>` arithmetic when DB type is known"
+        );
     }
 
     #[test]
@@ -1202,7 +1255,8 @@ mod tests {
             }
 
             let dash_comment_start = if mysql_compatible {
-                chars.get(i + 2)
+                chars
+                    .get(i + 2)
                     .is_none_or(|ch| ch.is_whitespace() || ch.is_control())
             } else {
                 true
@@ -1483,9 +1537,9 @@ mod tests {
         let sql = "SELECT col# trailing";
         let tokens = tokenize_sql_with_mysql_compat(sql, true);
 
-        assert!(tokens.iter().any(
-            |t| matches!(t, SqlToken::Comment(comment) if comment == "# trailing")
-        ));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, SqlToken::Comment(comment) if comment == "# trailing")));
     }
 
     #[test]
@@ -1540,9 +1594,9 @@ mod tests {
         let tokens = tokenize_sql_with_mysql_compat(sql, true);
 
         assert!(
-            !tokens
-                .iter()
-                .any(|token| matches!(token, SqlToken::Comment(comment) if comment.contains("2 AS diff"))),
+            !tokens.iter().any(
+                |token| matches!(token, SqlToken::Comment(comment) if comment.contains("2 AS diff"))
+            ),
             "MySQL `--<non-space>` must not start a comment: {tokens:?}"
         );
 

@@ -1011,6 +1011,9 @@ impl SplitState {
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
+            if self.mysql_mode && self.block_depth() > 0 {
+                return;
+            }
             self.block_stack.push(BlockKind::Declare);
             self.begin_state = BeginState::AfterDeclare;
         } else if upper == "BEGIN" {

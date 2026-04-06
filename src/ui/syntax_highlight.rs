@@ -547,20 +547,18 @@ impl SqlHighlighter {
                     }
                 }
             }
-            LexerState::InSingleQuote => match scan_until_single_quote_end(
-                bytes,
-                idx,
-                self.db_type == DatabaseType::MySQL,
-            ) {
-                ScanResult::Closed { next_idx } => {
-                    idx = next_idx;
-                    styles[..idx].fill(STYLE_STRING as u8);
+            LexerState::InSingleQuote => {
+                match scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL) {
+                    ScanResult::Closed { next_idx } => {
+                        idx = next_idx;
+                        styles[..idx].fill(STYLE_STRING as u8);
+                    }
+                    ScanResult::Unterminated { state, .. } => {
+                        styles[..].fill(STYLE_STRING as u8);
+                        return (style_bytes_to_string(styles), state);
+                    }
                 }
-                ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_STRING as u8);
-                    return (style_bytes_to_string(styles), state);
-                }
-            },
+            }
             LexerState::InQQuote { closing, depth } => {
                 match scan_until_q_quote_end(text, bytes, idx, closing, depth) {
                     ScanResult::Closed { next_idx } => {
@@ -573,20 +571,18 @@ impl SqlHighlighter {
                     }
                 }
             }
-            LexerState::InDoubleQuote => match scan_until_double_quote_end(
-                bytes,
-                idx,
-                self.db_type == DatabaseType::MySQL,
-            ) {
-                ScanResult::Closed { next_idx } => {
-                    idx = next_idx;
-                    styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+            LexerState::InDoubleQuote => {
+                match scan_until_double_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL) {
+                    ScanResult::Closed { next_idx } => {
+                        idx = next_idx;
+                        styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                    }
+                    ScanResult::Unterminated { state, .. } => {
+                        styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                        return (style_bytes_to_string(styles), state);
+                    }
                 }
-                ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
-                    return (style_bytes_to_string(styles), state);
-                }
-            },
+            }
             LexerState::InBacktickQuote => match scan_until_backtick_quote_end(bytes, idx) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
@@ -641,11 +637,8 @@ impl SqlHighlighter {
             }
 
             // Single-line comment (--)
-            if sql_text::is_dash_line_comment_start(
-                bytes,
-                idx,
-                self.db_type == DatabaseType::MySQL,
-            ) {
+            if sql_text::is_dash_line_comment_start(bytes, idx, self.db_type == DatabaseType::MySQL)
+            {
                 let start = idx;
                 idx += 2;
                 while let Some(&b) = bytes.get(idx) {
@@ -728,8 +721,11 @@ impl SqlHighlighter {
                 if let Some(prefix_len) = detect_prefixed_single_quote_start(text, idx) {
                     let start = idx;
                     idx += prefix_len;
-                    let scan_result =
-                        scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
+                    let scan_result = scan_until_single_quote_end(
+                        bytes,
+                        idx,
+                        self.db_type == DatabaseType::MySQL,
+                    );
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -1648,14 +1644,14 @@ fn scan_until_block_comment_end(
     }
 }
 
-fn scan_until_single_quote_end(
-    bytes: &[u8],
-    mut idx: usize,
-    mysql_compatible: bool,
-) -> ScanResult {
+fn scan_until_single_quote_end(bytes: &[u8], mut idx: usize, mysql_compatible: bool) -> ScanResult {
     loop {
         match bytes.get(idx) {
-            Some(_) if mysql_compatible && bytes.get(idx) == Some(&b'\\') && bytes.get(idx + 1).is_some() => {
+            Some(_)
+                if mysql_compatible
+                    && bytes.get(idx) == Some(&b'\\')
+                    && bytes.get(idx + 1).is_some() =>
+            {
                 idx += 2;
             }
             Some(&b'\'') => {
@@ -1722,14 +1718,14 @@ fn scan_until_q_quote_end(
     }
 }
 
-fn scan_until_double_quote_end(
-    bytes: &[u8],
-    mut idx: usize,
-    mysql_compatible: bool,
-) -> ScanResult {
+fn scan_until_double_quote_end(bytes: &[u8], mut idx: usize, mysql_compatible: bool) -> ScanResult {
     loop {
         match bytes.get(idx) {
-            Some(_) if mysql_compatible && bytes.get(idx) == Some(&b'\\') && bytes.get(idx + 1).is_some() => {
+            Some(_)
+                if mysql_compatible
+                    && bytes.get(idx) == Some(&b'\\')
+                    && bytes.get(idx + 1).is_some() =>
+            {
                 idx += 2;
             }
             Some(&b'"') => {

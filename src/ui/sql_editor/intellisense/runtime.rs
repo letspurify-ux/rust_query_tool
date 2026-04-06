@@ -27,11 +27,16 @@ impl SqlEditorWidget {
             popup.set_selected_callback(move |selected| {
                 let (cursor_pos, cursor_pos_usize) =
                     Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
+                let preferred_db_type = match connection_for_insert.lock() {
+                    Ok(conn_guard) => Some(conn_guard.db_type()),
+                    Err(poisoned) => Some(poisoned.into_inner().db_type()),
+                };
                 let context_text =
                     Self::normalize_intellisense_context_text(&Self::context_before_cursor(
                         &buffer_for_insert,
                         &text_shadow_for_insert,
                         cursor_pos,
+                        preferred_db_type,
                     ));
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {

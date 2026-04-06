@@ -28,6 +28,13 @@ fn load_intellisense_test_file(name: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+fn load_mariadb_intellisense_test_file(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test_mariadb");
+    path.push(name);
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 fn analyze_full_script_marker(
     script_with_cursor: &str,
 ) -> (String, usize, intellisense_context::CursorContext) {
@@ -69,6 +76,22 @@ fn assert_has_case_insensitive(values: &[String], expected: &str) {
         "expected `{expected}` in values: {:?}",
         values
     );
+}
+
+fn virtual_columns_for<'a>(
+    columns_by_name: &'a HashMap<String, Vec<String>>,
+    relation_name: &str,
+) -> &'a Vec<String> {
+    columns_by_name
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(relation_name))
+        .map(|(_, columns)| columns)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected virtual columns for `{relation_name}`, got keys: {:?}",
+                columns_by_name.keys().collect::<Vec<_>>()
+            )
+        })
 }
 
 fn collect_virtual_columns_from_ctes(
@@ -675,6 +698,155 @@ fn statement_bounds_ignore_inner_plsql_semicolons() {
         sql.get(start..end).unwrap_or(""),
         "BEGIN\n  v := 1;\n  v := v + 1;\nEND"
     );
+}
+
+#[test]
+fn statement_context_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+    let sql = "SELECT 5--2;\nSELECT 9;\n";
+    let cursor = sql.find("5--2").unwrap_or(0);
+    let context = SqlEditorWidget::statement_context_in_text_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+
+    assert_eq!(
+        context,
+        "SELECT 5--2",
+        "intellisense statement context must keep MySQL `--<non-space>` arithmetic inside the active statement"
+    );
+}
+
+#[test]
+fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+    let sql = "SELECT 5--2;\nSELECT 9;\n";
+    let cursor = sql.find("5--2").unwrap_or(0);
+    let expanded = SqlEditorWidget::expanded_statement_window_in_text_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+
+    assert_eq!(
+        expanded.text,
+        "SELECT 5--2",
+        "local symbol statement window must keep MySQL `--<non-space>` arithmetic inside the active statement"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_ranked_cte_completion_context_survives_full_script_split() {
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let marked = script.replacen(
+        "ORDER BY order_id",
+        "ORDER BY __CODEX_CURSOR__order_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected ORDER BY target in test1.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_final_boss ()"),
+        "cursor should stay inside the final-boss procedure statement, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("WITH order_base AS (") && statement.contains("FROM ranked"),
+        "ranked CTE query should remain in scope, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause
+    );
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_columns = collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
+    let ranked_columns = virtual_columns_for(&virtual_columns, "ranked");
+
+    for expected in [
+        "order_id",
+        "emp_id",
+        "total_usd",
+        "created_at",
+        "global_rank",
+    ] {
+        assert_has_case_insensitive(ranked_columns, expected);
+    }
+}
+
+#[test]
+fn mariadb_parser_killer_ranked_cte_completion_context_survives_full_script_split() {
+    let script = load_mariadb_intellisense_test_file("test2.txt");
+    let marked = script.replacen(
+        "SELECT\n        owner_name,\n        weight_sum\n    INTO",
+        "SELECT\n        __CODEX_CURSOR__owner_name,\n        weight_sum\n    INTO",
+        1,
+    );
+    assert_ne!(marked, script, "expected ranked SELECT target in test2.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_parser_killer ()"),
+        "cursor should stay inside the parser-killer procedure statement, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("WITH owner_score AS (") && statement.contains("FROM ranked"),
+        "ranked CTE query should remain in scope, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_columns = collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
+    let ranked_columns = virtual_columns_for(&virtual_columns, "ranked");
+
+    for expected in ["owner_name", "task_cnt", "priority_sum", "weight_sum", "rn"] {
+        assert_has_case_insensitive(ranked_columns, expected);
+    }
+}
+
+#[test]
+fn mariadb_ultra_final_boss_ranked_cte_completion_context_survives_full_script_split() {
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    let marked = script.replacen(
+        "WHERE owner_name = 'alice';",
+        "WHERE __CODEX_CURSOR__owner_name = 'alice';",
+        1,
+    );
+    assert_ne!(marked, script, "expected ranked WHERE target in test3.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
+        "cursor should stay inside the ultra-final procedure statement, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("WITH run_minutes AS (")
+            && statement.contains("WINDOW")
+            && statement.contains("FROM ranked"),
+        "window-ranked CTE query should remain in scope, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::WhereClause);
+
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let virtual_columns = collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
+    let ranked_columns = virtual_columns_for(&virtual_columns, "ranked");
+
+    for expected in [
+        "run_id",
+        "owner_name",
+        "weighted_minutes",
+        "rn_in_owner",
+        "prev_weighted_minutes",
+        "running_owner_weighted",
+        "global_rank",
+    ] {
+        assert_has_case_insensitive(ranked_columns, expected);
+    }
 }
 
 #[test]

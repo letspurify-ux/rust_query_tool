@@ -27,6 +27,62 @@ fn load_mariadb_query_test_file(name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+struct StatementCursorSample<'a> {
+    label: &'a str,
+    anchor: &'a str,
+    cursor_offset: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    expected_start: &'a str,
+    expected_contains: &'a [&'a str],
+    expected_excludes: &'a [&'a str],
+}
+
+fn assert_statement_cursor_sample(sql: &str, sample: StatementCursorSample<'_>) {
+    let anchor_start = sql.find(sample.anchor).unwrap_or_else(|| {
+        panic!(
+            "expected anchor `{}` for sample `{}`",
+            sample.anchor, sample.label
+        )
+    });
+    let cursor = anchor_start
+        .saturating_add(sample.cursor_offset)
+        .min(sql.len());
+    let statement =
+        QueryExecutor::statement_at_cursor_for_db_type(sql, cursor, sample.preferred_db_type)
+            .unwrap_or_else(|| {
+                panic!("expected statement at cursor for sample `{}`", sample.label)
+            });
+
+    assert!(
+        statement.trim_start().starts_with(sample.expected_start),
+        "sample `{}` should resolve statement starting with `{}` but got:\n{}",
+        sample.label,
+        sample.expected_start,
+        statement
+    );
+
+    for needle in sample.expected_contains {
+        assert!(
+            statement.contains(needle),
+            "sample `{}` should keep `{}` in the selected statement, got:\n{}",
+            sample.label,
+            needle,
+            statement
+        );
+    }
+
+    for needle in sample.expected_excludes {
+        assert!(
+            !statement.contains(needle),
+            "sample `{}` should not leak `{}` into the selected statement, got:\n{}",
+            sample.label,
+            needle,
+            statement
+        );
+    }
+}
+
 #[test]
 fn test_statement_bounds_at_cursor_ignores_string_literal_with_previous_statement_text() {
     let sql = "SELECT 1 FROM dual;
@@ -57,6 +113,300 @@ SELECT 2 FROM dual;";
     assert!(
         statement.starts_with("SELECT 2 FROM dual"),
         "expected final statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_at_cursor_samples_large_oracle_regression_scripts() {
+    let mega_torture = load_query_test_file("mega_torture.txt");
+    assert_statement_cursor_sample(
+        &mega_torture,
+        StatementCursorSample {
+            label: "mega torture trigger",
+            anchor: "CREATE OR REPLACE TRIGGER oqt_trg_test_bi",
+            cursor_offset: 24,
+            preferred_db_type: None,
+            expected_start: "CREATE OR REPLACE TRIGGER oqt_trg_test_bi",
+            expected_contains: &["BEFORE INSERT", "INSERT INTO oqt_t_log"],
+            expected_excludes: &["END oqt_mega_pkg;", "SHOW ERRORS PACKAGE BODY"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &mega_torture,
+        StatementCursorSample {
+            label: "mega torture execution block",
+            anchor: "oqt_mega_pkg.seed(30)",
+            cursor_offset: 8,
+            preferred_db_type: None,
+            expected_start: "BEGIN",
+            expected_contains: &["oqt_mega_pkg.seed(30);"],
+            expected_excludes: &["CREATE OR REPLACE TRIGGER oqt_trg_test_bi"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &mega_torture,
+        StatementCursorSample {
+            label: "mega torture trailing summary query",
+            anchor: "SELECT grp,",
+            cursor_offset: 7,
+            preferred_db_type: None,
+            expected_start: "SELECT grp,",
+            expected_contains: &["FROM oqt_t_test"],
+            expected_excludes: &["PRINT v_rc", "BEGIN\n  oqt_mega_pkg.open_rc"],
+        },
+    );
+
+    let test15 = load_query_test_file("test15.sql");
+    assert_statement_cursor_sample(
+        &test15,
+        StatementCursorSample {
+            label: "test15 package body",
+            anchor: "payload = q'[dynamic ; payload / still string]'",
+            cursor_offset: 11,
+            preferred_db_type: None,
+            expected_start: "CREATE OR REPLACE PACKAGE BODY qt_splitter_pkg",
+            expected_contains: &[
+                "payload = q'[dynamic ; payload / still string]'",
+                "END qt_splitter_pkg",
+            ],
+            expected_excludes: &["COMMENT ON TABLE qt_splitter_boss IS"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test15,
+        StatementCursorSample {
+            label: "test15 comment statement",
+            anchor: "COMMENT ON TABLE qt_splitter_boss IS",
+            cursor_offset: 18,
+            preferred_db_type: None,
+            expected_start: "COMMENT ON TABLE qt_splitter_boss IS",
+            expected_contains: &["splitter final boss ; comment / text"],
+            expected_excludes: &["CREATE OR REPLACE PACKAGE BODY qt_splitter_pkg"],
+        },
+    );
+
+    let test16 = load_query_test_file("test16.sql");
+    assert_statement_cursor_sample(
+        &test16,
+        StatementCursorSample {
+            label: "test16 package body",
+            anchor: "touch_row(p_id, 'AMOUNT>=1000;DONE-CANDIDATE');",
+            cursor_offset: 18,
+            preferred_db_type: None,
+            expected_start: "CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg",
+            expected_contains: &[
+                "touch_row(p_id, 'AMOUNT>=1000;DONE-CANDIDATE');",
+                "END qt_splitter_ultimate_pkg",
+            ],
+            expected_excludes: &["COMMENT ON TABLE qt_splitter_ultimate IS"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test16,
+        StatementCursorSample {
+            label: "test16 comment statement",
+            anchor: "COMMENT ON TABLE qt_splitter_ultimate IS",
+            cursor_offset: 19,
+            preferred_db_type: None,
+            expected_start: "COMMENT ON TABLE qt_splitter_ultimate IS",
+            expected_contains: &["ultimate splitter boss ; / table comment"],
+            expected_excludes: &["CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg"],
+        },
+    );
+
+    let test20 = load_query_test_file("test20.sql");
+    assert_statement_cursor_sample(
+        &test20,
+        StatementCursorSample {
+            label: "test20 final audit preview query",
+            anchor: "AS msg_preview",
+            cursor_offset: 4,
+            preferred_db_type: None,
+            expected_start: "SELECT audit_id, module_name, action_name, SUBSTR(message_text, 1, 120) AS msg_preview",
+            expected_contains: &["FROM qt_fb_audit"],
+            expected_excludes: &["FROM qt_fb_view", "p_module => 'final_validation'"],
+        },
+    );
+
+    let test21 = load_query_test_file("test21.sql");
+    assert_statement_cursor_sample(
+        &test21,
+        StatementCursorSample {
+            label: "test21 final error preview query",
+            anchor: "AS err_msg_preview",
+            cursor_offset: 6,
+            preferred_db_type: None,
+            expected_start: "SELECT err_id,",
+            expected_contains: &["FROM qt_x_err_log", "AS err_msg_preview"],
+            expected_excludes: &["FROM qt_x_audit", "p_module => 'final_validation'"],
+        },
+    );
+}
+
+#[test]
+fn test_statement_at_cursor_samples_large_mariadb_regression_scripts() {
+    let mysql_db = Some(crate::db::connection::DatabaseType::MySQL);
+
+    let test1 = load_mariadb_query_test_file("test1.txt");
+    assert_statement_cursor_sample(
+        &test1,
+        StatementCursorSample {
+            label: "mariadb final boss use command",
+            anchor: "USE qt_mysql_final_boss;",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "USE qt_mysql_final_boss",
+            expected_contains: &[],
+            expected_excludes: &["CREATE TABLE dept"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test1,
+        StatementCursorSample {
+            label: "mariadb final boss hash comment gap",
+            anchor: "# line comment torture: ; ; ; DELIMITER $$ should not matter here",
+            cursor_offset: 3,
+            preferred_db_type: mysql_db,
+            expected_start: "CREATE TABLE dept",
+            expected_contains: &["CONSTRAINT fk_dept_parent"],
+            expected_excludes: &["/*!80000 SET @versioned_comment_executed = 1 */"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test1,
+        StatementCursorSample {
+            label: "mariadb final boss procedure body",
+            anchor: "JOIN JSON_TABLE(",
+            cursor_offset: 7,
+            preferred_db_type: mysql_db,
+            expected_start: "CREATE PROCEDURE sp_run_final_boss ()",
+            expected_contains: &["JOIN JSON_TABLE(", "WINDOW", "COMMIT;"],
+            expected_excludes: &["CALL sp_run_final_boss();"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test1,
+        StatementCursorSample {
+            label: "mariadb final boss trailing summary query",
+            anchor: "'PASS' AS status",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "SELECT",
+            expected_contains: &["'PASS' AS status", "expected_duplicate_errors"],
+            expected_excludes: &["CALL sp_run_final_boss();"],
+        },
+    );
+
+    let test2 = load_mariadb_query_test_file("test2.txt");
+    assert_statement_cursor_sample(
+        &test2,
+        StatementCursorSample {
+            label: "mariadb parser killer use command",
+            anchor: "USE qt_mysql_parser_killer;",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "USE qt_mysql_parser_killer",
+            expected_contains: &[],
+            expected_excludes: &["CREATE TABLE node"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test2,
+        StatementCursorSample {
+            label: "mariadb parser killer delimiter command",
+            anchor: "DELIMITER //\n\nCREATE PROCEDURE sp_run_parser_killer ()",
+            cursor_offset: 0,
+            preferred_db_type: mysql_db,
+            expected_start: "DELIMITER //",
+            expected_contains: &[],
+            expected_excludes: &["CREATE PROCEDURE sp_run_parser_killer ()"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test2,
+        StatementCursorSample {
+            label: "mariadb parser killer procedure body",
+            anchor: "ORDER BY weight_sum DESC, owner_name",
+            cursor_offset: 10,
+            preferred_db_type: mysql_db,
+            expected_start: "CREATE PROCEDURE sp_run_parser_killer ()",
+            expected_contains: &["WITH owner_score AS (", "ROW_NUMBER() OVER (", "COMMIT;"],
+            expected_excludes: &["CALL sp_run_parser_killer();"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test2,
+        StatementCursorSample {
+            label: "mariadb parser killer final result query",
+            anchor: "ORDER BY result_key;",
+            cursor_offset: 10,
+            preferred_db_type: mysql_db,
+            expected_start: "SELECT",
+            expected_contains: &["FROM agg_result", "ORDER BY result_key"],
+            expected_excludes: &["FROM error_log"],
+        },
+    );
+
+    let test3 = load_mariadb_query_test_file("test3.txt");
+    assert_statement_cursor_sample(
+        &test3,
+        StatementCursorSample {
+            label: "mariadb ultra final boss use command",
+            anchor: "USE qt_mysql_ultra_final_boss;",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "USE qt_mysql_ultra_final_boss",
+            expected_contains: &[],
+            expected_excludes: &["CREATE TABLE stage_node"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test3,
+        StatementCursorSample {
+            label: "mariadb ultra final boss delimiter command",
+            anchor: "DELIMITER //\n\nCREATE PROCEDURE sp_run_ultra_final_boss ()",
+            cursor_offset: 0,
+            preferred_db_type: mysql_db,
+            expected_start: "DELIMITER //",
+            expected_contains: &[],
+            expected_excludes: &["CREATE PROCEDURE sp_run_ultra_final_boss ()"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test3,
+        StatementCursorSample {
+            label: "mariadb ultra final boss procedure body",
+            anchor: "WINDOW",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "CREATE PROCEDURE sp_run_ultra_final_boss ()",
+            expected_contains: &["WINDOW", "running owner weighted max", "COMMIT;"],
+            expected_excludes: &["CALL sp_run_ultra_final_boss();"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test3,
+        StatementCursorSample {
+            label: "mariadb ultra final boss final summary query",
+            anchor: "'PASS' AS status",
+            cursor_offset: 2,
+            preferred_db_type: mysql_db,
+            expected_start: "SELECT",
+            expected_contains: &["'PASS' AS status", "top_run_id"],
+            expected_excludes: &["CALL sp_run_ultra_final_boss();"],
+        },
+    );
+    assert_statement_cursor_sample(
+        &test3,
+        StatementCursorSample {
+            label: "mariadb ultra final boss qa summary query",
+            anchor: "ORDER BY `rank`, summary_key;",
+            cursor_offset: 10,
+            preferred_db_type: mysql_db,
+            expected_start: "SELECT",
+            expected_contains: &["FROM qa_summary", "ORDER BY `rank`, summary_key"],
+            expected_excludes: &["FROM error_log"],
+        },
     );
 }
 
@@ -8535,8 +8885,7 @@ fn test_parse_tool_command_mysql_show_create_table_preserves_quoted_identifier_a
 
 #[test]
 fn test_parse_tool_command_mysql_show_variables_like_keeps_spaced_literal() {
-    let command =
-        QueryExecutor::parse_tool_command("SHOW VARIABLES LIKE 'sql mode %'");
+    let command = QueryExecutor::parse_tool_command("SHOW VARIABLES LIKE 'sql mode %'");
 
     assert!(matches!(
         command,
@@ -8564,6 +8913,17 @@ fn test_parse_tool_command_mysql_source_alias_backslash_dot_is_supported() {
     assert!(matches!(
         command,
         crate::db::ToolCommand::MysqlSource { path } if path == "/tmp/mysql-init.sql"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_source_quoted_path_with_spaces_round_trips() {
+    let command = QueryExecutor::parse_tool_command("SOURCE '/tmp/mysql init.sql' # note")
+        .expect("quoted MySQL SOURCE path should parse as a tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::MysqlSource { path } if path == "/tmp/mysql init.sql"
     ));
 }
 
@@ -10869,6 +11229,215 @@ fn test_statement_bounds_at_cursor_mariadb_emp_table_regression() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_mariadb_final_boss_procedure_body_regression() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let expected_prefix = "CREATE PROCEDURE sp_run_final_boss ()";
+    let anchors = [
+        ("handler", "DECLARE CONTINUE HANDLER FOR 1062"),
+        (
+            "duplicate comment",
+            "-- expected duplicate: should be logged by handler, not kill the run",
+        ),
+        ("utf8 literal", "emoji 😊"),
+        ("json_table join", "JOIN JSON_TABLE("),
+        ("recursive cte", "WITH RECURSIVE dept_tree AS ("),
+        ("window clause", "WINDOW"),
+        ("commit", "COMMIT;"),
+        ("procedure terminator", "END$$\n\nDELIMITER ;"),
+    ];
+
+    for (label, anchor) in anchors {
+        let cursor = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected procedure bounds for anchor `{anchor}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with(expected_prefix),
+            "cursor at `{label}` should resolve the CREATE PROCEDURE statement, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("CALL sp_assert(v_top_emp_id = 130, 'window ranking mismatch');")
+                && statement.contains("COMMIT;"),
+            "cursor at `{label}` should keep the full stored procedure body, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("CALL sp_run_final_boss();"),
+            "post-procedure CALL statement must not leak into procedure bounds for anchor `{label}`"
+        );
+    }
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_end_delimiter_line_resolves_current_routine() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let cases = [
+        (
+            "function terminator",
+            "END$$\n\nCREATE PROCEDURE sp_assert",
+            "CREATE FUNCTION fn_currency_rate",
+        ),
+        (
+            "assert procedure terminator",
+            "END$$\n\nCREATE TRIGGER trg_orders_bi",
+            "CREATE PROCEDURE sp_assert",
+        ),
+        (
+            "before-insert trigger terminator",
+            "END$$\n\nCREATE TRIGGER trg_orders_bu",
+            "CREATE TRIGGER trg_orders_bi",
+        ),
+        (
+            "main procedure terminator",
+            "END$$\n\nDELIMITER ;",
+            "CREATE PROCEDURE sp_run_final_boss ()",
+        ),
+    ];
+
+    for (label, anchor, expected_prefix) in cases {
+        let cursor = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected statement bounds for `{label}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with(expected_prefix),
+            "cursor at `{label}` should resolve the owning routine, got:\n{statement}"
+        );
+    }
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_custom_delimiter_gap_prefers_following_routine() {
+    let sql = load_mariadb_query_test_file("test3.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let cases = [
+        (
+            "function to assert gap",
+            "END$$\n\nCREATE PROCEDURE sp_assert (",
+            "CREATE PROCEDURE sp_assert (",
+            "CREATE FUNCTION fn_priority_factor",
+        ),
+        (
+            "assert to shift gap",
+            "END$$\n\nCREATE PROCEDURE sp_shift_rank (",
+            "CREATE PROCEDURE sp_shift_rank (",
+            "CREATE PROCEDURE sp_assert (",
+        ),
+    ];
+
+    for (label, anchor, expected_prefix, previous_prefix) in cases {
+        let anchor_start = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let cursor = anchor_start.saturating_add("END$$\n".len());
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected statement bounds for `{label}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with(expected_prefix),
+            "cursor in MariaDB custom delimiter gap `{label}` should prefer the following routine, got:\n{statement}"
+        );
+        assert!(
+            !statement.starts_with(previous_prefix),
+            "cursor in MariaDB custom delimiter gap `{label}` should not fall back to the previous routine"
+        );
+    }
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_executable_comment_stays_runnable_statement() {
+    let sql = "SET @feature_flag = 0;\n/*!80000 SET @feature_flag = 1 */;\nSELECT 1;\n";
+    let cursor = sql.find("/*!80000").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    )
+    .expect("expected executable comment bounds");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "/*!80000 SET @feature_flag = 1 */",
+        "MariaDB executable comment should remain directly executable at cursor: {statement:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_comment_gap_prefers_following_statement() {
+    let sql = load_mariadb_query_test_file("test1.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let cases = [
+        (
+            "hash comment",
+            "# line comment torture: ; ; ; DELIMITER $$ should not matter here",
+        ),
+        (
+            "block comment body",
+            "CREATE PROCEDURE fake_proc() BEGIN SELECT 1; END$$",
+        ),
+    ];
+
+    for (label, anchor) in cases {
+        let cursor = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected statement bounds for `{label}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with("CREATE TABLE dept"),
+            "cursor in MariaDB comment gap `{label}` should prefer the following runnable statement, got:\n{statement}"
+        );
+        assert!(
+            !statement.starts_with("/*!80000 SET @versioned_comment_executed = 1 */"),
+            "cursor in MariaDB comment gap `{label}` should not fall back to the previous executable comment"
+        );
+    }
+}
+
+#[test]
 fn test_split_format_items_mariadb_final_boss_regression() {
     let sql = load_mariadb_query_test_file("test1.txt");
     assert!(
@@ -10918,6 +11487,248 @@ fn test_split_format_items_mariadb_final_boss_regression() {
         }),
         "format split should keep the main stored procedure as one statement: {statements:?}"
     );
+}
+
+#[test]
+fn test_split_script_items_mariadb_parser_killer_regression() {
+    let sql = load_mariadb_query_test_file("test2.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test2.txt should not be empty"
+    );
+
+    let items = QueryExecutor::split_script_items(&sql);
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        tool_command_count, 4,
+        "MariaDB parser killer script should keep USE + three DELIMITER commands as tool commands: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 25,
+        "MariaDB parser killer script execution split changed unexpectedly: {items:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("/*!80000 SET @versioned_comment_ok = 1 */")
+                && stmt.trim_end().ends_with("*/")
+        }),
+        "versioned comment statement should stay executable: {statements:?}"
+    );
+    assert!(
+        !statements.iter().any(|stmt| {
+            let trimmed = stmt.trim_start();
+            trimmed.starts_with('#')
+                || (trimmed.starts_with("/*")
+                    && !trimmed.starts_with("/*!")
+                    && !trimmed.starts_with("/**"))
+        }),
+        "plain MariaDB comments should not become standalone execution units: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_parser_killer ()")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR 1062")
+                && stmt.contains("JSON_TABLE(")
+                && stmt.contains("WITH RECURSIVE node_tree AS (")
+                && stmt.contains("ROW_NUMBER() OVER (")
+                && stmt.contains("COMMIT")
+        }),
+        "main stored procedure should remain intact as a single execution unit: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("'PASS' AS status")
+                && stmt.contains("expected_duplicate_errors")
+        }),
+        "post-run verification query should remain independently executable: {statements:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_parser_killer_procedure_body_regression() {
+    let sql = load_mariadb_query_test_file("test2.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test2.txt should not be empty"
+    );
+
+    let expected_prefix = "CREATE PROCEDURE sp_run_parser_killer ()";
+    let anchors = [
+        ("handler", "DECLARE CONTINUE HANDLER FOR 1062"),
+        (
+            "json literal",
+            "contains ; semicolon, DELIMITER //, $$, quote ''x''",
+        ),
+        ("json_table join", "JOIN JSON_TABLE("),
+        ("recursive cte", "WITH RECURSIVE node_tree AS ("),
+        ("window order", "ORDER BY weight_sum DESC, owner_name"),
+        ("commit", "COMMIT;"),
+        ("procedure terminator", "END//\n\nDELIMITER ;"),
+    ];
+
+    for (label, anchor) in anchors {
+        let cursor = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected procedure bounds for anchor `{anchor}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with(expected_prefix),
+            "cursor at `{label}` should resolve the CREATE PROCEDURE statement, got:\n{statement}"
+        );
+        assert!(
+            statement
+                .contains("CALL sp_check(v_top_owner = 'alice', 'window ranking owner mismatch');")
+                && statement.contains("COMMIT;"),
+            "cursor at `{label}` should keep the full stored procedure body, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("CALL sp_run_parser_killer();"),
+            "post-procedure CALL statement must not leak into procedure bounds for anchor `{label}`"
+        );
+    }
+}
+
+#[test]
+fn test_split_script_items_mariadb_ultra_final_boss_regression() {
+    let sql = load_mariadb_query_test_file("test3.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let items = QueryExecutor::split_script_items(&sql);
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        tool_command_count, 4,
+        "MariaDB ultra final boss script should keep USE + three DELIMITER commands as tool commands: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 25,
+        "MariaDB ultra final boss script execution split changed unexpectedly: {items:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("/*!80000 SET @versioned_comment_ok = 1 */")
+                && stmt.trim_end().ends_with("*/")
+        }),
+        "versioned comment statement should stay executable: {statements:?}"
+    );
+    assert!(
+        !statements.iter().any(|stmt| {
+            let trimmed = stmt.trim_start();
+            trimmed.starts_with('#')
+                || (trimmed.starts_with("/*")
+                    && !trimmed.starts_with("/*!")
+                    && !trimmed.starts_with("/**"))
+        }),
+        "plain MariaDB comments should not become standalone execution units: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_ultra_final_boss ()")
+                && stmt.contains("CALL sp_assert(v_local = 10, 'nested block / CASE mismatch');")
+                && stmt.contains("JOIN JSON_TABLE(")
+                && stmt.contains("WINDOW")
+                && stmt.contains("CALL sp_assert(v_top_run_id = 4001, 'top run id mismatch');")
+                && stmt.contains("COMMIT")
+        }),
+        "main stored procedure should remain intact as a single execution unit: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("'PASS' AS status")
+                && stmt.contains("top_run_id")
+        }),
+        "post-run verification query should remain independently executable: {statements:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_ultra_final_boss_procedure_body_regression() {
+    let sql = load_mariadb_query_test_file("test3.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let expected_prefix = "CREATE PROCEDURE sp_run_ultra_final_boss ()";
+    let anchors = [
+        (
+            "routine comment torture",
+            "-- comment torture inside routine ; END ; DELIMITER // $$ should not matter",
+        ),
+        (
+            "json literal",
+            "token DELIMITER $$, token //, emoji 🤖, 한글",
+        ),
+        ("json_table join", "JOIN JSON_TABLE("),
+        ("window clause", "WINDOW"),
+        (
+            "global rank order",
+            "ORDER BY s.weighted_minutes DESC, s.owner_name, s.run_id",
+        ),
+        (
+            "top run id",
+            "CALL sp_assert(v_top_run_id = 4001, 'top run id mismatch');",
+        ),
+        ("procedure terminator", "END//\n\nDELIMITER ;"),
+    ];
+
+    for (label, anchor) in anchors {
+        let cursor = sql
+            .find(anchor)
+            .unwrap_or_else(|| panic!("expected anchor `{anchor}` in MariaDB regression file"));
+        let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        )
+        .unwrap_or_else(|| panic!("expected procedure bounds for anchor `{anchor}`"));
+        let statement = &sql[bounds.0..bounds.1];
+
+        assert!(
+            statement.starts_with(expected_prefix),
+            "cursor at `{label}` should resolve the CREATE PROCEDURE statement, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("CALL sp_assert(v_top_owner = 'alice', 'top owner mismatch');")
+                && statement
+                    .contains("CALL sp_assert(v_top_run_id = 4001, 'top run id mismatch');")
+                && statement.contains("COMMIT;"),
+            "cursor at `{label}` should keep the full stored procedure body, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("CALL sp_run_ultra_final_boss();"),
+            "post-procedure CALL statement must not leak into procedure bounds for anchor `{label}`"
+        );
+    }
 }
 
 #[test]
@@ -15835,5 +16646,108 @@ DELIMITER ;
         stmts[0].contains("WHILE") && stmts[0].contains("END WHILE"),
         "WHILE body must stay intact: {}",
         stmts[0]
+    );
+}
+
+#[test]
+fn test_line_block_depths_mariadb_begin_not_atomic_declare_does_not_create_extra_block() {
+    let sql = r#"BEGIN NOT ATOMIC
+  DECLARE v_count INT DEFAULT 0;
+  SET v_count = v_count + 1;
+END;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "MariaDB BEGIN NOT ATOMIC block should keep DECLARE at statement-body depth: {depths:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_mariadb_begin_not_atomic_with_custom_delimiter_stays_single_statement() {
+    let sql = r#"DELIMITER $$
+BEGIN NOT ATOMIC
+  DECLARE v_count INT DEFAULT 0;
+  SET v_count = v_count + 1;
+END$$
+DELIMITER ;
+SELECT 1;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "MariaDB BEGIN NOT ATOMIC block should stay intact before the trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("BEGIN NOT ATOMIC")
+            && stmts[0].contains("DECLARE v_count INT DEFAULT 0;")
+            && stmts[0].contains("SET v_count = v_count + 1;"),
+        "first statement should preserve the full anonymous compound block: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_split_script_items_mariadb_begin_not_atomic_with_default_delimiter_stays_single_statement()
+{
+    let sql = r#"BEGIN NOT ATOMIC
+  DECLARE v_count INT DEFAULT 0;
+  SET v_count = v_count + 1;
+END;
+SELECT 1;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "MariaDB BEGIN NOT ATOMIC block should stay intact even with the default delimiter: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("BEGIN NOT ATOMIC")
+            && stmts[0].contains("DECLARE v_count INT DEFAULT 0;")
+            && stmts[0].contains("SET v_count = v_count + 1;")
+            && stmts[0].ends_with("END"),
+        "first statement should preserve the full anonymous compound block: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mariadb_begin_not_atomic_auto_detects_mysql_mode() {
+    let sql = r#"BEGIN NOT ATOMIC
+  DECLARE v_count INT DEFAULT 0;
+  SET v_count = v_count + 1;
+END;
+SELECT 1;
+"#;
+    let cursor = sql.find("SET v_count").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(sql, cursor, None)
+        .unwrap_or_else(|| panic!("expected anonymous MariaDB block bounds at cursor {cursor}"));
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("BEGIN NOT ATOMIC"),
+        "cursor inside anonymous MariaDB block should resolve the block statement, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("DECLARE v_count INT DEFAULT 0;")
+            && statement.contains("SET v_count = v_count + 1;")
+            && statement.ends_with("END"),
+        "anonymous MariaDB block bounds should keep the whole block body, got:\n{statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 1;"),
+        "following statement must not leak into anonymous MariaDB block bounds"
     );
 }

@@ -1327,11 +1327,9 @@ impl SqlEditorWidget {
                             });
                         }
                         ToolCommand::Use { database } => {
-                            let use_sql = SqlEditorWidget::format_tool_command(
-                                &ToolCommand::Use {
-                                    database: database.clone(),
-                                },
-                            );
+                            let use_sql = SqlEditorWidget::format_tool_command(&ToolCommand::Use {
+                                database: database.clone(),
+                            });
                             match execute_mysql_sql(use_sql.as_str()) {
                                 Ok(_) => {
                                     let info = SqlEditorWidget::sync_mysql_connection_info_for_ui(

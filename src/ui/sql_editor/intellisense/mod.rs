@@ -62,6 +62,7 @@ struct IntellisenseTriggerSnapshot {
     buffer_revision: u64,
     cursor_pos: i32,
     cursor_pos_usize: usize,
+    preferred_db_type: crate::db::connection::DatabaseType,
     prefix: String,
     word_start: usize,
     qualifier: Option<String>,

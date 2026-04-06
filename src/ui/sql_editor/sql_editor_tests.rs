@@ -759,6 +759,235 @@ fn format_sql_preserves_mariadb_final_boss_script() {
 }
 
 #[test]
+fn format_sql_preserves_mariadb_parser_killer_script() {
+    let input = load_mariadb_test_file("test2.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test2.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "USE qt_mysql_parser_killer",
+            "DELIMITER $$",
+            "DELIMITER //",
+            "CREATE PROCEDURE sp_run_parser_killer ()",
+            "END//",
+            "DELIMITER ;",
+            "`group`",
+            "`rank`",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test2.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test2.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("/*!80000 SET @versioned_comment_ok = 1 */")
+        }),
+        "Formatting should preserve the MariaDB executable comment statement: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_parser_killer")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR 1062")
+                && stmt.contains("WITH RECURSIVE node_tree")
+                && stmt.contains("ROW_NUMBER")
+                && stmt.contains("COMMIT")
+        }),
+        "Formatting should preserve the main MariaDB procedure execution unit: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("result_key")
+                && stmt.contains("ORDER BY result_key")
+        }),
+        "Formatting should preserve the final result query: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test2.txt"
+    );
+}
+
+#[test]
+fn format_sql_preserves_mariadb_ultra_final_boss_script() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "USE qt_mysql_ultra_final_boss",
+            "DELIMITER $$",
+            "DELIMITER //",
+            "CREATE PROCEDURE sp_run_ultra_final_boss ()",
+            "END//",
+            "DELIMITER ;",
+            "`group`",
+            "`rank`",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test3.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test3.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("/*!80000 SET @versioned_comment_ok = 1 */")
+        }),
+        "Formatting should preserve the MariaDB executable comment statement: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_run_ultra_final_boss")
+                && stmt.contains("nested block / CASE mismatch")
+                && stmt.contains("WINDOW")
+                && stmt.contains("top run id mismatch")
+                && stmt.contains("COMMIT")
+        }),
+        "Formatting should preserve the main MariaDB procedure execution unit: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT")
+                && stmt.contains("summary_key")
+                && stmt.contains("ORDER BY `rank`")
+                && stmt.contains("summary_key")
+        }),
+        "Formatting should preserve the final summary query: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test3.txt"
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_helper_procedure_closing_paren_aligned() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let expected = r#"CREATE PROCEDURE sp_collect_status_counts (
+    OUT p_done_cnt INT,
+    OUT p_running_cnt INT,
+    OUT p_other_cnt INT
+)
+BEGIN"#;
+
+    assert!(
+        formatted.contains(expected),
+        "helper procedure parameter closing paren should stay aligned with the procedure header, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_trigger_end_delimiter_aligned() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+    let trigger_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "CREATE TRIGGER trg_run_case_ai")
+        .expect("formatted output should contain trg_run_case_ai");
+    let begin_idx = lines
+        .iter()
+        .enumerate()
+        .skip(trigger_idx + 1)
+        .find(|(_, line)| line.trim_start() == "BEGIN")
+        .map(|(idx, _)| idx)
+        .expect("formatted output should contain trigger BEGIN");
+    let end_idx = lines
+        .iter()
+        .enumerate()
+        .skip(begin_idx + 1)
+        .find(|(_, line)| line.trim_start() == "END$$")
+        .map(|(idx, _)| idx)
+        .expect("formatted output should contain trigger END$$");
+
+    assert_eq!(
+        indent(lines[end_idx]),
+        indent(lines[begin_idx]),
+        "trigger END$$ should align with BEGIN, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_trigger_cast_type_inline() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    assert!(
+        formatted.contains(
+            "COALESCE (CAST (JSON_LENGTH (JSON_EXTRACT (NEW.payload, '$.steps')) AS CHAR), 'null')"
+        ),
+        "trigger CAST type should stay inline after AS, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_anonymous_block_with_local_record_bind_helpers_as_single_execution_unit() {
     let input = r#"DECLARE
     v_cursor_id INTEGER;

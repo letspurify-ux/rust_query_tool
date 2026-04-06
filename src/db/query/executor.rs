@@ -1482,11 +1482,11 @@ impl QueryExecutor {
         slash_line_start: Option<usize>,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> Option<(usize, usize)> {
-        let mut previous: Option<(usize, usize)> = None;
+        let mut previous: Option<((usize, usize), usize)> = None;
         let mut slash_previous: Option<(usize, usize)> = None;
         let mut resolved: Option<(usize, usize)> = None;
 
-        Self::walk_statement_spans_for_bounds(sql, preferred_db_type, |span| {
+        Self::walk_statement_spans_for_bounds(sql, preferred_db_type, |span, gap_start| {
             if let Some(line_start) = slash_line_start {
                 if span.1 <= line_start {
                     slash_previous = Some(span);
@@ -1501,11 +1501,21 @@ impl QueryExecutor {
             }
 
             if span.0 > cursor_pos {
-                resolved = Some(previous.unwrap_or(span));
+                let gap_start = previous.map(|(_, gap_start)| gap_start).unwrap_or(0);
+                resolved = Some(
+                    if Self::comment_gap_prefers_next_statement(sql, gap_start, cursor_pos, span.0)
+                    {
+                        span
+                    } else {
+                        previous
+                            .map(|(previous_span, _)| previous_span)
+                            .unwrap_or(span)
+                    },
+                );
                 return false;
             }
 
-            previous = Some(span);
+            previous = Some((span, gap_start));
             true
         });
 
@@ -1513,16 +1523,53 @@ impl QueryExecutor {
             return slash_previous;
         }
 
-        resolved.or(previous)
+        resolved.or_else(|| previous.map(|(span, _)| span))
+    }
+
+    fn comment_gap_prefers_next_statement(
+        sql: &str,
+        gap_start: usize,
+        cursor_pos: usize,
+        next_start: usize,
+    ) -> bool {
+        if gap_start >= next_start || cursor_pos < gap_start || cursor_pos >= next_start {
+            return false;
+        }
+
+        let stripped_gap_start =
+            Self::skip_leading_gap_terminator_for_bounds(sql, gap_start, next_start);
+        if stripped_gap_start >= next_start {
+            return sql
+                .get(gap_start..next_start)
+                .is_some_and(|gap| gap.trim().is_empty());
+        }
+        if cursor_pos < stripped_gap_start {
+            return false;
+        }
+
+        sql.get(stripped_gap_start..next_start)
+            .is_some_and(|gap| Self::strip_comments(gap).trim().is_empty())
+    }
+
+    fn skip_leading_gap_terminator_for_bounds(sql: &str, start: usize, end: usize) -> usize {
+        let mut idx = Self::trim_start_whitespace_for_bounds(sql, start, end);
+        if idx >= end {
+            return idx;
+        }
+
+        if sql.as_bytes().get(idx) == Some(&b';') {
+            idx = idx.saturating_add(1);
+        }
+
+        Self::trim_start_whitespace_for_bounds(sql, idx, end)
     }
 
     fn walk_statement_spans_for_bounds<F>(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
         mut on_span: F,
-    )
-    where
-        F: FnMut((usize, usize)) -> bool,
+    ) where
+        F: FnMut((usize, usize), usize) -> bool,
     {
         struct StatementSpanCollector {
             builder: SqlParserEngine,
@@ -1577,29 +1624,40 @@ impl QueryExecutor {
                 })
             }
 
-            fn trim_span_for_bounds(&self, sql: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+            fn trim_span_for_bounds(
+                &self,
+                sql: &str,
+                start: usize,
+                end: usize,
+            ) -> Option<((usize, usize), usize)> {
                 if self.mysql_delimiter == ";" {
-                    return QueryExecutor::trim_statement_span_for_bounds(sql, start, end);
+                    return QueryExecutor::trim_statement_span_for_bounds(sql, start, end)
+                        .map(|span| (span, span.1));
                 }
 
                 let statement = sql.get(start..end)?;
-                if let Some((delimiter_start, _)) = QueryExecutor::mysql_trailing_delimiter_range(
-                    statement,
-                    self.mysql_delimiter.as_str(),
-                ) {
-                    return QueryExecutor::trim_statement_span_for_bounds(
+                if let Some((delimiter_start, delimiter_end)) =
+                    QueryExecutor::mysql_trailing_delimiter_range(
+                        statement,
+                        self.mysql_delimiter.as_str(),
+                    )
+                {
+                    let span = QueryExecutor::trim_statement_span_for_bounds(
                         sql,
                         start,
                         start.saturating_add(delimiter_start),
-                    );
+                    )?;
+                    let gap_start = start.saturating_add(delimiter_end).min(end);
+                    return Some((span, gap_start));
                 }
 
                 QueryExecutor::trim_statement_span_for_bounds(sql, start, end)
+                    .map(|span| (span, span.1))
             }
 
             fn emit_current_span<F>(&mut self, sql: &str, on_span: &mut F) -> bool
             where
-                F: FnMut((usize, usize)) -> bool,
+                F: FnMut((usize, usize), usize) -> bool,
             {
                 let Some(start) = self.current_start.take() else {
                     self.current_end = 0;
@@ -1607,15 +1665,15 @@ impl QueryExecutor {
                 };
                 let end = self.current_end.max(start);
                 self.current_end = 0;
-                if let Some(span) = self.trim_span_for_bounds(sql, start, end) {
-                    return on_span(span);
+                if let Some((span, gap_start)) = self.trim_span_for_bounds(sql, start, end) {
+                    return on_span(span, gap_start);
                 }
                 true
             }
 
             fn force_terminate_current<F>(&mut self, sql: &str, on_span: &mut F) -> bool
             where
-                F: FnMut((usize, usize)) -> bool,
+                F: FnMut((usize, usize), usize) -> bool,
             {
                 let statements = self.builder.force_terminate_and_take_statements();
                 if statements.is_empty() {
@@ -1628,7 +1686,7 @@ impl QueryExecutor {
 
             fn finalize_current<F>(&mut self, sql: &str, on_span: &mut F) -> bool
             where
-                F: FnMut((usize, usize)) -> bool,
+                F: FnMut((usize, usize), usize) -> bool,
             {
                 let statements = self.builder.finalize_and_take_statements();
                 if statements.is_empty() {
@@ -1648,7 +1706,7 @@ impl QueryExecutor {
                 on_span: &mut F,
             ) -> bool
             where
-                F: FnMut((usize, usize)) -> bool,
+                F: FnMut((usize, usize), usize) -> bool,
             {
                 let mut boundary_offsets = Vec::new();
                 let _ = self
@@ -1703,7 +1761,10 @@ impl QueryExecutor {
         };
         collector
             .builder
-            .set_mysql_mode(sql_text::mysql_compatibility_for_sql(sql, preferred_db_type));
+            .set_mysql_mode(sql_text::mysql_compatibility_for_sql(
+                sql,
+                preferred_db_type,
+            ));
         let mut sqlblanklines_enabled = true;
         let mut line_start = 0usize;
 
@@ -1736,8 +1797,9 @@ impl QueryExecutor {
                 }
 
                 if collector.current_start.is_none() {
-                    collector.current_start = StatementSpanCollector::line_non_whitespace_start(line, 0)
-                        .map(|offset| line_start + offset);
+                    collector.current_start =
+                        StatementSpanCollector::line_non_whitespace_start(line, 0)
+                            .map(|offset| line_start + offset);
                 }
                 collector.current_end = next_line_start;
 
@@ -2048,7 +2110,9 @@ impl QueryExecutor {
             }
 
             let remaining = &sql[start..end];
-            if remaining.starts_with("/*") {
+            if remaining.starts_with("/*")
+                && !sql_text::is_mysql_executable_comment_start(remaining.as_bytes(), 0)
+            {
                 let block_end = remaining.find("*/")?;
                 start += block_end + 2;
                 continue;
@@ -2076,8 +2140,13 @@ impl QueryExecutor {
             let remaining = &sql[start..end];
             if remaining.ends_with("*/") {
                 if let Some(block_start) = remaining.rfind("/*") {
-                    end = start + block_start;
-                    continue;
+                    if !sql_text::is_mysql_executable_comment_start(
+                        remaining.as_bytes(),
+                        block_start,
+                    ) {
+                        end = start + block_start;
+                        continue;
+                    }
                 }
             }
 

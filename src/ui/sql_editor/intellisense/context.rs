@@ -425,6 +425,7 @@ impl SqlEditorWidget {
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: i32,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> String {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
@@ -441,7 +442,11 @@ impl SqlEditorWidget {
         }
         let rel_cursor = Self::clamp_to_char_boundary_local(&window, rel_cursor);
         let before_cursor = window.get(..rel_cursor).unwrap_or("");
-        let (stmt_start, _) = Self::statement_bounds_in_text(before_cursor, before_cursor.len());
+        let (stmt_start, _) = Self::statement_bounds_in_text_for_db_type(
+            before_cursor,
+            before_cursor.len(),
+            preferred_db_type,
+        );
         before_cursor.get(stmt_start..).unwrap_or("").to_string()
     }
 
@@ -480,6 +485,15 @@ impl SqlEditorWidget {
 
     #[cfg(test)]
     fn statement_context_in_text(text: &str, cursor_pos: usize) -> String {
+        Self::statement_context_in_text_for_db_type(text, cursor_pos, None)
+    }
+
+    #[cfg(test)]
+    fn statement_context_in_text_for_db_type(
+        text: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> String {
         if text.is_empty() {
             return String::new();
         }
@@ -501,17 +515,28 @@ impl SqlEditorWidget {
             .unwrap_or(text.len());
         let window = text.get(start..end).unwrap_or("");
         let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
-        let (stmt_start, stmt_end) = Self::statement_bounds_in_text(window, rel_cursor);
+        let (stmt_start, stmt_end) =
+            Self::statement_bounds_in_text_for_db_type(window, rel_cursor, preferred_db_type);
         window.get(stmt_start..stmt_end).unwrap_or("").to_string()
     }
 
     #[cfg(test)]
     fn context_before_cursor_in_text(text: &str, cursor_pos: usize) -> String {
+        Self::context_before_cursor_in_text_for_db_type(text, cursor_pos, None)
+    }
+
+    #[cfg(test)]
+    fn context_before_cursor_in_text_for_db_type(
+        text: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> String {
         let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text.len()));
         let start = cursor_pos.saturating_sub(INTELLISENSE_CONTEXT_WINDOW as usize);
         let start = Self::clamp_to_char_boundary_local(text, start);
         let window = text.get(start..cursor_pos).unwrap_or("");
-        let (stmt_start, _) = Self::statement_bounds_in_text(window, window.len());
+        let (stmt_start, _) =
+            Self::statement_bounds_in_text_for_db_type(window, window.len(), preferred_db_type);
         window.get(stmt_start..).unwrap_or("").to_string()
     }
 
@@ -675,8 +700,21 @@ impl SqlEditorWidget {
     }
 
     // 문장 경계 계산은 실행/포맷 공통 규칙을 공유하기 위해 `query_text` 유틸을 사용합니다.
+    #[cfg(test)]
     fn statement_bounds_in_text(text: &str, cursor_pos: usize) -> (usize, usize) {
-        crate::ui::sql_editor::query_text::statement_bounds_in_text(text, cursor_pos)
+        Self::statement_bounds_in_text_for_db_type(text, cursor_pos, None)
+    }
+
+    fn statement_bounds_in_text_for_db_type(
+        text: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> (usize, usize) {
+        crate::ui::sql_editor::query_text::statement_bounds_in_text_for_db_type(
+            text,
+            cursor_pos,
+            preferred_db_type,
+        )
     }
 
     fn strip_identifier_quotes(value: &str) -> String {

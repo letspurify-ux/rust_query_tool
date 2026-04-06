@@ -69,6 +69,10 @@ impl SqlEditorWidget {
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
         let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
+        let preferred_db_type = match connection.lock() {
+            Ok(conn_guard) => conn_guard.db_type(),
+            Err(poisoned) => poisoned.into_inner().db_type(),
+        };
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
             && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos)
@@ -88,6 +92,7 @@ impl SqlEditorWidget {
             buffer_revision,
             cursor_pos,
             cursor_pos_usize,
+            preferred_db_type,
             prefix,
             word_start,
             qualifier,
@@ -308,12 +313,13 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("intellisense-parse-worker".to_string())
             .spawn(move || {
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let (expanded_statement, text_bind_names) =
-                        Self::expanded_statement_window_and_text_binds_from_shadow(
-                            &text_shadow_for_thread,
-                            snapshot_for_thread.cursor_pos_usize,
-                        );
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let (expanded_statement, text_bind_names) =
+                            Self::expanded_statement_window_and_text_binds_from_shadow(
+                                &text_shadow_for_thread,
+                                snapshot_for_thread.cursor_pos_usize,
+                                Some(snapshot_for_thread.preferred_db_type),
+                            );
                     let routine_cache = {
                         let cache = routine_symbol_cache_for_thread
                             .lock()

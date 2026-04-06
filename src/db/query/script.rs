@@ -1229,8 +1229,13 @@ impl QueryExecutor {
                             || word.eq_ignore_ascii_case("EVENT")
                     })
             };
+            let mysql_anonymous_block_header_line =
+                sql_text::line_has_mysql_begin_not_atomic(trimmed_start);
             if mysql_routine_header_line {
                 mysql_routine_body_pending = true;
+            } else if mysql_anonymous_block_header_line {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
             }
             let in_leading_block_comment_line = leading_word.is_none()
                 && (was_in_leading_block_comment || in_leading_block_comment);
@@ -1537,6 +1542,10 @@ impl QueryExecutor {
                 mysql_routine_body_active = true;
                 mysql_routine_body_pending = false;
             }
+            if mysql_anonymous_block_header_line {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
+            }
             if mysql_routine_body_active
                 && leading_is("END")
                 && Self::statement_ends_with_mysql_delimiter(
@@ -1756,8 +1765,13 @@ impl QueryExecutor {
                             || word.eq_ignore_ascii_case("EVENT")
                     })
             };
+            let mysql_anonymous_block_header_line =
+                sql_text::line_has_mysql_begin_not_atomic(trimmed);
             if mysql_routine_header_line {
                 mysql_routine_body_pending = true;
+            } else if mysql_anonymous_block_header_line {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
             }
 
             if sql_text::line_is_comment_only_with_block_state(analysis_line, &mut in_block_comment)
@@ -2985,6 +2999,10 @@ impl QueryExecutor {
             if mysql_routine_body_pending
                 && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
             {
+                mysql_routine_body_active = true;
+                mysql_routine_body_pending = false;
+            }
+            if mysql_anonymous_block_header_line {
                 mysql_routine_body_active = true;
                 mysql_routine_body_pending = false;
             }
@@ -7714,13 +7732,17 @@ impl QueryExecutor {
             "VARIABLES" if tokens.len() == 2 => Some(ToolCommand::ShowVariables { filter: None }),
             "VARIABLES" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
                 Some(ToolCommand::ShowVariables {
-                    filter: Some(Self::unquote_mysql_tool_string_token(&tokens[3..].join(" "))),
+                    filter: Some(Self::unquote_mysql_tool_string_token(
+                        &tokens[3..].join(" "),
+                    )),
                 })
             }
             "STATUS" if tokens.len() == 2 => Some(ToolCommand::ShowStatus { filter: None }),
             "STATUS" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
                 Some(ToolCommand::ShowStatus {
-                    filter: Some(Self::unquote_mysql_tool_string_token(&tokens[3..].join(" "))),
+                    filter: Some(Self::unquote_mysql_tool_string_token(
+                        &tokens[3..].join(" "),
+                    )),
                 })
             }
             "WARNINGS" if tokens.len() == 2 => Some(ToolCommand::ShowWarnings),

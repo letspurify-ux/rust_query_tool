@@ -2,6 +2,8 @@ use mysql::prelude::*;
 use mysql::{Conn, Error as MysqlError, Row, Value as MysqlValue};
 use std::time::{Duration, Instant};
 
+use crate::sql_text;
+
 use super::executor::{ConstraintInfo, IndexInfo, QueryExecutor, TableColumnDetail};
 use super::types::{ColumnInfo, ProcedureArgument, QueryResult};
 
@@ -47,15 +49,10 @@ impl MysqlExecutor {
             // statements return tabular result sets in MySQL/MariaDB; route
             // them through execute_select so the results are not silently
             // discarded by query_drop().
-            Some("SHOW")
-            | Some("DESCRIBE")
-            | Some("DESC")
-            | Some("EXPLAIN")
-            | Some("ANALYZE")
-            | Some("CHECK")
-            | Some("CHECKSUM")
-            | Some("OPTIMIZE")
-            | Some("REPAIR") => MysqlStatementKind::Select,
+            Some("SHOW") | Some("DESCRIBE") | Some("DESC") | Some("EXPLAIN") | Some("ANALYZE")
+            | Some("CHECK") | Some("CHECKSUM") | Some("OPTIMIZE") | Some("REPAIR") => {
+                MysqlStatementKind::Select
+            }
             _ => MysqlStatementKind::Ddl,
         }
     }
@@ -548,11 +545,36 @@ impl MysqlObjectBrowser {
         index
     }
 
-    /// Strip a trailing `#` or `--` inline comment from `source`, honouring
-    /// single-quoted, double-quoted and backtick-quoted literals.
-    /// Returns the trimmed slice up to (but not including) the comment start.
-    fn strip_trailing_inline_comment(source: &str) -> &str {
+    fn append_comment_free_segment(
+        cleaned: &mut String,
+        source: &str,
+        start: usize,
+        end: usize,
+    ) {
+        if start >= end {
+            return;
+        }
+
+        if let Some(segment) = source.get(start..end) {
+            cleaned.push_str(segment);
+        }
+    }
+
+    fn ensure_comment_gap(cleaned: &mut String) {
+        if cleaned.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+            cleaned.push(' ');
+        }
+    }
+
+    /// Strip MySQL/MariaDB inline comments from `source`, honouring single-
+    /// quoted, double-quoted and backtick-quoted literals.
+    ///
+    /// Comments are replaced with at most one separating space so adjacent
+    /// tokens remain parseable after removal.
+    fn strip_mysql_inline_comments(source: &str) -> String {
         let bytes = source.as_bytes();
+        let mut cleaned = String::with_capacity(source.len());
+        let mut segment_start = 0usize;
         let mut index = 0usize;
         let mut in_single_quote = false;
         let mut in_double_quote = false;
@@ -563,6 +585,10 @@ impl MysqlObjectBrowser {
             let next = bytes.get(index + 1).copied();
 
             if in_single_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if next == Some(b'\'') {
                         index += 2;
@@ -575,6 +601,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_double_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'"' {
                     if next == Some(b'"') {
                         index += 2;
@@ -614,9 +644,42 @@ impl MysqlObjectBrowser {
                     index += 1;
                     continue;
                 }
-                b'#' => return source.get(..index).unwrap_or(source).trim_end(),
-                b'-' if next == Some(b'-') => {
-                    return source.get(..index).unwrap_or(source).trim_end()
+                b'#' => {
+                    Self::append_comment_free_segment(&mut cleaned, source, segment_start, index);
+                    Self::ensure_comment_gap(&mut cleaned);
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                    segment_start = Self::skip_ascii_whitespace(source, index);
+                    continue;
+                }
+                b'-' if sql_text::is_mysql_dash_comment_start(bytes, index) => {
+                    Self::append_comment_free_segment(&mut cleaned, source, segment_start, index);
+                    Self::ensure_comment_gap(&mut cleaned);
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                    segment_start = Self::skip_ascii_whitespace(source, index);
+                    continue;
+                }
+                b'/' if next == Some(b'*') => {
+                    Self::append_comment_free_segment(&mut cleaned, source, segment_start, index);
+                    Self::ensure_comment_gap(&mut cleaned);
+                    index += 2;
+                    let mut closed = false;
+                    while index + 1 < bytes.len() {
+                        if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                            index += 2;
+                            closed = true;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    if !closed {
+                        index = bytes.len();
+                    }
+                    segment_start = Self::skip_ascii_whitespace(source, index);
+                    continue;
                 }
                 _ => {}
             }
@@ -624,7 +687,8 @@ impl MysqlObjectBrowser {
             index += 1;
         }
 
-        source
+        Self::append_comment_free_segment(&mut cleaned, source, segment_start, source.len());
+        cleaned
     }
 
     fn unquote_identifier(identifier: &str) -> String {
@@ -741,6 +805,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_single_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if next == Some(b'\'') {
                         index += 2;
@@ -753,6 +821,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_double_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'"' {
                     if next == Some(b'"') {
                         index += 2;
@@ -776,7 +848,7 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
-            if byte == b'-' && next == Some(b'-') {
+            if sql_text::is_mysql_dash_comment_start(bytes, index) {
                 in_line_comment = true;
                 index += 2;
                 continue;
@@ -866,6 +938,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_single_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if next == Some(b'\'') {
                         index += 2;
@@ -878,6 +954,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_double_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'"' {
                     if next == Some(b'"') {
                         index += 2;
@@ -901,7 +981,7 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
-            if byte == b'-' && next == Some(b'-') {
+            if sql_text::is_mysql_dash_comment_start(bytes, index) {
                 in_line_comment = true;
                 index += 2;
                 continue;
@@ -974,6 +1054,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_single_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'\'' {
                     if next == Some(b'\'') {
                         index += 2;
@@ -986,6 +1070,10 @@ impl MysqlObjectBrowser {
             }
 
             if in_double_quote {
+                if byte == b'\\' && next.is_some() {
+                    index += 2;
+                    continue;
+                }
                 if byte == b'"' {
                     if next == Some(b'"') {
                         index += 2;
@@ -1009,7 +1097,7 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
-            if byte == b'-' && next == Some(b'-') {
+            if sql_text::is_mysql_dash_comment_start(bytes, index) {
                 in_line_comment = true;
                 index += 2;
                 continue;
@@ -1059,36 +1147,9 @@ impl MysqlObjectBrowser {
     }
 
     fn parse_mysql_parameter(parameter: &str, position: i32) -> Option<ProcedureArgument> {
+        let parameter = Self::strip_mysql_inline_comments(parameter);
+        let parameter = parameter.trim();
         let mut index = Self::skip_ascii_whitespace(parameter, 0);
-
-        // Skip any leading line comments (`#` or `--`) that may appear when a
-        // comment from the previous parameter follows the separator comma on
-        // the same line (e.g. `p1 INT, # note\np2 VARCHAR(50)` or
-        // `p1 INT, -- note\np2 VARCHAR(50)`).
-        {
-            let bytes = parameter.as_bytes();
-            loop {
-                if bytes.get(index) == Some(&b'#') {
-                    while index < bytes.len() && bytes[index] != b'\n' {
-                        index += 1;
-                    }
-                    if index < bytes.len() {
-                        index += 1; // skip the newline itself
-                    }
-                    index = Self::skip_ascii_whitespace(parameter, index);
-                } else if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
-                    while index < bytes.len() && bytes[index] != b'\n' {
-                        index += 1;
-                    }
-                    if index < bytes.len() {
-                        index += 1; // skip the newline itself
-                    }
-                    index = Self::skip_ascii_whitespace(parameter, index);
-                } else {
-                    break;
-                }
-            }
-        }
 
         let mut direction = "IN".to_string();
 
@@ -1104,9 +1165,7 @@ impl MysqlObjectBrowser {
         let name_raw = parameter.get(index..name_end)?;
         let name = Self::unquote_identifier(name_raw);
 
-        // Strip trailing inline comments (`#` or `--`) from the type/default
-        // section so they don't pollute the data_type string.
-        let remainder = Self::strip_trailing_inline_comment(parameter.get(name_end..)?.trim());
+        let remainder = parameter.get(name_end..)?.trim();
         if remainder.is_empty() {
             return None;
         }
@@ -1177,9 +1236,9 @@ impl MysqlObjectBrowser {
 
         type_section
             .get(..type_end)
-            .map(str::trim)
+            .map(Self::strip_mysql_inline_comments)
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
     }
 
     fn parse_routine_arguments_from_create_ddl(
@@ -1941,7 +2000,9 @@ mod tests {
             "p_val parameter should be present: {arguments:?}"
         );
         assert!(
-            arguments.iter().any(|a| a.in_out.as_deref() == Some("RETURN")),
+            arguments
+                .iter()
+                .any(|a| a.in_out.as_deref() == Some("RETURN")),
             "RETURN entry should be present: {arguments:?}"
         );
     }
@@ -2221,6 +2282,104 @@ mod tests {
         assert!(
             arguments[0].default_value.is_none(),
             "DEFAULT inside -- comment must not be parsed as actual default value"
+        );
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_keeps_backslash_escaped_quote_inside_default_string() {
+        let ddl = "CREATE PROCEDURE `escaped_default_proc`(\
+            p_msg VARCHAR(50) DEFAULT 'it\\'s ok',\
+            p_count INT\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with backslash-escaped default string should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "escaped quote must not swallow the next parameter"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_msg"));
+        assert_eq!(arguments[0].default_value.as_deref(), Some("'it\\'s ok'"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_count"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_keeps_double_dash_expression_when_no_comment_whitespace() {
+        let ddl = "CREATE PROCEDURE `dash_expr_proc`(\
+            p_score INT DEFAULT (5--2),\
+            p_limit INT\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with `--` arithmetic default should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "`--<non-space>` must stay part of the default expression"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_score"));
+        assert_eq!(arguments[0].default_value.as_deref(), Some("(5--2)"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_limit"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_skips_leading_block_comment_before_param() {
+        let ddl = "CREATE PROCEDURE `block_comment_proc`(\
+            p_id INT,\
+            /* second, user-facing parameter */ p_name VARCHAR(100)\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with leading block comments should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "leading block comment must not hide the following parameter: {arguments:?}"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_id"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("INT"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_name"));
+        assert_eq!(arguments[1].data_type.as_deref(), Some("VARCHAR(100)"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_strips_inline_block_comment_from_type_section() {
+        let ddl = "CREATE PROCEDURE `block_default_proc`(\
+            p_status VARCHAR(20) /* keep legacy width */ DEFAULT 'active'\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with inline block comment before DEFAULT should parse");
+
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].name.as_deref(), Some("p_status"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("VARCHAR(20)"));
+        assert_eq!(arguments[0].default_value.as_deref(), Some("'active'"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_function_return_type_ignores_inline_block_comment() {
+        let ddl = "CREATE FUNCTION `fn_block_comment_return`(p_id INT)\
+            RETURNS VARCHAR(20) /* display label */ CHARACTER SET utf8mb4 DETERMINISTIC\n\
+            RETURN 'ok'";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "FUNCTION")
+                .expect("function return type with inline block comment should parse");
+
+        assert_eq!(arguments[0].position, 0);
+        assert_eq!(arguments[0].in_out.as_deref(), Some("RETURN"));
+        assert_eq!(
+            arguments[0].data_type.as_deref(),
+            Some("VARCHAR(20) CHARACTER SET utf8mb4")
         );
     }
 }

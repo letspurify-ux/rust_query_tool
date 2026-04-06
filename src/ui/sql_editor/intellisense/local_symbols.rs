@@ -50,7 +50,16 @@ struct ParsedPackageBodyHeader {
 }
 
 impl SqlEditorWidget {
+    #[cfg(test)]
     fn expanded_statement_window_in_text(text: &str, cursor_pos: usize) -> ExpandedStatementWindow {
+        Self::expanded_statement_window_in_text_for_db_type(text, cursor_pos, None)
+    }
+
+    fn expanded_statement_window_in_text_for_db_type(
+        text: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> ExpandedStatementWindow {
         if text.is_empty() {
             return ExpandedStatementWindow {
                 statement_start: 0,
@@ -74,7 +83,8 @@ impl SqlEditorWidget {
             );
             let window = text.get(start..end).unwrap_or("");
             let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
-            let (stmt_start, stmt_end) = Self::statement_bounds_in_text(window, rel_cursor);
+            let (stmt_start, stmt_end) =
+                Self::statement_bounds_in_text_for_db_type(window, rel_cursor, preferred_db_type);
             let touches_left = stmt_start == 0 && start > 0;
             let touches_right = stmt_end == window.len() && end < text_len;
 
@@ -86,7 +96,11 @@ impl SqlEditorWidget {
                     start.saturating_add(stmt_end),
                 );
                 if Self::expanded_statement_requires_exact_bounds(text, &expanded) {
-                    return Self::exact_statement_window_in_text(text, cursor_pos);
+                    return Self::exact_statement_window_in_text_for_db_type(
+                        text,
+                        cursor_pos,
+                        preferred_db_type,
+                    );
                 }
                 return expanded;
             }
@@ -103,11 +117,20 @@ impl SqlEditorWidget {
         }
     }
 
-    fn exact_statement_window_in_text(text: &str, cursor_pos: usize) -> ExpandedStatementWindow {
+    fn exact_statement_window_in_text_for_db_type(
+        text: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> ExpandedStatementWindow {
         let text_len = text.len();
         let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text_len));
         let (statement_start, statement_end) =
-            QueryExecutor::statement_bounds_at_cursor(text, cursor_pos).unwrap_or((0, text_len));
+            QueryExecutor::statement_bounds_at_cursor_for_db_type(
+                text,
+                cursor_pos,
+                preferred_db_type,
+            )
+            .unwrap_or((0, text_len));
         Self::statement_window_from_bounds(text, cursor_pos, statement_start, statement_end)
     }
 
@@ -197,11 +220,13 @@ impl SqlEditorWidget {
     fn expanded_statement_window_and_text_binds_from_shadow(
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (ExpandedStatementWindow, Vec<String>) {
         let guard = text_shadow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let expanded = Self::expanded_statement_window_in_text(&guard.text, cursor_pos);
+        let expanded =
+            Self::expanded_statement_window_in_text_for_db_type(&guard.text, cursor_pos, preferred_db_type);
         let text_bind_names = Self::collect_text_var_bind_names_before_statement(
             &guard.text,
             expanded.statement_start,
