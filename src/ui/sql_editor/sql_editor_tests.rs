@@ -50,6 +50,16 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
     }
 }
 
+fn leading_spaces(line: &str) -> usize {
+    line.len().saturating_sub(line.trim_start().len())
+}
+
+fn find_line_starting_with(lines: &[&str], prefix: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(prefix))
+}
+
 fn apply_incremental_highlight_for_test(
     original_text: &str,
     updated_text: &str,
@@ -381,7 +391,10 @@ fn format_sql_select_hint_comment_is_idempotent() {
     let input = "SELECT /*+ INDEX(emp emp_idx1) */\nempno,\nename\nFROM emp;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
-    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    let formatted_again = SqlEditorWidget::format_sql_basic_for_db_type(
+        &formatted,
+        crate::db::connection::DatabaseType::MySQL,
+    );
 
     assert_eq!(
         formatted, formatted_again,
@@ -421,7 +434,10 @@ FROM sales_ranked;"#;
 #[test]
 fn format_sql_preserves_mega_torture_script() {
     let input = load_test_file("mega_torture.txt");
-    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        &input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
 
     let expected_lines = vec![
         "PROMPT [0] bind/substitution setup",
@@ -446,7 +462,10 @@ fn format_sql_preserves_mega_torture_script() {
         "Slash terminator count differs for mega_torture.txt"
     );
 
-    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    let formatted_again = SqlEditorWidget::format_sql_basic_for_db_type(
+        &formatted,
+        crate::db::connection::DatabaseType::MySQL,
+    );
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for mega_torture.txt"
@@ -904,6 +923,307 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test_mariadb/test3.txt"
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths() {
+    let input = load_mariadb_test_file("test1.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let case_idx =
+        find_line_starting_with(&lines, "CASE UPPER (TRIM (p_currency_code))").expect("CASE line");
+    let when_idx = lines
+        .iter()
+        .enumerate()
+        .skip(case_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("WHEN 'USD' THEN"))
+        .map(|(idx, _)| idx)
+        .expect("WHEN line");
+    let value_idx = lines
+        .iter()
+        .enumerate()
+        .skip(when_idx + 1)
+        .find(|(_, line)| line.trim_start() == "1.0000")
+        .map(|(idx, _)| idx)
+        .expect("CASE branch body");
+
+    assert_eq!(
+        leading_spaces(lines[when_idx]),
+        leading_spaces(lines[case_idx]).saturating_add(4),
+        "function CASE WHEN should stay one level deeper than CASE, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[value_idx]),
+        leading_spaces(lines[when_idx]).saturating_add(4),
+        "function CASE body should stay one level deeper than WHEN, got:\n{}",
+        formatted
+    );
+
+    let window_idx = find_line_starting_with(&lines, "WINDOW").expect("WINDOW line");
+    let named_idx = lines
+        .iter()
+        .enumerate()
+        .skip(window_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("w_emp AS ("))
+        .map(|(idx, _)| idx)
+        .expect("named WINDOW line");
+    let partition_idx = lines
+        .iter()
+        .enumerate()
+        .skip(named_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("PARTITION BY ob.emp_id"))
+        .map(|(idx, _)| idx)
+        .expect("PARTITION BY line");
+    let order_idx = lines
+        .iter()
+        .enumerate()
+        .skip(partition_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("ORDER BY ob.created_at"))
+        .map(|(idx, _)| idx)
+        .expect("ORDER BY line");
+    let close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(order_idx + 1)
+        .find(|(_, line)| line.trim() == "),")
+        .map(|(idx, _)| idx)
+        .expect("WINDOW definition close");
+
+    assert_eq!(
+        leading_spaces(lines[named_idx]),
+        leading_spaces(lines[window_idx]).saturating_add(4),
+        "named WINDOW definition should stay one level deeper than WINDOW, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[partition_idx]),
+        leading_spaces(lines[named_idx]).saturating_add(4),
+        "WINDOW PARTITION BY should stay one level deeper than the named definition, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[partition_idx]),
+        leading_spaces(lines[order_idx]),
+        "WINDOW PARTITION BY and ORDER BY should share the same body depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[close_idx]),
+        leading_spaces(lines[named_idx]),
+        "WINDOW closing line should realign with the named definition, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_test2_loop_and_case_branch_depths() {
+    let input = load_mariadb_test_file("test2.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test2.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let while_idx =
+        find_line_starting_with(&lines, "WHILE v_i <= 5 DO").expect("WHILE header line");
+    let while_body_idx = lines
+        .iter()
+        .enumerate()
+        .skip(while_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("SET v_sum_while ="))
+        .map(|(idx, _)| idx)
+        .expect("WHILE body line");
+    let end_while_idx = lines
+        .iter()
+        .enumerate()
+        .skip(while_body_idx + 1)
+        .find(|(_, line)| line.trim_start() == "END WHILE;")
+        .map(|(idx, _)| idx)
+        .expect("END WHILE line");
+
+    assert_eq!(
+        leading_spaces(lines[while_body_idx]),
+        leading_spaces(lines[while_idx]).saturating_add(4),
+        "WHILE body should stay one level deeper than WHILE, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[end_while_idx]),
+        leading_spaces(lines[while_idx]),
+        "END WHILE should realign with WHILE, got:\n{}",
+        formatted
+    );
+
+    let repeat_idx = find_line_starting_with(&lines, "REPEAT").expect("REPEAT line");
+    let repeat_body_idx = lines
+        .iter()
+        .enumerate()
+        .skip(repeat_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("SET v_i = v_i + 1;"))
+        .map(|(idx, _)| idx)
+        .expect("REPEAT body line");
+    let end_repeat_idx = lines
+        .iter()
+        .enumerate()
+        .skip(repeat_body_idx + 1)
+        .find(|(_, line)| line.trim_start() == "END REPEAT;")
+        .map(|(idx, _)| idx)
+        .expect("END REPEAT line");
+
+    assert_eq!(
+        leading_spaces(lines[repeat_body_idx]),
+        leading_spaces(lines[repeat_idx]).saturating_add(4),
+        "REPEAT body should stay one level deeper than REPEAT, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[end_repeat_idx]),
+        leading_spaces(lines[repeat_idx]),
+        "END REPEAT should realign with REPEAT, got:\n{}",
+        formatted
+    );
+
+    let case_idx = find_line_starting_with(&lines, "CASE v_status_code").expect("cursor CASE line");
+    let when_idx = lines
+        .iter()
+        .enumerate()
+        .skip(case_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("WHEN 'DONE' THEN"))
+        .map(|(idx, _)| idx)
+        .expect("cursor CASE WHEN");
+    let body_idx = lines
+        .iter()
+        .enumerate()
+        .skip(when_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("SET v_done_count ="))
+        .map(|(idx, _)| idx)
+        .expect("cursor CASE body");
+    let else_idx = lines
+        .iter()
+        .enumerate()
+        .skip(body_idx + 1)
+        .find(|(_, line)| line.trim_start() == "ELSE")
+        .map(|(idx, _)| idx)
+        .expect("cursor CASE ELSE");
+
+    assert_eq!(
+        leading_spaces(lines[when_idx]),
+        leading_spaces(lines[case_idx]).saturating_add(4),
+        "cursor CASE WHEN should stay one level deeper than CASE, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[body_idx]),
+        leading_spaces(lines[when_idx]).saturating_add(4),
+        "cursor CASE body should stay one level deeper than WHEN, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[else_idx]),
+        leading_spaces(lines[when_idx]),
+        "cursor CASE ELSE should align with WHEN, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_test3_nested_case_and_window_sibling_depths() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let nested_block_idx =
+        find_line_starting_with(&lines, "nested_block:").expect("nested block label");
+    let nested_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(nested_block_idx + 1)
+        .find(|(_, line)| line.trim_start() == "CASE")
+        .map(|(idx, _)| idx)
+        .expect("nested CASE line");
+    let nested_when_idx = lines
+        .iter()
+        .enumerate()
+        .skip(nested_case_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("WHEN v_local = 1 THEN"))
+        .map(|(idx, _)| idx)
+        .expect("nested CASE WHEN");
+    let nested_body_idx = lines
+        .iter()
+        .enumerate()
+        .skip(nested_when_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("SET v_local = v_local + 9;"))
+        .map(|(idx, _)| idx)
+        .expect("nested CASE body");
+
+    assert_eq!(
+        leading_spaces(lines[nested_when_idx]),
+        leading_spaces(lines[nested_case_idx]).saturating_add(4),
+        "nested CASE WHEN should stay one level deeper than CASE, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[nested_body_idx]),
+        leading_spaces(lines[nested_when_idx]).saturating_add(4),
+        "nested CASE body should stay one level deeper than WHEN, got:\n{}",
+        formatted
+    );
+
+    let window_idx = find_line_starting_with(&lines, "WINDOW").expect("WINDOW line");
+    let named_idx = lines
+        .iter()
+        .enumerate()
+        .skip(window_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("w_owner AS ("))
+        .map(|(idx, _)| idx)
+        .expect("named WINDOW line");
+    let partition_idx = lines
+        .iter()
+        .enumerate()
+        .skip(named_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("PARTITION BY s.owner_name"))
+        .map(|(idx, _)| idx)
+        .expect("PARTITION BY line");
+    let sibling_idx = lines
+        .iter()
+        .enumerate()
+        .skip(partition_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("w_owner_running AS ("))
+        .map(|(idx, _)| idx)
+        .expect("WINDOW sibling line");
+
+    assert_eq!(
+        leading_spaces(lines[named_idx]),
+        leading_spaces(lines[window_idx]).saturating_add(4),
+        "named WINDOW definition should stay one level deeper than WINDOW, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[partition_idx]),
+        leading_spaces(lines[named_idx]).saturating_add(4),
+        "WINDOW body should stay one level deeper than the named definition, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[sibling_idx]),
+        leading_spaces(lines[named_idx]),
+        "WINDOW siblings should realign to the named definition depth, got:\n{}",
+        formatted
     );
 }
 
@@ -2987,7 +3307,7 @@ END demo_pkg;
 #[test]
 fn format_sql_select_case_inside_sum_is_indented() {
     let input = r#"SELECT grp,
-COUNT (*) AS cnt,
+COUNT(*) AS cnt,
 SUM (
 CASE
 WHEN MOD (n, 2) = 0 THEN 1
@@ -3005,7 +3325,7 @@ ORDER BY grp;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = [
         "SELECT grp,",
-        "    COUNT (*) AS cnt,",
+        "    COUNT(*) AS cnt,",
         "    SUM (",
         "        CASE",
         "            WHEN MOD (n, 2) = 0 THEN 1",
@@ -5062,7 +5382,7 @@ fn format_sql_formats_multi_cte_join_subquery_depth_consistently() {
 dept_agg AS (
     SELECT
         eb.deptno,
-        COUNT (*) AS emp_cnt,
+        COUNT(*) AS emp_cnt,
         AVG (eb.sal) AS avg_sal
     FROM emp_base eb
     GROUP BY eb.deptno
@@ -5115,7 +5435,7 @@ d AS (
 stats AS (
     SELECT
         deptno,
-        COUNT (*) cnt,
+        COUNT(*) cnt,
         AVG (sal) avg_sal,
         SUM (NVL (comm, 0)) sum_comm
     FROM e
@@ -5170,7 +5490,7 @@ d AS (
 stats AS (
     SELECT
         deptno,
-        COUNT (*) cnt,
+        COUNT(*) cnt,
         AVG (sal) avg_sal,
         SUM (NVL (comm, 0)) sum_comm
     FROM e
@@ -7346,7 +7666,9 @@ fn format_sql_oracle_ultimate_boss_idempotent() {
 
 #[test]
 fn format_sql_keeps_test_format_pivot_reference_layout_exactly() {
-    let expected = load_test_file("test_format_pivot.sql");
+    let expected = load_test_file("test_format_pivot.sql")
+        .trim_end()
+        .to_string();
     assert!(
         !expected.is_empty(),
         "Test file test_format_pivot.sql should not be empty"
@@ -7772,7 +8094,7 @@ LEFT JOIN emp e
 fn format_sql_nested_operator_scalar_subquery_keeps_owner_and_child_query_depths_stable() {
     let input = r#"SELECT
     (
-        SELECT COUNT (*)
+        SELECT COUNT(*)
         FROM (
                 SELECT 1
                 FROM employees e5
@@ -7794,7 +8116,7 @@ FROM a;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"SELECT
     (
-        SELECT COUNT (*)
+        SELECT COUNT(*)
         FROM (
                 SELECT 1
                 FROM employees e5
@@ -8069,5 +8391,321 @@ WHERE b IN (
         formatted, expected,
         "nested IN subquery indentation must stay stable, got:\n{}",
         formatted
+    );
+}
+
+#[test]
+fn format_mariadb_test1_keeps_inline_over_body_and_on_duplicate_function_args_nested() {
+    let source = load_mariadb_test_file("test1.txt");
+    assert!(
+        !source.is_empty(),
+        "test_mariadb/test1.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        &source,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let over_idx = find_line_starting_with(&lines, "DENSE_RANK () OVER (").unwrap_or(0);
+    let order_idx = find_line_starting_with(&lines, "ORDER BY ob.total_usd DESC").unwrap_or(0);
+    let on_duplicate_idx =
+        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = CONCAT (")
+            .expect("ON DUPLICATE KEY UPDATE owner line");
+    let values_idx =
+        find_line_starting_with(&lines, "VALUES (dept_name),").expect("CONCAT argument line");
+    let literal_idx = find_line_starting_with(&lines, "' / touched'").expect("CONCAT literal line");
+    let concat_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(literal_idx + 1)
+        .find(|(_, line)| line.trim_start() == "),")
+        .map(|(idx, _)| idx)
+        .expect("CONCAT close line");
+    let over_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(order_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with(") AS global_rank"))
+        .map(|(idx, _)| idx)
+        .expect("analytic OVER close line");
+
+    assert!(
+        leading_spaces(lines[order_idx]) > leading_spaces(lines[over_idx]),
+        "inline OVER (...) body should indent deeper than the OVER owner line, got:\n{}",
+        formatted
+    );
+    assert!(
+        leading_spaces(lines[values_idx]) > leading_spaces(lines[on_duplicate_idx]),
+        "CONCAT argument inside ON DUPLICATE KEY UPDATE should stay nested under the function owner, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[literal_idx]),
+        leading_spaces(lines[values_idx]),
+        "sibling CONCAT arguments should share the same function-body depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[concat_close_idx]),
+        leading_spaces(lines[on_duplicate_idx]),
+        "CONCAT close line should realign with the ON DUPLICATE KEY UPDATE owner depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[over_close_idx]),
+        leading_spaces(lines[over_idx]),
+        "analytic OVER close line should realign with the owner depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
+    let source = load_mariadb_test_file("test2.txt");
+    assert!(
+        !source.is_empty(),
+        "test_mariadb/test2.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        &source,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let main_block_idx = find_line_starting_with(&lines, "main_block: BEGIN").unwrap_or(0);
+    let create_proc_idx =
+        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_parser_killer ()").unwrap_or(0);
+    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (")
+        .expect("ROW_NUMBER OVER owner line");
+    let order_idx = find_line_starting_with(&lines, "ORDER BY weight_sum DESC,")
+        .expect("ROW_NUMBER ORDER BY line");
+    let over_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(order_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with(") AS rn"))
+        .map(|(idx, _)| idx)
+        .expect("ROW_NUMBER OVER close line");
+
+    assert!(
+        lines[main_block_idx].trim_start() == "main_block: BEGIN",
+        "main_block label should stay attached to BEGIN on its own line, got:\n{}",
+        formatted
+    );
+    assert!(
+        main_block_idx > create_proc_idx,
+        "main_block label should not collapse onto the CREATE PROCEDURE header, got:\n{}",
+        formatted
+    );
+    assert!(
+        leading_spaces(lines[order_idx]) > leading_spaces(lines[over_idx]),
+        "inline OVER (...) body should indent deeper than the OVER owner line, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[over_close_idx]),
+        leading_spaces(lines[over_idx]),
+        "ROW_NUMBER OVER close line should realign with the owner depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested() {
+    let source = load_mariadb_test_file("test3.txt");
+    assert!(
+        !source.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        &source,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let main_block_idx = find_line_starting_with(&lines, "main_block: BEGIN").unwrap_or(0);
+    let nested_block_idx = find_line_starting_with(&lines, "nested_block: BEGIN").unwrap_or(0);
+    let create_proc_idx =
+        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_ultra_final_boss ()").unwrap_or(0);
+    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (")
+        .expect("owner_ranked ROW_NUMBER OVER owner line");
+    let order_idx = find_line_starting_with(&lines, "ORDER BY owner_weighted DESC,")
+        .expect("owner_ranked ORDER BY line");
+    let over_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(order_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with(") AS rn"))
+        .map(|(idx, _)| idx)
+        .expect("owner_ranked OVER close line");
+    let second_over_idx = lines
+        .iter()
+        .enumerate()
+        .skip(over_close_idx + 1)
+        .find(|(_, line)| line.trim_start() == "ROW_NUMBER () OVER (")
+        .map(|(idx, _)| idx)
+        .expect("second ROW_NUMBER OVER owner line");
+    let second_order_idx = lines
+        .iter()
+        .enumerate()
+        .skip(second_over_idx + 1)
+        .find(|(_, line)| {
+            line.trim_start()
+                .starts_with("ORDER BY weighted_minutes DESC,")
+        })
+        .map(|(idx, _)| idx)
+        .expect("second ROW_NUMBER ORDER BY line");
+    let second_over_close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(second_order_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with(") AS rn"))
+        .map(|(idx, _)| idx)
+        .expect("second ROW_NUMBER OVER close line");
+
+    assert!(
+        lines[main_block_idx].trim_start() == "main_block: BEGIN",
+        "top-level label should stay attached to BEGIN on its own line, got:\n{}",
+        formatted
+    );
+    assert!(
+        main_block_idx > create_proc_idx,
+        "top-level label should not collapse onto the CREATE PROCEDURE header, got:\n{}",
+        formatted
+    );
+    assert!(
+        lines[nested_block_idx].trim_start() == "nested_block: BEGIN",
+        "nested label should stay attached to BEGIN on its own line, got:\n{}",
+        formatted
+    );
+    assert!(
+        leading_spaces(lines[order_idx]) > leading_spaces(lines[over_idx]),
+        "inline OVER (...) body should indent deeper than the OVER owner line, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[over_close_idx]),
+        leading_spaces(lines[over_idx]),
+        "first ROW_NUMBER OVER close line should realign with the owner depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[second_over_close_idx]),
+        leading_spaces(lines[second_over_idx]),
+        "second ROW_NUMBER OVER close line should realign with the owner depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_count_star_tight_in_plain_and_analytic_calls() {
+    let input = r#"SELECT COUNT(*),
+    COUNT(*) OVER (PARTITION BY deptno)
+FROM emp
+HAVING COUNT(*) > 1;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("COUNT(*)"),
+        "COUNT(*) should stay tight without an extra space before the opening paren, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("COUNT (*)"),
+        "formatter should not insert a space in COUNT(*), got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_sum_case_close_aligned_with_owner_depth() {
+    let input = r#"CREATE PROCEDURE sp_status_counts (
+    OUT p_done_cnt INT,
+    OUT p_running_cnt INT
+)
+BEGIN
+    SELECT SUM (
+            CASE
+                WHEN status_code = 'DONE' THEN 1
+                ELSE 0
+            END
+),
+        SUM (
+            CASE
+                WHEN status_code = 'RUNNING' THEN 1
+                ELSE 0
+            END
+        )
+    INTO p_done_cnt,
+        p_running_cnt
+    FROM task;
+END$$"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+    let sum_idx = find_line_starting_with(&lines, "SELECT SUM (").expect("SUM owner line");
+    let close_idx = lines
+        .iter()
+        .enumerate()
+        .skip(sum_idx + 1)
+        .find(|(_, line)| line.trim() == "),")
+        .map(|(idx, _)| idx)
+        .expect("SUM close line");
+
+    assert_eq!(
+        leading_spaces(lines[close_idx]),
+        leading_spaces(lines[sum_idx]),
+        "MariaDB multiline SUM close line should realign with the SUM owner depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mariadb_call_scalar_subquery_arguments_on_shared_call_depth() {
+    let input = r#"CALL sp_assert_eq_bigint (
+    (
+        SELECT COUNT(*)
+        FROM task_log
+        ), (
+            SELECT COALESCE (SUM (log_count), 0)
+            FROM monthly_rollup
+                ), 'rollup log_count sum mismatch'
+);"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let expected = r#"CALL sp_assert_eq_bigint (
+    (
+        SELECT COUNT(*)
+        FROM task_log
+    ),
+    (
+        SELECT COALESCE (SUM (log_count), 0)
+        FROM monthly_rollup
+    ),
+    'rollup log_count sum mismatch'
+);"#;
+
+    assert_eq!(
+        formatted, expected,
+        "CALL argument siblings should return to the shared call body depth after each parenthesized scalar subquery"
+    );
+    assert_eq!(
+        SqlEditorWidget::format_sql_basic_for_db_type(
+            &formatted,
+            crate::db::connection::DatabaseType::MySQL,
+        ),
+        expected,
+        "MariaDB CALL scalar-subquery argument formatting should remain idempotent"
     );
 }

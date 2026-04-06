@@ -436,10 +436,11 @@ impl SqlEditorWidget {
         let sql = self.buffer.text();
         let (_, cursor_pos) = Self::editor_cursor_position(&self.editor, &self.buffer);
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
-        crate::db::QueryExecutor::statement_at_cursor_for_db_type(
+        query_text::statement_at_cursor_for_db_type_with_mysql_delimiter(
             &sql,
             cursor_pos,
             Some(self.current_db_type()),
+            self.current_mysql_delimiter().as_deref(),
         )
     }
 
@@ -477,8 +478,12 @@ impl SqlEditorWidget {
         pos
     }
 
-    fn normalize_statement_for_single_execution(statement: &str) -> String {
-        query_text::normalize_single_statement(statement)
+    fn normalize_statement_for_single_execution(&self, statement: &str) -> String {
+        query_text::normalize_single_statement(
+            statement,
+            Some(self.current_db_type()),
+            self.current_mysql_delimiter().as_deref(),
+        )
     }
 
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -1597,6 +1602,39 @@ impl SqlEditorWidget {
             Ok(conn_guard) => conn_guard.db_type(),
             Err(poisoned) => poisoned.into_inner().db_type(),
         }
+    }
+
+    fn current_mysql_delimiter(&self) -> Option<String> {
+        let session = match self.connection.lock() {
+            Ok(conn_guard) => {
+                if conn_guard.db_type() != crate::db::connection::DatabaseType::MySQL {
+                    return None;
+                }
+                conn_guard.session_state()
+            }
+            Err(poisoned) => {
+                let conn_guard = poisoned.into_inner();
+                if conn_guard.db_type() != crate::db::connection::DatabaseType::MySQL {
+                    return None;
+                }
+                conn_guard.session_state()
+            }
+        };
+
+        let delimiter = match session.lock() {
+            Ok(guard) => guard.mysql_delimiter.clone(),
+            Err(poisoned) => poisoned.into_inner().mysql_delimiter.clone(),
+        };
+        delimiter
+    }
+
+    fn mysql_delimiter_before_offset(&self, offset: usize) -> Option<String> {
+        query_text::active_mysql_delimiter_before_offset(
+            &self.buffer.text(),
+            offset,
+            Some(self.current_db_type()),
+            self.current_mysql_delimiter().as_deref(),
+        )
     }
 
     pub(crate) fn sync_db_type_from_connection(&self) {

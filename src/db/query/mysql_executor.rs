@@ -545,12 +545,7 @@ impl MysqlObjectBrowser {
         index
     }
 
-    fn append_comment_free_segment(
-        cleaned: &mut String,
-        source: &str,
-        start: usize,
-        end: usize,
-    ) {
+    fn append_comment_free_segment(cleaned: &mut String, source: &str, start: usize, end: usize) {
         if start >= end {
             return;
         }

@@ -1425,14 +1425,33 @@ impl QueryExecutor {
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> Option<String> {
+        Self::statement_at_cursor_for_db_type_with_mysql_delimiter(
+            sql,
+            cursor_pos,
+            preferred_db_type,
+            None,
+        )
+    }
+
+    pub(crate) fn statement_at_cursor_for_db_type_with_mysql_delimiter(
+        sql: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Option<String> {
         if sql.trim().is_empty() {
             return None;
         }
 
-        Self::statement_bounds_at_cursor_for_db_type(sql, cursor_pos, preferred_db_type)
-            .and_then(|(start, end)| sql.get(start..end))
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
+        Self::statement_bounds_at_cursor_for_db_type_with_mysql_delimiter(
+            sql,
+            cursor_pos,
+            preferred_db_type,
+            initial_mysql_delimiter,
+        )
+        .and_then(|(start, end)| sql.get(start..end))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
     }
 
     /// Return the [start, end) byte bounds of the statement containing the cursor.
@@ -1447,6 +1466,20 @@ impl QueryExecutor {
         sql: &str,
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Option<(usize, usize)> {
+        Self::statement_bounds_at_cursor_for_db_type_with_mysql_delimiter(
+            sql,
+            cursor_pos,
+            preferred_db_type,
+            None,
+        )
+    }
+
+    pub(crate) fn statement_bounds_at_cursor_for_db_type_with_mysql_delimiter(
+        sql: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
     ) -> Option<(usize, usize)> {
         if sql.trim().is_empty() {
             return None;
@@ -1473,7 +1506,13 @@ impl QueryExecutor {
         } else {
             None
         };
-        Self::find_statement_bounds_for_cursor(sql, cursor_pos, slash_line_start, preferred_db_type)
+        Self::find_statement_bounds_for_cursor(
+            sql,
+            cursor_pos,
+            slash_line_start,
+            preferred_db_type,
+            initial_mysql_delimiter,
+        )
     }
 
     fn find_statement_bounds_for_cursor(
@@ -1481,43 +1520,50 @@ impl QueryExecutor {
         cursor_pos: usize,
         slash_line_start: Option<usize>,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
     ) -> Option<(usize, usize)> {
         let mut previous: Option<((usize, usize), usize)> = None;
         let mut slash_previous: Option<(usize, usize)> = None;
         let mut resolved: Option<(usize, usize)> = None;
 
-        Self::walk_statement_spans_for_bounds(sql, preferred_db_type, |span, gap_start| {
-            if let Some(line_start) = slash_line_start {
-                if span.1 <= line_start {
-                    slash_previous = Some(span);
-                    return true;
+        Self::walk_statement_spans_for_bounds(
+            sql,
+            preferred_db_type,
+            initial_mysql_delimiter,
+            |span, gap_start| {
+                if let Some(line_start) = slash_line_start {
+                    if span.1 <= line_start {
+                        slash_previous = Some(span);
+                        return true;
+                    }
+                    return span.0 <= line_start;
                 }
-                return span.0 <= line_start;
-            }
 
-            if cursor_pos >= span.0 && cursor_pos < span.1 {
-                resolved = Some(span);
-                return false;
-            }
+                if cursor_pos >= span.0 && cursor_pos < span.1 {
+                    resolved = Some(span);
+                    return false;
+                }
 
-            if span.0 > cursor_pos {
-                let gap_start = previous.map(|(_, gap_start)| gap_start).unwrap_or(0);
-                resolved = Some(
-                    if Self::comment_gap_prefers_next_statement(sql, gap_start, cursor_pos, span.0)
-                    {
-                        span
-                    } else {
-                        previous
-                            .map(|(previous_span, _)| previous_span)
-                            .unwrap_or(span)
-                    },
-                );
-                return false;
-            }
+                if span.0 > cursor_pos {
+                    let gap_start = previous.map(|(_, gap_start)| gap_start).unwrap_or(0);
+                    resolved = Some(
+                        if Self::comment_gap_prefers_next_statement(
+                            sql, gap_start, cursor_pos, span.0,
+                        ) {
+                            span
+                        } else {
+                            previous
+                                .map(|(previous_span, _)| previous_span)
+                                .unwrap_or(span)
+                        },
+                    );
+                    return false;
+                }
 
-            previous = Some((span, gap_start));
-            true
-        });
+                previous = Some((span, gap_start));
+                true
+            },
+        );
 
         if slash_line_start.is_some() {
             return slash_previous;
@@ -1567,6 +1613,7 @@ impl QueryExecutor {
     fn walk_statement_spans_for_bounds<F>(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
         mut on_span: F,
     ) where
         F: FnMut((usize, usize), usize) -> bool,
@@ -1757,7 +1804,11 @@ impl QueryExecutor {
             builder: SqlParserEngine::new(),
             current_start: None,
             current_end: 0,
-            mysql_delimiter: ";".to_string(),
+            mysql_delimiter: initial_mysql_delimiter
+                .map(str::trim)
+                .filter(|delimiter| !delimiter.is_empty())
+                .unwrap_or(";")
+                .to_string(),
         };
         collector
             .builder

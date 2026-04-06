@@ -236,7 +236,11 @@ impl SqlEditorWidget {
                 let selected_text = buffer.selection_text();
                 if !selected_text.is_empty() {
                     // F5 runs script execution semantics even when only a range is selected.
-                    self.execute_sql(&selected_text, true);
+                    self.execute_sql_with_mysql_delimiter(
+                        &selected_text,
+                        true,
+                        self.mysql_delimiter_before_offset(start as usize),
+                    );
                     return;
                 }
             }
@@ -250,11 +254,20 @@ impl SqlEditorWidget {
         let selected_text = self.buffer.selection_text();
         if !selected_text.is_empty() {
             // Execute selected text
-            self.execute_sql(&selected_text, false);
+            let selection_start = self
+                .buffer
+                .selection_position()
+                .map(|(start, end)| start.min(end) as usize)
+                .unwrap_or(0);
+            self.execute_sql_with_mysql_delimiter(
+                &selected_text,
+                false,
+                self.mysql_delimiter_before_offset(selection_start),
+            );
         } else {
             // Execute statement at cursor position
             if let Some(statement) = self.statement_at_cursor_text() {
-                let normalized = Self::normalize_statement_for_single_execution(&statement);
+                let normalized = self.normalize_statement_for_single_execution(&statement);
                 self.execute_sql(&normalized, false);
             } else {
                 SqlEditorWidget::show_alert_dialog("No SQL at cursor");
@@ -272,7 +285,14 @@ impl SqlEditorWidget {
         let selection = buffer.selection_position();
         let insert_pos = self.editor.insert_position();
         let sql = buffer.selection_text();
-        self.execute_sql(&sql, false);
+        let selection_start = selection
+            .map(|(start, end)| start.min(end) as usize)
+            .unwrap_or(0);
+        self.execute_sql_with_mysql_delimiter(
+            &sql,
+            false,
+            self.mysql_delimiter_before_offset(selection_start),
+        );
         if let Some((start, end)) = selection {
             buffer.select(start, end);
             let mut editor = self.editor.clone();
@@ -524,6 +544,8 @@ impl SqlEditorWidget {
         target_path: &Path,
         normalized_target_path: &Path,
         base_dir: &Path,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
     ) -> Result<ResolvedScriptInclude, String> {
         let contents = fs::read_to_string(target_path)
             .map_err(|err| format!("Failed to read script {}: {}", target_path.display(), err))?;
@@ -536,7 +558,11 @@ impl SqlEditorWidget {
         Ok(ResolvedScriptInclude {
             source_path: normalized_target_path.to_path_buf(),
             script_dir,
-            items: super::query_text::split_script_items(&contents),
+            items: super::query_text::split_script_items_for_db_type_with_mysql_delimiter(
+                &contents,
+                preferred_db_type,
+                initial_mysql_delimiter,
+            ),
         })
     }
 
@@ -648,6 +674,24 @@ impl SqlEditorWidget {
         }
     }
 
+    fn current_mysql_delimiter_from_session(session: &Arc<Mutex<SessionState>>) -> Option<String> {
+        match session.lock() {
+            Ok(guard) => guard.mysql_delimiter.clone(),
+            Err(poisoned) => poisoned.into_inner().mysql_delimiter.clone(),
+        }
+    }
+
+    fn build_mysql_batch_items(
+        sql_text: &str,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Vec<ScriptItem> {
+        super::query_text::split_script_items_for_db_type_with_mysql_delimiter(
+            sql_text,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            initial_mysql_delimiter,
+        )
+    }
+
     fn execute_mysql_batch(
         shared_connection: &crate::db::SharedConnection,
         sender: &mpsc::Sender<QueryProgress>,
@@ -656,14 +700,13 @@ impl SqlEditorWidget {
         session: &Arc<Mutex<SessionState>>,
         cancel_flag: &Arc<Mutex<bool>>,
         script_mode: bool,
+        initial_mysql_delimiter_override: Option<String>,
         _query_timeout: Option<Duration>,
         initial_auto_commit: bool,
         db_activity: &str,
     ) {
-        let items = super::query_text::split_script_items_for_db_type(
-            sql_text,
-            Some(crate::db::connection::DatabaseType::MySQL),
-        );
+        let items =
+            Self::build_mysql_batch_items(sql_text, initial_mysql_delimiter_override.as_deref());
         if items.is_empty() {
             return;
         }
@@ -1281,29 +1324,37 @@ impl SqlEditorWidget {
                                 &frames,
                                 normalized_target_path.as_path(),
                             ) {
-                                Ok(()) => match SqlEditorWidget::load_script_include(
-                                    target_path.as_path(),
-                                    normalized_target_path.as_path(),
-                                    include_base_dir,
-                                ) {
-                                    Ok(resolved_include) => {
-                                        frames.push(ScriptExecutionFrame {
-                                            items: resolved_include.items,
-                                            index: 0,
-                                            base_dir: resolved_include.script_dir,
-                                            source_path: Some(resolved_include.source_path),
-                                        });
-                                    }
-                                    Err(message) => {
-                                        SqlEditorWidget::emit_script_message(
-                                            sender,
+                                Ok(()) => {
+                                    let current_mysql_delimiter =
+                                        SqlEditorWidget::current_mysql_delimiter_from_session(
                                             session,
-                                            if relative_to_caller { "@@" } else { "@" },
-                                            &format!("Error: {}", message),
                                         );
-                                        command_error = true;
+                                    match SqlEditorWidget::load_script_include(
+                                        target_path.as_path(),
+                                        normalized_target_path.as_path(),
+                                        include_base_dir,
+                                        Some(crate::db::connection::DatabaseType::MySQL),
+                                        current_mysql_delimiter.as_deref(),
+                                    ) {
+                                        Ok(resolved_include) => {
+                                            frames.push(ScriptExecutionFrame {
+                                                items: resolved_include.items,
+                                                index: 0,
+                                                base_dir: resolved_include.script_dir,
+                                                source_path: Some(resolved_include.source_path),
+                                            });
+                                        }
+                                        Err(message) => {
+                                            SqlEditorWidget::emit_script_message(
+                                                sender,
+                                                session,
+                                                if relative_to_caller { "@@" } else { "@" },
+                                                &format!("Error: {}", message),
+                                            );
+                                            command_error = true;
+                                        }
                                     }
-                                },
+                                }
                                 Err(message) => {
                                     SqlEditorWidget::emit_script_message(
                                         sender,
@@ -1667,6 +1718,15 @@ impl SqlEditorWidget {
     }
 
     fn execute_sql(&self, sql: &str, script_mode: bool) {
+        self.execute_sql_with_mysql_delimiter(sql, script_mode, None);
+    }
+
+    fn execute_sql_with_mysql_delimiter(
+        &self,
+        sql: &str,
+        script_mode: bool,
+        initial_mysql_delimiter: Option<String>,
+    ) {
         if sql.trim().is_empty() {
             return;
         }
@@ -1717,6 +1777,7 @@ impl SqlEditorWidget {
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
         // Reset cancel flag before starting new execution
         store_mutex_bool(&cancel_flag, false);
@@ -1780,6 +1841,7 @@ impl SqlEditorWidget {
                         &session,
                         &cancel_flag,
                         script_mode,
+                        initial_mysql_delimiter_for_worker.clone(),
                         query_timeout,
                         auto_commit,
                         &db_activity,
@@ -3902,6 +3964,8 @@ impl SqlEditorWidget {
                                         target_path.as_path(),
                                         normalized_target_path.as_path(),
                                         include_base_dir,
+                                        Some(crate::db::connection::DatabaseType::Oracle),
+                                        None,
                                     ) {
                                         Ok(resolved_include) => {
                                             frames.push(ScriptExecutionFrame {
@@ -7429,7 +7493,11 @@ mod query_execution_cleanup_tests {
 #[cfg(test)]
 mod script_include_guard_tests {
     use super::{ScriptExecutionFrame, SqlEditorWidget, MAX_SCRIPT_INCLUDE_DEPTH};
+    use crate::db::{connection::DatabaseType, ScriptItem};
+    use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn frame_with_source(path: &str) -> ScriptExecutionFrame {
         ScriptExecutionFrame {
@@ -7466,6 +7534,84 @@ mod script_include_guard_tests {
         assert!(
             err.contains("Maximum nested script depth"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn load_script_include_preserves_mysql_delimiter_context_for_nested_scripts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let target_path =
+            std::env::temp_dir().join(format!("space_query_mysql_include_{unique}.sql"));
+        let normalized_target_path = target_path.clone();
+        let sql = "CREATE PROCEDURE demo_proc()\nBEGIN\n    SELECT 1;\nEND$$\nSELECT 2$$\n";
+        fs::write(&target_path, sql).expect("temp include script should be writable");
+
+        let loaded = SqlEditorWidget::load_script_include(
+            target_path.as_path(),
+            normalized_target_path.as_path(),
+            Path::new("."),
+            Some(DatabaseType::MySQL),
+            Some("$$"),
+        )
+        .expect("MySQL include should load with inherited delimiter context");
+
+        let _ = fs::remove_file(&target_path);
+
+        let statements = loaded
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ScriptItem::Statement(statement) => Some(statement.as_str()),
+                ScriptItem::ToolCommand(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "nested MySQL include should keep both END$$-terminated statements executable: {statements:?}"
+        );
+        assert!(
+            statements
+                .first()
+                .is_some_and(|stmt| stmt.starts_with("CREATE PROCEDURE demo_proc()")),
+            "first included statement should remain the stored routine: {statements:?}"
+        );
+        assert_eq!(
+            statements.get(1).copied(),
+            Some("SELECT 2"),
+            "second included statement should preserve the custom delimiter split: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn build_mysql_batch_items_treats_top_level_script_as_self_contained_without_override() {
+        let sql = include_str!("../../../test_mariadb/test1.txt");
+
+        let items = SqlEditorWidget::build_mysql_batch_items(sql, None);
+        let statement_count = items
+            .iter()
+            .filter(|item| matches!(item, ScriptItem::Statement(_)))
+            .count();
+        let tool_command_count = items
+            .iter()
+            .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+            .count();
+
+        assert_eq!(
+            statement_count, 23,
+            "top-level MySQL batch execution should use the script's own delimiter directives: {items:?}"
+        );
+        assert_eq!(
+            tool_command_count, 3,
+            "top-level MySQL batch execution should keep USE + DELIMITER commands intact: {items:?}"
+        );
+        assert!(
+            matches!(items.first(), Some(ScriptItem::Statement(statement)) if statement.starts_with("DROP DATABASE IF EXISTS qt_mysql_final_boss")),
+            "top-level batch should keep the leading semicolon-terminated DDL separate from later END$$ routines: {items:?}"
         );
     }
 }

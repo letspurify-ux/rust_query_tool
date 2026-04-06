@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-06 (`WINDOW` clause를 named definition list header로 명시, bare `WINDOW` 다음 named window sibling depth 규칙 추가, exact bare `WINDOW` continuation taxonomy를 clause-body carry로 조정)
+> 최종 업데이트: 2026-04-06 (`WINDOW` clause named definition depth 규칙과 MySQL/MariaDB routine block / routine CASE depth 규칙 추가)
 
 ## 0. 이 문서의 역할
 
@@ -41,6 +41,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 닫힘 정렬은 "이전 줄보다 한 단계 덜 들여쓰기"가 아니라 실제로 pop된 owner의 depth를 기준으로 한다.
 
 - `)`는 pop된 paren owner depth에 정렬한다.
+- multiline function/expression wrapper의 compact close(`SUM (...)`, `CONCAT (...)`, `COUNT (...)`처럼 opener가 같은 line에 있는 경우)도 예외가 아니다. close line은 visual 현재 depth가 아니라 opener owner depth로 돌아가야 한다.
 - `END`, `END CASE`, `END IF`, `END LOOP`도 pop된 block owner depth에 정렬한다.
 - query close line은 stored query close alignment를 사용한다.
 
@@ -219,6 +220,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - direct from-item child-query owner (`LATERAL`, `TABLE`, `APPLY` child-query branch)
 - generic expression child-query owner (`CURSOR`, `MULTISET`)
 - `BEGIN … END`, `CASE … END`, `IF … END IF` 블록
+- MySQL/MariaDB compound routine block owner (`BEGIN`, labeled `LOOP`, `REPEAT`, `WHILE … DO`)
 - `OVER (…)`, `WITHIN GROUP (…)`, `WINDOW (…)`, `MATCH_RECOGNIZE (…)`, `PIVOT (…)`, `UNPIVOT (…)`, `MODEL (…)`, `JSON_TABLE ... NESTED/COLUMNS (...)` 같은 multiline clause owner
 - `CURSOR ... IS`, `OPEN ... FOR`, control-body query owner 같은 PL/SQL child-query owner
 - `THEN`, `ELSE`, `EXCEPTION` body owner
@@ -231,6 +233,9 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - bare `IF`/`ELSIF`/`ELSEIF` condition header는 owner family가 아니라 condition-header / wrapper family다. body owner는 `THEN`이 완료된 시점부터 열린다.
 - `CREATE TRIGGER` header body owner도 "header body line"과 "body opener"를 섞으면 안 된다. `BEFORE/AFTER`, `ON`, `REFERENCING`, `FOR EACH ROW`, `WHEN`은 owner depth + 1이지만, 그 다음 `DECLARE`/`BEGIN`은 retained trigger-header state를 종료하고 owner depth로 복귀해야 한다.
 - split `CREATE [MATERIALIZED] VIEW|TABLE ... AS` header chain은 trigger header body와 다르다. `BUILD DEFERRED`, `REFRESH FAST`, `ON DEMAND`, `ENABLE QUERY REWRITE`, storage/property option 같은 `AS` 이전 fragment는 최초 `CREATE ...` owner depth를 유지하고, trailing `AS`가 완료된 뒤의 query head (`WITH`/`SELECT`/`VALUES`)만 owner depth + 1에서 시작한다.
+- MySQL/MariaDB compound routine block도 block owner family다. `BEGIN`, labeled `LOOP`, `REPEAT`, `WHILE … DO` header는 owner depth를 열고 본문은 항상 `owner depth + 1`을 사용해야 하며, `END LOOP` / `END REPEAT` / `END WHILE`은 opener owner depth로 정렬해야 한다.
+- labeled routine block(`read_loop: LOOP`, `main_block: BEGIN`, `nested_block: BEGIN`)은 label 토큰이 추가되더라도 owner family가 바뀌지 않는다. label은 opener depth를 보존하는 장식이며, body depth나 close alignment를 별도 visual heuristic로 재계산하면 안 된다.
+- routine `CASE`는 SQL expression `CASE`와 semantic family가 다르다. MySQL/MariaDB compound block 안의 statement `CASE`는 PL/SQL `CASE` branch owner와 같은 depth 규칙을 따라 `WHEN`/`ELSE`는 `CASE`보다 한 단계 deeper, branch statement는 다시 한 단계 deeper여야 한다.
 
 ### 3.2 current structural continuation boundary taxonomy
 

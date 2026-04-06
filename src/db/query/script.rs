@@ -5787,9 +5787,10 @@ impl QueryExecutor {
         Self::split_script_items_for_db_type(sql, None)
     }
 
-    pub(crate) fn split_script_items_for_db_type(
+    pub(crate) fn split_script_items_for_db_type_with_mysql_delimiter(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
     ) -> Vec<ScriptItem> {
         let mut items: Vec<ScriptItem> = Vec::new();
         let add_statement = |stmt: String, items: &mut Vec<ScriptItem>| {
@@ -5806,6 +5807,7 @@ impl QueryExecutor {
         Self::split_items_core(
             sql,
             preferred_db_type,
+            initial_mysql_delimiter,
             &mut items,
             add_statement,
             on_tool_command,
@@ -5813,6 +5815,13 @@ impl QueryExecutor {
         );
         let items = Self::merge_fragmented_standalone_routine_script_statements(items);
         Self::merge_fragmented_with_single_letter_cte_script_items(items)
+    }
+
+    pub(crate) fn split_script_items_for_db_type(
+        sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Vec<ScriptItem> {
+        Self::split_script_items_for_db_type_with_mysql_delimiter(sql, preferred_db_type, None)
     }
 
     fn merge_fragmented_with_single_letter_cte_script_items(
@@ -6689,6 +6698,7 @@ impl QueryExecutor {
     fn split_items_core<T>(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
         items: &mut Vec<T>,
         mut add_statement: impl FnMut(String, &mut Vec<T>),
         mut on_tool_command: impl FnMut(ToolCommand, &str, &mut Vec<T>),
@@ -6696,7 +6706,11 @@ impl QueryExecutor {
     ) {
         let mut builder = SqlParserEngine::new();
         let mut sqlblanklines_enabled = true;
-        let mut mysql_delimiter = ";".to_string();
+        let mut mysql_delimiter = initial_mysql_delimiter
+            .map(str::trim)
+            .filter(|delimiter| !delimiter.is_empty())
+            .unwrap_or(";")
+            .to_string();
         let mut mysql_raw_statement = String::new();
 
         let mut lines = sql.lines().peekable();

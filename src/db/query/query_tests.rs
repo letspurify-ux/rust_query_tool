@@ -8533,6 +8533,137 @@ SELECT 3;
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_mysql_mixed_custom_delimiter_keeps_current_routine_isolated() {
+    let sql = r#"DELIMITER $$
+CREATE TRIGGER bi_task_log
+    BEFORE INSERT
+    ON task_log
+    FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL
+            OR NEW.hours <= 0
+            OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+END$$
+
+CREATE FUNCTION fn_efficiency_band (
+    p_hours DECIMAL (12, 2),
+    p_budget DECIMAL (14, 2)
+) RETURNS VARCHAR (16) DETERMINISTIC
+BEGIN
+    DECLARE v_score DECIMAL (12, 4);
+    SET v_score = IFNULL (p_hours / NULLIF (p_budget / 1000, 0), 0);
+    RETURN
+    CASE
+        WHEN v_score >= 1.20 THEN
+            'critical'
+        WHEN v_score >= 0.80 THEN
+            'watch'
+        ELSE
+            'ok'
+    END;
+END$$
+
+CREATE PROCEDURE sp_assert_eq_bigint (
+    IN p_expected BIGINT,
+    IN p_actual BIGINT,
+    IN p_message VARCHAR (255)
+)
+BEGIN
+    IF NOT (p_expected <=> p_actual) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = CONCAT ('ASSERT: ', p_message);
+    END IF;
+END$$"#;
+
+    let cursor = sql.find("v_score >= 0.80").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    )
+    .expect("expected function bounds inside mixed MySQL custom-delimiter script");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE FUNCTION fn_efficiency_band"),
+        "cursor inside the function should resolve only the function body, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("DECLARE v_score DECIMAL (12, 4);")
+            && statement.contains("WHEN v_score >= 0.80 THEN"),
+        "function body should stay intact, got:\n{statement}"
+    );
+    assert!(
+        !statement.contains("CREATE TRIGGER bi_task_log")
+            && !statement.contains("CREATE PROCEDURE sp_assert_eq_bigint"),
+        "neighboring custom-delimiter routines must not leak into the current function bounds, got:\n{statement}"
+    );
+    assert!(
+        statement.trim_end().ends_with("END"),
+        "statement bounds should stop at the stripped custom delimiter, got:\n{statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mysql_session_delimiter_isolates_second_trigger_without_directive(
+) {
+    let sql = r#"CREATE TRIGGER bi_task_log
+BEFORE INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL OR NEW.hours <= 0 OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+AFTER INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (
+        event_type,
+        entity_name,
+        entity_id,
+        detail
+    )
+    VALUES (
+        'TASK_INSERT',
+        'task_log',
+        NEW.log_id,
+        JSON_OBJECT(
+            'project_id', NEW.project_id,
+            'employee_id', NEW.employee_id,
+            'hours', NEW.hours,
+            'work_date', DATE_FORMAT(NEW.work_date, '%Y-%m-%d'),
+            'note', NEW.note
+        )
+    );
+END$$"#;
+
+    let cursor = sql.find("INSERT INTO audit_events").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type_with_mysql_delimiter(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+        Some("$$"),
+    )
+    .expect("expected second trigger bounds with session mysql delimiter");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE TRIGGER ai_task_log"),
+        "cursor inside second trigger should isolate only that trigger, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("INSERT INTO audit_events")
+            && !statement.contains("CREATE TRIGGER bi_task_log"),
+        "first trigger must not leak into second trigger bounds, got:\n{statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_mysql_use_command_isolated_from_following_statement() {
     let sql = "USE reporting\nSELECT 1;\n";
     let cursor = sql.find("SELECT 1").unwrap_or(0);
@@ -16599,6 +16730,157 @@ SELECT 1;
         stmts[0]
     );
     assert_eq!(stmts[1], "SELECT 1");
+}
+
+#[test]
+fn test_split_script_items_mysql_mixed_routines_with_custom_delimiter() {
+    let sql = r#"DELIMITER $$
+CREATE TRIGGER bi_task_log
+    BEFORE INSERT
+    ON task_log
+    FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL
+            OR NEW.hours <= 0
+            OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+    IF NEW.payload IS NULL
+            OR JSON_VALID (NEW.payload) = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'payload must be valid JSON';
+    END IF;
+    IF NEW.note IS NULL
+            OR CHAR_LENGTH (TRIM (NEW.note)) = 0 THEN
+        SET NEW.note = CONCAT ('auto-note:', NEW.employee_id, ':', DATE_FORMAT (NEW.work_date, '%Y%m%d'));
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+    AFTER INSERT
+    ON task_log
+    FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (event_type, entity_name, entity_id, detail)
+    VALUES ('TASK_INSERT', 'task_log', NEW.log_id, JSON_OBJECT ('project_id', NEW.project_id, 'employee_id', NEW.employee_id, 'hours', NEW.hours, 'work_date', DATE_FORMAT (NEW.work_date, '%Y-%m-%d'), 'note', NEW.note));
+END$$
+
+CREATE FUNCTION fn_efficiency_band (
+    p_hours DECIMAL (12, 2),
+    p_budget DECIMAL (14, 2)
+) RETURNS VARCHAR (16) DETERMINISTIC
+BEGIN
+    DECLARE v_score DECIMAL (12, 4);
+    SET v_score = IFNULL (p_hours / NULLIF (p_budget / 1000, 0), 0);
+    RETURN
+    CASE
+        WHEN v_score >= 1.20 THEN
+            'critical'
+        WHEN v_score >= 0.80 THEN
+            'watch'
+        ELSE
+            'ok'
+    END;
+END$$
+
+CREATE PROCEDURE sp_assert_eq_bigint (
+    IN p_expected BIGINT,
+    IN p_actual BIGINT,
+    IN p_message VARCHAR (255)
+)
+BEGIN
+    IF NOT (p_expected <=> p_actual) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = CONCAT ('ASSERT: ', p_message);
+    END IF;
+END$$"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        4,
+        "custom-delimiter script should split trigger/function/procedure definitions independently: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE TRIGGER bi_task_log"),
+        "first statement should be the BEFORE INSERT trigger: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("CREATE TRIGGER ai_task_log"),
+        "second statement should be the AFTER INSERT trigger: {}",
+        stmts[1]
+    );
+    assert!(
+        stmts[2].starts_with("CREATE FUNCTION fn_efficiency_band"),
+        "third statement should be the function: {}",
+        stmts[2]
+    );
+    assert!(
+        stmts[3].starts_with("CREATE PROCEDURE sp_assert_eq_bigint"),
+        "fourth statement should be the procedure: {}",
+        stmts[3]
+    );
+}
+
+#[test]
+fn test_split_script_items_mysql_session_delimiter_splits_triggers_without_directive() {
+    let sql = r#"CREATE TRIGGER bi_task_log
+BEFORE INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL OR NEW.hours <= 0 OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+AFTER INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (
+        event_type,
+        entity_name,
+        entity_id,
+        detail
+    )
+    VALUES (
+        'TASK_INSERT',
+        'task_log',
+        NEW.log_id,
+        JSON_OBJECT(
+            'project_id', NEW.project_id,
+            'employee_id', NEW.employee_id,
+            'hours', NEW.hours,
+            'work_date', DATE_FORMAT(NEW.work_date, '%Y-%m-%d'),
+            'note', NEW.note
+        )
+    );
+END$$"#;
+
+    let items = QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+        sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+        Some("$$"),
+    );
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "session mysql delimiter should split both triggers even when the selection omits the DELIMITER directive: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE TRIGGER bi_task_log"),
+        "first split statement should be the BEFORE trigger: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("CREATE TRIGGER ai_task_log"),
+        "second split statement should be the AFTER trigger: {}",
+        stmts[1]
+    );
 }
 
 /// A double-quoted string containing the custom delimiter must be shielded.

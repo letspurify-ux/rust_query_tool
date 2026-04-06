@@ -696,8 +696,22 @@ pub(crate) fn statement_at_cursor_for_db_type(
     cursor_pos: usize,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
 ) -> Option<String> {
+    statement_at_cursor_for_db_type_with_mysql_delimiter(sql, cursor_pos, preferred_db_type, None)
+}
+
+pub(crate) fn statement_at_cursor_for_db_type_with_mysql_delimiter(
+    sql: &str,
+    cursor_pos: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    initial_mysql_delimiter: Option<&str>,
+) -> Option<String> {
     let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
-    QueryExecutor::statement_at_cursor_for_db_type(sql, safe_cursor, preferred_db_type)
+    QueryExecutor::statement_at_cursor_for_db_type_with_mysql_delimiter(
+        sql,
+        safe_cursor,
+        preferred_db_type,
+        initial_mysql_delimiter,
+    )
 }
 
 /// 현재 커서 위치가 속한 문장의 바이트 범위를 반환합니다.
@@ -714,9 +728,28 @@ pub(crate) fn statement_bounds_in_text_for_db_type(
     cursor_pos: usize,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
 ) -> (usize, usize) {
+    statement_bounds_in_text_for_db_type_with_mysql_delimiter(
+        sql,
+        cursor_pos,
+        preferred_db_type,
+        None,
+    )
+}
+
+pub(crate) fn statement_bounds_in_text_for_db_type_with_mysql_delimiter(
+    sql: &str,
+    cursor_pos: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    initial_mysql_delimiter: Option<&str>,
+) -> (usize, usize) {
     let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
-    QueryExecutor::statement_bounds_at_cursor_for_db_type(sql, safe_cursor, preferred_db_type)
-        .unwrap_or((0, sql.len()))
+    QueryExecutor::statement_bounds_at_cursor_for_db_type_with_mysql_delimiter(
+        sql,
+        safe_cursor,
+        preferred_db_type,
+        initial_mysql_delimiter,
+    )
+    .unwrap_or((0, sql.len()))
 }
 
 /// SQL 텍스트를 실행 단위(`ScriptItem`)로 분해합니다.
@@ -727,11 +760,57 @@ pub(crate) fn split_script_items(sql: &str) -> Vec<ScriptItem> {
     QueryExecutor::split_script_items(sql)
 }
 
+#[allow(dead_code)]
 pub(crate) fn split_script_items_for_db_type(
     sql: &str,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
 ) -> Vec<ScriptItem> {
-    QueryExecutor::split_script_items_for_db_type(sql, preferred_db_type)
+    split_script_items_for_db_type_with_mysql_delimiter(sql, preferred_db_type, None)
+}
+
+pub(crate) fn split_script_items_for_db_type_with_mysql_delimiter(
+    sql: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    initial_mysql_delimiter: Option<&str>,
+) -> Vec<ScriptItem> {
+    QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+        sql,
+        preferred_db_type,
+        initial_mysql_delimiter,
+    )
+}
+
+pub(crate) fn active_mysql_delimiter_before_offset(
+    sql: &str,
+    offset: usize,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    initial_mysql_delimiter: Option<&str>,
+) -> Option<String> {
+    if preferred_db_type != Some(crate::db::connection::DatabaseType::MySQL) {
+        return None;
+    }
+
+    let safe_offset = clamp_cursor_to_char_boundary(sql, offset);
+    let mut active_delimiter = initial_mysql_delimiter
+        .map(str::trim)
+        .filter(|delimiter| !delimiter.is_empty() && *delimiter != ";")
+        .map(ToString::to_string);
+
+    let prefix = sql.get(..safe_offset).unwrap_or(sql);
+    for line in prefix.lines() {
+        let trimmed = line.trim();
+        if let Some(crate::db::ToolCommand::MysqlDelimiter { delimiter }) =
+            QueryExecutor::parse_mysql_delimiter_command(trimmed)
+        {
+            active_delimiter = if delimiter == ";" {
+                None
+            } else {
+                Some(delimiter)
+            };
+        }
+    }
+
+    active_delimiter
 }
 
 /// 쿼리 실행 전 선처리에서 `CONNECT`, `DISCONNECT`, 또는 `@` 스크립트 실행 명령이
@@ -856,8 +935,16 @@ pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
 
 /// `QueryExecutor`의 스크립트 분할 규칙을 UI 공통 경로로 위임해
 /// 실행/포맷/인텔리센스에서 동일한 기준의 첫 문장을 사용합니다.
-pub(crate) fn normalize_single_statement(statement: &str) -> String {
-    let items = split_script_items(statement);
+pub(crate) fn normalize_single_statement(
+    statement: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    initial_mysql_delimiter: Option<&str>,
+) -> String {
+    let items = split_script_items_for_db_type_with_mysql_delimiter(
+        statement,
+        preferred_db_type,
+        initial_mysql_delimiter,
+    );
     if items.len() > 1 {
         if let Some(ScriptItem::Statement(stmt)) = items
             .into_iter()
@@ -1004,9 +1091,11 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        can_execute_while_disconnected, clamp_cursor_to_char_boundary,
-        has_connection_bootstrap_command, statement_at_cursor, statement_at_cursor_for_db_type,
-        statement_bounds_in_text, statement_bounds_in_text_for_db_type, tokenize_sql,
+        active_mysql_delimiter_before_offset, can_execute_while_disconnected,
+        clamp_cursor_to_char_boundary, has_connection_bootstrap_command, statement_at_cursor,
+        statement_at_cursor_for_db_type, statement_at_cursor_for_db_type_with_mysql_delimiter,
+        statement_bounds_in_text, statement_bounds_in_text_for_db_type,
+        statement_bounds_in_text_for_db_type_with_mysql_delimiter, tokenize_sql,
         tokenize_sql_spanned, tokenize_sql_with_mysql_compat, DollarQuoteState,
         PendingTailTokenKind,
     };
@@ -1073,6 +1162,175 @@ mod tests {
             result.as_deref(),
             Some("SELECT 5--2"),
             "query_text statement extraction must honor MySQL `--<non-space>` arithmetic when DB type is known"
+        );
+    }
+
+    #[test]
+    fn normalize_single_statement_for_mysql_db_type_keeps_routine_body_intact() {
+        let sql = r#"CREATE FUNCTION fn_efficiency_band (
+    p_hours DECIMAL (12, 2),
+    p_budget DECIMAL (14, 2)
+) RETURNS VARCHAR (16) DETERMINISTIC
+BEGIN
+    DECLARE v_score DECIMAL (12, 4);
+    SET v_score = IFNULL (p_hours / NULLIF (p_budget / 1000, 0), 0);
+    RETURN
+    CASE
+        WHEN v_score >= 1.20 THEN
+            'critical'
+        WHEN v_score >= 0.80 THEN
+            'watch'
+        ELSE
+            'ok'
+    END;
+END"#;
+
+        let normalized = super::normalize_single_statement(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            None,
+        );
+
+        assert_eq!(
+            normalized, sql,
+            "single-statement normalization should not re-split a MySQL routine body by internal semicolons"
+        );
+    }
+
+    #[test]
+    fn statement_at_cursor_with_mysql_session_delimiter_isolates_second_trigger() {
+        let sql = r#"CREATE TRIGGER bi_task_log
+BEFORE INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL OR NEW.hours <= 0 OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+AFTER INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (event_type, entity_name, entity_id, detail)
+    VALUES ('TASK_INSERT', 'task_log', NEW.log_id, JSON_OBJECT('note', NEW.note));
+END$$"#;
+        let cursor = sql.find("INSERT INTO audit_events").unwrap_or(0);
+
+        let statement = statement_at_cursor_for_db_type_with_mysql_delimiter(
+            sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            Some("$$"),
+        );
+        let (start, end) = statement_bounds_in_text_for_db_type_with_mysql_delimiter(
+            sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            Some("$$"),
+        );
+
+        assert_eq!(
+            statement.as_deref(),
+            Some(
+                "CREATE TRIGGER ai_task_log\nAFTER INSERT ON task_log\nFOR EACH ROW\nBEGIN\n    INSERT INTO audit_events (event_type, entity_name, entity_id, detail)\n    VALUES ('TASK_INSERT', 'task_log', NEW.log_id, JSON_OBJECT('note', NEW.note));\nEND"
+            ),
+            "query_text current-statement extraction should honor the session mysql delimiter"
+        );
+        assert!(
+            sql.get(start..end)
+                .is_some_and(|span| span.starts_with("CREATE TRIGGER ai_task_log")),
+            "query_text bounds should also isolate the second trigger"
+        );
+    }
+
+    #[test]
+    fn active_mysql_delimiter_before_offset_tracks_latest_directive_in_buffer_prefix() {
+        let sql = r#"DELIMITER $$
+CREATE TRIGGER bi_task_log
+BEFORE INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL OR NEW.hours <= 0 OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';
+    END IF;
+END$$
+
+CREATE TRIGGER ai_task_log
+AFTER INSERT ON task_log
+FOR EACH ROW
+BEGIN
+    INSERT INTO audit_events (
+        event_type,
+        entity_name,
+        entity_id,
+        detail
+    )
+    VALUES (
+        'TASK_INSERT',
+        'task_log',
+        NEW.log_id,
+        JSON_OBJECT(
+            'project_id', NEW.project_id,
+            'employee_id', NEW.employee_id,
+            'hours', NEW.hours,
+            'work_date', DATE_FORMAT(NEW.work_date, '%Y-%m-%d'),
+            'note', NEW.note
+        )
+    );
+END$$"#;
+        let selection_start = sql.find("CREATE TRIGGER bi_task_log").unwrap_or(0);
+
+        let delimiter = active_mysql_delimiter_before_offset(
+            sql,
+            selection_start,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            None,
+        );
+        let selected = sql.get(selection_start..).unwrap_or_default();
+        let items = super::split_script_items_for_db_type_with_mysql_delimiter(
+            selected,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            delimiter.as_deref(),
+        );
+        let statements = items
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::db::ScriptItem::Statement(statement) => Some(statement),
+                crate::db::ScriptItem::ToolCommand(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(delimiter.as_deref(), Some("$$"));
+        assert_eq!(
+            statements.len(),
+            2,
+            "selection execution should still split both triggers even when the DELIMITER line is outside the selected range: {statements:?}"
+        );
+        assert!(
+            statements[0].starts_with("CREATE TRIGGER bi_task_log")
+                && statements[1].starts_with("CREATE TRIGGER ai_task_log"),
+            "selection split should preserve both trigger execution units: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn active_mysql_delimiter_before_offset_clears_after_reset_directive() {
+        let sql = "DELIMITER $$\nCREATE PROCEDURE demo_proc()\nBEGIN\n  SELECT 1;\nEND$$\nDELIMITER ;\nSELECT 2;\n";
+        let offset = sql.find("SELECT 2").unwrap_or(sql.len());
+
+        let delimiter = active_mysql_delimiter_before_offset(
+            sql,
+            offset,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            None,
+        );
+
+        assert_eq!(
+            delimiter, None,
+            "delimiter inference should reset to the default semicolon after DELIMITER ;"
         );
     }
 
