@@ -1774,30 +1774,40 @@ pub(crate) fn parse_mysql_delimiter_directive(line: &str) -> Option<String> {
 
     let bytes = line.as_bytes();
     let mut idx = start.saturating_add(word.len());
-    let mut trailing = String::new();
 
-    while idx < line.len() {
-        if sql_line_comment_prefix_len(bytes, idx).is_some() {
+    // Skip leading whitespace and block comments to reach the delimiter token.
+    // We intentionally do NOT treat `--` or `#` as comment starters here:
+    // MySQL's DELIMITER command accepts any non-whitespace string as the
+    // delimiter value, including `--` or `#`.
+    loop {
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
             break;
         }
-
         if line[idx..].starts_with("/*") {
             let block_start = idx.saturating_add(2);
             let block_end = line.get(block_start..)?.find("*/")?;
             idx = block_start.saturating_add(block_end).saturating_add(2);
             continue;
         }
-
-        let ch = line.get(idx..)?.chars().next()?;
-        trailing.push(ch);
-        idx = idx.saturating_add(ch.len_utf8());
+        break;
     }
 
-    let delimiter = trailing.trim();
-    Some(if delimiter.is_empty() {
+    // The delimiter value is the first contiguous non-whitespace token.
+    // Everything after the first whitespace is ignored (may be a comment).
+    let mut delimiter_buf = String::new();
+    while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+        let ch = line.get(idx..)?.chars().next()?;
+        delimiter_buf.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    Some(if delimiter_buf.is_empty() {
         ";".to_string()
     } else {
-        delimiter.to_string()
+        delimiter_buf
     })
 }
 
@@ -6873,6 +6883,40 @@ mod tests {
         assert_eq!(
             parse_mysql_delimiter_directive("DELIMITER"),
             Some(";".to_string())
+        );
+        // Dollar-sign delimiter with a trailing hash comment
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER $$ # switch to $$"),
+            Some("$$".to_string())
+        );
+        // Reset delimiter with trailing dash-dash comment
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER ; -- reset"),
+            Some(";".to_string())
+        );
+    }
+
+    #[test]
+    fn mysql_delimiter_directive_accepts_special_chars_as_delimiter_value() {
+        // `--` must be accepted as the delimiter value, not mistaken for a comment.
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER --"),
+            Some("--".to_string())
+        );
+        // `#` must be accepted as the delimiter value, not mistaken for a comment.
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER #"),
+            Some("#".to_string())
+        );
+        // `//` should work as a common alternative delimiter.
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER //"),
+            Some("//".to_string())
+        );
+        // Inline content after the token is ignored.
+        assert_eq!(
+            parse_mysql_delimiter_directive("DELIMITER // rest is ignored"),
+            Some("//".to_string())
         );
     }
 

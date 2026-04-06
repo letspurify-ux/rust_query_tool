@@ -15406,3 +15406,232 @@ SELECT 1 FROM dual;"#;
         "depth should be reset before trailing SELECT: {depths:?}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MySQL/MariaDB – additional edge-case tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `--` must be usable as a DELIMITER value.
+/// Previously `parse_mysql_delimiter_directive` stopped at `--` thinking it
+/// was a comment, returning the default `;` instead.
+#[test]
+fn test_parse_mysql_delimiter_directive_double_dash_as_delimiter_value() {
+    use crate::sql_text::parse_mysql_delimiter_directive;
+    assert_eq!(
+        parse_mysql_delimiter_directive("DELIMITER --"),
+        Some("--".to_string()),
+        "-- must be accepted as a literal delimiter value"
+    );
+}
+
+/// `#` must be usable as a DELIMITER value.
+/// Previously the function stopped at `#` thinking it was a MySQL hash comment.
+#[test]
+fn test_parse_mysql_delimiter_directive_hash_as_delimiter_value() {
+    use crate::sql_text::parse_mysql_delimiter_directive;
+    assert_eq!(
+        parse_mysql_delimiter_directive("DELIMITER #"),
+        Some("#".to_string()),
+        "# must be accepted as a literal delimiter value"
+    );
+}
+
+/// `//` is commonly used as an alternative delimiter.
+#[test]
+fn test_parse_mysql_delimiter_directive_double_slash_as_delimiter_value() {
+    use crate::sql_text::parse_mysql_delimiter_directive;
+    assert_eq!(
+        parse_mysql_delimiter_directive("DELIMITER //"),
+        Some("//".to_string())
+    );
+}
+
+/// A single-quoted string that contains the custom delimiter characters
+/// must NOT cause the statement to be split early.
+#[test]
+fn test_split_script_items_mysql_delimiter_string_shields_delimiter_chars() {
+    let sql = "DELIMITER $$\nSELECT '$$' AS val$$\nDELIMITER ;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        1,
+        "delimiter chars inside a string literal must not terminate the statement early: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("'$$'"),
+        "string literal with delimiter chars should be preserved intact: {}",
+        stmts[0]
+    );
+}
+
+/// A backtick-quoted identifier that contains the custom delimiter characters
+/// must NOT cause the statement to be split early.
+#[test]
+fn test_split_script_items_mysql_delimiter_backtick_shields_delimiter_chars() {
+    let sql = "DELIMITER $$\nSELECT `col$$` FROM t$$\nDELIMITER ;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        1,
+        "delimiter chars inside a backtick identifier must not terminate the statement early: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("`col$$`"),
+        "backtick identifier with delimiter chars should be preserved: {}",
+        stmts[0]
+    );
+}
+
+/// Two consecutive stored procedures separated by `$$` must each be emitted
+/// as a separate statement.
+#[test]
+fn test_split_script_items_mysql_multiple_procedures_with_custom_delimiter() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE proc1()
+BEGIN
+  SELECT 1;
+END$$
+CREATE PROCEDURE proc2()
+BEGIN
+  SELECT 2;
+END$$
+DELIMITER ;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "two $$-terminated procedures should produce two statements: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("proc1") && stmts[0].contains("SELECT 1"),
+        "first statement should be proc1: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].contains("proc2") && stmts[1].contains("SELECT 2"),
+        "second statement should be proc2: {}",
+        stmts[1]
+    );
+}
+
+/// A LOOP body must remain a single statement when using a custom delimiter.
+#[test]
+fn test_split_script_items_mysql_loop_body_with_custom_delimiter() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE loop_test()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  my_loop: LOOP
+    SET i = i + 1;
+    IF i >= 3 THEN
+      LEAVE my_loop;
+    END IF;
+  END LOOP my_loop;
+END$$
+DELIMITER ;
+SELECT 1;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LOOP procedure + trailing SELECT should be 2 statements: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("LOOP") && stmts[0].contains("LEAVE"),
+        "LOOP body must stay intact: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+/// A trigger body with an IF statement must remain a single statement
+/// when using a custom delimiter.
+#[test]
+fn test_split_script_items_mysql_trigger_body_with_custom_delimiter() {
+    let sql = r#"DELIMITER $$
+CREATE TRIGGER before_insert_check
+BEFORE INSERT ON orders FOR EACH ROW
+BEGIN
+  IF NEW.amount <= 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'amount must be positive';
+  END IF;
+END$$
+DELIMITER ;
+SELECT 1;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "trigger definition + trailing SELECT should be 2 statements: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("TRIGGER") && stmts[0].contains("SIGNAL"),
+        "trigger body must stay intact: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 1");
+}
+
+/// A double-quoted string containing the custom delimiter must be shielded.
+#[test]
+fn test_split_script_items_mysql_double_quoted_string_shields_delimiter_chars() {
+    let sql = "DELIMITER $$\nSELECT \"val$$\" AS x$$\nDELIMITER ;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        1,
+        "delimiter chars inside a double-quoted string must not terminate early: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("\"val$$\""),
+        "double-quoted string with delimiter chars should be preserved: {}",
+        stmts[0]
+    );
+}
+
+/// WHILE loop inside a procedure must stay as a single statement.
+#[test]
+fn test_split_script_items_mysql_while_loop_with_custom_delimiter() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE while_test()
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  WHILE n < 5 DO
+    SET n = n + 1;
+  END WHILE;
+END$$
+DELIMITER ;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        1,
+        "WHILE procedure should be one statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("WHILE") && stmts[0].contains("END WHILE"),
+        "WHILE body must stay intact: {}",
+        stmts[0]
+    );
+}
