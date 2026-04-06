@@ -43,12 +43,19 @@ impl MysqlExecutor {
             Some("ROLLBACK") => MysqlStatementKind::Rollback,
             Some("USE") => MysqlStatementKind::Use,
             Some("CALL") => MysqlStatementKind::Call,
-            // SHOW, DESCRIBE/DESC, EXPLAIN all return tabular result sets in MySQL;
-            // route them through execute_select so the results are not silently
+            // SHOW, DESCRIBE/DESC, EXPLAIN, and several table-maintenance
+            // statements return tabular result sets in MySQL/MariaDB; route
+            // them through execute_select so the results are not silently
             // discarded by query_drop().
-            Some("SHOW") | Some("DESCRIBE") | Some("DESC") | Some("EXPLAIN") => {
-                MysqlStatementKind::Select
-            }
+            Some("SHOW")
+            | Some("DESCRIBE")
+            | Some("DESC")
+            | Some("EXPLAIN")
+            | Some("ANALYZE")
+            | Some("CHECK")
+            | Some("CHECKSUM")
+            | Some("OPTIMIZE")
+            | Some("REPAIR") => MysqlStatementKind::Select,
             _ => MysqlStatementKind::Ddl,
         }
     }
@@ -2122,6 +2129,23 @@ mod tests {
             super::MysqlStatementKind::Select,
             "EXPLAIN UPDATE must also be routed as Select"
         );
+    }
+
+    #[test]
+    fn mysql_classify_statement_table_maintenance_commands_are_selects() {
+        for sql in [
+            "ANALYZE TABLE employees",
+            "CHECK TABLE employees",
+            "CHECKSUM TABLE employees",
+            "OPTIMIZE TABLE employees",
+            "REPAIR TABLE employees",
+        ] {
+            assert_eq!(
+                MysqlExecutor::classify_statement(sql),
+                super::MysqlStatementKind::Select,
+                "{sql} returns a result set in MySQL/MariaDB and must not be discarded"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
