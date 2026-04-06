@@ -790,7 +790,8 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
 
 // ---------------------------------------------------------------------------
-// MySQL / MariaDB keywords (sorted, uppercase, excludes words already in ORACLE_SQL_KEYWORDS)
+// MySQL / MariaDB keywords (sorted, uppercase, includes compatibility keywords
+// that must still be treated as keywords when db_type=MySQL)
 // ---------------------------------------------------------------------------
 pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "ACCESSIBLE",
@@ -801,6 +802,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "ALGORITHM",
     "ALL",
     "ALTER",
+    "ALWAYS",
     "ANALYZE",
     "AND",
     "AS",
@@ -839,6 +841,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "CONVERT",
     "CREATE",
     "CROSS",
+    "CURRENT",
     "CURRENT_DATE",
     "CURRENT_TIME",
     "CURRENT_TIMESTAMP",
@@ -855,6 +858,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "DAY_MINUTE",
     "DAY_SECOND",
     "DEC",
+    "DEALLOCATE",
     "DECIMAL",
     "DECLARE",
     "DEFAULT",
@@ -864,6 +868,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "DESC",
     "DESCRIBE",
     "DETERMINISTIC",
+    "DIAGNOSTICS",
     "DISABLE",
     "DISCARD",
     "DISTINCT",
@@ -910,6 +915,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "FULLTEXT",
     "FUNCTION",
     "GENERAL",
+    "GENERATED",
     "GEOMETRY",
     "GEOMETRYCOLLECTION",
     "GET",
@@ -992,6 +998,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "MEDIUMTEXT",
     "MEMORY",
     "MERGE",
+    "MESSAGE_TEXT",
     "MICROSECOND",
     "MIDDLEINT",
     "MIN_ROWS",
@@ -1006,6 +1013,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "MULTIPOINT",
     "MULTIPOLYGON",
     "MUTEX",
+    "MYSQL_ERRNO",
     "NAMES",
     "NATIONAL",
     "NATURAL",
@@ -1043,6 +1051,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "POINT",
     "POLYGON",
     "PORT",
+    "PRECEDING",
     "PRECISION",
     "PREPARE",
     "PRESERVE",
@@ -1075,6 +1084,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "RESIGNAL",
     "RESTRICT",
     "RETURN",
+    "RETURNED_SQLSTATE",
     "RETURNS",
     "REVOKE",
     "RIGHT",
@@ -1130,6 +1140,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "STATUS",
     "STOP",
     "STORAGE",
+    "STORED",
     "STRAIGHT_JOIN",
     "SUBJECT",
     "SUBPARTITION",
@@ -1157,6 +1168,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "TRUE",
     "TRUNCATE",
     "TYPE",
+    "UNBOUNDED",
     "UNCOMMITTED",
     "UNDEFINED",
     "UNDO",
@@ -1182,12 +1194,14 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "VARIABLES",
     "VARYING",
     "VIEW",
+    "VIRTUAL",
     "WAIT",
     "WARNINGS",
     "WEEK",
     "WHEN",
     "WHERE",
     "WHILE",
+    "WINDOW",
     "WITH",
     "WORK",
     "WRITE",
@@ -6138,6 +6152,7 @@ fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed: &str)
         format_query_owner_header_kind(trimmed),
         Some(FormatQueryOwnerKind::FromItem | FormatQueryOwnerKind::Condition)
     ) || format_query_owner_pending_header_kind(trimmed).is_some()
+        || line_has_exact_identifier_sequence(trimmed, &["WINDOW"])
         || format_indented_paren_owner_header_kind(trimmed)
             .is_some_and(|kind| kind != FormatIndentedParenOwnerKind::ModelSubclause)
         || format_indented_paren_pending_header_kind(trimmed).is_some()
@@ -6234,6 +6249,34 @@ mod tests {
     fn oracle_sql_keyword_lookup_uses_uppercase_tokens() {
         assert!(is_oracle_sql_keyword("SELECT"));
         assert!(!is_oracle_sql_keyword("select"));
+    }
+
+    #[test]
+    fn mysql_keyword_lookup_covers_mariadb_diagnostics_and_generated_column_tokens() {
+        for keyword in [
+            "ALWAYS",
+            "CURRENT",
+            "DEALLOCATE",
+            "DIAGNOSTICS",
+            "GENERATED",
+            "MESSAGE_TEXT",
+            "MYSQL_ERRNO",
+            "PRECEDING",
+            "RETURNED_SQLSTATE",
+            "STORED",
+            "UNBOUNDED",
+            "VIRTUAL",
+            "WINDOW",
+        ] {
+            assert!(
+                is_mysql_sql_keyword(keyword),
+                "missing MySQL/MariaDB keyword: {keyword}"
+            );
+        }
+        assert!(
+            !is_mysql_sql_keyword("INNODB"),
+            "storage engine names should not be promoted to keywords"
+        );
     }
 
     #[test]

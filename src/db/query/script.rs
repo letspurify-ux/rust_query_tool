@@ -2243,7 +2243,10 @@ impl QueryExecutor {
                 }
             }
 
-            if clause_kind.is_none() && !blocks_structural_line_continuation {
+            if clause_kind.is_none()
+                && context.query_role != AutoFormatQueryRole::Base
+                && !blocks_structural_line_continuation
+            {
                 if let Some(continuation) = active_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
@@ -2252,7 +2255,10 @@ impl QueryExecutor {
                 }
             }
 
-            if clause_kind.is_none() && !blocks_structural_line_continuation {
+            if clause_kind.is_none()
+                && context.query_role != AutoFormatQueryRole::Base
+                && !blocks_structural_line_continuation
+            {
                 if let Some(continuation) = active_inline_comment_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
@@ -2281,6 +2287,17 @@ impl QueryExecutor {
                 current_line_is_exact_exception,
             ) {
                 context.auto_depth = context.auto_depth.max(with_plsql_body_depth);
+            }
+
+            if active_frame.is_some_and(|frame| {
+                frame.head_kind == Some(AutoFormatClauseKind::With)
+                    && !frame.with_main_query_started
+                    && Self::line_is_cte_definition_header(clause_detection_trimmed)
+            }) {
+                if let Some(query_base_depth) = context.query_base_depth {
+                    context.auto_depth = query_base_depth;
+                    context.query_role = AutoFormatQueryRole::Base;
+                }
             }
 
             context.line_semantic = AutoFormatLineSemantic::from_analysis(
@@ -7443,25 +7460,19 @@ impl QueryExecutor {
     }
 
     fn parse_mysql_tool_command(raw: &str) -> Option<ToolCommand> {
-        let upper = raw.to_ascii_uppercase();
-
         if let Some(command) = Self::parse_mysql_delimiter_command(raw) {
             return Some(command);
         }
 
-        if upper == "SOURCE" || upper.starts_with("SOURCE ") {
-            return Some(Self::parse_mysql_source_command(raw));
-        }
+        let tokens = Self::tokenize_mysql_tool_command(raw);
+        let head = tokens.first()?.to_ascii_uppercase();
 
-        if upper == "USE" || upper.starts_with("USE ") {
-            return Some(Self::parse_mysql_use_command(raw));
+        match head.as_str() {
+            "SOURCE" => Some(Self::parse_mysql_source_command(raw)),
+            "USE" => Some(Self::parse_mysql_use_command(raw)),
+            "SHOW" => Self::parse_mysql_show_command(raw),
+            _ => None,
         }
-
-        if upper.starts_with("SHOW ") || upper == "SHOW" {
-            return Self::parse_mysql_show_command(raw);
-        }
-
-        None
     }
 
     fn parse_mysql_delimiter_command(raw: &str) -> Option<ToolCommand> {
@@ -7470,8 +7481,8 @@ impl QueryExecutor {
     }
 
     fn parse_mysql_source_command(raw: &str) -> ToolCommand {
-        let rest = raw.get(6..).unwrap_or_default().trim();
-        let path = Self::extract_script_path(rest);
+        let rest = Self::mysql_tool_command_remainder(raw).unwrap_or_default();
+        let path = Self::extract_mysql_script_path(rest);
         if path.is_empty() {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
@@ -7485,9 +7496,132 @@ impl QueryExecutor {
         }
     }
 
+    fn mysql_tool_command_remainder(raw: &str) -> Option<&str> {
+        let bytes = raw.as_bytes();
+        let mut index = 0usize;
+
+        loop {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+
+            if index >= bytes.len() {
+                return None;
+            }
+
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+
+            if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                return None;
+            }
+
+            break;
+        }
+
+        while index < bytes.len() {
+            if bytes[index].is_ascii_whitespace() {
+                break;
+            }
+            if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                break;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                break;
+            }
+            index += 1;
+        }
+
+        Some(raw.get(index..).unwrap_or_default().trim())
+    }
+
+    fn tokenize_mysql_tool_command(raw: &str) -> Vec<String> {
+        let bytes = raw.as_bytes();
+        let mut tokens = Vec::new();
+        let mut index = 0usize;
+
+        while index < bytes.len() {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+            if index >= bytes.len() {
+                break;
+            }
+
+            if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                break;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+
+            let token_start = index;
+            while index < bytes.len() {
+                if bytes[index].is_ascii_whitespace() {
+                    break;
+                }
+                if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                    break;
+                }
+                if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                    break;
+                }
+                if bytes[index] == b'`' {
+                    index = Self::skip_mysql_backtick_identifier(bytes, index);
+                    continue;
+                }
+                if bytes[index] == b'\'' {
+                    index = Self::skip_mysql_quoted_literal(bytes, index, b'\'', true);
+                    continue;
+                }
+                if bytes[index] == b'"' {
+                    index = Self::skip_mysql_quoted_literal(bytes, index, b'"', true);
+                    continue;
+                }
+                index += 1;
+            }
+
+            if let Some(token) = raw.get(token_start..index) {
+                if !token.is_empty() {
+                    tokens.push(token.to_string());
+                }
+            } else {
+                break;
+            }
+        }
+
+        tokens
+    }
+
+    fn unquote_mysql_tool_string_token(token: &str) -> String {
+        let trimmed = token.trim();
+        if let Some(inner) = trimmed
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+        {
+            return inner.replace("''", "'");
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            return inner.replace("\"\"", "\"");
+        }
+        trimmed.to_string()
+    }
+
     fn parse_mysql_use_command(raw: &str) -> ToolCommand {
-        let rest = raw.get(3..).unwrap_or_default().trim();
-        if rest.is_empty() {
+        let tokens = Self::tokenize_mysql_tool_command(raw);
+        if tokens.len() != 2 {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
                 message: "USE requires a database name.".to_string(),
@@ -7496,12 +7630,12 @@ impl QueryExecutor {
         }
 
         ToolCommand::Use {
-            database: rest.to_string(),
+            database: tokens[1].clone(),
         }
     }
 
     fn parse_mysql_show_command(raw: &str) -> Option<ToolCommand> {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let tokens = Self::tokenize_mysql_tool_command(raw);
         if tokens.len() < 2 {
             return None;
         }
@@ -7516,7 +7650,7 @@ impl QueryExecutor {
                         || tokens[2].eq_ignore_ascii_case("IN")) =>
             {
                 Some(ToolCommand::ShowColumns {
-                    table: tokens[3].to_string(),
+                    table: tokens[3].clone(),
                     schema: None,
                 })
             }
@@ -7528,38 +7662,26 @@ impl QueryExecutor {
                         || tokens[4].eq_ignore_ascii_case("IN")) =>
             {
                 Some(ToolCommand::ShowColumns {
-                    table: tokens[3].to_string(),
-                    schema: Some(tokens[5].to_string()),
+                    table: tokens[3].clone(),
+                    schema: Some(tokens[5].clone()),
                 })
             }
             "CREATE" if tokens.len() == 4 && tokens[2].eq_ignore_ascii_case("TABLE") => {
                 Some(ToolCommand::ShowCreateTable {
-                    table: tokens[3].to_string(),
+                    table: tokens[3].clone(),
                 })
             }
             "PROCESSLIST" if tokens.len() == 2 => Some(ToolCommand::ShowProcessList),
             "VARIABLES" if tokens.len() == 2 => Some(ToolCommand::ShowVariables { filter: None }),
             "VARIABLES" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
                 Some(ToolCommand::ShowVariables {
-                    filter: Some(
-                        tokens[3..]
-                            .join(" ")
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string(),
-                    ),
+                    filter: Some(Self::unquote_mysql_tool_string_token(&tokens[3..].join(" "))),
                 })
             }
             "STATUS" if tokens.len() == 2 => Some(ToolCommand::ShowStatus { filter: None }),
             "STATUS" if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("LIKE") => {
                 Some(ToolCommand::ShowStatus {
-                    filter: Some(
-                        tokens[3..]
-                            .join(" ")
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string(),
-                    ),
+                    filter: Some(Self::unquote_mysql_tool_string_token(&tokens[3..].join(" "))),
                 })
             }
             "WARNINGS" if tokens.len() == 2 => Some(ToolCommand::ShowWarnings),
@@ -8423,6 +8545,60 @@ impl QueryExecutor {
         }
 
         remainder.trim()
+    }
+
+    fn extract_mysql_script_path(remainder: &str) -> &str {
+        let bytes = remainder.as_bytes();
+        let mut index = 0usize;
+
+        loop {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+
+            if index >= bytes.len() {
+                return "";
+            }
+
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+
+            break;
+        }
+
+        let path_start = index;
+        while index < bytes.len() {
+            if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                break;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                break;
+            }
+            if bytes[index] == b'\'' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'\'', true);
+                continue;
+            }
+            if bytes[index] == b'"' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'"', true);
+                continue;
+            }
+            index += 1;
+        }
+
+        let mut path_end = index.min(remainder.len());
+        while path_end > path_start && !remainder.is_char_boundary(path_end) {
+            path_end -= 1;
+        }
+
+        remainder
+            .get(path_start..path_end)
+            .unwrap_or_default()
+            .trim()
     }
 
     fn is_start_script_command(trimmed: &str) -> bool {

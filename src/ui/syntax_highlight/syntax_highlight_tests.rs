@@ -9,6 +9,17 @@ fn load_mariadb_highlight_test_file(name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn assert_token_has_style(text: &str, styles: &str, token: &str, expected_style: char) {
+    let start = text.find(token).expect("token should exist in test SQL");
+    let end = start + token.len();
+    assert!(
+        styles[start..end]
+            .chars()
+            .all(|style| style == expected_style),
+        "{token} should use style {expected_style}"
+    );
+}
+
 #[test]
 fn test_number_highlighting_supports_single_decimal_point() {
     let highlighter = SqlHighlighter::new();
@@ -2280,6 +2291,65 @@ fn test_mysql_backtick_identifier_highlighting_uses_quoted_identifier_style() {
 }
 
 #[test]
+fn test_mysql_highlighting_covers_mariadb_keyword_gaps_and_end_delimiter_suffix() {
+    let text = "END$$
+GET DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO, v_msg = MESSAGE_TEXT;
+DEALLOCATE PREPARE stmt;
+CREATE TABLE t (
+    c1 INT GENERATED ALWAYS AS (col_a + 1) STORED,
+    c2 INT AS (col_b + 1) VIRTUAL
+);
+SELECT 1
+FROM t
+WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
+ALTER TABLE t ENGINE = InnoDB;
+RELEASE SAVEPOINT sp;";
+
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let styles = highlighter.generate_styles(text);
+
+    for token in [
+        "END",
+        "DIAGNOSTICS",
+        "DEALLOCATE",
+        "RETURNED_SQLSTATE",
+        "MYSQL_ERRNO",
+        "MESSAGE_TEXT",
+        "WINDOW",
+        "GENERATED",
+        "ALWAYS",
+        "STORED",
+        "VIRTUAL",
+        "UNBOUNDED",
+        "PRECEDING",
+        "CURRENT",
+        "ENGINE",
+        "RELEASE",
+    ] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
+
+    let delimiter_start = text.find("$$").expect("delimiter suffix should exist");
+    let delimiter_end = delimiter_start + 2;
+    assert!(
+        styles[delimiter_start..delimiter_end]
+            .chars()
+            .all(|style| style != STYLE_KEYWORD),
+        "delimiter suffix after END should not inherit keyword highlighting"
+    );
+
+    let engine_name_start = text.find("InnoDB").expect("engine name should exist");
+    let engine_name_end = engine_name_start + "InnoDB".len();
+    assert!(
+        styles[engine_name_start..engine_name_end]
+            .chars()
+            .all(|style| style == STYLE_DEFAULT),
+        "storage engine names should remain non-keyword text"
+    );
+}
+
+#[test]
 fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
     let text = load_mariadb_highlight_test_file("test1.txt");
     assert!(
@@ -2317,8 +2387,7 @@ fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
         "backtick identifier should use quoted-identifier highlighting"
     );
 
-    let string_literal =
-        r#"'contains ; semicolon, ''quote'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, emoji 😊'"#;
+    let string_literal = r#"'contains ; semicolon, ''quote'', backslash \\\\, text -- not comment, text /* not comment */, token DELIMITER $$, emoji 😊'"#;
     let string_start = text.find(string_literal).unwrap_or(0);
     let string_end = string_start + string_literal.len();
     assert!(

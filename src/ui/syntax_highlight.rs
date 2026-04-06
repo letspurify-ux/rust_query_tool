@@ -810,6 +810,16 @@ impl SqlHighlighter {
                 {
                     idx += 1;
                 }
+                let mut word_end = idx;
+                if self.db_type == DatabaseType::MySQL {
+                    if let Some(suffix_start) = text
+                        .get(start..word_end)
+                        .and_then(mysql_keyword_delimiter_suffix_start)
+                    {
+                        word_end = start + suffix_start;
+                    }
+                }
+                idx = word_end;
                 let word = text.get(start..idx).unwrap_or("");
 
                 // DATE / TIMESTAMP / INTERVAL literals
@@ -1288,6 +1298,26 @@ fn is_relation_identifier_context_word(word: &str) -> bool {
         word,
         "WITH" | "FROM" | "JOIN" | "UPDATE" | "INTO" | "USING" | "TABLE"
     )
+}
+
+fn mysql_keyword_delimiter_suffix_start(word: &str) -> Option<usize> {
+    let suffix_start = word.find('$')?;
+    let suffix = word.get(suffix_start..)?;
+    if !suffix.bytes().all(|byte| byte == b'$') {
+        return None;
+    }
+
+    let keyword = word.get(..suffix_start)?;
+    if keyword.is_empty() {
+        return None;
+    }
+
+    let upper: Cow<'_, str> = if keyword.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        Cow::Owned(keyword.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(keyword)
+    };
+    sql_text::is_mysql_sql_keyword(upper.as_ref()).then_some(suffix_start)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

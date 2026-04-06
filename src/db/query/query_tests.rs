@@ -8328,6 +8328,63 @@ fn test_parse_tool_command_mysql_show_columns_with_schema_round_trips() {
 }
 
 #[test]
+fn test_parse_tool_command_mysql_use_preserves_quoted_identifier_and_ignores_comment() {
+    let command = QueryExecutor::parse_tool_command("USE `qt final-boss` -- keep current db")
+        .expect("quoted MySQL USE command should parse as a tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::Use { database } if database == "`qt final-boss`"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_use_accepts_leading_block_comment_and_tab_separator() {
+    let command = QueryExecutor::parse_tool_command("/* keep */ USE\t`qt final-boss` # note")
+        .expect("MySQL USE with leading block comment and tab should parse as a tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::Use { database } if database == "`qt final-boss`"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_create_table_preserves_quoted_identifier_and_comment() {
+    let command =
+        QueryExecutor::parse_tool_command("SHOW CREATE TABLE `order summary` # keep comment")
+            .expect("quoted SHOW CREATE TABLE should parse as a MySQL tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::ShowCreateTable { table } if table == "`order summary`"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_show_variables_like_keeps_spaced_literal() {
+    let command =
+        QueryExecutor::parse_tool_command("SHOW VARIABLES LIKE 'sql mode %'");
+
+    assert!(matches!(
+        command,
+        Some(crate::db::ToolCommand::ShowVariables { filter: Some(filter) })
+            if filter == "sql mode %"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_source_keeps_double_dash_in_path_and_strips_hash_comment() {
+    let command = QueryExecutor::parse_tool_command("SOURCE /tmp/mysql--seed.sql # note")
+        .expect("MySQL SOURCE should parse as a tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::MysqlSource { path } if path == "/tmp/mysql--seed.sql"
+    ));
+}
+
+#[test]
 fn test_parse_tool_command_mysql_show_columns_with_like_stays_raw_statement() {
     let command = QueryExecutor::parse_tool_command("SHOW COLUMNS FROM orders LIKE 'id%'");
 
@@ -10531,15 +10588,13 @@ fn test_split_script_items_mariadb_final_boss_regression() {
         "versioned comment statement should stay executable: {statements:?}"
     );
     assert!(
-        !statements
-            .iter()
-            .any(|stmt| {
-                let trimmed = stmt.trim_start();
-                trimmed.starts_with('#')
-                    || (trimmed.starts_with("/*")
-                        && !trimmed.starts_with("/*!")
-                        && !trimmed.starts_with("/**"))
-            }),
+        !statements.iter().any(|stmt| {
+            let trimmed = stmt.trim_start();
+            trimmed.starts_with('#')
+                || (trimmed.starts_with("/*")
+                    && !trimmed.starts_with("/*!")
+                    && !trimmed.starts_with("/**"))
+        }),
         "plain MariaDB comments should not become standalone execution units: {statements:?}"
     );
     assert!(

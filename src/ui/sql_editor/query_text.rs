@@ -1263,8 +1263,7 @@ mod tests {
                 continue;
             }
 
-            if mysql_compatible && c == '<' && next == Some('=') && chars.get(i + 2) == Some(&'>')
-            {
+            if mysql_compatible && c == '<' && next == Some('=') && chars.get(i + 2) == Some(&'>') {
                 tokens.push(SqlToken::Symbol("<=>".to_string()));
                 i += 3;
                 continue;

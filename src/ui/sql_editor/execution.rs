@@ -1324,7 +1324,11 @@ impl SqlEditorWidget {
                             });
                         }
                         ToolCommand::Use { database } => {
-                            let use_sql = format!("USE {}", database);
+                            let use_sql = SqlEditorWidget::format_tool_command(
+                                &ToolCommand::Use {
+                                    database: database.clone(),
+                                },
+                            );
                             match execute_mysql_sql(use_sql.as_str()) {
                                 Ok(_) => {
                                     let info = SqlEditorWidget::sync_mysql_connection_info_for_ui(
@@ -3956,7 +3960,11 @@ impl SqlEditorWidget {
                                             db_activity.clone(),
                                         );
                                         if let Some(mysql_conn) = cg.get_mysql_connection_mut() {
-                                            let use_sql = format!("USE `{}`", database);
+                                            let use_sql = SqlEditorWidget::format_tool_command(
+                                                &ToolCommand::Use {
+                                                    database: database.clone(),
+                                                },
+                                            );
                                             match crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, &use_sql) {
                                                 Ok(_) => Ok(()),
                                                 Err(e) => Err(format!("Error: {}", e)),

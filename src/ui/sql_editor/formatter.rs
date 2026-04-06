@@ -3234,6 +3234,62 @@ impl SqlEditorWidget {
         }
     }
 
+    fn mysql_identifier_requires_quotes(segment: &str) -> bool {
+        if segment.is_empty() {
+            return true;
+        }
+
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            return true;
+        };
+
+        if first.is_ascii_digit() || !(first.is_ascii_alphabetic() || matches!(first, '_' | '$')) {
+            return true;
+        }
+
+        if chars.any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))) {
+            return true;
+        }
+
+        sql_text::is_mysql_sql_keyword(&segment.to_ascii_uppercase())
+    }
+
+    fn quote_mysql_identifier(identifier: &str) -> String {
+        format!("`{}`", identifier.replace('`', "``"))
+    }
+
+    fn format_mysql_identifier(identifier: &str) -> String {
+        let trimmed = identifier.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if trimmed.contains('`') || trimmed.contains('"') || trimmed.contains('\'') {
+            return trimmed.to_string();
+        }
+
+        if trimmed.contains('.') {
+            return trimmed
+                .split('.')
+                .map(|segment| {
+                    if Self::mysql_identifier_requires_quotes(segment) {
+                        Self::quote_mysql_identifier(segment)
+                    } else {
+                        segment.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+        }
+
+        if Self::mysql_identifier_requires_quotes(trimmed) {
+            Self::quote_mysql_identifier(trimmed)
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     pub(super) fn format_tool_command(command: &ToolCommand) -> String {
         match command {
             ToolCommand::Var { name, data_type } => {
@@ -3469,23 +3525,31 @@ impl SqlEditorWidget {
             }
             ToolCommand::Disconnect => "DISCONNECT".to_string(),
             // MySQL-specific commands — format as-is
-            ToolCommand::Use { database } => format!("USE {}", database),
+            ToolCommand::Use { database } => {
+                format!("USE {}", Self::format_mysql_identifier(database))
+            }
             ToolCommand::ShowDatabases => "SHOW DATABASES".to_string(),
             ToolCommand::ShowTables => "SHOW TABLES".to_string(),
             ToolCommand::ShowColumns { table, schema } => match schema {
                 Some(schema_name) => {
-                    format!("SHOW COLUMNS FROM {} FROM {}", table, schema_name)
+                    format!(
+                        "SHOW COLUMNS FROM {} FROM {}",
+                        Self::format_mysql_identifier(table),
+                        Self::format_mysql_identifier(schema_name)
+                    )
                 }
-                None => format!("SHOW COLUMNS FROM {}", table),
+                None => format!("SHOW COLUMNS FROM {}", Self::format_mysql_identifier(table)),
             },
-            ToolCommand::ShowCreateTable { table } => format!("SHOW CREATE TABLE {}", table),
+            ToolCommand::ShowCreateTable { table } => {
+                format!("SHOW CREATE TABLE {}", Self::format_mysql_identifier(table))
+            }
             ToolCommand::ShowProcessList => "SHOW PROCESSLIST".to_string(),
             ToolCommand::ShowVariables { filter } => match filter {
-                Some(f) => format!("SHOW VARIABLES LIKE '{}'", f),
+                Some(f) => format!("SHOW VARIABLES LIKE '{}'", Self::escape_sql_literal(f)),
                 None => "SHOW VARIABLES".to_string(),
             },
             ToolCommand::ShowStatus { filter } => match filter {
-                Some(f) => format!("SHOW STATUS LIKE '{}'", f),
+                Some(f) => format!("SHOW STATUS LIKE '{}'", Self::escape_sql_literal(f)),
                 None => "SHOW STATUS".to_string(),
             },
             ToolCommand::MysqlDelimiter { delimiter } => format!("DELIMITER {}", delimiter),
@@ -14966,6 +15030,41 @@ FROM t;
         });
 
         assert_eq!(rendered, "ACCEPT v_name PROMPT 'Owner''s value?'");
+    }
+
+    #[test]
+    fn format_tool_command_mysql_use_quotes_unsafe_identifier_and_preserves_prequoted_input() {
+        let unsafe_rendered =
+            SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::Use {
+                database: "qt final-boss".to_string(),
+            });
+        let quoted_rendered =
+            SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::Use {
+                database: "`qt final-boss`".to_string(),
+            });
+
+        assert_eq!(unsafe_rendered, "USE `qt final-boss`");
+        assert_eq!(quoted_rendered, "USE `qt final-boss`");
+    }
+
+    #[test]
+    fn format_tool_command_mysql_show_columns_quotes_keyword_schema_and_table() {
+        let rendered = SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::ShowColumns {
+            table: "group".to_string(),
+            schema: Some("order".to_string()),
+        });
+
+        assert_eq!(rendered, "SHOW COLUMNS FROM `group` FROM `order`");
+    }
+
+    #[test]
+    fn format_tool_command_mysql_show_variables_escapes_single_quote_literal() {
+        let rendered =
+            SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::ShowVariables {
+                filter: Some("sql_mode_'strict'".to_string()),
+            });
+
+        assert_eq!(rendered, "SHOW VARIABLES LIKE 'sql_mode_''strict'''");
     }
 
     #[test]
