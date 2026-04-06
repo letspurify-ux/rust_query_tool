@@ -43,6 +43,12 @@ impl MysqlExecutor {
             Some("ROLLBACK") => MysqlStatementKind::Rollback,
             Some("USE") => MysqlStatementKind::Use,
             Some("CALL") => MysqlStatementKind::Call,
+            // SHOW, DESCRIBE/DESC, EXPLAIN all return tabular result sets in MySQL;
+            // route them through execute_select so the results are not silently
+            // discarded by query_drop().
+            Some("SHOW") | Some("DESCRIBE") | Some("DESC") | Some("EXPLAIN") => {
+                MysqlStatementKind::Select
+            }
             _ => MysqlStatementKind::Ddl,
         }
     }
@@ -1048,13 +1054,22 @@ impl MysqlObjectBrowser {
     fn parse_mysql_parameter(parameter: &str, position: i32) -> Option<ProcedureArgument> {
         let mut index = Self::skip_ascii_whitespace(parameter, 0);
 
-        // Skip any leading `#`-style line comments that may appear when a hash
+        // Skip any leading line comments (`#` or `--`) that may appear when a
         // comment from the previous parameter follows the separator comma on
-        // the same line (e.g. `p1 INT, # note\np2 VARCHAR(50)`).
+        // the same line (e.g. `p1 INT, # note\np2 VARCHAR(50)` or
+        // `p1 INT, -- note\np2 VARCHAR(50)`).
         {
             let bytes = parameter.as_bytes();
             loop {
                 if bytes.get(index) == Some(&b'#') {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                    if index < bytes.len() {
+                        index += 1; // skip the newline itself
+                    }
+                    index = Self::skip_ascii_whitespace(parameter, index);
+                } else if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
                     while index < bytes.len() && bytes[index] != b'\n' {
                         index += 1;
                     }
@@ -1987,6 +2002,201 @@ mod tests {
         assert_eq!(
             MysqlExecutor::classify_statement("REPLACE INTO t(id, v) VALUES (1, 'x')"),
             super::MysqlStatementKind::Dml
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug fix: SHOW / DESCRIBE / EXPLAIN must be routed as Select so that
+    // their tabular result sets are not silently discarded by query_drop().
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mysql_classify_statement_show_databases_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW DATABASES"),
+            super::MysqlStatementKind::Select,
+            "SHOW DATABASES must be Select so its result set is not discarded"
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_tables_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW TABLES"),
+            super::MysqlStatementKind::Select
+        );
+        // Variants with qualifiers must also be Select.
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW TABLES FROM mydb"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW FULL TABLES"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_variables_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW VARIABLES"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW VARIABLES LIKE 'sql_mode'"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_status_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW STATUS"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_processlist_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW PROCESSLIST"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW FULL PROCESSLIST"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_warnings_and_errors_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW WARNINGS"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW ERRORS"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_show_create_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW CREATE TABLE orders"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW CREATE PROCEDURE p_sync"),
+            super::MysqlStatementKind::Select
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("SHOW CREATE VIEW v_active"),
+            super::MysqlStatementKind::Select
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_describe_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("DESCRIBE employees"),
+            super::MysqlStatementKind::Select,
+            "DESCRIBE must be Select so its result set is not discarded"
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("DESC employees"),
+            super::MysqlStatementKind::Select,
+            "DESC must be Select so its result set is not discarded"
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_explain_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("EXPLAIN SELECT * FROM employees"),
+            super::MysqlStatementKind::Select,
+            "EXPLAIN must be Select so its result set is not discarded"
+        );
+        assert_eq!(
+            MysqlExecutor::classify_statement("EXPLAIN UPDATE employees SET salary = 0"),
+            super::MysqlStatementKind::Select,
+            "EXPLAIN UPDATE must also be routed as Select"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug fix: parse_mysql_parameter must skip leading `--` style comments
+    // just as it already skips leading `#` comments.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mysql_parse_routine_arguments_ignores_comma_inside_dash_dash_comment() {
+        // The `--` comment on the first parameter contains a comma; it must not
+        // be treated as a parameter separator.
+        let ddl = "CREATE PROCEDURE `dash_comment_proc`(\
+            p_id INT,    -- first param, the user id\n\
+            p_name VARCHAR(50)\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with -- comments should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "comma inside -- comment must not create a phantom parameter: {arguments:?}"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_id"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("INT"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_name"));
+        assert_eq!(arguments[1].data_type.as_deref(), Some("VARCHAR(50)"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_skips_leading_dash_dash_comment_before_param() {
+        // A `--` comment appears on its own line before the parameter name.
+        // parse_mysql_parameter must skip it and still parse the name correctly.
+        let ddl = "CREATE PROCEDURE `leading_dash_proc`(\
+            -- user id\n\
+            p_id INT,\
+            -- user name\n\
+            p_name VARCHAR(100)\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with leading -- comments should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "leading -- comment must not break parameter parsing: {arguments:?}"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_id"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("INT"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_name"));
+        assert_eq!(arguments[1].data_type.as_deref(), Some("VARCHAR(100)"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_ignores_default_inside_dash_dash_comment() {
+        // DEFAULT keyword appearing in a `--` comment must not be treated as
+        // the parameter default-value marker.
+        let ddl = "CREATE PROCEDURE `dash_default_proc`(\
+            p_status VARCHAR(20) -- DEFAULT 'active'\n\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with DEFAULT in -- comment should parse");
+
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].name.as_deref(), Some("p_status"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("VARCHAR(20)"));
+        assert!(
+            arguments[0].default_value.is_none(),
+            "DEFAULT inside -- comment must not be parsed as actual default value"
         );
     }
 }
