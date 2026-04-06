@@ -1077,6 +1077,21 @@ impl ConstructState {
         if is_analytic_within_group {
             return true;
         }
+        // CHARACTER SET stays inline (MySQL-specific syntax)
+        if keyword == "SET" && matches!(prev_word_upper, Some("CHARACTER")) {
+            return true;
+        }
+        // SIGNAL/RESIGNAL ... SET MESSAGE_TEXT: SET is a sub-clause continuation,
+        // not an independent clause break (MySQL-specific syntax)
+        if keyword == "SET" && SqlEditorWidget::is_mysql_signal_set_clause(tokens, idx) {
+            return true;
+        }
+        // ON DUPLICATE KEY UPDATE: UPDATE stays inline with KEY (MySQL-specific syntax)
+        if keyword == "UPDATE"
+            && SqlEditorWidget::is_mysql_on_duplicate_key_update(tokens, idx)
+        {
+            return true;
+        }
         false
     }
 
@@ -3021,6 +3036,32 @@ impl SqlEditorWidget {
             })
     }
 
+    /// Returns true when SET is a sub-clause of a MySQL SIGNAL/RESIGNAL statement.
+    /// In MySQL, SIGNAL SQLSTATE '...' SET MESSAGE_TEXT = ... has SET as a
+    /// continuation of the SIGNAL statement, not a new independent clause.
+    fn is_mysql_signal_set_clause(tokens: &[SqlToken], idx: usize) -> bool {
+        Self::recent_statement_words_before(tokens, idx, 8)
+            .iter()
+            .any(|word| {
+                word.eq_ignore_ascii_case("SIGNAL") || word.eq_ignore_ascii_case("RESIGNAL")
+            })
+    }
+
+    /// Returns true when UPDATE is the keyword following ON DUPLICATE KEY,
+    /// forming MySQL's ON DUPLICATE KEY UPDATE clause.
+    fn is_mysql_on_duplicate_key_update(tokens: &[SqlToken], idx: usize) -> bool {
+        let recent = Self::recent_statement_words_before(tokens, idx, 3);
+        recent
+            .first()
+            .is_some_and(|w| w.eq_ignore_ascii_case("KEY"))
+            && recent
+                .get(1)
+                .is_some_and(|w| w.eq_ignore_ascii_case("DUPLICATE"))
+            && recent
+                .get(2)
+                .is_some_and(|w| w.eq_ignore_ascii_case("ON"))
+    }
+
     fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
         statement
             .split_whitespace()
@@ -3602,7 +3643,7 @@ impl SqlEditorWidget {
             ToolCommand::Disconnect => "DISCONNECT".to_string(),
             // MySQL-specific commands — format as-is
             ToolCommand::Use { database } => {
-                format!("USE {}", Self::format_mysql_identifier(database))
+                format!("USE {};", Self::format_mysql_identifier(database))
             }
             ToolCommand::ShowDatabases => "SHOW DATABASES".to_string(),
             ToolCommand::ShowTables => "SHOW TABLES".to_string(),
@@ -3686,6 +3727,8 @@ impl SqlEditorWidget {
         let mut exit_condition_state = ExitConditionState::None;
         let mut with_cte_state = WithCteFormatState::default();
         let mut statement_has_with_clause = false;
+        // MySQL ON DUPLICATE KEY UPDATE: tracks when VALUES() is a function, not a clause
+        let mut on_duplicate_key_update_active = false;
         let mut trigger_header_state = TriggerHeaderState::default();
         let mut compound_trigger_state = CompoundTriggerState::default();
         let mut plsql_context_state = ScopedFlag::default();
@@ -3945,8 +3988,7 @@ impl SqlEditorWidget {
                     let mysql_declare_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_for_clause(tokens, idx);
-                    let mysql_if_exists_modifier = mysql_compatible
-                        && upper == "IF"
+                    let mysql_if_exists_modifier = upper == "IF"
                         && Self::is_mysql_if_exists_modifier(tokens, idx, next_word);
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
@@ -4241,6 +4283,8 @@ impl SqlEditorWidget {
                         select_list_layout_state.clear();
                     } else if clause_keywords.contains(&upper.as_str())
                         && !mysql_declare_for_clause
+                        // VALUES() inside ON DUPLICATE KEY UPDATE is a function, not a clause
+                        && !(on_duplicate_key_update_active && upper == "VALUES")
                         && !construct.suppresses_clause_break(
                             tokens,
                             idx,
@@ -5159,6 +5203,15 @@ impl SqlEditorWidget {
                     }
                     exit_condition_state.on_keyword(upper.as_str());
 
+                    // MySQL ON DUPLICATE KEY UPDATE: activate flag so that VALUES(col)
+                    // inside the UPDATE assignment list is treated as a function call.
+                    if upper == "UPDATE"
+                        && paren_stack.is_empty()
+                        && Self::is_mysql_on_duplicate_key_update(tokens, idx)
+                    {
+                        on_duplicate_key_update_active = true;
+                    }
+
                     prev_word_upper = Some(upper);
                 }
                 SqlToken::String(literal) => {
@@ -5710,6 +5763,7 @@ impl SqlEditorWidget {
                             trim_trailing_space(&mut out);
                             out.push(';');
                             current_clause = None;
+                            on_duplicate_key_update_active = false;
                             select_list_layout_state.clear();
                             open_cursor_state = OpenCursorFormatState::None;
                             open_for_select_stack.clear();
@@ -10037,7 +10091,14 @@ impl SqlEditorWidget {
                 .filter(|t| !matches!(t, SqlToken::Comment(_)))
                 .peekable();
             let name_token = tokens_iter.next();
-            let name = name_token.map(Self::token_text).unwrap_or_default();
+            // Preserve the original case for column names: they are identifiers, not
+            // keywords, even if the word happens to match a SQL keyword (e.g. `profile`).
+            let name = name_token
+                .map(|t| match t {
+                    SqlToken::Word(w) => w.clone(),
+                    _ => Self::token_text(t),
+                })
+                .unwrap_or_default();
 
             let mut type_tokens: Vec<SqlToken> = Vec::new();
             let mut rest_tokens: Vec<SqlToken> = Vec::new();
@@ -15278,8 +15339,8 @@ FROM t;
             database: "`qt final-boss`".to_string(),
         });
 
-        assert_eq!(unsafe_rendered, "USE `qt final-boss`");
-        assert_eq!(quoted_rendered, "USE `qt final-boss`");
+        assert_eq!(unsafe_rendered, "USE `qt final-boss`;");
+        assert_eq!(quoted_rendered, "USE `qt final-boss`;");
     }
 
     #[test]
@@ -36039,5 +36100,29 @@ END;"#;
             ),
             formatted
         );
+    }
+
+    #[test]
+    fn debug_format_mysql_test_files() {
+        let test1 = std::fs::read_to_string("test_mariadb/test1.txt").unwrap_or_default();
+        let test2 = std::fs::read_to_string("test_mariadb/test2.txt").unwrap_or_default();
+        let test3 = std::fs::read_to_string("test_mariadb/test3.txt").unwrap_or_default();
+
+        let fmt1 = SqlEditorWidget::format_sql_basic(&test1);
+        let fmt2 = SqlEditorWidget::format_sql_basic(&test2);
+        let fmt3 = SqlEditorWidget::format_sql_basic(&test3);
+
+        println!("=== test1.txt formatted ===\n{fmt1}");
+        println!("=== test2.txt formatted ===\n{fmt2}");
+        println!("=== test3.txt formatted ===\n{fmt3}");
+
+        // idempotency checks
+        let fmt1b = SqlEditorWidget::format_sql_basic(&fmt1);
+        let fmt2b = SqlEditorWidget::format_sql_basic(&fmt2);
+        let fmt3b = SqlEditorWidget::format_sql_basic(&fmt3);
+
+        assert_eq!(fmt1, fmt1b, "test1.txt formatting is not idempotent");
+        assert_eq!(fmt2, fmt2b, "test2.txt formatting is not idempotent");
+        assert_eq!(fmt3, fmt3b, "test3.txt formatting is not idempotent");
     }
 }
