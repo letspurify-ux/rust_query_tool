@@ -129,12 +129,7 @@ impl MysqlExecutor {
             MysqlStatementKind::Use => {
                 let start = Instant::now();
                 conn.query_drop(sql)?;
-                let db_name = trimmed
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim_end_matches(';')
-                    .trim_matches('`');
+                let db_name = Self::extract_use_database_name(trimmed);
                 Ok(vec![QueryResult {
                     sql: sql.to_string(),
                     columns: vec![],
@@ -455,6 +450,43 @@ impl MysqlExecutor {
         ))
     }
 
+    /// Extract the database name from a `USE <db>` statement for display purposes.
+    /// Handles backtick-quoted identifiers, including names containing spaces.
+    fn extract_use_database_name(trimmed_use_sql: &str) -> String {
+        let after_use = trimmed_use_sql
+            .get("USE".len()..)
+            .unwrap_or("")
+            .trim_start();
+        if after_use.starts_with('`') {
+            // Backtick-quoted identifier: scan for the closing backtick,
+            // treating `` as an escaped backtick.
+            let bytes = after_use.as_bytes();
+            let mut idx = 1usize;
+            while idx < bytes.len() {
+                if bytes[idx] == b'`' {
+                    if bytes.get(idx + 1) == Some(&b'`') {
+                        idx += 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+            after_use
+                .get(1..idx)
+                .unwrap_or(after_use)
+                .replace("``", "`")
+        } else {
+            // Unquoted: take the first whitespace/semicolon-delimited token.
+            after_use
+                .split(|c: char| c.is_ascii_whitespace() || c == ';')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+
     /// Check if a MySQL error is a timeout/cancelled error.
     pub fn is_timeout_error(err: &MysqlError) -> bool {
         let msg = err.to_string();
@@ -501,6 +533,85 @@ impl MysqlObjectBrowser {
             index += 1;
         }
         index
+    }
+
+    /// Strip a trailing `#` or `--` inline comment from `source`, honouring
+    /// single-quoted, double-quoted and backtick-quoted literals.
+    /// Returns the trimmed slice up to (but not including) the comment start.
+    fn strip_trailing_inline_comment(source: &str) -> &str {
+        let bytes = source.as_bytes();
+        let mut index = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_backtick = false;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied();
+
+            if in_single_quote {
+                if byte == b'\'' {
+                    if next == Some(b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                index += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if byte == b'"' {
+                    if next == Some(b'"') {
+                        index += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                index += 1;
+                continue;
+            }
+
+            if in_backtick {
+                if byte == b'`' {
+                    if next == Some(b'`') {
+                        index += 2;
+                        continue;
+                    }
+                    in_backtick = false;
+                }
+                index += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => {
+                    in_single_quote = true;
+                    index += 1;
+                    continue;
+                }
+                b'"' => {
+                    in_double_quote = true;
+                    index += 1;
+                    continue;
+                }
+                b'`' => {
+                    in_backtick = true;
+                    index += 1;
+                    continue;
+                }
+                b'#' => return source.get(..index).unwrap_or(source).trim_end(),
+                b'-' if next == Some(b'-') => {
+                    return source.get(..index).unwrap_or(source).trim_end()
+                }
+                _ => {}
+            }
+
+            index += 1;
+        }
+
+        source
     }
 
     fn unquote_identifier(identifier: &str) -> String {
@@ -658,6 +769,12 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
+            if byte == b'#' {
+                in_line_comment = true;
+                index += 1;
+                continue;
+            }
+
             if byte == b'/' && next == Some(b'*') {
                 in_block_comment = true;
                 index += 2;
@@ -777,6 +894,12 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
+            if byte == b'#' {
+                in_line_comment = true;
+                index += 1;
+                continue;
+            }
+
             if byte == b'/' && next == Some(b'*') {
                 in_block_comment = true;
                 index += 2;
@@ -879,6 +1002,12 @@ impl MysqlObjectBrowser {
                 continue;
             }
 
+            if byte == b'#' {
+                in_line_comment = true;
+                index += 1;
+                continue;
+            }
+
             if byte == b'/' && next == Some(b'*') {
                 in_block_comment = true;
                 index += 2;
@@ -918,6 +1047,27 @@ impl MysqlObjectBrowser {
 
     fn parse_mysql_parameter(parameter: &str, position: i32) -> Option<ProcedureArgument> {
         let mut index = Self::skip_ascii_whitespace(parameter, 0);
+
+        // Skip any leading `#`-style line comments that may appear when a hash
+        // comment from the previous parameter follows the separator comma on
+        // the same line (e.g. `p1 INT, # note\np2 VARCHAR(50)`).
+        {
+            let bytes = parameter.as_bytes();
+            loop {
+                if bytes.get(index) == Some(&b'#') {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                    if index < bytes.len() {
+                        index += 1; // skip the newline itself
+                    }
+                    index = Self::skip_ascii_whitespace(parameter, index);
+                } else {
+                    break;
+                }
+            }
+        }
+
         let mut direction = "IN".to_string();
 
         for candidate in ["INOUT", "OUT", "IN"] {
@@ -932,7 +1082,9 @@ impl MysqlObjectBrowser {
         let name_raw = parameter.get(index..name_end)?;
         let name = Self::unquote_identifier(name_raw);
 
-        let remainder = parameter.get(name_end..)?.trim();
+        // Strip trailing inline comments (`#` or `--`) from the type/default
+        // section so they don't pollute the data_type string.
+        let remainder = Self::strip_trailing_inline_comment(parameter.get(name_end..)?.trim());
         if remainder.is_empty() {
             return None;
         }
@@ -1698,5 +1850,143 @@ mod tests {
         assert_eq!(arguments[1].data_type.as_deref(), Some("INT"));
         assert_eq!(arguments[2].name.as_deref(), Some("p_kind"));
         assert_eq!(arguments[2].data_type.as_deref(), Some("ENUM('A','B')"));
+    }
+
+    // -----------------------------------------------------------------------
+    // # comment handling in DDL parser helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mysql_parse_routine_arguments_ignores_comma_inside_hash_comment() {
+        // The hash comment on the first parameter contains a comma; it must not
+        // be treated as a parameter separator.
+        let ddl = "CREATE PROCEDURE `annotated_proc`(\
+            p_id INT,    # first param, the user id\n\
+            p_name VARCHAR(50)\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with hash comments should parse");
+
+        assert_eq!(
+            arguments.len(),
+            2,
+            "comma inside # comment must not create a phantom parameter: {arguments:?}"
+        );
+        assert_eq!(arguments[0].name.as_deref(), Some("p_id"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("INT"));
+        assert_eq!(arguments[1].name.as_deref(), Some("p_name"));
+        assert_eq!(arguments[1].data_type.as_deref(), Some("VARCHAR(50)"));
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_ignores_default_keyword_inside_hash_comment() {
+        // DEFAULT inside a hash comment must not be mistaken for the parameter
+        // default-value marker.
+        let ddl = "CREATE PROCEDURE `commented_proc`(\
+            p_status VARCHAR(20) # DEFAULT 'active' -- legacy default\n\
+        )\nBEGIN SELECT 1; END";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "PROCEDURE")
+                .expect("procedure with DEFAULT in hash comment should parse");
+
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].name.as_deref(), Some("p_status"));
+        assert_eq!(arguments[0].data_type.as_deref(), Some("VARCHAR(20)"));
+        assert!(
+            arguments[0].default_value.is_none(),
+            "DEFAULT inside # comment must not be parsed as actual default value"
+        );
+    }
+
+    #[test]
+    fn mysql_parse_routine_arguments_hash_comment_with_paren_does_not_confuse_matching() {
+        // A hash comment that contains parentheses must not disturb the paren-
+        // matching logic used to locate the parameter list.
+        let ddl = "CREATE FUNCTION `fn_hash_paren`(\
+            p_val INT # range: (0, 100)\n\
+        ) RETURNS INT DETERMINISTIC\nRETURN p_val * 2";
+
+        let arguments =
+            MysqlObjectBrowser::parse_routine_arguments_from_create_ddl(ddl, "FUNCTION")
+                .expect("function with paren inside hash comment should parse");
+
+        // First argument is the synthetic RETURN entry; second is p_val.
+        assert!(
+            arguments.iter().any(|a| a.name.as_deref() == Some("p_val")),
+            "p_val parameter should be present: {arguments:?}"
+        );
+        assert!(
+            arguments.iter().any(|a| a.in_out.as_deref() == Some("RETURN")),
+            "RETURN entry should be present: {arguments:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // USE statement db_name extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mysql_extract_use_database_name_simple() {
+        assert_eq!(MysqlExecutor::extract_use_database_name("USE mydb"), "mydb");
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE mydb;"),
+            "mydb"
+        );
+    }
+
+    #[test]
+    fn mysql_extract_use_database_name_backtick_quoted() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE `mydb`"),
+            "mydb"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE `mydb`;"),
+            "mydb"
+        );
+    }
+
+    #[test]
+    fn mysql_extract_use_database_name_backtick_with_spaces() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE `my database`"),
+            "my database",
+            "backtick-quoted name with spaces should be fully extracted"
+        );
+    }
+
+    #[test]
+    fn mysql_extract_use_database_name_backtick_with_escaped_backtick() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE `odd``name`"),
+            "odd`name",
+            "escaped backtick inside quoted name should be unescaped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_statement additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mysql_classify_statement_with_cte_select_is_select() {
+        assert_eq!(
+            MysqlExecutor::classify_statement(
+                "WITH recent AS (SELECT 1 AS id) SELECT id FROM recent"
+            ),
+            super::MysqlStatementKind::Select,
+            "WITH ... SELECT (CTE) should be classified as Select, not Dml"
+        );
+    }
+
+    #[test]
+    fn mysql_classify_statement_replace_into_is_dml() {
+        assert_eq!(
+            MysqlExecutor::classify_statement("REPLACE INTO t(id, v) VALUES (1, 'x')"),
+            super::MysqlStatementKind::Dml
+        );
     }
 }
