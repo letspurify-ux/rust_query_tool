@@ -436,7 +436,11 @@ impl SqlEditorWidget {
         let sql = self.buffer.text();
         let (_, cursor_pos) = Self::editor_cursor_position(&self.editor, &self.buffer);
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
-        query_text::statement_at_cursor(&sql, cursor_pos)
+        crate::db::QueryExecutor::statement_at_cursor_for_db_type(
+            &sql,
+            cursor_pos,
+            Some(self.current_db_type()),
+        )
     }
 
     fn remember_preferred_insert_position(

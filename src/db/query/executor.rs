@@ -1417,11 +1417,19 @@ impl QueryExecutor {
 
     /// Return the statement containing the cursor position (byte offset).
     pub fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String> {
+        Self::statement_at_cursor_for_db_type(sql, cursor_pos, None)
+    }
+
+    pub fn statement_at_cursor_for_db_type(
+        sql: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Option<String> {
         if sql.trim().is_empty() {
             return None;
         }
 
-        Self::statement_bounds_at_cursor(sql, cursor_pos)
+        Self::statement_bounds_at_cursor_for_db_type(sql, cursor_pos, preferred_db_type)
             .and_then(|(start, end)| sql.get(start..end))
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty())
@@ -1432,6 +1440,14 @@ impl QueryExecutor {
     /// Bounds are clamped to UTF-8 char boundaries and treat SQL*Plus standalone '/'
     /// lines as PL/SQL statement delimiters just like split_script_items.
     pub fn statement_bounds_at_cursor(sql: &str, cursor_pos: usize) -> Option<(usize, usize)> {
+        Self::statement_bounds_at_cursor_for_db_type(sql, cursor_pos, None)
+    }
+
+    pub fn statement_bounds_at_cursor_for_db_type(
+        sql: &str,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Option<(usize, usize)> {
         if sql.trim().is_empty() {
             return None;
         }
@@ -1457,19 +1473,20 @@ impl QueryExecutor {
         } else {
             None
         };
-        Self::find_statement_bounds_for_cursor(sql, cursor_pos, slash_line_start)
+        Self::find_statement_bounds_for_cursor(sql, cursor_pos, slash_line_start, preferred_db_type)
     }
 
     fn find_statement_bounds_for_cursor(
         sql: &str,
         cursor_pos: usize,
         slash_line_start: Option<usize>,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> Option<(usize, usize)> {
         let mut previous: Option<(usize, usize)> = None;
         let mut slash_previous: Option<(usize, usize)> = None;
         let mut resolved: Option<(usize, usize)> = None;
 
-        Self::walk_statement_spans_for_bounds(sql, |span| {
+        Self::walk_statement_spans_for_bounds(sql, preferred_db_type, |span| {
             if let Some(line_start) = slash_line_start {
                 if span.1 <= line_start {
                     slash_previous = Some(span);
@@ -1499,7 +1516,11 @@ impl QueryExecutor {
         resolved.or(previous)
     }
 
-    fn walk_statement_spans_for_bounds<F>(sql: &str, mut on_span: F)
+    fn walk_statement_spans_for_bounds<F>(
+        sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        mut on_span: F,
+    )
     where
         F: FnMut((usize, usize)) -> bool,
     {
@@ -1507,6 +1528,7 @@ impl QueryExecutor {
             builder: SqlParserEngine,
             current_start: Option<usize>,
             current_end: usize,
+            mysql_delimiter: String,
         }
 
         impl StatementSpanCollector {
@@ -1538,6 +1560,43 @@ impl QueryExecutor {
                     .unwrap_or_else(|| line.len())
             }
 
+            fn current_ends_with_mysql_delimiter(&self, sql: &str) -> bool {
+                if self.mysql_delimiter == ";" {
+                    return false;
+                }
+
+                let Some(start) = self.current_start else {
+                    return false;
+                };
+                let end = self.current_end.max(start).min(sql.len());
+                sql.get(start..end).is_some_and(|statement| {
+                    QueryExecutor::statement_ends_with_mysql_delimiter(
+                        statement,
+                        self.mysql_delimiter.as_str(),
+                    )
+                })
+            }
+
+            fn trim_span_for_bounds(&self, sql: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+                if self.mysql_delimiter == ";" {
+                    return QueryExecutor::trim_statement_span_for_bounds(sql, start, end);
+                }
+
+                let statement = sql.get(start..end)?;
+                if let Some((delimiter_start, _)) = QueryExecutor::mysql_trailing_delimiter_range(
+                    statement,
+                    self.mysql_delimiter.as_str(),
+                ) {
+                    return QueryExecutor::trim_statement_span_for_bounds(
+                        sql,
+                        start,
+                        start.saturating_add(delimiter_start),
+                    );
+                }
+
+                QueryExecutor::trim_statement_span_for_bounds(sql, start, end)
+            }
+
             fn emit_current_span<F>(&mut self, sql: &str, on_span: &mut F) -> bool
             where
                 F: FnMut((usize, usize)) -> bool,
@@ -1548,7 +1607,7 @@ impl QueryExecutor {
                 };
                 let end = self.current_end.max(start);
                 self.current_end = 0;
-                if let Some(span) = QueryExecutor::trim_statement_span_for_bounds(sql, start, end) {
+                if let Some(span) = self.trim_span_for_bounds(sql, start, end) {
                     return on_span(span);
                 }
                 true
@@ -1640,10 +1699,11 @@ impl QueryExecutor {
             builder: SqlParserEngine::new(),
             current_start: None,
             current_end: 0,
+            mysql_delimiter: ";".to_string(),
         };
         collector
             .builder
-            .set_mysql_mode(sql_text::mysql_compatibility_for_sql(sql, None));
+            .set_mysql_mode(sql_text::mysql_compatibility_for_sql(sql, preferred_db_type));
         let mut sqlblanklines_enabled = true;
         let mut line_start = 0usize;
 
@@ -1658,6 +1718,38 @@ impl QueryExecutor {
                 .unwrap_or(sql.len());
             let line = &sql[line_start..line_end];
             let trimmed = line.trim();
+
+            if collector.current_is_empty() {
+                if let Some(super::ToolCommand::MysqlDelimiter { delimiter }) =
+                    Self::parse_mysql_delimiter_command(trimmed)
+                {
+                    collector.mysql_delimiter = delimiter;
+                    line_start = next_line_start;
+                    continue;
+                }
+            }
+
+            if collector.mysql_delimiter != ";" {
+                if trimmed.is_empty() && collector.current_is_empty() {
+                    line_start = next_line_start;
+                    continue;
+                }
+
+                if collector.current_start.is_none() {
+                    collector.current_start = StatementSpanCollector::line_non_whitespace_start(line, 0)
+                        .map(|offset| line_start + offset);
+                }
+                collector.current_end = next_line_start;
+
+                if collector.current_ends_with_mysql_delimiter(sql)
+                    && !collector.emit_current_span(sql, &mut on_span)
+                {
+                    return;
+                }
+
+                line_start = next_line_start;
+                continue;
+            }
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
@@ -1890,6 +1982,9 @@ impl QueryExecutor {
         if trimmed.starts_with('@') {
             return true;
         }
+        if trimmed.starts_with("\\.") {
+            return true;
+        }
 
         let first = Self::line_first_word(trimmed)
             .map(|word| word.trim_end_matches(';'))
@@ -1918,6 +2013,9 @@ impl QueryExecutor {
             || first.eq_ignore_ascii_case("WHENEVER")
             || first.eq_ignore_ascii_case("EXIT")
             || first.eq_ignore_ascii_case("QUIT")
+            || first.eq_ignore_ascii_case("USE")
+            || first.eq_ignore_ascii_case("SOURCE")
+            || first.eq_ignore_ascii_case("DELIMITER")
             || first.eq_ignore_ascii_case("CONNECT")
             || first.eq_ignore_ascii_case("CONN")
             || first.eq_ignore_ascii_case("DISCONNECT")

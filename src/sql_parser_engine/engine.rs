@@ -535,6 +535,13 @@ impl SqlParserEngine {
                 }
                 LexMode::SingleQuote => {
                     self.current.push(c);
+                    if self.state.mysql_mode {
+                        if let Some(escaped) = next.filter(|_| c == '\\') {
+                            self.current.push(escaped);
+                            i += 2;
+                            continue;
+                        }
+                    }
                     if c == '\'' {
                         if next == Some('\'') {
                             self.current.push('\'');
@@ -548,6 +555,13 @@ impl SqlParserEngine {
                 }
                 LexMode::DoubleQuote => {
                     self.current.push(c);
+                    if self.state.mysql_mode {
+                        if let Some(escaped) = next.filter(|_| c == '\\') {
+                            self.current.push(escaped);
+                            i += 2;
+                            continue;
+                        }
+                    }
                     if c == '"' {
                         if next == Some('"') {
                             self.current.push('"');
@@ -592,7 +606,15 @@ impl SqlParserEngine {
 
             // ---- Normal (Idle) code processing ----
 
-            if c == '-' && next == Some('-') {
+            let dash_comment_start = if self.state.mysql_mode {
+                chars
+                    .get(i + 2)
+                    .is_none_or(|ch| ch.is_whitespace() || ch.is_control())
+            } else {
+                true
+            };
+
+            if c == '-' && next == Some('-') && dash_comment_start {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1

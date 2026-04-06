@@ -8148,6 +8148,75 @@ SELECT 3;
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_mysql_delimiter_keeps_routine_body_intact() {
+    let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+  SELECT 1;
+  SELECT 2;
+END$$
+DELIMITER ;
+SELECT 3;
+"#;
+
+    let cursor = sql.find("SELECT 2").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected CREATE PROCEDURE bounds inside MySQL custom-delimiter routine");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE demo_proc()"),
+        "cursor inside MySQL routine should resolve the full routine statement, got:\n{statement}"
+    );
+    assert!(
+        statement.contains("SELECT 1;") && statement.contains("SELECT 2;"),
+        "routine statement bounds should keep inner semicolon-terminated statements, got:\n{statement}"
+    );
+    assert!(
+        statement.trim_end().ends_with("END"),
+        "routine statement bounds should stop at the stripped custom delimiter terminator, got:\n{statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 3"),
+        "next statement must not leak into MySQL routine bounds"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mysql_use_command_isolated_from_following_statement() {
+    let sql = "USE reporting\nSELECT 1;\n";
+    let cursor = sql.find("SELECT 1").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected SELECT bounds after MySQL USE command");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "SELECT 1",
+        "MySQL USE command must not be merged into the following executable statement: {statement:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mysql_source_alias_isolated_from_following_statement() {
+    let sql = "\\. /tmp/mysql-bootstrap.sql\nSELECT 1;\n";
+    let cursor = sql.find("SELECT 1").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    )
+    .expect("expected SELECT bounds after MySQL source alias");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "SELECT 1",
+        "MySQL source alias must not be merged into the following executable statement: {statement:?}"
+    );
+}
+
+#[test]
 fn test_parse_tool_command_mysql_delimiter_accepts_leading_block_comment() {
     let command = QueryExecutor::parse_tool_command("/* note */ DELIMITER /* gap */ $$ -- keep");
 
@@ -8269,6 +8338,45 @@ SELECT 3;
 }
 
 #[test]
+fn test_split_script_items_mysql_hash_comment_after_identifier_auto_detects_mysql_mode() {
+    let sql = r#"SELECT col# keep ; inside comment
++ 2;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "identifier-adjacent MySQL # comment should still auto-enable MySQL splitting: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("+ 2"),
+        "continued arithmetic line should stay in the first statement when # follows an identifier: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_script_items_mysql_hash_after_backslash_escaped_quote_stays_string_content() {
+    let sql = "SELECT 'abc\\'#still string';\nSELECT 2;\n";
+    let items = QueryExecutor::split_script_items_for_db_type(
+        sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec!["SELECT 'abc\\'#still string'", "SELECT 2"],
+        "MySQL split must keep # after an escaped quote inside the string literal: {stmts:?}"
+    );
+}
+
+#[test]
 fn test_split_format_items_mysql_hash_comment_ignores_semicolon_inside_comment() {
     let sql = r#"SELECT 1 # keep ; inside comment
 + 2;
@@ -8295,6 +8403,70 @@ SELECT 3;
         stmts[0]
     );
     assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_format_items_mysql_hash_comment_after_identifier_auto_detects_mysql_mode() {
+    let sql = r#"SELECT col# keep ; inside comment
++ 2;
+SELECT 3;
+"#;
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(statement) => Some(statement.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "format split should keep identifier-adjacent MySQL # comments inside the statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("+ 2"),
+        "format split should preserve the continued line after an identifier-adjacent # comment: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 3");
+}
+
+#[test]
+fn test_split_script_items_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+    let sql = "SELECT 5--2;\nSELECT 9;\n";
+    let items = QueryExecutor::split_script_items_for_db_type(
+        sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec!["SELECT 5--2", "SELECT 9"],
+        "MySQL db-type split must keep `--2` as arithmetic and preserve the next statement: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_for_mysql_db_type_keeps_double_dash_arithmetic_as_code() {
+    let sql = "SELECT 5--2;\nSELECT 9;\n";
+    let cursor = sql.find("5--2").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    )
+    .expect("expected MySQL statement bounds for double-dash arithmetic");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "SELECT 5--2",
+        "MySQL db-type statement bounds must keep `--2` as arithmetic instead of treating it as a comment: {statement:?}"
+    );
 }
 
 #[test]
@@ -8381,6 +8553,17 @@ fn test_parse_tool_command_mysql_source_keeps_double_dash_in_path_and_strips_has
     assert!(matches!(
         command,
         crate::db::ToolCommand::MysqlSource { path } if path == "/tmp/mysql--seed.sql"
+    ));
+}
+
+#[test]
+fn test_parse_tool_command_mysql_source_alias_backslash_dot_is_supported() {
+    let command = QueryExecutor::parse_tool_command("\\. /tmp/mysql-init.sql # note")
+        .expect("MySQL \\. alias should parse as a SOURCE tool command");
+
+    assert!(matches!(
+        command,
+        crate::db::ToolCommand::MysqlSource { path } if path == "/tmp/mysql-init.sql"
     ));
 }
 
@@ -10623,6 +10806,25 @@ fn test_split_script_items_mariadb_final_boss_regression() {
         }),
         "post-run verification query should remain independently executable: {statements:?}"
     );
+}
+
+#[test]
+fn test_split_script_items_mariadb_executable_comment_stays_runnable_statement() {
+    let sql = "/*M!100100 SET @feature_flag = 1 */;\nSELECT 1;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "MariaDB executable comment should stay executable and not merge with following SQL: {statements:?}"
+    );
+    assert!(
+        statements[0].starts_with("/*M!100100 SET @feature_flag = 1 */"),
+        "first statement should preserve MariaDB executable comment: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1");
 }
 
 #[test]

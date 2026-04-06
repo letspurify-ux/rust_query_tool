@@ -5766,6 +5766,13 @@ impl QueryExecutor {
     }
 
     pub fn split_script_items(sql: &str) -> Vec<ScriptItem> {
+        Self::split_script_items_for_db_type(sql, None)
+    }
+
+    pub(crate) fn split_script_items_for_db_type(
+        sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Vec<ScriptItem> {
         let mut items: Vec<ScriptItem> = Vec::new();
         let add_statement = |stmt: String, items: &mut Vec<ScriptItem>| {
             let stripped = Self::strip_comments(&stmt);
@@ -5778,7 +5785,14 @@ impl QueryExecutor {
             items.push(ScriptItem::ToolCommand(cmd));
         };
 
-        Self::split_items_core(sql, &mut items, add_statement, on_tool_command, |_, _| {});
+        Self::split_items_core(
+            sql,
+            preferred_db_type,
+            &mut items,
+            add_statement,
+            on_tool_command,
+            |_, _| {},
+        );
         let items = Self::merge_fragmented_standalone_routine_script_statements(items);
         Self::merge_fragmented_with_single_letter_cte_script_items(items)
     }
@@ -6088,6 +6102,13 @@ impl QueryExecutor {
     }
 
     pub fn split_format_items(sql: &str) -> Vec<FormatItem> {
+        Self::split_format_items_for_db_type(sql, None)
+    }
+
+    pub(crate) fn split_format_items_for_db_type(
+        sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Vec<FormatItem> {
         // Standalone comments between statements need special handling in format
         // mode: line comments, remark lines, and multi-line block comments are
         // preserved as separate items so the formatter can keep them intact.
@@ -6126,6 +6147,7 @@ impl QueryExecutor {
                 &mut builder,
                 line,
                 trimmed,
+                preferred_db_type,
                 Some(mysql_delimiter.as_str()),
             );
 
@@ -6258,7 +6280,10 @@ impl QueryExecutor {
                     items.push(FormatItem::Statement(comment));
 
                     if let Some(trailing_line) = trailing_after_comment {
-                        items.extend(Self::split_format_items(&trailing_line));
+                        items.extend(Self::split_format_items_for_db_type(
+                            &trailing_line,
+                            preferred_db_type,
+                        ));
                     }
                     continue;
                 }
@@ -6526,21 +6551,28 @@ impl QueryExecutor {
     fn should_enable_mysql_parser_mode(
         line: &str,
         trimmed: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
         mysql_delimiter: Option<&str>,
     ) -> bool {
         mysql_delimiter.is_some_and(|delimiter| delimiter != ";")
             || Self::parse_mysql_tool_command(trimmed).is_some()
-            || sql_text::sql_uses_mysql_compatible_syntax(line)
+            || sql_text::mysql_compatibility_for_sql(line, preferred_db_type)
     }
 
     fn maybe_enable_mysql_parser_mode(
         builder: &mut SqlParserEngine,
         line: &str,
         trimmed: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
         mysql_delimiter: Option<&str>,
     ) {
         if !builder.mysql_mode()
-            && Self::should_enable_mysql_parser_mode(line, trimmed, mysql_delimiter)
+            && Self::should_enable_mysql_parser_mode(
+                line,
+                trimmed,
+                preferred_db_type,
+                mysql_delimiter,
+            )
         {
             builder.set_mysql_mode(true);
         }
@@ -6638,6 +6670,7 @@ impl QueryExecutor {
     /// non-comment line to `process_split_line` directly.
     fn split_items_core<T>(
         sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
         items: &mut Vec<T>,
         mut add_statement: impl FnMut(String, &mut Vec<T>),
         mut on_tool_command: impl FnMut(ToolCommand, &str, &mut Vec<T>),
@@ -6664,6 +6697,7 @@ impl QueryExecutor {
                 &mut builder,
                 line,
                 trimmed,
+                preferred_db_type,
                 Some(mysql_delimiter.as_str()),
             );
 
@@ -6865,11 +6899,7 @@ impl QueryExecutor {
     }
 
     fn is_mysql_dash_comment_start(bytes: &[u8], index: usize) -> bool {
-        bytes.get(index) == Some(&b'-')
-            && bytes.get(index + 1) == Some(&b'-')
-            && bytes
-                .get(index + 2)
-                .is_none_or(|byte| byte.is_ascii_whitespace())
+        sql_text::is_mysql_dash_comment_start(bytes, index)
     }
 
     fn skip_mysql_line_comment(bytes: &[u8], mut index: usize) -> usize {
@@ -6961,7 +6991,10 @@ impl QueryExecutor {
         true
     }
 
-    fn mysql_trailing_delimiter_range(statement: &str, delimiter: &str) -> Option<(usize, usize)> {
+    pub(crate) fn mysql_trailing_delimiter_range(
+        statement: &str,
+        delimiter: &str,
+    ) -> Option<(usize, usize)> {
         let delimiter_bytes = delimiter.as_bytes();
         if delimiter_bytes.is_empty() {
             return None;
@@ -7011,7 +7044,7 @@ impl QueryExecutor {
         None
     }
 
-    fn statement_ends_with_mysql_delimiter(statement: &str, delimiter: &str) -> bool {
+    pub(crate) fn statement_ends_with_mysql_delimiter(statement: &str, delimiter: &str) -> bool {
         Self::mysql_trailing_delimiter_range(statement, delimiter).is_some()
     }
 
@@ -7468,6 +7501,7 @@ impl QueryExecutor {
         let head = tokens.first()?.to_ascii_uppercase();
 
         match head.as_str() {
+            "\\." => Some(Self::parse_mysql_source_command(raw)),
             "SOURCE" => Some(Self::parse_mysql_source_command(raw)),
             "USE" => Some(Self::parse_mysql_use_command(raw)),
             "SHOW" => Self::parse_mysql_show_command(raw),
@@ -7475,7 +7509,7 @@ impl QueryExecutor {
         }
     }
 
-    fn parse_mysql_delimiter_command(raw: &str) -> Option<ToolCommand> {
+    pub(crate) fn parse_mysql_delimiter_command(raw: &str) -> Option<ToolCommand> {
         let delimiter = sql_text::parse_mysql_delimiter_directive(raw)?;
         Some(ToolCommand::MysqlDelimiter { delimiter })
     }
@@ -7519,6 +7553,11 @@ impl QueryExecutor {
 
             if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
                 return None;
+            }
+
+            if bytes.get(index) == Some(&b'\\') && bytes.get(index + 1) == Some(&b'.') {
+                index += 2;
+                return Some(raw.get(index..).unwrap_or_default().trim());
             }
 
             break;

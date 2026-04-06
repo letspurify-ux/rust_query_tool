@@ -660,7 +660,10 @@ impl SqlEditorWidget {
         initial_auto_commit: bool,
         db_activity: &str,
     ) {
-        let items = super::query_text::split_script_items(sql_text);
+        let items = super::query_text::split_script_items_for_db_type(
+            sql_text,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
         if items.is_empty() {
             return;
         }

@@ -547,7 +547,11 @@ impl SqlHighlighter {
                     }
                 }
             }
-            LexerState::InSingleQuote => match scan_until_single_quote_end(bytes, idx) {
+            LexerState::InSingleQuote => match scan_until_single_quote_end(
+                bytes,
+                idx,
+                self.db_type == DatabaseType::MySQL,
+            ) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
                     styles[..idx].fill(STYLE_STRING as u8);
@@ -569,7 +573,11 @@ impl SqlHighlighter {
                     }
                 }
             }
-            LexerState::InDoubleQuote => match scan_until_double_quote_end(bytes, idx) {
+            LexerState::InDoubleQuote => match scan_until_double_quote_end(
+                bytes,
+                idx,
+                self.db_type == DatabaseType::MySQL,
+            ) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
                     styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
@@ -633,7 +641,11 @@ impl SqlHighlighter {
             }
 
             // Single-line comment (--)
-            if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            if sql_text::is_dash_line_comment_start(
+                bytes,
+                idx,
+                self.db_type == DatabaseType::MySQL,
+            ) {
                 let start = idx;
                 idx += 2;
                 while let Some(&b) = bytes.get(idx) {
@@ -647,9 +659,7 @@ impl SqlHighlighter {
                 continue;
             }
 
-            if self.db_type == DatabaseType::MySQL
-                && sql_text::is_mysql_hash_comment_start(bytes, idx)
-            {
+            if self.db_type == DatabaseType::MySQL && bytes.get(idx) == Some(&b'#') {
                 let start = idx;
                 idx += 1;
                 while let Some(&b) = bytes.get(idx) {
@@ -718,7 +728,8 @@ impl SqlHighlighter {
                 if let Some(prefix_len) = detect_prefixed_single_quote_start(text, idx) {
                     let start = idx;
                     idx += prefix_len;
-                    let scan_result = scan_until_single_quote_end(bytes, idx);
+                    let scan_result =
+                        scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -736,7 +747,8 @@ impl SqlHighlighter {
             if byte == b'\'' {
                 let start = idx;
                 idx += 1;
-                let scan_result = scan_until_single_quote_end(bytes, idx);
+                let scan_result =
+                    scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -754,7 +766,8 @@ impl SqlHighlighter {
             if byte == b'"' {
                 let start = idx;
                 idx += 1;
-                let scan_result = scan_until_double_quote_end(bytes, idx);
+                let scan_result =
+                    scan_until_double_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -804,10 +817,13 @@ impl SqlHighlighter {
             if sql_text::is_identifier_start_byte(byte) {
                 let start = idx;
                 idx += 1;
-                while bytes
-                    .get(idx)
-                    .is_some_and(|&b| sql_text::is_identifier_byte(b))
-                {
+                while let Some(&next_byte) = bytes.get(idx) {
+                    if self.db_type == DatabaseType::MySQL && next_byte == b'#' {
+                        break;
+                    }
+                    if !sql_text::is_identifier_byte(next_byte) {
+                        break;
+                    }
                     idx += 1;
                 }
                 let mut word_end = idx;
@@ -836,7 +852,11 @@ impl SqlHighlighter {
                     }
                     if bytes.get(look_ahead) == Some(&b'\'') {
                         look_ahead += 1;
-                        let scan_result = scan_until_single_quote_end(bytes, look_ahead);
+                        let scan_result = scan_until_single_quote_end(
+                            bytes,
+                            look_ahead,
+                            self.db_type == DatabaseType::MySQL,
+                        );
                         look_ahead = match scan_result {
                             ScanResult::Closed { next_idx }
                             | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -1628,9 +1648,16 @@ fn scan_until_block_comment_end(
     }
 }
 
-fn scan_until_single_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+fn scan_until_single_quote_end(
+    bytes: &[u8],
+    mut idx: usize,
+    mysql_compatible: bool,
+) -> ScanResult {
     loop {
         match bytes.get(idx) {
+            Some(_) if mysql_compatible && bytes.get(idx) == Some(&b'\\') && bytes.get(idx + 1).is_some() => {
+                idx += 2;
+            }
             Some(&b'\'') => {
                 if bytes.get(idx + 1) == Some(&b'\'') {
                     idx += 2;
@@ -1695,9 +1722,16 @@ fn scan_until_q_quote_end(
     }
 }
 
-fn scan_until_double_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+fn scan_until_double_quote_end(
+    bytes: &[u8],
+    mut idx: usize,
+    mysql_compatible: bool,
+) -> ScanResult {
     loop {
         match bytes.get(idx) {
+            Some(_) if mysql_compatible && bytes.get(idx) == Some(&b'\\') && bytes.get(idx + 1).is_some() => {
+                idx += 2;
+            }
             Some(&b'"') => {
                 if bytes.get(idx + 1) == Some(&b'"') {
                     idx += 2;

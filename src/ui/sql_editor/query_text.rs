@@ -183,6 +183,8 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             Some(ch) => ch.is_whitespace(),
         }
     };
+    let is_dash_line_comment_start =
+        |idx: usize| sql_text::is_dash_line_comment_start(sql_bytes, idx, mysql_compatible);
 
     while let Some((idx, c)) = iter.next() {
         let next = iter.peek().map(|(_, ch)| *ch);
@@ -315,6 +317,12 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             crate::sql_parser_engine::LexMode::SingleQuote
         ) {
             current.push(c);
+            if mysql_compatible {
+                if let Some((_, escaped)) = iter.next_if(|_| c == '\\') {
+                    current.push(escaped);
+                    continue;
+                }
+            }
             if c == '\'' {
                 if next == Some('\'') {
                     iter.next();
@@ -337,6 +345,12 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             crate::sql_parser_engine::LexMode::DoubleQuote
         ) {
             current.push(c);
+            if mysql_compatible {
+                if let Some((_, escaped)) = iter.next_if(|_| c == '\\') {
+                    current.push(escaped);
+                    continue;
+                }
+            }
             if c == '"' {
                 if next == Some('"') {
                     iter.next();
@@ -399,7 +413,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             continue;
         }
 
-        if mysql_compatible && sql_text::is_mysql_hash_comment_start(sql_bytes, idx) {
+        if mysql_compatible && sql_bytes.get(idx) == Some(&b'#') {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
             current_start = idx;
@@ -411,7 +425,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             continue;
         }
 
-        if c == '-' && next == Some('-') {
+        if is_dash_line_comment_start(idx) {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
             current_start = idx;
@@ -672,6 +686,7 @@ fn is_dollar_quote_tag_char(ch: u8) -> bool {
 /// 현재 커서 위치가 포함된 문장을 문자열로 반환합니다.
 ///
 /// 실제 구문 경계 계산은 실행기 쪽 규칙을 그대로 사용해 동작 일관성을 유지합니다.
+#[allow(dead_code)]
 pub(crate) fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String> {
     let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
     QueryExecutor::statement_at_cursor(sql, safe_cursor)
@@ -692,6 +707,13 @@ pub(crate) fn statement_bounds_in_text(sql: &str, cursor_pos: usize) -> (usize, 
 /// 공통 진입점입니다.
 pub(crate) fn split_script_items(sql: &str) -> Vec<ScriptItem> {
     QueryExecutor::split_script_items(sql)
+}
+
+pub(crate) fn split_script_items_for_db_type(
+    sql: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> Vec<ScriptItem> {
+    QueryExecutor::split_script_items_for_db_type(sql, preferred_db_type)
 }
 
 /// 쿼리 실행 전 선처리에서 `CONNECT`, `DISCONNECT`, 또는 `@` 스크립트 실행 명령이
@@ -829,8 +851,16 @@ pub(crate) fn normalize_single_statement(statement: &str) -> String {
     statement.to_string()
 }
 
+#[allow(dead_code)]
 pub(crate) fn split_format_items(sql: &str) -> Vec<FormatItem> {
     QueryExecutor::split_format_items(sql)
+}
+
+pub(crate) fn split_format_items_for_db_type(
+    sql: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> Vec<FormatItem> {
+    QueryExecutor::split_format_items_for_db_type(sql, preferred_db_type)
 }
 
 pub(crate) fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
@@ -1098,6 +1128,13 @@ mod tests {
                 crate::sql_parser_engine::LexMode::SingleQuote
             ) {
                 current.push(c);
+                if mysql_compatible && c == '\\' && next.is_some() {
+                    if let Some(escaped) = next {
+                        current.push(escaped);
+                        i += 2;
+                        continue;
+                    }
+                }
                 if c == '\'' {
                     if next == Some('\'') {
                         current.push('\'');
@@ -1118,6 +1155,13 @@ mod tests {
                 crate::sql_parser_engine::LexMode::DoubleQuote
             ) {
                 current.push(c);
+                if mysql_compatible && c == '\\' && next.is_some() {
+                    if let Some(escaped) = next {
+                        current.push(escaped);
+                        i += 2;
+                        continue;
+                    }
+                }
                 if c == '"' {
                     if next == Some('"') {
                         current.push('"');
@@ -1157,7 +1201,14 @@ mod tests {
                 continue;
             }
 
-            if c == '-' && next == Some('-') {
+            let dash_comment_start = if mysql_compatible {
+                chars.get(i + 2)
+                    .is_none_or(|ch| ch.is_whitespace() || ch.is_control())
+            } else {
+                true
+            };
+
+            if c == '-' && next == Some('-') && dash_comment_start {
                 flush_word(&mut current, &mut tokens);
                 scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
                 if pending_newline {
@@ -1428,6 +1479,32 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_sql_treats_mysql_hash_comment_after_identifier_as_comment_token() {
+        let sql = "SELECT col# trailing";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        assert!(tokens.iter().any(
+            |t| matches!(t, SqlToken::Comment(comment) if comment == "# trailing")
+        ));
+    }
+
+    #[test]
+    fn tokenize_sql_keeps_mysql_hash_after_backslash_escaped_quote_inside_string() {
+        let sql = "SELECT 'abc\\'#still string' AS value";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Comment(comment) if comment.contains("still string"))),
+            "MySQL tokenizer must not treat # after an escaped quote as a comment: {tokens:?}"
+        );
+        assert!(tokens.iter().any(
+            |token| matches!(token, SqlToken::String(value) if value == "'abc\\'#still string'")
+        ));
+    }
+
+    #[test]
     fn tokenize_sql_treats_mysql_backtick_identifier_as_single_word() {
         let sql = "SELECT `order`, `complex``name` FROM `sales`";
         let tokens = tokenize_sql_with_mysql_compat(sql, true);
@@ -1454,6 +1531,28 @@ mod tests {
                 .iter()
                 .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "<=>")),
             "mysql null-safe equality should stay a single symbol token: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_treats_mysql_double_dash_without_whitespace_as_symbols() {
+        let sql = "SELECT 5--2 AS diff";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Comment(comment) if comment.contains("2 AS diff"))),
+            "MySQL `--<non-space>` must not start a comment: {tokens:?}"
+        );
+
+        let minus_count = tokens
+            .iter()
+            .filter(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "-"))
+            .count();
+        assert_eq!(
+            minus_count, 2,
+            "double-dash arithmetic should stay as two minus symbols: {tokens:?}"
         );
     }
 

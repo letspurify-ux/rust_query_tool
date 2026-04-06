@@ -2272,6 +2272,37 @@ fn test_mysql_hash_comment_highlighting_marks_comment_tail() {
 }
 
 #[test]
+fn test_mysql_hash_comment_highlighting_marks_identifier_adjacent_comment_tail() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let text = "SELECT col# trailing";
+    let styles = highlighter.generate_styles(text);
+
+    let comment_start = text.find('#').unwrap_or(0);
+    assert!(
+        styles[comment_start..]
+            .chars()
+            .all(|style| style == STYLE_COMMENT),
+        "identifier-adjacent MySQL # comment tail should stay comment-highlighted"
+    );
+}
+
+#[test]
+fn test_mysql_hash_after_backslash_escaped_quote_stays_string_highlighted() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let text = "SELECT 'abc\\'#still string' AS value";
+    let styles = highlighter.generate_styles(text);
+
+    let hash_idx = text.find('#').unwrap_or(0);
+    assert_eq!(
+        styles.as_bytes().get(hash_idx).copied(),
+        Some(STYLE_STRING as u8),
+        "hash inside a backslash-escaped MySQL string must stay string-highlighted"
+    );
+}
+
+#[test]
 fn test_mysql_backtick_identifier_highlighting_uses_quoted_identifier_style() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
@@ -2288,6 +2319,23 @@ fn test_mysql_backtick_identifier_highlighting_uses_quoted_identifier_style() {
             "{token} should use quoted identifier highlighting"
         );
     }
+}
+
+#[test]
+fn test_mysql_double_dash_without_whitespace_is_not_comment_highlighted() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let text = "SELECT 5--2 AS diff";
+    let styles = highlighter.generate_styles(text);
+
+    let expr_start = text.find("5--2").unwrap_or(0);
+    let expr_end = expr_start + "5--2".len();
+    assert!(
+        styles[expr_start..expr_end]
+            .chars()
+            .all(|style| style != STYLE_COMMENT),
+        "MySQL `--<non-space>` arithmetic must not be comment-highlighted"
+    );
 }
 
 #[test]

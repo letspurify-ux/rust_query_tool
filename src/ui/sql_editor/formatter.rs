@@ -2706,7 +2706,11 @@ impl SqlEditorWidget {
         preferred_db_type: Option<DatabaseType>,
     ) -> String {
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
-        let items = Self::normalize_format_items(super::query_text::split_format_items(sql));
+        let items =
+            Self::normalize_format_items(super::query_text::split_format_items_for_db_type(
+                sql,
+                preferred_db_type,
+            ));
         if items.is_empty() {
             return String::new();
         }
@@ -35667,6 +35671,73 @@ CREATE TABLE demo (
                 .iter()
                 .any(|stmt| stmt.starts_with("CREATE TABLE demo")),
             "following CREATE TABLE should remain a separate execution unit: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_mariadb_executable_comment_as_separate_statement() {
+        let source = r#"/*M!100100 SET @feature_flag = 1 */
+CREATE TABLE demo (
+    id INT
+);"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let items = crate::db::QueryExecutor::split_script_items(&formatted);
+        let statements: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::db::ScriptItem::Statement(statement) => Some(statement.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            formatted.contains("/*M!100100 SET @feature_flag = 1 */;"),
+            "mariadb executable comment should keep its own semicolon terminator, got:\n{}",
+            formatted
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("/*M!100100 SET @feature_flag = 1 */")),
+            "mariadb executable comment should remain independently executable: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("CREATE TABLE demo")),
+            "following CREATE TABLE should remain a separate execution unit: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_double_dash_arithmetic_as_expression() {
+        let source = "SELECT 5--2;\nSELECT 9;";
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let items = crate::db::QueryExecutor::split_script_items_for_db_type(
+            &formatted,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let statements: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::db::ScriptItem::Statement(statement) => Some(statement.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            formatted.contains("SELECT 5 - - 2;"),
+            "formatter should keep the arithmetic expression executable instead of turning it into a comment: {formatted}"
+        );
+        assert_eq!(
+            statements,
+            vec!["SELECT 5 - - 2", "SELECT 9"],
+            "MySQL formatter must keep `--2` arithmetic and the following statement separate: {statements:?}"
         );
     }
 

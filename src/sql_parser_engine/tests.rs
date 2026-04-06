@@ -220,6 +220,56 @@ fn with_function_recovery_splits_before_script_commands_after_leading_block_comm
 }
 
 #[test]
+fn mysql_mode_double_dash_without_whitespace_stays_expression() {
+    let mut engine = SqlParserEngine::new();
+    engine.set_mysql_mode(true);
+
+    let first_line = engine.process_line_and_take_statements("SELECT 5--2;");
+    let second_line = engine.process_line_and_take_statements("SELECT 9;");
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(
+        first_line,
+        vec!["SELECT 5--2".to_string()],
+        "MySQL parser mode must not treat `--2` as a line comment: {first_line:?}"
+    );
+    assert_eq!(
+        second_line,
+        vec!["SELECT 9".to_string()],
+        "subsequent statement should still split normally: {second_line:?}"
+    );
+    assert!(
+        statements.is_empty(),
+        "no trailing buffered statements expected after both semicolon-terminated lines: {statements:?}"
+    );
+}
+
+#[test]
+fn mysql_mode_hash_after_backslash_escaped_quote_stays_in_string() {
+    let mut engine = SqlParserEngine::new();
+    engine.set_mysql_mode(true);
+
+    let first_line = engine.process_line_and_take_statements("SELECT 'abc\\'#still string';");
+    let second_line = engine.process_line_and_take_statements("SELECT 2;");
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(
+        first_line,
+        vec!["SELECT 'abc\\'#still string'".to_string()],
+        "MySQL parser mode must not treat # after an escaped quote as a line comment: {first_line:?}"
+    );
+    assert_eq!(
+        second_line,
+        vec!["SELECT 2".to_string()],
+        "subsequent statement should still split normally: {second_line:?}"
+    );
+    assert!(
+        statements.is_empty(),
+        "no trailing buffered statements expected after both semicolon-terminated lines: {statements:?}"
+    );
+}
+
+#[test]
 fn with_function_end_label_comma_recovers_before_following_cte_as_clause() {
     let mut engine = SqlParserEngine::new();
 

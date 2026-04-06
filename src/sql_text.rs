@@ -1630,10 +1630,33 @@ pub(crate) fn is_mysql_hash_comment_start(bytes: &[u8], idx: usize) -> bool {
 }
 
 #[inline]
+pub(crate) fn is_mysql_dash_comment_start(bytes: &[u8], idx: usize) -> bool {
+    bytes.get(idx) == Some(&b'-')
+        && bytes.get(idx + 1) == Some(&b'-')
+        && bytes
+            .get(idx + 2)
+            .is_none_or(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+#[inline]
+pub(crate) fn is_dash_line_comment_start(
+    bytes: &[u8],
+    idx: usize,
+    mysql_compatible: bool,
+) -> bool {
+    if mysql_compatible {
+        is_mysql_dash_comment_start(bytes, idx)
+    } else {
+        bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-')
+    }
+}
+
+#[inline]
 pub(crate) fn is_mysql_executable_comment_start(bytes: &[u8], idx: usize) -> bool {
     bytes.get(idx) == Some(&b'/')
         && bytes.get(idx + 1) == Some(&b'*')
-        && bytes.get(idx + 2) == Some(&b'!')
+        && (bytes.get(idx + 2) == Some(&b'!')
+            || (bytes.get(idx + 2) == Some(&b'M') && bytes.get(idx + 3) == Some(&b'!')))
 }
 
 #[inline]
@@ -1666,6 +1689,7 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
     let mut idx = 0usize;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    let mut in_backtick_quote = false;
     let mut in_block_comment = false;
     let mut q_quote_end: Option<u8> = None;
 
@@ -1694,6 +1718,10 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
         }
 
         if in_single_quote {
+            if current == b'\\' && next.is_some() {
+                idx = idx.saturating_add(2);
+                continue;
+            }
             if current == b'\'' {
                 if next == Some(b'\'') {
                     idx = idx.saturating_add(2);
@@ -1706,6 +1734,10 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
         }
 
         if in_double_quote {
+            if current == b'\\' && next.is_some() {
+                idx = idx.saturating_add(2);
+                continue;
+            }
             if current == b'"' {
                 if next == Some(b'"') {
                     idx = idx.saturating_add(2);
@@ -1717,10 +1749,24 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
             continue;
         }
 
+        if in_backtick_quote {
+            if current == b'`' {
+                if next == Some(b'`') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_backtick_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
         if sql_line_comment_prefix_len(bytes, idx).is_some_and(|prefix_len| prefix_len == 2) {
             break;
         }
-        if is_mysql_hash_comment_start(bytes, idx) {
+        // In MySQL/MariaDB mode `#` starts a line comment anywhere outside
+        // strings, quoted identifiers, and block comments.
+        if current == b'#' {
             return true;
         }
         if current == b'/' && next == Some(b'*') {
@@ -1756,6 +1802,11 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
         }
         if current == b'"' {
             in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'`' {
+            in_backtick_quote = true;
             idx = idx.saturating_add(1);
             continue;
         }
@@ -1815,6 +1866,7 @@ pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
     sql.as_bytes().contains(&b'`')
         || sql.contains("<=>")
         || sql.contains("/*!")
+        || sql.contains("/*M!")
         || sql.lines().any(|line| {
             line_has_mysql_hash_comment(line) || parse_mysql_delimiter_directive(line).is_some()
         })
@@ -6871,7 +6923,9 @@ mod tests {
     fn mysql_hash_comment_helpers_treat_hash_as_comment_boundary() {
         assert!(line_has_mysql_hash_comment("SELECT 1 # trailing"));
         assert_eq!(trim_leading_sql_comments("  # comment only"), "");
-        assert!(!line_has_mysql_hash_comment("SELECT col#suffix FROM demo"));
+        assert!(line_has_mysql_hash_comment("SELECT col#suffix"));
+        assert!(!line_has_mysql_hash_comment("SELECT `col#suffix` FROM demo"));
+        assert!(!line_has_mysql_hash_comment("SELECT 'abc\\'#still string'"));
     }
 
     #[test]
@@ -6918,6 +6972,14 @@ mod tests {
             parse_mysql_delimiter_directive("DELIMITER // rest is ignored"),
             Some("//".to_string())
         );
+    }
+
+    #[test]
+    fn mysql_executable_comment_helpers_cover_mariadb_variant() {
+        let comment = "/*M!100100 SET @feature_flag = 1 */";
+
+        assert!(is_mysql_executable_comment_start(comment.as_bytes(), 0));
+        assert!(sql_uses_mysql_compatible_syntax(comment));
     }
 
     #[test]
