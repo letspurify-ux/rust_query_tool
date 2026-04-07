@@ -1492,19 +1492,23 @@ impl QueryExecutor {
                 }
             }
 
+            let mysql_parser_line =
+                Self::mysql_parser_visible_line(line, mysql_delimiter.as_str());
+            let parser_source_line = mysql_parser_line.as_deref().unwrap_or(line);
             let mysql_compound_declare = mysql_routine_body_active && leading_is("DECLARE");
             let sanitized_line = if mysql_compound_declare {
-                let trimmed = line.trim_start();
-                let leading_ws_len = line.len().saturating_sub(trimmed.len());
-                let mut rewritten = String::with_capacity(line.len().saturating_add(8));
-                rewritten.push_str(&line[..leading_ws_len]);
+                let trimmed = parser_source_line.trim_start();
+                let leading_ws_len = parser_source_line.len().saturating_sub(trimmed.len());
+                let mut rewritten =
+                    String::with_capacity(parser_source_line.len().saturating_add(8));
+                rewritten.push_str(&parser_source_line[..leading_ws_len]);
                 rewritten.push_str("MYSQL_DECLARE");
                 rewritten.push_str(&trimmed["DECLARE".len()..]);
                 Some(rewritten)
             } else {
                 None
             };
-            let parser_line = sanitized_line.as_deref().unwrap_or(line);
+            let parser_line = sanitized_line.as_deref().unwrap_or(parser_source_line);
 
             builder.process_line_with_byte_observer(parser_line, |bytes, byte_idx, symbol| {
                 if symbol == b'(' {
@@ -7148,6 +7152,14 @@ impl QueryExecutor {
 
         let stripped = Self::strip_trailing_mysql_delimiter(line, delimiter);
         sql_text::starts_with_keyword_token(&stripped.to_ascii_uppercase(), keyword)
+    }
+
+    fn mysql_parser_visible_line(line: &str, delimiter: &str) -> Option<String> {
+        if delimiter == ";" || !Self::statement_ends_with_mysql_delimiter(line, delimiter) {
+            return None;
+        }
+
+        Some(Self::strip_trailing_mysql_delimiter(line, delimiter))
     }
 
     fn strip_trailing_mysql_delimiter(statement: &str, delimiter: &str) -> String {
@@ -19089,6 +19101,146 @@ DELIMITER ;"#;
         assert_eq!(
             contexts[end_idx].auto_depth, 0,
             "auto-format depth should keep the custom-delimited procedure END on the owner depth"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_reset_after_custom_delimited_mysql_routine_end() {
+        let sql = r#"DELIMITER $$
+CREATE PROCEDURE first_proc()
+BEGIN
+    SET @a = 1;
+END$$
+
+CREATE PROCEDURE second_proc()
+BEGIN
+    SET @b = 2;
+END$$
+DELIMITER ;"#;
+
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END$$")
+            .unwrap_or(0);
+        let second_header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CREATE PROCEDURE second_proc()")
+            .unwrap_or(0);
+        let second_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_header_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END$$")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        let parser_depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(
+            parser_depths[first_end_idx], 0,
+            "first routine END should close the routine scope instead of leaking depth into the next statement"
+        );
+        assert_eq!(
+            parser_depths[second_header_idx], 0,
+            "second routine header should restart at depth 0 after the previous custom-delimited END"
+        );
+        assert_eq!(
+            parser_depths[second_begin_idx], 0,
+            "second routine BEGIN should stay on the owner depth"
+        );
+        assert_eq!(
+            parser_depths[second_end_idx], 0,
+            "second routine END should also return to depth 0"
+        );
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        assert_eq!(
+            contexts[second_header_idx].parser_depth, 0,
+            "auto-format parser depth should not inherit leaked routine depth"
+        );
+        assert_eq!(
+            contexts[second_begin_idx].auto_depth, 0,
+            "auto-format depth should keep the second routine anchored at depth 0"
+        );
+        assert_eq!(
+            contexts[second_end_idx].auto_depth, 0,
+            "auto-format depth should close the second routine back to depth 0"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_keep_mysql_while_do_owner_depth_when_body_contains_if_function() {
+        let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+    WHILE v_product_id <= 36 DO
+        INSERT INTO boss_product (active_yn)
+        VALUES (
+            IF(MOD(v_product_id, 17) = 0, 'N', 'Y')
+        );
+        SET v_product_id = v_product_id + 1;
+    END WHILE;
+END$$
+DELIMITER ;"#;
+
+        let lines: Vec<&str> = sql.lines().collect();
+        let while_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHILE v_product_id <= 36 DO")
+            .unwrap_or(0);
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF(MOD(v_product_id, 17) = 0, 'N', 'Y')")
+            .unwrap_or(0);
+        let set_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SET v_product_id = v_product_id + 1;")
+            .unwrap_or(0);
+        let end_while_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END WHILE;")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END$$")
+            .unwrap_or(0);
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(
+            depths[if_idx],
+            depths[while_idx].saturating_add(1),
+            "IF() scalar function inside a WHILE body should stay on the loop body depth"
+        );
+        assert_eq!(
+            depths[set_idx],
+            depths[while_idx].saturating_add(1),
+            "statement after IF() scalar function should remain on the WHILE body depth"
+        );
+        assert_eq!(
+            depths[end_while_idx], depths[while_idx],
+            "END WHILE should align with the WHILE header even when the body contains IF() scalar functions"
+        );
+        assert_eq!(
+            depths[end_idx], 0,
+            "routine END should return to depth 0 after WHILE ... DO closes"
+        );
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        assert_eq!(
+            contexts[set_idx].auto_depth,
+            contexts[while_idx].auto_depth.saturating_add(1),
+            "auto-format depth should keep statements after IF() scalar functions on the WHILE body floor"
+        );
+        assert_eq!(
+            contexts[end_while_idx].auto_depth, contexts[while_idx].auto_depth,
+            "auto-format depth should align END WHILE with its WHILE header"
         );
     }
 }

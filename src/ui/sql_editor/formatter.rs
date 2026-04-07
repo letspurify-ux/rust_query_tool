@@ -3800,6 +3800,13 @@ impl SqlEditorWidget {
             return false;
         };
 
+        if prev_word == "IF"
+            && Self::previous_meaningful_token_index(tokens, open_paren_idx)
+                .is_some_and(|if_idx| Self::mysql_if_is_scalar_function(tokens, if_idx))
+        {
+            return true;
+        }
+
         if prev_word == "VALUES" {
             return on_duplicate_key_update_active;
         }
@@ -3816,6 +3823,47 @@ impl SqlEditorWidget {
         }
 
         true
+    }
+
+    fn mysql_if_is_scalar_function(tokens: &[SqlToken], if_idx: usize) -> bool {
+        let Some(open_idx) = Self::next_meaningful_token_index(tokens, if_idx) else {
+            return false;
+        };
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return false;
+        }
+
+        let Some(close_idx) = Self::matching_paren_close_index(tokens, open_idx) else {
+            return false;
+        };
+        !matches!(
+            Self::next_meaningful_token_index(tokens, close_idx).and_then(|idx| tokens.get(idx)),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("THEN")
+        )
+    }
+
+    fn matching_paren_close_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
+            match token {
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     fn paren_opens_call_argument_list(tokens: &[SqlToken], open_idx: usize) -> bool {
@@ -4866,6 +4914,8 @@ impl SqlEditorWidget {
                         mysql_declare_cursor_for_clause || mysql_declare_handler_for_clause;
                     let mysql_if_exists_modifier =
                         upper == "IF" && Self::is_mysql_if_exists_modifier(tokens, idx, next_word);
+                    let mysql_scalar_if_function =
+                        mysql_compatible && upper == "IF" && Self::mysql_if_is_scalar_function(tokens, idx);
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper, "INSERT" | "UPDATE" | "DELETE");
                     let is_compound_trigger_timing_header = compound_trigger_state
@@ -4946,6 +4996,7 @@ impl SqlEditorWidget {
                     }
                     let should_treat_as_block_start = block_start_keywords.contains(&upper)
                         && !(mysql_if_exists_modifier
+                            || mysql_scalar_if_function
                             || mysql_compound_declare
                             || treat_control_keyword_as_identifier
                             || follows_alias_control_keyword);
@@ -38655,6 +38706,314 @@ DELIMITER ;"#;
                 crate::db::connection::DatabaseType::MySQL,
             ),
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_nested_seed_procedure_end_at_depth_zero() {
+        let source = r#"CREATE PROCEDURE sp_seed_final_boss()
+BEGIN
+    DECLARE v_customer_id INT DEFAULT 1;
+    DECLARE v_product_id INT DEFAULT 1;
+    DECLARE v_order_id INT DEFAULT 1;
+    DECLARE v_item_no INT DEFAULT 1;
+    DECLARE v_item_cnt INT DEFAULT 1;
+    DECLARE v_prod_id INT DEFAULT 1;
+    DECLARE v_order_total DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_order_date DATE;
+    DECLARE v_status VARCHAR(20);
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+        BEGIN
+            ROLLBACK;
+            RESIGNAL;
+        END;
+    START TRANSACTION;
+    INSERT INTO boss_region (region_id, parent_region_id, region_name, region_code)
+    VALUES (1, NULL, 'GLOBAL', 'GLOBAL'),
+        (2, 1, 'APAC', 'APAC'),
+        (3, 1, 'EMEA', 'EMEA'),
+        (4, 1, 'AMER', 'AMER'),
+        (5, 2, 'KOREA', 'KR'),
+        (6, 2, 'JAPAN', 'JP'),
+        (7, 2, 'SINGAPORE', 'SG'),
+        (8, 3, 'GERMANY', 'DE'),
+        (9, 3, 'UK', 'UK'),
+        (10, 3, 'FRANCE', 'FR'),
+        (11, 4, 'USA_EAST', 'USE'),
+        (12, 4, 'USA_WEST', 'USW'),
+        (13, 4, 'CANADA', 'CA');
+    WHILE v_customer_id <= 36 DO
+        INSERT INTO boss_customer (customer_id, region_id, customer_name, segment, email, profile_json, created_at)
+        VALUES (v_customer_id, 5 + MOD(v_customer_id - 1, 9), CONCAT('CUST_', LPAD(v_customer_id, 3, '0')), ELT(1 + MOD(v_customer_id - 1, 3), 'ENTERPRISE', 'SMB', 'PUBLIC'), CONCAT('cust', LPAD(v_customer_id, 3, '0'), '@boss.test'), JSON_OBJECT('tier', ELT(1 + MOD(v_customer_id - 1, 4), 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM'), 'flags', JSON_ARRAY(CONCAT('f', MOD(v_customer_id, 5)), 'split;test', '//slash', '한글'), 'credits', v_customer_id * 111, 'memo', CONCAT('memo ; ', v_customer_id, ' -- not comment')), DATE_ADD('2024-01-01 08:00:00', INTERVAL v_customer_id DAY));
+        SET v_customer_id = v_customer_id + 1;
+    END WHILE;
+    WHILE v_product_id <= 36 DO
+        INSERT INTO boss_product (product_id, sku, category, product_name, unit_price, attrs_json, active_yn)
+        VALUES (v_product_id, CONCAT('SKU-', LPAD(v_product_id, 4, '0')), ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV'), CONCAT(ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV'), '_PRODUCT_', LPAD(v_product_id, 2, '0')), ROUND(19 + (v_product_id * 7.35) + (MOD(v_product_id, 5) * 3.70), 2), JSON_OBJECT('color', ELT(1 + MOD(v_product_id - 1, 4), 'red', 'blue', 'black', 'silver'), 'weight', ROUND(0.5 + (v_product_id * 0.13), 2), 'tags', JSON_ARRAY(CONCAT('p', v_product_id), 'boss', 'json;test', CONCAT('cat:', ELT(1 + MOD(v_product_id - 1, 3), 'HW', 'SW', 'SV')))), 
+        IF (MOD(v_product_id, 17) = 0, 'N', 'Y'));
+            SET v_product_id = v_product_id + 1;
+        END WHILE;
+        WHILE v_order_id <= 240 DO
+            SET v_status =
+                CASE
+                    WHEN MOD(v_order_id, 17) = 0 THEN
+                        'CANCELLED'
+                    WHEN MOD(v_order_id, 11) = 0 THEN
+                        'HOLD'
+                    WHEN MOD(v_order_id, 3) = 0 THEN
+                        'OPEN'
+                    ELSE
+                        'COMPLETE'
+                END;
+            INSERT INTO boss_order (order_id, customer_id, order_no, order_date, status, meta_json)
+            VALUES (v_order_id, 1 + MOD(v_order_id * 7, 36), CONCAT('ORD', DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY), '%Y%m%d'), '-', LPAD(v_order_id, 5, '0')), DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY), v_status, JSON_OBJECT('channel', ELT(1 + MOD(v_order_id, 4), 'WEB', 'PARTNER', 'DIRECT', 'MOBILE'), 'priority', MOD(v_order_id, 5), 'memo', CONCAT('semi; // ', v_order_id, ' /* literal */'), 'flag', 
+            IF (MOD(v_order_id, 2) = 0, 'Y', 'N')));
+                SET v_item_cnt = 1 + MOD(v_order_id, 5);
+                SET v_item_no = 1;
+                WHILE v_item_no <= v_item_cnt DO
+                    SET v_prod_id = 1 + MOD(v_order_id * 7 + v_item_no * 11, 36);
+                    INSERT INTO boss_order_item (order_id, line_no, product_id, quantity, unit_price, discount_rate, tax_rate, note, details_json)
+                    VALUES (v_order_id, v_item_no, v_prod_id, 1 + MOD(v_order_id + v_item_no, 4), 
+                            CASE
+                                WHEN MOD(v_item_no, 2) = 0 THEN
+                                    NULL
+                                ELSE
+                                    ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)
+                            END, 
+                            CASE
+                                WHEN MOD(v_item_no, 5) = 0 THEN
+                                    0.2000
+                                WHEN MOD(v_item_no, 3) = 0 THEN
+                                    0.0700
+                                ELSE
+                                    ROUND((MOD(v_item_no + v_order_id, 4) * 0.0200), 4)
+                            END, 
+                            CASE
+                                WHEN MOD(v_prod_id, 7) = 0 THEN
+                                    0.0500
+                                ELSE
+                                    0.1000
+                            END, CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'), JSON_OBJECT('gift', 
+                    IF (MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'), 'tags', JSON_ARRAY(CONCAT('o', v_order_id), CONCAT('i', v_item_no), 'semi;colon', 'slash//slash'), 'payload', CONCAT('payload-', v_order_id, '-', v_item_no)));
+                        SET v_item_no = v_item_no + 1;
+                    END WHILE;
+                    SELECT order_date,
+                        grand_total
+                    INTO v_order_date,
+                        v_order_total
+                    FROM boss_order
+                    WHERE order_id = v_order_id;
+                    IF v_status <> 'CANCELLED' THEN
+                        IF MOD(v_order_id, 4) = 0 THEN
+                            INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                            VALUES (v_order_id, DATE_ADD(CAST(CONCAT(v_order_date, ' 09:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 48) HOUR), v_order_total, 'CARD', JSON_OBJECT('gateway', 'G1', 'memo', 'full payment ; // ok'));
+                            ELSEIF MOD(v_order_id, 4) = 1 THEN
+                            INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                            VALUES (v_order_id, DATE_ADD(CAST(CONCAT(v_order_date, ' 10:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 48) HOUR), ROUND(v_order_total * 0.35, 2), 'BANK', JSON_OBJECT('gateway', 'G2', 'memo', 'partial-1'));
+                            INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                            VALUES (v_order_id, DATE_ADD(CAST(CONCAT(v_order_date, ' 18:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 72) HOUR), ROUND(v_order_total - ROUND(v_order_total * 0.35, 2), 2), 'BANK', JSON_OBJECT('gateway', 'G2', 'memo', 'partial-2'));
+                            ELSEIF MOD(v_order_id, 4) = 2 THEN
+                            INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)
+                            VALUES (v_order_id, DATE_ADD(CAST(CONCAT(v_order_date, ' 14:00:00') AS DATETIME), INTERVAL MOD(v_order_id, 36) HOUR), ROUND(v_order_total * 0.60, 2), 'CASH', JSON_OBJECT('gateway', 'G3', 'memo', '60% only'));
+                        END IF;
+                    END IF;
+                    SET v_order_id = v_order_id + 1;
+                END WHILE;
+                UPDATE boss_customer c
+                JOIN (
+                    SELECT o.customer_id,
+                        COUNT(*) AS lifetime_orders,
+                        ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,
+                        MAX(o.order_date) AS last_order_date
+                    FROM boss_order o
+                    WHERE o.status <> 'CANCELLED'
+                    GROUP BY o.customer_id
+                ) s
+                    ON s.customer_id = c.customer_id
+                SET c.profile_json = JSON_SET(c.profile_json, '$.lifetime_orders', s.lifetime_orders, '$.lifetime_net_sales', s.lifetime_net_sales, '$.last_order_date', DATE_FORMAT(s.last_order_date, '%Y-%m-%d'));
+                INSERT INTO boss_audit (event_time, entity_type, entity_id, action_name, payload_json)
+                SELECT NOW(),
+                    'SYSTEM',
+                    '0',
+                    'SEED_COMPLETE',
+                    JSON_OBJECT('regions', (
+                    SELECT COUNT(*)
+                    FROM boss_region
+                    ), 'customers', (
+                    SELECT COUNT(*)
+                    FROM boss_customer
+                    ), 'products', (
+                    SELECT COUNT(*)
+                    FROM boss_product
+                    ), 'orders', (
+                    SELECT COUNT(*)
+                    FROM boss_order
+                    ), 'items', (
+                    SELECT COUNT(*)
+                    FROM boss_order_item
+                    ), 'payments', (
+                    SELECT COUNT(*)
+                    FROM boss_payment
+                    ));
+                COMMIT;
+            END$$"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let begin_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BEGIN")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END$$")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[end_idx]),
+            indent(lines[begin_idx]),
+            "nested MariaDB seed procedure should close on the owner depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_resets_depth_between_custom_delimited_routines() {
+        let source = r#"DELIMITER $$
+CREATE PROCEDURE first_proc()
+BEGIN
+    SET @a = 1;
+END$$
+
+CREATE PROCEDURE second_proc()
+BEGIN
+    SET @b = 2;
+END$$
+DELIMITER ;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let first_end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END$$")
+            .unwrap_or(0);
+        let second_header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CREATE PROCEDURE second_proc()")
+            .unwrap_or(0);
+        let second_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_header_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END$$")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[first_end_idx]), 0,
+            "first routine should close back to depth 0, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[second_header_idx]), 0,
+            "second routine header should not inherit leaked depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[second_begin_idx]), 0,
+            "second routine BEGIN should stay on owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[second_end_idx]), 0,
+            "second routine END should also return to depth 0, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_while_do_owner_depth_with_if_function_body() {
+        let source = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+    WHILE v_product_id <= 36 DO
+        INSERT INTO boss_product (active_yn)
+        VALUES (
+            IF(MOD(v_product_id, 17) = 0, 'N', 'Y')
+        );
+        SET v_product_id = v_product_id + 1;
+    END WHILE;
+END$$
+DELIMITER ;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let while_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHILE v_product_id <= 36 DO")
+            .unwrap_or(0);
+        let values_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    == "VALUES (IF(MOD(v_product_id, 17) = 0, 'N', 'Y'));"
+            })
+            .unwrap_or(0);
+        let set_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SET v_product_id = v_product_id + 1;")
+            .unwrap_or(0);
+        let end_while_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END WHILE;")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END$$")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[values_idx]),
+            indent(lines[while_idx]).saturating_add(4),
+            "VALUES(IF(...)) line should stay on the WHILE body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[set_idx]),
+            indent(lines[while_idx]).saturating_add(4),
+            "statement after IF() scalar function should stay on the WHILE body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[end_while_idx]),
+            indent(lines[while_idx]),
+            "END WHILE should align with the WHILE header, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[end_idx]), 0,
+            "routine END should return to depth 0 after WHILE ... DO closes, got:\n{formatted}"
         );
     }
 }
