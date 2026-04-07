@@ -2924,11 +2924,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             && !postgres_conflict_update_active
                             && !(matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(last_word.as_deref(), Some("UPDATE")))
+                            && !matches!(current_statement_kind, StatementKind::Update)
                         {
                             // Function-local operation keywords such as JSON_TRANSFORM `SET`
                             // can appear inside expression contexts. Keep the surrounding
                             // expression phase unless the token is the actual MERGE
-                            // `... UPDATE SET ...` introducer.
+                            // `... UPDATE SET ...` introducer, or a MySQL/MariaDB-style
+                            // `UPDATE t JOIN ... ON ... SET ...` multi-table update target.
                             relation_state.clear();
                         } else if matches!(
                             current_statement_kind,
