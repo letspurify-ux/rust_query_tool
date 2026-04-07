@@ -274,9 +274,9 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "CEIL",
     "CEILING",
     "CHAR",
-    "CHAR_LENGTH",
     "CHARACTER_LENGTH",
     "CHARSET",
+    "CHAR_LENGTH",
     "COALESCE",
     "COERCIBILITY",
     "COLLATION",
@@ -291,6 +291,7 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "COT",
     "COUNT",
     "CRC32",
+    "CUME_DIST",
     "CURDATE",
     "CURRENT_DATE",
     "CURRENT_TIME",
@@ -299,10 +300,10 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "CURTIME",
     "DATABASE",
     "DATE",
+    "DATEDIFF",
     "DATE_ADD",
     "DATE_FORMAT",
     "DATE_SUB",
-    "DATEDIFF",
     "DAY",
     "DAYNAME",
     "DAYOFMONTH",
@@ -311,6 +312,7 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "DECODE",
     "DEFAULT",
     "DEGREES",
+    "DENSE_RANK",
     "DES_DECRYPT",
     "DES_ENCRYPT",
     "ELT",
@@ -321,6 +323,7 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "EXTRACT",
     "FIELD",
     "FIND_IN_SET",
+    "FIRST_VALUE",
     "FLOOR",
     "FORMAT",
     "FOUND_ROWS",
@@ -335,23 +338,23 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "HOUR",
     "IF",
     "IFNULL",
-    "INET_ATON",
-    "INET_NTOA",
     "INET6_ATON",
     "INET6_NTOA",
+    "INET_ATON",
+    "INET_NTOA",
     "INSERT",
     "INSTR",
+    "ISNULL",
     "IS_FREE_LOCK",
     "IS_IPV4",
     "IS_IPV4_COMPAT",
     "IS_IPV4_MAPPED",
     "IS_IPV6",
     "IS_USED_LOCK",
-    "ISNULL",
     "JSON_ARRAY",
+    "JSON_ARRAYAGG",
     "JSON_ARRAY_APPEND",
     "JSON_ARRAY_INSERT",
-    "JSON_ARRAYAGG",
     "JSON_CONTAINS",
     "JSON_CONTAINS_PATH",
     "JSON_DEPTH",
@@ -364,10 +367,13 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "JSON_MERGE_PRESERVE",
     "JSON_OBJECT",
     "JSON_OBJECTAGG",
+    "JSON_OVERLAPS",
     "JSON_PRETTY",
     "JSON_QUOTE",
     "JSON_REMOVE",
     "JSON_REPLACE",
+    "JSON_SCHEMA_VALID",
+    "JSON_SCHEMA_VALIDATION_REPORT",
     "JSON_SEARCH",
     "JSON_SET",
     "JSON_STORAGE_FREE",
@@ -380,6 +386,7 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "LAG",
     "LAST_DAY",
     "LAST_INSERT_ID",
+    "LAST_VALUE",
     "LCASE",
     "LEAD",
     "LEAST",
@@ -396,9 +403,9 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "LOWER",
     "LPAD",
     "LTRIM",
-    "MAKE_SET",
     "MAKEDATE",
     "MAKETIME",
+    "MAKE_SET",
     "MASTER_POS_WAIT",
     "MAX",
     "MD5",
@@ -411,12 +418,15 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "MONTHNAME",
     "NAME_CONST",
     "NOW",
+    "NTH_VALUE",
+    "NTILE",
     "NULLIF",
     "OCT",
     "OCTET_LENGTH",
     "OLD_PASSWORD",
     "ORD",
     "PASSWORD",
+    "PERCENT_RANK",
     "PERIOD_ADD",
     "PERIOD_DIFF",
     "PI",
@@ -448,8 +458,8 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "RPAD",
     "RTRIM",
     "SCHEMA",
-    "SEC_TO_TIME",
     "SECOND",
+    "SEC_TO_TIME",
     "SESSION_USER",
     "SHA1",
     "SHA2",
@@ -463,8 +473,93 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "STDDEV",
     "STDDEV_POP",
     "STDDEV_SAMP",
-    "STR_TO_DATE",
     "STRCMP",
+    "STR_TO_DATE",
+    "ST_AREA",
+    "ST_ASBINARY",
+    "ST_ASTEXT",
+    "ST_ASWKB",
+    "ST_ASWKT",
+    "ST_BUFFER",
+    "ST_CENTROID",
+    "ST_CONTAINS",
+    "ST_CONVEXHULL",
+    "ST_CROSSES",
+    "ST_DIFFERENCE",
+    "ST_DIMENSION",
+    "ST_DISJOINT",
+    "ST_DISTANCE",
+    "ST_DISTANCE_SPHERE",
+    "ST_ENDPOINT",
+    "ST_ENVELOPE",
+    "ST_EQUALS",
+    "ST_EXTERIORRING",
+    "ST_GEOMCOLLFROMTEXT",
+    "ST_GEOMCOLLFROMWKB",
+    "ST_GEOMETRYCOLLECTIONFROMTEXT",
+    "ST_GEOMETRYCOLLECTIONFROMWKB",
+    "ST_GEOMETRYFROMTEXT",
+    "ST_GEOMETRYFROMWKB",
+    "ST_GEOMETRYN",
+    "ST_GEOMETRYTYPE",
+    "ST_GEOMFROMGEOJSON",
+    "ST_GEOMFROMTEXT",
+    "ST_GEOMFROMWKB",
+    "ST_INTERIORRINGN",
+    "ST_INTERSECTION",
+    "ST_INTERSECTS",
+    "ST_ISCLOSED",
+    "ST_ISEMPTY",
+    "ST_ISSIMPLE",
+    "ST_ISVALID",
+    "ST_LATFROMGEOHASH",
+    "ST_LATITUDE",
+    "ST_LENGTH",
+    "ST_LINEFROMTEXT",
+    "ST_LINEFROMWKB",
+    "ST_LINESTRINGFROMTEXT",
+    "ST_LINESTRINGFROMWKB",
+    "ST_LONGFROMGEOHASH",
+    "ST_LONGITUDE",
+    "ST_MAKEENVELOPE",
+    "ST_MLINEFROMTEXT",
+    "ST_MLINEFROMWKB",
+    "ST_MPOINTFROMTEXT",
+    "ST_MPOINTFROMWKB",
+    "ST_MPOLYFROMTEXT",
+    "ST_MPOLYFROMWKB",
+    "ST_MULTILINESTRINGFROMTEXT",
+    "ST_MULTILINESTRINGFROMWKB",
+    "ST_MULTIPOINTFROMTEXT",
+    "ST_MULTIPOINTFROMWKB",
+    "ST_MULTIPOLYGONFROMTEXT",
+    "ST_MULTIPOLYGONFROMWKB",
+    "ST_NUMGEOMETRIES",
+    "ST_NUMINTERIORRING",
+    "ST_NUMINTERIORRINGS",
+    "ST_NUMPOINTS",
+    "ST_OVERLAPS",
+    "ST_POINTATDISTANCE",
+    "ST_POINTFROMGEOHASH",
+    "ST_POINTFROMTEXT",
+    "ST_POINTFROMWKB",
+    "ST_POINTN",
+    "ST_POLYFROMTEXT",
+    "ST_POLYFROMWKB",
+    "ST_POLYGONFROMTEXT",
+    "ST_POLYGONFROMWKB",
+    "ST_SIMPLIFY",
+    "ST_SRID",
+    "ST_STARTPOINT",
+    "ST_SWAPXY",
+    "ST_SYMDIFFERENCE",
+    "ST_TOUCHES",
+    "ST_TRANSFORM",
+    "ST_UNION",
+    "ST_VALIDATE",
+    "ST_WITHIN",
+    "ST_X",
+    "ST_Y",
     "SUBDATE",
     "SUBSTR",
     "SUBSTRING",
@@ -475,12 +570,12 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "SYSTEM_USER",
     "TAN",
     "TIME",
-    "TIME_FORMAT",
-    "TIME_TO_SEC",
     "TIMEDIFF",
     "TIMESTAMP",
     "TIMESTAMPADD",
     "TIMESTAMPDIFF",
+    "TIME_FORMAT",
+    "TIME_TO_SEC",
     "TO_BASE64",
     "TO_DAYS",
     "TO_SECONDS",
@@ -501,9 +596,9 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "UUID_TO_BIN",
     "VALIDATE_PASSWORD_STRENGTH",
     "VALUES",
+    "VARIANCE",
     "VAR_POP",
     "VAR_SAMP",
-    "VARIANCE",
     "VERSION",
     "WAIT_FOR_EXECUTED_GTID_SET",
     "WEEK",
@@ -588,6 +683,18 @@ impl IntellisenseData {
         prefer_relations: bool,
         prefer_columns: bool,
     ) -> Vec<String> {
+        self.get_suggestions_for_db(prefix, include_columns, column_tables, prefer_relations, prefer_columns, None)
+    }
+
+    pub fn get_suggestions_for_db(
+        &mut self,
+        prefix: &str,
+        include_columns: bool,
+        column_tables: Option<&[String]>,
+        prefer_relations: bool,
+        prefer_columns: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
         self.ensure_base_indices();
 
         let prefix_upper = prefix.to_uppercase();
@@ -638,16 +745,22 @@ impl IntellisenseData {
             }
         }
 
-        // Add SQL keywords and Oracle functions only when a non-empty prefix
+        // Add SQL keywords and built-in functions only when a non-empty prefix
         // is available.  With an empty prefix we would iterate the entire
         // sorted array and hit MAX_SUGGESTIONS before useful entries appear,
         // so skip them – the caller already has context-specific entries
         // (tables, views, columns) for empty-prefix completions.
+        let is_mysql = matches!(db_type, Some(crate::db::DatabaseType::MySQL));
         if !prefix_upper.is_empty() {
-            // SQL keywords (binary search – SQL_KEYWORDS is sorted)
+            // SQL keywords – choose list based on connected database type
+            let keywords: &[&str] = if is_mysql {
+                sql_text::MYSQL_SQL_KEYWORDS
+            } else {
+                SQL_KEYWORDS
+            };
             {
-                let start = SQL_KEYWORDS.partition_point(|kw| *kw < prefix_upper.as_str());
-                for keyword in &SQL_KEYWORDS[start..] {
+                let start = keywords.partition_point(|kw| *kw < prefix_upper.as_str());
+                for keyword in &keywords[start..] {
                     if !keyword.starts_with(prefix_upper.as_str()) {
                         break;
                     }
@@ -660,10 +773,15 @@ impl IntellisenseData {
                 }
             }
 
-            // Oracle functions (binary search – ORACLE_FUNCTIONS is sorted)
+            // Built-in functions – choose list based on connected database type
+            let functions: &[&str] = if is_mysql {
+                MYSQL_FUNCTIONS
+            } else {
+                ORACLE_FUNCTIONS
+            };
             {
-                let start = ORACLE_FUNCTIONS.partition_point(|f| *f < prefix_upper.as_str());
-                for func in &ORACLE_FUNCTIONS[start..] {
+                let start = functions.partition_point(|f| *f < prefix_upper.as_str());
+                for func in &functions[start..] {
                     if !func.starts_with(prefix_upper.as_str()) {
                         break;
                     }
