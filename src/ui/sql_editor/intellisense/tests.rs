@@ -1310,6 +1310,248 @@ fn mariadb_final_boss_recursive_cte_dept_tree_second_member_where() {
 }
 
 #[test]
+fn mariadb_final_boss_trigger_body_insert_column_list_is_insert_column_list() {
+    // test4.txt: cursor inside INSERT INTO audit_events (...) column list
+    // inside the ai_task_log AFTER INSERT trigger body.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "INSERT INTO audit_events (\n        event_type,\n        entity_name,\n        entity_id,\n        detail\n    )",
+        "INSERT INTO audit_events (\n        event_type,\n        entity_name,\n        entity_id,\n        __CODEX_CURSOR__detail\n    )",
+        1,
+    );
+    assert_ne!(marked, script, "expected INSERT INTO audit_events column list target in test4.txt trigger");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE TRIGGER ai_task_log"),
+        "cursor should stay inside the ai_task_log trigger, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::InsertColumnList,
+        "INSERT column list inside trigger body should be InsertColumnList phase"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "AUDIT_EVENTS"),
+        "audit_events must be registered as INSERT target in trigger body, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_procedure_insert_inside_while_loop_is_insert_column_list() {
+    // test4.txt: cursor inside INSERT INTO task_log (...) column list
+    // inside the nested WHILE loop of sp_seed_monster_data procedure.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "INSERT INTO task_log (\n                project_id,\n                employee_id,",
+        "INSERT INTO task_log (\n                project_id,\n                __CODEX_CURSOR__employee_id,",
+        1,
+    );
+    assert_ne!(marked, script, "expected INSERT INTO task_log column list target in sp_seed_monster_data");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_seed_monster_data"),
+        "cursor should stay inside sp_seed_monster_data procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::InsertColumnList,
+        "INSERT column list inside WHILE loop in procedure should be InsertColumnList phase"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "TASK_LOG"),
+        "task_log must be registered as INSERT target inside WHILE loop, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_procedure_update_join_set_is_dml_set() {
+    // test4.txt: cursor inside SET clause of UPDATE projects p JOIN (...) x ON ... SET p.last_rollup_at
+    // in sp_build_monthly_rollup procedure.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "SET p.last_rollup_at = CURRENT_TIMESTAMP(6);",
+        "SET p.__CODEX_CURSOR__last_rollup_at = CURRENT_TIMESTAMP(6);",
+        1,
+    );
+    assert_ne!(marked, script, "expected UPDATE...SET target in sp_build_monthly_rollup");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_build_monthly_rollup"),
+        "cursor should stay inside sp_build_monthly_rollup, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::DmlSetTargetList,
+        "UPDATE...JOIN...SET inside procedure should be DmlSetTargetList phase"
+    );
+    assert!(
+        deep_ctx.phase.is_column_context(),
+        "DmlSetTargetList must be a column context"
+    );
+    assert!(
+        deep_ctx.focused_tables.iter().any(|t| t.eq_ignore_ascii_case("projects")),
+        "focused table for UPDATE...SET should include projects, got: {:?}", deep_ctx.focused_tables
+    );
+}
+
+#[test]
+fn mariadb_final_boss_standalone_monster_query1_recursive_cte_select_list() {
+    // test4.txt: Monster query #1 is a standalone WITH RECURSIVE... SELECT.
+    // Cursor inside the SELECT list of the outer query referencing dept_tree CTE.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    // The outer SELECT references columns from dept_tree CTE
+    let marked = script.replacen(
+        "SELECT\n    dept_id,\n    dept_code,\n    dept_name,\n    lvl,\n    path_text\nFROM dept_tree",
+        "SELECT\n    __CODEX_CURSOR__dept_id,\n    dept_code,\n    dept_name,\n    lvl,\n    path_text\nFROM dept_tree",
+        1,
+    );
+    assert_ne!(marked, script, "expected standalone monster query #1 SELECT target in test4.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("WITH RECURSIVE dept_tree AS"),
+        "cursor should be in standalone WITH RECURSIVE statement, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::SelectList,
+        "outer SELECT of WITH RECURSIVE should be SelectList phase"
+    );
+    let cte_names: Vec<String> = deep_ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect();
+    assert!(
+        cte_names.iter().any(|n| n == "DEPT_TREE"),
+        "DEPT_TREE CTE must be visible in outer SELECT, got: {cte_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_monster_query2_owner_chain_cte_dept_tree_visible() {
+    // test4.txt Monster query #2: cursor inside owner_chain CTE body.
+    // `FROM employees e JOIN dept_tree dt ON dt.dept_id = e.dept_id`
+    // The dept_tree CTE defined earlier in the same WITH clause must be visible.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    // This is the 2nd occurrence of `ON t.dept_id = c.parent_dept_id` - but that's different.
+    // owner_chain has `ON dt.dept_id = e.dept_id`
+    let marked = script.replacen(
+        "ON dt.dept_id = e.dept_id",
+        "ON dt.__CODEX_CURSOR__dept_id = e.dept_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected owner_chain ON clause target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::JoinCondition,
+        "ON clause inside owner_chain CTE body should be JoinCondition phase"
+    );
+    let cte_names: Vec<String> = deep_ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect();
+    assert!(
+        cte_names.iter().any(|n| n == "DEPT_TREE"),
+        "DEPT_TREE CTE must be visible inside owner_chain body, got: {cte_names:?}"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "DT"),
+        "alias `dt` (for dept_tree) must be in scope, got: {table_names:?}"
+    );
+    assert!(
+        table_names.iter().any(|n| n == "E"),
+        "alias `e` (for employees) must be in scope, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_monster_query3_json_table_group_by_is_column_context() {
+    // test4.txt Monster query #3: WITH tag_usage AS (...FROM task_log t
+    // JOIN JSON_TABLE(...) jt GROUP BY p.project_code, jt.tag)
+    // Cursor inside the GROUP BY clause, verifying it's GroupByClause phase
+    // and that jt (JSON_TABLE alias) is in scope.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "GROUP BY\n        p.project_code,\n        jt.tag",
+        "GROUP BY\n        p.project_code,\n        jt.__CODEX_CURSOR__tag",
+        1,
+    );
+    assert_ne!(marked, script, "expected JSON_TABLE GROUP BY target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::GroupByClause,
+        "GROUP BY with JSON_TABLE alias should be GroupByClause phase"
+    );
+    assert!(
+        deep_ctx.phase.is_column_context(),
+        "GroupByClause must be a column context"
+    );
+    // jt (JSON_TABLE virtual relation alias) must be visible
+    let qualifier_tables = crate::ui::intellisense_context::resolve_qualifier_tables(
+        "JT",
+        &deep_ctx.tables_in_scope,
+    );
+    assert!(
+        !qualifier_tables.is_empty(),
+        "qualifier `jt` (JSON_TABLE alias) must resolve in GROUP BY context, got empty"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_final_inspection_select_from_clause_tables_in_scope() {
+    // test4.txt: Final inspection SELECT query (lines ~751-765).
+    // Cursor inside WHERE/ORDER BY of the multi-join SELECT to verify all tables visible.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    // Target the ORDER BY clause of the final SELECT
+    let marked = script.replacen(
+        "ORDER BY mr.ym, p.project_code, e.emp_code;",
+        "ORDER BY mr.__CODEX_CURSOR__ym, p.project_code, e.emp_code;",
+        1,
+    );
+    assert_ne!(marked, script, "expected final SELECT ORDER BY target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause,
+        "final SELECT ORDER BY should be OrderByClause phase"
+    );
+    let table_aliases: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_aliases.iter().any(|n| n == "MR"),
+        "alias `mr` (monthly_rollup) must be in scope, got: {table_aliases:?}"
+    );
+    assert!(
+        table_aliases.iter().any(|n| n == "P"),
+        "alias `p` (projects) must be in scope, got: {table_aliases:?}"
+    );
+    assert!(
+        table_aliases.iter().any(|n| n == "E"),
+        "alias `e` (employees) must be in scope, got: {table_aliases:?}"
+    );
+}
+
+#[test]
 fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name() {
     for (file_name, target, replacement) in [
         (
