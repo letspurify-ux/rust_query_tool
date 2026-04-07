@@ -1379,6 +1379,100 @@ enum ExitConditionState {
     AwaitingWhen,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MySqlHandlerFormatState {
+    None,
+    AwaitingConditionStart,
+    AwaitingNotFoundTail,
+    AwaitingSqlstateValueOrLiteral,
+    AwaitingSqlstateLiteral,
+    AwaitingNextConditionOrBody,
+}
+
+impl MySqlHandlerFormatState {
+    fn start(&mut self) {
+        *self = Self::AwaitingConditionStart;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+
+    fn body_line_pending(self) -> bool {
+        matches!(self, Self::AwaitingNextConditionOrBody)
+    }
+
+    fn consume_word(&mut self, word_upper: &str) -> bool {
+        match *self {
+            Self::None => false,
+            Self::AwaitingConditionStart => {
+                *self = match word_upper {
+                    "NOT" => Self::AwaitingNotFoundTail,
+                    "SQLSTATE" => Self::AwaitingSqlstateValueOrLiteral,
+                    _ => Self::AwaitingNextConditionOrBody,
+                };
+                true
+            }
+            Self::AwaitingNotFoundTail => {
+                if word_upper == "FOUND" {
+                    *self = Self::AwaitingNextConditionOrBody;
+                    true
+                } else {
+                    *self = Self::None;
+                    false
+                }
+            }
+            Self::AwaitingSqlstateValueOrLiteral => {
+                if word_upper == "VALUE" {
+                    *self = Self::AwaitingSqlstateLiteral;
+                    true
+                } else {
+                    *self = Self::None;
+                    false
+                }
+            }
+            Self::AwaitingSqlstateLiteral => {
+                *self = Self::None;
+                false
+            }
+            Self::AwaitingNextConditionOrBody => {
+                *self = Self::None;
+                false
+            }
+        }
+    }
+
+    fn consume_string(&mut self) -> bool {
+        match *self {
+            Self::AwaitingConditionStart => {
+                *self = Self::AwaitingNextConditionOrBody;
+                true
+            }
+            Self::AwaitingSqlstateValueOrLiteral | Self::AwaitingSqlstateLiteral => {
+                *self = Self::AwaitingNextConditionOrBody;
+                true
+            }
+            Self::AwaitingNotFoundTail | Self::AwaitingNextConditionOrBody => {
+                *self = Self::None;
+                false
+            }
+            Self::None => false,
+        }
+    }
+
+    fn on_symbol(&mut self, symbol: &str) {
+        match (*self, symbol) {
+            (Self::AwaitingNextConditionOrBody, ",") => {
+                *self = Self::AwaitingConditionStart;
+            }
+            (_, ";") => {
+                *self = Self::None;
+            }
+            _ => {}
+        }
+    }
+}
+
 impl ExitConditionState {
     fn on_keyword(&mut self, keyword: &str) {
         match (keyword, *self) {
@@ -2656,6 +2750,200 @@ impl SqlEditorWidget {
         *formatted_statement = normalized;
     }
 
+    fn normalize_mysql_compound_declare_layout(formatted_statement: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum HandlerPhase {
+            AwaitingBody,
+            InBlock { nested_depth: usize },
+        }
+
+        #[derive(Clone, Copy)]
+        struct CursorState {
+            header_indent: usize,
+            paren_depth: isize,
+        }
+
+        #[derive(Clone, Copy)]
+        struct HandlerState {
+            header_indent: usize,
+            phase: HandlerPhase,
+        }
+
+        fn leading_spaces(line: &str) -> usize {
+            line.len().saturating_sub(line.trim_start().len())
+        }
+
+        fn rewrite_indent(line: &str, indent_spaces: usize) -> String {
+            format!("{}{}", " ".repeat(indent_spaces), line.trim_start())
+        }
+
+        fn is_comment_or_blank(line: &str) -> bool {
+            let trimmed = line.trim();
+            trimmed.is_empty()
+                || trimmed.starts_with("--")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("*/")
+        }
+
+        fn starts_with_mysql_query_clause(line: &str) -> bool {
+            matches!(
+                line.split_whitespace().next(),
+                Some(
+                    "SELECT"
+                        | "WITH"
+                        | "FROM"
+                        | "WHERE"
+                        | "GROUP"
+                        | "HAVING"
+                        | "ORDER"
+                        | "CONNECT"
+                        | "START"
+                        | "UNION"
+                        | "INTERSECT"
+                        | "MINUS"
+                        | "EXCEPT"
+                        | "LIMIT"
+                        | "WINDOW"
+                        | "QUALIFY"
+                        | "MODEL"
+                )
+            )
+        }
+
+        fn is_mysql_handler_condition_continuation(line: &str) -> bool {
+            let mut parts = line.split_whitespace();
+            let first = parts.next().unwrap_or_default();
+            let second = parts.next().unwrap_or_default();
+
+            first == "NOT"
+                || first == "FOUND"
+                || first == "SQLSTATE"
+                || first == "VALUE"
+                || first == "SQLEXCEPTION"
+                || first == "SQLWARNING"
+                || first.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                || first.starts_with('\'')
+                || (first == "NOT" && second == "FOUND")
+        }
+
+        let mut normalized_lines: Vec<String> = Vec::new();
+        let mut cursor_state: Option<CursorState> = None;
+        let mut handler_state: Option<HandlerState> = None;
+
+        for raw_line in formatted_statement.lines() {
+            let trimmed = raw_line.trim_start();
+            let mut line = raw_line.to_string();
+
+            if let Some(state) = handler_state {
+                if !is_comment_or_blank(trimmed) {
+                    match state.phase {
+                        HandlerPhase::AwaitingBody => {
+                            if is_mysql_handler_condition_continuation(trimmed) {
+                                line = rewrite_indent(raw_line, state.header_indent);
+                            } else if trimmed == "BEGIN" {
+                                line = rewrite_indent(raw_line, state.header_indent + 4);
+                                handler_state = Some(HandlerState {
+                                    header_indent: state.header_indent,
+                                    phase: HandlerPhase::InBlock { nested_depth: 1 },
+                                });
+                            } else {
+                                line = rewrite_indent(raw_line, state.header_indent + 4);
+                                if trimmed.ends_with(';') {
+                                    handler_state = None;
+                                }
+                            }
+                        }
+                        HandlerPhase::InBlock { nested_depth } => {
+                            if trimmed == "BEGIN" {
+                                line = rewrite_indent(
+                                    raw_line,
+                                    state.header_indent + 4 + (nested_depth.saturating_sub(1) * 4),
+                                );
+                                handler_state = Some(HandlerState {
+                                    header_indent: state.header_indent,
+                                    phase: HandlerPhase::InBlock {
+                                        nested_depth: nested_depth.saturating_add(1),
+                                    },
+                                });
+                            } else if trimmed.starts_with("END") {
+                                let remaining_depth = nested_depth.saturating_sub(1);
+                                line = rewrite_indent(
+                                    raw_line,
+                                    state.header_indent + 4 + (remaining_depth * 4),
+                                );
+                                handler_state = (remaining_depth > 0).then_some(HandlerState {
+                                    header_indent: state.header_indent,
+                                    phase: HandlerPhase::InBlock {
+                                        nested_depth: remaining_depth,
+                                    },
+                                });
+                            } else {
+                                line = rewrite_indent(
+                                    raw_line,
+                                    state.header_indent + 4 + (nested_depth * 4),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(state) = cursor_state {
+                let trimmed_after_handler = line.trim_start().to_string();
+                if !is_comment_or_blank(&trimmed_after_handler)
+                    && starts_with_mysql_query_clause(&trimmed_after_handler)
+                {
+                    line = rewrite_indent(&line, state.header_indent + 4);
+                }
+
+                let mut next_paren_depth = state.paren_depth;
+                for ch in trimmed_after_handler.chars() {
+                    match ch {
+                        '(' => next_paren_depth += 1,
+                        ')' => next_paren_depth -= 1,
+                        _ => {}
+                    }
+                }
+
+                if trimmed_after_handler.ends_with(';') && next_paren_depth <= 0 {
+                    cursor_state = None;
+                } else {
+                    cursor_state = Some(CursorState {
+                        header_indent: state.header_indent,
+                        paren_depth: next_paren_depth,
+                    });
+                }
+            }
+
+            let normalized_trimmed = line.trim_start();
+            if normalized_trimmed.starts_with("DECLARE") && normalized_trimmed.contains(" CURSOR FOR")
+            {
+                cursor_state = Some(CursorState {
+                    header_indent: leading_spaces(&line),
+                    paren_depth: 0,
+                });
+            }
+
+            if normalized_trimmed.starts_with("DECLARE") && normalized_trimmed.contains(" HANDLER FOR")
+            {
+                handler_state = Some(HandlerState {
+                    header_indent: leading_spaces(&line),
+                    phase: HandlerPhase::AwaitingBody,
+                });
+            }
+
+            normalized_lines.push(line);
+        }
+
+        let mut normalized = normalized_lines.join("\n");
+        if formatted_statement.ends_with('\n') {
+            normalized.push('\n');
+        }
+        normalized
+    }
+
     fn append_missing_statement_terminator(formatted_statement: &mut String) {
         Self::append_statement_terminator(formatted_statement, ";", false);
     }
@@ -2948,7 +3236,11 @@ impl SqlEditorWidget {
                         mysql_compatible_statement,
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
-                    let mut formatted_statement = formatted_statement;
+                    let mut formatted_statement = if mysql_compatible_statement {
+                        Self::normalize_mysql_compound_declare_layout(&formatted_statement)
+                    } else {
+                        formatted_statement
+                    };
                     if let Some(delimiter) = active_mysql_delimiter.as_deref() {
                         Self::append_statement_terminator(
                             &mut formatted_statement,
@@ -3556,14 +3848,24 @@ impl SqlEditorWidget {
         words
     }
 
-    fn is_mysql_declare_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
+    fn is_mysql_declare_cursor_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
         let recent_words = Self::recent_statement_words_before(tokens, idx, 6);
         recent_words
             .iter()
             .any(|word| word.eq_ignore_ascii_case("DECLARE"))
-            && recent_words.iter().any(|word| {
-                word.eq_ignore_ascii_case("HANDLER") || word.eq_ignore_ascii_case("CURSOR")
-            })
+            && recent_words
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("CURSOR"))
+    }
+
+    fn is_mysql_declare_handler_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
+        let recent_words = Self::recent_statement_words_before(tokens, idx, 6);
+        recent_words
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case("DECLARE"))
+            && recent_words
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("HANDLER"))
     }
 
     fn is_mysql_if_exists_modifier(
@@ -4268,6 +4570,7 @@ impl SqlEditorWidget {
         let mut pending_package_member_separator = false;
         let mut open_cursor_state = OpenCursorFormatState::None;
         let mut open_for_select_stack: Vec<OpenCursorFormatState> = Vec::new();
+        let mut mysql_handler_state = MySqlHandlerFormatState::None;
         let mut case_branch_started: Vec<bool> = Vec::new();
         let mut between_paren_depths: Vec<usize> = Vec::new();
         let mut phase1_wrapped_owner_frames: Vec<Phase1WrappedOwnerFrame> = Vec::new();
@@ -4278,6 +4581,7 @@ impl SqlEditorWidget {
         let mut statement_has_with_clause = false;
         // MySQL ON DUPLICATE KEY UPDATE: tracks when VALUES() is a function, not a clause
         let mut on_duplicate_key_update_active = false;
+        let mut mysql_handler_begin_block_depths: Vec<usize> = Vec::new();
         let mut trigger_header_state = TriggerHeaderState::default();
         let mut compound_trigger_state = CompoundTriggerState::default();
         let mut plsql_context_state = ScopedFlag::default();
@@ -4547,9 +4851,19 @@ impl SqlEditorWidget {
                             || (upper == "ON"
                                 && suppress_comma_break_depth > 0
                                 && !paren_stack.iter().any(|frame| frame.is_query_like())));
-                    let mysql_declare_for_clause = mysql_compatible
+                    let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
-                        && Self::is_mysql_declare_for_clause(tokens, idx);
+                        && Self::is_mysql_declare_cursor_for_clause(tokens, idx);
+                    let mysql_declare_handler_for_clause = mysql_compatible
+                        && upper == "FOR"
+                        && Self::is_mysql_declare_handler_for_clause(tokens, idx);
+                    let mysql_handler_body_line_pending =
+                        at_line_start && mysql_handler_state.body_line_pending();
+                    let mysql_handler_block_begin = mysql_handler_body_line_pending
+                        && upper == "BEGIN"
+                        && !mysql_declare_handler_for_clause;
+                    let mysql_declare_for_clause =
+                        mysql_declare_cursor_for_clause || mysql_declare_handler_for_clause;
                     let mysql_if_exists_modifier =
                         upper == "IF" && Self::is_mysql_if_exists_modifier(tokens, idx, next_word);
                     let is_trigger_event_keyword = trigger_header_state.is_active()
@@ -4614,6 +4928,12 @@ impl SqlEditorWidget {
                     let follows_alias_control_keyword = follows_alias_keyword
                         && sql_text::is_plsql_control_keyword(upper)
                         && !next_word_is("THEN");
+                    let mysql_create_function_header_attribute = mysql_compatible
+                        && matches!(construct.create_object.as_deref(), Some("FUNCTION"))
+                        && matches!(upper, "RETURNS" | "DETERMINISTIC");
+                    if mysql_handler_block_begin {
+                        indent_level = indent_level.saturating_add(1);
+                    }
                     if mysql_labeled_block_header_word && !at_line_start {
                         newline_with(
                             &mut out,
@@ -4717,6 +5037,7 @@ impl SqlEditorWidget {
                             Some("LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE")
                         );
                         let paren_extra = Self::paren_extra_depth(&paren_stack);
+                        let mut closed_block = None;
 
                         let case_expression_end =
                             !is_qualified_end && block_stack.last().is_some_and(|s| s == "CASE");
@@ -4741,7 +5062,6 @@ impl SqlEditorWidget {
                         } else {
                             // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
                             // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
-                            let mut closed_block = None;
                             while let Some(top) = block_stack.pop() {
                                 if top == "BEGIN"
                                     || top == "DECLARE"
@@ -4761,6 +5081,14 @@ impl SqlEditorWidget {
                         }
 
                         indent_level = indent_level.saturating_sub(1);
+                        let closed_mysql_handler_begin =
+                            matches!(closed_block.as_deref(), Some("BEGIN"))
+                                && mysql_handler_begin_block_depths
+                                    .last()
+                                    .copied()
+                                    .is_some_and(|depth| {
+                                        depth == block_stack.len().saturating_add(1)
+                                    });
                         if !block_stack.iter().any(|s| s == "COMPOUND_TRIGGER") {
                             compound_trigger_state.clear();
                         }
@@ -4818,6 +5146,10 @@ impl SqlEditorWidget {
                             }
                             idx = lookahead;
                         }
+                        if closed_mysql_handler_begin {
+                            let _ = mysql_handler_begin_block_depths.pop();
+                            indent_level = indent_level.saturating_sub(1);
+                        }
                         continue;
                     } else if is_compound_trigger_timing_header {
                         compound_trigger_state.start_timing_point();
@@ -4836,6 +5168,15 @@ impl SqlEditorWidget {
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
                             1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if mysql_create_function_header_attribute {
+                        newline_with(
+                            &mut out,
+                            base_indent(indent_level, open_cursor_state),
+                            0,
                             &mut at_line_start,
                             &mut needs_space,
                             &mut line_indent,
@@ -4887,6 +5228,9 @@ impl SqlEditorWidget {
                             let insert_all_extra = usize::from(
                                 insert_all_active_in_scope && matches!(upper, "INTO" | "VALUES"),
                             );
+                            let mysql_handler_body_extra = usize::from(
+                                mysql_handler_body_line_pending && !mysql_handler_block_begin,
+                            );
                             let window_body_header_indent = construct
                                 .in_window_paren(paren_stack.len())
                                 .then(|| {
@@ -4902,17 +5246,6 @@ impl SqlEditorWidget {
                             if insert_all_active_in_scope && upper == "SELECT" {
                                 construct.insert_all_active.deactivate();
                             }
-                            let cursor_clause_dedent = construct.cursor_sql_active.is_active()
-                                && !paren_stack.iter().any(|frame| frame.is_query_like())
-                                && (matches!(
-                                    upper,
-                                    "FROM" | "WHERE" | "GROUP" | "ORDER" | "CONNECT" | "HAVING"
-                                ) || crate::sql_text::is_format_set_operator_keyword(upper));
-                            let clause_indent_level = if cursor_clause_dedent {
-                                indent_level.saturating_sub(1)
-                            } else {
-                                indent_level
-                            };
                             if let Some(window_indent) = window_body_header_indent {
                                 newline_with(
                                     &mut out,
@@ -4926,7 +5259,7 @@ impl SqlEditorWidget {
                                 newline_with(
                                     &mut out,
                                     clause_indent(
-                                        clause_indent_level,
+                                        indent_level,
                                         open_cursor_state,
                                         upper,
                                         open_cursor_state
@@ -4934,7 +5267,7 @@ impl SqlEditorWidget {
                                             .is_some_and(|depth| paren_stack.len() == depth),
                                         construct.cursor_sql_active.is_active(),
                                     ),
-                                    insert_all_extra,
+                                    insert_all_extra + mysql_handler_body_extra,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -5360,6 +5693,12 @@ impl SqlEditorWidget {
                             );
                         } else if upper == "OPEN" {
                             open_cursor_state = OpenCursorFormatState::AwaitingFor;
+                        } else if upper == "FOR" && mysql_declare_cursor_for_clause {
+                            construct.cursor_sql_active.activate(current_scope);
+                            indent_level += 1;
+                            newline_after_keyword = true;
+                        } else if upper == "FOR" && mysql_declare_handler_for_clause {
+                            mysql_handler_state.start();
                         } else if upper == "FOR"
                             && next_word_is("UPDATE")
                             && !mysql_declare_for_clause
@@ -5542,8 +5881,20 @@ impl SqlEditorWidget {
                             .first()
                             .is_some_and(|byte| byte.is_ascii_digit())
                         && !matches!(upper, "WHEN" | "ELSE" | "END");
+                    let mysql_handler_header_word = if mysql_declare_handler_for_clause {
+                        false
+                    } else {
+                        mysql_handler_state.consume_word(upper)
+                    };
                     if case_branch_body_line {
                         line_indent = line_indent.saturating_add(1);
+                    }
+                    if mysql_handler_body_line_pending
+                        && !mysql_handler_header_word
+                        && !mysql_handler_block_begin
+                    {
+                        line_indent =
+                            line_indent.max(base_indent(indent_level, open_cursor_state) + 1);
                     }
                     let mysql_on_duplicate_values_argument_line = at_line_start
                         && on_duplicate_key_update_active
@@ -5729,6 +6080,9 @@ impl SqlEditorWidget {
                         }
                         plsql_context_state
                             .activate(FormatScope::new(paren_stack.len(), block_stack.len()));
+                        if mysql_handler_block_begin {
+                            mysql_handler_begin_block_depths.push(block_stack.len());
+                        }
                         if mysql_compatible && construct.create_object.is_some() {
                             // MySQL/MariaDB stored routines and triggers enter
                             // their executable body at BEGIN instead of AS/IS.
@@ -5875,6 +6229,13 @@ impl SqlEditorWidget {
                     prev_word_upper = Some(upper.to_string());
                 }
                 SqlToken::String(literal) => {
+                    let mysql_handler_body_line_pending =
+                        at_line_start && mysql_handler_state.body_line_pending();
+                    let mysql_handler_header_literal = mysql_handler_state.consume_string();
+                    if mysql_handler_body_line_pending && !mysql_handler_header_literal {
+                        line_indent =
+                            line_indent.max(base_indent(indent_level, open_cursor_state) + 1);
+                    }
                     ensure_indent(&mut out, &mut at_line_start, line_indent);
                     if needs_space {
                         out.push(' ');
@@ -6261,6 +6622,9 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Symbol(sym) => {
+                    let mysql_handler_condition_separator =
+                        sym == "," && mysql_handler_state.body_line_pending();
+                    mysql_handler_state.on_symbol(sym.as_str());
                     match sym.as_str() {
                         "," => {
                             with_cte_state.on_separator();
@@ -6367,22 +6731,23 @@ impl SqlEditorWidget {
                                     && !construct.grant_revoke_active.is_active()
                                     && !trigger_header_state.is_active()
                                 {
-                                    let comma_extra_indent =
-                                        if matches!(
+                                    let comma_extra_indent = if mysql_handler_condition_separator
+                                        || matches!(
                                             active_phase1_wrapped_owner_kind,
                                             Some(
                                                 FormatIndentedParenOwnerKind::WithinGroup
                                                     | FormatIndentedParenOwnerKind::Keep
                                             )
-                                        ) || (matches!(current_clause.as_deref(), Some("SET"))
+                                        )
+                                        || (matches!(current_clause.as_deref(), Some("SET"))
                                             && construct.merge_active.is_active())
-                                            || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                                && construct.cursor_sql_active.is_active())
-                                        {
-                                            0
-                                        } else {
-                                            1
-                                        };
+                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                            && construct.cursor_sql_active.is_active())
+                                    {
+                                        0
+                                    } else {
+                                        1
+                                    };
                                     if current_query_has_apply
                                         && matches!(current_clause.as_deref(), Some("SELECT"))
                                     {
@@ -6429,6 +6794,7 @@ impl SqlEditorWidget {
                             out.push(';');
                             current_clause = None;
                             on_duplicate_key_update_active = false;
+                            mysql_handler_state.clear();
                             select_list_layout_state.clear();
                             open_cursor_state = OpenCursorFormatState::None;
                             open_for_select_stack.clear();
@@ -34341,6 +34707,56 @@ JOIN -- joined rows
     }
 
     #[test]
+    fn apply_parser_depth_indentation_normalizes_exact_bare_call_header() {
+        let source = r#"CALL
+pkg_do_work (
+        p_id
+    );"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let call_idx = find_line_starting_with(&lines, "CALL").unwrap_or(0);
+        let callee_idx = find_line_starting_with(&lines, "pkg_do_work (").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[callee_idx]),
+            leading_spaces(lines[call_idx]).saturating_add(4),
+            "exact bare CALL should normalize its callee line to one level deeper than the query head, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "exact bare CALL header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_normalizes_comment_split_call_header() {
+        let source = r#"CALL -- invoke routine
+pkg_do_work (
+        p_id
+    );"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let call_idx = find_line_starting_with(&lines, "CALL -- invoke routine").unwrap_or(0);
+        let callee_idx = find_line_starting_with(&lines, "pkg_do_work (").unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[callee_idx]),
+            leading_spaces(lines[call_idx]).saturating_add(4),
+            "comment-split CALL should normalize its callee line to one level deeper than the query head, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "comment-split CALL header normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
     fn comment_header_continuation_kind_reuses_exact_bare_structural_taxonomy_and_skips_named_owners(
     ) {
         let continuation_kind =
@@ -34388,6 +34804,12 @@ JOIN -- joined rows
         assert_eq!(
             continuation_kind("JOIN -- joined rows"),
             Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            continuation_kind("CALL -- invoke routine"),
+            Some(
+                crate::sql_text::FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine
+            )
         );
         assert_eq!(
             continuation_kind("INNER JOIN -- joined rows"),
@@ -37165,6 +37587,559 @@ END;"#;
                 "formatted test3 output should not regress to `{snippet}`:\n{formatted}"
             );
         }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_mariadb_function_headers_split() {
+        let cases = [
+            (
+                include_str!("../../../test_mariadb/test1.txt"),
+                "CREATE FUNCTION fn_currency_rate(p_currency_code CHAR(3))\nRETURNS DECIMAL(10, 4)\nDETERMINISTIC\nBEGIN",
+            ),
+            (
+                include_str!("../../../test_mariadb/test2.txt"),
+                "CREATE FUNCTION fn_priority_weight(p_priority INT)\nRETURNS DECIMAL(10, 2)\nDETERMINISTIC\nBEGIN",
+            ),
+            (
+                include_str!("../../../test_mariadb/test3.txt"),
+                "CREATE FUNCTION fn_priority_factor(p_priority INT)\nRETURNS DECIMAL(10, 2)\nDETERMINISTIC\nBEGIN",
+            ),
+        ];
+
+        for (source, snippet) in cases {
+            let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+                source,
+                crate::db::connection::DatabaseType::MySQL,
+            );
+
+            assert!(
+                formatted.contains(snippet),
+                "formatted MySQL/MariaDB function header should keep RETURNS and routine attributes on their own lines, got:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test1_declare_cursor_and_handlers_nested() {
+        let source = include_str!("../../../test_mariadb/test1.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let cursor_idx =
+            find_line_starting_with(&lines, "DECLARE cur_emp CURSOR FOR").expect("cursor header");
+        let cursor_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT emp_id,")
+            .map(|(idx, _)| idx)
+            .expect("cursor SELECT");
+        let cursor_from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "FROM emp")
+            .map(|(idx, _)| idx)
+            .expect("cursor FROM");
+        let cursor_order_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_from_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ORDER BY emp_id;")
+            .map(|(idx, _)| idx)
+            .expect("cursor ORDER BY");
+        let not_found_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR NOT FOUND")
+                .expect("NOT FOUND handler");
+        let not_found_set_idx = lines
+            .iter()
+            .enumerate()
+            .skip(not_found_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SET v_done = 1;")
+            .map(|(idx, _)| idx)
+            .expect("NOT FOUND SET");
+        let duplicate_idx = find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR 1062")
+            .expect("duplicate handler");
+        let duplicate_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler BEGIN");
+        let duplicate_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler diagnostics");
+        let duplicate_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler END");
+        let exit_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("exit handler");
+        let exit_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("exit handler BEGIN");
+        let exit_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("exit handler diagnostics");
+        let exit_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("exit handler END");
+
+        assert_eq!(
+            leading_spaces(lines[cursor_select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "test1 cursor SELECT should stay one level deeper than DECLARE ... CURSOR FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_from_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test1 cursor FROM should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_order_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test1 cursor ORDER BY should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[not_found_set_idx]),
+            leading_spaces(lines[not_found_idx]).saturating_add(4),
+            "test1 NOT FOUND handler body should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_begin_idx]),
+            leading_spaces(lines[duplicate_idx]).saturating_add(4),
+            "test1 duplicate-key handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_diag_idx]),
+            leading_spaces(lines[duplicate_begin_idx]).saturating_add(4),
+            "test1 duplicate-key handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_end_idx]),
+            leading_spaces(lines[duplicate_begin_idx]),
+            "test1 duplicate-key handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_begin_idx]),
+            leading_spaces(lines[exit_idx]).saturating_add(4),
+            "test1 SQLEXCEPTION handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_diag_idx]),
+            leading_spaces(lines[exit_begin_idx]).saturating_add(4),
+            "test1 SQLEXCEPTION handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_end_idx]),
+            leading_spaces(lines[exit_begin_idx]),
+            "test1 SQLEXCEPTION handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test2_declare_cursor_and_handlers_nested() {
+        let source = include_str!("../../../test_mariadb/test2.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let cursor_idx =
+            find_line_starting_with(&lines, "DECLARE cur_task CURSOR FOR").expect("cursor header");
+        let cursor_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT task_id,")
+            .map(|(idx, _)| idx)
+            .expect("cursor SELECT");
+        let cursor_from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "FROM task")
+            .map(|(idx, _)| idx)
+            .expect("cursor FROM");
+        let cursor_order_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_from_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ORDER BY task_id;")
+            .map(|(idx, _)| idx)
+            .expect("cursor ORDER BY");
+        let not_found_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR NOT FOUND")
+                .expect("NOT FOUND handler");
+        let not_found_set_idx = lines
+            .iter()
+            .enumerate()
+            .skip(not_found_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SET v_fetch_done = 1;")
+            .map(|(idx, _)| idx)
+            .expect("NOT FOUND SET");
+        let duplicate_idx = find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR 1062")
+            .expect("duplicate handler");
+        let duplicate_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler BEGIN");
+        let duplicate_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler diagnostics");
+        let duplicate_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler END");
+        let exit_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("exit handler");
+        let exit_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("exit handler BEGIN");
+        let exit_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("exit handler diagnostics");
+        let exit_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("exit handler END");
+
+        assert_eq!(
+            leading_spaces(lines[cursor_select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "test2 cursor SELECT should stay one level deeper than DECLARE ... CURSOR FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_from_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test2 cursor FROM should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_order_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test2 cursor ORDER BY should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[not_found_set_idx]),
+            leading_spaces(lines[not_found_idx]).saturating_add(4),
+            "test2 NOT FOUND handler body should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_begin_idx]),
+            leading_spaces(lines[duplicate_idx]).saturating_add(4),
+            "test2 duplicate-key handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_diag_idx]),
+            leading_spaces(lines[duplicate_begin_idx]).saturating_add(4),
+            "test2 duplicate-key handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_end_idx]),
+            leading_spaces(lines[duplicate_begin_idx]),
+            "test2 duplicate-key handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_begin_idx]),
+            leading_spaces(lines[exit_idx]).saturating_add(4),
+            "test2 SQLEXCEPTION handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_diag_idx]),
+            leading_spaces(lines[exit_begin_idx]).saturating_add(4),
+            "test2 SQLEXCEPTION handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_end_idx]),
+            leading_spaces(lines[exit_begin_idx]),
+            "test2 SQLEXCEPTION handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test3_declare_cursor_and_handlers_nested() {
+        let source = include_str!("../../../test_mariadb/test3.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let cursor_idx =
+            find_line_starting_with(&lines, "DECLARE cur_run CURSOR FOR").expect("cursor header");
+        let cursor_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT run_id,")
+            .map(|(idx, _)| idx)
+            .expect("cursor SELECT");
+        let cursor_from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "FROM run_case")
+            .map(|(idx, _)| idx)
+            .expect("cursor FROM");
+        let cursor_order_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_from_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ORDER BY run_id;")
+            .map(|(idx, _)| idx)
+            .expect("cursor ORDER BY");
+        let not_found_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR NOT FOUND")
+                .expect("NOT FOUND handler");
+        let not_found_set_idx = lines
+            .iter()
+            .enumerate()
+            .skip(not_found_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SET v_fetch_done = 1;")
+            .map(|(idx, _)| idx)
+            .expect("NOT FOUND SET");
+        let duplicate_idx = find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR 1062")
+            .expect("duplicate handler");
+        let duplicate_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler BEGIN");
+        let duplicate_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler diagnostics");
+        let duplicate_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler END");
+        let exit_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("exit handler");
+        let exit_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("exit handler BEGIN");
+        let exit_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_begin_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .expect("exit handler diagnostics");
+        let exit_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_diag_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("exit handler END");
+
+        assert_eq!(
+            leading_spaces(lines[cursor_select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "test3 cursor SELECT should stay one level deeper than DECLARE ... CURSOR FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_from_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test3 cursor FROM should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[cursor_order_idx]),
+            leading_spaces(lines[cursor_select_idx]),
+            "test3 cursor ORDER BY should stay aligned with the cursor SELECT query base, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[not_found_set_idx]),
+            leading_spaces(lines[not_found_idx]).saturating_add(4),
+            "test3 NOT FOUND handler body should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_begin_idx]),
+            leading_spaces(lines[duplicate_idx]).saturating_add(4),
+            "test3 duplicate-key handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_diag_idx]),
+            leading_spaces(lines[duplicate_begin_idx]).saturating_add(4),
+            "test3 duplicate-key handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[duplicate_end_idx]),
+            leading_spaces(lines[duplicate_begin_idx]),
+            "test3 duplicate-key handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_begin_idx]),
+            leading_spaces(lines[exit_idx]).saturating_add(4),
+            "test3 SQLEXCEPTION handler block should stay one level deeper than DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_diag_idx]),
+            leading_spaces(lines[exit_begin_idx]).saturating_add(4),
+            "test3 SQLEXCEPTION handler statements should stay one level deeper than handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_end_idx]),
+            leading_spaces(lines[exit_begin_idx]),
+            "test3 SQLEXCEPTION handler END should realign with handler BEGIN, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_split_not_found_handler_header_out_of_body_indent()
+    {
+        let source = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE CONTINUE HANDLER FOR -- fetch exhausted
+NOT FOUND
+SET v_done = 1;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let handler_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR -- fetch exhausted")
+                .expect("split NOT FOUND handler header");
+        let not_found_idx =
+            find_line_starting_with(&lines, "NOT FOUND").expect("NOT FOUND continuation");
+        let set_idx = find_line_starting_with(&lines, "SET v_done = 1;").expect("handler SET");
+
+        assert_eq!(
+            leading_spaces(lines[not_found_idx]),
+            leading_spaces(lines[handler_idx]),
+            "split NOT FOUND condition line should stay aligned with DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "split NOT FOUND handler body should remain one level deeper than its header, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_split_sqlstate_and_comma_handler_conditions_at_header_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE EXIT HANDLER FOR SQLSTATE -- application error
+VALUE '45000',
+SQLEXCEPTION
+BEGIN
+RESIGNAL;
+END;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let handler_idx = find_line_starting_with(
+            &lines,
+            "DECLARE EXIT HANDLER FOR SQLSTATE -- application error",
+        )
+        .expect("split SQLSTATE handler header");
+        let value_idx =
+            find_line_starting_with(&lines, "VALUE '45000',").expect("VALUE continuation");
+        let sql_exception_idx =
+            find_line_starting_with(&lines, "SQLEXCEPTION").expect("SQLEXCEPTION continuation");
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sql_exception_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("handler BEGIN");
+
+        assert_eq!(
+            leading_spaces(lines[value_idx]),
+            leading_spaces(lines[handler_idx]),
+            "split SQLSTATE VALUE line should stay aligned with DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[sql_exception_idx]),
+            leading_spaces(lines[handler_idx]),
+            "comma-separated handler condition line should stay aligned with DECLARE ... HANDLER FOR, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[begin_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "handler body should begin one level deeper than split condition lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
     }
 
     #[test]

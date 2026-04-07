@@ -13321,6 +13321,11 @@ deptno;"#;
     #[test]
     fn inline_comment_line_continuation_kind_combines_header_and_operator_families() {
         assert_eq!(
+            QueryExecutor::inline_comment_line_continuation_kind("CALL -- invoke routine"),
+            Some(InlineCommentContinuationKind::OneDeeperThanCurrentLine),
+            "CALL query heads should keep their callee line on the shared query-head body depth"
+        );
+        assert_eq!(
             QueryExecutor::inline_comment_line_continuation_kind("WHERE e.empno ="),
             Some(InlineCommentContinuationKind::OneDeeperThanQueryBase),
             "WHERE header plus trailing operator should keep the operand on the shared WHERE body depth"

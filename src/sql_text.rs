@@ -715,6 +715,7 @@ const FORMAT_INLINE_COMMENT_HEADER_QUERY_BASE_KEYWORDS: &[&str] = &[
 /// the current header line after an inline comment split.
 const FORMAT_INLINE_COMMENT_HEADER_CURRENT_LINE_KEYWORDS: &[&str] = &[
     "SELECT",
+    "CALL",
     "VALUES",
     "SET",
     "RETURNING",
@@ -4064,6 +4065,32 @@ pub(crate) fn format_plsql_child_query_owner_kind(
             .skip(1)
             .any(|word| word.eq_ignore_ascii_case("FOR")))
     .then_some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+    .or_else(|| {
+        if !first_word.eq_ignore_ascii_case("DECLARE") {
+            return None;
+        }
+
+        let has_cursor = words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("CURSOR"));
+        let has_handler = words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("HANDLER"));
+        let has_for = words
+            .iter()
+            .skip(1)
+            .any(|word| word.eq_ignore_ascii_case("FOR"));
+
+        if has_cursor && has_for {
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        } else if has_handler && has_for {
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        } else {
+            None
+        }
+    })
 }
 
 impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
@@ -7147,6 +7174,10 @@ mod tests {
             Some(FormatInlineCommentHeaderContinuationKind::SameDepth)
         );
         assert_eq!(
+            format_inline_comment_header_continuation_kind(None, "CALL"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
             format_inline_comment_header_continuation_kind(None, "LIMIT"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
@@ -7260,6 +7291,10 @@ mod tests {
         );
         assert_eq!(
             format_structural_header_continuation_kind("SELECT"),
+            Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
+        );
+        assert_eq!(
+            format_structural_header_continuation_kind("CALL"),
             Some(FormatInlineCommentHeaderContinuationKind::OneDeeperThanCurrentLine)
         );
         assert_eq!(
@@ -7975,6 +8010,10 @@ mod tests {
         assert_eq!(
             format_bare_structural_header_continuation_kind("SELECT DISTINCT"),
             format_structural_header_continuation_kind("SELECT DISTINCT")
+        );
+        assert_eq!(
+            format_bare_structural_header_continuation_kind("CALL"),
+            format_structural_header_continuation_kind("CALL")
         );
         assert_eq!(
             format_bare_structural_header_continuation_kind("LEFT OUTER JOIN"),
@@ -9365,6 +9404,18 @@ mod tests {
         assert_eq!(
             format_plsql_child_query_owner_kind("OPEN/* gap */c_emp/* gap */FOR"),
             Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("DECLARE cur_emp CURSOR FOR"),
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("DECLARE CONTINUE HANDLER FOR NOT FOUND"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        );
+        assert_eq!(
+            format_plsql_child_query_owner_kind("DECLARE EXIT HANDLER FOR SQLEXCEPTION"),
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
         );
         assert_eq!(
             format_plsql_child_query_owner_kind(") CURSOR c_emp IS"),

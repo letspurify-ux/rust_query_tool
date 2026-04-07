@@ -463,10 +463,63 @@ impl MysqlExecutor {
     /// Extract the database name from a `USE <db>` statement for display purposes.
     /// Handles backtick-quoted identifiers, including names containing spaces.
     fn extract_use_database_name(trimmed_use_sql: &str) -> String {
-        let after_use = trimmed_use_sql
-            .get("USE".len()..)
-            .unwrap_or("")
-            .trim_start();
+        let bytes = trimmed_use_sql.as_bytes();
+        let mut index = 0usize;
+
+        loop {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index += 2;
+                while index + 1 < bytes.len() {
+                    if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        if bytes
+            .get(index..index.saturating_add("USE".len()))
+            .is_some_and(|slice| slice.eq_ignore_ascii_case(b"USE"))
+        {
+            index = index.saturating_add("USE".len());
+        }
+
+        loop {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index += 2;
+                while index + 1 < bytes.len() {
+                    if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        let after_use = trimmed_use_sql.get(index..).unwrap_or("").trim_start();
         if after_use.starts_with('`') {
             // Backtick-quoted identifier: scan for the closing backtick,
             // treating `` as an escaped backtick.
@@ -2094,6 +2147,36 @@ mod tests {
             MysqlExecutor::extract_use_database_name("USE `odd``name`"),
             "odd`name",
             "escaped backtick inside quoted name should be unescaped"
+        );
+    }
+
+    #[test]
+    fn mysql_extract_use_database_name_skips_leading_block_comments() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE /* switch */ mydb"),
+            "mydb",
+            "block comment between USE and db name should be ignored"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("USE /* first */ /* second */ `my database`;"),
+            "my database",
+            "multiple block comments before a quoted db name should be ignored"
+        );
+    }
+
+    #[test]
+    fn mysql_extract_use_database_name_skips_block_comments_before_use_keyword() {
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name("/* preface */ USE mydb"),
+            "mydb",
+            "leading block comment before USE should be ignored"
+        );
+        assert_eq!(
+            MysqlExecutor::extract_use_database_name(
+                "  /* first */ /* second */ USE `my database`;"
+            ),
+            "my database",
+            "multiple leading block comments before USE should be ignored"
         );
     }
 

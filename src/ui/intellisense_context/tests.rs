@@ -1154,7 +1154,12 @@ fn create_or_replace_view_select_list_is_column_context() {
     let table_names: Vec<String> = ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "E"),
@@ -1171,15 +1176,19 @@ fn create_or_replace_view_from_clause_is_table_context() {
 
 #[test]
 fn create_or_replace_view_where_clause_is_column_context() {
-    let ctx = analyze(
-        "CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|",
-    );
+    let ctx =
+        analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert!(ctx.phase.is_column_context());
     let table_names: Vec<String> = ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "E"),
@@ -1191,9 +1200,8 @@ fn create_or_replace_view_where_clause_is_column_context() {
 fn create_or_replace_view_does_not_register_view_keyword_as_table() {
     // After the fix, `VIEW` must not be collected as a DML target table.
     // Cursor is at the WHERE clause so all tables from the FROM clause are visible.
-    let ctx = analyze(
-        "CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|",
-    );
+    let ctx =
+        analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|");
     let raw_names: Vec<String> = ctx
         .tables_in_scope
         .iter()
@@ -1218,7 +1226,11 @@ fn create_or_replace_view_statement_kind_is_not_insert() {
         analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|");
     // WhereClause is a column context; focused table should be "employees", not "VIEW".
     assert!(ctx.phase.is_column_context());
-    let focused: Vec<String> = ctx.focused_tables.iter().map(|n| n.to_uppercase()).collect();
+    let focused: Vec<String> = ctx
+        .focused_tables
+        .iter()
+        .map(|n| n.to_uppercase())
+        .collect();
     assert!(
         !focused.iter().any(|n| n == "VIEW"),
         "`VIEW` must not appear in focused_tables: {focused:?}"
