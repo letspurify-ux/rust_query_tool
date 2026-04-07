@@ -2398,6 +2398,26 @@ RELEASE SAVEPOINT sp;";
 }
 
 #[test]
+fn test_mysql_highlighting_marks_control_and_cast_keywords_from_mariadb_scripts() {
+    let text = "DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+WHILE v_i <= 5 DO
+    SET signed_total = CAST(v_i AS SIGNED);
+END WHILE;
+CLOSE cur_task;
+IF NOT (OLD.status_code <=> NEW.status_code) THEN
+    SET done = 0;
+END IF;";
+
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["FOUND", "DO", "SIGNED", "CLOSE", "OLD"] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
+}
+
+#[test]
 fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
     let text = load_mariadb_highlight_test_file("test1.txt");
     assert!(

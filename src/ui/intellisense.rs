@@ -1895,6 +1895,51 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_suggestions_include_mysql_control_and_cast_keywords() {
+        let mut data = IntellisenseData::new();
+
+        let do_suggestions = data.get_suggestions_for_db(
+            "do",
+            false,
+            None,
+            false,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        assert!(do_suggestions.iter().any(|s| s == "DO"));
+
+        let close_suggestions = data.get_suggestions_for_db(
+            "clo",
+            false,
+            None,
+            false,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        assert!(close_suggestions.iter().any(|s| s == "CLOSE"));
+
+        let signed_suggestions = data.get_suggestions_for_db(
+            "sig",
+            false,
+            None,
+            false,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        assert!(signed_suggestions.iter().any(|s| s == "SIGNED"));
+
+        let found_suggestions = data.get_suggestions_for_db(
+            "fou",
+            false,
+            None,
+            false,
+            false,
+            Some(crate::db::DatabaseType::MySQL),
+        );
+        assert!(found_suggestions.iter().any(|s| s == "FOUND"));
+    }
+
+    #[test]
     fn get_suggestions_prefers_columns_in_column_context_with_empty_prefix() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
