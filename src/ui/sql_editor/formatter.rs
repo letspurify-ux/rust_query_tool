@@ -3137,6 +3137,65 @@ impl SqlEditorWidget {
             && matches!(tokens.get(close_idx), Some(SqlToken::Symbol(sym)) if sym == ")")
     }
 
+    fn mysql_keyword_prefers_space_before_paren(word: &str) -> bool {
+        matches!(
+            word,
+            "ALL"
+                | "AND"
+                | "AS"
+                | "BEGIN"
+                | "BETWEEN"
+                | "BY"
+                | "CASE"
+                | "CHECK"
+                | "ELSE"
+                | "ELSEIF"
+                | "ELSIF"
+                | "EXISTS"
+                | "FOR"
+                | "FROM"
+                | "GROUP"
+                | "HAVING"
+                | "IF"
+                | "IN"
+                | "INTO"
+                | "JOIN"
+                | "KEY"
+                | "LIMIT"
+                | "NOT"
+                | "ON"
+                | "OR"
+                | "ORDER"
+                | "OVER"
+                | "PARTITION"
+                | "PRIMARY"
+                | "REFERENCES"
+                | "REPEAT"
+                | "RETURN"
+                | "RETURNS"
+                | "SELECT"
+                | "SET"
+                | "TABLE"
+                | "THEN"
+                | "UNIQUE"
+                | "UNTIL"
+                | "USING"
+                | "VALUES"
+                | "WHEN"
+                | "WHERE"
+                | "WHILE"
+                | "WINDOW"
+        )
+    }
+
+    fn mysql_word_paren_should_stay_tight(tokens: &[SqlToken], open_paren_idx: usize) -> bool {
+        let Some((prev_word, _)) = Self::previous_word_upper(tokens, open_paren_idx) else {
+            return false;
+        };
+
+        !Self::mysql_keyword_prefers_space_before_paren(prev_word.as_str())
+    }
+
     fn paren_opens_call_argument_list(tokens: &[SqlToken], open_idx: usize) -> bool {
         let recent = Self::recent_statement_words_before(tokens, open_idx, 2);
         recent
@@ -6242,9 +6301,12 @@ impl SqlEditorWidget {
                                 );
                             let keeps_count_star_call_tight =
                                 Self::count_star_call_should_stay_tight(tokens, idx);
+                            let keeps_mysql_word_paren_tight = mysql_compatible
+                                && Self::mysql_word_paren_should_stay_tight(tokens, idx);
                             if needs_space
                                 && !keeps_aggregate_call_tight
                                 && !keeps_count_star_call_tight
+                                && !keeps_mysql_word_paren_tight
                             {
                                 out.push(' ');
                             }
@@ -36504,5 +36566,87 @@ END;"#;
             ),
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test1_function_parens_tight() {
+        let source = include_str!("../../../test_mariadb/test1.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        let forbidden_snippets = [
+            "fn_currency_rate (",
+            "sp_assert (",
+            "sp_run_final_boss ()",
+            "UPPER (",
+            "TRIM (",
+            "CURRENT_TIMESTAMP (",
+            "JSON_UNQUOTE (",
+            "JSON_EXTRACT (",
+        ];
+
+        for snippet in forbidden_snippets {
+            assert!(
+                !formatted.contains(snippet),
+                "formatted test1 output is introducing a MySQL/MariaDB function gap around `{snippet}`:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test2_function_parens_tight() {
+        let source = include_str!("../../../test_mariadb/test2.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        let forbidden_snippets = [
+            "fn_priority_weight (",
+            "sp_check (",
+            "sp_touch_rank (",
+            "sp_status_counts (",
+            "LOWER (",
+            "TRIM (",
+            "SUM (",
+        ];
+
+        for snippet in forbidden_snippets {
+            assert!(
+                !formatted.contains(snippet),
+                "formatted test2 output is introducing a MySQL/MariaDB function gap around `{snippet}`:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test3_function_parens_tight() {
+        let source = include_str!("../../../test_mariadb/test3.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        let forbidden_snippets = [
+            "fn_priority_factor (",
+            "sp_assert (",
+            "sp_shift_rank (",
+            "sp_collect_status_counts (",
+            "LOWER (",
+            "TRIM (",
+            "COALESCE (",
+            "CAST (",
+            "JSON_LENGTH (",
+            "JSON_EXTRACT (",
+        ];
+
+        for snippet in forbidden_snippets {
+            assert!(
+                !formatted.contains(snippet),
+                "formatted test3 output is introducing a MySQL/MariaDB function gap around `{snippet}`:\n{formatted}"
+            );
+        }
     }
 }

@@ -728,7 +728,7 @@ fn format_sql_preserves_mariadb_final_boss_script() {
         &[
             "USE qt_mysql_final_boss",
             "DELIMITER $$",
-            "CREATE PROCEDURE sp_run_final_boss ()",
+            "CREATE PROCEDURE sp_run_final_boss()",
             "read_loop: LOOP",
             "END$$",
             "DELIMITER ;",
@@ -802,7 +802,7 @@ fn format_sql_preserves_mariadb_parser_killer_script() {
             "USE qt_mysql_parser_killer",
             "DELIMITER $$",
             "DELIMITER //",
-            "CREATE PROCEDURE sp_run_parser_killer ()",
+            "CREATE PROCEDURE sp_run_parser_killer()",
             "END//",
             "DELIMITER ;",
             "`group`",
@@ -876,7 +876,7 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
             "USE qt_mysql_ultra_final_boss",
             "DELIMITER $$",
             "DELIMITER //",
-            "CREATE PROCEDURE sp_run_ultra_final_boss ()",
+            "CREATE PROCEDURE sp_run_ultra_final_boss()",
             "END//",
             "DELIMITER ;",
             "`group`",
@@ -938,7 +938,7 @@ fn format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths() {
     let lines: Vec<&str> = formatted.lines().collect();
 
     let case_idx =
-        find_line_starting_with(&lines, "CASE UPPER (TRIM (p_currency_code))").expect("CASE line");
+        find_line_starting_with(&lines, "CASE UPPER(TRIM(p_currency_code))").expect("CASE line");
     let when_idx = lines
         .iter()
         .enumerate()
@@ -1236,7 +1236,7 @@ fn format_sql_keeps_mariadb_helper_procedure_closing_paren_aligned() {
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
-    let expected = r#"CREATE PROCEDURE sp_collect_status_counts (
+    let expected = r#"CREATE PROCEDURE sp_collect_status_counts(
     OUT p_done_cnt INT,
     OUT p_running_cnt INT,
     OUT p_other_cnt INT
@@ -1300,7 +1300,7 @@ fn format_sql_keeps_mariadb_trigger_cast_type_inline() {
 
     assert!(
         formatted.contains(
-            "COALESCE (CAST (JSON_LENGTH (JSON_EXTRACT (NEW.payload, '$.steps')) AS CHAR), 'null')"
+            "COALESCE(CAST(JSON_LENGTH(JSON_EXTRACT(NEW.payload, '$.steps')) AS CHAR), 'null')"
         ),
         "trigger CAST type should stay inline after AS, got:\n{}",
         formatted
@@ -8408,10 +8408,10 @@ fn format_mariadb_test1_keeps_inline_over_body_and_on_duplicate_function_args_ne
     );
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let over_idx = find_line_starting_with(&lines, "DENSE_RANK () OVER (").unwrap_or(0);
+    let over_idx = find_line_starting_with(&lines, "DENSE_RANK() OVER (").unwrap_or(0);
     let order_idx = find_line_starting_with(&lines, "ORDER BY ob.total_usd DESC").unwrap_or(0);
     let on_duplicate_idx =
-        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = CONCAT (")
+        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = CONCAT(")
             .expect("ON DUPLICATE KEY UPDATE owner line");
     let values_idx =
         find_line_starting_with(&lines, "VALUES (dept_name),").expect("CONCAT argument line");
@@ -8477,8 +8477,8 @@ fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
 
     let main_block_idx = find_line_starting_with(&lines, "main_block: BEGIN").unwrap_or(0);
     let create_proc_idx =
-        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_parser_killer ()").unwrap_or(0);
-    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (")
+        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_parser_killer()").unwrap_or(0);
+    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER() OVER (")
         .expect("ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY weight_sum DESC,")
         .expect("ROW_NUMBER ORDER BY line");
@@ -8530,8 +8530,8 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
     let main_block_idx = find_line_starting_with(&lines, "main_block: BEGIN").unwrap_or(0);
     let nested_block_idx = find_line_starting_with(&lines, "nested_block: BEGIN").unwrap_or(0);
     let create_proc_idx =
-        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_ultra_final_boss ()").unwrap_or(0);
-    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER () OVER (")
+        find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_ultra_final_boss()").unwrap_or(0);
+    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER() OVER (")
         .expect("owner_ranked ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY owner_weighted DESC,")
         .expect("owner_ranked ORDER BY line");
@@ -8546,7 +8546,7 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
         .iter()
         .enumerate()
         .skip(over_close_idx + 1)
-        .find(|(_, line)| line.trim_start() == "ROW_NUMBER () OVER (")
+        .find(|(_, line)| line.trim_start() == "ROW_NUMBER() OVER (")
         .map(|(idx, _)| idx)
         .expect("second ROW_NUMBER OVER owner line");
     let second_order_idx = lines
@@ -8624,18 +8624,18 @@ HAVING COUNT(*) > 1;"#;
 
 #[test]
 fn format_sql_keeps_mariadb_sum_case_close_aligned_with_owner_depth() {
-    let input = r#"CREATE PROCEDURE sp_status_counts (
+    let input = r#"CREATE PROCEDURE sp_status_counts(
     OUT p_done_cnt INT,
     OUT p_running_cnt INT
 )
 BEGIN
-    SELECT SUM (
+    SELECT SUM(
             CASE
                 WHEN status_code = 'DONE' THEN 1
                 ELSE 0
             END
 ),
-        SUM (
+        SUM(
             CASE
                 WHEN status_code = 'RUNNING' THEN 1
                 ELSE 0
@@ -8651,7 +8651,7 @@ END$$"#;
         crate::db::connection::DatabaseType::MySQL,
     );
     let lines: Vec<&str> = formatted.lines().collect();
-    let sum_idx = find_line_starting_with(&lines, "SELECT SUM (").expect("SUM owner line");
+    let sum_idx = find_line_starting_with(&lines, "SELECT SUM(").expect("SUM owner line");
     let close_idx = lines
         .iter()
         .enumerate()
@@ -8670,12 +8670,12 @@ END$$"#;
 
 #[test]
 fn format_sql_keeps_mariadb_call_scalar_subquery_arguments_on_shared_call_depth() {
-    let input = r#"CALL sp_assert_eq_bigint (
+    let input = r#"CALL sp_assert_eq_bigint(
     (
         SELECT COUNT(*)
         FROM task_log
         ), (
-            SELECT COALESCE (SUM (log_count), 0)
+            SELECT COALESCE(SUM(log_count), 0)
             FROM monthly_rollup
                 ), 'rollup log_count sum mismatch'
 );"#;
@@ -8684,13 +8684,13 @@ fn format_sql_keeps_mariadb_call_scalar_subquery_arguments_on_shared_call_depth(
         input,
         crate::db::connection::DatabaseType::MySQL,
     );
-    let expected = r#"CALL sp_assert_eq_bigint (
+    let expected = r#"CALL sp_assert_eq_bigint(
     (
         SELECT COUNT(*)
         FROM task_log
     ),
     (
-        SELECT COALESCE (SUM (log_count), 0)
+        SELECT COALESCE(SUM(log_count), 0)
         FROM monthly_rollup
     ),
     'rollup log_count sum mismatch'

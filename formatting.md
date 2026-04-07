@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-06 (`WINDOW` clause named definition depth 규칙과 MySQL/MariaDB routine block / routine CASE depth 규칙 추가)
+> 최종 업데이트: 2026-04-07 (MySQL/MariaDB function-call tight-paren 렌더링 규칙 추가)
 
 ## 0. 이 문서의 역할
 
@@ -236,6 +236,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - MySQL/MariaDB compound routine block도 block owner family다. `BEGIN`, labeled `LOOP`, `REPEAT`, `WHILE … DO` header는 owner depth를 열고 본문은 항상 `owner depth + 1`을 사용해야 하며, `END LOOP` / `END REPEAT` / `END WHILE`은 opener owner depth로 정렬해야 한다.
 - labeled routine block(`read_loop: LOOP`, `main_block: BEGIN`, `nested_block: BEGIN`)은 label 토큰이 추가되더라도 owner family가 바뀌지 않는다. label은 opener depth를 보존하는 장식이며, body depth나 close alignment를 별도 visual heuristic로 재계산하면 안 된다.
 - routine `CASE`는 SQL expression `CASE`와 semantic family가 다르다. MySQL/MariaDB compound block 안의 statement `CASE`는 PL/SQL `CASE` branch owner와 같은 depth 규칙을 따라 `WHEN`/`ELSE`는 `CASE`보다 한 단계 deeper, branch statement는 다시 한 단계 deeper여야 한다.
+- MySQL/MariaDB의 function-like syntax는 callee/type token과 `(` 사이 공백을 새로 삽입하면 안 된다. stored routine declaration header(`CREATE FUNCTION fn_x(...)`, `CALL proc(...)`), built-in/UDF call(`JSON_EXTRACT(...)`, `ROW_NUMBER()`, `CAST(...)`), type/precision spec(`VARCHAR(255)`, `DECIMAL(10,2)`, `CHAR(3)`)는 모두 tight paren을 유지해야 한다. 반대로 `VALUES (`, `IF (`, `EXISTS (`, `OVER (`처럼 clause/control owner를 여는 structural keyword는 same-family가 아니므로 기존 spacing 규칙을 유지한다.
 
 ### 3.2 current structural continuation boundary taxonomy
 

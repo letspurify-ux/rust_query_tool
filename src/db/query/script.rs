@@ -6182,10 +6182,12 @@ impl QueryExecutor {
                 if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
                     Self::parse_mysql_delimiter_command(trimmed)
                 {
-                    mysql_delimiter = delimiter.clone();
-                    items.push(FormatItem::ToolCommand(ToolCommand::MysqlDelimiter {
-                        delimiter,
-                    }));
+                    let command = ToolCommand::MysqlDelimiter { delimiter };
+                    Self::sync_mysql_delimiter_from_tool_command(
+                        &command,
+                        &mut mysql_delimiter,
+                    );
+                    items.push(FormatItem::ToolCommand(command));
                     continue;
                 }
             }
@@ -6330,6 +6332,10 @@ impl QueryExecutor {
                         &mut line_items,
                         &mut add_statement,
                         &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
+                            Self::sync_mysql_delimiter_from_tool_command(
+                                &cmd,
+                                &mut mysql_delimiter,
+                            );
                             if matches!(cmd, ToolCommand::Prompt { .. }) {
                                 items.push(FormatItem::Verbatim(raw_line.to_string()));
                             } else {
@@ -6368,6 +6374,7 @@ impl QueryExecutor {
                 &mut items,
                 &mut add_statement,
                 &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
+                    Self::sync_mysql_delimiter_from_tool_command(&cmd, &mut mysql_delimiter);
                     if matches!(cmd, ToolCommand::Prompt { .. }) {
                         items.push(FormatItem::Verbatim(raw_line.to_string()));
                     } else {
@@ -6737,8 +6744,12 @@ impl QueryExecutor {
                 if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
                     Self::parse_mysql_delimiter_command(trimmed)
                 {
-                    mysql_delimiter = delimiter.clone();
-                    on_tool_command(ToolCommand::MysqlDelimiter { delimiter }, line, items);
+                    let command = ToolCommand::MysqlDelimiter { delimiter };
+                    Self::sync_mysql_delimiter_from_tool_command(
+                        &command,
+                        &mut mysql_delimiter,
+                    );
+                    on_tool_command(command, line, items);
                     continue;
                 }
             }
@@ -6788,7 +6799,10 @@ impl QueryExecutor {
                 &mut sqlblanklines_enabled,
                 items,
                 &mut add_statement,
-                &mut on_tool_command,
+                &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<T>| {
+                    Self::sync_mysql_delimiter_from_tool_command(&cmd, &mut mysql_delimiter);
+                    on_tool_command(cmd, raw_line, items);
+                },
                 &mut on_slash,
             );
         }
@@ -6927,6 +6941,12 @@ impl QueryExecutor {
         // Feed line to the parser engine
         for stmt in builder.process_line_and_take_statements(line) {
             add_statement(stmt, items);
+        }
+    }
+
+    fn sync_mysql_delimiter_from_tool_command(command: &ToolCommand, mysql_delimiter: &mut String) {
+        if let ToolCommand::MysqlDelimiter { delimiter } = command {
+            *mysql_delimiter = delimiter.clone();
         }
     }
 

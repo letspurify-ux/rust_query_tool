@@ -1946,6 +1946,9 @@ impl QueryExecutor {
                     if !collector.force_terminate_current(sql, &mut on_span) {
                         return;
                     }
+                    if let ToolCommand::MysqlDelimiter { delimiter } = &command {
+                        collector.mysql_delimiter = delimiter.clone();
+                    }
                     if let ToolCommand::SetSqlBlankLines { enabled } = command {
                         sqlblanklines_enabled = enabled;
                     }
@@ -1961,6 +1964,9 @@ impl QueryExecutor {
             ) && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
+                    if let ToolCommand::MysqlDelimiter { delimiter } = &command {
+                        collector.mysql_delimiter = delimiter.clone();
+                    }
                     if let ToolCommand::SetSqlBlankLines { enabled } = command {
                         sqlblanklines_enabled = enabled;
                     }

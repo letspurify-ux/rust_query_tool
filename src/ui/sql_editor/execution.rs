@@ -7493,7 +7493,7 @@ mod query_execution_cleanup_tests {
 #[cfg(test)]
 mod script_include_guard_tests {
     use super::{ScriptExecutionFrame, SqlEditorWidget, MAX_SCRIPT_INCLUDE_DEPTH};
-    use crate::db::{connection::DatabaseType, ScriptItem};
+    use crate::db::{connection::DatabaseType, ScriptItem, ToolCommand};
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -7612,6 +7612,59 @@ mod script_include_guard_tests {
         assert!(
             matches!(items.first(), Some(ScriptItem::Statement(statement)) if statement.starts_with("DROP DATABASE IF EXISTS qt_mysql_final_boss")),
             "top-level batch should keep the leading semicolon-terminated DDL separate from later END$$ routines: {items:?}"
+        );
+    }
+
+    #[test]
+    fn build_mysql_batch_items_keeps_test4_full_script_routines_and_trailing_calls_separate() {
+        let sql = include_str!("../../../test_mariadb/test4.txt");
+
+        let items = SqlEditorWidget::build_mysql_batch_items(sql, None);
+        let statements = items
+            .iter()
+            .filter_map(|item| match item {
+                ScriptItem::Statement(statement) => Some(statement.as_str()),
+                ScriptItem::ToolCommand(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mysql_delimiters = items
+            .iter()
+            .filter_map(|item| match item {
+                ScriptItem::ToolCommand(ToolCommand::MysqlDelimiter { delimiter }) => {
+                    Some(delimiter.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            mysql_delimiters,
+            vec![";", "$$", ";"],
+            "top-level MySQL execution should propagate DELIMITER state changes even when DELIMITER follows earlier DDL/view statements: {items:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("CREATE TRIGGER bi_task_log")),
+            "first trigger should remain independently executable in the top-level MySQL batch: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.starts_with("CREATE PROCEDURE sp_build_monthly_rollup")),
+            "second procedure should remain independently executable in the top-level MySQL batch: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.trim_start().starts_with("CALL sp_seed_monster_data()")),
+            "post-routine CALL statements should not be absorbed into the preceding END$$ block: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|stmt| stmt.trim_start().starts_with("SELECT 'ALL ASSERTIONS PASSED' AS status")),
+            "post-routine assertions/selects should remain separate execution units: {statements:?}"
         );
     }
 }

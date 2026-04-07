@@ -876,6 +876,78 @@ fn test_split_script_items_test21_execution_unit_splitter_regression() {
 }
 
 #[test]
+fn test_split_script_items_test4_mariadb_full_script_keeps_delimiter_routine_boundaries() {
+    let sql = load_mariadb_query_test_file("test4.txt");
+    let items =
+        QueryExecutor::split_script_items_for_db_type(&sql, Some(crate::db::connection::DatabaseType::MySQL));
+
+    let statements = get_statements(&items);
+    let mysql_delimiters = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::ToolCommand(ToolCommand::MysqlDelimiter { delimiter }) => {
+                Some(delimiter.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        mysql_delimiters,
+        vec![";", "$$", ";"],
+        "test4 should preserve top-level DELIMITER commands in order: {items:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE OR REPLACE VIEW v_employee_workload AS")),
+        "view statement before DELIMITER $$ should remain independently split: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE TRIGGER bi_task_log")),
+        "trigger after DELIMITER $$ should start its own execution unit: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE TRIGGER ai_task_log")),
+        "second trigger should stay independently executable after END$$: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE FUNCTION fn_efficiency_band")),
+        "function should stay independently executable after END$$: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE PROCEDURE sp_seed_monster_data")),
+        "first procedure should stay independently executable after END$$: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.starts_with("CREATE PROCEDURE sp_build_monthly_rollup")),
+        "second procedure should stay independently executable after END$$: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.trim_start().starts_with("CALL sp_seed_monster_data()")),
+        "post-routine CALL should remain separated from the preceding END$$ block: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.trim_start().starts_with("SELECT 'ALL ASSERTIONS PASSED' AS status")),
+        "post-routine assertions/selects should remain independently executable: {statements:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_standalone_procedure_nested_block_followed_by_dml() {
     let sql = r#"CREATE OR REPLACE PROCEDURE nested_proc IS
 BEGIN
