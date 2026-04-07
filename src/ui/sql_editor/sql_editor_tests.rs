@@ -8478,13 +8478,15 @@ fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
     let main_block_idx = find_line_starting_with(&lines, "main_block: BEGIN").unwrap_or(0);
     let create_proc_idx =
         find_line_starting_with(&lines, "CREATE PROCEDURE sp_run_parser_killer()").unwrap_or(0);
-    let over_idx = find_line_starting_with(&lines, "ROW_NUMBER() OVER (")
-        .expect("ROW_NUMBER OVER owner line");
+    let over_idx =
+        find_line_starting_with(&lines, "ROW_NUMBER() OVER (").expect("ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY weight_sum DESC,")
         .expect("ROW_NUMBER ORDER BY line");
-    let on_duplicate_idx =
-        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),")
-            .expect("ON DUPLICATE KEY UPDATE line");
+    let on_duplicate_idx = find_line_starting_with(
+        &lines,
+        "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),",
+    )
+    .expect("ON DUPLICATE KEY UPDATE line");
     let over_close_idx = lines
         .iter()
         .enumerate()
@@ -8545,12 +8547,13 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
         .expect("owner_ranked ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY owner_weighted DESC,")
         .expect("owner_ranked ORDER BY line");
-    let on_duplicate_idx =
-        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),")
-            .expect("first ON DUPLICATE KEY UPDATE line");
-    let summary_rank_idx =
-        find_line_starting_with(&lines, "`rank` = VALUES(`rank`),")
-            .expect("summary rank VALUES() line");
+    let on_duplicate_idx = find_line_starting_with(
+        &lines,
+        "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),",
+    )
+    .expect("first ON DUPLICATE KEY UPDATE line");
+    let summary_rank_idx = find_line_starting_with(&lines, "`rank` = VALUES(`rank`),")
+        .expect("summary rank VALUES() line");
     let over_close_idx = lines
         .iter()
         .enumerate()

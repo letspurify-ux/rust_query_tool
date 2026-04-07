@@ -1347,6 +1347,35 @@ fn phase_create_table_as_select_is_table_context_before_name() {
 }
 
 #[test]
+fn phase_create_table_definition_keyword_is_not_table_context() {
+    let ctx = analyze("CREATE TABLE demo (id BI|)");
+    assert!(
+        !ctx.phase.is_table_context(),
+        "CREATE TABLE definition should not stay in table-target context: {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
+fn phase_create_table_option_keyword_is_not_table_context() {
+    let ctx = analyze("CREATE TABLE demo (id INT) ENG|");
+    assert!(
+        !ctx.phase.is_table_context(),
+        "CREATE TABLE option list should not stay in table-target context: {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
+fn phase_create_table_references_target_is_table_context() {
+    let ctx = analyze(
+        "CREATE TABLE demo (dept_id INT, CONSTRAINT fk_demo FOREIGN KEY (dept_id) REFERENCES |)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_join_on_remains_join_condition_context() {
     let ctx = analyze("SELECT * FROM emp e JOIN dept d ON |");
     assert_eq!(ctx.phase, SqlPhase::JoinCondition);

@@ -6183,10 +6183,7 @@ impl QueryExecutor {
                     Self::parse_mysql_delimiter_command(trimmed)
                 {
                     let command = ToolCommand::MysqlDelimiter { delimiter };
-                    Self::sync_mysql_delimiter_from_tool_command(
-                        &command,
-                        &mut mysql_delimiter,
-                    );
+                    Self::sync_mysql_delimiter_from_tool_command(&command, &mut mysql_delimiter);
                     items.push(FormatItem::ToolCommand(command));
                     continue;
                 }
@@ -6745,10 +6742,7 @@ impl QueryExecutor {
                     Self::parse_mysql_delimiter_command(trimmed)
                 {
                     let command = ToolCommand::MysqlDelimiter { delimiter };
-                    Self::sync_mysql_delimiter_from_tool_command(
-                        &command,
-                        &mut mysql_delimiter,
-                    );
+                    Self::sync_mysql_delimiter_from_tool_command(&command, &mut mysql_delimiter);
                     on_tool_command(command, line, items);
                     continue;
                 }

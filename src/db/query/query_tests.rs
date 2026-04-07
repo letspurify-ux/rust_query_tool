@@ -878,8 +878,10 @@ fn test_split_script_items_test21_execution_unit_splitter_regression() {
 #[test]
 fn test_split_script_items_test4_mariadb_full_script_keeps_delimiter_routine_boundaries() {
     let sql = load_mariadb_query_test_file("test4.txt");
-    let items =
-        QueryExecutor::split_script_items_for_db_type(&sql, Some(crate::db::connection::DatabaseType::MySQL));
+    let items = QueryExecutor::split_script_items_for_db_type(
+        &sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
 
     let statements = get_statements(&items);
     let mysql_delimiters = items
@@ -940,9 +942,9 @@ fn test_split_script_items_test4_mariadb_full_script_keeps_delimiter_routine_bou
         "post-routine CALL should remain separated from the preceding END$$ block: {statements:?}"
     );
     assert!(
-        statements
-            .iter()
-            .any(|stmt| stmt.trim_start().starts_with("SELECT 'ALL ASSERTIONS PASSED' AS status")),
+        statements.iter().any(|stmt| stmt
+            .trim_start()
+            .starts_with("SELECT 'ALL ASSERTIONS PASSED' AS status")),
         "post-routine assertions/selects should remain independently executable: {statements:?}"
     );
 }

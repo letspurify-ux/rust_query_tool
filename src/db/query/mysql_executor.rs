@@ -519,6 +519,18 @@ pub struct MysqlTableColumnDetail {
 }
 
 impl MysqlObjectBrowser {
+    fn create_ddl_column_names(object_type: &str) -> &'static [&'static str] {
+        match object_type {
+            "TABLE" | "VIEW" => &["Create Table", "Create View"],
+            "PROCEDURE" => &["Create Procedure"],
+            "FUNCTION" => &["Create Function"],
+            "TRIGGER" => &["SQL Original Statement", "Create Trigger"],
+            "EVENT" => &["Create Event"],
+            "SEQUENCE" => &["Create Sequence", "Create Table"],
+            _ => &[],
+        }
+    }
+
     fn optional_schema_param(schema_name: Option<&str>) -> Option<String> {
         schema_name
             .map(str::trim)
@@ -1364,6 +1376,24 @@ impl MysqlObjectBrowser {
         Ok(rows)
     }
 
+    pub fn get_sequences(conn: &mut Conn) -> Result<Vec<String>, MysqlError> {
+        let rows: Vec<String> = conn.query(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'SEQUENCE' \
+             ORDER BY TABLE_NAME",
+        )?;
+        Ok(rows)
+    }
+
+    pub fn get_events(conn: &mut Conn) -> Result<Vec<String>, MysqlError> {
+        let rows: Vec<String> = conn.query(
+            "SELECT EVENT_NAME FROM INFORMATION_SCHEMA.EVENTS \
+             WHERE EVENT_SCHEMA = DATABASE() \
+             ORDER BY EVENT_NAME",
+        )?;
+        Ok(rows)
+    }
+
     pub fn get_indexes(conn: &mut Conn, table_name: &str) -> Result<Vec<String>, MysqlError> {
         let rows: Vec<String> = conn.exec(
             "SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS \
@@ -1581,11 +1611,9 @@ impl MysqlObjectBrowser {
         object_name: &str,
     ) -> Result<String, MysqlError> {
         let object_type_upper = object_type.to_ascii_uppercase();
-        let ddl_column_index = match object_type_upper.as_str() {
-            "TABLE" | "VIEW" => 1usize,
-            "PROCEDURE" | "FUNCTION" | "TRIGGER" => 2usize,
-            _ => return Ok(String::new()),
-        };
+        if Self::create_ddl_column_names(&object_type_upper).is_empty() {
+            return Ok(String::new());
+        }
 
         let qualified_name = if let Some(schema) = Self::optional_schema_param(schema_name) {
             format!(
@@ -1599,14 +1627,21 @@ impl MysqlObjectBrowser {
 
         let sql = format!("SHOW CREATE {} {}", object_type_upper, qualified_name);
         let mut result = conn.query_iter(sql)?;
+        let ddl_column_index = result.columns().as_ref().iter().position(|column| {
+            let column_name = column.name_str();
+            Self::create_ddl_column_names(&object_type_upper)
+                .iter()
+                .any(|candidate| column_name.eq_ignore_ascii_case(candidate))
+        });
         let Some(row_result) = result.next() else {
             return Ok(String::new());
         };
         let row = row_result?;
-        Ok(row
-            .as_ref(ddl_column_index)
+        let ddl = ddl_column_index
+            .and_then(|index| row.as_ref(index))
             .map(MysqlExecutor::value_to_string)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(ddl)
     }
 
     pub fn get_object_types(conn: &mut Conn, object_name: &str) -> Result<Vec<String>, MysqlError> {
@@ -1639,9 +1674,26 @@ impl MysqlObjectBrowser {
             "SELECT 'TRIGGER' \
              FROM INFORMATION_SCHEMA.TRIGGERS \
              WHERE TRIGGER_SCHEMA = COALESCE(?, DATABASE()) AND TRIGGER_NAME = ?",
-            (schema_name, object_name),
+            (schema_name.clone(), object_name),
         )?;
         object_types.append(&mut trigger_types);
+
+        let mut sequence_types: Vec<String> = conn.exec(
+            "SELECT 'SEQUENCE' \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+               AND TABLE_TYPE = 'SEQUENCE'",
+            (schema_name.clone(), object_name),
+        )?;
+        object_types.append(&mut sequence_types);
+
+        let mut event_types: Vec<String> = conn.exec(
+            "SELECT 'EVENT' \
+             FROM INFORMATION_SCHEMA.EVENTS \
+             WHERE EVENT_SCHEMA = COALESCE(?, DATABASE()) AND EVENT_NAME = ?",
+            (schema_name, object_name),
+        )?;
+        object_types.append(&mut event_types);
 
         object_types.sort();
         object_types.dedup();

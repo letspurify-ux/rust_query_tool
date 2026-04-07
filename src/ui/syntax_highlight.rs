@@ -873,8 +873,8 @@ impl SqlHighlighter {
                 let treat_keyword_as_identifier =
                     should_treat_keyword_as_identifier_context(text, bytes, start, idx, word)
                         && !should_keep_keyword_highlighting_around_member_access(word);
-                let treat_alias_as_identifier = expect_alias_identifier
-                    && !should_keep_keyword_highlighting_after_as(word);
+                let treat_alias_as_identifier =
+                    expect_alias_identifier && !should_keep_keyword_highlighting_after_as(word);
                 let token_type = if treat_alias_as_identifier
                     || treat_keyword_as_identifier
                     || should_treat_function_name_as_identifier(text, bytes, start, idx, word)

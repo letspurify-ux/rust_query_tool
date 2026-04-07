@@ -3242,16 +3242,45 @@ impl SqlEditorWidget {
     fn mysql_identifier_left_boundary_symbol(sym: &str) -> bool {
         matches!(
             sym,
-            "(" | "," | "." | "=" | "+" | "-" | "*" | "/" | "%" | "<" | ">" | "<="
-                | ">=" | "<>" | "!=" | ":=" | "=>"
+            "(" | ","
+                | "."
+                | "="
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "<>"
+                | "!="
+                | ":="
+                | "=>"
         )
     }
 
     fn mysql_identifier_right_boundary_symbol(sym: &str) -> bool {
         matches!(
             sym,
-            ")" | "," | "." | ";" | "=" | "+" | "-" | "*" | "/" | "%" | "<" | ">" | "<="
-                | ">=" | "<>" | "!=" | ":=" | "=>"
+            ")" | ","
+                | "."
+                | ";"
+                | "="
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "<>"
+                | "!="
+                | ":="
+                | "=>"
         )
     }
 
@@ -3489,8 +3518,7 @@ impl SqlEditorWidget {
 
         let insert_target_column_list =
             Self::mysql_paren_belongs_to_insert_target_column_list(tokens, open_paren_idx);
-        if Self::paren_opens_call_argument_list(tokens, open_paren_idx)
-            || insert_target_column_list
+        if Self::paren_opens_call_argument_list(tokens, open_paren_idx) || insert_target_column_list
         {
             return !insert_target_column_list;
         }
@@ -4596,8 +4624,7 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     }
-                    let should_treat_as_block_start = block_start_keywords
-                        .contains(&upper)
+                    let should_treat_as_block_start = block_start_keywords.contains(&upper)
                         && !(mysql_if_exists_modifier
                             || mysql_compound_declare
                             || treat_control_keyword_as_identifier
@@ -4858,17 +4885,14 @@ impl SqlEditorWidget {
                                 .insert_all_active
                                 .is_active_at_paren_depth(current_scope.paren_depth);
                             let insert_all_extra = usize::from(
-                                insert_all_active_in_scope
-                                    && matches!(upper, "INTO" | "VALUES"),
+                                insert_all_active_in_scope && matches!(upper, "INTO" | "VALUES"),
                             );
                             let window_body_header_indent = construct
                                 .in_window_paren(paren_stack.len())
                                 .then(|| {
                                     FormatIndentedParenOwnerKind::Window
                                         .starts_phase1_body_header_words(
-                                            upper,
-                                            next_word,
-                                            third_word,
+                                            upper, next_word, third_word,
                                         )
                                 })
                                 .filter(|is_header| *is_header)
@@ -4883,9 +4907,7 @@ impl SqlEditorWidget {
                                 && (matches!(
                                     upper,
                                     "FROM" | "WHERE" | "GROUP" | "ORDER" | "CONNECT" | "HAVING"
-                                ) || crate::sql_text::is_format_set_operator_keyword(
-                                    upper,
-                                ));
+                                ) || crate::sql_text::is_format_set_operator_keyword(upper));
                             let clause_indent_level = if cursor_clause_dedent {
                                 indent_level.saturating_sub(1)
                             } else {
@@ -5084,10 +5106,7 @@ impl SqlEditorWidget {
                         construct.create_synonym_active.activate(current_scope);
                         construct.create_pending.deactivate();
                     } else if construct.create_pending.is_active()
-                        && matches!(
-                            upper,
-                            "PROCEDURE" | "FUNCTION" | "TYPE" | "TRIGGER"
-                        )
+                        && matches!(upper, "PROCEDURE" | "FUNCTION" | "TYPE" | "TRIGGER")
                     {
                         construct
                             .create_object
@@ -5281,26 +5300,14 @@ impl SqlEditorWidget {
                         let match_recognize_body_header = construct
                             .in_match_recognize_paren(paren_stack.len())
                             && FormatIndentedParenOwnerKind::MatchRecognize
-                                .starts_phase1_body_header_words(
-                                    upper,
-                                    next_word,
-                                    third_word,
-                                );
+                                .starts_phase1_body_header_words(upper, next_word, third_word);
                         let analytic_over_body_header = construct
                             .in_analytic_over_paren(paren_stack.len())
                             && FormatIndentedParenOwnerKind::AnalyticOver
-                                .starts_phase1_body_header_words(
-                                    upper,
-                                    next_word,
-                                    third_word,
-                                );
+                                .starts_phase1_body_header_words(upper, next_word, third_word);
                         let window_body_header = construct.in_window_paren(paren_stack.len())
                             && FormatIndentedParenOwnerKind::Window
-                                .starts_phase1_body_header_words(
-                                    upper,
-                                    next_word,
-                                    third_word,
-                                );
+                                .starts_phase1_body_header_words(upper, next_word, third_word);
                         if match_recognize_body_header
                             || analytic_over_body_header
                             || window_body_header
@@ -5325,11 +5332,7 @@ impl SqlEditorWidget {
                             .model_active
                             .is_active_at_paren_depth(current_scope.paren_depth)
                             && FormatIndentedParenOwnerKind::ModelSubclause
-                                .starts_phase1_body_header_words(
-                                    upper,
-                                    next_word,
-                                    third_word,
-                                )
+                                .starts_phase1_body_header_words(upper, next_word, third_word)
                         {
                             if upper == "REFERENCE" {
                                 construct.model_reference_pending.activate(current_scope);
@@ -5345,11 +5348,7 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         } else if active_phase1_wrapped_owner_kind.is_some_and(|kind| {
-                            kind.starts_phase1_body_header_words(
-                                upper,
-                                next_word,
-                                third_word,
-                            )
+                            kind.starts_phase1_body_header_words(upper, next_word, third_word)
                         }) {
                             newline_with(
                                 &mut out,
@@ -5598,9 +5597,7 @@ impl SqlEditorWidget {
                     if upper == "CURSOR" && in_plsql_block {
                         construct.cursor_decl_pending.activate(current_scope);
                     }
-                    if matches!(upper, "IS" | "AS")
-                        && construct.cursor_decl_pending.is_active()
-                    {
+                    if matches!(upper, "IS" | "AS") && construct.cursor_decl_pending.is_active() {
                         construct.cursor_decl_pending.deactivate();
                         construct.cursor_sql_active.activate(current_scope);
                         indent_level += 1;
@@ -5654,9 +5651,7 @@ impl SqlEditorWidget {
                         construct.grant_revoke_active.activate(current_scope);
                     }
                     // GRANT/REVOKE ends at ON (for privilege grants) or TO/FROM
-                    if construct.grant_revoke_active.is_active()
-                        && matches!(upper, "TO" | "FROM")
-                    {
+                    if construct.grant_revoke_active.is_active() && matches!(upper, "TO" | "FROM") {
                         construct.grant_revoke_active.deactivate();
                     }
 
@@ -11035,14 +11030,10 @@ impl SqlEditorWidget {
         sym == "%" && next_token.map(Self::token_is_word_like).unwrap_or(false)
     }
 
-    fn join_tokens_compact_for_create_table(
-        tokens: &[SqlToken],
-        mysql_compatible: bool,
-    ) -> String {
+    fn join_tokens_compact_for_create_table(tokens: &[SqlToken], mysql_compatible: bool) -> String {
         let mut out = String::new();
         let mut needs_space = false;
-        let meaningful_token_links =
-            mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
+        let meaningful_token_links = mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
         for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text_for_create_table(
                 tokens,
@@ -11096,8 +11087,7 @@ impl SqlEditorWidget {
         let mut needs_space = false;
         let indent = " ".repeat(indent_level * 4);
         let mut at_line_start = true;
-        let meaningful_token_links =
-            mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
+        let meaningful_token_links = mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
 
         for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text_for_create_table(
@@ -37235,7 +37225,8 @@ END;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_preserves_keyword_like_aliases() {
-        let source = "select profile as rank, profile window\nfrom metrics profile\nwhere profile.rank > 0;";
+        let source =
+            "select profile as rank, profile window\nfrom metrics profile\nwhere profile.rank > 0;";
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -37342,8 +37333,10 @@ END;"#;
 
     #[test]
     fn mysql_keyword_identifier_helper_keeps_top_level_values_clause_structural() {
-        let tokens =
-            SqlEditorWidget::tokenize_sql_with_mysql_compat("insert into t (profile) values (1)", true);
+        let tokens = SqlEditorWidget::tokenize_sql_with_mysql_compat(
+            "insert into t (profile) values (1)",
+            true,
+        );
         let values_idx = tokens
             .iter()
             .position(|token| matches!(token, SqlToken::Word(word) if word == "values"))
@@ -37364,5 +37357,4 @@ END;"#;
             None,
         ));
     }
-
 }

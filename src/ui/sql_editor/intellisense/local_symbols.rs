@@ -34,6 +34,7 @@ struct LocalScopeBuilder {
     token_end_idx: usize,
     decl_start_idx: Option<usize>,
     decl_end_idx: Option<usize>,
+    mysql_declare_statements: bool,
 }
 
 #[derive(Clone)]
@@ -41,6 +42,7 @@ struct ParsedRoutineHeader {
     body_keyword_idx: usize,
     decl_start_idx: usize,
     parameter_names: Vec<String>,
+    body_starts_immediately: bool,
 }
 
 #[derive(Clone)]
@@ -427,6 +429,12 @@ impl SqlEditorWidget {
         token_spans: &[SqlTokenSpan],
     ) -> (Vec<LocalScope>, Vec<LocalSymbolEntry>) {
         let statement_len = statement_text.len();
+        let mysql_compatible = sql_text::mysql_compatibility_for_sql(statement_text, None);
+        let root_begins_with_begin = token_spans.iter().find_map(|span| match &span.token {
+            SqlToken::Word(word) => Some(word.eq_ignore_ascii_case("BEGIN")),
+            SqlToken::Comment(_) => None,
+            _ => Some(false),
+        }) == Some(true);
         let mut scopes = vec![LocalScopeBuilder {
             scope: LocalScope {
                 parent: None,
@@ -438,6 +446,7 @@ impl SqlEditorWidget {
             token_end_idx: token_spans.len(),
             decl_start_idx: None,
             decl_end_idx: None,
+            mysql_declare_statements: mysql_compatible && root_begins_with_begin,
         }];
         let mut symbols = Vec::new();
         let mut block_stack = Vec::<LocalBlockFrame>::new();
@@ -498,7 +507,12 @@ impl SqlEditorWidget {
                                 token_start_idx: idx,
                                 token_end_idx: token_spans.len(),
                                 decl_start_idx: Some(parsed.decl_start_idx),
-                                decl_end_idx: None,
+                                decl_end_idx: if parsed.body_starts_immediately {
+                                    Some(parsed.body_keyword_idx)
+                                } else {
+                                    None
+                                },
+                                mysql_declare_statements: parsed.body_starts_immediately,
                             });
                             for name in parsed.parameter_names {
                                 Self::push_local_symbol(&mut symbols, scope_id, name, scope_start);
@@ -506,7 +520,7 @@ impl SqlEditorWidget {
                             block_stack.push(LocalBlockFrame {
                                 kind: LocalBlockKind::Routine,
                                 scope_id: Some(scope_id),
-                                awaiting_body_begin: true,
+                                awaiting_body_begin: !parsed.body_starts_immediately,
                             });
                             idx = parsed.body_keyword_idx.saturating_add(1);
                             continue;
@@ -515,6 +529,25 @@ impl SqlEditorWidget {
 
                     match upper.as_str() {
                         "DECLARE" => {
+                            if Self::current_scope_uses_mysql_declare_statements(&scopes, &block_stack)
+                            {
+                                let scope_id = Self::current_local_parent_scope_id(&block_stack);
+                                let item_end =
+                                    Self::find_statement_item_end(token_spans, idx, token_spans.len());
+                                let item = &token_spans[idx..item_end];
+                                let declared_at = Self::declaration_item_declared_at(item);
+                                for name in Self::extract_mysql_declaration_symbols_from_item(item) {
+                                    Self::push_local_symbol(
+                                        &mut symbols,
+                                        scope_id,
+                                        name,
+                                        declared_at,
+                                    );
+                                }
+                                idx = item_end.saturating_sub(1);
+                                continue;
+                            }
+
                             let parent_scope = Self::current_local_parent_scope_id(&block_stack);
                             let scope_id = scopes.len();
                             scopes.push(LocalScopeBuilder {
@@ -528,6 +561,7 @@ impl SqlEditorWidget {
                                 token_end_idx: token_spans.len(),
                                 decl_start_idx: Some(idx.saturating_add(1)),
                                 decl_end_idx: None,
+                                mysql_declare_statements: false,
                             });
                             block_stack.push(LocalBlockFrame {
                                 kind: LocalBlockKind::Declare,
@@ -559,6 +593,10 @@ impl SqlEditorWidget {
                                     token_end_idx: token_spans.len(),
                                     decl_start_idx: None,
                                     decl_end_idx: None,
+                                    mysql_declare_statements: Self::scope_uses_mysql_declare_statements(
+                                        &scopes,
+                                        parent_scope,
+                                    ),
                                 });
                                 Self::push_local_symbol(
                                     &mut symbols,
@@ -616,9 +654,39 @@ impl SqlEditorWidget {
                                 continue;
                             }
 
+                            let begin_scope_id =
+                                if Self::current_scope_uses_mysql_declare_statements(
+                                    &scopes,
+                                    &block_stack,
+                                ) {
+                                    let parent_scope =
+                                        Self::current_local_parent_scope_id(&block_stack);
+                                    let scope_id = scopes.len();
+                                    scopes.push(LocalScopeBuilder {
+                                        scope: LocalScope {
+                                            parent: Some(parent_scope),
+                                            start: token.end,
+                                            end: statement_len,
+                                            kind: LocalScopeKind::Block,
+                                        },
+                                        token_start_idx: idx,
+                                        token_end_idx: token_spans.len(),
+                                        decl_start_idx: None,
+                                        decl_end_idx: None,
+                                        mysql_declare_statements:
+                                            Self::scope_uses_mysql_declare_statements(
+                                                &scopes,
+                                                parent_scope,
+                                            ),
+                                    });
+                                    Some(scope_id)
+                                } else {
+                                    None
+                                };
+
                             block_stack.push(LocalBlockFrame {
                                 kind: LocalBlockKind::Begin,
-                                scope_id: None,
+                                scope_id: begin_scope_id,
                                 awaiting_body_begin: false,
                             });
                         }
@@ -776,27 +844,10 @@ impl SqlEditorWidget {
             }
 
             let mut item_end = item_start;
-            let mut paren_depth = 0usize;
-            while item_end < decl_end_idx {
-                if child_idx < child_ranges.len() && item_end == child_ranges[child_idx].0 {
-                    break;
-                }
-                match &token_spans[item_end].token {
-                    SqlToken::Comment(_) => {}
-                    SqlToken::Symbol(sym) if sym == "(" => {
-                        paren_depth = paren_depth.saturating_add(1);
-                    }
-                    SqlToken::Symbol(sym) if sym == ")" => {
-                        paren_depth = paren_depth.saturating_sub(1);
-                    }
-                    SqlToken::Symbol(sym) if sym == ";" && paren_depth == 0 => {
-                        item_end += 1;
-                        break;
-                    }
-                    _ => {}
-                }
-                item_end += 1;
+            if child_idx < child_ranges.len() && item_end == child_ranges[child_idx].0 {
+                break;
             }
+            item_end = Self::find_statement_item_end(token_spans, item_start, decl_end_idx);
 
             if item_end <= item_start {
                 idx = idx.saturating_add(1);
@@ -850,6 +901,77 @@ impl SqlEditorWidget {
         Some(name)
     }
 
+    fn extract_mysql_declaration_symbols_from_item(item: &[SqlTokenSpan]) -> Vec<String> {
+        let Some(first_idx) = item
+            .iter()
+            .position(|span| !matches!(span.token, SqlToken::Comment(_)))
+        else {
+            return Vec::new();
+        };
+
+        let Some(first_word) = Self::token_word(&item[first_idx].token) else {
+            return Vec::new();
+        };
+        if !first_word.eq_ignore_ascii_case("DECLARE") {
+            return Vec::new();
+        }
+
+        let meaningful_words: Vec<&str> = item[first_idx + 1..]
+            .iter()
+            .filter_map(|span| Self::token_word(&span.token))
+            .collect();
+        let Some(first_after_declare) = meaningful_words.first().copied() else {
+            return Vec::new();
+        };
+
+        if matches!(
+            first_after_declare.to_ascii_uppercase().as_str(),
+            "CONTINUE" | "EXIT" | "UNDO" | "HANDLER"
+        ) {
+            return Vec::new();
+        }
+
+        let mut names = Vec::new();
+        let mut idx = first_idx.saturating_add(1);
+        let mut expecting_name = true;
+
+        while idx < item.len() {
+            match &item[idx].token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "," && !names.is_empty() => {
+                    expecting_name = true;
+                }
+                SqlToken::Word(word) if expecting_name => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "DECLARE" {
+                        idx += 1;
+                        continue;
+                    }
+                    if let Some(name) = Self::local_identifier_from_word(word) {
+                        names.push(name);
+                        expecting_name = false;
+                    } else {
+                        break;
+                    }
+                }
+                SqlToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    if upper == "CURSOR" || upper == "CONDITION" {
+                        return names;
+                    }
+                    break;
+                }
+                SqlToken::Symbol(_) => {
+                    break;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        names
+    }
+
     fn declaration_item_declared_at(item: &[SqlTokenSpan]) -> usize {
         let mut last = 0usize;
         for span in item {
@@ -862,6 +984,33 @@ impl SqlEditorWidget {
             }
         }
         last
+    }
+
+    fn find_statement_item_end(
+        token_spans: &[SqlTokenSpan],
+        item_start: usize,
+        limit: usize,
+    ) -> usize {
+        let mut item_end = item_start;
+        let mut paren_depth = 0usize;
+        while item_end < limit {
+            match &token_spans[item_end].token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    paren_depth = paren_depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                SqlToken::Symbol(sym) if sym == ";" && paren_depth == 0 => {
+                    item_end += 1;
+                    break;
+                }
+                _ => {}
+            }
+            item_end += 1;
+        }
+        item_end
     }
 
     fn parse_for_loop_variable(tokens: &[SqlTokenSpan], idx: usize) -> Option<String> {
@@ -915,6 +1064,7 @@ impl SqlEditorWidget {
 
         let mut scan_idx = Self::next_meaningful_token_idx(tokens, name_idx + 1).unwrap_or(tokens.len());
         let mut parameter_names = Vec::new();
+        let mut saw_mysql_returns = false;
         if scan_idx < tokens.len() && Self::token_symbol_at(tokens, scan_idx, "(") {
             let (close_idx, names) = Self::extract_parameter_names(tokens, scan_idx)?;
             parameter_names = names;
@@ -946,6 +1096,30 @@ impl SqlEditorWidget {
                         body_keyword_idx: scan_idx,
                         decl_start_idx: scan_idx.saturating_add(1),
                         parameter_names,
+                        body_starts_immediately: false,
+                    });
+                }
+                SqlToken::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("RETURNS") => {
+                    saw_mysql_returns = true;
+                }
+                SqlToken::Word(word) if paren_depth == 0 && word.eq_ignore_ascii_case("BEGIN") => {
+                    return Some(ParsedRoutineHeader {
+                        body_keyword_idx: scan_idx,
+                        decl_start_idx: scan_idx,
+                        parameter_names,
+                        body_starts_immediately: true,
+                    });
+                }
+                SqlToken::Word(word)
+                    if paren_depth == 0
+                        && saw_mysql_returns
+                        && word.eq_ignore_ascii_case("RETURN") =>
+                {
+                    return Some(ParsedRoutineHeader {
+                        body_keyword_idx: scan_idx,
+                        decl_start_idx: scan_idx,
+                        parameter_names,
+                        body_starts_immediately: true,
                     });
                 }
                 _ => {}
@@ -1047,8 +1221,13 @@ impl SqlEditorWidget {
 
     fn extract_parameter_name_from_item(item: &[SqlTokenSpan]) -> Option<String> {
         item.iter()
-            .find_map(|span| Self::token_word(&span.token))
-            .and_then(Self::local_identifier_from_word)
+            .filter_map(|span| Self::token_word(&span.token))
+            .skip_while(|word| Self::is_parameter_mode_keyword(word))
+            .find_map(Self::local_identifier_from_word)
+    }
+
+    fn is_parameter_mode_keyword(word: &str) -> bool {
+        matches!(word.to_ascii_uppercase().as_str(), "IN" | "OUT" | "INOUT")
     }
 
     fn collect_text_var_bind_names_before_statement(
@@ -1092,6 +1271,32 @@ impl SqlEditorWidget {
             .rev()
             .find_map(|frame| frame.scope_id)
             .unwrap_or(0)
+    }
+
+    fn scope_uses_mysql_declare_statements(
+        scopes: &[LocalScopeBuilder],
+        mut scope_id: usize,
+    ) -> bool {
+        loop {
+            if scopes
+                .get(scope_id)
+                .is_some_and(|scope| scope.mysql_declare_statements)
+            {
+                return true;
+            }
+            let Some(parent) = scopes.get(scope_id).and_then(|scope| scope.scope.parent) else {
+                return false;
+            };
+            scope_id = parent;
+        }
+    }
+
+    fn current_scope_uses_mysql_declare_statements(
+        scopes: &[LocalScopeBuilder],
+        block_stack: &[LocalBlockFrame],
+    ) -> bool {
+        let scope_id = Self::current_local_parent_scope_id(block_stack);
+        Self::scope_uses_mysql_declare_statements(scopes, scope_id)
     }
 
     fn pop_local_block_kind(
@@ -1209,7 +1414,15 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let normalized = sql_text::strip_identifier_quotes(trimmed);
+        let is_quoted = trimmed.starts_with('"') || trimmed.starts_with('`');
+        let normalized = if let Some(inner) = trimmed
+            .strip_prefix('`')
+            .and_then(|value| value.strip_suffix('`'))
+        {
+            inner.replace("``", "`")
+        } else {
+            sql_text::strip_identifier_quotes(trimmed)
+        };
         if normalized.is_empty() {
             return None;
         }
@@ -1220,9 +1433,7 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if !trimmed.starts_with('"')
-            && sql_text::is_oracle_sql_keyword(&normalized.to_ascii_uppercase())
-        {
+        if !is_quoted && sql_text::is_oracle_sql_keyword(&normalized.to_ascii_uppercase()) {
             return None;
         }
 

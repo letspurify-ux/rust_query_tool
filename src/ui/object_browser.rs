@@ -57,6 +57,7 @@ struct ObjectCache {
     functions: Vec<String>,
     sequences: Vec<String>,
     triggers: Vec<String>,
+    events: Vec<String>,
     synonyms: Vec<String>,
     packages: Vec<String>,
     package_routines: HashMap<String, Vec<PackageRoutine>>,
@@ -135,6 +136,10 @@ pub struct ObjectBrowserWidget {
 
 impl ObjectBrowserWidget {
     pub fn new(x: i32, y: i32, w: i32, h: i32, connection: SharedConnection) -> Self {
+        let initial_db_type = crate::db::try_lock_connection(&connection)
+            .map(|guard| guard.db_type())
+            .unwrap_or(crate::db::DatabaseType::Oracle);
+
         // Create a flex container for the filter input and tree
         let mut flex = Flex::default().with_pos(x, y).with_size(w, h);
         flex.set_type(FlexType::Column);
@@ -158,53 +163,20 @@ impl ObjectBrowserWidget {
 
         // Initialize tree structure
         tree.set_show_root(false);
-        tree.add("Tables");
-        tree.add("Views");
-        tree.add("Procedures");
-        tree.add("Functions");
-        tree.add("Sequences");
-        tree.add("Triggers");
-        tree.add("Synonyms");
-        tree.add("Packages");
+        Self::rebuild_root_categories_for_db_type(
+            &mut tree,
+            initial_db_type,
+            &ObjectCache::default(),
+        );
 
         // Make tree resizable (takes remaining space after filter input)
         flex.resizable(&tree);
         flex.end();
 
-        // Close all items by default
-        if let Some(mut item) = tree.find_item("Tables") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Views") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Procedures") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Functions") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Sequences") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Triggers") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Synonyms") {
-            item.close();
-        }
-        if let Some(mut item) = tree.find_item("Packages") {
-            item.close();
-        }
-
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
-        let current_db_type = Arc::new(Mutex::new(
-            crate::db::try_lock_connection(&connection)
-                .map(|guard| guard.db_type())
-                .unwrap_or(crate::db::DatabaseType::Oracle),
-        ));
+        let current_db_type = Arc::new(Mutex::new(initial_db_type));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
 
@@ -252,7 +224,12 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        Self::rebuild_root_categories(&mut self.tree);
+        let db_type = self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned();
+        Self::rebuild_root_categories_for_db_type(&mut self.tree, db_type, &cache_snapshot);
         Self::populate_tree(&mut self.tree, &cache_snapshot, &filter_text);
         // Force layout recalculation so new font metrics take effect immediately.
         let (x, y, w, h) = (self.tree.x(), self.tree.y(), self.tree.w(), self.tree.h());
@@ -269,6 +246,7 @@ impl ObjectBrowserWidget {
         let mut tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let pending_tree_refresh = self.pending_tree_refresh.clone();
+        let current_db_type = self.current_db_type.clone();
         let status_callback = self.status_callback.clone();
 
         self.filter_input.set_callback(move |input| {
@@ -284,6 +262,10 @@ impl ObjectBrowserWidget {
             let cache = object_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let db_type = *current_db_type
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ObjectBrowserWidget::rebuild_root_categories_for_db_type(&mut tree, db_type, &cache);
             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
             tree.redraw();
             if canceled_pending_refresh {
@@ -329,7 +311,7 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             // Keep receiver lock scope minimal: drain messages first, then perform UI work.
             // This prevents long lock hold while rebuilding tree widgets.
-            let mut latest_cache: Option<ObjectCache> = None;
+            let mut latest_cache: Option<(crate::db::DatabaseType, ObjectCache)> = None;
 
             {
                 let r = receiver
@@ -338,7 +320,7 @@ impl ObjectBrowserWidget {
                 loop {
                     match r.try_recv() {
                         Ok(RefreshEvent::Finished { cache, db_type }) => {
-                            latest_cache = Some(cache);
+                            latest_cache = Some((db_type, cache));
                             match current_db_type.lock() {
                                 Ok(mut guard) => *guard = db_type,
                                 Err(poisoned) => *poisoned.into_inner() = db_type,
@@ -353,9 +335,10 @@ impl ObjectBrowserWidget {
                 }
             }
 
-            if let Some(cache) = latest_cache {
+            if let Some((db_type, cache)) = latest_cache {
                 let filter_text = filter_input.value().to_lowercase();
                 let paths = ObjectBrowserWidget::collect_tree_paths(&cache, &filter_text);
+                let cache_snapshot = cache.clone();
 
                 {
                     let mut cache_guard = object_cache
@@ -364,6 +347,11 @@ impl ObjectBrowserWidget {
                     *cache_guard = cache;
                 }
 
+                ObjectBrowserWidget::rebuild_root_categories_for_db_type(
+                    &mut tree,
+                    db_type,
+                    &cache_snapshot,
+                );
                 ObjectBrowserWidget::clear_tree_items(&mut tree);
                 {
                     let mut pending = pending_tree_refresh
@@ -1024,7 +1012,7 @@ impl ObjectBrowserWidget {
 
         match parent_type_upper.as_str() {
             "TABLES" | "VIEWS" | "PROCEDURES" | "FUNCTIONS" | "SEQUENCES" | "TRIGGERS"
-            | "SYNONYMS" | "PACKAGES" => Some(ObjectItem::Simple {
+            | "EVENTS" | "SYNONYMS" | "PACKAGES" => Some(ObjectItem::Simple {
                 object_type: parent_type_upper,
                 object_name,
             }),
@@ -1695,6 +1683,9 @@ impl ObjectBrowserWidget {
                     "Check Compilation|Generate DDL"
                     }
                 }
+                ObjectItem::Simple { object_type, .. } if object_type == "EVENTS" => {
+                    "Generate DDL"
+                }
                 ObjectItem::Simple { object_type, .. } if object_type == "SYNONYMS" => {
                     "View Info|Generate DDL"
                 }
@@ -2261,6 +2252,7 @@ impl ObjectBrowserWidget {
                                 "FUNCTIONS" => Some("FUNCTION"),
                                 "SEQUENCES" => Some("SEQUENCE"),
                                 "TRIGGERS" => Some("TRIGGER"),
+                                "EVENTS" => Some("EVENT"),
                                 "SYNONYMS" => Some("SYNONYM"),
                                 "PACKAGES" => Some("PACKAGE"),
                                 _ => None,
@@ -2633,10 +2625,16 @@ impl ObjectBrowserWidget {
                 if let Ok(functions) = MysqlObjectBrowser::get_functions(mysql_conn) {
                     cache.functions = functions;
                 }
+                if let Ok(sequences) = MysqlObjectBrowser::get_sequences(mysql_conn) {
+                    cache.sequences = sequences;
+                }
                 if let Ok(triggers) = MysqlObjectBrowser::get_triggers(mysql_conn) {
                     cache.triggers = triggers;
                 }
-                // MySQL doesn't have sequences, synonyms, or packages
+                if let Ok(events) = MysqlObjectBrowser::get_events(mysql_conn) {
+                    cache.events = events;
+                }
+                // MySQL/MariaDB connections do not expose Oracle-only synonyms or packages.
 
                 Some((db_type, cache))
             }
@@ -2658,18 +2656,7 @@ impl ObjectBrowserWidget {
     }
 
     fn clear_tree_items(tree: &mut Tree) {
-        let categories = [
-            "Tables",
-            "Views",
-            "Procedures",
-            "Functions",
-            "Sequences",
-            "Triggers",
-            "Synonyms",
-            "Packages",
-        ];
-
-        for category in categories {
+        for category in Self::all_root_categories() {
             if let Some(item) = tree.find_item(category) {
                 while item.has_children() {
                     if let Some(child) = item.child(0) {
@@ -2682,22 +2669,64 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn rebuild_root_categories(tree: &mut Tree) {
-        let categories = [
+    fn all_root_categories() -> &'static [&'static str] {
+        &[
             "Tables",
             "Views",
             "Procedures",
             "Functions",
             "Sequences",
             "Triggers",
+            "Events",
             "Synonyms",
             "Packages",
-        ];
+        ]
+    }
 
-        for category in categories {
+    fn root_categories_for_db_type(
+        db_type: crate::db::DatabaseType,
+        cache: &ObjectCache,
+    ) -> Vec<&'static str> {
+        match db_type {
+            crate::db::DatabaseType::Oracle => vec![
+                "Tables",
+                "Views",
+                "Procedures",
+                "Functions",
+                "Sequences",
+                "Triggers",
+                "Synonyms",
+                "Packages",
+            ],
+            crate::db::DatabaseType::MySQL => {
+                let mut categories = vec![
+                    "Tables",
+                    "Views",
+                    "Procedures",
+                    "Functions",
+                    "Triggers",
+                    "Events",
+                ];
+                if !cache.sequences.is_empty() {
+                    categories.insert(4, "Sequences");
+                }
+                categories
+            }
+        }
+    }
+
+    fn rebuild_root_categories_for_db_type(
+        tree: &mut Tree,
+        db_type: crate::db::DatabaseType,
+        cache: &ObjectCache,
+    ) {
+        for category in Self::all_root_categories() {
             if let Some(item) = tree.find_item(category) {
                 let _ = tree.remove(&item);
             }
+        }
+
+        for category in Self::root_categories_for_db_type(db_type, cache) {
             tree.add(category);
             if let Some(mut item) = tree.find_item(category) {
                 item.close();
@@ -2742,6 +2771,11 @@ impl ObjectBrowserWidget {
         for trig in &cache.triggers {
             if filter_text.is_empty() || trig.to_lowercase().contains(filter_text) {
                 paths.push(format!("Triggers/{}", trig));
+            }
+        }
+        for event in &cache.events {
+            if filter_text.is_empty() || event.to_lowercase().contains(filter_text) {
+                paths.push(format!("Events/{}", event));
             }
         }
         for syn in &cache.synonyms {
@@ -2865,6 +2899,7 @@ fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::{copy_text_for_object_item, ObjectBrowserWidget, ObjectItem};
+    use crate::db::DatabaseType;
     use crate::db::ProcedureArgument;
 
     #[test]
@@ -2930,5 +2965,22 @@ mod tests {
         assert!(sql.contains("SELECT @v_p_status AS `p_status`;"));
         assert!(!sql.contains("FROM dual"));
         assert!(!sql.contains("BEGIN\n"));
+    }
+
+    #[test]
+    fn mysql_root_categories_hide_oracle_only_groups_and_keep_events() {
+        let categories = ObjectBrowserWidget::root_categories_for_db_type(
+            DatabaseType::MySQL,
+            &Default::default(),
+        );
+
+        assert!(categories.contains(&"Tables"));
+        assert!(categories.contains(&"Views"));
+        assert!(categories.contains(&"Procedures"));
+        assert!(categories.contains(&"Functions"));
+        assert!(categories.contains(&"Triggers"));
+        assert!(categories.contains(&"Events"));
+        assert!(!categories.contains(&"Synonyms"));
+        assert!(!categories.contains(&"Packages"));
     }
 }

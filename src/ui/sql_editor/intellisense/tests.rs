@@ -68,6 +68,35 @@ fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::Cur
     intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
 }
 
+fn mysql_context_and_suggestions_for_inline_sql(sql_with_cursor: &str) -> (SqlContext, Vec<String>) {
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+    let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+    let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    let (prefix, _, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let mut data = IntellisenseData::new();
+    let suggestions = SqlEditorWidget::base_suggestions_for_context(
+        &mut data,
+        &prefix,
+        None,
+        None,
+        matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+        context,
+        false,
+        Some(crate::db::DatabaseType::MySQL),
+    );
+
+    (context, suggestions)
+}
+
 fn assert_has_case_insensitive(values: &[String], expected: &str) {
     assert!(
         values
@@ -1131,6 +1160,124 @@ fn mariadb_ultra_final_boss_nested_labeled_block_select_into_is_select_list() {
         cte_names.iter().any(|n| n == "RANKED"),
         "CTE `ranked` must be visible after nested block, got: {cte_names:?}"
     );
+}
+
+#[test]
+fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name() {
+    for (file_name, target, replacement) in [
+        (
+            "test1.txt",
+            "order_id BIGINT NOT NULL,",
+            "order_id BI__CODEX_CURSOR__ NOT NULL,",
+        ),
+        (
+            "test2.txt",
+            "task_id BIGINT NOT NULL,",
+            "task_id BI__CODEX_CURSOR__ NOT NULL,",
+        ),
+        (
+            "test3.txt",
+            "run_id BIGINT NOT NULL,",
+            "run_id BI__CODEX_CURSOR__ NOT NULL,",
+        ),
+    ] {
+        let script = load_mariadb_intellisense_test_file(file_name);
+        let marked = script.replacen(target, replacement, 1);
+        assert_ne!(marked, script, "expected CREATE TABLE target in {file_name}");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+
+        assert!(
+            statement.starts_with("CREATE TABLE"),
+            "cursor should stay inside CREATE TABLE statement for {file_name}, got:\n{statement}"
+        );
+        assert_ne!(
+            context,
+            SqlContext::TableName,
+            "CREATE TABLE definition keyword in {file_name} must not stay in table-name context"
+        );
+    }
+}
+
+#[test]
+fn mariadb_scripts_create_table_option_contexts_do_not_regress_to_table_name() {
+    for (file_name, target, replacement) in [
+        (
+            "test1.txt",
+            ") ENGINE = InnoDB;",
+            ") ENG__CODEX_CURSOR__ = InnoDB;",
+        ),
+        (
+            "test2.txt",
+            ") ENGINE = InnoDB;",
+            ") ENG__CODEX_CURSOR__ = InnoDB;",
+        ),
+        (
+            "test3.txt",
+            ") ENGINE = InnoDB;",
+            ") ENG__CODEX_CURSOR__ = InnoDB;",
+        ),
+    ] {
+        let script = load_mariadb_intellisense_test_file(file_name);
+        let marked = script.replacen(target, replacement, 1);
+        assert_ne!(marked, script, "expected ENGINE target in {file_name}");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+
+        assert!(
+            statement.starts_with("CREATE TABLE"),
+            "cursor should stay inside CREATE TABLE statement for {file_name}, got:\n{statement}"
+        );
+        assert_ne!(
+            context,
+            SqlContext::TableName,
+            "CREATE TABLE option keyword in {file_name} must not stay in table-name context"
+        );
+    }
+}
+
+#[test]
+fn mysql_create_table_definition_keywords_include_numeric_types_and_nullability() {
+    let (bigint_context, bigint_suggestions) =
+        mysql_context_and_suggestions_for_inline_sql("CREATE TABLE demo (id BI|)");
+    assert_ne!(bigint_context, SqlContext::TableName);
+    assert_has_case_insensitive(&bigint_suggestions, "BIGINT");
+
+    let (not_context, not_suggestions) =
+        mysql_context_and_suggestions_for_inline_sql("CREATE TABLE demo (id INT NO|)");
+    assert_ne!(not_context, SqlContext::TableName);
+    assert_has_case_insensitive(&not_suggestions, "NOT");
+
+    let (null_context, null_suggestions) =
+        mysql_context_and_suggestions_for_inline_sql("CREATE TABLE demo (id INT NU|)");
+    assert_ne!(null_context, SqlContext::TableName);
+    assert_has_case_insensitive(&null_suggestions, "NULL");
+}
+
+#[test]
+fn mysql_create_table_option_keywords_include_engine_default_and_collate() {
+    let (engine_context, engine_suggestions) =
+        mysql_context_and_suggestions_for_inline_sql("CREATE TABLE demo (id INT) ENG|");
+    assert_ne!(engine_context, SqlContext::TableName);
+    assert_has_case_insensitive(&engine_suggestions, "ENGINE");
+
+    let (default_context, default_suggestions) = mysql_context_and_suggestions_for_inline_sql(
+        "CREATE TABLE demo (id INT) DEF| CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+    );
+    assert_ne!(default_context, SqlContext::TableName);
+    assert_has_case_insensitive(&default_suggestions, "DEFAULT");
+
+    let (collate_context, collate_suggestions) = mysql_context_and_suggestions_for_inline_sql(
+        "CREATE TABLE demo (id INT) DEFAULT CHARACTER SET utf8mb4 COL| utf8mb4_unicode_ci",
+    );
+    assert_ne!(collate_context, SqlContext::TableName);
+    assert_has_case_insensitive(&collate_suggestions, "COLLATE");
 }
 
 #[test]
@@ -3061,6 +3208,121 @@ END demo_pkg;"#,
 
     assert_has_case_insensitive(&suggestions, "p_input");
     assert_has_case_insensitive(&suggestions, "p_output");
+}
+
+#[test]
+fn local_symbol_suggestions_include_mysql_procedure_in_out_parameters() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"CREATE PROCEDURE upsert_emp(
+    IN p_empno INT,
+    INOUT p_ename VARCHAR(100),
+    OUT p_message VARCHAR(255)
+)
+BEGIN
+    __CODEX_CURSOR__SELECT 1;
+END;"#,
+        &[],
+    );
+
+    for expected in ["p_empno", "p_ename", "p_message"] {
+        assert_has_case_insensitive(&suggestions, expected);
+    }
+}
+
+#[test]
+fn local_symbol_suggestions_include_mysql_function_parameters_for_return_body() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"CREATE FUNCTION fn_total(p_amount DECIMAL(10,2), `p_rate` DECIMAL(5,2))
+RETURNS DECIMAL(10,2)
+RETURN __CODEX_CURSOR__p_amount + `p_rate`;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, "p_amount");
+    assert_has_case_insensitive(&suggestions, "p_rate");
+}
+
+#[test]
+fn local_symbol_suggestions_include_mysql_declared_locals_and_cursor_without_handler_noise() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"CREATE PROCEDURE demo_proc()
+BEGIN
+    DECLARE v_count INT DEFAULT 0;
+    DECLARE `v_total` DECIMAL(10,2) DEFAULT 0;
+    DECLARE cur_emp CURSOR FOR SELECT empno FROM emp;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_count = 1;
+
+    __CODEX_CURSOR__SELECT v_count, `v_total` FROM dual;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, "v_count");
+    assert_has_case_insensitive(&suggestions, "v_total");
+    assert_has_case_insensitive(&suggestions, "cur_emp");
+    assert!(
+        !suggestions
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("continue") || name.eq_ignore_ascii_case("handler")),
+        "handler keywords must not leak into local suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn local_symbol_suggestions_keep_mysql_nested_block_locals_scoped() {
+    let inner_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"CREATE PROCEDURE demo_proc()
+BEGIN
+    DECLARE v_outer INT DEFAULT 0;
+
+    nested_block: BEGIN
+        DECLARE v_inner INT DEFAULT 1;
+        __CODEX_CURSOR__SELECT v_inner;
+    END;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&inner_suggestions, "v_outer");
+    assert_has_case_insensitive(&inner_suggestions, "v_inner");
+
+    let outer_suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"CREATE PROCEDURE demo_proc()
+BEGIN
+    DECLARE v_outer INT DEFAULT 0;
+
+    nested_block: BEGIN
+        DECLARE v_inner INT DEFAULT 1;
+        SELECT v_inner;
+    END;
+
+    __CODEX_CURSOR__SELECT v_outer;
+END;"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&outer_suggestions, "v_outer");
+    assert!(
+        !outer_suggestions
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("v_inner")),
+        "nested MySQL block variable should not remain visible after END: {:?}",
+        outer_suggestions
+    );
+}
+
+#[test]
+fn local_symbol_suggestions_include_mariadb_begin_not_atomic_declares() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"BEGIN NOT ATOMIC
+    DECLARE v_count INT DEFAULT 0;
+    __CODEX_CURSOR__SET v_count = v_count + 1;
+END"#,
+        &[],
+    );
+
+    assert_has_case_insensitive(&suggestions, "v_count");
 }
 
 #[test]

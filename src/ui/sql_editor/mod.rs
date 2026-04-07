@@ -246,6 +246,7 @@ pub(crate) enum LocalScopeKind {
     PackageBody,
     Routine,
     DeclareBlock,
+    Block,
     Loop,
 }
 

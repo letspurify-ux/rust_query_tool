@@ -1564,6 +1564,7 @@ enum StatementKind {
     Update,
     Delete,
     Merge,
+    CreateTable,
     Fetch,
     ExecuteImmediate,
     OpenCursor,
@@ -2664,6 +2665,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // should provide table-name completion.
                         if matches!(last_word.as_deref(), Some("LOCK")) {
                             depth_frames[depth].statement_kind = StatementKind::Lock;
+                        } else if is_create_table_target(tokens, idx) {
+                            depth_frames[depth].statement_kind = StatementKind::CreateTable;
+                            depth_frames[depth].current_target_table = None;
                         }
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
@@ -2701,6 +2705,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // completions for the leading table/view segment.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
+                    }
+                    "REFERENCES" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::CreateTable) {
+                            // CREATE TABLE foreign-key clauses introduce a referenced
+                            // relation target after `REFERENCES`.
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
+                            relation_state.expect_table();
+                        } else {
+                            relation_state.clear();
+                        }
                     }
                     "JOIN" | "APPLY" => {
                         if upper == "APPLY" {
@@ -3143,9 +3161,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // In MySQL ON DUPLICATE KEY UPDATE, VALUES(col) is a function
                         // reference to the attempted-insert value, NOT the INSERT VALUES clause.
                         // Skip the phase change when we're inside a DML SET expression.
-                        let in_set_expr = depth_frames
-                            .get(depth)
-                            .is_some_and(|frame| frame.dml_set_active && matches!(frame.phase, SqlPhase::SetClause));
+                        let in_set_expr = depth_frames.get(depth).is_some_and(|frame| {
+                            frame.dml_set_active && matches!(frame.phase, SqlPhase::SetClause)
+                        });
                         if !in_set_expr {
                             depth_frames[depth].phase = SqlPhase::ValuesClause;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
@@ -3200,6 +3218,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     .get(depth)
                                     .map(|frame| frame.statement_kind)
                                     .unwrap_or(StatementKind::Unknown);
+                                let create_table_target_consumed =
+                                    matches!(current_phase, SqlPhase::IntoClause)
+                                        && matches!(
+                                            current_statement_kind,
+                                            StatementKind::CreateTable
+                                        );
                                 let should_record_target_table = matches!(
                                     current_phase,
                                     SqlPhase::UpdateTarget
@@ -3328,7 +3352,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                         idx = after_alias + 1;
                                         continue;
                                     }
-                                    if sym == "(" && !alias_present {
+                                    if sym == "(" && !alias_present && !create_table_target_consumed
+                                    {
                                         // Preserve table-function name for immediate
                                         // parenthesized argument scope handling.
                                         last_word = relation_name_hint;
@@ -3342,6 +3367,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 if !matches!(tokens.get(after_alias), Some(SqlToken::Symbol(sym)) if sym == "(")
                                 {
                                     relation_modifier_state.clear();
+                                }
+                                if create_table_target_consumed {
+                                    // Once the CREATE TABLE target relation has been consumed,
+                                    // subsequent tokens belong to the table-definition body or
+                                    // table-option list rather than another table-name slot.
+                                    depth_frames[depth].phase = SqlPhase::Initial;
                                 }
                                 relation_state.clear();
                                 idx = after_alias;

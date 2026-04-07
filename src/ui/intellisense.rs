@@ -683,7 +683,14 @@ impl IntellisenseData {
         prefer_relations: bool,
         prefer_columns: bool,
     ) -> Vec<String> {
-        self.get_suggestions_for_db(prefix, include_columns, column_tables, prefer_relations, prefer_columns, None)
+        self.get_suggestions_for_db(
+            prefix,
+            include_columns,
+            column_tables,
+            prefer_relations,
+            prefer_columns,
+            None,
+        )
     }
 
     pub fn get_suggestions_for_db(
