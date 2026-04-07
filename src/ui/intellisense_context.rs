@@ -3140,8 +3140,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "VALUES" => {
-                        depth_frames[depth].phase = SqlPhase::ValuesClause;
-                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        // In MySQL ON DUPLICATE KEY UPDATE, VALUES(col) is a function
+                        // reference to the attempted-insert value, NOT the INSERT VALUES clause.
+                        // Skip the phase change when we're inside a DML SET expression.
+                        let in_set_expr = depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.dml_set_active && matches!(frame.phase, SqlPhase::SetClause));
+                        if !in_set_expr {
+                            depth_frames[depth].phase = SqlPhase::ValuesClause;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        }
                         relation_state.clear();
                     }
                     "MATCH_RECOGNIZE" => {
