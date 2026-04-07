@@ -2392,8 +2392,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].postgres_conflict_update_active = false;
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
-                        if is_expression_context {
+                        // `CREATE OR REPLACE VIEW/PROCEDURE/FUNCTION/TRIGGER ...` uses
+                        // REPLACE as a DDL modifier, not as a DML statement.
+                        let is_create_or_replace =
+                            matches!(last_word.as_deref(), Some("OR"));
+                        if is_expression_context || is_create_or_replace {
                             // Inside expressions, REPLACE can be a scalar function name.
+                            // After `CREATE OR`, REPLACE is a DDL modifier, not DML.
                             relation_state.clear();
                         } else {
                             // MySQL `REPLACE [INTO] table ...` behaves like INSERT for

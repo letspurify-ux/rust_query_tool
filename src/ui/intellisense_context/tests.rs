@@ -1143,6 +1143,89 @@ fn replace_function_call_in_select_list_stays_column_context() {
 }
 
 #[test]
+fn create_or_replace_view_select_list_is_column_context() {
+    // `CREATE OR REPLACE VIEW` — REPLACE is a DDL modifier, not a DML statement.
+    // The SELECT list inside the view body must be a column context with the
+    // view's row sources visible.
+    let ctx = analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.| FROM employees e");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+    assert!(!ctx.phase.is_table_context());
+    let table_names: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "E"),
+        "alias `e` for employees must be in scope inside CREATE OR REPLACE VIEW body: {table_names:?}"
+    );
+}
+
+#[test]
+fn create_or_replace_view_from_clause_is_table_context() {
+    let ctx = analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn create_or_replace_view_where_clause_is_column_context() {
+    let ctx = analyze(
+        "CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+    let table_names: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "E"),
+        "alias `e` must be in scope in CREATE OR REPLACE VIEW WHERE clause: {table_names:?}"
+    );
+}
+
+#[test]
+fn create_or_replace_view_does_not_register_view_keyword_as_table() {
+    // After the fix, `VIEW` must not be collected as a DML target table.
+    // Cursor is at the WHERE clause so all tables from the FROM clause are visible.
+    let ctx = analyze(
+        "CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|",
+    );
+    let raw_names: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        !raw_names.iter().any(|n| n == "VIEW"),
+        "`VIEW` must not be registered as a relation name: {raw_names:?}"
+    );
+    assert!(
+        raw_names.iter().any(|n| n == "EMPLOYEES"),
+        "`employees` must be registered as a relation: {raw_names:?}"
+    );
+}
+
+#[test]
+fn create_or_replace_view_statement_kind_is_not_insert() {
+    // The statement_kind must NOT be Insert after `CREATE OR REPLACE VIEW ... AS SELECT`.
+    // Before the fix, REPLACE was treated as DML INSERT which carried Insert kind
+    // into the SELECT body via preserve_insert_statement_kind.
+    let ctx =
+        analyze("CREATE OR REPLACE VIEW v_emp AS SELECT e.emp_code FROM employees e WHERE e.|");
+    // WhereClause is a column context; focused table should be "employees", not "VIEW".
+    assert!(ctx.phase.is_column_context());
+    let focused: Vec<String> = ctx.focused_tables.iter().map(|n| n.to_uppercase()).collect();
+    assert!(
+        !focused.iter().any(|n| n == "VIEW"),
+        "`VIEW` must not appear in focused_tables: {focused:?}"
+    );
+}
+
+#[test]
 fn phase_truncate_table_is_table_context() {
     let ctx = analyze("TRUNCATE TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);

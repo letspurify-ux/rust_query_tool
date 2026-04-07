@@ -1163,6 +1163,153 @@ fn mariadb_ultra_final_boss_nested_labeled_block_select_into_is_select_list() {
 }
 
 #[test]
+fn mariadb_final_boss_create_or_replace_view_select_list_is_column_context() {
+    // test4.txt: cursor inside the SELECT list of the CREATE OR REPLACE VIEW.
+    // `SELECT e.employee_id, e.emp_code, CONCAT(e.last_name, ...`
+    // REPLACE in `CREATE OR REPLACE VIEW` must NOT be treated as a DML REPLACE.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "e.employee_id,",
+        "e.__CODEX_CURSOR__employee_id,",
+        1,
+    );
+    assert_ne!(marked, script, "expected CREATE OR REPLACE VIEW SELECT target in test4.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE OR REPLACE VIEW"),
+        "cursor should stay inside the CREATE OR REPLACE VIEW statement, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::SelectList,
+        "CREATE OR REPLACE VIEW body should be SelectList phase"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "E"),
+        "alias `e` (for employees) must be in scope inside CREATE OR REPLACE VIEW, got: {table_names:?}"
+    );
+    // VIEW must not appear as a relation — it is a DDL keyword, not a table name.
+    let raw_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        !raw_names.iter().any(|n| n == "VIEW"),
+        "`VIEW` keyword must not be registered as a relation in CREATE OR REPLACE VIEW: {raw_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_create_or_replace_view_join_on_is_join_condition() {
+    // test4.txt: cursor inside an ON condition of a JOIN inside the CREATE OR REPLACE VIEW body.
+    // `JOIN departments d ON d.dept_id = e.|dept_id`
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "ON d.dept_id = e.dept_id",
+        "ON d.dept_id = e.__CODEX_CURSOR__dept_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected ON condition cursor target in test4.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE OR REPLACE VIEW"),
+        "cursor should stay inside CREATE OR REPLACE VIEW, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::JoinCondition,
+        "ON clause inside CREATE OR REPLACE VIEW JOIN should be JoinCondition phase"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "E"),
+        "alias `e` must be visible inside JOIN ON of CREATE OR REPLACE VIEW: {table_names:?}"
+    );
+    assert!(
+        table_names.iter().any(|n| n == "D"),
+        "alias `d` must be visible inside JOIN ON of CREATE OR REPLACE VIEW: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_insert_on_duplicate_key_update_values_fn_is_dml_set() {
+    // test4.txt: ON DUPLICATE KEY UPDATE with VALUES() references.
+    // `ON DUPLICATE KEY UPDATE role_name = VALUES(role_name), ...`
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "role_name = VALUES(role_name),",
+        "role_name = VALUES(role_name),\n        __CODEX_CURSOR__",
+        1,
+    );
+    assert_ne!(marked, script, "expected ON DUPLICATE KEY UPDATE target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::DmlSetTargetList,
+        "ON DUPLICATE KEY UPDATE should produce DmlSetTargetList phase"
+    );
+    assert!(deep_ctx.phase.is_column_context());
+}
+
+#[test]
+fn mariadb_final_boss_monster_query_window_function_order_by_is_order_by_clause() {
+    // test4.txt Monster query #2: cursor inside a WINDOW function ORDER BY clause.
+    // `ROW_NUMBER() OVER (PARTITION BY d.project_id ORDER BY d.|day_hours DESC, d.work_date)`
+    // The ORDER BY inside an inline OVER clause sets OrderByClause phase.
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "ORDER BY d.day_hours DESC, d.work_date\n        ) AS rn,",
+        "ORDER BY d.__CODEX_CURSOR__day_hours DESC, d.work_date\n        ) AS rn,",
+        1,
+    );
+    assert_ne!(marked, script, "expected ROW_NUMBER ORDER BY target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause,
+        "ORDER BY inside ROW_NUMBER OVER should be OrderByClause phase"
+    );
+    assert!(
+        deep_ctx.phase.is_column_context(),
+        "OrderByClause must be a column context"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_recursive_cte_dept_tree_second_member_where() {
+    // test4.txt Monster query #2: cursor inside the recursive UNION ALL second member.
+    // `FROM departments c JOIN dept_tree t ON t.dept_id = c.|parent_dept_id`
+    let script = load_mariadb_intellisense_test_file("test4.txt");
+    let marked = script.replacen(
+        "ON t.dept_id = c.parent_dept_id",
+        "ON t.dept_id = c.__CODEX_CURSOR__parent_dept_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected recursive CTE ON target in test4.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::JoinCondition,
+        "recursive CTE second member ON clause should be JoinCondition phase"
+    );
+}
+
+#[test]
 fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name() {
     for (file_name, target, replacement) in [
         (
@@ -1179,6 +1326,11 @@ fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name
             "test3.txt",
             "run_id BIGINT NOT NULL,",
             "run_id BI__CODEX_CURSOR__ NOT NULL,",
+        ),
+        (
+            "test4.txt",
+            "dept_id INT NOT NULL AUTO_INCREMENT,",
+            "dept_id INT NOT NULL __CODEX_CURSOR__AUTO_INCREMENT,",
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
@@ -1219,6 +1371,11 @@ fn mariadb_scripts_create_table_option_contexts_do_not_regress_to_table_name() {
             "test3.txt",
             ") ENGINE = InnoDB;",
             ") ENG__CODEX_CURSOR__ = InnoDB;",
+        ),
+        (
+            "test4.txt",
+            ") ENGINE=InnoDB;",
+            ") ENG__CODEX_CURSOR__=InnoDB;",
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
