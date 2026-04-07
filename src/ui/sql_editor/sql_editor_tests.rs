@@ -8414,7 +8414,7 @@ fn format_mariadb_test1_keeps_inline_over_body_and_on_duplicate_function_args_ne
         find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = CONCAT(")
             .expect("ON DUPLICATE KEY UPDATE owner line");
     let values_idx =
-        find_line_starting_with(&lines, "VALUES (dept_name),").expect("CONCAT argument line");
+        find_line_starting_with(&lines, "VALUES(dept_name),").expect("CONCAT argument line");
     let literal_idx = find_line_starting_with(&lines, "' / touched'").expect("CONCAT literal line");
     let concat_close_idx = lines
         .iter()
@@ -8482,6 +8482,9 @@ fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
         .expect("ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY weight_sum DESC,")
         .expect("ROW_NUMBER ORDER BY line");
+    let on_duplicate_idx =
+        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),")
+            .expect("ON DUPLICATE KEY UPDATE line");
     let over_close_idx = lines
         .iter()
         .enumerate()
@@ -8498,6 +8501,13 @@ fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
     assert!(
         main_block_idx > create_proc_idx,
         "main_block label should not collapse onto the CREATE PROCEDURE header, got:\n{}",
+        formatted
+    );
+    assert!(
+        lines[on_duplicate_idx]
+            .trim_start()
+            .starts_with("ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),"),
+        "ON DUPLICATE KEY UPDATE should keep MySQL VALUES() tight in test2, got:\n{}",
         formatted
     );
     assert!(
@@ -8535,6 +8545,12 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
         .expect("owner_ranked ROW_NUMBER OVER owner line");
     let order_idx = find_line_starting_with(&lines, "ORDER BY owner_weighted DESC,")
         .expect("owner_ranked ORDER BY line");
+    let on_duplicate_idx =
+        find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),")
+            .expect("first ON DUPLICATE KEY UPDATE line");
+    let summary_rank_idx =
+        find_line_starting_with(&lines, "`rank` = VALUES(`rank`),")
+            .expect("summary rank VALUES() line");
     let over_close_idx = lines
         .iter()
         .enumerate()
@@ -8580,6 +8596,18 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
     assert!(
         lines[nested_block_idx].trim_start() == "nested_block: BEGIN",
         "nested label should stay attached to BEGIN on its own line, got:\n{}",
+        formatted
+    );
+    assert!(
+        lines[on_duplicate_idx]
+            .trim_start()
+            .starts_with("ON DUPLICATE KEY UPDATE node_name = VALUES(node_name),"),
+        "first ON DUPLICATE KEY UPDATE should keep MySQL VALUES() tight in test3, got:\n{}",
+        formatted
+    );
+    assert!(
+        lines[summary_rank_idx].trim_start() == "`rank` = VALUES(`rank`),",
+        "summary upsert should keep backticked rank reference as tight MySQL VALUES() call, got:\n{}",
         formatted
     );
     assert!(
