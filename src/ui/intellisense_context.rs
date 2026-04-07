@@ -2902,6 +2902,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
+                        let merge_update_set_introducer = matches!(
+                            current_statement_kind,
+                            StatementKind::Merge
+                        ) && matches!(last_word.as_deref(), Some("UPDATE"));
+                        let keep_expression_phase_for_set = is_statement_keyword_suppressed_in_expression_phase(current_phase)
+                            && !postgres_conflict_update_active
+                            && !matches!(current_statement_kind, StatementKind::Update)
+                            && !merge_update_set_introducer;
                         if hierarchical_clause_active {
                             // Oracle hierarchical query SEARCH/CYCLE clauses use
                             // `... SET <ordering_or_cycle_col>` where SET introduces
@@ -2919,12 +2927,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::RecursiveCteGeneratedColumnName;
                             depth_frames[depth].dml_set_active = false;
                             depth_frames[depth].postgres_conflict_update_active = false;
-                        } else if is_statement_keyword_suppressed_in_expression_phase(current_phase)
-                            && !postgres_conflict_update_active
-                            && !(matches!(current_statement_kind, StatementKind::Merge)
-                                && matches!(last_word.as_deref(), Some("UPDATE")))
-                            && !matches!(current_statement_kind, StatementKind::Update)
-                        {
+                        } else if keep_expression_phase_for_set {
                             // Function-local operation keywords such as JSON_TRANSFORM `SET`
                             // can appear inside expression contexts. Keep the surrounding
                             // expression phase unless the token is the actual MERGE

@@ -5911,7 +5911,7 @@ impl SqlEditorWidget {
                         out.push(' ');
                     }
                     if is_keyword && !mysql_keyword_identifier {
-                        out.push_str(&upper);
+                        out.push_str(upper);
                     } else {
                         out.push_str(word);
                     }

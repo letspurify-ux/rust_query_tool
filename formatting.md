@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-07 (MySQL/MariaDB function-call tight-paren 렌더링 규칙 추가)
+> 최종 업데이트: 2026-04-07 (fallback 서술을 residual semantic/lexical family 원칙으로 정리)
 
 ## 0. 이 문서의 역할
 
@@ -24,10 +24,11 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 - 여기서 "모든 구문이 depth +- 규칙을 따른다"는 말은 "모든 토큰마다 전용 예외를 만든다"는 뜻이 아니다. 대상은 open/close/anchor/query-head/continuation carry처럼 structural event를 만드는 syntax family이며, 구조 이벤트를 만들지 않는 토큰은 shared lexical/operator taxonomy로 처리해야 한다.
 - depth는 기존 공백 수, hanging indent, 수동 정렬에서 역산하면 안 된다.
-- `existing_indent`는 구조 계산의 fallback, soft floor, tie-breaker가 될 수 없다.
+- `existing_indent`는 구조 계산의 보정 기준, soft floor, tie-breaker가 될 수 없다.
 - 이전 줄 정보를 쓰더라도 반드시 이름 붙은 pending/active structural state로 승격된 값만 써야 한다.
 - `직전 줄이 콤마였다`, `직전 줄이 THEN이었다`, `직전 줄이 '('였다` 같은 anonymous line-shape heuristic로 depth를 복원하면 안 된다.
 - line-shape 정보는 "지금 pending state를 소비할 차례인가"를 판별하는 lexical adjacency 용도로만 허용된다.
+- `fallback`이라는 이름의 무구조 보정 계층도 두면 안 된다. owner/header/query/close family가 아니면 반드시 shared lexical 또는 operator family 중 하나로 명시 분류해야 하며, "마지막 else"는 구조적 판정을 덮어쓰는 탈출구가 아니라 residual family 선택을 뜻해야 한다.
 
 ### 1.2 모든 open event는 정확히 +1이다
 
@@ -84,7 +85,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - exact bare header classifier와 generic leading-prefix continuation은 같은 consumer가 아니다. `WITHIN GROUP`, `REFERENCE`, `WINDOW`, `FROM TABLE`, `LEFT JOIN TABLE`처럼 bare exact line 자체가 same-depth owner/header family인 경우는 dedicated bare-header taxonomy로 판정해야 하고, inline comment split용 generic prefix carry와 같은 함수에서 같은 depth 규칙으로 뭉개면 안 된다.
 - 따라서 "inline comment가 붙은 structural prefix"에서도 exact bare owner/header line과 generic last-keyword consumer가 충돌하는 family(`JOIN`, `REFERENCE`, `WINDOW`, `FROM TABLE`, `... JOIN TABLE` 등)는 dedicated bare-header taxonomy를 먼저 참조할 수 있어야 한다. 다만 이 우선순위를 모든 exact bare line에 일괄 적용하면 `FOR UPDATE`, `RULES`, `AFTER MATCH SKIP`처럼 inline comment에서 body depth를 유지해야 하는 family까지 깨지므로, owner/header collision family로 범위를 한정해야 한다.
 - inline comment용 exact bare owner/header collision family는 별도 문자열 목록으로 유지하면 안 된다. shared owner/pending classifier 결과에서 파생돼야 하며, `RIGHT/FULL/... JOIN TABLE`, `WITHIN GROUP`, `KEEP` 같은 modifier/owner variant가 새로 생겨도 같은 semantic family면 자동으로 같은 우선순위를 따라야 한다.
-- 반대로 named owner line(`WINDOW w_sales AS`, `OPEN c_emp FOR`, `CURSOR c_emp IS`)은 generic header consumer가 아니다. 이런 line은 owner/pending-owner family로만 해석하고, generic leading-prefix continuation은 owner/header classifier가 모두 아니라고 판정된 뒤의 fallback이어야 한다.
+- 반대로 named owner line(`WINDOW w_sales AS`, `OPEN c_emp FOR`, `CURSOR c_emp IS`)은 generic header consumer가 아니다. 이런 line은 owner/pending-owner family로만 해석하고, generic leading-prefix continuation은 owner/header classifier가 모두 아니라고 명시 판정된 뒤에만 선택되는 residual lexical family여야 한다.
 - 이때 "named owner line이 generic header consumer가 아니다"는 "항상 inline-comment header continuation kind를 반환하지 않는다"와 동치다. standalone wrapper/query head를 다음 line에서 same-depth로 붙이는 책임은 generic prefix carry가 아니라 pending owner anchor/state machine이 질 수 있다. 예를 들어 `REFERENCE ref ON`처럼 surviving tail이 exact owner token으로 닫히는 family와 `WINDOW w_sales AS`, `OPEN c_emp FOR`처럼 named owner anchor가 다음 `(` / child query를 직접 이어야 하는 family는 같은 named-owner 계열이어도 continuation helper의 반환값이 같을 필요가 없다.
 - exact bare keyword-only header line의 continuation taxonomy도 예외가 아니다. inline comment split용 prefix classifier와 bare-line classifier가 서로 다른 hand-maintained keyword list를 가지면 안 된다.
 - 특히 leading prefix continuation helper가 일부 owner-relative family를 raw literal 예외로 따로 들고 있으면 안 된다. `KEEP`의 `DENSE_RANK` / `DENSE_RANK LAST` / comment-glued `DENSE /* ... */ RANK`처럼 lexical shape가 달라도 같은 semantic family면 shared owner-relative sequence matcher로 먼저 판정해야 한다. 그 다음에야 "bare carry는 same-depth, structural prefix carry는 body depth" 같은 depth mapping 차이를 별도 단계에서 적용할 수 있다.
@@ -95,7 +96,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - stable query-head taxonomy와 bare-header continuation taxonomy도 서로 독립이면 안 된다. single-keyword query head가 dedicated owner family가 아니라면 exact bare line과 inline-comment split line이 같은 shared continuation kind를 가져야 한다. 예를 들어 `CALL`은 query-head boundary helper에는 있지만 bare-header carry에서 빠지면 `CALL -- ...` / `pkg.do_work (...)`와 bare `CALL` / `pkg.do_work (...)`가 모두 구조 carry를 잃어 root rule 1.6과 1.7을 동시에 깨게 된다.
 - condition/operator RHS continuation taxonomy도 shared semantic family여야 한다. trailing RHS operator, mixed leading-close expression continuation, trailing inline-comment continuation은 서로 다른 ad-hoc keyword table을 가지면 안 되며, `MEMBER OF`, `SUBMULTISET OF`, `LIKEC/LIKE2/LIKE4`, `ESCAPE`, `:=`, `=>` 같은 family를 한 phase만 알게 두면 안 된다.
 - trailing inline-comment continuation은 "operator RHS family" 하나로 축약하면 안 된다. structural header carry가 필요한 family(`JOIN`, `ON`, `USING`, `WINDOW`, `SELECT`, `SET` 등)는 shared bare/header taxonomy에서 파생된 header family로, `AND`, `LIKE4`, `MEMBER OF`, `:=` 같은 RHS family는 shared operator taxonomy로 판정해야 한다.
-- 같은 trailing token이 lexical하게는 operator RHS처럼 보여도 structural owner family와 충돌하면 structural owner가 우선한다. 예를 들어 exact bare / completed deferred-wrapper owner line인 `EXISTS`, `IN`, `ANY/SOME/ALL`, `NOT EXISTS`, `NOT IN` 뒤 inline comment는 generic operator `+1` fallback으로 처리하면 안 되고, shared owner classifier가 산출한 same-depth owner carry를 먼저 유지해야 한다.
+- 같은 trailing token이 lexical하게는 operator RHS처럼 보여도 structural owner family와 충돌하면 structural owner가 우선한다. 예를 들어 exact bare / completed deferred-wrapper owner line인 `EXISTS`, `IN`, `ANY/SOME/ALL`, `NOT EXISTS`, `NOT IN` 뒤 inline comment는 generic operator `+1` residual path로 재분류하면 안 되고, shared owner classifier가 산출한 same-depth owner carry를 먼저 유지해야 한다.
 - exact bare line이 "다음 code line에서 wrapper/query head를 받을 completed owner anchor"인 경우도 예외가 아니다. `EXISTS`, `IN`, `ANY/SOME/ALL`, same-line `NOT EXISTS`/`NOT IN`, `LATERAL`, `TABLE`, `CROSS/OUTER APPLY`, `CURSOR`, `MULTISET`처럼 standalone `(` 또는 child query가 뒤로 밀린 owner line은 generic `FROM`/`WHERE` body header처럼 다시 +1 하지 말고 same-depth owner family로 유지해야 한다.
 - same token이 carry를 열고/닫거나 frame reset을 일으키는 경우도 예외가 아니다. semicolon/comma/standalone `(` 같은 punctuation-driven state transition은 analyzer와 formatter가 같은 trailing/standalone structural helper를 공유해야 한다.
 - `WITH` sibling CTE definition header 판정도 예외가 아니다. `cte_name AS (`와 `cte_name (col1, ...) AS (`는 local analyzer heuristic가 아니라 shared structural helper로 분류해야 다음 CTE/main query가 continuation state를 잘못 상속하지 않는다.
@@ -104,7 +105,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 이 resolver는 최소한 `same-depth anchor`, `current-line anchor`, `query-base anchor`를 구분할 수 있어야 한다. comment split renderer처럼 `SameDepth`는 owner/header line에 snap 해야 하지만 `OneDeeperThanCurrentLine`은 이미 증가된 현재 줄 depth에서 한 단계 더 가야 하는 경로가 있기 때문이다.
 - 여기서 `query-base anchor`는 항상 active query frame의 저장 depth와 동일한 값일 필요는 없다. renderer처럼 local formatting context만 가진 caller는 semantic query base를 나타내는 synthetic anchor를 전달할 수 있어야 하며, resolver는 그 차이를 이름과 계약 수준에서 드러내야 한다.
 - renderer/helper wrapper도 이 세 anchor를 하나의 `base indent`로 뭉개면 안 된다. exact bare owner/header family(`REFERENCE`, `WITHIN GROUP`, deferred-wrapper owner 등)에서 `SameDepth`는 현재 owner/header line depth를 써야 하고, clause family(`WHERE`, `FOR UPDATE` 등)의 `query-base+1`만 semantic query base anchor를 써야 한다.
-- raw previous/last-word 기반 continuation helper는 lexical fallback일 뿐이다. exact bare owner/header/pending classifier가 semantic family를 이미 판정한 line(`AFTER MATCH SKIP -- ...`, `DENSE_RANK LAST -- ...`, `INNER JOIN -- ...` 등)에서는 이 fallback이 depth를 덮어쓰면 안 된다.
+- raw previous/last-word 기반 continuation helper는 독립 구조가 아니라 residual lexical classifier일 뿐이다. exact bare owner/header/pending classifier가 semantic family를 이미 판정한 line(`AFTER MATCH SKIP -- ...`, `DENSE_RANK LAST -- ...`, `INNER JOIN -- ...` 등)에서는 이 residual classifier가 depth를 다시 결정하면 안 된다.
 - non-subquery 일반 괄호 내부의 function-local `RETURNING`은 구조 clause가 아니다. `JSON_VALUE(... RETURNING VARCHAR2 (...))`, `XMLQUERY(... RETURNING CONTENT)` 같은 line은 function-local option으로만 해석해야 하며, analyzer/query-role/structural-boundary/header-carry helper 중 한 phase라도 이를 top-level clause로 승격하면 다음 sibling list item까지 잘못된 carry가 누수된다.
 
 ### 1.7 formatter output은 canonical하고 idempotent해야 한다
@@ -305,8 +306,8 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - single-keyword family: `AND`, `OR`, `IN`, `IS`, `LIKE`, `LIKEC`, `LIKE2`, `LIKE4`, `BETWEEN`, `NOT`, `EXISTS`, `MEMBER`, `SUBMULTISET`, `ESCAPE`
 - paired keyword family: `IS OF`, `MEMBER OF`, `SUBMULTISET OF`
 - trailing inline-comment continuation consumer는 별도 ad-hoc keyword list가 아니라 `structural header family ∪ operator RHS family`다. 즉 `JOIN`/`ON`/`USING`/`WINDOW`/`SELECT`/`SET` 같은 header carry와 `AND`/`LIKE4`/`MEMBER OF`/`:=` 같은 RHS carry를 같은 shared taxonomy 위에서 본다.
-- 단, union이라고 해서 precedence가 없는 것은 아니다. exact bare / completed owner anchor family와 operator RHS family가 같은 trailing token에서 충돌하면 owner anchor가 먼저고, generic operator RHS depth는 그 다음 fallback이다.
-- header line이 trailing operator도 함께 가지는 경우(`WHERE col =`, `SET col =`, `SELECT expr +`, `RETURNING col =` 등)는 operator family만 따로 해석하면 안 된다. analyzer의 line-level continuation depth는 shared structural header family를 먼저 반영하고, 그 header family가 없을 때만 pure operator current-depth fallback(`AND col =`, `v_total :=`)을 쓴다.
+- 단, union이라고 해서 precedence가 없는 것은 아니다. exact bare / completed owner anchor family와 operator RHS family가 같은 trailing token에서 충돌하면 owner anchor가 먼저고, generic operator RHS는 semantic family가 남기지 않은 residual operator path로만 해석해야 한다.
+- header line이 trailing operator도 함께 가지는 경우(`WHERE col =`, `SET col =`, `SELECT expr +`, `RETURNING col =` 등)는 operator family만 따로 해석하면 안 된다. analyzer의 line-level continuation depth는 shared structural header family를 먼저 반영하고, 그 header family가 없을 때만 pure operator current-depth residual rule(`AND col =`, `v_total :=`)을 쓴다.
 
 주의:
 
