@@ -1783,16 +1783,6 @@ impl QueryExecutor {
             let pending_control_branch_body_depth_for_line =
                 pending_control_branch_body_depth.take();
 
-            let mut closing_query_close_align_depth = None;
-            while query_frames
-                .last()
-                .is_some_and(|frame| parser_depth < frame.start_parser_depth)
-            {
-                if let Some(frame) = query_frames.pop() {
-                    closing_query_close_align_depth = Some(frame.close_align_depth);
-                }
-            }
-
             let trimmed_upper = sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase();
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
@@ -1855,6 +1845,19 @@ impl QueryExecutor {
             } else {
                 Self::auto_format_clause_kind(&clause_detection_upper)
             };
+            let mut closing_query_close_align_depth = None;
+            while query_frames.last().copied().is_some_and(|frame| {
+                Self::query_frame_closes_before_line(
+                    frame,
+                    parser_depth,
+                    clause_kind,
+                    line_has_leading_close_paren,
+                )
+            }) {
+                if let Some(frame) = query_frames.pop() {
+                    closing_query_close_align_depth = Some(frame.close_align_depth);
+                }
+            }
             let previous_window_definition_depth_anchor = idx.checked_sub(1).and_then(|prev_idx| {
                 let previous_line = lines.get(prev_idx)?.trim_start();
                 let previous_context = contexts.get(prev_idx)?;
@@ -3509,6 +3512,24 @@ impl QueryExecutor {
         head_kind == AutoFormatClauseKind::With
             && !(frame.head_kind == Some(AutoFormatClauseKind::With)
                 && parser_depth == frame.query_base_depth)
+    }
+
+    fn query_frame_closes_before_line(
+        frame: QueryBaseDepthFrame,
+        parser_depth: usize,
+        clause_kind: Option<AutoFormatClauseKind>,
+        line_has_leading_close_paren: bool,
+    ) -> bool {
+        if parser_depth >= frame.start_parser_depth {
+            return false;
+        }
+
+        // Query frames must close on structural events, not on whatever
+        // indentation the current line happens to carry. Under-indented
+        // select-list/body lines inside a nested query are still part of that
+        // query until a real close-paren or a sibling/outer clause boundary
+        // appears.
+        line_has_leading_close_paren || clause_kind.is_some()
     }
 
     fn line_owns_next_query(trimmed_upper: &str) -> bool {
@@ -17555,6 +17576,94 @@ end a;"#;
             contexts[deepest_select_idx].auto_depth,
             contexts[inner_from_paren_idx].auto_depth.saturating_add(1),
             "SELECT under FROM ( should stay exactly one child-query level below FROM owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_inline_view_body_on_nested_scalar_query_base() {
+        let sql = r#"WITH t AS (
+    SELECT
+        1 AS grp_id,
+        'A' AS code,
+        10 AS val
+    FROM DUAL
+)
+SELECT
+    x.grp_id,
+    (
+        SELECT MAX (z.val)
+        FROM (
+                SELECT
+        t2.*,
+        DENSE_RANK () OVER (
+            PARTITION BY t2.grp_id
+            ORDER BY t2.val DESC,
+                    t2.code
+        ) AS dr
+                FROM t t2
+                WHERE t2.grp_id = x.grp_id
+            ) z
+        WHERE z.dr = 1
+    ) AS grp_top_val
+FROM t x;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let scalar_select_idx = find_line("SELECT MAX (z.val)");
+        let from_idx = find_line("FROM (");
+        let inline_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_item_idx = find_line("t2.*,");
+        let inline_from_idx = find_line("FROM t t2");
+        let close_idx = find_line(") z");
+        let outer_where_idx = find_line("WHERE z.dr = 1");
+
+        assert_eq!(
+            contexts[from_idx].query_base_depth,
+            contexts[scalar_select_idx].query_base_depth,
+            "scalar-subquery FROM should stay on the same nested query base as its SELECT"
+        );
+        assert_eq!(
+            contexts[inline_select_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "inline-view SELECT should open exactly one child-query level under FROM ("
+        );
+        assert_eq!(
+            contexts[select_item_idx].query_base_depth,
+            contexts[inline_select_idx].query_base_depth,
+            "inline-view SELECT-list item should stay on the same nested query base as the child SELECT"
+        );
+        assert_eq!(
+            contexts[select_item_idx].auto_depth,
+            contexts[inline_select_idx].auto_depth.saturating_add(1),
+            "inline-view SELECT-list item should stay one level deeper than the child SELECT header"
+        );
+        assert_eq!(
+            contexts[inline_from_idx].query_base_depth,
+            contexts[inline_select_idx].query_base_depth,
+            "inline-view FROM should stay on the child query base after the SELECT list"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth,
+            contexts[from_idx].auto_depth,
+            "inline-view close should realign with the scalar-subquery FROM owner depth"
+        );
+        assert_eq!(
+            contexts[outer_where_idx].query_base_depth,
+            contexts[from_idx].query_base_depth,
+            "scalar-subquery WHERE should return to the outer scalar query base after the inline view closes"
         );
     }
 

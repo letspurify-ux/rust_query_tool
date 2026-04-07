@@ -7717,6 +7717,7 @@ impl SqlEditorWidget {
     fn normalized_general_paren_body_depth(
         trimmed: &str,
         trimmed_upper: &str,
+        query_role: AutoFormatQueryRole,
         starts_query_head: bool,
         starts_with_close_paren: bool,
         current_line_is_condition_boundary: bool,
@@ -7729,6 +7730,7 @@ impl SqlEditorWidget {
     ) -> Option<usize> {
         let frame = active_general_paren_frame?;
         if starts_with_close_paren
+            || query_role != AutoFormatQueryRole::None
             || starts_query_head
             || current_line_is_condition_boundary
             || current_line_starts_case
@@ -7900,6 +7902,24 @@ impl SqlEditorWidget {
             .or(query_base_depth)
             .map(|depth| effective_depth.max(depth))
             .unwrap_or(effective_depth)
+    }
+
+    fn resolved_query_frame_closes_before_line(
+        frame: ResolvedQueryBaseLayoutFrame,
+        depth: usize,
+        trimmed_upper: &str,
+        has_leading_close_paren: bool,
+    ) -> bool {
+        if depth >= frame.start_parser_depth {
+            return false;
+        }
+
+        // Phase 2 must only close a nested query frame on structural events.
+        // Under-indented nested-query body lines are still inside the child
+        // query until a real close paren or outer clause boundary appears.
+        has_leading_close_paren
+            || Self::is_dml_clause_starter(trimmed_upper)
+            || Self::line_starts_query_head(trimmed_upper)
     }
 
     fn continuation_operator_owner_depth(
@@ -8146,6 +8166,7 @@ impl SqlEditorWidget {
 
     fn normalize_indented_owner_relative_depth(
         trimmed_upper: &str,
+        query_role: AutoFormatQueryRole,
         starts_with_close_paren: bool,
         current_line_multiline_clause_owner_kind: Option<FormatIndentedParenOwnerKind>,
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
@@ -8168,10 +8189,13 @@ impl SqlEditorWidget {
         }
 
         if let Some(kind) = current_line_multiline_clause_owner_kind {
+            let general_paren_continuation_depth = active_general_paren_frame.and_then(|frame| {
+                (query_role == AutoFormatQueryRole::None).then_some(frame.continuation_depth)
+            });
             return kind.formatter_owner_depth(
                 effective_depth,
                 resolved_query_base_depth,
-                active_general_paren_frame.map(|frame| frame.continuation_depth),
+                general_paren_continuation_depth,
             );
         }
 
@@ -8290,7 +8314,14 @@ impl SqlEditorWidget {
             let closing_query_frame_count = resolved_query_base_depths
                 .iter()
                 .rev()
-                .take_while(|frame| depth < frame.start_parser_depth)
+                .take_while(|frame| {
+                    Self::resolved_query_frame_closes_before_line(
+                        **frame,
+                        depth,
+                        &trimmed_upper,
+                        layouts[idx].has_leading_close_paren,
+                    )
+                })
                 .count();
 
             let current_line_is_standalone_open_paren =
@@ -8785,8 +8816,27 @@ impl SqlEditorWidget {
                         .find(|frame| frame.raw_base_depth == query_base_depth)
                         .copied()
                 });
+            let previous_head_resolved_query_base_depth = layouts[idx]
+                .query_base_depth
+                .and_then(|query_base_depth| {
+                    last_code_idx
+                        .and_then(|prev_idx| layouts.get(prev_idx))
+                        .and_then(|previous| {
+                            let previous_query_base_depth = previous.query_base_depth?;
+                            if previous_query_base_depth != query_base_depth
+                                || !previous.starts_query_frame
+                            {
+                                return None;
+                            }
+
+                            let previous_extra_depth =
+                                previous.auto_depth.saturating_sub(previous_query_base_depth);
+                            Some(previous.final_depth.saturating_sub(previous_extra_depth))
+                        })
+                });
             let resolved_query_base_depth = resolved_query_base_frame
                 .map(|frame| frame.resolved_base_depth)
+                .or(previous_head_resolved_query_base_depth)
                 .or(layouts[idx].query_base_depth);
             let analyzer_query_depth = if let Some(query_base_depth) = layouts[idx].query_base_depth
             {
@@ -9008,6 +9058,7 @@ impl SqlEditorWidget {
             let effective_depth = Self::normalized_general_paren_body_depth(
                 trimmed,
                 &trimmed_upper,
+                layouts[idx].query_role,
                 starts_query_head,
                 starts_with_close_paren,
                 current_line_is_condition_keyword || current_line_is_join_condition_clause,
@@ -9091,6 +9142,7 @@ impl SqlEditorWidget {
             };
             let effective_depth = Self::normalize_indented_owner_relative_depth(
                 &owner_relative_detection_upper,
+                layouts[idx].query_role,
                 starts_with_close_paren,
                 current_line_multiline_clause_owner_kind,
                 active_owner_relative_frame,
@@ -9337,7 +9389,9 @@ impl SqlEditorWidget {
             if let Some(frame) = pending_operator_for_line {
                 effective_depth = effective_depth.max(frame.owner_depth.saturating_add(1));
             }
-            if starts_query_head {
+            let line_starts_effective_query_head =
+                starts_query_head || pending_query_head_depth_for_line.is_some();
+            if line_starts_effective_query_head {
                 if let Some(query_base_depth) = layouts[idx].query_base_depth {
                     let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
                     let resolved_base_depth = effective_depth.saturating_sub(extra_depth);
@@ -22538,6 +22592,208 @@ FROM dept d,
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             expected,
             "split LATERAL-derived nested query formatting should remain stable"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_inline_view_under_scalar_subquery_from_owner_depth() {
+        let source = r#"WITH t AS (
+    SELECT
+        1 AS grp_id,
+        'A' AS code,
+        10 AS val
+    FROM DUAL
+    UNION ALL
+    SELECT
+        1,
+        'B',
+        20
+    FROM DUAL
+    UNION ALL
+    SELECT
+        1,
+        'C',
+        30
+    FROM DUAL
+)
+SELECT
+    x.grp_id,
+    (
+        SELECT MAX (z.val)
+        FROM (
+                SELECT
+        t2.*,
+        DENSE_RANK () OVER (
+            PARTITION BY t2.grp_id
+            ORDER BY t2.val DESC,
+                    t2.code
+        ) AS dr
+                FROM t t2
+                WHERE t2.grp_id = x.grp_id
+            ) z
+        WHERE z.dr = 1
+    ) AS grp_top_val
+FROM t x;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let line_count = formatted.lines().count();
+        let contexts = crate::db::QueryExecutor::auto_format_line_contexts(&formatted);
+        let multiline_string_prefix_lengths =
+            SqlEditorWidget::multiline_string_continuation_prefix_lengths(&formatted, line_count);
+        let mut layouts = SqlEditorWidget::build_line_layouts(
+            &formatted,
+            &contexts,
+            &multiline_string_prefix_lengths,
+        );
+        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        SqlEditorWidget::resolve_code_line_layouts(
+            &mut layouts,
+            &next_code_indices,
+            crate::sql_text::mysql_compatibility_for_sql(&formatted, None),
+        );
+
+        let scalar_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT MAX (z.val)")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "FROM (")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inline_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let select_item_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inline_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "t2.*,")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let analytic_item_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_item_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("DENSE_RANK () OVER ("))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inline_from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(analytic_item_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "FROM t t2")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inline_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inline_from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ") z")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inline_close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "WHERE z.dr = 1")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            layouts[select_item_idx].query_base_depth,
+            layouts[inline_select_idx].query_base_depth,
+            "formatter analyzer contexts should keep the inline-view SELECT-list item on the child query base, got:\n{}",
+            formatted
+        );
+        assert!(
+            layouts[inline_select_idx].starts_query_frame,
+            "inline-view SELECT should be marked as a query-frame head for phase 2, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            layouts[select_item_idx].auto_depth,
+            layouts[inline_select_idx].auto_depth.saturating_add(1),
+            "formatter analyzer contexts should keep the inline-view SELECT-list item one level deeper than the child SELECT header before phase 2, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            layouts[select_item_idx].final_depth,
+            layouts[inline_select_idx].final_depth.saturating_add(1),
+            "formatter phase 2 should keep the inline-view SELECT-list item one structural level deeper than the child SELECT header (item auto={}, item base={:?}, select auto={}, select base={:?}, select final={}), got:\n{}",
+            layouts[select_item_idx].auto_depth,
+            layouts[select_item_idx].query_base_depth,
+            layouts[inline_select_idx].auto_depth,
+            layouts[inline_select_idx].query_base_depth,
+            layouts[inline_select_idx].final_depth,
+            formatted
+        );
+        assert_eq!(
+            layouts[analytic_item_idx].final_depth,
+            layouts[select_item_idx].final_depth,
+            "formatter phase 2 should keep comma-separated inline-view SELECT-list siblings on one canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            layouts[inline_from_idx].final_depth,
+            layouts[inline_select_idx].final_depth,
+            "formatter phase 2 should return FROM to the child query clause depth after the SELECT list, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[from_idx]),
+            indent(lines[scalar_select_idx]),
+            "scalar-subquery FROM owner should stay aligned with the parent SELECT clause, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inline_select_idx]),
+            indent(lines[from_idx]).saturating_add(8),
+            "inline-view SELECT under scalar-subquery FROM should use the shared query-base + child-query step, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[select_item_idx]),
+            indent(lines[inline_select_idx]).saturating_add(4),
+            "inline-view SELECT-list item should stay one level deeper than the child SELECT header, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[analytic_item_idx]),
+            indent(lines[select_item_idx]),
+            "comma-separated inline-view SELECT-list siblings should share one canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inline_from_idx]),
+            indent(lines[inline_select_idx]),
+            "inline-view FROM should return to the child query clause depth after the SELECT list, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inline_close_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "inline-view close should realign with the child-query close depth under FROM, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_where_idx]),
+            indent(lines[from_idx]),
+            "scalar-subquery WHERE should return to the scalar query clause depth after the inline view closes, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "inline-view scalar-subquery formatting should remain idempotent"
         );
     }
 

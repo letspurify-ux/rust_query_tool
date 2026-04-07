@@ -1271,8 +1271,8 @@ fn mariadb_final_boss_monster_query_window_function_order_by_is_order_by_clause(
     // The ORDER BY inside an inline OVER clause sets OrderByClause phase.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     let marked = script.replacen(
-        "ORDER BY d.day_hours DESC, d.work_date\n        ) AS rn,",
-        "ORDER BY d.__CODEX_CURSOR__day_hours DESC, d.work_date\n        ) AS rn,",
+        "ORDER BY d.day_hours DESC,\n                d.work_date",
+        "ORDER BY d.__CODEX_CURSOR__day_hours DESC,\n                d.work_date",
         1,
     );
     assert_ne!(marked, script, "expected ROW_NUMBER ORDER BY target in test4.txt");
@@ -1315,8 +1315,8 @@ fn mariadb_final_boss_trigger_body_insert_column_list_is_insert_column_list() {
     // inside the ai_task_log AFTER INSERT trigger body.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     let marked = script.replacen(
-        "INSERT INTO audit_events (\n        event_type,\n        entity_name,\n        entity_id,\n        detail\n    )",
-        "INSERT INTO audit_events (\n        event_type,\n        entity_name,\n        entity_id,\n        __CODEX_CURSOR__detail\n    )",
+        "INSERT INTO audit_events (event_type, entity_name, entity_id, detail)",
+        "INSERT INTO audit_events (event_type, entity_name, entity_id, __CODEX_CURSOR__detail)",
         1,
     );
     assert_ne!(marked, script, "expected INSERT INTO audit_events column list target in test4.txt trigger");
@@ -1348,8 +1348,8 @@ fn mariadb_final_boss_procedure_insert_inside_while_loop_is_insert_column_list()
     // inside the nested WHILE loop of sp_seed_monster_data procedure.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     let marked = script.replacen(
-        "INSERT INTO task_log (\n                project_id,\n                employee_id,",
-        "INSERT INTO task_log (\n                project_id,\n                __CODEX_CURSOR__employee_id,",
+        "INSERT INTO task_log (project_id, employee_id, work_date, hours, note, payload)",
+        "INSERT INTO task_log (project_id, __CODEX_CURSOR__employee_id, work_date, hours, note, payload)",
         1,
     );
     assert_ne!(marked, script, "expected INSERT INTO task_log column list target in sp_seed_monster_data");
@@ -1486,8 +1486,8 @@ fn mariadb_final_boss_monster_query3_json_table_group_by_is_column_context() {
     // and that jt (JSON_TABLE alias) is in scope.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     let marked = script.replacen(
-        "GROUP BY\n        p.project_code,\n        jt.tag",
-        "GROUP BY\n        p.project_code,\n        jt.__CODEX_CURSOR__tag",
+        "GROUP BY p.project_code,\n        jt.tag",
+        "GROUP BY p.project_code,\n        jt.__CODEX_CURSOR__tag",
         1,
     );
     assert_ne!(marked, script, "expected JSON_TABLE GROUP BY target in test4.txt");
@@ -1520,8 +1520,8 @@ fn mariadb_final_boss_final_inspection_select_from_clause_tables_in_scope() {
     let script = load_mariadb_intellisense_test_file("test4.txt");
     // Target the ORDER BY clause of the final SELECT
     let marked = script.replacen(
-        "ORDER BY mr.ym, p.project_code, e.emp_code;",
-        "ORDER BY mr.__CODEX_CURSOR__ym, p.project_code, e.emp_code;",
+        "ORDER BY mr.ym,\n    p.project_code,\n    e.emp_code;",
+        "ORDER BY mr.__CODEX_CURSOR__ym,\n    p.project_code,\n    e.emp_code;",
         1,
     );
     assert_ne!(marked, script, "expected final SELECT ORDER BY target in test4.txt");
@@ -1571,8 +1571,8 @@ fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name
         ),
         (
             "test4.txt",
-            "dept_id INT NOT NULL AUTO_INCREMENT,",
-            "dept_id INT NOT NULL __CODEX_CURSOR__AUTO_INCREMENT,",
+            "dept_id        INT          NOT NULL AUTO_INCREMENT,",
+            "dept_id        INT          NOT NULL __CODEX_CURSOR__AUTO_INCREMENT,",
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
@@ -1616,8 +1616,8 @@ fn mariadb_scripts_create_table_option_contexts_do_not_regress_to_table_name() {
         ),
         (
             "test4.txt",
-            ") ENGINE=InnoDB;",
-            ") ENG__CODEX_CURSOR__=InnoDB;",
+            ")\nENGINE = InnoDB;",
+            ")\nENG__CODEX_CURSOR__ = InnoDB;",
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
