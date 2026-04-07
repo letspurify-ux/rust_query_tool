@@ -849,6 +849,290 @@ fn mariadb_ultra_final_boss_ranked_cte_completion_context_survives_full_script_s
     }
 }
 
+// ─── Additional MariaDB/MySQL intellisense tests ─────────────────────────────
+
+#[test]
+fn mariadb_final_boss_window_named_window_definition_is_column_context() {
+    // test1.txt: cursor inside WINDOW named-window definition body.
+    // After `WINDOW w_emp AS (PARTITION BY ob.|emp_id ...)`, the phase must
+    // be OrderByClause and table alias `ob` must be visible.
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let marked = script.replacen(
+        "PARTITION BY ob.emp_id\n                ORDER BY ob.created_at, ob.order_id\n            ),",
+        "PARTITION BY ob.__CODEX_CURSOR__emp_id\n                ORDER BY ob.created_at, ob.order_id\n            ),",
+        1,
+    );
+    assert_ne!(marked, script, "expected WINDOW w_emp PARTITION BY target in test1.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_final_boss ()"),
+        "cursor should stay inside the final-boss procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause,
+        "WINDOW definition body should be OrderByClause phase"
+    );
+
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "OB"),
+        "alias `ob` (for order_base) must be visible inside WINDOW definition, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_final_boss_recursive_cte_union_all_member_select_is_select_list() {
+    // test1.txt: cursor inside the recursive UNION ALL member SELECT of dept_tree.
+    // `SELECT c.dept_id, c.parent_dept_id, c.dept_code, CONCAT(p.path_txt, ' > ', c.dept_code) ...`
+    let script = load_mariadb_intellisense_test_file("test1.txt");
+    let marked = script.replacen(
+        "CONCAT(p.path_txt, ' > ', c.dept_code) AS path_txt,",
+        "CONCAT(p.path_txt, ' > ', c.__CODEX_CURSOR__dept_code) AS path_txt,",
+        1,
+    );
+    assert_ne!(marked, script, "expected recursive CTE CONCAT target in test1.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::SelectList,
+        "UNION ALL member SELECT should be in SelectList phase"
+    );
+    // dept and dept_tree (self-ref) must be visible in the UNION ALL member scope.
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "DEPT"),
+        "table `dept` (as c) must be visible in recursive CTE member, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_parser_killer_exists_subquery_where_is_where_clause() {
+    // test2.txt: cursor inside WHERE clause of an EXISTS subquery.
+    // `SELECT 1 FROM task AS t WHERE t.node_id = n.|node_id`
+    let script = load_mariadb_intellisense_test_file("test2.txt");
+    let marked = script.replacen(
+        "WHERE t.node_id = n.node_id",
+        "WHERE t.node_id = n.__CODEX_CURSOR__node_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected EXISTS WHERE target in test2.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::WhereClause,
+        "EXISTS subquery WHERE clause should be WhereClause phase"
+    );
+    // table `n` (alias of node) should be visible as outer reference
+    let qualifier_tables =
+        intellisense_context::resolve_qualifier_tables("n", &deep_ctx.tables_in_scope);
+    assert!(
+        !qualifier_tables.is_empty(),
+        "qualifier `n` must resolve inside EXISTS subquery, got empty"
+    );
+}
+
+#[test]
+fn mariadb_parser_killer_while_loop_body_select_is_where_clause() {
+    // test2.txt: the sp_run_parser_killer procedure contains a WITH ... SELECT
+    // statement after several control-flow blocks.  Cursor at the WHERE clause
+    // of the scalar SELECT inside the procedure body.
+    let script = load_mariadb_intellisense_test_file("test2.txt");
+    let marked = script.replacen(
+        "FROM agg_result\n     WHERE result_key = 'TEMP_ROLLBACK'",
+        "FROM agg_result\n     WHERE result_key = '__CODEX_CURSOR__TEMP_ROLLBACK'",
+        1,
+    );
+    assert_ne!(marked, script, "expected agg_result WHERE target in test2.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_parser_killer ()"),
+        "cursor should stay inside the parser-killer procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::WhereClause,
+        "scalar SELECT WHERE clause should be WhereClause phase"
+    );
+    let table_names: Vec<String> = deep_ctx
+        .tables_in_scope
+        .iter()
+        .map(|t| t.name.to_uppercase())
+        .collect();
+    assert!(
+        table_names.iter().any(|n| n == "AGG_RESULT"),
+        "table `agg_result` must be in scope, got: {table_names:?}"
+    );
+}
+
+#[test]
+fn mariadb_ultra_final_boss_window_named_window_definition_is_column_context() {
+    // test3.txt: cursor inside WINDOW w_owner definition in the ranked CTE body.
+    // `WINDOW w_owner AS (PARTITION BY s.|owner_name ORDER BY ...)`
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    let marked = script.replacen(
+        "PARTITION BY s.owner_name\n                ORDER BY s.created_at, s.run_id\n            ),\n            w_owner_running AS (",
+        "PARTITION BY s.__CODEX_CURSOR__owner_name\n                ORDER BY s.created_at, s.run_id\n            ),\n            w_owner_running AS (",
+        1,
+    );
+    assert_ne!(marked, script, "expected WINDOW w_owner PARTITION BY target in test3.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
+        "cursor should stay inside the ultra-final procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause,
+        "WINDOW definition body should be OrderByClause phase"
+    );
+    // alias `s` (scored CTE) must be visible inside the window definition
+    let qualifier_tables =
+        intellisense_context::resolve_qualifier_tables("s", &deep_ctx.tables_in_scope);
+    assert!(
+        !qualifier_tables.is_empty(),
+        "qualifier `s` (scored CTE alias) must resolve inside WINDOW definition, got empty"
+    );
+}
+
+#[test]
+fn mariadb_ultra_final_boss_recursive_cte_second_member_where_clause() {
+    // test3.txt: cursor in WHERE of the recursive CTE join condition
+    // `JOIN node_tree AS p ON c.parent_node_id = p.|node_id`
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    let marked = script.replacen(
+        "ON c.parent_node_id = p.node_id",
+        "ON c.parent_node_id = p.__CODEX_CURSOR__node_id",
+        1,
+    );
+    assert_ne!(marked, script, "expected recursive CTE ON target in test3.txt");
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::JoinCondition,
+        "recursive CTE JOIN ON clause should be JoinCondition phase"
+    );
+    // Both `c` (stage_node) and `p` (node_tree self-ref) must be visible
+    let qualifier_p =
+        intellisense_context::resolve_qualifier_tables("p", &deep_ctx.tables_in_scope);
+    let qualifier_c =
+        intellisense_context::resolve_qualifier_tables("c", &deep_ctx.tables_in_scope);
+    assert!(
+        !qualifier_p.is_empty(),
+        "qualifier `p` (node_tree self-ref) must be visible in recursive CTE JOIN ON, got empty"
+    );
+    assert!(
+        !qualifier_c.is_empty(),
+        "qualifier `c` (stage_node) must be visible in recursive CTE JOIN ON, got empty"
+    );
+}
+
+#[test]
+fn mariadb_ultra_final_boss_insert_column_list_with_backtick_column() {
+    // test3.txt: cursor inside INSERT INTO qa_summary (..., `group`, ...) column list.
+    // The backtick-quoted column should not break InsertColumnList phase detection.
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    // Target the last INSERT INTO qa_summary column list (uses `group`, `rank`)
+    let marked = script.replacen(
+        "INSERT INTO qa_summary (\n        summary_key,\n        `group`,\n        `rank`,\n        summary_num,\n        summary_text,\n        summary_json\n    )\n    VALUES\n        (\n            'TOP_OWNER_WEIGHTED'",
+        "INSERT INTO qa_summary (\n        summary_key,\n        `group`,\n        `rank`,\n        summary_num,\n        summary_text,\n        __CODEX_CURSOR__summary_json\n    )\n    VALUES\n        (\n            'TOP_OWNER_WEIGHTED'",
+        1,
+    );
+    assert_ne!(marked, script, "expected INSERT INTO qa_summary column list target in test3.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
+        "cursor should stay inside the ultra-final procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::InsertColumnList,
+        "INSERT column list with backtick-quoted columns should be InsertColumnList phase"
+    );
+}
+
+#[test]
+fn mariadb_ultra_final_boss_on_duplicate_key_update_backtick_column_is_dml_set() {
+    // test3.txt: cursor inside ON DUPLICATE KEY UPDATE after backtick column.
+    // `ON DUPLICATE KEY UPDATE `group` = VALUES(`group`), `rank` = VALUES(`rank`), ...|`
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    let marked = script.replacen(
+        "ON DUPLICATE KEY UPDATE\n        `group` = VALUES(`group`),\n        `rank` = VALUES(`rank`),\n        summary_num = VALUES(summary_num),",
+        "ON DUPLICATE KEY UPDATE\n        `group` = VALUES(`group`),\n        `rank` = VALUES(`rank`),\n        __CODEX_CURSOR__summary_num = VALUES(summary_num),",
+        1,
+    );
+    assert_ne!(marked, script, "expected ON DUPLICATE KEY UPDATE target in test3.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
+        "cursor should stay inside the ultra-final procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::DmlSetTargetList,
+        "ON DUPLICATE KEY UPDATE with backtick columns should remain DmlSetTargetList"
+    );
+    assert_eq!(
+        deep_ctx.focused_tables,
+        vec!["qa_summary".to_string()],
+        "focused table for ON DUPLICATE KEY UPDATE should be qa_summary"
+    );
+}
+
+#[test]
+fn mariadb_ultra_final_boss_nested_labeled_block_select_into_is_select_list() {
+    // test3.txt: cursor inside a SELECT INTO statement that follows a nested
+    // labeled block (`nested_block: BEGIN ... END`).
+    // The nested block is terminated by `END;` and the subsequent SELECT after
+    // several CALL/WHILE statements should still be found correctly.
+    let script = load_mariadb_intellisense_test_file("test3.txt");
+    // SELECT MAX(running_owner_weighted) INTO v_alice_running_weighted FROM ranked WHERE owner_name = 'alice'
+    // The first occurrence of "MAX(running_owner_weighted)" is in the procedure
+    let marked = script.replacen(
+        "SELECT MAX(running_owner_weighted)",
+        "SELECT __CODEX_CURSOR__MAX(running_owner_weighted)",
+        1,
+    );
+    assert_ne!(marked, script, "expected SELECT MAX target in test3.txt");
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+    assert!(
+        statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
+        "cursor should stay inside the ultra-final procedure, got:\n{statement}"
+    );
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::SelectList,
+        "SELECT inside procedure after nested block should be SelectList"
+    );
+
+    let cte_names: Vec<String> = deep_ctx
+        .ctes
+        .iter()
+        .map(|c| c.name.to_uppercase())
+        .collect();
+    assert!(
+        cte_names.iter().any(|n| n == "RANKED"),
+        "CTE `ranked` must be visible after nested block, got: {cte_names:?}"
+    );
+}
+
 #[test]
 fn statement_bounds_slash_terminates_create_plsql_block() {
     // After 'CREATE FUNCTION ... IS BEGIN ... END;\n/\n', a subsequent
