@@ -38588,4 +38588,73 @@ END;"#;
             None,
         ));
     }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_custom_delimited_procedure_end_on_owner_depth() {
+        let source = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+    DECLARE v_id INT DEFAULT 1;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+        BEGIN
+            ROLLBACK;
+            RESIGNAL;
+        END;
+    WHILE v_id <= 2 DO
+        IF v_id = 1 THEN
+            SET v_id = v_id + 1;
+        ELSE
+            SET v_id = v_id + 1;
+        END IF;
+    END WHILE;
+END$$
+DELIMITER ;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let header_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CREATE PROCEDURE demo_proc()")
+            .unwrap_or(0);
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(header_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END$$")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[begin_idx]), 0,
+            "procedure BEGIN should stay on the owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[end_idx]),
+            indent(lines[begin_idx]),
+            "custom-delimited procedure END should realign with BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[end_idx]),
+            indent(lines[header_idx]),
+            "custom-delimited procedure END should return to depth 0, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
 }

@@ -1183,17 +1183,6 @@ impl QueryExecutor {
             let was_in_leading_block_comment = in_leading_block_comment;
             let leading_word = leading_keyword_after_comments(line, &mut in_leading_block_comment);
             let leading_identifier_chain = parse_identifier_chain(line);
-            let pending_end_label_continuation =
-                leading_identifier_chain
-                    .as_ref()
-                    .is_some_and(|identifier_chain| {
-                        if !identifier_chain.is_line_tail {
-                            return false;
-                        }
-
-                        identifier_chain.upper.contains('.')
-                            || !is_non_label_control_keyword(leading_word)
-                    });
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -1237,6 +1226,24 @@ impl QueryExecutor {
                 mysql_routine_body_active = true;
                 mysql_routine_body_pending = false;
             }
+            let current_line_is_mysql_custom_delimited_end =
+                Self::line_starts_with_mysql_delimited_keyword(
+                    trimmed_start,
+                    mysql_delimiter.as_str(),
+                    "END",
+                );
+            let leading_starts_end = leading_is("END") || current_line_is_mysql_custom_delimited_end;
+            let pending_end_label_continuation = !leading_starts_end
+                && leading_identifier_chain
+                    .as_ref()
+                    .is_some_and(|identifier_chain| {
+                        if !identifier_chain.is_line_tail {
+                            return false;
+                        }
+
+                        identifier_chain.upper.contains('.')
+                            || !is_non_label_control_keyword(leading_word)
+                    });
             let in_leading_block_comment_line = leading_word.is_none()
                 && (was_in_leading_block_comment || in_leading_block_comment);
             let is_comment_or_blank = trimmed_start.is_empty()
@@ -1296,7 +1303,7 @@ impl QueryExecutor {
             let innermost_case_depth = builder.state.innermost_case_depth();
             let at_case_header_level =
                 innermost_case_depth.is_some_and(|depth| depth + 1 == builder.block_depth());
-            let end_suffix_or_label = if leading_is("END") {
+            let end_suffix_or_label = if leading_starts_end {
                 parse_end_suffix_or_label(line)
             } else {
                 None
@@ -1309,16 +1316,19 @@ impl QueryExecutor {
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
-                && leading_is("END")
+                && leading_starts_end
                 && !end_has_suffix;
 
-            let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
+            let mut block_depth_component =
+                if leading_word.is_some_and(should_pre_dedent)
+                    || current_line_is_mysql_custom_delimited_end
+                {
                 builder.block_depth().saturating_sub(1)
             } else {
                 builder.block_depth()
             };
 
-            if leading_is("END")
+            if leading_starts_end
                 && !end_has_suffix
                 && builder.state.plain_end_closes_parent_scope(
                     end_suffix_or_label
@@ -1393,7 +1403,7 @@ impl QueryExecutor {
                         if branch_active {
                             let case_depth = stack_idx;
                             let is_header_line = builder.block_depth() == case_depth + 1
-                                && leading_is_any(&["WHEN", "ELSE", "END"]);
+                                && (leading_is_any(&["WHEN", "ELSE"]) || leading_starts_end);
                             if !is_header_line {
                                 case_branch_indent += 1;
                             }
@@ -1461,7 +1471,7 @@ impl QueryExecutor {
                 if let Some(in_handler_body) = exception_handler_body_stack.last_mut() {
                     *in_handler_body = true;
                 }
-            } else if leading_is("END") {
+            } else if leading_starts_end {
                 while exception_depth_stack
                     .last()
                     .is_some_and(|depth| *depth >= builder.block_depth())
@@ -1475,7 +1485,7 @@ impl QueryExecutor {
                     if let Some(last) = case_branch_stack.last_mut() {
                         *last = true;
                     }
-                } else if leading_is("END") {
+                } else if leading_starts_end {
                     if let Some(last) = case_branch_stack.last_mut() {
                         *last = false;
                     }
@@ -1547,7 +1557,7 @@ impl QueryExecutor {
                 mysql_routine_body_pending = false;
             }
             if mysql_routine_body_active
-                && leading_is("END")
+                && leading_starts_end
                 && Self::statement_ends_with_mysql_delimiter(
                     trimmed_start,
                     mysql_delimiter.as_str(),
@@ -1782,8 +1792,17 @@ impl QueryExecutor {
             sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
             let pending_control_branch_body_depth_for_line =
                 pending_control_branch_body_depth.take();
+            let current_line_is_mysql_custom_delimited_end =
+                Self::line_starts_with_mysql_delimited_keyword(
+                    trimmed,
+                    mysql_delimiter.as_str(),
+                    "END",
+                );
 
             let trimmed_upper = sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase();
+            let current_line_starts_end_keyword =
+                sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                    || current_line_is_mysql_custom_delimited_end;
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
                 &mut pending_auto_format_subquery_paren_count,
@@ -1837,7 +1856,7 @@ impl QueryExecutor {
                 && !sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
                 && !sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE")
                 && !sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
-                && !sql_text::starts_with_keyword_token(&trimmed_upper, "END");
+                && !current_line_starts_end_keyword;
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
             let clause_kind = if suppress_non_subquery_paren_layout_clause {
@@ -2289,7 +2308,7 @@ impl QueryExecutor {
                     && !current_line_starts_elseif
                     && !current_line_is_exact_else
                     && !current_line_is_exact_exception
-                    && !sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                    && !current_line_starts_end_keyword
                 {
                     context.auto_depth = context.auto_depth.max(branch_body_depth);
                 }
@@ -3010,7 +3029,7 @@ impl QueryExecutor {
                 mysql_routine_body_pending = false;
             }
             if mysql_routine_body_active
-                && sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                && current_line_starts_end_keyword
                 && Self::statement_ends_with_mysql_delimiter(trimmed, mysql_delimiter.as_str())
             {
                 mysql_routine_body_active = false;
@@ -7113,6 +7132,22 @@ impl QueryExecutor {
 
     pub(crate) fn statement_ends_with_mysql_delimiter(statement: &str, delimiter: &str) -> bool {
         Self::mysql_trailing_delimiter_range(statement, delimiter).is_some()
+    }
+
+    fn line_starts_with_mysql_delimited_keyword(
+        line: &str,
+        delimiter: &str,
+        keyword: &str,
+    ) -> bool {
+        if delimiter == ";" || keyword.is_empty() {
+            return false;
+        }
+        if !Self::statement_ends_with_mysql_delimiter(line, delimiter) {
+            return false;
+        }
+
+        let stripped = Self::strip_trailing_mysql_delimiter(line, delimiter);
+        sql_text::starts_with_keyword_token(&stripped.to_ascii_uppercase(), keyword)
     }
 
     fn strip_trailing_mysql_delimiter(statement: &str, delimiter: &str) -> String {
@@ -19002,6 +19037,58 @@ WHERE 1 = 1;"#;
         assert_eq!(
             contexts[outer_where_idx].auto_depth, 0,
             "outer WHERE should return to the top-level query depth after the nested query closes"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_and_auto_contexts_dedent_custom_delimited_mysql_procedure_end() {
+        let sql = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+    DECLARE v_id INT DEFAULT 1;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+        BEGIN
+            ROLLBACK;
+            RESIGNAL;
+        END;
+    WHILE v_id <= 2 DO
+        IF v_id = 1 THEN
+            SET v_id = v_id + 1;
+        ELSE
+            SET v_id = v_id + 1;
+        END IF;
+    END WHILE;
+END$$
+DELIMITER ;"#;
+
+        let lines: Vec<&str> = sql.lines().collect();
+        let begin_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BEGIN")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END$$")
+            .unwrap_or(0);
+
+        let parser_depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(
+            parser_depths[begin_idx], 0,
+            "procedure BEGIN should stay on the owner depth"
+        );
+        assert_eq!(
+            parser_depths[end_idx], 0,
+            "custom-delimited procedure END should dedent back to the owner depth"
+        );
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        assert_eq!(
+            contexts[end_idx].parser_depth, 0,
+            "auto-format parser depth should share the same custom-delimited END close semantics"
+        );
+        assert_eq!(
+            contexts[end_idx].auto_depth, 0,
+            "auto-format depth should keep the custom-delimited procedure END on the owner depth"
         );
     }
 }
