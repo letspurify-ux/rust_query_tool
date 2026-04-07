@@ -2699,6 +2699,7 @@ fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
         false,
         SqlContext::TableName,
         false,
+        None,
     );
 
     assert_has_case_insensitive(&suggestions, "CONFIG");
@@ -2737,6 +2738,7 @@ fn base_suggestions_for_restricted_column_context_with_prefix_stay_column_only()
         true,
         SqlContext::ColumnName,
         true,
+        None,
     );
 
     assert_has_case_insensitive(&suggestions, "CODE");

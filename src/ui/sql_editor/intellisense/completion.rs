@@ -676,6 +676,7 @@ impl SqlEditorWidget {
                     include_columns,
                     context,
                     restrict_to_relation_columns,
+                    Some(snapshot.preferred_db_type),
                 )
             }
         };
@@ -776,6 +777,7 @@ impl SqlEditorWidget {
         include_columns: bool,
         context: SqlContext,
         restrict_to_relation_columns: bool,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         if qualifier.is_some() {
             return data.get_column_suggestions(prefix, column_scope);
@@ -793,12 +795,13 @@ impl SqlEditorWidget {
             return data.get_column_suggestions(prefix, column_scope);
         }
 
-        data.get_suggestions(
+        data.get_suggestions_for_db(
             prefix,
             include_columns,
             column_scope,
             false,
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
+            db_type,
         )
     }
 
