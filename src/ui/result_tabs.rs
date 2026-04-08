@@ -145,6 +145,14 @@ impl ResultTabsWidget {
         child_count > 1 && width > 0 && height > 0
     }
 
+    fn should_reapply_tab_overflow_mode_on_wheel(
+        child_count: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        child_count > 0 && width > 0 && height > 0
+    }
+
     fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
         matches!(
             ev,
@@ -315,7 +323,11 @@ impl ResultTabsWidget {
                 return true;
             }
             if matches!(ev, Event::MouseWheel)
-                && Self::should_reset_tab_strip_left_anchor(tabs.children(), tabs.w(), tabs.h())
+                && Self::should_reapply_tab_overflow_mode_on_wheel(
+                    tabs.children(),
+                    tabs.w(),
+                    tabs.h(),
+                )
             {
                 // Prevent FLTK Tabs from applying wheel-based strip offset changes.
                 // Wheel events can bubble down from nearby panes and cause the
@@ -991,5 +1003,33 @@ impl ResultTabsWidget {
 impl Default for ResultTabsWidget {
     fn default() -> Self {
         Self::new(0, 0, 100, 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResultTabsWidget;
+
+    #[test]
+    fn tab_strip_left_anchor_reset_requires_multi_tab_layout() {
+        assert!(!ResultTabsWidget::should_reset_tab_strip_left_anchor(
+            0, 320, 240
+        ));
+        assert!(!ResultTabsWidget::should_reset_tab_strip_left_anchor(
+            1, 320, 240
+        ));
+        assert!(ResultTabsWidget::should_reset_tab_strip_left_anchor(
+            2, 320, 240
+        ));
+    }
+
+    #[test]
+    fn mouse_wheel_overflow_reapply_allows_single_tab() {
+        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(0, 320, 240));
+        assert!(ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 320, 240
+        ));
+        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 0, 240));
+        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 320, 0));
     }
 }

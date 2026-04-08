@@ -2902,14 +2902,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let merge_update_set_introducer = matches!(
-                            current_statement_kind,
-                            StatementKind::Merge
-                        ) && matches!(last_word.as_deref(), Some("UPDATE"));
-                        let keep_expression_phase_for_set = is_statement_keyword_suppressed_in_expression_phase(current_phase)
-                            && !postgres_conflict_update_active
-                            && !matches!(current_statement_kind, StatementKind::Update)
-                            && !merge_update_set_introducer;
+                        let merge_update_set_introducer =
+                            matches!(current_statement_kind, StatementKind::Merge)
+                                && matches!(last_word.as_deref(), Some("UPDATE"));
+                        let keep_expression_phase_for_set =
+                            is_statement_keyword_suppressed_in_expression_phase(current_phase)
+                                && !postgres_conflict_update_active
+                                && !matches!(current_statement_kind, StatementKind::Update)
+                                && !merge_update_set_introducer;
                         if hierarchical_clause_active {
                             // Oracle hierarchical query SEARCH/CYCLE clauses use
                             // `... SET <ordering_or_cycle_col>` where SET introduces

@@ -155,6 +155,14 @@ impl QueryTabsWidget {
         child_count > 1 && width > 0 && height > 0
     }
 
+    fn should_reapply_tab_overflow_mode_on_wheel(
+        child_count: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        child_count > 0 && width > 0 && height > 0
+    }
+
     fn tab_strip_left_anchor_reset_mode(
         child_count: i32,
         width: i32,
@@ -322,7 +330,11 @@ impl QueryTabsWidget {
                 return true;
             }
             if matches!(ev, Event::MouseWheel)
-                && Self::should_reset_tab_strip_left_anchor(tabs.children(), tabs.w(), tabs.h())
+                && Self::should_reapply_tab_overflow_mode_on_wheel(
+                    tabs.children(),
+                    tabs.w(),
+                    tabs.h(),
+                )
             {
                 Self::advance_tab_strip_reset_generation(&tab_strip_reset_generation_for_cb);
                 Self::apply_tab_strip_left_anchor_reset(tabs);
@@ -534,6 +546,22 @@ mod tests {
             QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, true),
             TabStripLeftAnchorResetMode::Deferred
         );
+    }
+
+    #[test]
+    fn mouse_wheel_overflow_reapply_allows_single_tab() {
+        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            0, 320, 240
+        ));
+        assert!(QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 320, 240
+        ));
+        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 0, 240
+        ));
+        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 320, 0
+        ));
     }
 
     #[test]
