@@ -11478,6 +11478,58 @@ AND d.status = 'A';"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_not_exists_child_query_ands_on_inner_query_base() {
+        let sql = r#"SELECT e.emp_id
+FROM qt_fmt_emp e
+WHERE EXISTS (
+    SELECT 1
+    FROM qt_fmt_sales s
+    WHERE s.emp_id = e.emp_id
+        AND (
+            s.channel_code = 'PARTNER'
+            AND NOT EXISTS (
+                SELECT 1
+                FROM qt_fmt_sales z
+                WHERE z.emp_id = s.emp_id
+                                        AND z.sale_date > s.sale_date
+                                        AND z.product_code = s.product_code
+            )
+        )
+);"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE z.emp_id = s.emp_id")
+            .expect("source should contain the inner NOT EXISTS WHERE line");
+        let sale_date_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND z.sale_date > s.sale_date")
+            .expect("source should contain the sale_date continuation");
+        let product_code_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND z.product_code = s.product_code")
+            .expect("source should contain the product_code continuation");
+
+        assert_eq!(
+            contexts[sale_date_idx].query_base_depth,
+            contexts[where_idx].query_base_depth,
+            "inner NOT EXISTS child-query AND should stay on the same nested query base as the WHERE owner"
+        );
+        assert_eq!(
+            contexts[sale_date_idx].auto_depth,
+            contexts[where_idx].auto_depth.saturating_add(1),
+            "inner NOT EXISTS child-query AND should be exactly one level deeper than the child-query WHERE owner"
+        );
+        assert_eq!(
+            contexts[product_code_idx].auto_depth,
+            contexts[sale_date_idx].auto_depth,
+            "sibling AND lines inside the NOT EXISTS child query should share the same continuation depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_split_not_in_chain_relative_to_nested_query_base() {
         let sql = r#"SELECT d.deptno
 FROM dept d

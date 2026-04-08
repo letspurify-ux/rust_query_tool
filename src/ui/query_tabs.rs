@@ -1,4 +1,5 @@
 use fltk::{
+    app,
     enums::Align,
     enums::Event,
     group::{Group, Tabs, TabsOverflow},
@@ -22,6 +23,7 @@ pub struct QueryTabsWidget {
     on_select: Arc<Mutex<Option<TabSelectCallback>>>,
     suppress_select_callback_depth: Arc<Mutex<u32>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
+    tab_strip_reset_generation: Arc<Mutex<u64>>,
 }
 
 #[derive(Clone)]
@@ -80,6 +82,13 @@ impl Drop for PointerEventSuppressGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = guard.saturating_sub(1);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabStripLeftAnchorResetMode {
+    None,
+    Immediate,
+    Deferred,
 }
 
 impl QueryTabsWidget {
@@ -146,6 +155,42 @@ impl QueryTabsWidget {
         child_count > 1 && width > 0 && height > 0
     }
 
+    fn tab_strip_left_anchor_reset_mode(
+        child_count: i32,
+        width: i32,
+        height: i32,
+        defer_until_next_loop: bool,
+    ) -> TabStripLeftAnchorResetMode {
+        if !Self::should_reset_tab_strip_left_anchor(child_count, width, height) {
+            return TabStripLeftAnchorResetMode::None;
+        }
+
+        if defer_until_next_loop {
+            TabStripLeftAnchorResetMode::Deferred
+        } else {
+            TabStripLeftAnchorResetMode::Immediate
+        }
+    }
+
+    fn advance_tab_strip_reset_generation(counter: &Arc<Mutex<u64>>) -> u64 {
+        let mut guard = counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = (*guard).wrapping_add(1);
+        *guard = generation;
+        generation
+    }
+
+    fn current_tab_strip_reset_generation(counter: &Arc<Mutex<u64>>) -> u64 {
+        *counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn apply_tab_strip_left_anchor_reset(tabs: &mut Tabs) {
+        tabs.handle_overflow(TabsOverflow::Pulldown);
+    }
+
     fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
         matches!(
             ev,
@@ -163,16 +208,51 @@ impl QueryTabsWidget {
     }
 
     fn reset_tab_strip_left_anchor(&mut self) {
-        // Re-applying overflow mode resets FLTK's internal tab offset,
-        // keeping the visible strip anchored from the left. Skip transient
-        // empty/single-tab states while tabs are being closed/recreated
-        // because FLTK does not need overflow math there.
-        if Self::should_reset_tab_strip_left_anchor(
+        self.request_tab_strip_left_anchor_reset(false);
+    }
+
+    fn request_tab_strip_left_anchor_reset(&mut self, defer_until_next_loop: bool) {
+        let generation = Self::advance_tab_strip_reset_generation(&self.tab_strip_reset_generation);
+        let mode = Self::tab_strip_left_anchor_reset_mode(
             self.tabs.children(),
             self.tabs.w(),
             self.tabs.h(),
-        ) {
-            self.tabs.handle_overflow(TabsOverflow::Pulldown);
+            defer_until_next_loop,
+        );
+
+        match mode {
+            TabStripLeftAnchorResetMode::None => {}
+            TabStripLeftAnchorResetMode::Immediate => {
+                Self::apply_tab_strip_left_anchor_reset(&mut self.tabs);
+            }
+            TabStripLeftAnchorResetMode::Deferred => {
+                let generation_ref = self.tab_strip_reset_generation.clone();
+                let mut tabs = self.tabs.clone();
+                app::add_timeout3(0.0, move |_| {
+                    if Self::current_tab_strip_reset_generation(&generation_ref) != generation {
+                        return;
+                    }
+
+                    if tabs.was_deleted() {
+                        return;
+                    }
+
+                    if !Self::should_reset_tab_strip_left_anchor(
+                        tabs.children(),
+                        tabs.w(),
+                        tabs.h(),
+                    ) {
+                        return;
+                    }
+
+                    // `handle_overflow()` triggers `FL_DAMAGE_SCROLL` redraw inside
+                    // FLTK. Deferring the reset until the next loop avoids calling
+                    // into `Fl_Tabs::draw()/value()` while a close transaction is
+                    // still removing the old child and swapping selection.
+                    Self::apply_tab_strip_left_anchor_reset(&mut tabs);
+                    tabs.redraw();
+                });
+            }
         }
     }
 
@@ -205,11 +285,13 @@ impl QueryTabsWidget {
         let on_select = Arc::new(Mutex::new(None::<TabSelectCallback>));
         let suppress_select_callback_depth = Arc::new(Mutex::new(0u32));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
+        let tab_strip_reset_generation = Arc::new(Mutex::new(0u64));
 
         let entries_for_cb = entries.clone();
         let on_select_for_cb = on_select.clone();
         let suppress_for_cb = suppress_select_callback_depth.clone();
         let suppress_pointer_for_cb = suppress_pointer_event_depth.clone();
+        let tab_strip_reset_generation_for_cb = tab_strip_reset_generation.clone();
         tabs.set_callback(move |tabs| {
             if *suppress_for_cb
                 .lock()
@@ -242,7 +324,8 @@ impl QueryTabsWidget {
             if matches!(ev, Event::MouseWheel)
                 && Self::should_reset_tab_strip_left_anchor(tabs.children(), tabs.w(), tabs.h())
             {
-                tabs.handle_overflow(TabsOverflow::Pulldown);
+                Self::advance_tab_strip_reset_generation(&tab_strip_reset_generation_for_cb);
+                Self::apply_tab_strip_left_anchor_reset(tabs);
                 return true;
             }
             false
@@ -255,6 +338,7 @@ impl QueryTabsWidget {
             on_select,
             suppress_select_callback_depth,
             suppress_pointer_event_depth,
+            tab_strip_reset_generation,
         }
     }
 
@@ -376,7 +460,7 @@ impl QueryTabsWidget {
         if !group.was_deleted() {
             fltk::group::Group::delete(group);
         }
-        self.reset_tab_strip_left_anchor();
+        self.request_tab_strip_left_anchor_reset(true);
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         true
@@ -413,7 +497,7 @@ impl Default for QueryTabsWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryTabsWidget;
+    use super::{QueryTabsWidget, TabStripLeftAnchorResetMode};
     use fltk::enums::Event;
     use std::sync::{Arc, Mutex};
 
@@ -434,6 +518,22 @@ mod tests {
         assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(
             2, 320, 240
         ));
+    }
+
+    #[test]
+    fn tab_strip_left_anchor_reset_mode_defers_close_path_only_when_reset_is_needed() {
+        assert_eq!(
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(1, 320, 240, true),
+            TabStripLeftAnchorResetMode::None
+        );
+        assert_eq!(
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, false),
+            TabStripLeftAnchorResetMode::Immediate
+        );
+        assert_eq!(
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, true),
+            TabStripLeftAnchorResetMode::Deferred
+        );
     }
 
     #[test]
