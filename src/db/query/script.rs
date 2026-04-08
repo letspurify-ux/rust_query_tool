@@ -9369,6 +9369,53 @@ FROM outer_2;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_merge_using_nested_cte_sibling_on_with_depth() {
+        let sql = r#"MERGE INTO tgt t
+USING (
+    WITH recent_sales AS (
+        SELECT s.emp_id
+        FROM qt_fmt_sales s
+    ),
+    scored AS (
+        SELECT rs.emp_id
+        FROM recent_sales rs
+    )
+    SELECT s.emp_id
+    FROM scored s
+) src
+ON (t.emp_id = src.emp_id)
+WHEN MATCHED THEN
+    UPDATE SET t.emp_id = src.emp_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH recent_sales AS ("))
+            .unwrap_or(0);
+        let scored_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("scored AS ("))
+            .unwrap_or(0);
+        let main_select_idx = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.trim_start() == "SELECT s.emp_id").then_some(idx))
+            .nth(1)
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[scored_idx].auto_depth, contexts[with_idx].auto_depth,
+            "nested USING CTE siblings should stay on the same WITH base depth"
+        );
+        assert_eq!(
+            contexts[main_select_idx].auto_depth, contexts[with_idx].auto_depth,
+            "main SELECT after nested USING CTEs should return to the nested WITH base depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_normalize_overindented_cte_header_to_with_owner_depth() {
         let sql = r#"WITH
             dept_stats AS (

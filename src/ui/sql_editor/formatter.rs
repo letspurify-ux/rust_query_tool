@@ -486,6 +486,7 @@ struct ResolvedQueryBaseLayoutFrame {
 #[derive(Clone, Copy)]
 struct WithDefinitionLayoutFrame {
     start_parser_depth: usize,
+    resolved_base_depth: usize,
     main_query_started: bool,
 }
 
@@ -528,6 +529,12 @@ struct PendingPartialMultilineClauseOwnerLayoutFrame {
 #[derive(Clone, Copy)]
 struct PendingWindowDefinitionOwnerLayoutFrame {
     owner_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAnchorGroupLayoutFrame {
+    group: usize,
+    anchor_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -3136,7 +3143,7 @@ impl SqlEditorWidget {
                 || upper.contains("IF(")
         }
 
-        fn split_top_level_segments<'a>(text: &'a str) -> Vec<&'a str> {
+        fn split_top_level_segments(text: &str) -> Vec<&str> {
             let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
             let mut segments: Vec<&str> = Vec::new();
             let mut depth = 0usize;
@@ -3341,7 +3348,7 @@ impl SqlEditorWidget {
             line.len().saturating_sub(line.trim_start().len())
         }
 
-        fn split_top_level_segments<'a>(text: &'a str) -> Vec<&'a str> {
+        fn split_top_level_segments(text: &str) -> Vec<&str> {
             let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
             let mut segments: Vec<&str> = Vec::new();
             let mut depth = 0usize;
@@ -3622,7 +3629,7 @@ impl SqlEditorWidget {
             line.len().saturating_sub(line.trim_start().len())
         }
 
-        fn split_top_level_segments<'a>(text: &'a str) -> Vec<&'a str> {
+        fn split_top_level_segments(text: &str) -> Vec<&str> {
             let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
             let mut segments: Vec<&str> = Vec::new();
             let mut depth = 0usize;
@@ -3819,7 +3826,7 @@ impl SqlEditorWidget {
             line.len().saturating_sub(line.trim_start().len())
         }
 
-        fn split_top_level_segments<'a>(text: &'a str) -> Vec<&'a str> {
+        fn split_top_level_segments(text: &str) -> Vec<&str> {
             let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
             let mut segments: Vec<&str> = Vec::new();
             let mut depth = 0usize;
@@ -4049,14 +4056,14 @@ impl SqlEditorWidget {
         let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
         let mut case_stack: Vec<CaseFrame> = Vec::new();
 
-        for idx in 0..lines.len() {
-            let trimmed = lines[idx].trim_start().to_string();
+        for line in &mut lines {
+            let trimmed = line.trim_start().to_string();
             if trimmed.is_empty() {
                 continue;
             }
 
             if starts_case_header(&trimmed) {
-                let case_indent = leading_spaces(&lines[idx]);
+                let case_indent = leading_spaces(line);
                 case_stack.push(CaseFrame { case_indent });
                 continue;
             }
@@ -4067,23 +4074,23 @@ impl SqlEditorWidget {
 
             if starts_when_header(&trimmed) || is_else_header(&trimmed) {
                 let desired_indent = frame.case_indent.saturating_add(4);
-                if leading_spaces(&lines[idx]) > desired_indent {
-                    lines[idx] = format!("{}{}", " ".repeat(desired_indent), trimmed);
+                if leading_spaces(line) > desired_indent {
+                    *line = format!("{}{}", " ".repeat(desired_indent), trimmed);
                 }
                 continue;
             }
 
             if starts_end_header(&trimmed) {
-                if leading_spaces(&lines[idx]) > frame.case_indent {
-                    lines[idx] = format!("{}{}", " ".repeat(frame.case_indent), trimmed);
+                if leading_spaces(line) > frame.case_indent {
+                    *line = format!("{}{}", " ".repeat(frame.case_indent), trimmed);
                 }
                 case_stack.pop();
                 continue;
             }
 
             let desired_indent = frame.case_indent.saturating_add(8);
-            if leading_spaces(&lines[idx]) > desired_indent {
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), trimmed);
+            if leading_spaces(line) > desired_indent {
+                *line = format!("{}{}", " ".repeat(desired_indent), trimmed);
             }
         }
 
@@ -10353,6 +10360,30 @@ impl SqlEditorWidget {
             || Self::line_starts_query_head(trimmed_upper)
     }
 
+    fn take_closing_resolved_query_base_layout_frames(
+        resolved_query_base_depths: &mut Vec<ResolvedQueryBaseLayoutFrame>,
+        depth: usize,
+        trimmed_upper: &str,
+        has_leading_close_paren: bool,
+    ) -> Vec<ResolvedQueryBaseLayoutFrame> {
+        let mut closing_frames = Vec::new();
+
+        while resolved_query_base_depths.last().copied().is_some_and(|frame| {
+            Self::resolved_query_frame_closes_before_line(
+                frame,
+                depth,
+                trimmed_upper,
+                has_leading_close_paren,
+            )
+        }) {
+            if let Some(frame) = resolved_query_base_depths.pop() {
+                closing_frames.push(frame);
+            }
+        }
+
+        closing_frames
+    }
+
     fn continuation_operator_owner_depth(
         line: &str,
         line_depth: usize,
@@ -10619,7 +10650,6 @@ impl SqlEditorWidget {
     ) {
         let mut in_dml_statement = false;
         let mut case_layout_state = CaseLayoutState::default();
-        let mut last_code_idx: Option<usize> = None;
         let mut next_anchor_group = 0usize;
         let mut dml_case_frames: Vec<DmlCaseLayoutFrame> = Vec::new();
         let mut plsql_case_frames: Vec<PlSqlCaseLayoutFrame> = Vec::new();
@@ -10643,6 +10673,7 @@ impl SqlEditorWidget {
         > = None;
         let mut pending_window_definition_owner: Option<PendingWindowDefinitionOwnerLayoutFrame> =
             None;
+        let mut pending_anchor_group_frame: Option<PendingAnchorGroupLayoutFrame> = None;
         let mut pending_partial_query_owner: Option<PendingPartialQueryOwnerLayoutFrame> = None;
         let mut paren_layout_frames: Vec<ParenLayoutFrame> = Vec::new();
         // Tracks active JOIN ON/USING condition scope. The frame stores the
@@ -10678,9 +10709,9 @@ impl SqlEditorWidget {
             {
                 with_definition_frames.pop();
             }
-            let active_with_definition_scope = with_definition_frames.last().is_some_and(|frame| {
-                !frame.main_query_started && depth >= frame.start_parser_depth
-            });
+            let active_with_definition_frame = with_definition_frames.last().copied().filter(
+                |frame| !frame.main_query_started && depth >= frame.start_parser_depth,
+            );
             let structural_trimmed = crate::sql_text::auto_format_structural_tail(trimmed);
             let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
@@ -10693,6 +10724,7 @@ impl SqlEditorWidget {
                 .take()
                 .map(|frame| frame.body_depth);
             let pending_window_definition_owner_for_line = pending_window_definition_owner.take();
+            let pending_anchor_group_frame_for_line = pending_anchor_group_frame.take();
             let pending_general_open_paren_for_line = pending_general_open_paren.take();
             let pending_forall_body_head_for_line = pending_forall_body_head;
             let pending_merge_branch_header_for_line = pending_merge_branch_header;
@@ -10726,18 +10758,13 @@ impl SqlEditorWidget {
                 case_layout_state.pending_branch_body_depth();
             let pending_dml_case_expression_close_depth_for_line =
                 case_layout_state.pending_dml_case_expression_close_depth();
-            let closing_query_frame_count = resolved_query_base_depths
-                .iter()
-                .rev()
-                .take_while(|frame| {
-                    Self::resolved_query_frame_closes_before_line(
-                        **frame,
-                        depth,
-                        &trimmed_upper,
-                        layouts[idx].has_leading_close_paren,
-                    )
-                })
-                .count();
+            let closing_query_frames_for_line =
+                Self::take_closing_resolved_query_base_layout_frames(
+                    &mut resolved_query_base_depths,
+                    depth,
+                    &trimmed_upper,
+                    layouts[idx].has_leading_close_paren,
+                );
 
             let current_line_is_standalone_open_paren =
                 Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
@@ -10764,9 +10791,6 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
-                Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].analysis_trimmed)
-            });
             let control_branch_body_depth_for_line = pending_control_branch_body_depth_for_line;
             let current_line_branch_body_depth =
                 control_branch_body_depth_for_line.or(pending_case_branch_body_depth_for_line);
@@ -10959,10 +10983,13 @@ impl SqlEditorWidget {
                 && !current_line_is_control_condition_close;
             let paren_case_base_depth = parser_depth;
             let parser_depth = parser_depth + usize::from(is_paren_case_closer);
-            let last_code_depth = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
             let current_line_starts_case =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let current_line_starts_query_head_token = Self::line_starts_query_head(&trimmed_upper);
+            let current_line_is_cte_definition_header =
+                crate::sql_text::line_is_format_cte_definition_header(structural_trimmed);
+            let current_line_is_active_with_sibling_cte_definition_header =
+                current_line_is_cte_definition_header && !current_line_starts_query_head_token;
             let current_line_is_join_condition_clause =
                 layouts[idx].line_semantic.is_join_condition_clause()
                     && !current_line_is_mysql_on_duplicate_key_update;
@@ -11179,25 +11206,16 @@ impl SqlEditorWidget {
                 (!current_line_rejects_structural_continuation_depth)
                     .then_some(incoming_structural_continuation_depth)
                     .flatten();
-            let current_line_query_close_align_depth = resolved_query_base_depths
-                .iter()
-                .rev()
-                .take(closing_query_frame_count)
-                .next_back()
+            let current_line_query_close_align_depth = closing_query_frames_for_line
+                .last()
                 .map(|frame| frame.close_align_depth);
             let parenthesized_condition_header_depth =
                 Self::parenthesized_condition_header_depth(layouts, idx);
             let resolved_query_base_frame =
                 layouts[idx].query_base_depth.and_then(|query_base_depth| {
-                    let closing_query_frame_skip = if has_structural_tail_after_leading_close {
-                        closing_query_frame_count
-                    } else {
-                        0
-                    };
                     resolved_query_base_depths
                         .iter()
                         .rev()
-                        .skip(closing_query_frame_skip)
                         .find(|frame| frame.raw_base_depth == query_base_depth)
                         .copied()
                 });
@@ -11213,6 +11231,15 @@ impl SqlEditorWidget {
             } else {
                 layouts[idx].auto_depth
             };
+            let active_with_definition_scope_depth = active_with_definition_frame.map(|frame| {
+                let line_extra_depth = layouts[idx]
+                    .query_base_depth
+                    .map(|query_base_depth| {
+                        layouts[idx].auto_depth.saturating_sub(query_base_depth)
+                    })
+                    .unwrap_or(0);
+                frame.resolved_base_depth.saturating_add(line_extra_depth)
+            });
             let structural_body_depth_for_line = active_owner_relative_frame
                 .map(OwnerRelativeLayoutFrame::body_depth)
                 .or_else(|| {
@@ -11401,16 +11428,16 @@ impl SqlEditorWidget {
                     }
                 }
             }
-            if active_with_definition_scope {
+            if let Some(with_definition_scope_depth) = active_with_definition_scope_depth {
                 // WITH local FUNCTION/PROCEDURE definitions already have a
                 // canonical owner/body depth from the analyzer. Reusing that
                 // structural depth here keeps routine body statements such as
                 // RETURN on the body floor and labeled END on the owner depth
                 // instead of collapsing back to the raw parser depth.
-                if crate::sql_text::line_is_format_cte_definition_header(structural_trimmed) {
-                    effective_depth = layouts[idx].auto_depth;
+                if current_line_is_active_with_sibling_cte_definition_header {
+                    effective_depth = with_definition_scope_depth;
                 } else {
-                    effective_depth = effective_depth.max(layouts[idx].auto_depth);
+                    effective_depth = effective_depth.max(with_definition_scope_depth);
                 }
             }
             if let Some(frame) = pending_window_definition_owner_for_line {
@@ -11750,6 +11777,16 @@ impl SqlEditorWidget {
             let current_line_completes_pending_plsql_child_query_owner =
                 pending_plsql_child_query_owner_progress_for_line
                     .is_some_and(|progress| progress.completed_owner_anchor);
+            if let Some(with_definition_scope_depth) = active_with_definition_scope_depth {
+                // Nested WITH definition headers are stable anchors. Generic
+                // owner/header normalization must not pull sibling CTE
+                // definitions back to the outer query-base or wrapper depth.
+                if current_line_is_active_with_sibling_cte_definition_header {
+                    effective_depth = with_definition_scope_depth;
+                } else {
+                    effective_depth = effective_depth.max(with_definition_scope_depth);
+                }
+            }
             if let Some(frame) = pending_operator_for_line {
                 effective_depth = effective_depth.max(frame.owner_depth.saturating_add(1));
             }
@@ -11794,7 +11831,6 @@ impl SqlEditorWidget {
                     }
                 }
             }
-
             layouts[idx].final_depth = effective_depth;
             layouts[idx].dml_case_expression_close_depth =
                 current_line_dml_case_expression_close_depth;
@@ -11946,25 +11982,27 @@ impl SqlEditorWidget {
                     depth,
                 ));
             }
-            let anchor_group = if !in_dml_statement
-                && previous_line_ends_with_trailing_comma
-                && last_code_depth.is_some_and(|indent| indent == effective_depth)
-            {
-                if let Some(group) =
-                    last_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
-                {
-                    group
-                } else {
-                    let group = next_anchor_group;
-                    next_anchor_group = next_anchor_group.saturating_add(1);
-                    group
-                }
+            let anchor_group = if !in_dml_statement {
+                pending_anchor_group_frame_for_line
+                    .filter(|frame| frame.anchor_depth == effective_depth)
+                    .map(|frame| frame.group)
+                    .unwrap_or_else(|| {
+                        let group = next_anchor_group;
+                        next_anchor_group = next_anchor_group.saturating_add(1);
+                        group
+                    })
             } else {
                 let group = next_anchor_group;
                 next_anchor_group = next_anchor_group.saturating_add(1);
                 group
             };
             layouts[idx].anchor_group = Some(anchor_group);
+            pending_anchor_group_frame = (!in_dml_statement
+                && Self::line_ends_with_comma_before_inline_comment(trimmed))
+            .then_some(PendingAnchorGroupLayoutFrame {
+                group: anchor_group,
+                anchor_depth: effective_depth,
+            });
 
             if in_dml_statement && current_line_starts_case {
                 dml_case_frames.push(DmlCaseLayoutFrame {
@@ -12446,6 +12484,7 @@ impl SqlEditorWidget {
             {
                 with_definition_frames.push(WithDefinitionLayoutFrame {
                     start_parser_depth: depth,
+                    resolved_base_depth: layouts[idx].final_depth,
                     main_query_started: false,
                 });
             } else if let Some(frame) = with_definition_frames.last_mut() {
@@ -12480,6 +12519,7 @@ impl SqlEditorWidget {
                 pending_multiline_clause_owner = None;
                 pending_partial_multiline_clause_owner = None;
                 pending_window_definition_owner = None;
+                pending_anchor_group_frame = None;
                 pending_partial_query_owner = None;
                 paren_layout_frames.clear();
                 dml_case_frames.clear();
@@ -12495,12 +12535,7 @@ impl SqlEditorWidget {
                 if semicolon_closes_with_definition_scope {
                     with_definition_frames.clear();
                 }
-            } else {
-                for _ in 0..closing_query_frame_count {
-                    resolved_query_base_depths.pop();
-                }
             }
-            last_code_idx = Some(idx);
         }
     }
 
@@ -33458,7 +33493,7 @@ USING (
             WHERE s.sale_date >= DATE '2024-03-01'
             GROUP BY s.emp_id
         ),
-        scored AS (
+    scored AS (
             SELECT
                 e.emp_id,
                 e.note_text,
@@ -33495,10 +33530,22 @@ WHEN MATCHED THEN
         let when_matched = find_line("WHEN MATCHED THEN").unwrap_or("");
         let update_line = find_line("UPDATE SET t.note_text = src.new_note_text,").unwrap_or("");
         let updated_at_line = find_line("t.updated_at = SYSTIMESTAMP;").unwrap_or("");
+        let with_line = find_line("WITH recent_sales AS (").unwrap_or("");
+        let scored_line = find_line("scored AS (").unwrap_or("");
 
         assert!(
-            !when_matched.is_empty() && !update_line.is_empty() && !updated_at_line.is_empty(),
+            !when_matched.is_empty()
+                && !update_line.is_empty()
+                && !updated_at_line.is_empty()
+                && !with_line.is_empty()
+                && !scored_line.is_empty(),
             "expected MERGE branch lines to be present, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading(scored_line),
+            leading(with_line),
+            "nested USING CTE siblings should align on the same WITH base depth, got:\n{}",
             formatted
         );
         assert_eq!(
