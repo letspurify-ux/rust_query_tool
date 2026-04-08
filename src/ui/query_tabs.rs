@@ -376,7 +376,10 @@ impl QueryTabsWidget {
         if !group.was_deleted() {
             fltk::group::Group::delete(group);
         }
-        self.reset_tab_strip_left_anchor();
+        // Avoid forcing FLTK overflow recalculation while a tab is being
+        // removed. The close path already performs selection/remove/delete in
+        // one transaction, and immediate overflow re-application here can
+        // hit unstable internal state on some platforms.
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         true
