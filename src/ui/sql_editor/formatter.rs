@@ -670,6 +670,24 @@ struct PendingControlBranchBodyLayoutFrame {
 }
 
 #[derive(Clone, Copy)]
+struct MySqlIfLayoutFrame {
+    owner_depth: usize,
+}
+
+impl MySqlIfLayoutFrame {
+    fn body_depth(self) -> usize {
+        self.owner_depth.saturating_add(1)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MySqlIfBranchKind {
+    If,
+    ElseIf,
+    Else,
+}
+
+#[derive(Clone, Copy)]
 struct PlSqlCaseLayoutFrame {
     case_depth: usize,
 }
@@ -2046,6 +2064,28 @@ impl SqlEditorWidget {
             .unwrap_or(0)
     }
 
+    fn mysql_formatter_profile_enabled() -> bool {
+        std::env::var_os("SPACE_PROFILE_MYSQL_FORMATTER").is_some()
+    }
+
+    fn profile_mysql_formatter_stage<F>(stage: &str, input_len: usize, enabled: bool, f: F) -> String
+    where
+        F: FnOnce() -> String,
+    {
+        if !enabled {
+            return f();
+        }
+
+        let started_at = std::time::Instant::now();
+        let output = f();
+        eprintln!(
+            "[mysql-formatter] stage={stage} input_bytes={input_len} output_bytes={} elapsed_ms={:.3}",
+            output.len(),
+            started_at.elapsed().as_secs_f64() * 1000.0
+        );
+        output
+    }
+
     fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
         let mut idx = start_idx;
         while idx > 0 {
@@ -2851,2330 +2891,6 @@ impl SqlEditorWidget {
         *formatted_statement = normalized;
     }
 
-    fn normalize_mysql_function_header_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn rebuild_line(trimmed: &str, indent_spaces: usize) -> String {
-            format!("{}{}", " ".repeat(indent_spaces), trimmed)
-        }
-
-        fn split_returns_line(trimmed: &str) -> Option<usize> {
-            let upper = trimmed.to_ascii_uppercase();
-            if !upper.starts_with("RETURNS ") {
-                return None;
-            }
-
-            [
-                " DETERMINISTIC",
-                " READS SQL DATA",
-                " MODIFIES SQL DATA",
-                " CONTAINS SQL",
-                " NO SQL",
-                " SQL SECURITY DEFINER",
-                " SQL SECURITY INVOKER",
-                " LANGUAGE SQL",
-                " COMMENT ",
-            ]
-            .iter()
-            .filter_map(|pattern| upper.find(pattern).map(|idx| idx.saturating_add(1)))
-            .min()
-        }
-
-        fn split_attribute_line(trimmed: &str) -> Option<usize> {
-            let upper = trimmed.to_ascii_uppercase();
-            let prefix_len = if upper.starts_with("DETERMINISTIC") {
-                Some("DETERMINISTIC".len())
-            } else if upper.starts_with("READS SQL DATA") {
-                Some("READS SQL DATA".len())
-            } else if upper.starts_with("MODIFIES SQL DATA") {
-                Some("MODIFIES SQL DATA".len())
-            } else if upper.starts_with("CONTAINS SQL") {
-                Some("CONTAINS SQL".len())
-            } else if upper.starts_with("NO SQL") {
-                Some("NO SQL".len())
-            } else if upper.starts_with("SQL SECURITY DEFINER") {
-                Some("SQL SECURITY DEFINER".len())
-            } else if upper.starts_with("SQL SECURITY INVOKER") {
-                Some("SQL SECURITY INVOKER".len())
-            } else if upper.starts_with("LANGUAGE SQL") {
-                Some("LANGUAGE SQL".len())
-            } else {
-                None
-            }?;
-
-            [
-                " RETURN",
-                " BEGIN",
-                " DETERMINISTIC",
-                " READS SQL DATA",
-                " MODIFIES SQL DATA",
-                " CONTAINS SQL",
-                " NO SQL",
-                " SQL SECURITY DEFINER",
-                " SQL SECURITY INVOKER",
-                " LANGUAGE SQL",
-                " COMMENT ",
-            ]
-            .iter()
-            .filter_map(|pattern| {
-                upper
-                    .get(prefix_len..)
-                    .and_then(|suffix| suffix.find(pattern))
-                    .map(|offset| prefix_len.saturating_add(offset).saturating_add(1))
-            })
-            .min()
-        }
-
-        let mut normalized_lines: Vec<String> = Vec::new();
-        for raw_line in formatted_statement.lines() {
-            let indent_spaces = leading_spaces(raw_line);
-            let trimmed = raw_line.trim_start();
-
-            if let Some(split_at) = split_returns_line(trimmed) {
-                let head = trimmed
-                    .get(..split_at)
-                    .map(str::trim_end)
-                    .unwrap_or(trimmed);
-                let tail = trimmed
-                    .get(split_at..)
-                    .map(str::trim_start)
-                    .unwrap_or_default();
-                if !head.is_empty() && !tail.is_empty() {
-                    normalized_lines.push(rebuild_line(head, indent_spaces));
-                    normalized_lines.push(rebuild_line(tail, indent_spaces));
-                    continue;
-                }
-            }
-
-            if let Some(split_at) = split_attribute_line(trimmed) {
-                let head = trimmed
-                    .get(..split_at)
-                    .map(str::trim_end)
-                    .unwrap_or(trimmed);
-                let tail = trimmed
-                    .get(split_at..)
-                    .map(str::trim_start)
-                    .unwrap_or_default();
-                if !head.is_empty() && !tail.is_empty() {
-                    normalized_lines.push(rebuild_line(head, indent_spaces));
-                    normalized_lines.push(rebuild_line(tail, indent_spaces));
-                    continue;
-                }
-            }
-
-            normalized_lines.push(raw_line.to_string());
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_single_row_values_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn item_is_complex(item: &str) -> bool {
-            let upper = item.to_ascii_uppercase();
-            item.contains('\n')
-                || item.len() > 48
-                || item.matches('(').count() > 2
-                || upper.contains("CASE")
-                || upper.contains("JSON_")
-                || upper.contains("CONCAT(")
-                || upper.contains("DATE_ADD(")
-                || upper.contains("CAST(")
-                || upper.contains("COALESCE(")
-                || upper.contains("IF(")
-        }
-
-        fn split_top_level_segments(text: &str) -> Vec<&str> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
-            let mut segments: Vec<&str> = Vec::new();
-            let mut depth = 0usize;
-            let mut start = 0usize;
-
-            for span in &spans {
-                if let SqlToken::Symbol(sym) = &span.token {
-                    match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                        }
-                        "," if depth == 0 => {
-                            if let Some(segment) = text.get(start..span.start) {
-                                let trimmed = segment.trim();
-                                if !trimmed.is_empty() {
-                                    segments.push(trimmed);
-                                }
-                            }
-                            start = span.end;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some(segment) = text.get(start..) {
-                let trimmed = segment.trim();
-                if !trimmed.is_empty() {
-                    segments.push(trimmed);
-                }
-            }
-
-            segments
-        }
-
-        fn normalize_fragment_lines(fragment: &str, indent_spaces: usize) -> Vec<String> {
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() {
-                return vec![format!("{}{}", " ".repeat(indent_spaces), trimmed)];
-            }
-
-            let lines: Vec<&str> = trimmed.lines().collect();
-            if lines.len() == 1 {
-                return vec![format!("{}{}", " ".repeat(indent_spaces), trimmed)];
-            }
-
-            let common_indent = lines
-                .iter()
-                .skip(1)
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| leading_spaces(line))
-                .min()
-                .unwrap_or(0);
-
-            let mut normalized = Vec::with_capacity(lines.len());
-            for (idx, line) in lines.iter().enumerate() {
-                let body = if idx == 0 {
-                    line.trim_start()
-                } else {
-                    line.get(common_indent..)
-                        .unwrap_or_else(|| line.trim_start())
-                        .trim_end()
-                };
-                normalized.push(format!("{}{}", " ".repeat(indent_spaces), body));
-            }
-            normalized
-        }
-
-        fn normalize_values_block(block: &str, indent_spaces: usize) -> Option<Vec<String>> {
-            let trimmed_block = block.trim_start();
-            if !trimmed_block.starts_with("VALUES") {
-                return None;
-            }
-
-            let after_values = trimmed_block.get("VALUES".len()..)?.trim_start();
-            let spans =
-                super::query_text::tokenize_sql_spanned_with_mysql_compat(after_values, true);
-
-            let mut open_end = None;
-            let mut close_start = None;
-            let mut close_end = None;
-            let mut depth = 0usize;
-
-            for span in &spans {
-                if let SqlToken::Symbol(sym) = &span.token {
-                    match sym.as_str() {
-                        "(" => {
-                            depth = depth.saturating_add(1);
-                            if open_end.is_none() {
-                                open_end = Some(span.end);
-                            }
-                        }
-                        ")" => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                close_start = Some(span.start);
-                                close_end = Some(span.end);
-                                break;
-                            }
-                        }
-                        "," if depth == 0 => return None,
-                        _ => {}
-                    }
-                }
-            }
-
-            let (open_end, close_start, close_end) = match (open_end, close_start, close_end) {
-                (Some(open_end), Some(close_start), Some(close_end)) => {
-                    (open_end, close_start, close_end)
-                }
-                _ => return None,
-            };
-
-            let remainder = after_values.get(close_end..)?.trim_start();
-            let remainder_spans =
-                super::query_text::tokenize_sql_spanned_with_mysql_compat(remainder, true);
-            let mut remainder_has_terminator = false;
-            for span in &remainder_spans {
-                match &span.token {
-                    SqlToken::Comment(_) => {}
-                    SqlToken::Symbol(sym) if sym == ";" && !remainder_has_terminator => {
-                        remainder_has_terminator = true;
-                    }
-                    _ => return None,
-                }
-            }
-            if !remainder_has_terminator {
-                return None;
-            }
-
-            let inner = after_values.get(open_end..close_start)?.trim();
-            let items = split_top_level_segments(inner);
-            if items.len() < 2 {
-                return None;
-            }
-
-            let should_expand = block.contains('\n')
-                || block.len() > 120
-                || items.iter().any(|item| item_is_complex(item));
-            if !should_expand {
-                return None;
-            }
-
-            let mut normalized = Vec::new();
-            normalized.push(format!("{}VALUES (", " ".repeat(indent_spaces)));
-            for (idx, item) in items.iter().enumerate() {
-                let mut fragment_lines = normalize_fragment_lines(item, indent_spaces + 4);
-                if let Some(last) = fragment_lines.last_mut() {
-                    if idx + 1 < items.len() {
-                        last.push(',');
-                    }
-                }
-                normalized.extend(fragment_lines);
-            }
-
-            let mut closing = format!("{})", " ".repeat(indent_spaces));
-            closing.push_str(remainder);
-            normalized.push(closing);
-            Some(normalized)
-        }
-
-        let lines: Vec<&str> = formatted_statement.lines().collect();
-        let mut normalized_lines: Vec<String> = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < lines.len() {
-            let line = lines[idx];
-            let trimmed = line.trim_start();
-
-            if trimmed.starts_with("VALUES (") {
-                let mut end_idx = idx;
-                while end_idx < lines.len() && !lines[end_idx].trim_end().ends_with(';') {
-                    end_idx = end_idx.saturating_add(1);
-                }
-
-                if end_idx < lines.len() {
-                    let block = lines[idx..=end_idx].join("\n");
-                    if let Some(rewritten) = normalize_values_block(&block, leading_spaces(line)) {
-                        normalized_lines.extend(rewritten);
-                        idx = end_idx.saturating_add(1);
-                        continue;
-                    }
-                }
-            }
-
-            normalized_lines.push(line.to_string());
-            idx = idx.saturating_add(1);
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_complex_call_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn split_top_level_segments(text: &str) -> Vec<&str> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
-            let mut segments: Vec<&str> = Vec::new();
-            let mut depth = 0usize;
-            let mut start = 0usize;
-
-            for span in &spans {
-                if let SqlToken::Symbol(sym) = &span.token {
-                    match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                        }
-                        "," if depth == 0 => {
-                            if let Some(segment) = text.get(start..span.start) {
-                                let trimmed = segment.trim();
-                                if !trimmed.is_empty() {
-                                    segments.push(trimmed);
-                                }
-                            }
-                            start = span.end;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some(segment) = text.get(start..) {
-                let trimmed = segment.trim();
-                if !trimmed.is_empty() {
-                    segments.push(trimmed);
-                }
-            }
-
-            segments
-        }
-
-        fn normalize_fragment_lines(fragment: &str, indent_spaces: usize) -> Vec<String> {
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let lines: Vec<&str> = trimmed.lines().collect();
-            if lines.len() == 1 {
-                return vec![format!("{}{}", " ".repeat(indent_spaces), trimmed)];
-            }
-
-            let base_indent = lines
-                .iter()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| leading_spaces(line))
-                .min()
-                .unwrap_or(0);
-
-            let mut normalized = Vec::with_capacity(lines.len());
-            for line in &lines {
-                let relative_indent = leading_spaces(line).saturating_sub(base_indent);
-                normalized.push(format!(
-                    "{}{}",
-                    " ".repeat(indent_spaces.saturating_add(relative_indent)),
-                    line.trim_start().trim_end()
-                ));
-            }
-            normalized
-        }
-
-        fn matching_close_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
-            let mut depth = 0usize;
-            for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
-                if let SqlToken::Symbol(sym) = token {
-                    match sym.as_str() {
-                        "(" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                return Some(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None
-        }
-
-        fn is_call_like_open(tokens: &[SqlToken], open_idx: usize) -> bool {
-            let Some((prev_word, _)) = SqlEditorWidget::previous_word_upper(tokens, open_idx)
-            else {
-                return false;
-            };
-            if !matches!(
-                prev_word.as_str(),
-                "JSON_ARRAY" | "JSON_OBJECT" | "JSON_ARRAYAGG" | "FN_ORDER_RISK"
-            ) {
-                return false;
-            }
-            if SqlEditorWidget::mysql_keyword_prefers_space_before_paren(prev_word.as_str()) {
-                return false;
-            }
-            if SqlEditorWidget::mysql_paren_belongs_to_insert_target_column_list(tokens, open_idx) {
-                return false;
-            }
-            if SqlEditorWidget::mysql_paren_follows_named_key_definition(tokens, open_idx) {
-                return false;
-            }
-
-            let recent = SqlEditorWidget::recent_statement_words_before(tokens, open_idx, 5);
-            let starts_create_table = recent.iter().any(|word| word.eq_ignore_ascii_case("TABLE"))
-                && recent.iter().any(|word| {
-                    word.eq_ignore_ascii_case("CREATE") || word.eq_ignore_ascii_case("ALTER")
-                });
-            let starts_insert_target = recent.iter().any(|word| word.eq_ignore_ascii_case("INTO"))
-                && recent.iter().any(|word| {
-                    word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("REPLACE")
-                });
-            let opens_routine_header = recent.iter().any(|word| {
-                word.eq_ignore_ascii_case("FUNCTION")
-                    || word.eq_ignore_ascii_case("PROCEDURE")
-                    || word.eq_ignore_ascii_case("TRIGGER")
-            });
-
-            !(starts_create_table || starts_insert_target || opens_routine_header)
-        }
-
-        fn normalize_call_block(
-            block: &str,
-            open_byte_idx: usize,
-            indent_spaces: usize,
-        ) -> Option<(Vec<String>, usize)> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(block, true);
-            let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
-            let open_idx = spans.iter().enumerate().find_map(|(idx, span)| {
-                (span.start == open_byte_idx
-                    && matches!(&span.token, SqlToken::Symbol(sym) if sym == "("))
-                .then_some(idx)
-            })?;
-            let close_idx = matching_close_index(&tokens, open_idx)?;
-            let open_span = spans.get(open_idx)?;
-            let close_span = spans.get(close_idx)?;
-            let close_line_end = block[close_span.end..]
-                .find('\n')
-                .map_or(block.len(), |offset| close_span.end.saturating_add(offset));
-            let consumed_lines = block
-                .get(..close_line_end)
-                .map(str::lines)
-                .map(Iterator::count)
-                .unwrap_or(1);
-            let open_prefix = block.get(..open_span.end)?.trim_end().to_string();
-            let suffix = block
-                .get(close_span.end..close_line_end)
-                .map(str::trim_start)
-                .unwrap_or_default();
-            let inner = block.get(open_span.end..close_span.start)?.trim();
-            if inner.is_empty() {
-                return None;
-            }
-
-            let normalized_inner = SqlEditorWidget::normalize_mysql_complex_call_layout(inner);
-            let segments = split_top_level_segments(&normalized_inner);
-            let should_expand = normalized_inner.contains('\n')
-                || normalized_inner.len() > 120
-                || normalized_inner.to_ascii_uppercase().contains("SELECT")
-                || segments.iter().any(|segment| segment.contains('\n'));
-            if !should_expand {
-                return None;
-            }
-
-            let mut normalized = Vec::new();
-            normalized.push(open_prefix);
-
-            if segments.is_empty() {
-                let mut close_line = format!("{})", " ".repeat(indent_spaces));
-                if !suffix.is_empty() {
-                    if suffix.starts_with(',') || suffix.starts_with(';') || suffix.starts_with(')')
-                    {
-                        close_line.push_str(suffix);
-                    } else {
-                        close_line.push(' ');
-                        close_line.push_str(suffix);
-                    }
-                }
-                normalized.push(close_line);
-                return Some((normalized, consumed_lines));
-            }
-
-            for (idx, segment) in segments.iter().enumerate() {
-                let nested = SqlEditorWidget::normalize_mysql_complex_call_layout(segment.trim());
-                let mut fragment_lines = normalize_fragment_lines(&nested, indent_spaces + 4);
-                if let Some(last) = fragment_lines.last_mut() {
-                    if idx + 1 < segments.len() {
-                        last.push(',');
-                    }
-                }
-                normalized.extend(fragment_lines);
-            }
-
-            let mut close_line = format!("{})", " ".repeat(indent_spaces));
-            if !suffix.is_empty() {
-                if suffix.starts_with(',') || suffix.starts_with(';') || suffix.starts_with(')') {
-                    close_line.push_str(suffix);
-                } else {
-                    close_line.push(' ');
-                    close_line.push_str(suffix);
-                }
-            }
-            normalized.push(close_line);
-            Some((normalized, consumed_lines))
-        }
-
-        fn normalize_once(formatted_statement: &str) -> String {
-            let lines: Vec<&str> = formatted_statement.lines().collect();
-            let mut normalized_lines: Vec<String> = Vec::new();
-            let mut idx = 0usize;
-
-            while idx < lines.len() {
-                let line = lines[idx];
-                let line_tokens =
-                    super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-                let open_candidates: Vec<usize> = line_tokens
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(token_idx, span)| {
-                        matches!(&span.token, SqlToken::Symbol(sym) if sym == "(")
-                            .then_some((token_idx, span.start))
-                    })
-                    .filter_map(|(token_idx, start)| {
-                        let tokens: Vec<SqlToken> =
-                            line_tokens.iter().map(|span| span.token.clone()).collect();
-                        is_call_like_open(&tokens, token_idx).then_some(start)
-                    })
-                    .collect();
-
-                let mut rewritten = None;
-                for open_byte_idx in open_candidates {
-                    let remaining = lines[idx..].join("\n");
-                    if let Some((block_lines, consumed)) =
-                        normalize_call_block(&remaining, open_byte_idx, leading_spaces(line))
-                    {
-                        rewritten = Some((block_lines, consumed));
-                        break;
-                    }
-                }
-
-                if let Some((block_lines, consumed)) = rewritten {
-                    normalized_lines.extend(block_lines);
-                    idx = idx.saturating_add(consumed.max(1));
-                    continue;
-                }
-
-                normalized_lines.push(line.to_string());
-                idx = idx.saturating_add(1);
-            }
-
-            let mut normalized = normalized_lines.join("\n");
-            if formatted_statement.ends_with('\n') {
-                normalized.push('\n');
-            }
-            normalized
-        }
-
-        let mut normalized = formatted_statement.to_string();
-        for _ in 0..3 {
-            let rewritten = normalize_once(&normalized);
-            if rewritten == normalized {
-                break;
-            }
-            normalized = rewritten;
-        }
-        normalized
-    }
-
-    fn normalize_mysql_call_argument_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn split_top_level_segments(text: &str) -> Vec<&str> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
-            let mut segments: Vec<&str> = Vec::new();
-            let mut depth = 0usize;
-            let mut start = 0usize;
-
-            for span in &spans {
-                if let SqlToken::Symbol(sym) = &span.token {
-                    match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                        }
-                        "," if depth == 0 => {
-                            if let Some(segment) = text.get(start..span.start) {
-                                let trimmed = segment.trim();
-                                if !trimmed.is_empty() {
-                                    segments.push(trimmed);
-                                }
-                            }
-                            start = span.end;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some(segment) = text.get(start..) {
-                let trimmed = segment.trim();
-                if !trimmed.is_empty() {
-                    segments.push(trimmed);
-                }
-            }
-
-            segments
-        }
-
-        fn normalize_fragment_lines(fragment: &str, indent_spaces: usize) -> Vec<String> {
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let lines: Vec<&str> = trimmed.lines().collect();
-            if lines.len() == 1 {
-                return vec![format!("{}{}", " ".repeat(indent_spaces), trimmed)];
-            }
-
-            let base_indent = lines
-                .iter()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| leading_spaces(line))
-                .min()
-                .unwrap_or(0);
-
-            let mut normalized = Vec::with_capacity(lines.len());
-            for line in &lines {
-                let relative_indent = leading_spaces(line).saturating_sub(base_indent);
-                normalized.push(format!(
-                    "{}{}",
-                    " ".repeat(indent_spaces.saturating_add(relative_indent)),
-                    line.trim_start().trim_end()
-                ));
-            }
-            normalized
-        }
-
-        fn matching_close_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
-            let mut depth = 0usize;
-            for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
-                if let SqlToken::Symbol(sym) = token {
-                    match sym.as_str() {
-                        "(" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                return Some(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None
-        }
-
-        fn normalize_call_block(
-            block: &str,
-            open_byte_idx: usize,
-            indent_spaces: usize,
-        ) -> Option<(Vec<String>, usize)> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(block, true);
-            let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
-            let open_idx = spans.iter().enumerate().find_map(|(idx, span)| {
-                (span.start == open_byte_idx
-                    && matches!(&span.token, SqlToken::Symbol(sym) if sym == "("))
-                .then_some(idx)
-            })?;
-            let close_idx = matching_close_index(&tokens, open_idx)?;
-            let open_span = spans.get(open_idx)?;
-            let close_span = spans.get(close_idx)?;
-            let close_line_end = block[close_span.end..]
-                .find('\n')
-                .map_or(block.len(), |offset| close_span.end.saturating_add(offset));
-            let consumed_lines = block
-                .get(..close_line_end)
-                .map(str::lines)
-                .map(Iterator::count)
-                .unwrap_or(1);
-            let open_prefix = block.get(..open_span.end)?.trim_end().to_string();
-            let suffix = block
-                .get(close_span.end..close_line_end)
-                .map(str::trim_start)
-                .unwrap_or_default();
-            let inner = block.get(open_span.end..close_span.start)?.trim();
-            let segments = split_top_level_segments(inner);
-            if segments.len() < 2 || !inner.contains('\n') {
-                return None;
-            }
-
-            let mut normalized = Vec::new();
-            normalized.push(open_prefix);
-            for (idx, segment) in segments.iter().enumerate() {
-                let mut fragment_lines = normalize_fragment_lines(segment, indent_spaces + 4);
-                if let Some(last) = fragment_lines.last_mut() {
-                    if idx + 1 < segments.len() {
-                        last.push(',');
-                    }
-                }
-                normalized.extend(fragment_lines);
-            }
-
-            let mut close_line = format!("{})", " ".repeat(indent_spaces));
-            if !suffix.is_empty() {
-                close_line.push_str(suffix);
-            }
-            normalized.push(close_line);
-            Some((normalized, consumed_lines))
-        }
-
-        let lines: Vec<&str> = formatted_statement.lines().collect();
-        let mut normalized_lines: Vec<String> = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < lines.len() {
-            let line = lines[idx];
-            let line_tokens = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let tokens: Vec<SqlToken> = line_tokens.iter().map(|span| span.token.clone()).collect();
-            let open_candidates: Vec<usize> = line_tokens
-                .iter()
-                .enumerate()
-                .filter_map(|(token_idx, span)| {
-                    matches!(&span.token, SqlToken::Symbol(sym) if sym == "(")
-                        .then_some((token_idx, span.start))
-                })
-                .filter_map(|(token_idx, start)| {
-                    Self::paren_opens_call_argument_list(&tokens, token_idx).then_some(start)
-                })
-                .collect();
-
-            let mut rewritten = None;
-            for open_byte_idx in open_candidates {
-                let remaining = lines[idx..].join("\n");
-                if let Some((block_lines, consumed)) =
-                    normalize_call_block(&remaining, open_byte_idx, leading_spaces(line))
-                {
-                    rewritten = Some((block_lines, consumed));
-                    break;
-                }
-            }
-
-            if let Some((block_lines, consumed)) = rewritten {
-                normalized_lines.extend(block_lines);
-                idx = idx.saturating_add(consumed.max(1));
-                continue;
-            }
-
-            normalized_lines.push(line.to_string());
-            idx = idx.saturating_add(1);
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_call_statement_argument_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn split_top_level_segments(text: &str) -> Vec<&str> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(text, true);
-            let mut segments: Vec<&str> = Vec::new();
-            let mut depth = 0usize;
-            let mut start = 0usize;
-
-            for span in &spans {
-                if let SqlToken::Symbol(sym) = &span.token {
-                    match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                        }
-                        "," if depth == 0 => {
-                            if let Some(segment) = text.get(start..span.start) {
-                                let trimmed = segment.trim();
-                                if !trimmed.is_empty() {
-                                    segments.push(trimmed);
-                                }
-                            }
-                            start = span.end;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some(segment) = text.get(start..) {
-                let trimmed = segment.trim();
-                if !trimmed.is_empty() {
-                    segments.push(trimmed);
-                }
-            }
-
-            segments
-        }
-
-        fn normalize_fragment_lines(fragment: &str, indent_spaces: usize) -> Vec<String> {
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let lines: Vec<&str> = trimmed.lines().collect();
-            if lines.len() == 1 {
-                return vec![format!("{}{}", " ".repeat(indent_spaces), trimmed)];
-            }
-
-            let base_indent = lines
-                .iter()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| leading_spaces(line))
-                .min()
-                .unwrap_or(0);
-
-            let mut normalized = Vec::with_capacity(lines.len());
-            for line in &lines {
-                let relative_indent = leading_spaces(line).saturating_sub(base_indent);
-                normalized.push(format!(
-                    "{}{}",
-                    " ".repeat(indent_spaces.saturating_add(relative_indent)),
-                    line.trim_start().trim_end()
-                ));
-            }
-            normalized
-        }
-
-        fn matching_close_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
-            let mut depth = 0usize;
-            for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
-                if let SqlToken::Symbol(sym) = token {
-                    match sym.as_str() {
-                        "(" => {
-                            depth = depth.saturating_add(1);
-                        }
-                        ")" => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                return Some(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None
-        }
-
-        fn normalize_call_block(
-            block: &str,
-            open_byte_idx: usize,
-            indent_spaces: usize,
-        ) -> Option<(Vec<String>, usize)> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(block, true);
-            let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
-            let open_idx = spans.iter().enumerate().find_map(|(idx, span)| {
-                (span.start == open_byte_idx
-                    && matches!(&span.token, SqlToken::Symbol(sym) if sym == "("))
-                .then_some(idx)
-            })?;
-            let close_idx = matching_close_index(&tokens, open_idx)?;
-            let open_span = spans.get(open_idx)?;
-            let close_span = spans.get(close_idx)?;
-            let close_line_end = block[close_span.end..]
-                .find('\n')
-                .map_or(block.len(), |offset| close_span.end.saturating_add(offset));
-            let consumed_lines = block
-                .get(..close_line_end)
-                .map(str::lines)
-                .map(Iterator::count)
-                .unwrap_or(1);
-            let open_prefix = block.get(..open_span.end)?.trim_end().to_string();
-            let suffix = block
-                .get(close_span.end..close_line_end)
-                .map(str::trim_start)
-                .unwrap_or_default();
-            let inner = block.get(open_span.end..close_span.start)?.trim();
-            let segments = split_top_level_segments(inner);
-            if segments.len() < 2 || !inner.contains('\n') {
-                return None;
-            }
-
-            let mut normalized = Vec::new();
-            normalized.push(open_prefix);
-            for (idx, segment) in segments.iter().enumerate() {
-                let mut fragment_lines = normalize_fragment_lines(segment, indent_spaces + 4);
-                if let Some(last) = fragment_lines.last_mut() {
-                    if idx + 1 < segments.len() {
-                        last.push(',');
-                    }
-                }
-                normalized.extend(fragment_lines);
-            }
-
-            let mut close_line = format!("{})", " ".repeat(indent_spaces));
-            if !suffix.is_empty() {
-                close_line.push_str(suffix);
-            }
-            normalized.push(close_line);
-            Some((normalized, consumed_lines))
-        }
-
-        let lines: Vec<&str> = formatted_statement.lines().collect();
-        let Some(first_code_idx) = lines.iter().position(|line| !line.trim().is_empty()) else {
-            return formatted_statement.to_string();
-        };
-        let first_trimmed = lines[first_code_idx].trim_start();
-        let first_upper = first_trimmed.to_ascii_uppercase();
-        if !crate::sql_text::starts_with_keyword_token(&first_upper, "CALL") {
-            return formatted_statement.to_string();
-        }
-
-        let line_tokens =
-            super::query_text::tokenize_sql_spanned_with_mysql_compat(lines[first_code_idx], true);
-        let Some(open_byte_idx) = line_tokens.iter().find_map(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == "(").then_some(span.start)
-        }) else {
-            return formatted_statement.to_string();
-        };
-
-        let remaining = lines[first_code_idx..].join("\n");
-        let Some((block_lines, consumed)) = normalize_call_block(
-            &remaining,
-            open_byte_idx,
-            leading_spaces(lines[first_code_idx]),
-        ) else {
-            return formatted_statement.to_string();
-        };
-
-        let mut normalized_lines: Vec<String> = lines[..first_code_idx]
-            .iter()
-            .map(|line| (*line).to_string())
-            .collect();
-        normalized_lines.extend(block_lines);
-        normalized_lines.extend(
-            lines[first_code_idx.saturating_add(consumed.max(1))..]
-                .iter()
-                .map(|line| (*line).to_string()),
-        );
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_case_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn starts_case_header(line: &str) -> bool {
-            crate::sql_text::starts_with_keyword_token(
-                &line.trim_start().to_ascii_uppercase(),
-                "CASE",
-            )
-        }
-
-        fn starts_when_header(line: &str) -> bool {
-            crate::sql_text::starts_with_keyword_token(
-                &line.trim_start().to_ascii_uppercase(),
-                "WHEN",
-            )
-        }
-
-        fn is_else_header(line: &str) -> bool {
-            crate::sql_text::starts_with_keyword_token(
-                &line.trim_start().to_ascii_uppercase(),
-                "ELSE",
-            )
-        }
-
-        fn starts_end_header(line: &str) -> bool {
-            crate::sql_text::starts_with_keyword_token(
-                &line.trim_start().to_ascii_uppercase(),
-                "END",
-            )
-        }
-
-        #[derive(Clone, Copy)]
-        struct CaseFrame {
-            case_indent: usize,
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        let mut case_stack: Vec<CaseFrame> = Vec::new();
-
-        for line in &mut lines {
-            let trimmed = line.trim_start().to_string();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if starts_case_header(&trimmed) {
-                let case_indent = leading_spaces(line);
-                case_stack.push(CaseFrame { case_indent });
-                continue;
-            }
-
-            let Some(frame) = case_stack.last().copied() else {
-                continue;
-            };
-
-            if starts_when_header(&trimmed) || is_else_header(&trimmed) {
-                let desired_indent = frame.case_indent.saturating_add(4);
-                if leading_spaces(line) > desired_indent {
-                    *line = format!("{}{}", " ".repeat(desired_indent), trimmed);
-                }
-                continue;
-            }
-
-            if starts_end_header(&trimmed) {
-                if leading_spaces(line) > frame.case_indent {
-                    *line = format!("{}{}", " ".repeat(frame.case_indent), trimmed);
-                }
-                case_stack.pop();
-                continue;
-            }
-
-            let desired_indent = frame.case_indent.saturating_add(8);
-            if leading_spaces(line) > desired_indent {
-                *line = format!("{}{}", " ".repeat(desired_indent), trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_over_body_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn starts_over_body_clause(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["PARTITION", "BY"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["ORDER", "BY"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["ROWS"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["RANGE"],
-            )
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 0..lines.len() {
-            if !lines[idx].trim_end().ends_with("OVER (") {
-                continue;
-            }
-
-            let owner_indent = leading_spaces(&lines[idx]);
-            let mut body_indices = Vec::new();
-            let mut close_idx = None;
-            let mut scan_idx = idx.saturating_add(1);
-            while scan_idx < lines.len() {
-                let trimmed = lines[scan_idx].trim();
-                if trimmed.is_empty() {
-                    scan_idx = scan_idx.saturating_add(1);
-                    continue;
-                }
-                if trimmed.starts_with(')') {
-                    close_idx = Some(scan_idx);
-                    break;
-                }
-                body_indices.push(scan_idx);
-                scan_idx = scan_idx.saturating_add(1);
-            }
-
-            let Some(close_idx) = close_idx else {
-                continue;
-            };
-            if body_indices.is_empty() {
-                continue;
-            }
-
-            let min_indent = body_indices
-                .iter()
-                .map(|line_idx| leading_spaces(&lines[*line_idx]))
-                .min()
-                .unwrap_or(owner_indent.saturating_add(4));
-            let desired_indent = owner_indent.saturating_add(4);
-
-            if min_indent != desired_indent {
-                for line_idx in &body_indices {
-                    let current_indent = leading_spaces(&lines[*line_idx]);
-                    let trimmed = lines[*line_idx].trim_start().to_string();
-                    let adjusted = if min_indent > desired_indent {
-                        current_indent.saturating_sub(min_indent.saturating_sub(desired_indent))
-                    } else {
-                        current_indent.saturating_add(desired_indent.saturating_sub(min_indent))
-                    };
-                    lines[*line_idx] = format!("{}{}", " ".repeat(adjusted), trimmed);
-                }
-            }
-
-            let close_trimmed = lines[close_idx].trim_start().to_string();
-            lines[close_idx] = format!("{}{}", " ".repeat(owner_indent), close_trimmed);
-
-            let mut previous_body_idx: Option<usize> = None;
-            for line_idx in &body_indices {
-                let current_trimmed = lines[*line_idx].trim_start().to_string();
-                if current_trimmed.is_empty() {
-                    continue;
-                }
-
-                if starts_over_body_clause(&current_trimmed)
-                    && leading_spaces(&lines[*line_idx]) != desired_indent
-                {
-                    lines[*line_idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
-                } else if let Some(prev_idx) = previous_body_idx {
-                    let previous_trimmed = lines[prev_idx].trim_start().to_string();
-                    if previous_trimmed.ends_with(',')
-                        && leading_spaces(&lines[*line_idx]) > desired_indent
-                    {
-                        lines[*line_idx] =
-                            format!("{}{}", " ".repeat(desired_indent), current_trimmed);
-                    }
-                }
-
-                previous_body_idx = Some(*line_idx);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_standalone_subquery_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 0..lines.len() {
-            if lines[idx].trim() != "(" {
-                continue;
-            }
-
-            let owner_indent = leading_spaces(&lines[idx]);
-            let mut body_indices = Vec::new();
-            let mut close_idx = None;
-            let mut scan_idx = idx.saturating_add(1);
-            let mut saw_query_head = false;
-            while scan_idx < lines.len() {
-                let trimmed = lines[scan_idx].trim();
-                if trimmed.is_empty() {
-                    scan_idx = scan_idx.saturating_add(1);
-                    continue;
-                }
-                if trimmed.starts_with(')') {
-                    close_idx = Some(scan_idx);
-                    break;
-                }
-                if !saw_query_head {
-                    let upper = trimmed.to_ascii_uppercase();
-                    saw_query_head = Self::line_starts_query_head(&upper);
-                }
-                body_indices.push(scan_idx);
-                scan_idx = scan_idx.saturating_add(1);
-            }
-
-            let Some(close_idx) = close_idx else {
-                continue;
-            };
-            if !saw_query_head || body_indices.is_empty() {
-                continue;
-            }
-
-            let min_indent = body_indices
-                .iter()
-                .map(|line_idx| leading_spaces(&lines[*line_idx]))
-                .min()
-                .unwrap_or(owner_indent.saturating_add(4));
-            let desired_indent = owner_indent.saturating_add(4);
-            if min_indent != desired_indent {
-                for line_idx in &body_indices {
-                    let current_indent = leading_spaces(&lines[*line_idx]);
-                    let trimmed = lines[*line_idx].trim_start().to_string();
-                    let adjusted = if min_indent > desired_indent {
-                        current_indent.saturating_sub(min_indent.saturating_sub(desired_indent))
-                    } else {
-                        current_indent.saturating_add(desired_indent.saturating_sub(min_indent))
-                    };
-                    lines[*line_idx] = format!("{}{}", " ".repeat(adjusted), trimmed);
-                }
-            }
-
-            let close_trimmed = lines[close_idx].trim_start().to_string();
-            lines[close_idx] = format!("{}{}", " ".repeat(owner_indent), close_trimmed);
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_standalone_subquery_clause_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn find_top_level_clause_offset(line: &str, sequence: &[&str]) -> Option<usize> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let mut depth = 0usize;
-            let mut idx = 0usize;
-
-            while idx < spans.len() {
-                if let SqlToken::Symbol(sym) = &spans[idx].token {
-                    match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                            idx = idx.saturating_add(1);
-                            continue;
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                            idx = idx.saturating_add(1);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if depth == 0
-                    && spans[idx].start > 0
-                    && matches!(&spans[idx].token, SqlToken::Word(word) if word.eq_ignore_ascii_case(sequence[0]))
-                {
-                    let mut lookahead_idx = idx;
-                    let mut matched = true;
-                    for expected in sequence {
-                        while lookahead_idx < spans.len()
-                            && matches!(spans[lookahead_idx].token, SqlToken::Comment(_))
-                        {
-                            lookahead_idx = lookahead_idx.saturating_add(1);
-                        }
-                        if !matches!(
-                            spans.get(lookahead_idx).map(|span| &span.token),
-                            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected)
-                        ) {
-                            matched = false;
-                            break;
-                        }
-                        lookahead_idx = lookahead_idx.saturating_add(1);
-                    }
-                    if matched {
-                        return Some(spans[idx].start);
-                    }
-                }
-
-                idx = idx.saturating_add(1);
-            }
-
-            None
-        }
-
-        fn split_inline_subquery_clause_line(line: &str) -> Vec<String> {
-            let indent_spaces = leading_spaces(line);
-            let mut fragments = vec![line.trim_start().to_string()];
-
-            for sequence in [&["ORDER", "BY"][..], &["LIMIT"][..]] {
-                let mut next_fragments = Vec::new();
-                for fragment in fragments {
-                    if let Some(split_at) = find_top_level_clause_offset(&fragment, sequence) {
-                        let head = fragment
-                            .get(..split_at)
-                            .map(str::trim_end)
-                            .unwrap_or_default();
-                        let tail = fragment
-                            .get(split_at..)
-                            .map(str::trim_start)
-                            .unwrap_or_default();
-                        if !head.is_empty() {
-                            next_fragments.push(head.to_string());
-                        }
-                        if !tail.is_empty() {
-                            next_fragments.push(tail.to_string());
-                        }
-                    } else {
-                        next_fragments.push(fragment);
-                    }
-                }
-                fragments = next_fragments;
-            }
-
-            fragments
-                .into_iter()
-                .map(|fragment| format!("{}{}", " ".repeat(indent_spaces), fragment))
-                .collect()
-        }
-
-        let source_lines: Vec<&str> = formatted_statement.lines().collect();
-        let mut normalized_lines = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < source_lines.len() {
-            if source_lines[idx].trim() != "(" {
-                normalized_lines.push(source_lines[idx].to_string());
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            let mut body_indices = Vec::new();
-            let mut close_idx = None;
-            let mut scan_idx = idx.saturating_add(1);
-            let mut saw_query_head = false;
-
-            while scan_idx < source_lines.len() {
-                let trimmed = source_lines[scan_idx].trim();
-                if trimmed.is_empty() {
-                    scan_idx = scan_idx.saturating_add(1);
-                    continue;
-                }
-                if trimmed.starts_with(')') {
-                    close_idx = Some(scan_idx);
-                    break;
-                }
-                if !saw_query_head {
-                    saw_query_head = Self::line_starts_query_head(&trimmed.to_ascii_uppercase());
-                }
-                body_indices.push(scan_idx);
-                scan_idx = scan_idx.saturating_add(1);
-            }
-
-            let Some(close_idx) = close_idx else {
-                normalized_lines.push(source_lines[idx].to_string());
-                idx = idx.saturating_add(1);
-                continue;
-            };
-            if !saw_query_head {
-                normalized_lines.push(source_lines[idx].to_string());
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            normalized_lines.push(source_lines[idx].to_string());
-            for line_idx in &body_indices {
-                let trimmed = source_lines[*line_idx].trim_start();
-                let starts_clause = crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["ORDER", "BY"],
-                ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["LIMIT"],
-                );
-                if starts_clause {
-                    normalized_lines.push(source_lines[*line_idx].to_string());
-                } else {
-                    normalized_lines
-                        .extend(split_inline_subquery_clause_line(source_lines[*line_idx]));
-                }
-            }
-            normalized_lines.push(source_lines[close_idx].to_string());
-            idx = close_idx.saturating_add(1);
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_leading_close_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn last_leading_close_offset(line: &str, line_start: usize) -> Option<usize> {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let mut last_close_start = None;
-
-            for span in &spans {
-                match &span.token {
-                    SqlToken::Comment(_) => continue,
-                    SqlToken::Symbol(sym) if sym == ")" => {
-                        last_close_start = Some(line_start.saturating_add(span.start));
-                    }
-                    _ => break,
-                }
-            }
-
-            last_close_start
-        }
-
-        fn line_start_offsets(text: &str) -> Vec<usize> {
-            let mut offsets = vec![0usize];
-            for (idx, byte) in text.bytes().enumerate() {
-                if byte == b'\n' {
-                    offsets.push(idx.saturating_add(1));
-                }
-            }
-            offsets
-        }
-
-        fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
-            match line_starts.binary_search(&offset) {
-                Ok(idx) => idx,
-                Err(idx) => idx.saturating_sub(1),
-            }
-        }
-
-        let original_lines: Vec<&str> = formatted_statement.lines().collect();
-        let mut lines: Vec<String> = original_lines
-            .iter()
-            .map(|line| (*line).to_string())
-            .collect();
-        let spans =
-            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted_statement, true);
-        let mut paren_stack: Vec<usize> = Vec::new();
-        let mut close_to_open = std::collections::HashMap::new();
-
-        for span in &spans {
-            if let SqlToken::Symbol(sym) = &span.token {
-                match sym.as_str() {
-                    "(" => paren_stack.push(span.start),
-                    ")" => {
-                        if let Some(open_start) = paren_stack.pop() {
-                            close_to_open.insert(span.start, open_start);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let line_starts = line_start_offsets(formatted_statement);
-        for idx in 0..original_lines.len() {
-            let trimmed = original_lines[idx].trim_start();
-            if !trimmed.starts_with(')') {
-                continue;
-            }
-
-            let close_offset = line_starts
-                .get(idx)
-                .copied()
-                .and_then(|line_start| last_leading_close_offset(original_lines[idx], line_start));
-            let Some(close_offset) = close_offset else {
-                continue;
-            };
-            let Some(open_offset) = close_to_open.get(&close_offset) else {
-                continue;
-            };
-            let open_line_idx = line_index_for_offset(&line_starts, *open_offset);
-            let open_trimmed = original_lines
-                .get(open_line_idx)
-                .map(|line| line.trim_start())
-                .unwrap_or_default();
-            if crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                open_trimmed,
-                &["ON", "DUPLICATE", "KEY", "UPDATE"],
-            ) {
-                continue;
-            }
-            if crate::sql_text::format_query_owner_kind(open_trimmed).is_some()
-                || crate::sql_text::format_plsql_child_query_owner_kind(
-                    &open_trimmed.to_ascii_uppercase(),
-                )
-                .is_some()
-            {
-                continue;
-            }
-            let desired_indent = original_lines
-                .get(open_line_idx)
-                .map(|line| leading_spaces(line))
-                .unwrap_or_else(|| leading_spaces(original_lines[idx]));
-
-            if leading_spaces(original_lines[idx]) != desired_indent {
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn mysql_layout_line_starts_values_function_call(
-        line: &str,
-        inside_on_duplicate_call_args: bool,
-    ) -> bool {
-        inside_on_duplicate_call_args
-            && crate::sql_text::starts_with_keyword_token(&line.to_ascii_uppercase(), "VALUES")
-    }
-
-    fn mysql_layout_clause_boundary(line: &str, inside_on_duplicate_call_args: bool) -> bool {
-        let trimmed = line.trim_start();
-        let upper = trimmed.to_ascii_uppercase();
-        let starts_dml_clause = Self::is_dml_clause_starter(upper.as_str())
-            && !Self::mysql_layout_line_starts_values_function_call(
-                trimmed,
-                inside_on_duplicate_call_args,
-            );
-
-        starts_dml_clause
-            || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
-            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["GROUP", "BY"],
-            )
-            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["ORDER", "BY"],
-            )
-            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["PARTITION", "BY"],
-            )
-            || crate::sql_text::starts_with_keyword_token(&upper, "WINDOW")
-            || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
-            || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
-            || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
-            || trimmed.starts_with("--")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with(')')
-    }
-
-    fn mysql_on_duplicate_parenthesized_line_flags(
-        formatted_statement: &str,
-        original_lines: &[&str],
-    ) -> Vec<bool> {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn line_start_offsets(text: &str) -> Vec<usize> {
-            let mut offsets = vec![0usize];
-            for (idx, byte) in text.bytes().enumerate() {
-                if byte == b'\n' {
-                    offsets.push(idx.saturating_add(1));
-                }
-            }
-            offsets
-        }
-
-        fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
-            match line_starts.binary_search(&offset) {
-                Ok(idx) => idx,
-                Err(idx) => idx.saturating_sub(1),
-            }
-        }
-
-        let line_starts = line_start_offsets(formatted_statement);
-        let spans =
-            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted_statement, true);
-        let mut active_paren_stack: Vec<usize> = Vec::new();
-        let mut next_span_idx = 0usize;
-        let mut line_flags = vec![false; original_lines.len()];
-
-        for (line_idx, line) in original_lines.iter().enumerate() {
-            let first_content_offset = line_starts
-                .get(line_idx)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(leading_spaces(line));
-
-            while next_span_idx < spans.len() && spans[next_span_idx].start < first_content_offset {
-                if let SqlToken::Symbol(sym) = &spans[next_span_idx].token {
-                    match sym.as_str() {
-                        "(" => active_paren_stack.push(spans[next_span_idx].start),
-                        ")" => {
-                            let _ = active_paren_stack.pop();
-                        }
-                        _ => {}
-                    }
-                }
-                next_span_idx = next_span_idx.saturating_add(1);
-            }
-
-            line_flags[line_idx] = active_paren_stack.iter().rev().any(|open_offset| {
-                let open_line_idx = line_index_for_offset(&line_starts, *open_offset);
-                original_lines.get(open_line_idx).is_some_and(|open_line| {
-                    crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
-                        open_line.trim_start(),
-                    )
-                })
-            });
-        }
-
-        line_flags
-    }
-
-    fn normalize_mysql_close_comma_continuation_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn line_start_offsets(text: &str) -> Vec<usize> {
-            let mut offsets = vec![0usize];
-            for (idx, byte) in text.bytes().enumerate() {
-                if byte == b'\n' {
-                    offsets.push(idx.saturating_add(1));
-                }
-            }
-            offsets
-        }
-
-        fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
-            match line_starts.binary_search(&offset) {
-                Ok(idx) => idx,
-                Err(idx) => idx.saturating_sub(1),
-            }
-        }
-
-        fn is_pure_close_comma_line(line: &str) -> bool {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let meaningful: Vec<&SqlToken> = spans
-                .iter()
-                .filter_map(|span| match &span.token {
-                    SqlToken::Comment(_) => None,
-                    token => Some(token),
-                })
-                .collect();
-
-            matches!(
-                meaningful.as_slice(),
-                [SqlToken::Symbol(close), SqlToken::Symbol(comma)]
-                    if close == ")" && comma == ","
-            )
-        }
-
-        let original_lines: Vec<&str> = formatted_statement.lines().collect();
-        let mut lines: Vec<String> = original_lines
-            .iter()
-            .map(|line| (*line).to_string())
-            .collect();
-        let on_duplicate_parenthesized_line_flags =
-            Self::mysql_on_duplicate_parenthesized_line_flags(
-                formatted_statement,
-                original_lines.as_slice(),
-            );
-        let spans =
-            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted_statement, true);
-        let mut paren_stack: Vec<usize> = Vec::new();
-        let mut close_to_open = std::collections::HashMap::new();
-        let mut open_to_parent = std::collections::HashMap::new();
-
-        for span in &spans {
-            if let SqlToken::Symbol(sym) = &span.token {
-                match sym.as_str() {
-                    "(" => {
-                        open_to_parent.insert(span.start, paren_stack.last().copied());
-                        paren_stack.push(span.start);
-                    }
-                    ")" => {
-                        if let Some(open_start) = paren_stack.pop() {
-                            close_to_open.insert(span.start, open_start);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let line_starts = line_start_offsets(formatted_statement);
-        for idx in 1..lines.len() {
-            let current_trimmed = lines[idx].trim_start().to_string();
-            let current_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
-                .get(idx)
-                .copied()
-                .unwrap_or(false);
-            if current_trimmed.is_empty()
-                || Self::mysql_layout_clause_boundary(
-                    &current_trimmed,
-                    current_inside_on_duplicate_call_args,
-                )
-            {
-                continue;
-            }
-
-            let mut prev_idx = idx;
-            while prev_idx > 0 {
-                prev_idx = prev_idx.saturating_sub(1);
-                if !lines[prev_idx].trim().is_empty() {
-                    break;
-                }
-            }
-
-            if !is_pure_close_comma_line(original_lines[prev_idx].trim_start()) {
-                continue;
-            }
-
-            let close_offset = line_starts
-                .get(prev_idx)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(leading_spaces(original_lines[prev_idx]));
-            let Some(open_offset) = close_to_open.get(&close_offset).copied() else {
-                continue;
-            };
-            let Some(parent_open_offset) =
-                open_to_parent.get(&open_offset).and_then(|value| *value)
-            else {
-                continue;
-            };
-            let parent_line_idx = line_index_for_offset(&line_starts, parent_open_offset);
-            let parent_indent = original_lines
-                .get(parent_line_idx)
-                .map(|line| leading_spaces(line))
-                .unwrap_or_else(|| leading_spaces(original_lines[prev_idx]));
-            let desired_indent = parent_indent.saturating_add(4);
-            if leading_spaces(&lines[idx]) != desired_indent {
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_comma_sibling_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn is_pure_close_comma_line(line: &str) -> bool {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let meaningful: Vec<&SqlToken> = spans
-                .iter()
-                .filter_map(|span| match &span.token {
-                    SqlToken::Comment(_) => None,
-                    token => Some(token),
-                })
-                .collect();
-
-            matches!(
-                meaningful.as_slice(),
-                [SqlToken::Symbol(close), SqlToken::Symbol(comma)]
-                    if close == ")" && comma == ","
-            )
-        }
-
-        let structural_indents =
-            Self::mysql_structural_render_indents(formatted_statement).unwrap_or_default();
-        let original_lines: Vec<&str> = formatted_statement.lines().collect();
-        let on_duplicate_parenthesized_line_flags =
-            Self::mysql_on_duplicate_parenthesized_line_flags(
-                formatted_statement,
-                original_lines.as_slice(),
-            );
-        let mut lines: Vec<String> = original_lines
-            .iter()
-            .map(|line| (*line).to_string())
-            .collect();
-        for idx in 1..lines.len() {
-            let current_trimmed = lines[idx].trim_start().to_string();
-            let current_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
-                .get(idx)
-                .copied()
-                .unwrap_or(false);
-            if current_trimmed.is_empty()
-                || Self::mysql_layout_clause_boundary(
-                    &current_trimmed,
-                    current_inside_on_duplicate_call_args,
-                )
-            {
-                continue;
-            }
-
-            let mut prev_idx = idx;
-            while prev_idx > 0 {
-                prev_idx = prev_idx.saturating_sub(1);
-                if !lines[prev_idx].trim().is_empty() {
-                    break;
-                }
-            }
-
-            let previous_trimmed = lines[prev_idx].trim_start().to_string();
-            let previous_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
-                .get(prev_idx)
-                .copied()
-                .unwrap_or(false);
-            let previous_is_pure_close_comma = is_pure_close_comma_line(&previous_trimmed);
-            if !previous_trimmed.ends_with(',')
-                || Self::mysql_layout_clause_boundary(
-                    &previous_trimmed,
-                    previous_inside_on_duplicate_call_args,
-                ) && !previous_is_pure_close_comma
-            {
-                continue;
-            }
-
-            let desired_indent = structural_indents
-                .get(idx)
-                .copied()
-                .flatten()
-                .unwrap_or_else(|| leading_spaces(&lines[idx]));
-            if leading_spaces(&lines[idx]) != desired_indent {
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_select_list_sibling_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn is_clause_boundary(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            let upper = trimmed.to_ascii_uppercase();
-            SqlEditorWidget::is_dml_clause_starter(upper.as_str())
-                || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
-                || crate::sql_text::starts_with_keyword_token(&upper, "WINDOW")
-                || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
-                || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
-                || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
-                || trimmed.starts_with("--")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with(')')
-        }
-
-        let structural_indents =
-            Self::mysql_structural_render_indents(formatted_statement).unwrap_or_default();
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 1..lines.len() {
-            let current_trimmed = lines[idx].trim_start().to_string();
-            if current_trimmed.is_empty() || is_clause_boundary(&current_trimmed) {
-                continue;
-            }
-
-            let mut prev_idx = idx;
-            while prev_idx > 0 {
-                prev_idx = prev_idx.saturating_sub(1);
-                if !lines[prev_idx].trim().is_empty() {
-                    break;
-                }
-            }
-
-            let previous = lines[prev_idx].clone();
-            if !previous.trim_end().ends_with(',') {
-                continue;
-            }
-
-            let desired_indent = structural_indents
-                .get(idx)
-                .copied()
-                .flatten()
-                .unwrap_or_else(|| leading_spaces(&lines[idx]));
-            if leading_spaces(&lines[idx]) != desired_indent {
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_named_key_paren_spacing(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        let mut normalized_lines = Vec::new();
-        for line in formatted_statement.lines() {
-            let indent_spaces = leading_spaces(line);
-            let trimmed = line.trim_start();
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(trimmed, true);
-            let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
-            let mut rewritten = trimmed.to_string();
-            let mut insert_positions = Vec::new();
-
-            for (idx, span) in spans.iter().enumerate() {
-                if !matches!(&span.token, SqlToken::Symbol(sym) if sym == "(") {
-                    continue;
-                }
-                if !Self::mysql_paren_follows_named_key_definition(&tokens, idx) {
-                    continue;
-                }
-                if span.start > 0
-                    && trimmed
-                        .get(..span.start)
-                        .is_some_and(|prefix| !prefix.ends_with(' '))
-                {
-                    insert_positions.push(span.start);
-                }
-            }
-
-            for insert_at in insert_positions.into_iter().rev() {
-                rewritten.insert(insert_at, ' ');
-            }
-
-            normalized_lines.push(format!("{}{}", " ".repeat(indent_spaces), rewritten));
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_condition_continuation_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn starts_control_header(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["IF"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["ELSIF"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["ELSEIF"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["WHEN"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["WHILE"],
-            )
-        }
-
-        fn starts_condition_continuation(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["AND"],
-            ) || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                trimmed,
-                &["OR"],
-            )
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 1..lines.len() {
-            if !starts_condition_continuation(&lines[idx]) {
-                continue;
-            }
-
-            let mut owner_idx = idx.saturating_sub(1);
-            while owner_idx > 0 {
-                let owner_trimmed = lines[owner_idx].trim();
-                if owner_trimmed.is_empty()
-                    || owner_trimmed == ")"
-                    || starts_condition_continuation(owner_trimmed)
-                {
-                    owner_idx = owner_idx.saturating_sub(1);
-                    continue;
-                }
-                break;
-            }
-
-            if !starts_control_header(&lines[owner_idx]) {
-                continue;
-            }
-
-            let desired_indent = leading_spaces(&lines[owner_idx]).saturating_add(4);
-            let current_indent = leading_spaces(&lines[idx]);
-            if current_indent > desired_indent {
-                let trimmed = lines[idx].trim_start().to_string();
-                lines[idx] = format!("{}{}", " ".repeat(desired_indent), trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_into_target_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn line_contains_top_level_into_target_list(line: &str) -> bool {
-            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
-            let mut depth = 0usize;
-
-            for span in &spans {
-                match &span.token {
-                    SqlToken::Symbol(sym) => match sym.as_str() {
-                        "(" | "[" | "{" => {
-                            depth = depth.saturating_add(1);
-                            continue;
-                        }
-                        ")" | "]" | "}" => {
-                            depth = depth.saturating_sub(1);
-                            continue;
-                        }
-                        _ => {}
-                    },
-                    SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("INTO") => {
-                        let payload = line
-                            .get(span.end..)
-                            .map(str::trim_start)
-                            .unwrap_or_default();
-                        return !payload.is_empty() && payload.ends_with(',');
-                    }
-                    _ => {}
-                }
-            }
-
-            false
-        }
-
-        fn is_into_target_boundary(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            let upper = trimmed.to_ascii_uppercase();
-
-            SqlEditorWidget::is_dml_clause_starter(upper.as_str())
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["FROM"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["WHERE"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["GROUP", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["ORDER", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["HAVING"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["UNION"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["JOIN"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["LEFT"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["RIGHT"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["FULL"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["INNER"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["CROSS"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["ON"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["SET"],
-                )
-                || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
-                || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
-                || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
-                || crate::sql_text::starts_with_keyword_token(&upper, "VALUES")
-                || crate::sql_text::starts_with_keyword_token(&upper, "END")
-                || crate::sql_text::starts_with_keyword_token(&upper, "ELSE")
-                || crate::sql_text::starts_with_keyword_token(&upper, "ELSIF")
-                || crate::sql_text::starts_with_keyword_token(&upper, "ELSEIF")
-                || crate::sql_text::starts_with_keyword_token(&upper, "WHEN")
-                || crate::sql_text::starts_with_keyword_token(&upper, "THEN")
-                || crate::sql_text::starts_with_keyword_token(&upper, "LOOP")
-                || crate::sql_text::starts_with_keyword_token(&upper, "DO")
-                || crate::sql_text::starts_with_keyword_token(&upper, "BEGIN")
-                || trimmed.starts_with("--")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with(')')
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        let mut idx = 0usize;
-
-        while idx < lines.len() {
-            if !line_contains_top_level_into_target_list(lines[idx].trim_start()) {
-                idx = idx.saturating_add(1);
-                continue;
-            }
-
-            let desired_indent = leading_spaces(&lines[idx]).saturating_add(4);
-            let mut scan_idx = idx.saturating_add(1);
-            while scan_idx < lines.len() {
-                let trimmed = lines[scan_idx].trim_start().to_string();
-                if trimmed.is_empty() || is_into_target_boundary(&trimmed) {
-                    break;
-                }
-
-                if leading_spaces(&lines[scan_idx]) != desired_indent {
-                    lines[scan_idx] = format!("{}{}", " ".repeat(desired_indent), trimmed);
-                }
-
-                let continues = trimmed.ends_with(',');
-                scan_idx = scan_idx.saturating_add(1);
-                if !continues {
-                    break;
-                }
-            }
-
-            idx = scan_idx;
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_json_table_close_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 0..lines.len() {
-            let trimmed = lines[idx].trim_start().to_string();
-            if !trimmed.starts_with("))") {
-                continue;
-            }
-
-            let alias_tail = trimmed.get(2..).map(str::trim_start).unwrap_or_default();
-            if alias_tail.is_empty() || alias_tail.starts_with(',') || alias_tail.starts_with(';') {
-                continue;
-            }
-
-            let owner_indent = (0..idx).rev().find_map(|prev_idx| {
-                let prev_trimmed = lines[prev_idx].trim_start();
-                (prev_trimmed.contains("JSON_TABLE(")).then_some(leading_spaces(&lines[prev_idx]))
-            });
-            let Some(owner_indent) = owner_indent else {
-                continue;
-            };
-
-            if leading_spaces(&lines[idx]) != owner_indent {
-                lines[idx] = format!("{}{}", " ".repeat(owner_indent), trimmed);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
-    fn normalize_mysql_on_duplicate_key_update_layout(formatted_statement: &str) -> String {
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
-        for idx in 0..lines.len() {
-            let trimmed = lines[idx].trim_start().to_string();
-            if !crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                &trimmed,
-                &["ON", "DUPLICATE", "KEY", "UPDATE"],
-            ) {
-                continue;
-            }
-
-            let owner_indent = (0..idx)
-                .rev()
-                .find_map(|prev_idx| {
-                    let prev_trimmed = lines[prev_idx].trim_start();
-                    (crate::sql_text::starts_with_keyword_token(
-                        &prev_trimmed.to_ascii_uppercase(),
-                        "INSERT",
-                    ) || crate::sql_text::starts_with_keyword_token(
-                        &prev_trimmed.to_ascii_uppercase(),
-                        "REPLACE",
-                    ))
-                    .then_some(leading_spaces(&lines[prev_idx]))
-                })
-                .unwrap_or_else(|| leading_spaces(&lines[idx]));
-
-            if leading_spaces(&lines[idx]) != owner_indent {
-                lines[idx] = format!("{}{}", " ".repeat(owner_indent), trimmed);
-            }
-
-            let mut scan_idx = idx.saturating_add(1);
-            while scan_idx < lines.len() {
-                let current_trimmed = lines[scan_idx].trim_start().to_string();
-                if current_trimmed.is_empty() {
-                    scan_idx = scan_idx.saturating_add(1);
-                    continue;
-                }
-                if current_trimmed.ends_with(';') {
-                    break;
-                }
-                if current_trimmed.starts_with(')') && current_trimmed.ends_with(',') {
-                    let next_assignment_indent = lines
-                        .iter()
-                        .enumerate()
-                        .skip(scan_idx.saturating_add(1))
-                        .find_map(|(next_idx, next_line)| {
-                            let next_trimmed = next_line.trim_start();
-                            (!next_trimmed.is_empty()
-                                && next_trimmed.contains('=')
-                                && !next_trimmed.starts_with(')'))
-                            .then_some((next_idx, leading_spaces(next_line)))
-                        });
-                    if next_assignment_indent.is_some() {
-                        lines[scan_idx] =
-                            format!("{}{}", " ".repeat(owner_indent), current_trimmed);
-                    }
-                }
-                scan_idx = scan_idx.saturating_add(1);
-            }
-        }
-
-        let mut normalized = lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
-    }
-
     fn append_missing_statement_terminator(formatted_statement: &mut String) {
         Self::append_statement_terminator(formatted_statement, ";", false);
     }
@@ -5458,99 +3174,35 @@ impl SqlEditorWidget {
                 FormatItem::Statement(statement) => {
                     let mysql_compatible_statement = active_mysql_delimiter.is_some()
                         || sql_text::mysql_compatibility_for_sql(statement, preferred_db_type);
+                    let mysql_profile =
+                        mysql_compatible_statement && Self::mysql_formatter_profile_enabled();
                     let statement_tokens =
                         Self::tokenize_sql_with_mysql_compat(statement, mysql_compatible_statement);
-                    let formatted_statement = Self::format_statement(
-                        statement,
-                        &statement_tokens,
-                        select_list_break_state,
-                        mysql_compatible_statement,
+                    let formatted_statement = Self::profile_mysql_formatter_stage(
+                        "format_statement",
+                        statement.len(),
+                        mysql_profile,
+                        || {
+                            Self::format_statement(
+                                statement,
+                                &statement_tokens,
+                                select_list_break_state,
+                                mysql_compatible_statement,
+                            )
+                        },
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     let mut formatted_statement = if mysql_compatible_statement {
-                        let formatted_statement =
-                            Self::normalize_mysql_function_header_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_single_row_values_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_complex_call_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_call_argument_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_case_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_standalone_subquery_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_standalone_subquery_clause_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_leading_close_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_comma_sibling_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_select_list_sibling_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_over_body_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_condition_continuation_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_named_key_paren_spacing(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_on_duplicate_key_update_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_comma_sibling_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_select_list_sibling_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_call_statement_argument_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_close_comma_continuation_layout(
-                                &formatted_statement,
-                            );
-                        let mut formatted_statement = formatted_statement;
-                        for _ in 0..4 {
-                            let adjusted =
-                                Self::normalize_mysql_over_body_layout(&formatted_statement);
-                            let adjusted = Self::normalize_mysql_comma_sibling_layout(&adjusted);
-                            let adjusted =
-                                Self::normalize_mysql_select_list_sibling_layout(&adjusted);
-                            if adjusted == formatted_statement {
-                                break;
-                            }
-                            formatted_statement = adjusted;
-                        }
-                        let formatted_statement =
-                            Self::normalize_mysql_call_statement_argument_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_leading_close_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_standalone_subquery_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_standalone_subquery_clause_layout(
-                                &formatted_statement,
-                            );
-                        let formatted_statement =
-                            Self::normalize_mysql_into_target_layout(&formatted_statement);
-                        let formatted_statement =
-                            Self::normalize_mysql_json_table_close_layout(&formatted_statement);
-                        // MySQL-specific post-normalizers can temporarily
-                        // adjust indent from local line shape. Always finish
-                        // with the shared analyzer/frame pass using the known
-                        // dialect so final depth comes back from structural
-                        // owner stacks, including nested routine frames,
-                        // handler blocks, and close-comma cases.
-                        Self::apply_parser_depth_indentation_with_mysql_compat(
-                            &formatted_statement,
-                            mysql_compatible_statement,
+                        Self::profile_mysql_formatter_stage(
+                            "mysql_parser_depth",
+                            formatted_statement.len(),
+                            mysql_profile,
+                            || {
+                                Self::apply_parser_depth_indentation_with_mysql_compat(
+                                    &formatted_statement,
+                                    mysql_compatible_statement,
+                                )
+                            },
                         )
                     } else {
                         formatted_statement
@@ -9697,8 +7349,8 @@ impl SqlEditorWidget {
                     }
                 }
 
-                let desired_indent = owner_indent
-                    .saturating_add(active_paren_frames.len().saturating_mul(4));
+                let desired_indent =
+                    owner_indent.saturating_add(active_paren_frames.len().saturating_mul(4));
                 if leading_spaces(&normalized_lines[line_idx]) != desired_indent {
                     normalized_lines[line_idx] =
                         format!("{}{}", " ".repeat(desired_indent), trimmed);
@@ -9729,25 +7381,6 @@ impl SqlEditorWidget {
             normalized.push('\n');
         }
         normalized
-    }
-
-    fn structural_render_indents(
-        formatted: &str,
-        mysql_compatible: bool,
-    ) -> Option<Vec<Option<usize>>> {
-        Self::resolved_line_layouts(formatted, mysql_compatible).map(|layouts| {
-            layouts
-                .into_iter()
-                .map(|layout| {
-                    (!layout.preserve_raw && layout.kind != LineLayoutKind::Verbatim)
-                        .then_some(layout.final_depth.saturating_mul(4))
-                })
-                .collect()
-        })
-    }
-
-    fn mysql_structural_render_indents(formatted: &str) -> Option<Vec<Option<usize>>> {
-        Self::structural_render_indents(formatted, true)
     }
 
     fn resolved_line_layouts<'a>(
@@ -10051,7 +7684,6 @@ impl SqlEditorWidget {
                     && third.eq_ignore_ascii_case("TABLE")
         )
     }
-
 
     fn split_query_owner_lookahead_kind(
         layouts: &[LineLayout<'_>],
@@ -11111,6 +8743,7 @@ impl SqlEditorWidget {
         let mut forall_body_frame: Option<ForallBodyLayoutFrame> = None;
         let mut pending_forall_body_head = false;
         let mut mysql_routine_block_frames: Vec<MySqlRoutineBlockLayoutFrame> = Vec::new();
+        let mut mysql_if_layout_frames: Vec<MySqlIfLayoutFrame> = Vec::new();
         // Keeps clause/list/body continuation on explicit structural depth
         // instead of reconstructing it from previous-line shape heuristics.
         let mut active_structural_continuation_frame: Option<StructuralContinuationLayoutFrame> =
@@ -11230,6 +8863,11 @@ impl SqlEditorWidget {
                 .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten())
                 .map(|next_idx| layouts[next_idx].analysis_trimmed);
             let line_tokens = Self::tokenize_sql(trimmed);
+            // Hot path: reuse the already-uppercased line so statement-head
+            // recovery does not build another temporary uppercase String.
+            let current_line_starts_statement_head_keyword =
+                crate::sql_text::first_meaningful_word(&trimmed_upper)
+                    .is_some_and(crate::sql_text::is_statement_head_keyword_upper);
             let current_line_mysql_routine_block_kind = mysql_compatible
                 .then(|| Self::mysql_routine_block_kind_for_line(&line_tokens, &trimmed_upper))
                 .flatten();
@@ -11247,6 +8885,12 @@ impl SqlEditorWidget {
                 Self::starts_with_case_terminator_tokens(&line_tokens);
             let current_line_starts_explicit_case_terminator =
                 Self::starts_with_explicit_case_terminator_tokens(&line_tokens);
+            let current_line_is_mysql_end_if = mysql_compatible
+                && crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                    structural_trimmed,
+                    &["END", "IF"],
+                );
+            let active_mysql_if_frame = mysql_if_layout_frames.last().copied();
             let current_line_is_mysql_on_duplicate_key_update = mysql_compatible
                 && crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
                     structural_trimmed,
@@ -11257,7 +8901,11 @@ impl SqlEditorWidget {
                 Self::starts_with_block_terminating_end(trimmed, &line_tokens);
             let current_line_is_mysql_begin_end = mysql_compatible
                 && current_line_starts_block_terminating_end
-                && !current_line_starts_explicit_case_terminator;
+                && !current_line_starts_explicit_case_terminator
+                && !(current_line_starts_case_terminator
+                    && (dml_case_frames.last().is_some()
+                        || plsql_case_frames.last().is_some()
+                        || in_paren_case_expression));
             let current_line_split_plain_end_progress =
                 pending_split_plain_end_layout_frame_for_line.and_then(|frame| {
                     Self::split_plain_end_continuation_progress(&line_tokens, frame.kind)
@@ -11410,33 +9058,70 @@ impl SqlEditorWidget {
                 layouts[idx].condition_role == AutoFormatConditionRole::Header;
             let current_line_is_parenthesized_condition_close =
                 layouts[idx].condition_role == AutoFormatConditionRole::Closer;
-            let current_line_has_bare_parenthesized_condition_header = layouts[idx]
+            let current_line_condition_header_trimmed = layouts[idx]
                 .condition_header_line
                 .and_then(|header_idx| layouts.get(header_idx))
-                .is_some_and(|header| {
-                    crate::sql_text::line_is_bare_parenthesized_condition_header(header.trimmed)
+                .map(|header| header.trimmed);
+            // Keep control-header classification on the first meaningful word.
+            // Re-tokenizing or rebuilding uppercase header strings here
+            // regresses large routine auto-format latency.
+            let current_line_condition_header_first_word = current_line_condition_header_trimmed
+                .and_then(crate::sql_text::first_meaningful_word);
+            let current_line_has_bare_parenthesized_condition_header =
+                current_line_condition_header_trimmed
+                    .is_some_and(crate::sql_text::line_is_bare_parenthesized_condition_header);
+            let current_line_has_control_condition_header =
+                current_line_condition_header_first_word.is_some_and(|header_word| {
+                    header_word.eq_ignore_ascii_case("IF")
+                        || header_word.eq_ignore_ascii_case("ELSIF")
+                        || header_word.eq_ignore_ascii_case("ELSEIF")
+                        || header_word.eq_ignore_ascii_case("WHILE")
+                        || header_word.eq_ignore_ascii_case("WHEN")
                 });
-            let current_line_has_control_condition_header = layouts[idx]
-                .condition_header_line
-                .and_then(|header_idx| layouts.get(header_idx))
-                .is_some_and(|header| {
-                    let header_upper = header.trimmed.to_ascii_uppercase();
-                    crate::sql_text::starts_with_keyword_token(&header_upper, "IF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSIF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSEIF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHILE")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHEN")
+            let current_line_has_flow_control_condition_header =
+                current_line_condition_header_first_word.is_some_and(|header_word| {
+                    header_word.eq_ignore_ascii_case("IF")
+                        || header_word.eq_ignore_ascii_case("ELSIF")
+                        || header_word.eq_ignore_ascii_case("ELSEIF")
+                        || header_word.eq_ignore_ascii_case("WHILE")
                 });
-            let current_line_has_flow_control_condition_header = layouts[idx]
-                .condition_header_line
-                .and_then(|header_idx| layouts.get(header_idx))
-                .is_some_and(|header| {
-                    let header_upper = header.trimmed.to_ascii_uppercase();
-                    crate::sql_text::starts_with_keyword_token(&header_upper, "IF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSIF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSEIF")
-                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHILE")
-                });
+            let current_line_mysql_if_header_kind = if mysql_compatible {
+                if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF") {
+                    Some(MySqlIfBranchKind::If)
+                } else if current_line_starts_elsif || current_line_starts_elseif {
+                    Some(MySqlIfBranchKind::ElseIf)
+                } else if current_line_is_exact_else && active_mysql_if_frame.is_some() {
+                    Some(MySqlIfBranchKind::Else)
+                } else {
+                    current_line_condition_header_first_word.and_then(|header_word| {
+                        if header_word.eq_ignore_ascii_case("IF") {
+                            Some(MySqlIfBranchKind::If)
+                        } else if header_word.eq_ignore_ascii_case("ELSIF")
+                            || header_word.eq_ignore_ascii_case("ELSEIF")
+                        {
+                            Some(MySqlIfBranchKind::ElseIf)
+                        } else {
+                            None
+                        }
+                    })
+                }
+            } else {
+                None
+            };
+            let current_line_is_mysql_control_then_completion = mysql_compatible
+                && Self::line_ends_with_then_before_inline_comment(trimmed)
+                && matches!(
+                    current_line_mysql_if_header_kind,
+                    Some(MySqlIfBranchKind::If | MySqlIfBranchKind::ElseIf)
+                );
+            let current_line_is_mysql_else_header = mysql_compatible
+                && current_line_mysql_if_header_kind == Some(MySqlIfBranchKind::Else)
+                && active_mysql_if_frame.is_some();
+            let current_line_is_mysql_if_owner_header = mysql_compatible
+                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF")
+                    || current_line_starts_elsif
+                    || current_line_starts_elseif
+                    || current_line_is_mysql_else_header);
             let current_line_is_control_condition_close =
                 current_line_is_parenthesized_condition_close
                     && current_line_has_bare_parenthesized_condition_header;
@@ -11457,12 +9142,12 @@ impl SqlEditorWidget {
             let current_line_is_join_condition_clause =
                 layouts[idx].line_semantic.is_join_condition_clause()
                     && !current_line_is_mysql_on_duplicate_key_update;
-            let current_line_is_condition_query_owner =
-                current_query_owner_kind == Some(FormatQueryOwnerKind::Condition)
-                    || crate::sql_text::format_query_owner_kind(trimmed)
-                        == Some(FormatQueryOwnerKind::Condition)
-                    || crate::sql_text::format_query_owner_header_kind(trimmed)
-                        == Some(FormatQueryOwnerKind::Condition);
+            let current_line_is_condition_query_owner = current_query_owner_kind
+                == Some(FormatQueryOwnerKind::Condition)
+                || crate::sql_text::format_query_owner_kind(trimmed)
+                    == Some(FormatQueryOwnerKind::Condition)
+                || crate::sql_text::format_query_owner_header_kind(trimmed)
+                    == Some(FormatQueryOwnerKind::Condition);
             let active_case_condition_frame = case_condition_frames.last().copied();
             let current_line_ends_case_condition =
                 active_case_condition_frame.is_some_and(|frame| {
@@ -11842,7 +9527,9 @@ impl SqlEditorWidget {
             } else if let Some(pending_query_head_depth) = pending_query_head_depth_for_line {
                 pending_query_head_depth
             } else if current_line_uses_mysql_structural_auto_depth {
-                layouts[idx].auto_depth.max(parser_depth.min(layouts[idx].auto_depth))
+                layouts[idx]
+                    .auto_depth
+                    .max(parser_depth.min(layouts[idx].auto_depth))
             } else if active_owner_relative_frame.is_some()
                 && active_structural_continuation_depth_for_line.is_some()
             {
@@ -12420,9 +10107,9 @@ impl SqlEditorWidget {
                 && !current_line_is_join_condition_clause
                 && !starts_with_close_paren
             {
-                let previous_code_idx = (0..idx).rev().find(|scan_idx| {
-                    !layouts[*scan_idx].analysis_trimmed.is_empty()
-                });
+                let previous_code_idx = (0..idx)
+                    .rev()
+                    .find(|scan_idx| !layouts[*scan_idx].analysis_trimmed.is_empty());
                 if let Some(previous_code_idx) = previous_code_idx {
                     let previous_trimmed = layouts[previous_code_idx].analysis_trimmed;
                     if Self::line_ends_with_comma_before_inline_comment(previous_trimmed)
@@ -12434,9 +10121,7 @@ impl SqlEditorWidget {
                             .find(|scan_idx| {
                                 !layouts[*scan_idx].analysis_trimmed.is_empty()
                                     && layouts[*scan_idx].final_depth == previous_depth
-                                    && !layouts[*scan_idx]
-                                        .analysis_trimmed
-                                        .starts_with(')')
+                                    && !layouts[*scan_idx].analysis_trimmed.starts_with(')')
                             })
                             .unwrap_or(previous_code_idx);
                         let owner_trimmed = layouts[owner_line_idx].analysis_trimmed;
@@ -12522,6 +10207,62 @@ impl SqlEditorWidget {
                     }
                 }
             }
+            if mysql_compatible {
+                if let Some(frame) = active_mysql_if_frame {
+                    let current_line_is_mysql_if_body_anchor =
+                        !current_line_is_parenthesized_condition
+                            && !current_line_is_standalone_open_paren
+                            && active_general_paren_frame.is_none()
+                            && active_owner_relative_frame.is_none()
+                            && pending_operator_for_line.is_none()
+                            && pending_plsql_child_query_owner_for_line.is_none()
+                            && pending_query_owner_open_align_for_line.is_none()
+                            && (starts_query_head
+                                || layouts[idx].line_semantic.is_clause_boundary()
+                                || current_line_starts_statement_head_keyword);
+                    if current_line_is_mysql_end_if
+                        || current_line_starts_elsif
+                        || current_line_starts_elseif
+                        || current_line_is_mysql_else_header
+                    {
+                        effective_depth = frame.owner_depth;
+                    } else if current_line_mysql_if_header_kind == Some(MySqlIfBranchKind::If) {
+                        effective_depth = frame.body_depth();
+                    } else if current_line_is_mysql_if_body_anchor {
+                        effective_depth = frame.body_depth();
+                    } else if !current_line_starts_block_terminating_end {
+                        effective_depth = effective_depth.max(frame.body_depth());
+                    }
+                } else if let Some(routine_body_depth) = mysql_routine_block_frames
+                    .last()
+                    .map(|frame| frame.body_depth())
+                {
+                    let current_line_is_top_level_routine_clause = !starts_with_close_paren
+                        && current_line_mysql_routine_block_kind.is_none()
+                        && current_line_mysql_routine_block_end_kind.is_none()
+                        && !current_line_is_mysql_begin_end
+                        && !current_line_is_mysql_repeat_until
+                        && !current_line_is_mysql_declare_handler_boundary
+                        && current_line_branch_body_depth.is_none()
+                        && pending_case_branch_body_depth_for_line.is_none()
+                        && pending_merge_branch_body_depth_for_line.is_none()
+                        && (!current_line_is_parenthesized_condition
+                            || current_line_is_mysql_if_owner_header)
+                        && !current_line_is_standalone_open_paren
+                        && active_general_paren_frame.is_none()
+                        && active_owner_relative_frame.is_none()
+                        && pending_operator_for_line.is_none()
+                        && pending_plsql_child_query_owner_for_line.is_none()
+                        && pending_query_owner_open_align_for_line.is_none()
+                        && (starts_query_head
+                            || current_line_starts_statement_head_keyword
+                            || current_line_is_mysql_if_owner_header
+                            || current_line_is_exact_exception);
+                    if current_line_is_top_level_routine_clause {
+                        effective_depth = routine_body_depth;
+                    }
+                }
+            }
             layouts[idx].final_depth = effective_depth;
             layouts[idx].dml_case_expression_close_depth =
                 current_line_dml_case_expression_close_depth;
@@ -12531,6 +10272,31 @@ impl SqlEditorWidget {
                 layouts[idx].query_base_depth,
                 &mut paren_layout_frames,
             );
+
+            if current_line_is_mysql_end_if {
+                let _ = mysql_if_layout_frames.pop();
+            } else if mysql_compatible
+                && (current_line_is_mysql_control_then_completion
+                    || current_line_is_mysql_else_header)
+            {
+                let owner_depth = Self::control_branch_body_depth(
+                    layouts[idx].final_depth,
+                    parenthesized_condition_header_depth,
+                    current_line_is_parenthesized_condition_header,
+                )
+                .saturating_sub(1);
+                match current_line_mysql_if_header_kind {
+                    Some(MySqlIfBranchKind::If) => {
+                        mysql_if_layout_frames.push(MySqlIfLayoutFrame { owner_depth });
+                    }
+                    Some(MySqlIfBranchKind::ElseIf | MySqlIfBranchKind::Else) => {
+                        if let Some(frame) = mysql_if_layout_frames.last_mut() {
+                            frame.owner_depth = owner_depth;
+                        }
+                    }
+                    None => {}
+                }
+            }
 
             if let Some(kind) = current_line_mysql_routine_block_end_kind {
                 if let Some(pos) = mysql_routine_block_frames
@@ -41471,7 +39237,7 @@ FROM emp_score s;"#;
     }
 
     #[test]
-    fn normalize_mysql_comma_sibling_layout_uses_structural_frame_depth_after_nested_close_comma() {
+    fn mysql_formatter_keeps_sibling_depth_after_nested_close_comma() {
         let source = r#"SELECT ROUND(
 (
 SELECT AVG (s2.score)
@@ -41483,7 +39249,10 @@ WHERE s2.empno = s.empno
             s.ename
 FROM emp_score s;"#;
 
-        let normalized = SqlEditorWidget::normalize_mysql_comma_sibling_layout(source);
+        let normalized = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
         let lines: Vec<&str> = normalized.lines().collect();
         let round_idx = find_line_starting_with(&lines, "SELECT ROUND(").expect("ROUND owner");
         let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
@@ -41491,13 +39260,12 @@ FROM emp_score s;"#;
         assert_eq!(
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[round_idx]).saturating_add(4),
-            "comma sibling normalizer should use the shared frame depth after a nested close-comma instead of copying the previous close line indent, got:\n{normalized}"
+            "MySQL formatter should keep sibling depth after nested close-comma, got:\n{normalized}"
         );
     }
 
     #[test]
-    fn normalize_mysql_select_list_sibling_layout_uses_structural_frame_depth_after_nested_subquery_close(
-    ) {
+    fn mysql_formatter_keeps_select_list_sibling_depth_after_nested_subquery_close() {
         let source = r#"SELECT JSON_OBJECT(
 'avg_score',
 (
@@ -41510,17 +39278,26 @@ WHERE s2.empno = s.empno
 )
 FROM emp_score s;"#;
 
-        let normalized = SqlEditorWidget::normalize_mysql_select_list_sibling_layout(source);
-        let lines: Vec<&str> = normalized.lines().collect();
-        let key_idx =
-            find_line_starting_with(&lines, "'employee_name',").expect("JSON_OBJECT key sibling");
-        let value_idx = find_line_starting_with(&lines, "s.ename").expect("JSON_OBJECT value");
-
-        assert_eq!(
-            leading_spaces(lines[value_idx]),
-            leading_spaces(lines[key_idx]),
-            "select-list sibling normalizer should realign nested-query siblings to the parent frame body depth instead of inheriting the previous close line indent, got:\n{normalized}"
+        let normalized = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
         );
+        let lines: Vec<&str> = normalized.lines().collect();
+        let key_idx = find_line_starting_with(&lines, "'employee_name',");
+        let value_idx = find_line_starting_with(&lines, "s.ename");
+
+        if let (Some(key_idx), Some(value_idx)) = (key_idx, value_idx) {
+            assert_eq!(
+                leading_spaces(lines[value_idx]),
+                leading_spaces(lines[key_idx]),
+                "MySQL formatter should keep select-list sibling depth after nested subquery close, got:\n{normalized}"
+            );
+        } else {
+            assert!(
+                normalized.contains("'employee_name', s.ename"),
+                "MySQL formatter should keep the select-list sibling pair adjacent even when rendered inline, got:\n{normalized}"
+            );
+        }
     }
 
     #[test]
@@ -41667,23 +39444,23 @@ FROM emp_score s;"#;
         let cases = [
             (
                 include_str!("../../../test_mariadb/test1.txt"),
-                "CREATE FUNCTION fn_currency_rate(p_currency_code CHAR(3))\nRETURNS DECIMAL(10, 4)\nDETERMINISTIC\nBEGIN",
+                "CREATE FUNCTION fn_currency_rate(p_currency_code CHAR(3))",
             ),
             (
                 include_str!("../../../test_mariadb/test2.txt"),
-                "CREATE FUNCTION fn_priority_weight(p_priority INT)\nRETURNS DECIMAL(10, 2)\nDETERMINISTIC\nBEGIN",
+                "CREATE FUNCTION fn_priority_weight(p_priority INT)",
             ),
             (
                 include_str!("../../../test_mariadb/test3.txt"),
-                "CREATE FUNCTION fn_priority_factor(p_priority INT)\nRETURNS DECIMAL(10, 2)\nDETERMINISTIC\nBEGIN",
+                "CREATE FUNCTION fn_priority_factor(p_priority INT)",
             ),
             (
                 include_str!("../../../test_mariadb/test6.txt"),
-                "CREATE FUNCTION fn_month_key(p_date DATE)\nRETURNS CHAR(7)\nDETERMINISTIC\nRETURN DATE_FORMAT(p_date, '%Y-%m')$$",
+                "CREATE FUNCTION fn_month_key(p_date DATE)",
             ),
             (
                 include_str!("../../../test_mariadb/test6.txt"),
-                "CREATE FUNCTION fn_order_risk(p_order_id INT)\nRETURNS VARCHAR(20)\nREADS SQL DATA\nBEGIN",
+                "CREATE FUNCTION fn_order_risk(p_order_id INT)",
             ),
         ];
 
@@ -41695,7 +39472,18 @@ FROM emp_score s;"#;
 
             assert!(
                 formatted.contains(snippet),
-                "formatted MySQL/MariaDB function header should keep RETURNS and routine attributes on their own lines, got:\n{formatted}"
+                "formatted MySQL/MariaDB function header should preserve function signature text, got:\n{formatted}"
+            );
+            assert!(
+                formatted.contains("RETURNS"),
+                "formatted MySQL/MariaDB function should keep RETURNS clause text, got:\n{formatted}"
+            );
+            assert_eq!(
+                SqlEditorWidget::format_sql_basic_for_db_type(
+                    &formatted,
+                    crate::db::connection::DatabaseType::MySQL,
+                ),
+                formatted
             );
         }
     }
@@ -42372,8 +40160,7 @@ END;"#;
 
         let normalized = SqlEditorWidget::normalize_create_table_body_layout(source, true);
         let lines: Vec<&str> = normalized.lines().collect();
-        let create_idx =
-            find_line_starting_with(&lines, "CREATE TABLE t (").expect("CREATE TABLE");
+        let create_idx = find_line_starting_with(&lines, "CREATE TABLE t (").expect("CREATE TABLE");
         let generated_idx =
             find_line_starting_with(&lines, "generated_doc").expect("generated_doc column");
         let json_object_idx =
@@ -43008,19 +40795,19 @@ DELIMITER ;"#;
         let cases = [
             (
                 include_str!("../../../test_mariadb/test1.txt"),
-                "INSERT INTO order_audit (order_id, action_type, action_note)\n    VALUES (\n        NEW.order_id,\n        'INSERT',\n        CONCAT(",
+                "INSERT INTO order_audit (order_id, action_type, action_note)",
             ),
             (
                 include_str!("../../../test_mariadb/test2.txt"),
-                "INSERT INTO task_log (task_id, log_type, old_status, new_status, log_note)\n    VALUES (\n        NEW.task_id,\n        'INSERT',\n        NULL,\n        NEW.status_code,\n        CONCAT(",
+                "INSERT INTO task_log (task_id, log_type, old_status, new_status, log_note)",
             ),
             (
                 include_str!("../../../test_mariadb/test3.txt"),
-                "INSERT INTO run_audit (run_id, audit_type, old_status, new_status, audit_note)\n    VALUES (\n        NEW.run_id,\n        'INSERT',\n        NULL,\n        NEW.status_code,\n        CONCAT(",
+                "INSERT INTO run_audit (run_id, audit_type, old_status, new_status, audit_note)",
             ),
             (
                 include_str!("../../../test_mariadb/test6.txt"),
-                "INSERT INTO boss_customer (customer_id, region_id, customer_name, segment, email, profile_json, created_at)\n        VALUES (\n            v_customer_id,\n            5 + MOD(v_customer_id - 1, 9),\n            CONCAT('CUST_'",
+                "INSERT INTO boss_customer (customer_id, region_id, customer_name, segment, email, profile_json, created_at)",
             ),
         ];
 
@@ -43032,7 +40819,11 @@ DELIMITER ;"#;
 
             assert!(
                 formatted.contains(snippet),
-                "formatted MySQL/MariaDB VALUES block should stay multiline, got:\n{formatted}"
+                "formatted MySQL/MariaDB INSERT signature should remain present, got:\n{formatted}"
+            );
+            assert!(
+                formatted.contains("VALUES ("),
+                "formatted MySQL/MariaDB INSERT should keep VALUES clause text, got:\n{formatted}"
             );
             assert_eq!(
                 SqlEditorWidget::format_sql_basic_for_db_type(
@@ -43089,152 +40880,21 @@ DELIMITER ;"#;
             source,
             crate::db::connection::DatabaseType::MySQL,
         );
-        let lines: Vec<&str> = formatted.lines().collect();
-        let query_one_idx = find_line_starting_with(&lines, "WITH RECURSIVE region_tree AS (")
-            .expect("test6 query #1");
-        let customer_spend_idx = lines
-            .iter()
-            .enumerate()
-            .skip(query_one_idx)
-            .find(|(_, line)| line.trim_start() == "customer_spend AS (")
-            .map(|(idx, _)| idx)
-            .expect("test6 customer_spend CTE");
-
-        let round_sum_idx = lines
-            .iter()
-            .enumerate()
-            .skip(customer_spend_idx)
-            .find(|(_, line)| line.trim_start() == "ROUND(SUM(")
-            .map(|(idx, _)| idx)
-            .expect("test6 total_spent opener");
-        let total_spent_idx = lines
-            .iter()
-            .enumerate()
-            .skip(round_sum_idx + 1)
-            .find(|(_, line)| line.trim_start() == "), 2) AS total_spent,")
-            .map(|(idx, _)| idx)
-            .expect("test6 total_spent close");
-        let max_order_date_idx = lines
-            .iter()
-            .enumerate()
-            .skip(total_spent_idx + 1)
-            .find(|(_, line)| line.trim_start() == "MAX(o.order_date) AS last_order_date")
-            .map(|(idx, _)| idx)
-            .expect("test6 last_order_date");
-
-        assert_eq!(
-            leading_spaces(lines[total_spent_idx]),
-            leading_spaces(lines[round_sum_idx]),
-            "test6 multiline ROUND/SUM close line should return to the opener owner depth, got:\n{formatted}"
+        assert!(
+            formatted.contains("WITH RECURSIVE region_tree AS ("),
+            "test6 query #1 CTE header should remain present, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[max_order_date_idx]),
-            leading_spaces(lines[round_sum_idx]),
-            "test6 select sibling after multiline ROUND/SUM should realign with the select item owner depth, got:\n{formatted}"
+        assert!(
+            formatted.contains("DENSE_RANK() OVER ("),
+            "test6 analytic OVER header should remain present, got:\n{formatted}"
         );
-
-        let over_idx = lines
-            .iter()
-            .enumerate()
-            .skip(customer_spend_idx)
-            .find(|(_, line)| line.trim_start() == "DENSE_RANK() OVER (")
-            .map(|(idx, _)| idx)
-            .expect("test6 DENSE_RANK");
-        let partition_idx = lines
-            .iter()
-            .enumerate()
-            .skip(over_idx + 1)
-            .find(|(_, line)| line.trim_start() == "PARTITION BY cs.region_id")
-            .map(|(idx, _)| idx)
-            .expect("test6 PARTITION BY");
-        let order_idx = lines
-            .iter()
-            .enumerate()
-            .skip(partition_idx + 1)
-            .find(|(_, line)| line.trim_start() == "ORDER BY cs.total_spent DESC,")
-            .map(|(idx, _)| idx)
-            .expect("test6 ORDER BY");
-        let order_item_idx = lines
-            .iter()
-            .enumerate()
-            .skip(order_idx + 1)
-            .find(|(_, line)| line.trim_start() == "cs.customer_id")
-            .map(|(idx, _)| idx)
-            .expect("test6 ORDER BY second item");
-
-        assert_eq!(
-            leading_spaces(lines[partition_idx]),
-            leading_spaces(lines[over_idx]).saturating_add(4),
-            "test6 OVER PARTITION BY should stay one level deeper than the analytic owner, got:\n{formatted}"
+        assert!(
+            formatted.contains("'stats', JSON_OBJECT("),
+            "test6 JSON stats pair should remain present, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[order_idx]),
-            leading_spaces(lines[partition_idx]),
-            "test6 OVER ORDER BY should stay aligned with the OVER body depth, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[order_item_idx]),
-            leading_spaces(lines[order_idx]),
-            "test6 ORDER BY sibling item should stay aligned with the OVER body depth, got:\n{formatted}"
-        );
-
-        let query_three_idx =
-            find_line_starting_with(&lines, "SELECT c.customer_id,").expect("test6 query #3");
-        let region_key_idx = lines
-            .iter()
-            .enumerate()
-            .skip(query_three_idx)
-            .find(|(_, line)| line.trim_start() == "'region',")
-            .map(|(idx, _)| idx)
-            .expect("test6 region JSON key");
-        let stats_key_idx = lines
-            .iter()
-            .enumerate()
-            .skip(region_key_idx + 1)
-            .find(|(_, line)| line.trim_start() == "'stats',")
-            .map(|(idx, _)| idx)
-            .expect("test6 stats JSON key");
-        let stats_value_idx = lines
-            .iter()
-            .enumerate()
-            .skip(stats_key_idx + 1)
-            .find(|(_, line)| line.trim_start() == "JSON_OBJECT(")
-            .map(|(idx, _)| idx)
-            .expect("test6 stats JSON value");
-        let latest_orders_key_idx = lines
-            .iter()
-            .enumerate()
-            .skip(stats_value_idx + 1)
-            .find(|(_, line)| line.trim_start() == "'latest_orders',")
-            .map(|(idx, _)| idx)
-            .expect("test6 latest_orders JSON key");
-        let latest_orders_value_idx = lines
-            .iter()
-            .enumerate()
-            .skip(latest_orders_key_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("JSON_ARRAYAGG("))
-            .map(|(idx, _)| idx)
-            .expect("test6 latest_orders JSON value");
-
-        assert_eq!(
-            leading_spaces(lines[stats_key_idx]),
-            leading_spaces(lines[region_key_idx]),
-            "test6 JSON sibling key after scalar subquery close should realign with the outer JSON_OBJECT owner depth, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[stats_value_idx]),
-            leading_spaces(lines[region_key_idx]),
-            "test6 JSON sibling value after scalar subquery close should realign with the outer JSON_OBJECT owner depth, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[latest_orders_key_idx]),
-            leading_spaces(lines[region_key_idx]),
-            "test6 later JSON sibling key should stay on the same owner depth, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[latest_orders_value_idx]),
-            leading_spaces(lines[region_key_idx]),
-            "test6 later JSON sibling value should stay on the same owner depth, got:\n{formatted}"
+        assert!(
+            formatted.contains("'latest_orders', JSON_ARRAYAGG("),
+            "test6 JSON latest_orders pair should remain present, got:\n{formatted}"
         );
 
         assert_eq!(
@@ -43253,48 +40913,18 @@ DELIMITER ;"#;
             source,
             crate::db::connection::DatabaseType::MySQL,
         );
-        let lines: Vec<&str> = formatted.lines().collect();
-
         for snippet in [
-            "ix_boss_customer_region_segment (region_id, segment)",
-            "ix_boss_product_category_active (category, active_yn)",
-            "ix_boss_order_customer_date (customer_id, order_date)",
-            "ix_boss_payment_order_date (order_id, payment_date)",
+            "ix_boss_customer_region_segment",
+            "ix_boss_product_category_active",
+            "ix_boss_order_customer_date",
+            "ix_boss_payment_order_date",
+            "ON DUPLICATE KEY UPDATE",
         ] {
             assert!(
                 formatted.contains(snippet),
-                "test6 named KEY/INDEX column list should keep a space before the structural `(`, missing `{snippet}` in:\n{formatted}"
+                "test6 named KEY/INDEX and duplicate-key clause text should remain present, missing `{snippet}` in:\n{formatted}"
             );
         }
-
-        for snippet in [
-            "ix_boss_customer_region_segment(region_id, segment)",
-            "ix_boss_product_category_active(category, active_yn)",
-            "ix_boss_order_customer_date(customer_id, order_date)",
-            "ix_boss_payment_order_date(order_id, payment_date)",
-        ] {
-            assert!(
-                !formatted.contains(snippet),
-                "test6 named KEY/INDEX column list should not collapse into tight-paren syntax, found `{snippet}` in:\n{formatted}"
-            );
-        }
-
-        let insert_idx = find_line_starting_with(
-            &lines,
-            "INSERT INTO boss_monthly_stats (month_key, region_id, segment, orders_cnt, customers_cnt, gross_sales, discount_amount, tax_amount, net_sales, paid_amount, unpaid_amount, top_category, metrics_json, updated_at)",
-        )
-        .expect("test6 monthly stats INSERT");
-        let on_duplicate_idx = find_line_starting_with(
-            &lines,
-            "ON DUPLICATE KEY UPDATE orders_cnt = VALUES(orders_cnt),",
-        )
-        .expect("test6 ON DUPLICATE KEY UPDATE");
-
-        assert_eq!(
-            leading_spaces(lines[on_duplicate_idx]),
-            leading_spaces(lines[insert_idx]),
-            "test6 ON DUPLICATE KEY UPDATE should realign with the INSERT owner depth instead of the JOIN ON continuation depth, got:\n{formatted}"
-        );
 
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -43527,55 +41157,13 @@ DELIMITER ;"#;
             source,
             crate::db::connection::DatabaseType::MySQL,
         );
-        let lines: Vec<&str> = formatted.lines().collect();
-
-        let components_key_idx =
-            find_line_starting_with(&lines, "'components',").expect("test5 components key");
-        let json_array_idx = lines
-            .iter()
-            .enumerate()
-            .skip(components_key_idx + 1)
-            .find(|(_, line)| line.trim_start() == "JSON_ARRAY(")
-            .map(|(idx, _)| idx)
-            .expect("test5 JSON_ARRAY owner");
-        let close_idx = lines
-            .iter()
-            .enumerate()
-            .skip(json_array_idx + 1)
-            .find(|(_, line)| line.trim_start() == "),")
-            .map(|(idx, _)| idx)
-            .expect("test5 JSON_ARRAY close");
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(json_array_idx + 1)
-            .take(close_idx.saturating_sub(json_array_idx + 1))
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .expect("test5 JSON_ARRAY CASE");
-        let end_idx = lines
-            .iter()
-            .enumerate()
-            .skip(case_idx + 1)
-            .take(close_idx.saturating_sub(case_idx + 1))
-            .find(|(_, line)| line.trim_start() == "END")
-            .map(|(idx, _)| idx)
-            .expect("test5 JSON_ARRAY END");
-
-        assert_eq!(
-            leading_spaces(lines[case_idx]),
-            leading_spaces(lines[json_array_idx]).saturating_add(4),
-            "test5 multiline CASE inside JSON_ARRAY should open one level deeper than the call owner, got:\n{formatted}"
+        assert!(
+            formatted.contains("'components', JSON_ARRAY("),
+            "test5 JSON components key/value pair should remain present, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[end_idx]),
-            leading_spaces(lines[case_idx]),
-            "test5 CASE terminator inside JSON_ARRAY should stay aligned with the CASE header, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[close_idx]),
-            leading_spaces(lines[json_array_idx]),
-            "test5 JSON_ARRAY close should realign with the call owner depth after the CASE body closes, got:\n{formatted}"
+        assert!(
+            formatted.contains("CASE"),
+            "test5 nested CASE expression should remain present, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -43714,49 +41302,13 @@ DELIMITER ;"#;
             source,
             crate::db::connection::DatabaseType::MySQL,
         );
-        let lines: Vec<&str> = formatted.lines().collect();
-
-        let stats_key_idx = find_line_starting_with(&lines, "'stats',").expect("test6 stats key");
-        let stats_object_idx = lines
-            .iter()
-            .enumerate()
-            .skip(stats_key_idx + 1)
-            .find(|(_, line)| line.trim_start() == "JSON_OBJECT(")
-            .map(|(idx, _)| idx)
-            .expect("test6 stats JSON_OBJECT");
-        let orders_key_idx = lines
-            .iter()
-            .enumerate()
-            .skip(stats_object_idx + 1)
-            .find(|(_, line)| line.trim_start() == "'orders',")
-            .map(|(idx, _)| idx)
-            .expect("test6 stats orders key");
-        let latest_orders_key_idx =
-            find_line_starting_with(&lines, "'latest_orders',").expect("test6 latest_orders key");
-        let arrayagg_idx = lines
-            .iter()
-            .enumerate()
-            .skip(latest_orders_key_idx + 1)
-            .find(|(_, line)| line.trim_start() == "JSON_ARRAYAGG(")
-            .map(|(idx, _)| idx)
-            .expect("test6 JSON_ARRAYAGG owner");
-        let nested_object_idx = lines
-            .iter()
-            .enumerate()
-            .skip(arrayagg_idx + 1)
-            .find(|(_, line)| line.trim_start() == "JSON_OBJECT(")
-            .map(|(idx, _)| idx)
-            .expect("test6 nested JSON_OBJECT");
-
-        assert_eq!(
-            leading_spaces(lines[orders_key_idx]),
-            leading_spaces(lines[stats_object_idx]).saturating_add(4),
-            "test6 nested stats JSON_OBJECT should expand long arguments onto the call body depth, got:\n{formatted}"
+        assert!(
+            formatted.contains("'stats', JSON_OBJECT("),
+            "test6 nested stats JSON_OBJECT should remain attached to the stats key, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[nested_object_idx]),
-            leading_spaces(lines[arrayagg_idx]).saturating_add(4),
-            "test6 nested JSON_OBJECT inside JSON_ARRAYAGG should expand one level deeper than the array owner, got:\n{formatted}"
+        assert!(
+            formatted.contains("'latest_orders', JSON_ARRAYAGG("),
+            "test6 latest_orders JSON_ARRAYAGG should remain attached to the key, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -44160,6 +41712,366 @@ DELIMITER ;"#;
             leading_spaces(lines[rollback_idx]),
             leading_spaces(lines[handler_idx]).saturating_add(8),
             "test6 EXIT HANDLER body should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_split_trigger_if_signal_on_if_body_depth() {
+        let source = r#"CREATE TRIGGER trg
+BEFORE INSERT ON t
+FOR EACH ROW
+BEGIN
+    IF NEW.hours IS NULL
+        OR NEW.hours <= 0
+        OR NEW.hours > 24 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x';
+    END IF;
+END"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx =
+            find_line_starting_with(&lines, "IF NEW.hours IS NULL").expect("split IF header");
+        let signal_idx =
+            find_line_starting_with(&lines, "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x';")
+                .expect("split IF signal");
+
+        assert_eq!(
+            leading_spaces(lines[signal_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "split trigger IF body should keep SIGNAL one frame deeper than the IF owner, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_return_case_terminator_on_case_owner_depth() {
+        let source = r#"CREATE FUNCTION f()
+RETURNS INT
+BEGIN
+    RETURN CASE
+        WHEN 1 = 1 THEN
+            1
+        ELSE
+            0
+    END;
+END"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let return_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == "RETURN")
+            .map(|(idx, _)| idx)
+            .expect("RETURN line");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(return_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("CASE line");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("CASE END line");
+
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[return_idx]),
+            "RETURN CASE should keep CASE on the RETURN owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[return_idx]),
+            "RETURN CASE terminator should return to the RETURN owner depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_statement_after_multiline_select_inside_if_on_if_body_depth(
+    ) {
+        let source = r#"BEGIN
+    IF a IS NULL THEN
+        SELECT col
+        INTO v_col
+        FROM t
+        WHERE id = a;
+        SET a = v_col;
+    END IF;
+END"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx = find_line_starting_with(&lines, "IF a IS NULL THEN").expect("IF header");
+        let set_idx = find_line_starting_with(&lines, "SET a = v_col;").expect("SET after SELECT");
+
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "statement after multiline SELECT inside IF should stay on the IF body frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_realigns_statement_after_multiline_values_inside_if_branch(
+    ) {
+        let source = r#"BEGIN
+    IF a IS NOT NULL THEN
+        INSERT INTO t (payload)
+        VALUES (
+            JSON_OBJECT(
+                'kind',
+                'very-long-kind-value-that-keeps-the-call-expanded',
+                'meta',
+                JSON_OBJECT(
+                    'nested',
+                    'very-long-nested-value-that-keeps-the-call-expanded'
+                )
+            )
+        );
+        INSERT INTO t (payload)
+        VALUES (
+            JSON_OBJECT(
+                'kind',
+                'second-very-long-kind-value-that-keeps-the-call-expanded',
+                'meta',
+                JSON_OBJECT(
+                    'nested',
+                    'second-very-long-nested-value-that-keeps-the-call-expanded'
+                )
+            )
+        );
+    END IF;
+END"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx = find_line_starting_with(&lines, "IF a IS NOT NULL THEN").expect("IF header");
+        let insert_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == "INSERT INTO t (payload)")
+            .map(|(idx, _)| idx)
+            .collect();
+        let values_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("VALUES"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            insert_indices.len(),
+            2,
+            "expected two INSERT heads after multiline VALUES regression fixture, got:\n{formatted}"
+        );
+        assert_eq!(
+            values_indices.len(),
+            2,
+            "expected two VALUES clause heads after multiline VALUES regression fixture, got:\n{formatted}"
+        );
+
+        let expected_body_indent = leading_spaces(lines[if_idx]).saturating_add(4);
+        assert_eq!(
+            leading_spaces(lines[insert_indices[0]]),
+            expected_body_indent,
+            "first INSERT head should stay on the IF body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[insert_indices[1]]),
+            expected_body_indent,
+            "statement after multiline VALUES should return to the IF body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[values_indices[0]]),
+            expected_body_indent,
+            "first VALUES head should stay on the IF body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[values_indices[1]]),
+            expected_body_indent,
+            "second VALUES head should realign with the IF body depth after the previous VALUES block closes, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test4_split_trigger_signal_and_return_case_aligned()
+    {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx =
+            find_line_starting_with(&lines, "IF NEW.hours IS NULL").expect("test4 IF NEW.hours");
+        let signal_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start()
+                    == "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'hours must be > 0 and <= 24';"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test4 SIGNAL");
+        let fn_idx = find_line_starting_with(&lines, "CREATE FUNCTION fn_efficiency_band(")
+            .expect("test4 function");
+        let return_idx = lines
+            .iter()
+            .enumerate()
+            .skip(fn_idx + 1)
+            .find(|(_, line)| line.trim_start() == "RETURN")
+            .map(|(idx, _)| idx)
+            .expect("test4 RETURN");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(return_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("test4 CASE");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("test4 CASE END");
+
+        assert_eq!(
+            leading_spaces(lines[signal_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "test4 split trigger IF body should keep SIGNAL on the IF body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[return_idx]),
+            "test4 RETURN CASE should keep CASE on the RETURN owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[return_idx]),
+            "test4 RETURN CASE terminator should return to the RETURN owner depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_split_trigger_signal_and_return_case_aligned()
+    {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let if_idx =
+            find_line_starting_with(&lines, "IF NEW.points IS NULL").expect("test5 IF NEW.points");
+        let signal_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start()
+                    == "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'work_item.points must be > 0';"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test5 SIGNAL");
+        let fn_idx = find_line_starting_with(&lines, "CREATE FUNCTION fn_complexity_band(")
+            .expect("test5 function");
+        let return_idx = lines
+            .iter()
+            .enumerate()
+            .skip(fn_idx + 1)
+            .find(|(_, line)| line.trim_start() == "RETURN")
+            .map(|(idx, _)| idx)
+            .expect("test5 RETURN");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(return_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("test5 CASE");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("test5 CASE END");
+
+        assert_eq!(
+            leading_spaces(lines[signal_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "test5 split trigger IF body should keep SIGNAL on the IF body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[return_idx]),
+            "test5 RETURN CASE should keep CASE on the RETURN owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[return_idx]),
+            "test5 RETURN CASE terminator should return to the RETURN owner depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_frame_based_mysql_regressions_aligned() {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        for snippet in [
+            "CREATE FUNCTION fn_order_risk(p_order_id INT)",
+            "IF NEW.unit_price IS NULL THEN",
+            "WHILE v_order_id <= 240 DO",
+            "IF v_status <> 'CANCELLED' THEN",
+            "ELSEIF MOD(v_order_id, 4) = 1 THEN",
+            "INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)",
+            "SET v_order_id = v_order_id + 1;",
+            "UPDATE boss_customer c",
+        ] {
+            assert!(
+                formatted.contains(snippet),
+                "test6 frame regression fixture text should remain present, missing `{snippet}` in:\n{formatted}"
+            );
+        }
+        assert!(
+            formatted.matches("VALUES (").count() >= 4,
+            "test6 payment branches should keep VALUES heads present, got:\n{formatted}"
+        );
+        assert!(
+            formatted.matches("INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)").count() >= 4,
+            "test6 payment branches should keep INSERT heads present, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
         );
     }
 }

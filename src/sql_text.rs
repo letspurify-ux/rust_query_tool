@@ -1567,11 +1567,8 @@ fn matches_keyword(keyword: &str, candidates: &[&str]) -> bool {
 }
 
 #[inline]
-fn is_password_command_keyword(word: &str) -> bool {
-    matches!(
-        word.to_ascii_uppercase().as_str(),
-        "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD"
-    )
+fn is_password_command_keyword_upper(word_upper: &str) -> bool {
+    matches!(word_upper, "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD")
 }
 
 #[inline]
@@ -2584,7 +2581,16 @@ pub(crate) fn is_with_non_cte_query_head_keyword(word: &str) -> bool {
 /// statement head instead of a main query keyword.
 pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
     let upper = word.to_ascii_uppercase();
-    STATEMENT_HEAD_KEYWORDS_SET.contains(upper.as_str()) || is_password_command_keyword(word)
+    is_statement_head_keyword_upper(upper.as_str())
+}
+
+/// Uppercase fast path for statement-head detection.
+///
+/// Callers that already computed an ASCII-uppercased view of the line can
+/// avoid rebuilding a second temporary string for the first identifier token.
+pub(crate) fn is_statement_head_keyword_upper(word_upper: &str) -> bool {
+    STATEMENT_HEAD_KEYWORDS_SET.contains(word_upper)
+        || is_password_command_keyword_upper(word_upper)
 }
 
 /// Returns true when `word` is a SQL*Plus `SET` option keyword.

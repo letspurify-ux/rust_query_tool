@@ -2348,8 +2348,7 @@ impl QueryExecutor {
                     && Self::auto_format_is_for_update_clause(&clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
-                current_line_is_for_update_update_continuation =
-                    is_for_update_update_continuation;
+                current_line_is_for_update_update_continuation = is_for_update_update_continuation;
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(clause_detection_trimmed)
@@ -2943,8 +2942,9 @@ impl QueryExecutor {
                     || sql_text::starts_with_keyword_token(&header_upper, "WHILE")
                     || sql_text::starts_with_keyword_token(&header_upper, "WHEN")
             });
-            let suppress_condition_alignment = current_line_is_same_depth_merge_branch_header_fragment
-                || current_line_is_for_update_update_continuation;
+            let suppress_condition_alignment =
+                current_line_is_same_depth_merge_branch_header_fragment
+                    || current_line_is_for_update_update_continuation;
             let leading_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
                 && sql_text::line_has_leading_significant_close_paren(line)
@@ -3228,31 +3228,30 @@ impl QueryExecutor {
                         body_depth: context.auto_depth.saturating_add(1),
                     });
 
-            pending_condition_close_continuation =
-                if context.condition_role == AutoFormatConditionRole::Closer {
-                    match (
-                        context.condition_header_line,
-                        context.condition_header_depth,
-                    ) {
-                        (Some(header_line_idx), Some(header_depth))
-                            if condition_header_is_control =>
-                        {
-                            let continuation_depth = if condition_header_is_bare_parenthesized {
-                                header_depth.saturating_add(1)
-                            } else {
-                                header_depth
-                            };
-                            Some(PendingConditionCloseContinuationFrame {
-                                header_line_idx,
-                                header_depth,
-                                continuation_depth,
-                            })
-                        }
-                        _ => None,
+            pending_condition_close_continuation = if context.condition_role
+                == AutoFormatConditionRole::Closer
+            {
+                match (
+                    context.condition_header_line,
+                    context.condition_header_depth,
+                ) {
+                    (Some(header_line_idx), Some(header_depth)) if condition_header_is_control => {
+                        let continuation_depth = if condition_header_is_bare_parenthesized {
+                            header_depth.saturating_add(1)
+                        } else {
+                            header_depth
+                        };
+                        Some(PendingConditionCloseContinuationFrame {
+                            header_line_idx,
+                            header_depth,
+                            continuation_depth,
+                        })
                     }
-                } else {
-                    None
-                };
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             let suppress_line_continuation = suppress_non_subquery_paren_layout_clause
                 || current_line_is_same_depth_merge_branch_header_fragment
