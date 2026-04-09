@@ -218,18 +218,55 @@ impl MeaningfulTokenLinks {
     }
 }
 
+struct StatementWordLinks {
+    prev_word_in_statement: Vec<Option<usize>>,
+}
+
+impl StatementWordLinks {
+    fn build(tokens: &[SqlToken]) -> Self {
+        let mut prev_word_in_statement = vec![None; tokens.len()];
+        let mut previous_word_idx = None;
+
+        for (idx, token) in tokens.iter().enumerate() {
+            prev_word_in_statement[idx] = previous_word_idx;
+            match token {
+                SqlToken::Symbol(symbol) if symbol == ";" => {
+                    previous_word_idx = None;
+                }
+                SqlToken::Word(_) => {
+                    previous_word_idx = Some(idx);
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            prev_word_in_statement,
+        }
+    }
+
+    fn prev_word_index(&self, idx: usize) -> Option<usize> {
+        self.prev_word_in_statement.get(idx).copied().flatten()
+    }
+}
+
 struct FormatterTokenCache {
     meaningful_links: MeaningfulTokenLinks,
+    statement_word_links: StatementWordLinks,
     next_word_indices: Vec<Option<usize>>,
     second_next_word_indices: Vec<Option<usize>>,
+    matching_paren_close_indices: Vec<Option<usize>>,
+    open_paren_multiline_child_head_prefix_counts: Vec<usize>,
     upper_words: Vec<Option<String>>,
 }
 
 impl FormatterTokenCache {
     fn build(tokens: &[SqlToken]) -> Self {
         let meaningful_links = MeaningfulTokenLinks::build(tokens);
+        let statement_word_links = StatementWordLinks::build(tokens);
         let mut next_word_indices = vec![None; tokens.len()];
         let mut second_next_word_indices = vec![None; tokens.len()];
+        let matching_paren_close_indices = Self::build_matching_paren_close_indices(tokens);
         let mut upper_words = vec![None; tokens.len()];
 
         let mut next_word_idx = None;
@@ -243,17 +280,114 @@ impl FormatterTokenCache {
                 next_word_idx = Some(idx);
             }
         }
+        let open_paren_multiline_child_head_prefix_counts =
+            Self::build_open_paren_multiline_child_head_prefix_counts(
+                tokens,
+                &meaningful_links,
+                &statement_word_links,
+            );
 
         Self {
             meaningful_links,
+            statement_word_links,
             next_word_indices,
             second_next_word_indices,
+            matching_paren_close_indices,
+            open_paren_multiline_child_head_prefix_counts,
             upper_words,
         }
     }
 
+    fn build_matching_paren_close_indices(tokens: &[SqlToken]) -> Vec<Option<usize>> {
+        let mut closes = vec![None; tokens.len()];
+        let mut open_stack: Vec<usize> = Vec::new();
+
+        for (idx, token) in tokens.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == "(" => open_stack.push(idx),
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    if let Some(open_idx) = open_stack.pop() {
+                        closes[open_idx] = Some(idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        closes
+    }
+
+    fn build_open_paren_multiline_child_head_prefix_counts(
+        tokens: &[SqlToken],
+        meaningful_links: &MeaningfulTokenLinks,
+        statement_word_links: &StatementWordLinks,
+    ) -> Vec<usize> {
+        let mut prefix_counts = vec![0usize; tokens.len().saturating_add(1)];
+
+        for idx in 0..tokens.len() {
+            let previous = prefix_counts[idx];
+            let Some(slot) = prefix_counts.get_mut(idx.saturating_add(1)) else {
+                continue;
+            };
+            *slot = previous;
+
+            if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                continue;
+            }
+
+            let next_non_comment = meaningful_links
+                .next_index(idx)
+                .and_then(|token_idx| tokens.get(token_idx));
+            let opens_query_like_child = matches!(
+                next_non_comment,
+                Some(SqlToken::Word(word)) if crate::sql_text::is_subquery_head_keyword(word)
+            );
+            let opens_wrapped_layout_child =
+                SqlEditorWidget::paren_starts_wrapped_layout_head(
+                    tokens,
+                    idx,
+                    Some(meaningful_links),
+                );
+            let opens_owner_relative_child =
+                SqlEditorWidget::paren_multiline_clause_owner_kind(
+                    tokens,
+                    idx,
+                    Some(statement_word_links),
+                )
+                .is_some();
+            let opens_column_list_child = statement_word_links
+                .prev_word_index(idx)
+                .and_then(|token_idx| tokens.get(token_idx))
+                .is_some_and(|token| {
+                    matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COLUMNS"))
+                });
+
+            if opens_query_like_child
+                || opens_wrapped_layout_child
+                || opens_owner_relative_child
+                || opens_column_list_child
+            {
+                *slot = slot.saturating_add(1);
+            }
+        }
+
+        prefix_counts
+    }
+
     fn meaningful_links(&self) -> &MeaningfulTokenLinks {
         &self.meaningful_links
+    }
+
+    fn statement_word_links(&self) -> &StatementWordLinks {
+        &self.statement_word_links
+    }
+
+    fn matching_paren_close_indices(&self) -> &[Option<usize>] {
+        self.matching_paren_close_indices.as_slice()
+    }
+
+    fn open_paren_multiline_child_head_prefix_counts(&self) -> &[usize] {
+        self.open_paren_multiline_child_head_prefix_counts.as_slice()
     }
 
     fn next_non_comment<'a>(&self, tokens: &'a [SqlToken], idx: usize) -> Option<&'a SqlToken> {
@@ -286,6 +420,88 @@ impl FormatterTokenCache {
 
     fn upper_word(&self, idx: usize) -> Option<&str> {
         self.upper_words.get(idx).and_then(|word| word.as_deref())
+    }
+}
+
+struct CommentPrefixCache {
+    prefix_text: String,
+    prefix_len_before_token: Vec<usize>,
+    previous_non_comment_token: Vec<Option<usize>>,
+    second_previous_non_comment_token: Vec<Option<usize>>,
+    has_string_token_before: Vec<bool>,
+}
+
+impl CommentPrefixCache {
+    fn build(tokens: &[SqlToken]) -> Self {
+        let mut prefix_text = String::new();
+        let mut prefix_len_before_token = vec![0usize; tokens.len()];
+        let mut previous_non_comment_token = vec![None; tokens.len()];
+        let mut second_previous_non_comment_token = vec![None; tokens.len()];
+        let mut has_string_token_before = vec![false; tokens.len()];
+        let mut prev_non_comment = None;
+        let mut prev_prev_non_comment = None;
+        let mut saw_string_token = false;
+
+        for (idx, token) in tokens.iter().enumerate() {
+            prefix_len_before_token[idx] = prefix_text.len();
+            previous_non_comment_token[idx] = prev_non_comment;
+            second_previous_non_comment_token[idx] = prev_prev_non_comment;
+            has_string_token_before[idx] = saw_string_token;
+
+            if matches!(token, SqlToken::Comment(_)) {
+                continue;
+            }
+
+            if !prefix_text.is_empty() {
+                prefix_text.push(' ');
+            }
+            match token {
+                SqlToken::Word(word) => prefix_text.push_str(word),
+                SqlToken::String(literal) => {
+                    prefix_text.push_str(literal);
+                    saw_string_token = true;
+                }
+                SqlToken::Symbol(symbol) => prefix_text.push_str(symbol),
+                SqlToken::Comment(_) => {}
+            }
+            prev_prev_non_comment = prev_non_comment;
+            prev_non_comment = Some(idx);
+        }
+
+        Self {
+            prefix_text,
+            prefix_len_before_token,
+            previous_non_comment_token,
+            second_previous_non_comment_token,
+            has_string_token_before,
+        }
+    }
+
+    fn prefix_before(&self, idx: usize) -> &str {
+        let prefix_len = self
+            .prefix_len_before_token
+            .get(idx)
+            .copied()
+            .unwrap_or(self.prefix_text.len());
+        self.prefix_text.get(..prefix_len).unwrap_or("")
+    }
+
+    fn previous_non_comment_token_index(&self, idx: usize) -> Option<usize> {
+        self.previous_non_comment_token.get(idx).copied().flatten()
+    }
+
+    fn second_previous_non_comment_token_index(&self, idx: usize) -> Option<usize> {
+        self.second_previous_non_comment_token
+            .get(idx)
+            .copied()
+            .flatten()
+    }
+
+    fn has_string_token_before(&self, idx: usize) -> bool {
+        self.has_string_token_before
+            .get(idx)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -662,6 +878,7 @@ struct JoinConditionLayoutFrame {
 #[derive(Clone, Copy)]
 struct StructuralContinuationLayoutFrame {
     continuation_depth: usize,
+    from_leading_close_comma_list: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1188,6 +1405,7 @@ impl ConstructState {
         is_fetch_into_single_target: bool,
         in_analytic_over_paren: bool,
         in_keep_paren: bool,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
         // Inside analytic OVER(): clause keywords are handled by the
         // analytic_over_paren_depths branch instead.
@@ -1204,6 +1422,7 @@ impl ConstructState {
             prev_word_upper,
             current_scope,
             self,
+            statement_word_links,
         ) {
             return true;
         }
@@ -1326,11 +1545,15 @@ impl ConstructState {
         }
         // SIGNAL/RESIGNAL ... SET MESSAGE_TEXT: SET is a sub-clause continuation,
         // not an independent clause break (MySQL-specific syntax)
-        if keyword == "SET" && SqlEditorWidget::is_mysql_signal_set_clause(tokens, idx) {
+        if keyword == "SET"
+            && SqlEditorWidget::is_mysql_signal_set_clause(tokens, idx, statement_word_links)
+        {
             return true;
         }
         // ON DUPLICATE KEY UPDATE: UPDATE stays inline with KEY (MySQL-specific syntax)
-        if keyword == "UPDATE" && SqlEditorWidget::is_mysql_on_duplicate_key_update(tokens, idx) {
+        if keyword == "UPDATE"
+            && SqlEditorWidget::is_mysql_on_duplicate_key_update(tokens, idx, statement_word_links)
+        {
             return true;
         }
         false
@@ -2100,25 +2323,48 @@ impl SqlEditorWidget {
         None
     }
 
-    fn is_log_errors_into_clause(tokens: &[SqlToken], into_idx: usize) -> bool {
-        let Some((prev_word, prev_idx)) = Self::previous_word_upper(tokens, into_idx) else {
+    fn is_log_errors_into_clause(
+        tokens: &[SqlToken],
+        into_idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let prev_word_idx = statement_word_links
+            .and_then(|links| links.prev_word_index(into_idx))
+            .or_else(|| Self::previous_word_upper(tokens, into_idx).map(|(_, idx)| idx));
+        let Some(prev_idx) = prev_word_idx else {
             return false;
         };
-        if prev_word != "ERRORS" {
+        let Some(SqlToken::Word(prev_word)) = tokens.get(prev_idx) else {
+            return false;
+        };
+        if !prev_word.eq_ignore_ascii_case("ERRORS") {
             return false;
         }
 
-        matches!(
-            Self::previous_word_upper(tokens, prev_idx),
-            Some((word, _)) if word == "LOG"
-        )
+        let second_prev_word_idx = statement_word_links
+            .and_then(|links| links.prev_word_index(prev_idx))
+            .or_else(|| Self::previous_word_upper(tokens, prev_idx).map(|(_, idx)| idx));
+        second_prev_word_idx
+            .and_then(|idx| tokens.get(idx))
+            .is_some_and(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("LOG")))
     }
 
-    fn is_multiset_set_operator(tokens: &[SqlToken], idx: usize) -> bool {
-        matches!(
-            Self::previous_word_upper(tokens, idx),
-            Some((prev, _)) if prev == "MULTISET"
-        )
+    fn is_multiset_set_operator(
+        tokens: &[SqlToken],
+        idx: usize,
+        prev_word_upper: Option<&str>,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        if matches!(prev_word_upper, Some("MULTISET")) {
+            return true;
+        }
+
+        statement_word_links
+            .and_then(|links| links.prev_word_index(idx))
+            .and_then(|prev_idx| tokens.get(prev_idx))
+            .is_some_and(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("MULTISET")),
+            )
     }
 
     fn is_inline_clause_phrase(
@@ -2128,18 +2374,20 @@ impl SqlEditorWidget {
         prev_word_upper: Option<&str>,
         current_scope: FormatScope,
         construct: &ConstructState,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
         if construct.forall_pending.is_active() && keyword == "VALUES" {
             return true;
         }
-        if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx) {
+        if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx, statement_word_links)
+        {
             return true;
         }
         if keyword == "LIMIT" && matches!(prev_word_upper, Some("REJECT")) {
             return true;
         }
         if crate::sql_text::is_format_set_operator_keyword(keyword)
-            && Self::is_multiset_set_operator(tokens, idx)
+            && Self::is_multiset_set_operator(tokens, idx, prev_word_upper, statement_word_links)
         {
             return true;
         }
@@ -3192,11 +3440,11 @@ impl SqlEditorWidget {
                         },
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
-                    let mut formatted_statement = if mysql_compatible_statement {
+                    let mut formatted_statement = if mysql_profile {
                         Self::profile_mysql_formatter_stage(
                             "mysql_parser_depth",
                             formatted_statement.len(),
-                            mysql_profile,
+                            true,
                             || {
                                 Self::apply_parser_depth_indentation_with_mysql_compat(
                                     &formatted_statement,
@@ -3205,7 +3453,10 @@ impl SqlEditorWidget {
                             },
                         )
                     } else {
-                        formatted_statement
+                        Self::apply_parser_depth_indentation_with_mysql_compat(
+                            &formatted_statement,
+                            mysql_compatible_statement,
+                        )
                     };
                     if let Some(delimiter) = active_mysql_delimiter.as_deref() {
                         Self::append_statement_terminator(
@@ -3673,18 +3924,38 @@ impl SqlEditorWidget {
         prev_is_boundary && next_is_boundary
     }
 
-    fn count_star_call_should_stay_tight(tokens: &[SqlToken], open_paren_idx: usize) -> bool {
-        let Some((prev_word, _)) = Self::previous_word_upper(tokens, open_paren_idx) else {
+    fn count_star_call_should_stay_tight(
+        tokens: &[SqlToken],
+        open_paren_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let prev_word_idx = statement_word_links
+            .and_then(|links| links.prev_word_index(open_paren_idx))
+            .or_else(|| Self::previous_word_upper(tokens, open_paren_idx).map(|(_, idx)| idx));
+        let Some(prev_word) = prev_word_idx
+            .and_then(|idx| tokens.get(idx))
+            .and_then(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
+            })
+        else {
             return false;
         };
-        if prev_word != "COUNT" {
+        if !prev_word.eq_ignore_ascii_case("COUNT") {
             return false;
         }
 
-        let Some(star_idx) = Self::next_meaningful_token_index(tokens, open_paren_idx) else {
+        let Some(star_idx) = meaningful_token_links
+            .and_then(|links| links.next_index(open_paren_idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, open_paren_idx))
+        else {
             return false;
         };
-        let Some(close_idx) = Self::next_meaningful_token_index(tokens, star_idx) else {
+        let Some(close_idx) = meaningful_token_links
+            .and_then(|links| links.next_index(star_idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, star_idx))
+        else {
             return false;
         };
 
@@ -3746,31 +4017,52 @@ impl SqlEditorWidget {
     fn mysql_paren_belongs_to_insert_target_column_list(
         tokens: &[SqlToken],
         open_paren_idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
-        let recent = Self::recent_statement_words_before(tokens, open_paren_idx, 6);
-        recent
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("INTO"))
-            && recent.iter().any(|word| {
-                word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("REPLACE")
-            })
+        let mut has_into = false;
+        let mut has_insert_or_replace = false;
+
+        Self::scan_recent_statement_words(
+            tokens,
+            open_paren_idx,
+            6,
+            statement_word_links,
+            |word, pos| {
+                if pos > 0 && word.eq_ignore_ascii_case("INTO") {
+                    has_into = true;
+                }
+                if word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("REPLACE") {
+                    has_insert_or_replace = true;
+                }
+                !(has_into && has_insert_or_replace)
+            },
+        );
+
+        has_into && has_insert_or_replace
     }
 
     fn mysql_paren_follows_named_key_definition(
         tokens: &[SqlToken],
         open_paren_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
-        let Some((_, prev_word_idx)) = Self::previous_word_upper(tokens, open_paren_idx) else {
+        let prev_word_idx = statement_word_links
+            .and_then(|links| links.prev_word_index(open_paren_idx))
+            .or_else(|| Self::previous_word_upper(tokens, open_paren_idx).map(|(_, idx)| idx));
+        let Some(prev_word_idx) = prev_word_idx else {
             return false;
         };
-        let Some(key_idx) = Self::previous_meaningful_token_index(tokens, prev_word_idx) else {
+        let Some(key_idx) = meaningful_token_links
+            .and_then(|links| links.prev_index(prev_word_idx))
+            .or_else(|| Self::previous_meaningful_token_index(tokens, prev_word_idx))
+        else {
             return false;
         };
         let Some(SqlToken::Word(key_word)) = tokens.get(key_idx) else {
             return false;
         };
-        if !matches!(key_word.to_ascii_uppercase().as_str(), "KEY" | "INDEX") {
+        if !key_word.eq_ignore_ascii_case("KEY") && !key_word.eq_ignore_ascii_case("INDEX") {
             return false;
         }
         true
@@ -3780,14 +4072,38 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         open_paren_idx: usize,
         on_duplicate_key_update_active: bool,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        statement_word_links: Option<&StatementWordLinks>,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
     ) -> bool {
-        let Some((prev_word, _)) = Self::previous_word_upper(tokens, open_paren_idx) else {
+        let prev_word_idx = statement_word_links
+            .and_then(|links| links.prev_word_index(open_paren_idx))
+            .or_else(|| Self::previous_word_upper(tokens, open_paren_idx).map(|(_, idx)| idx));
+        let Some(prev_word_idx) = prev_word_idx else {
             return false;
         };
+        let Some(prev_word) = tokens.get(prev_word_idx).and_then(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let prev_word = prev_word.as_str();
+
+        let prev_meaningful_idx = meaningful_token_links
+            .and_then(|links| links.prev_index(open_paren_idx))
+            .or_else(|| Self::previous_meaningful_token_index(tokens, open_paren_idx));
 
         if prev_word == "IF"
-            && Self::previous_meaningful_token_index(tokens, open_paren_idx)
-                .is_some_and(|if_idx| Self::mysql_if_is_scalar_function(tokens, if_idx))
+            && prev_meaningful_idx
+                .is_some_and(|if_idx| {
+                    Self::mysql_if_is_scalar_function(
+                        tokens,
+                        if_idx,
+                        meaningful_token_links,
+                        matching_paren_close_indices,
+                    )
+                })
         {
             return true;
         }
@@ -3796,16 +4112,26 @@ impl SqlEditorWidget {
             return on_duplicate_key_update_active;
         }
 
-        if Self::mysql_keyword_prefers_space_before_paren(prev_word.as_str()) {
+        if Self::mysql_keyword_prefers_space_before_paren(prev_word) {
             return false;
         }
 
         let insert_target_column_list =
-            Self::mysql_paren_belongs_to_insert_target_column_list(tokens, open_paren_idx);
-        if Self::mysql_paren_follows_named_key_definition(tokens, open_paren_idx) {
+            Self::mysql_paren_belongs_to_insert_target_column_list(
+                tokens,
+                open_paren_idx,
+                statement_word_links,
+            );
+        if Self::mysql_paren_follows_named_key_definition(
+            tokens,
+            open_paren_idx,
+            meaningful_token_links,
+            statement_word_links,
+        ) {
             return false;
         }
-        if Self::paren_opens_call_argument_list(tokens, open_paren_idx) || insert_target_column_list
+        if Self::paren_opens_call_argument_list(tokens, open_paren_idx, statement_word_links)
+            || insert_target_column_list
         {
             return !insert_target_column_list;
         }
@@ -3813,24 +4139,48 @@ impl SqlEditorWidget {
         true
     }
 
-    fn mysql_if_is_scalar_function(tokens: &[SqlToken], if_idx: usize) -> bool {
-        let Some(open_idx) = Self::next_meaningful_token_index(tokens, if_idx) else {
+    fn mysql_if_is_scalar_function(
+        tokens: &[SqlToken],
+        if_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+    ) -> bool {
+        let open_idx = meaningful_token_links
+            .and_then(|links| links.next_index(if_idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, if_idx));
+        let Some(open_idx) = open_idx else {
             return false;
         };
         if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
             return false;
         }
 
-        let Some(close_idx) = Self::matching_paren_close_index(tokens, open_idx) else {
+        let Some(close_idx) =
+            Self::matching_paren_close_index(tokens, open_idx, matching_paren_close_indices)
+        else {
             return false;
         };
         !matches!(
-            Self::next_meaningful_token_index(tokens, close_idx).and_then(|idx| tokens.get(idx)),
+            meaningful_token_links
+                .and_then(|links| links.next_index(close_idx))
+                .or_else(|| Self::next_meaningful_token_index(tokens, close_idx))
+                .and_then(|idx| tokens.get(idx)),
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("THEN")
         )
     }
 
-    fn matching_paren_close_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
+    fn matching_paren_close_index(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+    ) -> Option<usize> {
+        if let Some(close_idx) = matching_paren_close_indices
+            .and_then(|indices| indices.get(open_idx))
+            .copied()
+            .flatten()
+        {
+            return Some(close_idx);
+        }
         if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
             return None;
         }
@@ -3854,21 +4204,104 @@ impl SqlEditorWidget {
         None
     }
 
-    fn paren_opens_call_argument_list(tokens: &[SqlToken], open_idx: usize) -> bool {
-        let recent = Self::recent_statement_words_before(tokens, open_idx, 2);
-        recent
-            .get(1)
-            .is_some_and(|word| word.eq_ignore_ascii_case("CALL"))
+    fn paren_opens_call_argument_list(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let mut second_recent_is_call = false;
+        Self::scan_recent_statement_words(
+            tokens,
+            open_idx,
+            2,
+            statement_word_links,
+            |word, pos| {
+                if pos == 1 && word.eq_ignore_ascii_case("CALL") {
+                    second_recent_is_call = true;
+                    return false;
+                }
+                true
+            },
+        );
+        second_recent_is_call
     }
 
-    fn recent_statement_words_before(
+    fn scan_recent_statement_words<F>(
         tokens: &[SqlToken],
         idx: usize,
         max_words: usize,
-    ) -> Vec<&str> {
-        let mut words = Vec::with_capacity(max_words);
+        statement_word_links: Option<&StatementWordLinks>,
+        mut visitor: F,
+    ) where
+        F: FnMut(&str, usize) -> bool,
+    {
+        if max_words == 0 {
+            return;
+        }
 
-        for token in tokens[..idx].iter().rev() {
+        if let Some(links) = statement_word_links {
+            let mut seen = 0usize;
+            let mut word_idx = links.prev_word_index(idx);
+            while let Some(current_word_idx) = word_idx {
+                let Some(SqlToken::Word(word)) = tokens.get(current_word_idx) else {
+                    break;
+                };
+                if !visitor(word.as_str(), seen) {
+                    break;
+                }
+                seen = seen.saturating_add(1);
+                if seen >= max_words {
+                    break;
+                }
+                word_idx = links.prev_word_index(current_word_idx);
+            }
+            return;
+        }
+
+        let capped_idx = idx.min(tokens.len());
+        let mut seen = 0usize;
+        for token in tokens[..capped_idx].iter().rev() {
+            match token {
+                SqlToken::Symbol(sym) if sym == ";" => break,
+                SqlToken::Word(word) => {
+                    if !visitor(word.as_str(), seen) {
+                        break;
+                    }
+                    seen = seen.saturating_add(1);
+                    if seen >= max_words {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn recent_statement_words_before<'a>(
+        tokens: &'a [SqlToken],
+        idx: usize,
+        max_words: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> Vec<&'a str> {
+        if let Some(links) = statement_word_links {
+            let mut words = Vec::with_capacity(max_words);
+            let mut word_idx = links.prev_word_index(idx);
+            while let Some(current_word_idx) = word_idx {
+                let Some(SqlToken::Word(word)) = tokens.get(current_word_idx) else {
+                    break;
+                };
+                words.push(word.as_str());
+                if words.len() >= max_words {
+                    break;
+                }
+                word_idx = links.prev_word_index(current_word_idx);
+            }
+            return words;
+        }
+
+        let capped_idx = idx.min(tokens.len());
+        let mut words = Vec::with_capacity(max_words);
+        for token in tokens[..capped_idx].iter().rev() {
             match token {
                 SqlToken::Symbol(sym) if sym == ";" => break,
                 SqlToken::Word(word) => {
@@ -3884,30 +4317,47 @@ impl SqlEditorWidget {
         words
     }
 
-    fn is_mysql_declare_cursor_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
-        let recent_words = Self::recent_statement_words_before(tokens, idx, 6);
-        recent_words
-            .iter()
-            .any(|word| word.eq_ignore_ascii_case("DECLARE"))
-            && recent_words
-                .iter()
-                .any(|word| word.eq_ignore_ascii_case("CURSOR"))
+    fn is_mysql_declare_cursor_for_clause(
+        tokens: &[SqlToken],
+        idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let mut has_declare = false;
+        let mut has_cursor = false;
+        Self::scan_recent_statement_words(tokens, idx, 6, statement_word_links, |word, _| {
+            if word.eq_ignore_ascii_case("DECLARE") {
+                has_declare = true;
+            } else if word.eq_ignore_ascii_case("CURSOR") {
+                has_cursor = true;
+            }
+            !(has_declare && has_cursor)
+        });
+        has_declare && has_cursor
     }
 
-    fn is_mysql_declare_handler_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
-        let recent_words = Self::recent_statement_words_before(tokens, idx, 6);
-        recent_words
-            .iter()
-            .any(|word| word.eq_ignore_ascii_case("DECLARE"))
-            && recent_words
-                .iter()
-                .any(|word| word.eq_ignore_ascii_case("HANDLER"))
+    fn is_mysql_declare_handler_for_clause(
+        tokens: &[SqlToken],
+        idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let mut has_declare = false;
+        let mut has_handler = false;
+        Self::scan_recent_statement_words(tokens, idx, 6, statement_word_links, |word, _| {
+            if word.eq_ignore_ascii_case("DECLARE") {
+                has_declare = true;
+            } else if word.eq_ignore_ascii_case("HANDLER") {
+                has_handler = true;
+            }
+            !(has_declare && has_handler)
+        });
+        has_declare && has_handler
     }
 
     fn is_mysql_if_exists_modifier(
         tokens: &[SqlToken],
         idx: usize,
         next_word: Option<&str>,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
         if !matches!(
             next_word,
@@ -3916,37 +4366,59 @@ impl SqlEditorWidget {
             return false;
         }
 
-        Self::recent_statement_words_before(tokens, idx, 6)
-            .iter()
-            .any(|word| {
-                word.eq_ignore_ascii_case("DROP")
-                    || word.eq_ignore_ascii_case("CREATE")
-                    || word.eq_ignore_ascii_case("ALTER")
-            })
+        let mut has_ddl_verb = false;
+        Self::scan_recent_statement_words(tokens, idx, 6, statement_word_links, |word, _| {
+            if word.eq_ignore_ascii_case("DROP")
+                || word.eq_ignore_ascii_case("CREATE")
+                || word.eq_ignore_ascii_case("ALTER")
+            {
+                has_ddl_verb = true;
+                return false;
+            }
+            true
+        });
+        has_ddl_verb
     }
 
     /// Returns true when SET is a sub-clause of a MySQL SIGNAL/RESIGNAL statement.
     /// In MySQL, SIGNAL SQLSTATE '...' SET MESSAGE_TEXT = ... has SET as a
     /// continuation of the SIGNAL statement, not a new independent clause.
-    fn is_mysql_signal_set_clause(tokens: &[SqlToken], idx: usize) -> bool {
-        Self::recent_statement_words_before(tokens, idx, 8)
-            .iter()
-            .any(|word| {
-                word.eq_ignore_ascii_case("SIGNAL") || word.eq_ignore_ascii_case("RESIGNAL")
-            })
+    fn is_mysql_signal_set_clause(
+        tokens: &[SqlToken],
+        idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let mut has_signal = false;
+        Self::scan_recent_statement_words(tokens, idx, 8, statement_word_links, |word, _| {
+            if word.eq_ignore_ascii_case("SIGNAL") || word.eq_ignore_ascii_case("RESIGNAL") {
+                has_signal = true;
+                return false;
+            }
+            true
+        });
+        has_signal
     }
 
     /// Returns true when UPDATE is the keyword following ON DUPLICATE KEY,
     /// forming MySQL's ON DUPLICATE KEY UPDATE clause.
-    fn is_mysql_on_duplicate_key_update(tokens: &[SqlToken], idx: usize) -> bool {
-        let recent = Self::recent_statement_words_before(tokens, idx, 3);
-        recent
-            .first()
-            .is_some_and(|w| w.eq_ignore_ascii_case("KEY"))
-            && recent
-                .get(1)
-                .is_some_and(|w| w.eq_ignore_ascii_case("DUPLICATE"))
-            && recent.get(2).is_some_and(|w| w.eq_ignore_ascii_case("ON"))
+    fn is_mysql_on_duplicate_key_update(
+        tokens: &[SqlToken],
+        idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let mut first_is_key = false;
+        let mut second_is_duplicate = false;
+        let mut third_is_on = false;
+        Self::scan_recent_statement_words(tokens, idx, 3, statement_word_links, |word, pos| {
+            match pos {
+                0 => first_is_key = word.eq_ignore_ascii_case("KEY"),
+                1 => second_is_duplicate = word.eq_ignore_ascii_case("DUPLICATE"),
+                2 => third_is_on = word.eq_ignore_ascii_case("ON"),
+                _ => {}
+            }
+            true
+        });
+        first_is_key && second_is_duplicate && third_is_on
     }
 
     fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
@@ -4142,26 +4614,6 @@ impl SqlEditorWidget {
             SqlToken::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]"),
             SqlToken::Comment(comment) => Self::is_mysql_executable_comment_token(comment),
         }
-    }
-
-    fn is_mysql_compound_statement(tokens: &[SqlToken]) -> bool {
-        let words = tokens
-            .iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.as_str()),
-                _ => None,
-            })
-            .take(8)
-            .collect::<Vec<_>>();
-
-        matches!(words.first(), Some(word) if word.eq_ignore_ascii_case("BEGIN"))
-            || matches!(words.first(), Some(word) if word.eq_ignore_ascii_case("CREATE"))
-                && words.iter().skip(1).any(|word| {
-                    word.eq_ignore_ascii_case("PROCEDURE")
-                        || word.eq_ignore_ascii_case("FUNCTION")
-                        || word.eq_ignore_ascii_case("TRIGGER")
-                        || word.eq_ignore_ascii_case("EVENT")
-                })
     }
 
     fn word_token_can_terminate_statement(word: &str) -> bool {
@@ -4632,6 +5084,7 @@ impl SqlEditorWidget {
         let token_spans =
             super::query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible);
         let token_cache = FormatterTokenCache::build(tokens);
+        let comment_prefix_cache = CommentPrefixCache::build(tokens);
 
         let newline_with = |out: &mut String,
                             indent_level: usize,
@@ -4889,10 +5342,18 @@ impl SqlEditorWidget {
                                 && !paren_stack.iter().any(|frame| frame.is_query_like())));
                     let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
-                        && Self::is_mysql_declare_cursor_for_clause(tokens, idx);
+                        && Self::is_mysql_declare_cursor_for_clause(
+                            tokens,
+                            idx,
+                            Some(token_cache.statement_word_links()),
+                        );
                     let mysql_declare_handler_for_clause = mysql_compatible
                         && upper == "FOR"
-                        && Self::is_mysql_declare_handler_for_clause(tokens, idx);
+                        && Self::is_mysql_declare_handler_for_clause(
+                            tokens,
+                            idx,
+                            Some(token_cache.statement_word_links()),
+                        );
                     let mysql_handler_body_line_pending =
                         at_line_start && mysql_handler_state.body_line_pending();
                     let mysql_handler_block_begin = mysql_handler_body_line_pending
@@ -4901,10 +5362,21 @@ impl SqlEditorWidget {
                     let mysql_declare_for_clause =
                         mysql_declare_cursor_for_clause || mysql_declare_handler_for_clause;
                     let mysql_if_exists_modifier =
-                        upper == "IF" && Self::is_mysql_if_exists_modifier(tokens, idx, next_word);
+                        upper == "IF"
+                            && Self::is_mysql_if_exists_modifier(
+                                tokens,
+                                idx,
+                                next_word,
+                                Some(token_cache.statement_word_links()),
+                            );
                     let mysql_scalar_if_function = mysql_compatible
                         && upper == "IF"
-                        && Self::mysql_if_is_scalar_function(tokens, idx);
+                        && Self::mysql_if_is_scalar_function(
+                            tokens,
+                            idx,
+                            Some(token_cache.meaningful_links()),
+                            Some(token_cache.matching_paren_close_indices()),
+                        );
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper, "INSERT" | "UPDATE" | "DELETE");
                     let is_compound_trigger_timing_header = compound_trigger_state
@@ -5249,6 +5721,7 @@ impl SqlEditorWidget {
                             !Self::fetch_into_has_multiple_targets(tokens, idx),
                             construct.in_analytic_over_paren(paren_stack.len()),
                             construct.in_keep_paren(paren_stack.len()),
+                            Some(token_cache.statement_word_links()),
                         )
                     {
                         // FORALL body is always exactly one structural level
@@ -5835,7 +6308,12 @@ impl SqlEditorWidget {
                         } else if upper == "DO"
                             && mysql_compatible
                             && after_for_while
-                            && Self::recent_statement_words_before(tokens, idx, 8)
+                            && Self::recent_statement_words_before(
+                                tokens,
+                                idx,
+                                8,
+                                Some(token_cache.statement_word_links()),
+                            )
                                 .iter()
                                 .any(|word| word.eq_ignore_ascii_case("WHILE"))
                         {
@@ -6261,7 +6739,11 @@ impl SqlEditorWidget {
                     // inside the UPDATE assignment list is treated as a function call.
                     if upper == "UPDATE"
                         && paren_stack.is_empty()
-                        && Self::is_mysql_on_duplicate_key_update(tokens, idx)
+                        && Self::is_mysql_on_duplicate_key_update(
+                            tokens,
+                            idx,
+                            Some(token_cache.statement_word_links()),
+                        )
                     {
                         on_duplicate_key_update_active = true;
                     }
@@ -6320,8 +6802,20 @@ impl SqlEditorWidget {
                     let top_level_set_list =
                         in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     let active_list_layout = select_list_layout_state.has_active_indent();
+                    let comment_structural_prefix = comment_prefix_cache.prefix_before(idx);
+                    let previous_non_comment_token = comment_prefix_cache
+                        .previous_non_comment_token_index(idx)
+                        .and_then(|token_idx| tokens.get(token_idx));
+                    let second_previous_non_comment_token = comment_prefix_cache
+                        .second_previous_non_comment_token_index(idx)
+                        .and_then(|token_idx| tokens.get(token_idx));
                     let keeps_next_line_continuation =
-                        Self::comment_keeps_next_line_continuation(tokens, idx);
+                        Self::comment_keeps_next_line_continuation_for_prefix(
+                            comment_structural_prefix,
+                            second_previous_non_comment_token,
+                            previous_non_comment_token,
+                            comment_prefix_cache.has_string_token_before(idx),
+                        );
                     let attachment = Self::classify_comment_attachment(
                         &out,
                         at_line_start,
@@ -6467,7 +6961,9 @@ impl SqlEditorWidget {
 
                     needs_space = true;
                     let comment_header_continuation_kind =
-                        Self::comment_header_continuation_kind(tokens, idx);
+                        Self::comment_header_continuation_kind_for_prefix(
+                            comment_structural_prefix,
+                        );
                     if is_multiline_block_comment {
                         at_line_start = true;
                         needs_space = false;
@@ -6933,14 +7429,21 @@ impl SqlEditorWidget {
                                 Some(SqlToken::Word(word))
                                     if crate::sql_text::is_subquery_head_keyword(word)
                             );
-                            let wraps_subquery_or_case_head =
-                                Self::paren_starts_wrapped_layout_head(tokens, idx);
+                            let wraps_subquery_or_case_head = Self::paren_starts_wrapped_layout_head(
+                                tokens,
+                                idx,
+                                Some(token_cache.meaningful_links()),
+                            );
                             let is_analytic_over_paren = Self::paren_opens_analytic_layout(
                                 current_clause.as_deref(),
                                 prev_word_upper.as_deref(),
                             );
-                            let multiline_clause_owner_kind =
-                                Self::paren_multiline_clause_owner_kind(tokens, idx).or_else(
+                            let multiline_clause_owner_kind = Self::paren_multiline_clause_owner_kind(
+                                tokens,
+                                idx,
+                                Some(token_cache.statement_word_links()),
+                            )
+                                .or_else(
                                     || {
                                         (matches!(current_clause.as_deref(), Some("WINDOW"))
                                             && matches!(prev_word_upper.as_deref(), Some("AS")))
@@ -6948,7 +7451,18 @@ impl SqlEditorWidget {
                                     },
                                 );
                             let wrapped_owner_kind = multiline_clause_owner_kind.filter(|kind| {
-                                Self::paren_owner_requires_wrapped_layout(tokens, idx, *kind)
+                                Self::paren_owner_requires_wrapped_layout(
+                                    tokens,
+                                    idx,
+                                    *kind,
+                                    Some(token_cache.matching_paren_close_indices()),
+                                    Some(
+                                        token_cache
+                                            .open_paren_multiline_child_head_prefix_counts(),
+                                    ),
+                                    Some(token_cache.meaningful_links()),
+                                    Some(token_cache.statement_word_links()),
+                                )
                             });
                             let is_keep_paren = matches!(prev_word_upper.as_deref(), Some("KEEP"));
                             let is_multiline_clause_paren = matches!(
@@ -6972,11 +7486,25 @@ impl SqlEditorWidget {
                                     token_spans.as_slice(),
                                     statement,
                                     idx,
+                                    Some(token_cache.matching_paren_close_indices()),
+                                    Some(token_cache.meaningful_links()),
                                 );
                             let is_call_argument_list =
-                                Self::paren_opens_call_argument_list(tokens, idx)
+                                Self::paren_opens_call_argument_list(
+                                    tokens,
+                                    idx,
+                                    Some(token_cache.statement_word_links()),
+                                )
                                     && Self::paren_body_contains_nested_multiline_child(
-                                        tokens, idx,
+                                        tokens,
+                                        idx,
+                                        Some(token_cache.matching_paren_close_indices()),
+                                        Some(
+                                            token_cache
+                                                .open_paren_multiline_child_head_prefix_counts(),
+                                        ),
+                                        Some(token_cache.meaningful_links()),
+                                        Some(token_cache.statement_word_links()),
                                     );
                             let paren_frame_kind = if multiline_clause_owner_kind
                                 == Some(FormatIndentedParenOwnerKind::Window)
@@ -7027,12 +7555,20 @@ impl SqlEditorWidget {
                                     Some("AVG" | "COUNT" | "MAX" | "MIN")
                                 );
                             let keeps_count_star_call_tight =
-                                Self::count_star_call_should_stay_tight(tokens, idx);
+                                Self::count_star_call_should_stay_tight(
+                                    tokens,
+                                    idx,
+                                    Some(token_cache.meaningful_links()),
+                                    Some(token_cache.statement_word_links()),
+                                );
                             let keeps_mysql_word_paren_tight = mysql_compatible
                                 && Self::mysql_word_paren_should_stay_tight(
                                     tokens,
                                     idx,
                                     on_duplicate_key_update_active,
+                                    Some(token_cache.meaningful_links()),
+                                    Some(token_cache.statement_word_links()),
+                                    Some(token_cache.matching_paren_close_indices()),
                                 );
                             if needs_space
                                 && !keeps_aggregate_call_tight
@@ -7269,12 +7805,7 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        let normalized = Self::split_inline_statement_separators(out.trim_end());
-        if mysql_compatible && Self::is_mysql_compound_statement(tokens) {
-            normalized
-        } else {
-            Self::apply_parser_depth_indentation_with_mysql_compat(&normalized, mysql_compatible)
-        }
+        Self::split_inline_statement_separators(out.trim_end())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7292,11 +7823,39 @@ impl SqlEditorWidget {
         if formatted.is_empty() {
             return formatted.to_string();
         }
+        if !formatted.contains('\n') {
+            return formatted.to_string();
+        }
 
+        let profile = mysql_compatible && Self::mysql_formatter_profile_enabled();
+        let rendered_started_at = profile.then(std::time::Instant::now);
         let rendered = Self::resolved_line_layouts(formatted, mysql_compatible)
             .map(|layouts| Self::render_line_layouts(&layouts))
             .unwrap_or_else(|| formatted.to_string());
-        Self::normalize_create_table_body_layout(&rendered, mysql_compatible)
+        if let Some(started_at) = rendered_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_resolve_layouts input_bytes={} output_bytes={} elapsed_ms={:.3}",
+                formatted.len(),
+                rendered.len(),
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if !Self::contains_ascii_case_insensitive(&rendered, "CREATE")
+            || !Self::contains_ascii_case_insensitive(&rendered, "TABLE")
+        {
+            return rendered;
+        }
+        let normalize_started_at = profile.then(std::time::Instant::now);
+        let normalized = Self::normalize_create_table_body_layout(&rendered, mysql_compatible);
+        if let Some(started_at) = normalize_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_normalize_create_table input_bytes={} output_bytes={} elapsed_ms={:.3}",
+                rendered.len(),
+                normalized.len(),
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        normalized
     }
 
     fn normalize_create_table_body_layout(formatted: &str, mysql_compatible: bool) -> String {
@@ -7387,29 +7946,71 @@ impl SqlEditorWidget {
         formatted: &'a str,
         mysql_compatible: bool,
     ) -> Option<Vec<LineLayout<'a>>> {
+        let profile = mysql_compatible && Self::mysql_formatter_profile_enabled();
         let line_count = formatted.lines().count();
+        let contexts_started_at = profile.then(std::time::Instant::now);
         let contexts = QueryExecutor::auto_format_line_contexts(formatted);
+        if let Some(started_at) = contexts_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_contexts input_bytes={} lines={} elapsed_ms={:.3}",
+                formatted.len(),
+                line_count,
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         if contexts.len() != line_count {
             return None;
         }
 
         let multiline_string_prefix_lengths =
             Self::multiline_string_continuation_prefix_lengths(formatted, line_count);
+        let build_layouts_started_at = profile.then(std::time::Instant::now);
         let mut layouts =
             Self::build_line_layouts(formatted, &contexts, &multiline_string_prefix_lengths);
+        if let Some(started_at) = build_layouts_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_build_layouts lines={} elapsed_ms={:.3}",
+                line_count,
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
 
+        let resolve_code_started_at = profile.then(std::time::Instant::now);
         Self::resolve_code_line_layouts(&mut layouts, &next_code_indices, mysql_compatible);
+        if let Some(started_at) = resolve_code_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_resolve_code lines={} elapsed_ms={:.3}",
+                line_count,
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let align_started_at = profile.then(std::time::Instant::now);
         Self::align_case_close_paren_layouts(
             &mut layouts,
             &previous_code_indices,
             &next_code_indices,
         );
+        if let Some(started_at) = align_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_align_case_close lines={} elapsed_ms={:.3}",
+                line_count,
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let resolve_non_code_started_at = profile.then(std::time::Instant::now);
         Self::resolve_non_code_line_layouts(
             &mut layouts,
             &previous_code_indices,
             &next_code_indices,
         );
+        if let Some(started_at) = resolve_non_code_started_at {
+            eprintln!(
+                "[mysql-formatter] stage=mysql_parser_depth_resolve_non_code lines={} elapsed_ms={:.3}",
+                line_count,
+                started_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Some(layouts)
     }
@@ -7670,6 +8271,14 @@ impl SqlEditorWidget {
     }
 
     fn line_starts_create_table_header(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if !Self::starts_with_ascii_keyword_token_ci(trimmed, "CREATE") {
+            return false;
+        }
+        if !Self::contains_ascii_case_insensitive(trimmed, "TABLE") {
+            return false;
+        }
+
         let words = crate::sql_text::meaningful_identifier_words_before_inline_comment(line, 4);
         matches!(
             words.as_slice(),
@@ -7956,6 +8565,15 @@ impl SqlEditorWidget {
             return None;
         }
 
+        if line_semantic.is_join_clause()
+            && query_owner_kind == Some(FormatQueryOwnerKind::Clause)
+        {
+            // JOIN (...) owns a derived-table child query. Treat it as a
+            // FROM-item owner so the child SELECT head stays one frame deeper
+            // than the JOIN line instead of inheriting clause-level +2 depth.
+            return Some(layout.final_depth.saturating_add(1));
+        }
+
         if query_owner_kind == Some(FormatQueryOwnerKind::Condition) {
             let condition_head_depth = resolved_query_base_depth
                 .or(layout.query_base_depth)
@@ -8129,6 +8747,8 @@ impl SqlEditorWidget {
         leading_close_starts_with_comma_continuation: bool,
         leading_close_tail_closes_current_parent: bool,
         leading_close_has_mixed_continuation: bool,
+        line_ends_with_trailing_comma: bool,
+        line_ends_with_open_paren: bool,
         mixed_tail_is_condition_keyword: bool,
         defers_to_condition_close_alignment: bool,
         is_paren_case_closer: bool,
@@ -8141,6 +8761,7 @@ impl SqlEditorWidget {
         current_line_query_close_align_depth: Option<usize>,
         popped_query_paren_frame: Option<ParenLayoutFrame>,
         last_popped_non_multiline_paren_frame: Option<ParenLayoutFrame>,
+        active_general_paren_frame: Option<ParenLayoutFrame>,
         close_continuation_frame: Option<ParenLayoutFrame>,
         exact_structural_owner_alignment_depth: Option<usize>,
     ) -> usize {
@@ -8209,7 +8830,21 @@ impl SqlEditorWidget {
                         .or(current_line_query_close_align_depth)
                         .unwrap_or(effective_depth)
                 } else {
-                    effective_depth
+                    // Pure `),` can mean either:
+                    // - nested child close inside an still-open parent call
+                    //   (`... IFNULL(...), 2`) => keep parent body depth
+                    // - close of the current top-level call item
+                    //   (`CONCAT(...),`) => return to owner depth
+                    //
+                    // Use the active frame when it still exists after
+                    // consuming the close; otherwise align to the popped owner.
+                    active_general_paren_frame
+                        .map(|frame| frame.body_depth())
+                        .or_else(|| {
+                            last_popped_non_multiline_paren_frame.map(|frame| frame.owner_depth)
+                        })
+                        .or(current_line_query_close_align_depth)
+                        .unwrap_or(effective_depth)
                 };
             }
 
@@ -8223,7 +8858,19 @@ impl SqlEditorWidget {
             }
 
             return close_continuation_frame
-                .map(|frame| effective_depth.max(frame.body_depth()))
+                .map(|frame| {
+                    if leading_close_has_mixed_continuation
+                        && (line_ends_with_trailing_comma || line_ends_with_open_paren)
+                    {
+                        // `), ...` mixed close tails should inherit the parent
+                        // list/body frame depth directly. Letting a deeper
+                        // analyzer value win here leaks previous-line carry
+                        // into sibling argument chains.
+                        frame.body_depth()
+                    } else {
+                        effective_depth.max(frame.body_depth())
+                    }
+                })
                 .or_else(|| {
                     popped_query_paren_frame.map(|frame| effective_depth.max(frame.owner_depth))
                 })
@@ -8517,12 +9164,46 @@ impl SqlEditorWidget {
         stable_list_depth: Option<usize>,
         carried_depth: Option<usize>,
         header_continuation_depth: Option<usize>,
+        closing_owner_body_depth: Option<usize>,
+        leading_close_starts_with_comma_continuation: bool,
+        active_general_paren_frame: Option<ParenLayoutFrame>,
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
     ) -> Option<usize> {
         let ends_with_trailing_comma = Self::line_ends_with_comma_before_inline_comment(line);
         if !ends_with_trailing_comma {
             return None;
         }
+
+        let closing_owner_body_depth = (!leading_close_starts_with_comma_continuation)
+            .then_some(closing_owner_body_depth)
+            .flatten();
+        let line_has_leading_close =
+            crate::sql_text::line_has_leading_significant_close_paren(line);
+        let line_has_mixed_leading_close_continuation = line_has_leading_close
+            && crate::sql_text::line_has_mixed_leading_close_continuation(line);
+        let stable_list_depth = if line_has_mixed_leading_close_continuation {
+            // Mixed leading-close list items such as `) AS alias,` already
+            // resolved their canonical owner depth on this line. Letting a
+            // shallower carried/query-base value win here leaks stale frame
+            // state into the next sibling (`(`, key/value item, ...).
+            stable_list_depth.map(|depth| depth.max(line_depth))
+        } else {
+            stable_list_depth
+        };
+        let carried_depth = if line_has_mixed_leading_close_continuation {
+            carried_depth.map(|depth| depth.max(line_depth))
+        } else {
+            carried_depth
+        };
+        let general_paren_list_depth = (line_has_leading_close
+            && !leading_close_starts_with_comma_continuation
+            && !line_has_mixed_leading_close_continuation)
+            .then(|| active_general_paren_frame.map(|frame| frame.body_depth()))
+            .flatten();
+        let same_depth_general_paren_sibling_depth = (!line_has_leading_close
+            && active_general_paren_frame.is_some()
+            && stable_list_depth.is_some_and(|depth| depth > line_depth))
+            .then_some(line_depth);
 
         let owner_prefers_body_list_depth = active_owner_relative_frame.is_some_and(|frame| {
             matches!(
@@ -8534,12 +9215,17 @@ impl SqlEditorWidget {
         });
 
         if owner_prefers_body_list_depth {
-            stable_list_depth
+            closing_owner_body_depth
+                .or(general_paren_list_depth)
+                .or(stable_list_depth)
                 .or(carried_depth)
                 .or(header_continuation_depth)
                 .or(Some(line_depth))
         } else {
             header_continuation_depth
+                .or(closing_owner_body_depth)
+                .or(general_paren_list_depth)
+                .or(same_depth_general_paren_sibling_depth)
                 .or(stable_list_depth)
                 .or(carried_depth)
                 .or(Some(line_depth))
@@ -8669,6 +9355,7 @@ impl SqlEditorWidget {
         current_line_multiline_clause_owner_kind: Option<FormatIndentedParenOwnerKind>,
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
         active_general_paren_frame: Option<ParenLayoutFrame>,
+        active_structural_continuation_depth_for_line: Option<usize>,
         resolved_query_base_depth: Option<usize>,
         effective_depth: usize,
     ) -> usize {
@@ -8690,11 +9377,14 @@ impl SqlEditorWidget {
             let general_paren_continuation_depth = active_general_paren_frame.and_then(|frame| {
                 (query_role == AutoFormatQueryRole::None).then_some(frame.continuation_depth)
             });
-            return kind.formatter_owner_depth(
+            let owner_depth = kind.formatter_owner_depth(
                 effective_depth,
                 resolved_query_base_depth,
                 general_paren_continuation_depth,
             );
+            return active_structural_continuation_depth_for_line
+                .map(|depth| owner_depth.max(depth))
+                .unwrap_or(owner_depth);
         }
 
         effective_depth
@@ -8775,8 +9465,12 @@ impl SqlEditorWidget {
             let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
+            let incoming_structural_continuation_frame = active_structural_continuation_frame;
             let incoming_structural_continuation_depth =
-                active_structural_continuation_frame.map(|frame| frame.continuation_depth);
+                incoming_structural_continuation_frame.map(|frame| frame.continuation_depth);
+            let incoming_structural_continuation_from_leading_close_comma_list =
+                incoming_structural_continuation_frame
+                    .is_some_and(|frame| frame.from_leading_close_comma_list);
             let pending_split_plain_end_layout_frame_for_line =
                 pending_split_plain_end_layout_frame.take();
             let pending_control_branch_body_depth_for_line = pending_control_branch_body_frame
@@ -8862,7 +9556,7 @@ impl SqlEditorWidget {
             let next_next_code_trimmed = next_code_indices[idx]
                 .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten())
                 .map(|next_idx| layouts[next_idx].analysis_trimmed);
-            let line_tokens = Self::tokenize_sql(trimmed);
+            let line_tokens = Self::tokenize_sql_with_mysql_compat(trimmed, mysql_compatible);
             // Hot path: reuse the already-uppercased line so statement-head
             // recovery does not build another temporary uppercase String.
             let current_line_starts_statement_head_keyword =
@@ -9293,6 +9987,9 @@ impl SqlEditorWidget {
                 .is_some()
                 && layouts[idx].query_role == AutoFormatQueryRole::None
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES");
+            let current_line_is_expression_case_owner = in_dml_statement
+                && active_general_paren_frame.is_some()
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let current_line_starts_dml_case_expression = in_dml_statement
                 && current_line_starts_case
                 && current_line_branch_body_depth.is_none()
@@ -9377,10 +10074,15 @@ impl SqlEditorWidget {
                     || current_line_query_owner_keeps_continuation_target
                     || current_line_is_pending_partial_multiline_owner
                     || current_line_is_pending_partial_query_owner
-                    || current_line_is_exact_bare_owner_or_pending_header;
+                    || current_line_is_exact_bare_owner_or_pending_header
+                    || current_line_is_expression_case_owner;
+            let current_line_ends_statement_terminator =
+                Self::line_ends_with_semicolon_before_inline_comment(trimmed);
             let current_line_rejects_structural_continuation_depth =
                 (current_line_is_structural_continuation_boundary
                     && !current_line_is_structural_continuation_target)
+                    || (current_line_starts_statement_head_keyword
+                        && !current_line_is_expression_case_owner)
                     || current_line_is_join_condition_clause
                     || current_line_is_condition_keyword
                     || current_line_is_parenthesized_condition_header
@@ -9389,17 +10091,27 @@ impl SqlEditorWidget {
                     || current_line_is_mysql_declare_handler_boundary;
             let current_line_clears_structural_continuation_depth =
                 current_line_is_structural_continuation_boundary
+                    || (current_line_starts_statement_head_keyword
+                        && !current_line_is_expression_case_owner)
                     || current_line_is_join_condition_clause
                     || current_line_is_condition_keyword
                     || current_line_is_parenthesized_condition_header
                     || current_line_is_parenthesized_condition_close
                     || current_line_is_standalone_open_paren
                     || starts_with_close_paren
+                    || current_line_ends_statement_terminator
                     || current_line_is_mysql_declare_handler_boundary;
             let active_structural_continuation_depth_for_line =
                 (!current_line_rejects_structural_continuation_depth)
                     .then_some(incoming_structural_continuation_depth)
                     .flatten();
+            let current_line_allows_general_structural_continuation_depth =
+                !current_line_starts_multiline_clause
+                    || incoming_structural_continuation_from_leading_close_comma_list;
+            let multiline_owner_structural_floor_depth_for_line =
+                active_structural_continuation_depth_for_line.filter(|_| {
+                    incoming_structural_continuation_from_leading_close_comma_list
+                });
             let current_line_query_close_align_depth = closing_query_frames_for_line
                 .last()
                 .map(|frame| frame.close_align_depth);
@@ -9470,6 +10182,11 @@ impl SqlEditorWidget {
             let current_line_uses_mysql_structural_auto_depth = mysql_compatible
                 && layouts[idx].query_role == AutoFormatQueryRole::None
                 && !starts_with_close_paren
+                && !(active_structural_continuation_depth_for_line.is_some()
+                    && current_line_allows_general_structural_continuation_depth)
+                && !(current_line_is_standalone_query_head_open
+                    && incoming_structural_continuation_from_leading_close_comma_list
+                    && active_structural_continuation_depth_for_line.is_some())
                 && (is_trigger_header_body_line
                     || is_trigger_header_body_start
                     || is_trigger_header_body_end
@@ -9517,7 +10234,9 @@ impl SqlEditorWidget {
                 owner_depth
             } else if starts_with_close_paren && is_paren_case_closer {
                 paren_case_close_frame_depth.unwrap_or(paren_case_base_depth)
-            } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth {
+            } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth
+                .filter(|_| active_structural_continuation_depth_for_line.is_none())
+            {
                 // CASE inside a parenthesized DML expression inherits the
                 // structural owner line that opened the active `(`. Manual
                 // indent on the CASE line must not add extra depth.
@@ -9532,11 +10251,14 @@ impl SqlEditorWidget {
                     .max(parser_depth.min(layouts[idx].auto_depth))
             } else if active_owner_relative_frame.is_some()
                 && active_structural_continuation_depth_for_line.is_some()
+                && !current_line_is_expression_case_owner
             {
                 active_structural_continuation_depth_for_line
                     .unwrap_or(parser_depth)
                     .max(parser_depth)
-            } else if let Some(continuation_depth) = active_structural_continuation_depth_for_line {
+            } else if let Some(continuation_depth) = active_structural_continuation_depth_for_line
+                .filter(|_| current_line_allows_general_structural_continuation_depth)
+            {
                 // Shared structural continuation state (for example
                 // `UPDATE SET item,` carrying the next list item depth or a
                 // nested close-comma returning to the parent frame body
@@ -9545,7 +10267,21 @@ impl SqlEditorWidget {
                 // remember a stale local continuation path from the previous
                 // line shape, so do not let that deeper analyzer value
                 // override the carried frame depth.
-                continuation_depth.max(parser_depth)
+                let continuation_floor_depth = if current_line_is_expression_case_owner {
+                    continuation_depth
+                } else if active_general_paren_frame.is_some() {
+                    mysql_routine_block_frames
+                        .last()
+                        .map(|frame| frame.body_depth())
+                        .unwrap_or(0)
+                } else if layouts[idx].query_role != AutoFormatQueryRole::None {
+                    resolved_query_base_depth
+                        .or(layouts[idx].query_base_depth)
+                        .unwrap_or(parser_depth)
+                } else {
+                    parser_depth
+                };
+                continuation_depth.max(continuation_floor_depth)
             } else if uses_analyzer_query_depth {
                 if starts_query_head {
                     active_pending_query_head
@@ -9571,7 +10307,19 @@ impl SqlEditorWidget {
                 // depth. Reusing a previously carried list/header continuation
                 // depth here leaks inner multiline-query state into the outer
                 // select-item anchor after nested scalar subqueries.
-                analyzer_query_depth.max(parser_depth)
+                let standalone_query_head_depth = analyzer_query_depth.max(parser_depth);
+                if incoming_structural_continuation_from_leading_close_comma_list {
+                    // A continuation that was explicitly produced from a
+                    // leading-close comma list is already frame-typed sibling
+                    // state (`) AS alias,` -> next scalar subquery `(`).
+                    // Keep it as a floor so standalone query-head opens do
+                    // not fall back to a shallower analyzer heuristic.
+                    active_structural_continuation_depth_for_line
+                        .map(|depth| depth.max(standalone_query_head_depth))
+                        .unwrap_or(standalone_query_head_depth)
+                } else {
+                    standalone_query_head_depth
+                }
             } else if current_line_is_pending_partial_multiline_owner
                 || current_line_is_standalone_open_paren
             {
@@ -9792,6 +10540,7 @@ impl SqlEditorWidget {
                 current_line_multiline_clause_owner_kind,
                 active_owner_relative_frame,
                 active_general_paren_frame,
+                multiline_owner_structural_floor_depth_for_line,
                 resolved_query_base_depth,
                 effective_depth,
             );
@@ -9885,6 +10634,8 @@ impl SqlEditorWidget {
                 leading_close_starts_with_comma_continuation,
                 leading_close_tail_closes_current_parent,
                 leading_close_has_mixed_continuation,
+                Self::line_ends_with_comma_before_inline_comment(trimmed),
+                Self::line_ends_with_open_paren_before_inline_comment(trimmed),
                 current_line_tail_is_condition_keyword,
                 defers_to_condition_close_alignment,
                 is_paren_case_closer,
@@ -9897,6 +10648,7 @@ impl SqlEditorWidget {
                 current_line_query_close_align_depth,
                 popped_query_paren_frame,
                 last_popped_non_multiline_paren_frame,
+                active_general_paren_frame,
                 close_continuation_frame,
                 exact_structural_owner_alignment_depth,
             );
@@ -9961,6 +10713,14 @@ impl SqlEditorWidget {
                     .last()
                     .map(|frame| frame.owner_depth)
                     .unwrap_or(effective_depth)
+            } else if active_general_paren_frame.is_some()
+                || active_structural_continuation_depth_for_line.is_some()
+            {
+                // Expression/list continuation inside routine blocks must keep
+                // their own frame depth (for example CASE siblings inside a
+                // VALUES call). Forcing the routine body floor here leaks
+                // statement-level body depth into function-argument siblings.
+                effective_depth
             } else {
                 mysql_routine_block_frames
                     .last()
@@ -9974,6 +10734,7 @@ impl SqlEditorWidget {
                 && !starts_with_close_paren
                 && layouts[idx].query_role == AutoFormatQueryRole::None
                 && layouts[idx].line_semantic.is_clause_boundary()
+                && active_structural_continuation_depth_for_line.is_none()
                 && current_line_branch_body_depth.is_none()
                 && pending_case_branch_body_depth_for_line.is_none()
                 && pending_merge_branch_body_depth_for_line.is_none()
@@ -10099,49 +10860,6 @@ impl SqlEditorWidget {
             if let Some(owner_depth) = window_definition_owner_depth_for_line {
                 effective_depth = effective_depth.max(owner_depth);
             }
-            if mysql_compatible
-                && in_dml_statement
-                && idx > 0
-                && !current_line_starts_query_head_token
-                && !current_line_is_condition_keyword
-                && !current_line_is_join_condition_clause
-                && !starts_with_close_paren
-            {
-                let previous_code_idx = (0..idx)
-                    .rev()
-                    .find(|scan_idx| !layouts[*scan_idx].analysis_trimmed.is_empty());
-                if let Some(previous_code_idx) = previous_code_idx {
-                    let previous_trimmed = layouts[previous_code_idx].analysis_trimmed;
-                    if Self::line_ends_with_comma_before_inline_comment(previous_trimmed)
-                        && previous_trimmed.starts_with(')')
-                    {
-                        let previous_depth = layouts[previous_code_idx].final_depth;
-                        let owner_line_idx = (0..previous_code_idx)
-                            .rev()
-                            .find(|scan_idx| {
-                                !layouts[*scan_idx].analysis_trimmed.is_empty()
-                                    && layouts[*scan_idx].final_depth == previous_depth
-                                    && !layouts[*scan_idx].analysis_trimmed.starts_with(')')
-                            })
-                            .unwrap_or(previous_code_idx);
-                        let owner_trimmed = layouts[owner_line_idx].analysis_trimmed;
-                        let owner_is_inline_select_head =
-                            crate::sql_text::starts_with_keyword_token(
-                                &owner_trimmed.to_ascii_uppercase(),
-                                "SELECT",
-                            ) && !crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                                owner_trimmed,
-                                &["SELECT"],
-                            );
-                        let sibling_depth = if owner_is_inline_select_head {
-                            layouts[owner_line_idx].final_depth.saturating_add(1)
-                        } else {
-                            previous_depth
-                        };
-                        effective_depth = effective_depth.max(sibling_depth);
-                    }
-                }
-            }
             if current_line_is_parenthesized_condition
                 && current_line_has_flow_control_condition_header
                 && current_line_is_condition_keyword
@@ -10168,10 +10886,75 @@ impl SqlEditorWidget {
             }
             let line_starts_effective_query_head =
                 starts_query_head || pending_query_head_depth_for_line.is_some();
+            if mysql_compatible {
+                if let Some(frame) = active_mysql_if_frame {
+                    let current_line_is_mysql_if_body_anchor =
+                        !current_line_is_parenthesized_condition
+                            && !current_line_is_standalone_open_paren
+                            && active_general_paren_frame.is_none()
+                            && active_owner_relative_frame.is_none()
+                            && pending_operator_for_line.is_none()
+                            && pending_plsql_child_query_owner_for_line.is_none()
+                            && pending_query_owner_open_align_for_line.is_none()
+                            && (starts_query_head
+                                || layouts[idx].line_semantic.is_clause_boundary()
+                                || current_line_starts_statement_head_keyword);
+                    if current_line_is_mysql_end_if
+                        || current_line_starts_elsif
+                        || current_line_starts_elseif
+                        || current_line_is_mysql_else_header
+                    {
+                        effective_depth = frame.owner_depth;
+                    } else if current_line_mysql_if_header_kind == Some(MySqlIfBranchKind::If) {
+                        effective_depth = frame.body_depth();
+                    } else if current_line_is_mysql_if_body_anchor {
+                        effective_depth = frame.body_depth();
+                    } else if !current_line_starts_block_terminating_end {
+                        effective_depth = effective_depth.max(frame.body_depth());
+                    }
+                } else if let Some(routine_body_depth) = mysql_routine_block_frames
+                    .last()
+                    .map(|frame| frame.body_depth())
+                {
+                    let has_active_general_paren_frame = paren_layout_frames
+                        .iter()
+                        .rev()
+                        .any(|frame| frame.kind == ParenLayoutFrameKind::General);
+                    let current_line_is_top_level_routine_clause = !starts_with_close_paren
+                        && current_line_mysql_routine_block_kind.is_none()
+                        && current_line_mysql_routine_block_end_kind.is_none()
+                        && !current_line_is_mysql_begin_end
+                        && !current_line_is_mysql_repeat_until
+                        && !current_line_is_mysql_declare_handler_boundary
+                        && active_structural_continuation_depth_for_line.is_none()
+                        && current_line_branch_body_depth.is_none()
+                        && pending_case_branch_body_depth_for_line.is_none()
+                        && pending_merge_branch_body_depth_for_line.is_none()
+                        && (!current_line_is_parenthesized_condition
+                            || current_line_is_mysql_if_owner_header)
+                        && !current_line_is_standalone_open_paren
+                        && !has_active_general_paren_frame
+                        && pending_query_head_depth_for_line.is_none()
+                        && active_owner_relative_frame.is_none()
+                        && pending_operator_for_line.is_none()
+                        && pending_plsql_child_query_owner_for_line.is_none()
+                        && pending_query_owner_open_align_for_line.is_none()
+                        && (starts_query_head
+                            || current_line_starts_statement_head_keyword
+                            || current_line_is_mysql_if_owner_header
+                            || current_line_is_exact_exception);
+                    if current_line_is_top_level_routine_clause {
+                        effective_depth = routine_body_depth;
+                    }
+                }
+            }
+            layouts[idx].final_depth = effective_depth;
+            layouts[idx].dml_case_expression_close_depth =
+                current_line_dml_case_expression_close_depth;
             if line_starts_effective_query_head {
                 if let Some(query_base_depth) = layouts[idx].query_base_depth {
                     let extra_depth = layouts[idx].auto_depth.saturating_sub(query_base_depth);
-                    let resolved_base_depth = effective_depth.saturating_sub(extra_depth);
+                    let resolved_base_depth = layouts[idx].final_depth.saturating_sub(extra_depth);
                     let close_align_depth = resolved_base_depth.saturating_sub(1);
                     let should_store_resolved_query_base = active_pending_query_head.is_some()
                         || resolved_base_depth != query_base_depth;
@@ -10207,65 +10990,6 @@ impl SqlEditorWidget {
                     }
                 }
             }
-            if mysql_compatible {
-                if let Some(frame) = active_mysql_if_frame {
-                    let current_line_is_mysql_if_body_anchor =
-                        !current_line_is_parenthesized_condition
-                            && !current_line_is_standalone_open_paren
-                            && active_general_paren_frame.is_none()
-                            && active_owner_relative_frame.is_none()
-                            && pending_operator_for_line.is_none()
-                            && pending_plsql_child_query_owner_for_line.is_none()
-                            && pending_query_owner_open_align_for_line.is_none()
-                            && (starts_query_head
-                                || layouts[idx].line_semantic.is_clause_boundary()
-                                || current_line_starts_statement_head_keyword);
-                    if current_line_is_mysql_end_if
-                        || current_line_starts_elsif
-                        || current_line_starts_elseif
-                        || current_line_is_mysql_else_header
-                    {
-                        effective_depth = frame.owner_depth;
-                    } else if current_line_mysql_if_header_kind == Some(MySqlIfBranchKind::If) {
-                        effective_depth = frame.body_depth();
-                    } else if current_line_is_mysql_if_body_anchor {
-                        effective_depth = frame.body_depth();
-                    } else if !current_line_starts_block_terminating_end {
-                        effective_depth = effective_depth.max(frame.body_depth());
-                    }
-                } else if let Some(routine_body_depth) = mysql_routine_block_frames
-                    .last()
-                    .map(|frame| frame.body_depth())
-                {
-                    let current_line_is_top_level_routine_clause = !starts_with_close_paren
-                        && current_line_mysql_routine_block_kind.is_none()
-                        && current_line_mysql_routine_block_end_kind.is_none()
-                        && !current_line_is_mysql_begin_end
-                        && !current_line_is_mysql_repeat_until
-                        && !current_line_is_mysql_declare_handler_boundary
-                        && current_line_branch_body_depth.is_none()
-                        && pending_case_branch_body_depth_for_line.is_none()
-                        && pending_merge_branch_body_depth_for_line.is_none()
-                        && (!current_line_is_parenthesized_condition
-                            || current_line_is_mysql_if_owner_header)
-                        && !current_line_is_standalone_open_paren
-                        && active_general_paren_frame.is_none()
-                        && active_owner_relative_frame.is_none()
-                        && pending_operator_for_line.is_none()
-                        && pending_plsql_child_query_owner_for_line.is_none()
-                        && pending_query_owner_open_align_for_line.is_none()
-                        && (starts_query_head
-                            || current_line_starts_statement_head_keyword
-                            || current_line_is_mysql_if_owner_header
-                            || current_line_is_exact_exception);
-                    if current_line_is_top_level_routine_clause {
-                        effective_depth = routine_body_depth;
-                    }
-                }
-            }
-            layouts[idx].final_depth = effective_depth;
-            layouts[idx].dml_case_expression_close_depth =
-                current_line_dml_case_expression_close_depth;
             Self::consume_active_general_paren_multiline_child_continuation(
                 &line_tokens,
                 paren_frame_scan_start_idx,
@@ -10582,17 +11306,35 @@ impl SqlEditorWidget {
                     active_structural_continuation_depth_for_line
                         .or(incoming_structural_continuation_depth),
                     next_header_continuation_depth.or(header_prefix_continuation_depth),
+                    current_line_closes_multiline_clause_owner_depth
+                        .map(|owner_depth| owner_depth.saturating_add(1))
+                        .filter(|_| {
+                            structural_list_body_depth
+                                .is_some_and(|depth| depth > layouts[idx].final_depth)
+                        }),
+                    leading_close_starts_with_comma_continuation,
+                    active_general_paren_frame,
                     active_owner_relative_frame,
                 )
             });
+            let next_structural_from_leading_close_comma_list = starts_with_close_paren
+                && Self::line_ends_with_comma_before_inline_comment(trimmed);
             active_structural_continuation_frame =
                 if let Some(continuation_depth) = next_structural_continuation_depth {
-                    Some(StructuralContinuationLayoutFrame { continuation_depth })
+                    Some(StructuralContinuationLayoutFrame {
+                        continuation_depth,
+                        from_leading_close_comma_list:
+                            next_structural_from_leading_close_comma_list,
+                    })
                 } else if current_line_clears_structural_continuation_depth {
                     None
                 } else {
                     active_structural_continuation_depth_for_line.map(|continuation_depth| {
-                        StructuralContinuationLayoutFrame { continuation_depth }
+                        StructuralContinuationLayoutFrame {
+                            continuation_depth,
+                            from_leading_close_comma_list:
+                                incoming_structural_continuation_from_leading_close_comma_list,
+                        }
                     })
                 };
             pending_split_plain_end_layout_frame =
@@ -10614,9 +11356,10 @@ impl SqlEditorWidget {
                     None
                 };
             layouts[idx].retain_following_non_code_scope =
-                pending_split_plain_end_layout_frame.is_some_and(|frame| {
+                    pending_split_plain_end_layout_frame.is_some_and(|frame| {
                     next_code_trimmed.is_some_and(|next| {
-                        let next_tokens = Self::tokenize_sql(next);
+                        let next_tokens =
+                            Self::tokenize_sql_with_mysql_compat(next, mysql_compatible);
                         Self::split_plain_end_continuation_progress(&next_tokens, frame.kind)
                             .is_some()
                     })
@@ -10729,11 +11472,24 @@ impl SqlEditorWidget {
                     .or_else(|| {
                         Self::structural_plsql_next_query_head_depth(&layouts[idx], &trimmed_upper)
                     });
+                let frame_based_parenthesized_query_head_depth =
+                    (structural_query_owner_depth.is_none()
+                        && Self::line_ends_with_open_paren_before_inline_comment(trimmed))
+                    .then(|| {
+                        active_general_paren_frame
+                            .map(|frame| {
+                                frame
+                                    .body_depth()
+                                    .max(layouts[idx].final_depth.saturating_add(1))
+                            })
+                            .unwrap_or_else(|| layouts[idx].final_depth.saturating_add(1))
+                    });
                 // Deferred child-query heads already carry structural depth
                 // from the analyzer or an explicit owner frame. Existing line
                 // indent must not shift that pending owner stack.
-                let adjusted_next_query_head_depth =
-                    structural_query_owner_depth.unwrap_or(next_query_head_depth);
+                let adjusted_next_query_head_depth = structural_query_owner_depth
+                    .or(frame_based_parenthesized_query_head_depth)
+                    .unwrap_or(next_query_head_depth);
                 let general_paren_floor =
                     (Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                         && structural_query_owner_depth.is_none())
@@ -11457,18 +12213,16 @@ impl SqlEditorWidget {
     fn paren_multiline_clause_owner_kind(
         tokens: &[SqlToken],
         open_idx: usize,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> Option<FormatIndentedParenOwnerKind> {
         const MAX_PRECEDING_WORDS: usize = 8;
 
-        let mut preceding_words: Vec<&str> = Vec::with_capacity(MAX_PRECEDING_WORDS);
-        for token in tokens[..open_idx].iter().rev() {
-            if let SqlToken::Word(word) = token {
-                preceding_words.push(word.as_str());
-                if preceding_words.len() == MAX_PRECEDING_WORDS {
-                    break;
-                }
-            }
-        }
+        let mut preceding_words = Self::recent_statement_words_before(
+            tokens,
+            open_idx,
+            MAX_PRECEDING_WORDS,
+            statement_word_links,
+        );
 
         if preceding_words.is_empty() {
             return None;
@@ -11480,7 +12234,19 @@ impl SqlEditorWidget {
         crate::sql_text::format_indented_paren_owner_kind(&candidate)
     }
 
-    fn matching_close_paren_index(tokens: &[SqlToken], open_idx: usize) -> Option<usize> {
+    fn matching_close_paren_index(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+    ) -> Option<usize> {
+        if let Some(close_idx) = matching_paren_close_indices
+            .and_then(|indices| indices.get(open_idx))
+            .copied()
+            .flatten()
+        {
+            return Some(close_idx);
+        }
+
         let mut paren_depth = 0usize;
 
         for (idx, token) in tokens.iter().enumerate().skip(open_idx) {
@@ -11501,29 +12267,68 @@ impl SqlEditorWidget {
         None
     }
 
-    fn paren_body_contains_nested_multiline_child(tokens: &[SqlToken], open_idx: usize) -> bool {
-        let Some(close_idx) = Self::matching_close_paren_index(tokens, open_idx) else {
+    fn paren_body_contains_nested_multiline_child(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+        open_paren_multiline_child_head_prefix_counts: Option<&[usize]>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let Some(close_idx) =
+            Self::matching_close_paren_index(tokens, open_idx, matching_paren_close_indices)
+        else {
             return false;
         };
+
+        if let Some(prefix_counts) = open_paren_multiline_child_head_prefix_counts {
+            let start = open_idx.saturating_add(1).min(tokens.len());
+            let end = close_idx.min(tokens.len());
+            if end <= start {
+                return false;
+            }
+
+            let start_count = prefix_counts.get(start).copied().unwrap_or(0);
+            let end_count = prefix_counts.get(end).copied().unwrap_or(start_count);
+            return end_count > start_count;
+        }
 
         for idx in open_idx.saturating_add(1)..close_idx {
             if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                 continue;
             }
 
-            let next_non_comment = tokens
-                .iter()
-                .skip(idx.saturating_add(1))
-                .find(|token| !matches!(token, SqlToken::Comment(_)));
+            let next_non_comment_idx = meaningful_token_links
+                .and_then(|links| links.next_index(idx))
+                .or_else(|| {
+                    tokens
+                        .iter()
+                        .enumerate()
+                        .skip(idx.saturating_add(1))
+                        .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+                        .map(|(token_idx, _)| token_idx)
+                });
+            let next_non_comment = next_non_comment_idx.and_then(|token_idx| tokens.get(token_idx));
             let opens_query_like_child = matches!(
                 next_non_comment,
                 Some(SqlToken::Word(word))
                     if crate::sql_text::is_subquery_head_keyword(word)
             );
-            let opens_wrapped_layout_child = Self::paren_starts_wrapped_layout_head(tokens, idx);
+            let opens_wrapped_layout_child = Self::paren_starts_wrapped_layout_head(
+                tokens,
+                idx,
+                meaningful_token_links,
+            );
             let opens_owner_relative_child =
-                Self::paren_multiline_clause_owner_kind(tokens, idx).is_some();
-            let prev_word_upper = Self::previous_word_upper(tokens, idx).map(|(word, _)| word);
+                Self::paren_multiline_clause_owner_kind(tokens, idx, statement_word_links).is_some();
+            let prev_word_upper = statement_word_links
+                .and_then(|links| links.prev_word_index(idx))
+                .and_then(|token_idx| tokens.get(token_idx))
+                .and_then(|token| match token {
+                    SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                    _ => None,
+                })
+                .or_else(|| Self::previous_word_upper(tokens, idx).map(|(word, _)| word));
             let opens_column_list_child =
                 Self::paren_opens_structured_column_list(prev_word_upper.as_deref(), false);
 
@@ -11543,11 +12348,22 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         open_idx: usize,
         owner_kind: FormatIndentedParenOwnerKind,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+        open_paren_multiline_child_head_prefix_counts: Option<&[usize]>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        statement_word_links: Option<&StatementWordLinks>,
     ) -> bool {
         matches!(
             owner_kind,
             FormatIndentedParenOwnerKind::WithinGroup | FormatIndentedParenOwnerKind::Keep
-        ) && Self::paren_body_contains_nested_multiline_child(tokens, open_idx)
+        ) && Self::paren_body_contains_nested_multiline_child(
+            tokens,
+            open_idx,
+            matching_paren_close_indices,
+            open_paren_multiline_child_head_prefix_counts,
+            meaningful_token_links,
+            statement_word_links,
+        )
     }
 
     fn active_phase1_wrapped_owner_kind_at_depth(
@@ -11629,11 +12445,20 @@ impl SqlEditorWidget {
         }
     }
 
-    fn paren_starts_wrapped_layout_head(tokens: &[SqlToken], open_idx: usize) -> bool {
-        let previous_non_comment = tokens[..open_idx]
-            .iter()
-            .rev()
-            .find(|token| !matches!(token, SqlToken::Comment(_)));
+    fn paren_starts_wrapped_layout_head(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        let previous_non_comment = meaningful_token_links
+            .and_then(|links| links.prev_index(open_idx))
+            .and_then(|token_idx| tokens.get(token_idx))
+            .or_else(|| {
+                tokens[..open_idx]
+                    .iter()
+                    .rev()
+                    .find(|token| !matches!(token, SqlToken::Comment(_)))
+            });
         if !Self::token_can_own_wrapped_layout(previous_non_comment) {
             return false;
         }
@@ -11658,28 +12483,7 @@ impl SqlEditorWidget {
         false
     }
 
-    fn significant_tokens_structural_prefix(significant_tokens: &[&SqlToken]) -> Option<String> {
-        if significant_tokens.is_empty() {
-            return None;
-        }
-
-        let mut prefix = String::new();
-        for token in significant_tokens {
-            let token_text = match token {
-                SqlToken::Word(word) => word.as_str(),
-                SqlToken::Symbol(symbol) => symbol.as_str(),
-                SqlToken::String(_) | SqlToken::Comment(_) => return None,
-            };
-
-            if !prefix.is_empty() {
-                prefix.push(' ');
-            }
-            prefix.push_str(token_text);
-        }
-
-        Some(prefix)
-    }
-
+    #[cfg_attr(not(test), allow(dead_code))]
     fn non_comment_tokens_prefix_text(tokens: &[SqlToken], idx: usize) -> Option<String> {
         let mut prefix = String::new();
 
@@ -11696,22 +12500,16 @@ impl SqlEditorWidget {
         (!prefix.is_empty()).then_some(prefix)
     }
 
-    fn comment_keeps_next_line_continuation(tokens: &[SqlToken], idx: usize) -> bool {
-        let significant_tokens: Vec<&SqlToken> = tokens[..idx]
-            .iter()
-            .filter(|token| !matches!(token, SqlToken::Comment(_)))
-            .collect();
-
-        let Some(last_token) = significant_tokens.last().copied() else {
-            return false;
-        };
-
-        let previous_token = significant_tokens
-            .get(significant_tokens.len().saturating_sub(2))
-            .copied();
+    fn comment_keeps_next_line_continuation_for_prefix(
+        structural_prefix: &str,
+        previous_non_comment_token: Option<&SqlToken>,
+        last_non_comment_token: Option<&SqlToken>,
+        has_string_token_before: bool,
+    ) -> bool {
         let previous_token =
-            previous_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
-        let last_token = Self::format_trailing_meaningful_token_from_sql_token(last_token);
+            previous_non_comment_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
+        let last_token =
+            last_non_comment_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
 
         if last_token.is_some_and(|last| {
             crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
@@ -11723,22 +12521,19 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let Some(SqlToken::Word(last_word)) = significant_tokens.last().copied() else {
-            return false;
-        };
-        let last_upper = last_word.to_ascii_uppercase();
-        if crate::sql_text::is_format_comment_continuation_keyword(last_upper.as_str()) {
-            return true;
+        if let Some(SqlToken::Word(last_word)) = last_non_comment_token {
+            let last_upper = last_word.to_ascii_uppercase();
+            if crate::sql_text::is_format_comment_continuation_keyword(last_upper.as_str()) {
+                return true;
+            }
         }
 
-        Self::significant_tokens_structural_prefix(&significant_tokens).is_some_and(
-            |structural_prefix| {
-                crate::sql_text::format_inline_comment_structural_header_continuation_kind(
-                    &structural_prefix,
-                )
-                .is_some()
-            },
-        )
+        !has_string_token_before
+            && !structural_prefix.is_empty()
+            && crate::sql_text::format_inline_comment_structural_header_continuation_kind(
+                structural_prefix,
+            )
+            .is_some()
     }
 
     fn format_trailing_meaningful_token_from_sql_token(
@@ -11757,12 +12552,21 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn comment_header_continuation_kind(
         tokens: &[SqlToken],
         idx: usize,
     ) -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
         Self::non_comment_tokens_prefix_text(tokens, idx)
             .and_then(|prefix| crate::sql_text::format_inline_comment_continuation_kind(&prefix))
+    }
+
+    fn comment_header_continuation_kind_for_prefix(
+        structural_prefix: &str,
+    ) -> Option<crate::sql_text::FormatInlineCommentHeaderContinuationKind> {
+        (!structural_prefix.is_empty())
+            .then_some(structural_prefix)
+            .and_then(crate::sql_text::format_inline_comment_continuation_kind)
     }
 
     fn resolve_comment_header_continuation_indent(
@@ -11894,20 +12698,37 @@ impl SqlEditorWidget {
         token_spans: &[SqlTokenSpan],
         statement: &str,
         open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
     ) -> bool {
-        Self::paren_opens_routine_parameter_list(tokens, open_idx)
-            && Self::paren_body_contains_newline(tokens, token_spans, statement, open_idx)
+        Self::paren_opens_routine_parameter_list(tokens, open_idx, meaningful_token_links)
+            && Self::paren_body_contains_newline(
+                tokens,
+                token_spans,
+                statement,
+                open_idx,
+                matching_paren_close_indices,
+            )
     }
 
-    fn paren_opens_routine_parameter_list(tokens: &[SqlToken], open_idx: usize) -> bool {
+    fn paren_opens_routine_parameter_list(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
         const MAX_LOOKBACK_TOKENS: usize = 6;
 
         let mut lookback = 0usize;
         let mut saw_identifier = false;
 
-        for token in tokens[..open_idx].iter().rev() {
+        let mut lookback_idx = meaningful_token_links
+            .and_then(|links| links.prev_index(open_idx))
+            .or_else(|| Self::previous_meaningful_token_index(tokens, open_idx));
+        while let Some(current_idx) = lookback_idx {
+            let Some(token) = tokens.get(current_idx) else {
+                break;
+            };
             match token {
-                SqlToken::Comment(_) => continue,
                 SqlToken::Word(word) => {
                     lookback = lookback.saturating_add(1);
                     if lookback > MAX_LOOKBACK_TOKENS {
@@ -11940,7 +12761,11 @@ impl SqlEditorWidget {
                 }
                 SqlToken::String(_) => return false,
                 SqlToken::Symbol(_) => return false,
+                SqlToken::Comment(_) => {}
             }
+            lookback_idx = meaningful_token_links
+                .and_then(|links| links.prev_index(current_idx))
+                .or_else(|| Self::previous_meaningful_token_index(tokens, current_idx));
         }
 
         false
@@ -11951,12 +12776,15 @@ impl SqlEditorWidget {
         token_spans: &[SqlTokenSpan],
         statement: &str,
         open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
     ) -> bool {
         if tokens.len() != token_spans.len() {
             return false;
         }
 
-        let Some(close_idx) = Self::matching_close_paren_index(tokens, open_idx) else {
+        let Some(close_idx) =
+            Self::matching_close_paren_index(tokens, open_idx, matching_paren_close_indices)
+        else {
             return false;
         };
         let Some(open_span) = token_spans.get(open_idx) else {
@@ -12340,6 +13168,9 @@ impl SqlEditorWidget {
         let mut out = String::new();
         let mut needs_space = false;
         let meaningful_token_links = mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
+        let statement_word_links = mysql_compatible.then(|| StatementWordLinks::build(tokens));
+        let matching_paren_close_indices = mysql_compatible
+            .then(|| FormatterTokenCache::build_matching_paren_close_indices(tokens));
         for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text_for_create_table(
                 tokens,
@@ -12350,7 +13181,14 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => {
                     let keeps_mysql_word_paren_tight = mysql_compatible
-                        && Self::mysql_word_paren_should_stay_tight(tokens, idx, false);
+                        && Self::mysql_word_paren_should_stay_tight(
+                            tokens,
+                            idx,
+                            false,
+                            meaningful_token_links.as_ref(),
+                            statement_word_links.as_ref(),
+                            matching_paren_close_indices.as_deref(),
+                        );
                     if needs_space && !keeps_mysql_word_paren_tight {
                         out.push(' ');
                     }
@@ -12394,6 +13232,9 @@ impl SqlEditorWidget {
         let indent = " ".repeat(indent_level * 4);
         let mut at_line_start = true;
         let meaningful_token_links = mysql_compatible.then(|| MeaningfulTokenLinks::build(tokens));
+        let statement_word_links = mysql_compatible.then(|| StatementWordLinks::build(tokens));
+        let matching_paren_close_indices = mysql_compatible
+            .then(|| FormatterTokenCache::build_matching_paren_close_indices(tokens));
 
         for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text_for_create_table(
@@ -12425,7 +13266,14 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     let keeps_mysql_word_paren_tight = mysql_compatible
-                        && Self::mysql_word_paren_should_stay_tight(tokens, idx, false);
+                        && Self::mysql_word_paren_should_stay_tight(
+                            tokens,
+                            idx,
+                            false,
+                            meaningful_token_links.as_ref(),
+                            statement_word_links.as_ref(),
+                            matching_paren_close_indices.as_deref(),
+                        );
                     if needs_space && !keeps_mysql_word_paren_tight {
                         out.push(' ');
                     }
@@ -41368,6 +42216,859 @@ DELIMITER ;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_round_alias_close_on_parent_frame_depth() {
+        let source = r#"WITH monthly AS (
+    SELECT
+        month_key,
+        segment,
+        ROUND(SUM(net_sales), 2) AS net_sales,
+        ROUND(SUM(paid_amount), 2) AS paid_amount,
+        ROUND(SUM(unpaid_amount), 2) AS unpaid_amount
+    FROM boss_monthly_stats
+    GROUP BY month_key,
+        segment
+)
+SELECT
+    month_key,
+    segment,
+    net_sales,
+    paid_amount,
+    unpaid_amount,
+    LAG(net_sales, 1) OVER (
+        PARTITION BY segment
+        ORDER BY month_key
+    ) AS prev_month_net_sales,
+    ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (
+            PARTITION BY segment
+            ORDER BY month_key
+    ),
+        0
+),
+        2
+    ) AS mom_diff,
+    ROUND(SUM(net_sales) OVER (
+        PARTITION BY segment
+        ORDER BY month_key
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ),
+        2
+    ) AS rolling_3m_net_sales,
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+        segment
+    ) AS month_rank
+FROM monthly
+ORDER BY month_key,
+    segment;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let round_owner_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (")
+            .expect("ROUND owner");
+        let round_close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .find(|(_, line)| line.trim_start() == ") AS mom_diff,")
+            .map(|(idx, _)| idx)
+            .expect("ROUND close alias");
+        let rolling_owner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_close_alias_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROUND(SUM(net_sales) OVER (")
+            .map(|(idx, _)| idx)
+            .expect("rolling ROUND owner");
+        let zero_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .take(8)
+            .find(|(_, line)| line.trim_start() == "0")
+            .map(|(idx, _)| idx)
+            .expect("IFNULL fallback");
+        let precision_idx = lines
+            .iter()
+            .enumerate()
+            .skip(zero_idx + 1)
+            .take(6)
+            .find(|(_, line)| line.trim_start() == "2")
+            .map(|(idx, _)| idx)
+            .expect("ROUND precision");
+        let ifnull_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(zero_idx + 1)
+            .take(4)
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("IFNULL close");
+
+        let round_owner_indent = leading_spaces(lines[round_owner_idx]);
+        let expected_arg_indent = round_owner_indent.saturating_add(4);
+        assert_eq!(
+            leading_spaces(lines[zero_idx]),
+            expected_arg_indent,
+            "nested IFNULL fallback should stay on the ROUND call frame body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[precision_idx]),
+            expected_arg_indent,
+            "ROUND precision argument should stay on the ROUND call frame body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[ifnull_close_idx]),
+            expected_arg_indent,
+            "IFNULL pure-close line should stay on the parent call frame body depth before ROUND sibling arguments, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[round_close_alias_idx]),
+            round_owner_indent,
+            "ROUND close alias should return to the ROUND owner frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rolling_owner_idx]),
+            round_owner_indent,
+            "SELECT sibling after the ROUND close alias should realign with the parent SELECT-list frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_round_alias_close_on_parent_frame_depth() {
+        let source = r#"/* ------------------------------------------------------------------------
+   FINAL BOSS QUERY #2
+   monthly analytic + LAG + rolling window + dense rank
+   ------------------------------------------------------------------------ */
+
+WITH monthly AS (
+    SELECT
+        month_key,
+        segment,
+        ROUND(SUM(net_sales), 2) AS net_sales,
+        ROUND(SUM(paid_amount), 2) AS paid_amount,
+        ROUND(SUM(unpaid_amount), 2) AS unpaid_amount
+    FROM boss_monthly_stats
+    GROUP BY month_key,
+        segment
+)
+SELECT
+    month_key,
+    segment,
+    net_sales,
+    paid_amount,
+    unpaid_amount,
+    LAG(net_sales, 1) OVER (
+        PARTITION BY segment
+        ORDER BY month_key
+    ) AS prev_month_net_sales,
+    ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (
+            PARTITION BY segment
+            ORDER BY month_key
+    ),
+        0
+),
+        2
+    ) AS mom_diff,
+    ROUND(SUM(net_sales) OVER (
+        PARTITION BY segment
+        ORDER BY month_key
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ),
+        2
+    ) AS rolling_3m_net_sales,
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+        segment
+    ) AS month_rank
+FROM monthly
+ORDER BY month_key,
+    segment;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let round_owner_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (")
+            .expect("ROUND owner");
+        let round_close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .find(|(_, line)| line.trim_start() == ") AS mom_diff,")
+            .map(|(idx, _)| idx)
+            .expect("ROUND close alias");
+        let rolling_owner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_close_alias_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROUND(SUM(net_sales) OVER (")
+            .map(|(idx, _)| idx)
+            .expect("rolling ROUND owner");
+        let zero_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .take(8)
+            .find(|(_, line)| line.trim_start() == "0")
+            .map(|(idx, _)| idx)
+            .expect("IFNULL fallback");
+        let precision_idx = lines
+            .iter()
+            .enumerate()
+            .skip(zero_idx + 1)
+            .take(6)
+            .find(|(_, line)| line.trim_start() == "2")
+            .map(|(idx, _)| idx)
+            .expect("ROUND precision");
+        let ifnull_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(zero_idx + 1)
+            .take(4)
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("IFNULL close");
+
+        let round_owner_indent = leading_spaces(lines[round_owner_idx]);
+        let expected_arg_indent = round_owner_indent.saturating_add(4);
+        assert_eq!(
+            leading_spaces(lines[zero_idx]),
+            expected_arg_indent,
+            "auto-format IFNULL fallback should stay on the ROUND call frame body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[precision_idx]),
+            expected_arg_indent,
+            "auto-format ROUND precision should stay on the ROUND call frame body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[ifnull_close_idx]),
+            expected_arg_indent,
+            "auto-format IFNULL pure-close line should stay on the parent call frame body depth before ROUND sibling arguments, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[round_close_alias_idx]),
+            round_owner_indent,
+            "auto-format ROUND close alias should return to the ROUND owner frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rolling_owner_idx]),
+            round_owner_indent,
+            "auto-format SELECT sibling after ROUND close alias should realign with the parent SELECT-list frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_mariadb_scalar_subquery_siblings_on_select_list_frame_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE sp_validate_final_boss()
+BEGIN
+    SELECT
+        (
+            SELECT COUNT(*)
+            FROM boss_region
+        ) AS regions,
+    (
+        SELECT COUNT(*)
+        FROM boss_customer
+    ) AS customers,
+    (
+        SELECT COUNT(*)
+        FROM boss_product
+    ) AS products,
+    (
+        SELECT COUNT(*)
+        FROM boss_order
+    ) AS orders_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_order_item
+    ) AS items_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_payment
+    ) AS payments_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_monthly_stats
+    ) AS monthly_rows,
+    (
+        SELECT COUNT(*)
+        FROM boss_audit
+    ) AS audit_rows;
+END $$"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_idx = find_line_starting_with(&lines, "SELECT").expect("procedure SELECT head");
+        let open_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .collect();
+        let close_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start().starts_with(") AS "))
+            .map(|(idx, _)| idx)
+            .collect();
+        let count_select_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start() == "SELECT COUNT(*)")
+            .map(|(idx, _)| idx)
+            .collect();
+        let count_from_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start().starts_with("FROM boss_"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            open_indices.len(),
+            8,
+            "procedure scalar subquery list should keep eight sibling open lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            close_indices.len(),
+            8,
+            "procedure scalar subquery list should keep eight sibling close-alias lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            count_select_indices.len(),
+            8,
+            "procedure scalar subquery list should keep eight SELECT COUNT(*) heads, got:\n{formatted}"
+        );
+        assert_eq!(
+            count_from_indices.len(),
+            8,
+            "procedure scalar subquery list should keep eight FROM siblings, got:\n{formatted}"
+        );
+
+        let select_indent = leading_spaces(lines[select_idx]);
+        let open_indent = leading_spaces(lines[open_indices[0]]);
+        assert_eq!(
+            open_indent,
+            select_indent.saturating_add(4),
+            "scalar subquery opener should stay one frame deeper than the SELECT owner, got:\n{formatted}"
+        );
+        for idx in open_indices.iter().skip(1) {
+            assert_eq!(
+                leading_spaces(lines[*idx]),
+                open_indent,
+                "scalar subquery sibling openers after close-alias comma should return to the same SELECT-list frame depth, got:\n{formatted}"
+            );
+        }
+        for idx in close_indices {
+            assert_eq!(
+                leading_spaces(lines[idx]),
+                open_indent,
+                "scalar subquery close-alias lines should align with the subquery opener owner depth, got:\n{formatted}"
+            );
+        }
+        for (select_count_idx, from_idx) in count_select_indices
+            .iter()
+            .zip(count_from_indices.iter())
+        {
+            assert_eq!(
+                leading_spaces(lines[*select_count_idx]),
+                open_indent.saturating_add(4),
+                "scalar subquery SELECT COUNT(*) heads should stay one frame deeper than the opener, got:\n{formatted}"
+            );
+            assert_eq!(
+                leading_spaces(lines[*from_idx]),
+                leading_spaces(lines[*select_count_idx]),
+                "scalar subquery FROM lines should stay aligned with their SELECT heads, got:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_mariadb_scalar_subquery_siblings_on_select_list_frame_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE sp_validate_final_boss()
+BEGIN
+    SELECT
+        (
+            SELECT COUNT(*)
+            FROM boss_region
+        ) AS regions,
+    (
+        SELECT COUNT(*)
+        FROM boss_customer
+    ) AS customers,
+    (
+        SELECT COUNT(*)
+        FROM boss_product
+    ) AS products,
+    (
+        SELECT COUNT(*)
+        FROM boss_order
+    ) AS orders_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_order_item
+    ) AS items_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_payment
+    ) AS payments_cnt,
+    (
+        SELECT COUNT(*)
+        FROM boss_monthly_stats
+    ) AS monthly_rows,
+    (
+        SELECT COUNT(*)
+        FROM boss_audit
+    ) AS audit_rows;
+END $$"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_idx = find_line_starting_with(&lines, "SELECT").expect("procedure SELECT head");
+        let open_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start() == "(")
+            .map(|(idx, _)| idx)
+            .collect();
+        let close_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start().starts_with(") AS "))
+            .map(|(idx, _)| idx)
+            .collect();
+        let count_select_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start() == "SELECT COUNT(*)")
+            .map(|(idx, _)| idx)
+            .collect();
+        let count_from_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .filter(|(_, line)| line.trim_start().starts_with("FROM boss_"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            open_indices.len(),
+            8,
+            "auto-format procedure scalar subquery list should keep eight sibling open lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            close_indices.len(),
+            8,
+            "auto-format procedure scalar subquery list should keep eight sibling close-alias lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            count_select_indices.len(),
+            8,
+            "auto-format procedure scalar subquery list should keep eight SELECT COUNT(*) heads, got:\n{formatted}"
+        );
+        assert_eq!(
+            count_from_indices.len(),
+            8,
+            "auto-format procedure scalar subquery list should keep eight FROM siblings, got:\n{formatted}"
+        );
+
+        let select_indent = leading_spaces(lines[select_idx]);
+        let open_indent = leading_spaces(lines[open_indices[0]]);
+        assert_eq!(
+            open_indent,
+            select_indent.saturating_add(4),
+            "auto-format scalar subquery opener should stay one frame deeper than the SELECT owner, got:\n{formatted}"
+        );
+        for idx in open_indices.iter().skip(1) {
+            assert_eq!(
+                leading_spaces(lines[*idx]),
+                open_indent,
+                "auto-format scalar subquery sibling openers after close-alias comma should return to the same SELECT-list frame depth, got:\n{formatted}"
+            );
+        }
+        for idx in close_indices {
+            assert_eq!(
+                leading_spaces(lines[idx]),
+                open_indent,
+                "auto-format scalar subquery close-alias lines should align with the subquery opener owner depth, got:\n{formatted}"
+            );
+        }
+        for (select_count_idx, from_idx) in count_select_indices
+            .iter()
+            .zip(count_from_indices.iter())
+        {
+            assert_eq!(
+                leading_spaces(lines[*select_count_idx]),
+                open_indent.saturating_add(4),
+                "auto-format scalar subquery SELECT COUNT(*) heads should stay one frame deeper than the opener, got:\n{formatted}"
+            );
+            assert_eq!(
+                leading_spaces(lines[*from_idx]),
+                leading_spaces(lines[*select_count_idx]),
+                "auto-format scalar subquery FROM lines should stay aligned with their SELECT heads, got:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_mariadb_values_case_siblings_on_same_call_frame_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE sp_seed_final_boss()
+BEGIN
+    WHILE v_order_id <= 240 DO
+        INSERT INTO boss_order_item (order_id, line_no, unit_price, discount_rate, tax_rate, note)
+        VALUES (v_order_id, v_item_no,
+            CASE
+                WHEN MOD(v_item_no, 2) = 0 THEN
+                    NULL
+                ELSE
+                    ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)
+            END,
+                CASE
+                    WHEN MOD(v_item_no, 5) = 0 THEN
+                        0.2000
+                    WHEN MOD(v_item_no, 3) = 0 THEN
+                        0.0700
+                    ELSE
+                        ROUND((MOD(v_item_no + v_order_id, 4) * 0.0200), 4)
+                END,
+                CASE
+                    WHEN MOD(v_prod_id, 7) = 0 THEN
+                        0.0500
+                    ELSE
+                        0.1000
+                END, CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'));
+        SET v_item_no = v_item_no + 1;
+    END WHILE;
+END$$"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let case_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .collect();
+        let end_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("END,"))
+            .map(|(idx, _)| idx)
+            .collect();
+        let when_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("WHEN "))
+            .map(|(idx, _)| idx)
+            .collect();
+        let else_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            case_indices.len(),
+            3,
+            "VALUES argument CASE siblings should remain present, got:\n{formatted}"
+        );
+        assert!(
+            end_indices.len() >= 2,
+            "first two CASE items should close with END, got:\n{formatted}"
+        );
+        assert!(
+            when_indices.len() >= 3,
+            "CASE branches should remain expanded with WHEN lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            else_indices.len(),
+            3,
+            "each CASE sibling should keep an ELSE branch, got:\n{formatted}"
+        );
+
+        let case_indent = leading_spaces(lines[case_indices[0]]);
+        assert_eq!(
+            leading_spaces(lines[case_indices[1]]),
+            case_indent,
+            "second CASE after END, should return to the same VALUES call frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[case_indices[2]]),
+            case_indent,
+            "third CASE sibling should stay on the same VALUES call frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[0]]),
+            case_indent,
+            "CASE END, should align with its CASE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[1]]),
+            case_indent,
+            "second CASE END, should align with its CASE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[when_indices[0]]),
+            case_indent.saturating_add(4),
+            "WHEN branch should be one frame deeper than CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[else_indices[0]]),
+            case_indent.saturating_add(4),
+            "ELSE branch should be one frame deeper than CASE, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_mariadb_values_case_siblings_on_same_call_frame_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE sp_seed_final_boss()
+BEGIN
+    WHILE v_order_id <= 240 DO
+        INSERT INTO boss_order_item (order_id, line_no, unit_price, discount_rate, tax_rate, note)
+        VALUES (v_order_id, v_item_no,
+            CASE
+                WHEN MOD(v_item_no, 2) = 0 THEN
+                    NULL
+                ELSE
+                    ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)
+            END,
+                CASE
+                    WHEN MOD(v_item_no, 5) = 0 THEN
+                        0.2000
+                    WHEN MOD(v_item_no, 3) = 0 THEN
+                        0.0700
+                    ELSE
+                        ROUND((MOD(v_item_no + v_order_id, 4) * 0.0200), 4)
+                END,
+                CASE
+                    WHEN MOD(v_prod_id, 7) = 0 THEN
+                        0.0500
+                    ELSE
+                        0.1000
+                END, CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'));
+        SET v_item_no = v_item_no + 1;
+    END WHILE;
+END$$"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let case_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .collect();
+        let end_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("END,"))
+            .map(|(idx, _)| idx)
+            .collect();
+        let when_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("WHEN "))
+            .map(|(idx, _)| idx)
+            .collect();
+        let else_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == "ELSE")
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            case_indices.len(),
+            3,
+            "auto-format VALUES argument CASE siblings should remain present, got:\n{formatted}"
+        );
+        assert!(
+            end_indices.len() >= 2,
+            "auto-format first two CASE items should close with END, got:\n{formatted}"
+        );
+        assert!(
+            when_indices.len() >= 3,
+            "auto-format CASE branches should remain expanded with WHEN lines, got:\n{formatted}"
+        );
+        assert_eq!(
+            else_indices.len(),
+            3,
+            "auto-format each CASE sibling should keep an ELSE branch, got:\n{formatted}"
+        );
+
+        let case_indent = leading_spaces(lines[case_indices[0]]);
+        assert_eq!(
+            leading_spaces(lines[case_indices[1]]),
+            case_indent,
+            "auto-format second CASE after END, should return to the same VALUES call frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[case_indices[2]]),
+            case_indent,
+            "auto-format third CASE sibling should stay on the same VALUES call frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[0]]),
+            case_indent,
+            "auto-format CASE END, should align with its CASE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[1]]),
+            case_indent,
+            "auto-format second CASE END, should align with its CASE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[when_indices[0]]),
+            case_indent.saturating_add(4),
+            "auto-format WHEN branch should be one frame deeper than CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[else_indices[0]]),
+            case_indent.saturating_add(4),
+            "auto-format ELSE branch should be one frame deeper than CASE, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_user_example_case_end_siblings_on_frame_depth() {
+        let source = r#"CREATE PROCEDURE sp_seed_final_boss()
+BEGIN
+    WHILE v_order_id <= 240 DO
+        INSERT INTO boss_order (order_id, customer_id, order_no, order_date, status, meta_json)
+        VALUES (v_order_id, 1 + MOD(v_order_id * 7, 36), CONCAT('ORD', DATE_FORMAT(DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY), '%Y%m%d'), '-', LPAD(v_order_id, 5, '0')), DATE_ADD('2024-01-01', INTERVAL MOD(v_order_id * 5, 720) DAY), v_status, JSON_OBJECT('channel', ELT(1 + MOD(v_order_id, 4), 'WEB', 'PARTNER', 'DIRECT', 'MOBILE'), 'priority', MOD(v_order_id, 5), 'memo', CONCAT('semi; // ', v_order_id, ' /* literal */'), 'flag', IF(MOD(v_order_id, 2) = 0, 'Y', 'N')));
+        SET v_item_cnt = 1 + MOD(v_order_id, 5);
+        SET v_item_no = 1;
+        WHILE v_item_no <= v_item_cnt DO
+            SET v_prod_id = 1 + MOD(v_order_id * 7 + v_item_no * 11, 36);
+            INSERT INTO boss_order_item (order_id, line_no, product_id, quantity, unit_price, discount_rate, tax_rate, note, details_json)
+            VALUES (v_order_id, v_item_no, v_prod_id, 1 + MOD(v_order_id + v_item_no, 4), 
+                CASE
+                    WHEN MOD(v_item_no, 2) = 0 THEN
+                        NULL
+                    ELSE
+                        ROUND(19 +(v_prod_id * 7.35) +(MOD(v_prod_id, 5) * 3.70), 2)
+                END, 
+                    CASE
+                        WHEN MOD(v_item_no, 5) = 0 THEN
+                            0.2000
+                        WHEN MOD(v_item_no, 3) = 0 THEN
+                            0.0700
+                        ELSE
+                            ROUND((MOD(v_item_no + v_order_id, 4) * 0.0200), 4)
+                    END, 
+                    CASE
+                        WHEN MOD(v_prod_id, 7) = 0 THEN
+                            0.0500
+                        ELSE
+                            0.1000
+                    END, CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'), JSON_OBJECT('gift', IF(MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'), 'tags', JSON_ARRAY(CONCAT('o', v_order_id), CONCAT('i', v_item_no), 'semi;colon', 'slash//slash'), 'payload', CONCAT('payload-', v_order_id, '-', v_item_no)));
+            SET v_item_no = v_item_no + 1;
+        END WHILE;
+    END WHILE;
+END$$"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let values_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("VALUES (v_order_id, v_item_no, v_prod_id,"))
+            .expect("VALUES owner");
+        let case_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(values_idx + 1)
+            .take(40)
+            .filter(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .collect();
+        let end_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(values_idx + 1)
+            .take(60)
+            .filter(|(_, line)| line.trim_start().starts_with("END,"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            case_indices.len(),
+            3,
+            "user example VALUES should keep three CASE siblings, got:\n{formatted}"
+        );
+        assert!(
+            end_indices.len() >= 2,
+            "user example first two CASE siblings should close with END, got:\n{formatted}"
+        );
+
+        let case_indent = leading_spaces(lines[case_indices[0]]);
+        assert_eq!(
+            leading_spaces(lines[case_indices[1]]),
+            case_indent,
+            "user example second CASE after END, should realign with the first CASE frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[case_indices[2]]),
+            case_indent,
+            "user example third CASE should stay on the same call argument frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[0]]),
+            case_indent,
+            "user example first END, should align with CASE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_indices[1]]),
+            case_indent,
+            "user example second END, should align with CASE owner depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test6_fetch_into_targets_indented_under_into_owner()
     {
         let source = include_str!("../../../test_mariadb/test6.txt");
@@ -42074,4 +43775,297 @@ END"#;
             formatted
         );
     }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test4_cte_sibling_headers_aligned_after_close() {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let from_daily_idx =
+            find_line_starting_with(&lines, "FROM daily d").expect("test4 FROM daily d");
+        let cte_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_daily_idx + 1)
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("test4 ranked CTE close");
+        let member_stats_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cte_close_idx + 1)
+            .find(|(_, line)| line.trim_start() == "member_stats AS (")
+            .map(|(idx, _)| idx)
+            .expect("test4 member_stats CTE");
+        let owner_chain_idx = lines
+            .iter()
+            .enumerate()
+            .skip(member_stats_idx + 1)
+            .find(|(_, line)| line.trim_start() == "owner_chain AS (")
+            .map(|(idx, _)| idx)
+            .expect("test4 owner_chain CTE");
+
+        assert_eq!(
+            leading_spaces(lines[member_stats_idx]),
+            leading_spaces(lines[cte_close_idx]),
+            "test4 sibling CTE header after close-comma should keep the parent CTE header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[owner_chain_idx]),
+            leading_spaces(lines[member_stats_idx]),
+            "test4 subsequent sibling CTE headers should stay on the same frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_values_siblings_on_subquery_argument_depth() {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let min_item_select_idx = find_line_starting_with(&lines, "SELECT MIN(item_id)")
+            .expect("test5 SELECT MIN(item_id)");
+        let scalar_idx = lines
+            .iter()
+            .enumerate()
+            .skip(min_item_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "6,")
+            .map(|(idx, _)| idx)
+            .expect("test5 scalar literal 6");
+        let broken_event_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'BROKEN_EVENT',")
+            .map(|(idx, _)| idx)
+            .expect("test5 BROKEN_EVENT literal");
+        let broken_event_time_idx = lines
+            .iter()
+            .enumerate()
+            .skip(broken_event_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'2025-02-10 10:00:00.000000',")
+            .map(|(idx, _)| idx)
+            .expect("test5 BROKEN_EVENT timestamp literal");
+
+        assert_eq!(
+            leading_spaces(lines[broken_event_idx]),
+            leading_spaces(lines[scalar_idx]),
+            "test5 VALUES siblings after a close-comma subquery argument must stay on the same parent frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[broken_event_time_idx]),
+            leading_spaces(lines[scalar_idx]),
+            "test5 subsequent VALUES siblings should keep the same argument frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_json_scalar_subquery_chain_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let customers_idx = find_line_starting_with(&lines, "), 'customers', (")
+            .expect("test6 JSON customers key");
+        let products_idx = find_line_starting_with(&lines, "), 'products', (")
+            .expect("test6 JSON products key");
+        let orders_idx =
+            find_line_starting_with(&lines, "), 'orders', (").expect("test6 JSON orders key");
+        let items_idx =
+            find_line_starting_with(&lines, "), 'items', (").expect("test6 JSON items key");
+        let payments_idx = find_line_starting_with(&lines, "), 'payments', (")
+            .expect("test6 JSON payments key");
+
+        let key_indent = leading_spaces(lines[customers_idx]);
+        for idx in [products_idx, orders_idx, items_idx, payments_idx] {
+            assert_eq!(
+                leading_spaces(lines[idx]),
+                key_indent,
+                "test6 mixed close-open JSON key lines should not accumulate depth across siblings, got:\n{formatted}"
+            );
+        }
+
+        let chain_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(payments_idx + 1)
+            .find(|(_, line)| line.trim_start() == "));")
+            .map(|(idx, _)| idx)
+            .expect("test6 JSON_OBJECT close");
+        let select_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(customers_idx + 1)
+            .take(chain_end_idx.saturating_sub(customers_idx + 1))
+            .filter(|(_, line)| line.trim_start() == "SELECT COUNT(*)")
+            .map(|(idx, _)| idx)
+            .collect();
+        let from_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(customers_idx + 1)
+            .take(chain_end_idx.saturating_sub(customers_idx + 1))
+            .filter(|(_, line)| line.trim_start().starts_with("FROM boss_"))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        assert_eq!(
+            select_indices.len(),
+            5,
+            "test6 JSON scalar subquery chain should keep five repeated SELECT COUNT(*) siblings after regions/customers/products/orders/items keys, got:\n{formatted}"
+        );
+        assert_eq!(
+            from_indices.len(),
+            5,
+            "test6 JSON scalar subquery chain should keep five repeated FROM siblings in the same region, got:\n{formatted}"
+        );
+
+        let select_indent = leading_spaces(lines[select_indices[0]]);
+        for idx in select_indices.iter().skip(1) {
+            assert_eq!(
+                leading_spaces(lines[*idx]),
+                select_indent,
+                "test6 repeated SELECT COUNT(*) siblings must keep a stable frame depth, got:\n{formatted}"
+            );
+        }
+        for (select_idx, from_idx) in select_indices.iter().zip(from_indices.iter()) {
+            assert_eq!(
+                leading_spaces(lines[*from_idx]),
+                leading_spaces(lines[*select_idx]),
+                "test6 scalar subquery FROM clause should stay aligned with its SELECT head inside JSON_OBJECT chain, got:\n{formatted}"
+            );
+        }
+        assert_eq!(
+            select_indent,
+            key_indent.saturating_add(4),
+            "test6 scalar subquery SELECT heads should stay exactly one frame deeper than sibling JSON key lines, got:\n{formatted}"
+        );
+
+        let order_count_idx = find_line_starting_with(&lines, "COUNT(DISTINCT o.order_id) AS order_count,")
+            .expect("test6 customer_spend order_count");
+        let total_spent_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_count_idx + 1)
+            .find(|(_, line)| line.trim_start() == "), 2) AS total_spent,")
+            .map(|(idx, _)| idx)
+            .expect("test6 customer_spend total_spent close-comma");
+        let max_order_date_idx = lines
+            .iter()
+            .enumerate()
+            .skip(total_spent_idx + 1)
+            .find(|(_, line)| line.trim_start() == "MAX(o.order_date) AS last_order_date")
+            .map(|(idx, _)| idx)
+            .expect("test6 customer_spend MAX(o.order_date)");
+        assert_eq!(
+            leading_spaces(lines[max_order_date_idx]),
+            leading_spaces(lines[total_spent_idx]),
+            "test6 SELECT-list sibling after mixed close-comma should return to the list frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_update_join_subquery_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let update_idx =
+            find_line_starting_with(&lines, "UPDATE boss_customer c").expect("test6 UPDATE head");
+        let join_idx = lines
+            .iter()
+            .enumerate()
+            .skip(update_idx + 1)
+            .find(|(_, line)| line.trim_start() == "JOIN (")
+            .map(|(idx, _)| idx)
+            .expect("test6 UPDATE JOIN open");
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(join_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("SELECT"))
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery SELECT");
+        let count_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "COUNT(*) AS lifetime_orders,")
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery lifetime_orders");
+        let round_idx = lines
+            .iter()
+            .enumerate()
+            .skip(count_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,")
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery lifetime_net_sales");
+        let max_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_idx + 1)
+            .find(|(_, line)| line.trim_start() == "MAX(o.order_date) AS last_order_date")
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery last_order_date");
+        let from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(max_idx + 1)
+            .find(|(_, line)| line.trim_start() == "FROM boss_order o")
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery FROM");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx + 1)
+            .find(|(_, line)| line.trim_start() == ") s")
+            .map(|(idx, _)| idx)
+            .expect("test6 JOIN subquery close");
+
+        let join_indent = leading_spaces(lines[join_idx]);
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            join_indent.saturating_add(4),
+            "test6 UPDATE JOIN subquery SELECT should be one frame deeper than JOIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[count_idx]),
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "test6 JOIN subquery first sibling should be one frame deeper than SELECT head, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[round_idx]),
+            leading_spaces(lines[count_idx]),
+            "test6 JOIN subquery SELECT siblings should keep stable list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[max_idx]),
+            leading_spaces(lines[count_idx]),
+            "test6 JOIN subquery SELECT siblings should stay aligned at list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "test6 JOIN subquery FROM should align with SELECT head, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            join_indent,
+            "test6 UPDATE JOIN subquery close should return to JOIN depth, got:\n{formatted}"
+        );
+    }
+
 }
