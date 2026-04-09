@@ -4537,6 +4537,14 @@ impl SqlEditorWidget {
             ) {
                 continue;
             }
+            if crate::sql_text::format_query_owner_kind(open_trimmed).is_some()
+                || crate::sql_text::format_plsql_child_query_owner_kind(
+                    &open_trimmed.to_ascii_uppercase(),
+                )
+                .is_some()
+            {
+                continue;
+            }
             let desired_indent = original_lines
                 .get(open_line_idx)
                 .map(|line| leading_spaces(line))
@@ -25005,6 +25013,63 @@ FETCH FIRST 20 ROWS ONLY;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             expected,
             "LATERAL-derived nested query formatting should remain stable"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_from_inline_view_alias_close_uses_query_close_depth() {
+        let source = r#"SELECT x.month_key,
+    JSON_OBJECTAGG(x.segment, x.net_sales) AS segment_to_net_sales
+FROM (
+        SELECT month_key,
+            segment,
+            ROUND(SUM(net_sales), 2) AS net_sales
+        FROM boss_monthly_stats
+        GROUP BY month_key,
+            segment
+) x
+GROUP BY x.month_key
+ORDER BY x.month_key;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let from_idx = find_line_starting_with(&lines, "FROM (").expect("inline-view FROM owner");
+        let inner_select_idx =
+            find_line_starting_with(&lines, "SELECT month_key,").expect("child SELECT");
+        let inner_group_idx =
+            find_line_starting_with(&lines, "GROUP BY month_key,").expect("child GROUP BY");
+        let close_idx = find_line_starting_with(&lines, ") x").expect("inline-view close alias");
+        let outer_group_idx =
+            find_line_starting_with(&lines, "GROUP BY x.month_key").expect("outer GROUP BY");
+
+        assert_eq!(
+            indent(lines[inner_select_idx]),
+            indent(lines[from_idx]).saturating_add(8),
+            "child SELECT under MariaDB FROM ( should keep the query-head step relative to the owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inner_group_idx]),
+            indent(lines[inner_select_idx]),
+            "child GROUP BY should stay on the child query clause depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "close+alias after a MariaDB FROM inline view should use stored query-close depth instead of collapsing to the FROM owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_group_idx]),
+            indent(lines[from_idx]),
+            "outer GROUP BY should return to the outer query base after the inline view closes, got:\n{}",
+            formatted
         );
     }
 
