@@ -101,6 +101,7 @@ pub(crate) struct AutoFormatLineContext {
     pub(crate) next_query_head_depth: Option<usize>,
     pub(crate) condition_header_line: Option<usize>,
     pub(crate) condition_header_depth: Option<usize>,
+    condition_header_terminator: Option<AutoFormatConditionTerminator>,
     pub(crate) condition_role: AutoFormatConditionRole,
 }
 
@@ -119,7 +120,10 @@ enum AutoFormatConditionTerminator {
 
 impl AutoFormatConditionTerminator {
     fn matches_keyword(self, upper: &str) -> bool {
-        matches!((self, upper), (Self::Then, "THEN") | (Self::Loop, "LOOP"))
+        matches!(
+            (self, upper),
+            (Self::Then, "THEN") | (Self::Loop, "LOOP") | (Self::Loop, "DO")
+        )
     }
 }
 
@@ -187,6 +191,7 @@ type InlineCommentContinuationKind = sql_text::FormatInlineCommentHeaderContinua
 struct ConditionLineAnnotation {
     header_line_idx: Option<usize>,
     header_depth: Option<usize>,
+    header_terminator: Option<AutoFormatConditionTerminator>,
     role: AutoFormatConditionRole,
 }
 
@@ -295,6 +300,11 @@ struct TriggerHeaderDepthFrame {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MySqlTriggerBodyDepthFrame {
+    owner_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ForallBodyDepthFrame {
     owner_depth: usize,
 }
@@ -354,11 +364,12 @@ struct PendingControlBranchBodyFrame {
 struct PendingConditionCloseContinuationFrame {
     header_line_idx: usize,
     header_depth: usize,
+    continuation_depth: usize,
 }
 
 impl PendingConditionCloseContinuationFrame {
     fn continuation_depth(self) -> usize {
-        self.header_depth.saturating_add(1)
+        self.continuation_depth
     }
 }
 
@@ -1841,6 +1852,7 @@ impl QueryExecutor {
         let mut pending_inline_comment_line_continuation: Option<InlineCommentLineContinuation> =
             None;
         let mut trigger_header_frame: Option<TriggerHeaderDepthFrame> = None;
+        let mut mysql_trigger_body_frame: Option<MySqlTriggerBodyDepthFrame> = None;
         let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
         let mut pending_control_branch_body_frame: Option<PendingControlBranchBodyFrame> = None;
         let mut pending_condition_close_continuation: Option<
@@ -1874,12 +1886,14 @@ impl QueryExecutor {
             let mut current_line_is_join_clause = false;
             let mut current_line_is_join_condition_clause = false;
             let mut current_line_is_query_condition_continuation_clause = false;
+            let mut current_line_is_for_update_update_continuation = false;
             let mut active_merge_branch_header = None;
             let mut current_line_is_same_depth_merge_branch_header_fragment = false;
             let mut current_line_suspends_merge_branch_condition = false;
             let mut current_line_is_mysql_declare_handler_header = false;
             let mut current_line_is_mysql_declare_handler_body = false;
             let mut current_line_is_mysql_declare_handler_block_end = false;
+            let active_mysql_trigger_body_frame_for_line = mysql_trigger_body_frame;
 
             if trimmed.is_empty() {
                 contexts.push(context);
@@ -2334,6 +2348,8 @@ impl QueryExecutor {
                     && Self::auto_format_is_for_update_clause(&clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
+                current_line_is_for_update_update_continuation =
+                    is_for_update_update_continuation;
 
                 if frame.head_kind == Some(AutoFormatClauseKind::With)
                     && Self::line_is_cte_definition_header(clause_detection_trimmed)
@@ -2440,10 +2456,21 @@ impl QueryExecutor {
                     context.auto_depth = parser_depth;
                 }
             }
+            if let Some(frame) = active_mysql_trigger_body_frame_for_line {
+                let closes_mysql_trigger_body =
+                    current_line_starts_end_keyword && parser_depth <= frame.owner_depth;
+                if !closes_mysql_trigger_body && context.query_role == AutoFormatQueryRole::None {
+                    context.auto_depth = context
+                        .auto_depth
+                        .saturating_sub(1)
+                        .max(frame.owner_depth.saturating_add(1));
+                }
+            }
 
             if clause_kind.is_none()
                 && context.query_role != AutoFormatQueryRole::Base
                 && !blocks_structural_line_continuation
+                && trigger_header_frame.is_none()
             {
                 if let Some(continuation) = active_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
@@ -2456,6 +2483,7 @@ impl QueryExecutor {
             if clause_kind.is_none()
                 && context.query_role != AutoFormatQueryRole::Base
                 && !blocks_structural_line_continuation
+                && trigger_header_frame.is_none()
             {
                 if let Some(continuation) = active_inline_comment_line_continuation {
                     context.auto_depth = context.auto_depth.max(continuation.depth);
@@ -2891,19 +2919,39 @@ impl QueryExecutor {
                         OwnerRelativeDepthFrameKind::MultilineClause { .. }
                     )
                 }),
+                trigger_header_frame.is_some()
+                    && (sql_text::starts_with_keyword_token(&trimmed_upper, "FOR")
+                        || sql_text::starts_with_keyword_token(&trimmed_upper, "WHEN")),
                 &mut pending_condition_headers,
                 &mut active_condition_frames,
             );
             context.condition_header_line = condition_annotation.header_line_idx;
             context.condition_header_depth = condition_annotation.header_depth;
+            context.condition_header_terminator = condition_annotation.header_terminator;
             context.condition_role = condition_annotation.role;
+            let condition_header_line = context
+                .condition_header_line
+                .and_then(|header_idx| lines.get(header_idx).copied())
+                .map(str::trim_start);
+            let condition_header_is_bare_parenthesized = condition_header_line
+                .is_some_and(sql_text::line_is_bare_parenthesized_condition_header);
+            let condition_header_is_control = condition_header_line.is_some_and(|header_line| {
+                let header_upper = header_line.to_ascii_uppercase();
+                sql_text::starts_with_keyword_token(&header_upper, "IF")
+                    || sql_text::starts_with_keyword_token(&header_upper, "ELSIF")
+                    || sql_text::starts_with_keyword_token(&header_upper, "ELSEIF")
+                    || sql_text::starts_with_keyword_token(&header_upper, "WHILE")
+                    || sql_text::starts_with_keyword_token(&header_upper, "WHEN")
+            });
+            let suppress_condition_alignment = current_line_is_same_depth_merge_branch_header_fragment
+                || current_line_is_for_update_update_continuation;
             let leading_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
                 && sql_text::line_has_leading_significant_close_paren(line)
                 && Self::auto_format_is_query_condition_continuation_clause(
                     &sql_text::trim_after_leading_close_parens(line).to_ascii_uppercase(),
                 );
-            let pure_close_bare_condition_continuation = context.condition_role
+            let pure_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
                 && !sql_text::line_has_leading_significant_close_paren(line)
                 && Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper)
@@ -2912,17 +2960,25 @@ impl QueryExecutor {
                         && Some(frame.header_depth) == context.condition_header_depth
                 });
 
-            if context.condition_role == AutoFormatConditionRole::Closer {
+            if !suppress_condition_alignment
+                && context.condition_role == AutoFormatConditionRole::Closer
+            {
                 if let Some(header_depth) = context.condition_header_depth {
                     context.auto_depth = header_depth;
                 }
-            } else if leading_close_condition_continuation {
+            } else if !suppress_condition_alignment && leading_close_condition_continuation {
                 if let Some(header_depth) = context.condition_header_depth {
                     context.auto_depth = header_depth.saturating_add(1);
                 }
-            } else if pure_close_bare_condition_continuation {
+            } else if !suppress_condition_alignment && pure_close_condition_continuation {
                 if let Some(frame) = pending_condition_close_continuation_for_line {
                     context.auto_depth = context.auto_depth.max(frame.continuation_depth());
+                }
+            } else if !suppress_condition_alignment
+                && context.condition_role == AutoFormatConditionRole::Continuation
+            {
+                if let Some(header_depth) = context.condition_header_depth {
+                    context.auto_depth = context.auto_depth.max(header_depth.saturating_add(1));
                 }
             }
             if let (Some(frame), Some(progress)) = (active_frame, active_merge_branch_header) {
@@ -3179,13 +3235,17 @@ impl QueryExecutor {
                         context.condition_header_depth,
                     ) {
                         (Some(header_line_idx), Some(header_depth))
-                            if lines.get(header_line_idx).is_some_and(|header_line| {
-                                sql_text::line_is_bare_parenthesized_condition_header(header_line)
-                            }) =>
+                            if condition_header_is_control =>
                         {
+                            let continuation_depth = if condition_header_is_bare_parenthesized {
+                                header_depth.saturating_add(1)
+                            } else {
+                                header_depth
+                            };
                             Some(PendingConditionCloseContinuationFrame {
                                 header_line_idx,
                                 header_depth,
+                                continuation_depth,
                             })
                         }
                         _ => None,
@@ -3263,6 +3323,11 @@ impl QueryExecutor {
             }
             if is_trigger_header_begin {
                 trigger_header_frame = None;
+                if mysql_routine_body_pending || mysql_routine_body_active {
+                    mysql_trigger_body_frame = Some(MySqlTriggerBodyDepthFrame {
+                        owner_depth: context.auto_depth,
+                    });
+                }
             }
             if sql_text::starts_with_keyword_token(&trimmed_upper, "FORALL") {
                 forall_body_frame = Some(ForallBodyDepthFrame {
@@ -3294,6 +3359,12 @@ impl QueryExecutor {
                 mysql_routine_body_active = false;
                 mysql_routine_body_pending = false;
             }
+            if mysql_trigger_body_frame.is_some()
+                && current_line_starts_end_keyword
+                && parser_depth == 0
+            {
+                mysql_trigger_body_frame = None;
+            }
 
             let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
@@ -3315,6 +3386,7 @@ impl QueryExecutor {
                 pending_condition_close_continuation = None;
                 pending_mysql_declare_handler_frame = None;
                 trigger_header_frame = None;
+                mysql_trigger_body_frame = None;
                 forall_body_frame = None;
                 auto_format_subquery_paren_stack.clear();
                 pending_auto_format_subquery_paren_count = 0;
@@ -3506,22 +3578,36 @@ impl QueryExecutor {
         line_idx: usize,
         line_owner_depth: usize,
         in_multiline_clause: bool,
+        suppress_trigger_header_when_condition: bool,
         pending_headers: &mut Vec<PendingConditionHeader>,
         active_frames: &mut Vec<ActiveConditionFrame>,
     ) -> ConditionLineAnnotation {
         let bytes = line.as_bytes();
         let mut idx = 0usize;
-        let mut annotation =
-            active_frames
-                .last()
-                .copied()
-                .map_or_else(ConditionLineAnnotation::default, |frame| {
-                    ConditionLineAnnotation {
-                        header_line_idx: Some(frame.header_line_idx),
-                        header_depth: Some(frame.header_depth),
-                        ..ConditionLineAnnotation::default()
-                    }
-                });
+        let mut annotation = active_frames.last().copied().map_or_else(
+            || {
+                pending_headers
+                    .last()
+                    .copied()
+                    .filter(|header| {
+                        header.header_line_idx != line_idx && header.is_ready_for_open_paren()
+                    })
+                    .map_or_else(ConditionLineAnnotation::default, |header| {
+                        ConditionLineAnnotation {
+                            header_line_idx: Some(header.header_line_idx),
+                            header_depth: Some(header.header_depth),
+                            header_terminator: Some(header.terminator),
+                            ..ConditionLineAnnotation::default()
+                        }
+                    })
+            },
+            |frame| ConditionLineAnnotation {
+                header_line_idx: Some(frame.header_line_idx),
+                header_depth: Some(frame.header_depth),
+                header_terminator: Some(frame.terminator),
+                ..ConditionLineAnnotation::default()
+            },
+        );
         let mut saw_significant_token = false;
         let mut saw_leading_close_paren = false;
 
@@ -3648,6 +3734,7 @@ impl QueryExecutor {
                     if let Some(frame) = active_frames.pop() {
                         annotation.header_line_idx = Some(frame.header_line_idx);
                         annotation.header_depth = Some(frame.header_depth);
+                        annotation.header_terminator = Some(frame.terminator);
                     }
                 }
 
@@ -3660,7 +3747,10 @@ impl QueryExecutor {
 
                 let should_track_header =
                     is_leading_word && !(in_multiline_clause && word_upper == "FOR");
-                if should_track_header {
+                if should_track_header
+                    && !(suppress_trigger_header_when_condition
+                        && matches!(word_upper.as_str(), "FOR" | "WHEN"))
+                {
                     if let Some(header) = Self::pending_condition_header_for_word(
                         &word_upper,
                         line_idx,
@@ -3689,6 +3779,7 @@ impl QueryExecutor {
                     let header = pending_headers.remove(header_idx);
                     annotation.header_line_idx = Some(header.header_line_idx);
                     annotation.header_depth = Some(header.header_depth);
+                    annotation.header_terminator = Some(header.terminator);
                     if header.header_line_idx == line_idx {
                         annotation.role = AutoFormatConditionRole::Header;
                     }
@@ -3701,6 +3792,7 @@ impl QueryExecutor {
                 } else if let Some(frame) = active_frames.last().copied() {
                     annotation.header_line_idx = Some(frame.header_line_idx);
                     annotation.header_depth = Some(frame.header_depth);
+                    annotation.header_terminator = Some(frame.terminator);
                 }
 
                 idx += 1;
@@ -3716,6 +3808,7 @@ impl QueryExecutor {
                 if let Some(frame) = active_frames.last().copied() {
                     annotation.header_line_idx = Some(frame.header_line_idx);
                     annotation.header_depth = Some(frame.header_depth);
+                    annotation.header_terminator = Some(frame.terminator);
                 }
 
                 for frame in active_frames.iter_mut() {
@@ -4292,6 +4385,9 @@ impl QueryExecutor {
         );
         if context.condition_role != AutoFormatConditionRole::None {
             if let Some(header_depth) = context.condition_header_depth {
+                if Self::line_ends_with_then_before_inline_comment(normalized) {
+                    return structural_owner_base;
+                }
                 if current_line_query_owner_kind.is_some() && structural_owner_base > header_depth {
                     // Condition-owned child-query lines such as `AND EXISTS (`
                     // must anchor the child query from the current owner line,
@@ -4301,6 +4397,11 @@ impl QueryExecutor {
                 if sql_text::line_is_standalone_open_paren_before_inline_comment(normalized)
                     && structural_owner_base > header_depth
                 {
+                    if context.condition_header_terminator
+                        == Some(AutoFormatConditionTerminator::Loop)
+                    {
+                        return header_depth;
+                    }
                     return structural_owner_base;
                 }
                 return header_depth;

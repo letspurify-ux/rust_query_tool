@@ -4653,6 +4653,25 @@ impl SqlEditorWidget {
             line.len().saturating_sub(line.trim_start().len())
         }
 
+        fn is_pure_close_comma_line(line: &str) -> bool {
+            let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(line, true);
+            let meaningful: Vec<&SqlToken> = spans
+                .iter()
+                .filter_map(|span| match &span.token {
+                    SqlToken::Comment(_) => None,
+                    token => Some(token),
+                })
+                .collect();
+
+            matches!(
+                meaningful.as_slice(),
+                [SqlToken::Symbol(close), SqlToken::Symbol(comma)]
+                    if close == ")" && comma == ","
+            )
+        }
+
+        let structural_indents =
+            Self::mysql_structural_render_indents(formatted_statement).unwrap_or_default();
         let original_lines: Vec<&str> = formatted_statement.lines().collect();
         let on_duplicate_parenthesized_line_flags =
             Self::mysql_on_duplicate_parenthesized_line_flags(
@@ -4691,17 +4710,22 @@ impl SqlEditorWidget {
                 .get(prev_idx)
                 .copied()
                 .unwrap_or(false);
+            let previous_is_pure_close_comma = is_pure_close_comma_line(&previous_trimmed);
             if !previous_trimmed.ends_with(',')
                 || Self::mysql_layout_clause_boundary(
                     &previous_trimmed,
                     previous_inside_on_duplicate_call_args,
-                )
+                ) && !previous_is_pure_close_comma
             {
                 continue;
             }
 
-            let desired_indent = leading_spaces(&lines[prev_idx]);
-            if leading_spaces(&lines[idx]) > desired_indent {
+            let desired_indent = structural_indents
+                .get(idx)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| leading_spaces(&lines[idx]));
+            if leading_spaces(&lines[idx]) != desired_indent {
                 lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
             }
         }
@@ -4732,6 +4756,8 @@ impl SqlEditorWidget {
                 || trimmed.starts_with(')')
         }
 
+        let structural_indents =
+            Self::mysql_structural_render_indents(formatted_statement).unwrap_or_default();
         let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
         for idx in 1..lines.len() {
             let current_trimmed = lines[idx].trim_start().to_string();
@@ -4748,14 +4774,42 @@ impl SqlEditorWidget {
             }
 
             let previous = lines[prev_idx].clone();
+            let previous_trimmed = previous.trim_start().to_string();
             if !previous.trim_end().ends_with(',') {
                 continue;
             }
 
-            let previous_indent = leading_spaces(&previous);
-            let current_indent = leading_spaces(&lines[idx]);
-            if current_indent < previous_indent {
-                lines[idx] = format!("{}{}", " ".repeat(previous_indent), current_trimmed);
+            let mut desired_indent = structural_indents
+                .get(idx)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| leading_spaces(&lines[idx]));
+            if previous_trimmed.starts_with(')') {
+                let previous_indent = leading_spaces(&previous);
+                let owner_line_idx = (0..prev_idx)
+                    .rev()
+                    .find(|scan_idx| {
+                        let scan_line = &lines[*scan_idx];
+                        !scan_line.trim().is_empty()
+                            && leading_spaces(scan_line) == previous_indent
+                            && !scan_line.trim_start().starts_with(')')
+                    })
+                    .unwrap_or(prev_idx);
+                let owner_trimmed = lines[owner_line_idx].trim_start();
+                if crate::sql_text::starts_with_keyword_token(
+                    &owner_trimmed.to_ascii_uppercase(),
+                    "SELECT",
+                ) && !crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                    owner_trimmed,
+                    &["SELECT"],
+                ) {
+                    desired_indent = desired_indent.max(previous_indent.saturating_add(4));
+                } else {
+                    desired_indent = desired_indent.max(previous_indent);
+                }
+            }
+            if leading_spaces(&lines[idx]) != desired_indent {
+                lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
             }
         }
 
@@ -5515,10 +5569,14 @@ impl SqlEditorWidget {
                             Self::normalize_mysql_json_table_close_layout(&formatted_statement);
                         // MySQL-specific post-normalizers can temporarily
                         // adjust indent from local line shape. Always finish
-                        // with the shared analyzer/frame pass so final depth
-                        // comes back from structural owner stacks, including
-                        // nested subquery/wrapper close-comma cases.
-                        Self::apply_parser_depth_indentation(&formatted_statement)
+                        // with the shared analyzer/frame pass using the known
+                        // dialect so final depth comes back from structural
+                        // owner stacks, including nested routine frames,
+                        // handler blocks, and close-comma cases.
+                        Self::apply_parser_depth_indentation_with_mysql_compat(
+                            &formatted_statement,
+                            mysql_compatible_statement,
+                        )
                     } else {
                         formatted_statement
                     };
@@ -9588,19 +9646,121 @@ impl SqlEditorWidget {
         if mysql_compatible && Self::is_mysql_compound_statement(tokens) {
             normalized
         } else {
-            Self::apply_parser_depth_indentation(&normalized)
+            Self::apply_parser_depth_indentation_with_mysql_compat(&normalized, mysql_compatible)
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_parser_depth_indentation(formatted: &str) -> String {
+        Self::apply_parser_depth_indentation_with_mysql_compat(
+            formatted,
+            sql_text::mysql_compatibility_for_sql(formatted, None),
+        )
+    }
+
+    fn apply_parser_depth_indentation_with_mysql_compat(
+        formatted: &str,
+        mysql_compatible: bool,
+    ) -> String {
         if formatted.is_empty() {
             return formatted.to_string();
         }
 
+        let rendered = Self::resolved_line_layouts(formatted, mysql_compatible)
+            .map(|layouts| Self::render_line_layouts(&layouts))
+            .unwrap_or_else(|| formatted.to_string());
+        Self::normalize_create_table_body_layout(&rendered, mysql_compatible)
+    }
+
+    fn normalize_create_table_body_layout(
+        formatted: &str,
+        mysql_compatible: bool,
+    ) -> String {
+        if formatted.is_empty() {
+            return formatted.to_string();
+        }
+
+        let lines: Vec<&str> = formatted.lines().collect();
+        let Some(header_idx) = lines.iter().position(|line| {
+            let trimmed = line.trim_start();
+            Self::line_starts_create_table_header(trimmed)
+                && trimmed.contains('(')
+                && !trimmed.contains(')')
+        }) else {
+            return formatted.to_string();
+        };
+
+        let owner_indent =
+            lines[header_idx].len().saturating_sub(lines[header_idx].trim_start().len());
+        let body_indent = owner_indent.saturating_add(4);
+        let mut paren_depth = 1usize;
+        let mut normalized_lines: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
+
+        for idx in (header_idx + 1)..normalized_lines.len() {
+            let trimmed = normalized_lines[idx].trim_start().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if paren_depth == 0 {
+                break;
+            }
+
+            let target_indent = if paren_depth == 1 && trimmed.starts_with(')') {
+                owner_indent
+            } else {
+                body_indent
+            };
+            normalized_lines[idx] = format!("{}{}", " ".repeat(target_indent), trimmed);
+
+            let line_tokens = Self::tokenize_sql_with_mysql_compat(&trimmed, mysql_compatible);
+            let mut open_count = 0usize;
+            let mut close_count = 0usize;
+            for token in line_tokens {
+                if let SqlToken::Symbol(symbol) = token {
+                    for ch in symbol.chars() {
+                        match ch {
+                            '(' => {
+                                open_count = open_count.saturating_add(1);
+                            }
+                            ')' => {
+                                close_count = close_count.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if open_count >= close_count {
+                paren_depth = paren_depth.saturating_add(open_count.saturating_sub(close_count));
+            } else {
+                paren_depth = paren_depth.saturating_sub(close_count.saturating_sub(open_count));
+            }
+        }
+
+        normalized_lines.join("\n")
+    }
+
+    fn mysql_structural_render_indents(formatted: &str) -> Option<Vec<Option<usize>>> {
+        Self::resolved_line_layouts(formatted, true).map(|layouts| {
+            layouts
+                .into_iter()
+                .map(|layout| {
+                    (!layout.preserve_raw && layout.kind != LineLayoutKind::Verbatim)
+                        .then_some(layout.final_depth.saturating_mul(4))
+                })
+                .collect()
+        })
+    }
+
+    fn resolved_line_layouts<'a>(
+        formatted: &'a str,
+        mysql_compatible: bool,
+    ) -> Option<Vec<LineLayout<'a>>> {
         let line_count = formatted.lines().count();
         let contexts = QueryExecutor::auto_format_line_contexts(formatted);
         if contexts.len() != line_count {
-            return formatted.to_string();
+            return None;
         }
 
         let multiline_string_prefix_lengths =
@@ -9609,7 +9769,6 @@ impl SqlEditorWidget {
             Self::build_line_layouts(formatted, &contexts, &multiline_string_prefix_lengths);
         let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
 
-        let mysql_compatible = sql_text::mysql_compatibility_for_sql(formatted, None);
         Self::resolve_code_line_layouts(&mut layouts, &next_code_indices, mysql_compatible);
         Self::align_case_close_paren_layouts(
             &mut layouts,
@@ -9622,7 +9781,7 @@ impl SqlEditorWidget {
             &next_code_indices,
         );
 
-        Self::render_line_layouts(&layouts)
+        Some(layouts)
     }
 
     fn build_line_layouts<'a>(
@@ -9772,6 +9931,22 @@ impl SqlEditorWidget {
             .copied()
     }
 
+    fn active_relaxed_general_paren_layout_frame(
+        paren_layout_frames: &[ParenLayoutFrame],
+        current_query_base_depth: Option<usize>,
+    ) -> Option<ParenLayoutFrame> {
+        Self::active_general_paren_layout_frame(paren_layout_frames, current_query_base_depth)
+            .or_else(|| {
+                current_query_base_depth.is_none().then(|| {
+                    paren_layout_frames
+                        .iter()
+                        .rev()
+                        .find(|frame| frame.kind == ParenLayoutFrameKind::General)
+                        .copied()
+                })?
+            })
+    }
+
     fn active_general_paren_layout_frame_mut(
         paren_layout_frames: &mut [ParenLayoutFrame],
         current_query_base_depth: Option<usize>,
@@ -9863,6 +10038,23 @@ impl SqlEditorWidget {
     fn line_starts_query_head(trimmed_upper: &str) -> bool {
         crate::sql_text::line_starts_query_head(trimmed_upper)
     }
+
+    fn line_starts_create_table_header(line: &str) -> bool {
+        let words = crate::sql_text::meaningful_identifier_words_before_inline_comment(line, 4);
+        matches!(
+            words.as_slice(),
+            [first, second, ..]
+                if first.eq_ignore_ascii_case("CREATE")
+                    && second.eq_ignore_ascii_case("TABLE")
+        ) || matches!(
+            words.as_slice(),
+            [first, second, third, ..]
+                if first.eq_ignore_ascii_case("CREATE")
+                    && second.eq_ignore_ascii_case("TEMPORARY")
+                    && third.eq_ignore_ascii_case("TABLE")
+        )
+    }
+
 
     fn split_query_owner_lookahead_kind(
         layouts: &[LineLayout<'_>],
@@ -11077,6 +11269,10 @@ impl SqlEditorWidget {
             let current_line_is_condition_keyword_base =
                 layouts[idx].line_semantic.is_condition_continuation()
                     && !current_line_is_mysql_on_duplicate_key_update;
+            let current_line_starts_condition_keyword =
+                !current_line_is_mysql_on_duplicate_key_update
+                    && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "AND")
+                        || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OR"));
             let current_line_is_mysql_declare_handler_header =
                 layouts[idx].line_semantic.is_mysql_declare_handler_header();
             let current_line_is_mysql_declare_handler_body =
@@ -11089,8 +11285,8 @@ impl SqlEditorWidget {
                     || current_line_is_mysql_declare_handler_body
                     || current_line_is_mysql_declare_handler_block_end;
             let current_query_owner_kind = crate::sql_text::contextual_format_query_owner_kind(
-                structural_trimmed,
-                current_line_is_condition_keyword_base,
+                trimmed,
+                current_line_is_condition_keyword_base || current_line_starts_condition_keyword,
             );
             let current_line_has_retained_same_depth_merge_fragment =
                 pending_merge_branch_header_for_line.is_some_and(|frame| {
@@ -11211,20 +11407,42 @@ impl SqlEditorWidget {
                 && !crate::sql_text::trim_after_leading_close_parens(trimmed).is_empty();
             let current_line_is_parenthesized_condition =
                 layouts[idx].condition_header_line.is_some();
+            let current_line_is_own_condition_header_line =
+                layouts[idx].condition_header_line == Some(idx);
             let current_line_is_parenthesized_condition_header =
                 layouts[idx].condition_role == AutoFormatConditionRole::Header;
             let current_line_is_parenthesized_condition_close =
                 layouts[idx].condition_role == AutoFormatConditionRole::Closer;
+            let current_line_has_bare_parenthesized_condition_header = layouts[idx]
+                .condition_header_line
+                .and_then(|header_idx| layouts.get(header_idx))
+                .is_some_and(|header| {
+                    crate::sql_text::line_is_bare_parenthesized_condition_header(header.trimmed)
+                });
+            let current_line_has_control_condition_header = layouts[idx]
+                .condition_header_line
+                .and_then(|header_idx| layouts.get(header_idx))
+                .is_some_and(|header| {
+                    let header_upper = header.trimmed.to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&header_upper, "IF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSIF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSEIF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHILE")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHEN")
+                });
+            let current_line_has_flow_control_condition_header = layouts[idx]
+                .condition_header_line
+                .and_then(|header_idx| layouts.get(header_idx))
+                .is_some_and(|header| {
+                    let header_upper = header.trimmed.to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&header_upper, "IF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSIF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "ELSEIF")
+                        || crate::sql_text::starts_with_keyword_token(&header_upper, "WHILE")
+                });
             let current_line_is_control_condition_close =
                 current_line_is_parenthesized_condition_close
-                    && layouts[idx]
-                        .condition_header_line
-                        .and_then(|header_idx| layouts.get(header_idx))
-                        .is_some_and(|header| {
-                            crate::sql_text::line_is_bare_parenthesized_condition_header(
-                                header.trimmed,
-                            )
-                        });
+                    && current_line_has_bare_parenthesized_condition_header;
             let pending_paren_case_closer_depth_for_line =
                 case_layout_state.pending_paren_case_closer_depth();
             let is_paren_case_closer = pending_paren_case_closer_depth_for_line.is_some()
@@ -11243,7 +11461,11 @@ impl SqlEditorWidget {
                 layouts[idx].line_semantic.is_join_condition_clause()
                     && !current_line_is_mysql_on_duplicate_key_update;
             let current_line_is_condition_query_owner =
-                current_query_owner_kind == Some(FormatQueryOwnerKind::Condition);
+                current_query_owner_kind == Some(FormatQueryOwnerKind::Condition)
+                    || crate::sql_text::format_query_owner_kind(trimmed)
+                        == Some(FormatQueryOwnerKind::Condition)
+                    || crate::sql_text::format_query_owner_header_kind(trimmed)
+                        == Some(FormatQueryOwnerKind::Condition);
             let active_case_condition_frame = case_condition_frames.last().copied();
             let current_line_ends_case_condition =
                 active_case_condition_frame.is_some_and(|frame| {
@@ -11287,8 +11509,23 @@ impl SqlEditorWidget {
                     &owner_relative_detection_upper,
                     "OR",
                 ));
-            let current_line_is_condition_keyword =
-                current_line_is_condition_keyword_base || current_line_tail_is_condition_keyword;
+            let current_line_is_condition_keyword = current_line_is_condition_keyword_base
+                || current_line_starts_condition_keyword
+                || current_line_tail_is_condition_keyword;
+            let previous_code_is_control_condition_close = if current_line_is_condition_keyword
+                && current_line_has_flow_control_condition_header
+            {
+                (0..idx)
+                    .rev()
+                    .find(|scan_idx| layouts[*scan_idx].kind == LineLayoutKind::Code)
+                    .is_some_and(|previous_idx| {
+                        layouts[previous_idx].condition_role == AutoFormatConditionRole::Closer
+                            && layouts[previous_idx].condition_header_line
+                                == layouts[idx].condition_header_line
+                    })
+            } else {
+                false
+            };
             let current_line_closes_multiline_clause_owner_depth =
                 Self::consume_leading_multiline_owner_relative_paren_closes_in_place(
                     &mut owner_relative_frames,
@@ -11366,7 +11603,7 @@ impl SqlEditorWidget {
                     &line_tokens,
                     paren_frame_scan_start_idx,
                 );
-            let active_general_paren_frame = Self::active_general_paren_layout_frame(
+            let active_general_paren_frame = Self::active_relaxed_general_paren_layout_frame(
                 &paren_layout_frames,
                 layouts[idx].query_base_depth,
             );
@@ -11548,6 +11785,18 @@ impl SqlEditorWidget {
             let is_trigger_header_body_end = trigger_header_frame.is_some()
                 && !in_dml_statement
                 && current_line_starts_block_terminating_end;
+            let current_line_uses_mysql_structural_auto_depth = mysql_compatible
+                && layouts[idx].query_role == AutoFormatQueryRole::None
+                && !starts_with_close_paren
+                && (is_trigger_header_body_line
+                    || is_trigger_header_body_start
+                    || is_trigger_header_body_end
+                    || current_line_mysql_routine_block_kind.is_some()
+                    || current_line_mysql_routine_block_end_kind.is_some()
+                    || current_line_is_mysql_begin_end
+                    || current_line_is_mysql_repeat_until
+                    || !mysql_routine_block_frames.is_empty()
+                    || current_line_is_mysql_declare_handler_boundary);
             let mysql_declare_handler_depth_for_line =
                 if current_line_is_mysql_declare_handler_header
                     || current_line_is_mysql_declare_handler_body
@@ -11595,6 +11844,8 @@ impl SqlEditorWidget {
                 frame.owner_depth
             } else if let Some(pending_query_head_depth) = pending_query_head_depth_for_line {
                 pending_query_head_depth
+            } else if current_line_uses_mysql_structural_auto_depth {
+                layouts[idx].auto_depth.max(parser_depth.min(layouts[idx].auto_depth))
             } else if active_owner_relative_frame.is_some()
                 && active_structural_continuation_depth_for_line.is_some()
             {
@@ -11602,17 +11853,15 @@ impl SqlEditorWidget {
                     .unwrap_or(parser_depth)
                     .max(parser_depth)
             } else if let Some(continuation_depth) = active_structural_continuation_depth_for_line {
-                if uses_analyzer_query_depth {
-                    // Shared structural continuation state (for example
-                    // `UPDATE SET item,` carrying the next list item depth)
-                    // is a typed semantic anchor, not visual residue. When
-                    // it is active, canonical query/DML layout must honor at
-                    // least that carried depth instead of collapsing back to
-                    // the analyzer's line-local query role.
-                    analyzer_query_depth.max(continuation_depth)
-                } else {
-                    continuation_depth.max(parser_depth)
-                }
+                // Shared structural continuation state (for example
+                // `UPDATE SET item,` carrying the next list item depth or a
+                // nested close-comma returning to the parent frame body
+                // depth) is already the canonical structural answer for the
+                // current line family. The query-role analyzer may still
+                // remember a stale local continuation path from the previous
+                // line shape, so do not let that deeper analyzer value
+                // override the carried frame depth.
+                continuation_depth.max(parser_depth)
             } else if uses_analyzer_query_depth {
                 if starts_query_head {
                     active_pending_query_head
@@ -11658,10 +11907,38 @@ impl SqlEditorWidget {
                 } else {
                     branch_body_depth.max(parser_depth)
                 }
-            } else if !in_dml_statement
-                && current_line_is_parenthesized_condition
+            } else if current_line_is_parenthesized_condition
+                && current_line_has_flow_control_condition_header
+                && current_line_is_condition_keyword
                 && !current_line_is_parenthesized_condition_header
                 && !current_line_is_parenthesized_condition_close
+                && !current_line_is_own_condition_header_line
+                && (previous_code_is_control_condition_close
+                    || parenthesized_condition_header_depth
+                        .is_some_and(|header_depth| parser_depth <= header_depth))
+            {
+                let header_depth = parenthesized_condition_header_depth.unwrap_or(parser_depth);
+                if current_line_is_condition_query_owner {
+                    header_depth
+                } else {
+                    header_depth.saturating_add(1)
+                }
+            } else if !in_dml_statement
+                && current_line_is_parenthesized_condition
+                && current_line_has_control_condition_header
+                && !current_line_has_bare_parenthesized_condition_header
+                && !current_line_is_condition_keyword
+                && !current_line_is_parenthesized_condition_header
+                && !current_line_is_parenthesized_condition_close
+                && !current_line_is_own_condition_header_line
+            {
+                parenthesized_condition_header_depth.unwrap_or(parser_depth)
+            } else if !in_dml_statement
+                && current_line_is_parenthesized_condition
+                && current_line_has_bare_parenthesized_condition_header
+                && !current_line_is_parenthesized_condition_header
+                && !current_line_is_parenthesized_condition_close
+                && !current_line_is_own_condition_header_line
             {
                 parser_depth.saturating_add(1)
             } else if in_dml_statement && forall_body_depth.is_some() {
@@ -12006,6 +12283,24 @@ impl SqlEditorWidget {
                     .map(|frame| effective_depth.max(frame.body_depth()))
                     .unwrap_or(effective_depth)
             };
+            let effective_depth = if current_line_mysql_routine_block_kind.is_none()
+                && current_line_mysql_routine_block_end_kind.is_none()
+                && !current_line_is_mysql_begin_end
+                && !current_line_is_mysql_repeat_until
+                && !starts_with_close_paren
+                && layouts[idx].query_role == AutoFormatQueryRole::None
+                && layouts[idx].line_semantic.is_clause_boundary()
+                && current_line_branch_body_depth.is_none()
+                && pending_case_branch_body_depth_for_line.is_none()
+                && pending_merge_branch_body_depth_for_line.is_none()
+            {
+                mysql_routine_block_frames
+                    .last()
+                    .map(|frame| effective_depth.min(frame.body_depth()))
+                    .unwrap_or(effective_depth)
+            } else {
+                effective_depth
+            };
             let effective_depth = if current_line_is_mysql_declare_handler_boundary {
                 mysql_declare_handler_depth_for_line.unwrap_or(effective_depth)
             } else {
@@ -12119,6 +12414,75 @@ impl SqlEditorWidget {
             }
             if let Some(owner_depth) = window_definition_owner_depth_for_line {
                 effective_depth = effective_depth.max(owner_depth);
+            }
+            if mysql_compatible
+                && in_dml_statement
+                && idx > 0
+                && !current_line_starts_query_head_token
+                && !current_line_is_condition_keyword
+                && !current_line_is_join_condition_clause
+                && !starts_with_close_paren
+            {
+                let previous_code_idx = (0..idx).rev().find(|scan_idx| {
+                    !layouts[*scan_idx].analysis_trimmed.is_empty()
+                });
+                if let Some(previous_code_idx) = previous_code_idx {
+                    let previous_trimmed = layouts[previous_code_idx].analysis_trimmed;
+                    if Self::line_ends_with_comma_before_inline_comment(previous_trimmed)
+                        && previous_trimmed.starts_with(')')
+                    {
+                        let previous_depth = layouts[previous_code_idx].final_depth;
+                        let owner_line_idx = (0..previous_code_idx)
+                            .rev()
+                            .find(|scan_idx| {
+                                !layouts[*scan_idx].analysis_trimmed.is_empty()
+                                    && layouts[*scan_idx].final_depth == previous_depth
+                                    && !layouts[*scan_idx]
+                                        .analysis_trimmed
+                                        .starts_with(')')
+                            })
+                            .unwrap_or(previous_code_idx);
+                        let owner_trimmed = layouts[owner_line_idx].analysis_trimmed;
+                        let owner_is_inline_select_head =
+                            crate::sql_text::starts_with_keyword_token(
+                                &owner_trimmed.to_ascii_uppercase(),
+                                "SELECT",
+                            ) && !crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
+                                owner_trimmed,
+                                &["SELECT"],
+                            );
+                        let sibling_depth = if owner_is_inline_select_head {
+                            layouts[owner_line_idx].final_depth.saturating_add(1)
+                        } else {
+                            previous_depth
+                        };
+                        effective_depth = effective_depth.max(sibling_depth);
+                    }
+                }
+            }
+            if current_line_is_parenthesized_condition
+                && current_line_has_flow_control_condition_header
+                && current_line_is_condition_keyword
+                && !current_line_is_parenthesized_condition_header
+                && !current_line_is_parenthesized_condition_close
+                && !current_line_is_own_condition_header_line
+            {
+                if let Some(header_depth) = parenthesized_condition_header_depth {
+                    if parser_depth <= header_depth {
+                        // Control-condition AND/OR continuations already have
+                        // a structural answer from the analyzer:
+                        // - plain boolean tails (`AND v_col = ...`) return the
+                        //   continuation depth
+                        // - child-query owners (`AND EXISTS (`) stay on the
+                        //   condition owner depth
+                        //
+                        // Once the line has returned to the header parser
+                        // depth after a close or a compacted header, phase 2
+                        // should trust that frame-based auto depth instead of
+                        // reconstructing from the current line shape.
+                        effective_depth = layouts[idx].auto_depth.max(header_depth);
+                    }
+                }
             }
             let line_starts_effective_query_head =
                 starts_query_head || pending_query_head_depth_for_line.is_some();
@@ -27432,6 +27796,37 @@ FROM other_src;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_close_comma_sibling_ignores_previous_line_overindent() {
+        let source = r#"SELECT ROUND(
+(
+SELECT AVG (s2.score)
+FROM emp_score s2
+WHERE s2.empno = s.empno
+),
+2
+),
+            s.ename
+FROM emp_score s;"#;
+
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let round_idx = find_line_starting_with(&lines, "SELECT ROUND(").expect("ROUND owner");
+        let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[round_idx]).saturating_add(4),
+            "close-comma sibling should realign to the parent frame body depth instead of inheriting the previous overindented line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::apply_parser_depth_indentation(&formatted),
+            formatted,
+            "close-comma sibling normalization should remain stable after reformatting"
+        );
+    }
+
+    #[test]
     fn apply_parser_depth_indentation_condition_close_ignores_previous_line_overindent() {
         let source = r#"SELECT CASE
     WHEN EXISTS (
@@ -41079,6 +41474,59 @@ FROM emp_score s;"#;
     }
 
     #[test]
+    fn normalize_mysql_comma_sibling_layout_uses_structural_frame_depth_after_nested_close_comma() {
+        let source = r#"SELECT ROUND(
+(
+SELECT AVG (s2.score)
+FROM emp_score s2
+WHERE s2.empno = s.empno
+),
+2
+),
+            s.ename
+FROM emp_score s;"#;
+
+        let normalized = SqlEditorWidget::normalize_mysql_comma_sibling_layout(source);
+        let lines: Vec<&str> = normalized.lines().collect();
+        let round_idx = find_line_starting_with(&lines, "SELECT ROUND(").expect("ROUND owner");
+        let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[round_idx]).saturating_add(4),
+            "comma sibling normalizer should use the shared frame depth after a nested close-comma instead of copying the previous close line indent, got:\n{normalized}"
+        );
+    }
+
+    #[test]
+    fn normalize_mysql_select_list_sibling_layout_uses_structural_frame_depth_after_nested_subquery_close(
+    ) {
+        let source = r#"SELECT JSON_OBJECT(
+'avg_score',
+(
+SELECT AVG (s2.score)
+FROM emp_score s2
+WHERE s2.empno = s.empno
+),
+'employee_name',
+        s.ename
+)
+FROM emp_score s;"#;
+
+        let normalized = SqlEditorWidget::normalize_mysql_select_list_sibling_layout(source);
+        let lines: Vec<&str> = normalized.lines().collect();
+        let key_idx =
+            find_line_starting_with(&lines, "'employee_name',").expect("JSON_OBJECT key sibling");
+        let value_idx = find_line_starting_with(&lines, "s.ename").expect("JSON_OBJECT value");
+
+        assert_eq!(
+            leading_spaces(lines[value_idx]),
+            leading_spaces(lines[key_idx]),
+            "select-list sibling normalizer should realign nested-query siblings to the parent frame body depth instead of inheriting the previous close line indent, got:\n{normalized}"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test2_function_parens_tight() {
         let source = include_str!("../../../test_mariadb/test2.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -43367,5 +43815,301 @@ DELIMITER ;"#;
                 "test6 FETCH INTO target siblings should stay one level deeper than the INTO owner line, got:\n{formatted}"
             );
         }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test4_frame_based_depths_for_ddl_and_handlers() {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE departments (").expect("test4 CREATE");
+        let dept_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("dept_id"))
+            .map(|(idx, _)| idx)
+            .expect("test4 departments dept_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(dept_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test4 departments close");
+        let if_idx =
+            find_line_starting_with(&lines, "IF NEW.hours IS NULL").expect("test4 IF NEW.hours");
+        let or_idx =
+            find_line_starting_with(&lines, "OR NEW.hours <= 0").expect("test4 OR NEW.hours");
+        let while_idx =
+            find_line_starting_with(&lines, "WHILE v_day < 35 DO").expect("test4 outer WHILE");
+        let date_add_idx = find_line_starting_with(
+            &lines,
+            "SET v_work_date = DATE_ADD('2025-01-01', INTERVAL v_day DAY);",
+        )
+        .expect("test4 DATE_ADD body");
+        let handler_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("test4 handler header");
+        let handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test4 handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test4 handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[dept_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test4 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test4 CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "test4 split IF condition continuation should stay one frame deeper than the IF header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[date_add_idx]),
+            leading_spaces(lines[while_idx]).saturating_add(4),
+            "test4 WHILE body line with DATE_ADD should stay on the loop body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[handler_begin_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "test4 handler BEGIN should open one frame deeper than the DECLARE HANDLER header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(8),
+            "test4 handler body statements should stay one frame deeper than the handler BEGIN line, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_frame_based_depths_for_create_table_and_handlers(
+    ) {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE org_unit (").expect("test5 CREATE");
+        let org_unit_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("org_unit_id"))
+            .map(|(idx, _)| idx)
+            .expect("test5 org_unit_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(org_unit_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test5 org_unit close");
+        let continue_handler_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR user_error")
+                .expect("test5 CONTINUE HANDLER");
+        let continue_handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test5 handler BEGIN");
+        let diagnostics_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_begin_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start() == "GET DIAGNOSTICS CONDITION 1 v_sqlstate = RETURNED_SQLSTATE,"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test5 GET DIAGNOSTICS");
+        let exit_handler_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .map(|(idx, _)| idx)
+            .expect("test5 EXIT HANDLER");
+        let exit_handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test5 exit handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test5 exit handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[org_unit_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test5 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test5 CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[continue_handler_begin_idx]),
+            leading_spaces(lines[continue_handler_idx]).saturating_add(4),
+            "test5 CONTINUE HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[diagnostics_idx]),
+            leading_spaces(lines[continue_handler_idx]).saturating_add(8),
+            "test5 GET DIAGNOSTICS inside the handler should stay on the nested handler body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_handler_begin_idx]),
+            leading_spaces(lines[exit_handler_idx]).saturating_add(4),
+            "test5 EXIT HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[exit_handler_idx]).saturating_add(8),
+            "test5 EXIT HANDLER body statements should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_frame_based_depths_for_triggers_and_handlers()
+    {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE boss_region (").expect("test6 CREATE");
+        let region_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("region_id"))
+            .map(|(idx, _)| idx)
+            .expect("test6 region_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(region_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test6 boss_region close");
+        let trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER bi_boss_order_item")
+            .expect("test6 bi trigger");
+        let trigger_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(trigger_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 bi BEGIN");
+        let declare_idx = lines
+            .iter()
+            .enumerate()
+            .skip(trigger_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE v_unit_price DECIMAL(18, 2);")
+            .map(|(idx, _)| idx)
+            .expect("test6 DECLARE v_unit_price");
+        let au_trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER au_boss_order_item")
+            .expect("test6 au trigger");
+        let au_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(au_trigger_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 au BEGIN");
+        let order_change_if_idx = lines
+            .iter()
+            .enumerate()
+            .skip(au_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "IF OLD.order_id <> NEW.order_id THEN")
+            .map(|(idx, _)| idx)
+            .expect("test6 order change IF");
+        let handler_idx = lines
+            .iter()
+            .enumerate()
+            .skip(declare_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .map(|(idx, _)| idx)
+            .expect("test6 EXIT HANDLER");
+        let handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test6 handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[region_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test6 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test6 CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[declare_idx]),
+            leading_spaces(lines[trigger_begin_idx]).saturating_add(4),
+            "test6 trigger DECLARE line should stay on the BEGIN body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[order_change_if_idx]),
+            leading_spaces(lines[au_begin_idx]).saturating_add(4),
+            "test6 trigger IF header should realign with the trigger BEGIN body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[handler_begin_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "test6 EXIT HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(8),
+            "test6 EXIT HANDLER body should stay on the nested handler frame depth, got:\n{formatted}"
+        );
     }
 }
