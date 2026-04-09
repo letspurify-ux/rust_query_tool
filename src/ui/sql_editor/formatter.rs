@@ -4774,40 +4774,15 @@ impl SqlEditorWidget {
             }
 
             let previous = lines[prev_idx].clone();
-            let previous_trimmed = previous.trim_start().to_string();
             if !previous.trim_end().ends_with(',') {
                 continue;
             }
 
-            let mut desired_indent = structural_indents
+            let desired_indent = structural_indents
                 .get(idx)
                 .copied()
                 .flatten()
                 .unwrap_or_else(|| leading_spaces(&lines[idx]));
-            if previous_trimmed.starts_with(')') {
-                let previous_indent = leading_spaces(&previous);
-                let owner_line_idx = (0..prev_idx)
-                    .rev()
-                    .find(|scan_idx| {
-                        let scan_line = &lines[*scan_idx];
-                        !scan_line.trim().is_empty()
-                            && leading_spaces(scan_line) == previous_indent
-                            && !scan_line.trim_start().starts_with(')')
-                    })
-                    .unwrap_or(prev_idx);
-                let owner_trimmed = lines[owner_line_idx].trim_start();
-                if crate::sql_text::starts_with_keyword_token(
-                    &owner_trimmed.to_ascii_uppercase(),
-                    "SELECT",
-                ) && !crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    owner_trimmed,
-                    &["SELECT"],
-                ) {
-                    desired_indent = desired_indent.max(previous_indent.saturating_add(4));
-                } else {
-                    desired_indent = desired_indent.max(previous_indent);
-                }
-            }
             if leading_spaces(&lines[idx]) != desired_indent {
                 lines[idx] = format!("{}{}", " ".repeat(desired_indent), current_trimmed);
             }
@@ -9672,77 +9647,95 @@ impl SqlEditorWidget {
         Self::normalize_create_table_body_layout(&rendered, mysql_compatible)
     }
 
-    fn normalize_create_table_body_layout(
-        formatted: &str,
-        mysql_compatible: bool,
-    ) -> String {
+    fn normalize_create_table_body_layout(formatted: &str, mysql_compatible: bool) -> String {
         if formatted.is_empty() {
             return formatted.to_string();
         }
 
+        fn leading_spaces(line: &str) -> usize {
+            line.len().saturating_sub(line.trim_start().len())
+        }
+
         let lines: Vec<&str> = formatted.lines().collect();
-        let Some(header_idx) = lines.iter().position(|line| {
-            let trimmed = line.trim_start();
-            Self::line_starts_create_table_header(trimmed)
+        let mut normalized_lines: Vec<String> =
+            lines.iter().map(|line| (*line).to_string()).collect();
+        let mut idx = 0usize;
+
+        while idx < lines.len() {
+            let trimmed = lines[idx].trim_start();
+            let is_create_table_header = Self::line_starts_create_table_header(trimmed)
                 && trimmed.contains('(')
-                && !trimmed.contains(')')
-        }) else {
-            return formatted.to_string();
-        };
-
-        let owner_indent =
-            lines[header_idx].len().saturating_sub(lines[header_idx].trim_start().len());
-        let body_indent = owner_indent.saturating_add(4);
-        let mut paren_depth = 1usize;
-        let mut normalized_lines: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
-
-        for idx in (header_idx + 1)..normalized_lines.len() {
-            let trimmed = normalized_lines[idx].trim_start().to_string();
-            if trimmed.is_empty() {
+                && !trimmed.contains(')');
+            if !is_create_table_header {
+                idx = idx.saturating_add(1);
                 continue;
             }
 
-            if paren_depth == 0 {
-                break;
-            }
+            let owner_indent = leading_spaces(lines[idx]);
+            let mut active_paren_frames = vec![()];
+            let mut line_idx = idx.saturating_add(1);
 
-            let target_indent = if paren_depth == 1 && trimmed.starts_with(')') {
-                owner_indent
-            } else {
-                body_indent
-            };
-            normalized_lines[idx] = format!("{}{}", " ".repeat(target_indent), trimmed);
+            while line_idx < lines.len() && !active_paren_frames.is_empty() {
+                let trimmed = normalized_lines[line_idx].trim_start().to_string();
+                if trimmed.is_empty() {
+                    line_idx = line_idx.saturating_add(1);
+                    continue;
+                }
 
-            let line_tokens = Self::tokenize_sql_with_mysql_compat(&trimmed, mysql_compatible);
-            let mut open_count = 0usize;
-            let mut close_count = 0usize;
-            for token in line_tokens {
-                if let SqlToken::Symbol(symbol) = token {
-                    for ch in symbol.chars() {
-                        match ch {
-                            '(' => {
-                                open_count = open_count.saturating_add(1);
+                let line_tokens = Self::tokenize_sql_with_mysql_compat(&trimmed, mysql_compatible);
+                let mut token_idx = 0usize;
+                while token_idx < line_tokens.len() {
+                    match line_tokens.get(token_idx) {
+                        Some(SqlToken::Comment(_)) => {
+                            token_idx = token_idx.saturating_add(1);
+                        }
+                        Some(SqlToken::Symbol(symbol)) if symbol == ")" => {
+                            let _ = active_paren_frames.pop();
+                            token_idx = token_idx.saturating_add(1);
+                        }
+                        _ => break,
+                    }
+                }
+
+                let desired_indent = owner_indent
+                    .saturating_add(active_paren_frames.len().saturating_mul(4));
+                if leading_spaces(&normalized_lines[line_idx]) != desired_indent {
+                    normalized_lines[line_idx] =
+                        format!("{}{}", " ".repeat(desired_indent), trimmed);
+                }
+
+                for token in line_tokens.iter().skip(token_idx) {
+                    if let SqlToken::Symbol(symbol) = token {
+                        for ch in symbol.chars() {
+                            match ch {
+                                '(' => active_paren_frames.push(()),
+                                ')' => {
+                                    let _ = active_paren_frames.pop();
+                                }
+                                _ => {}
                             }
-                            ')' => {
-                                close_count = close_count.saturating_add(1);
-                            }
-                            _ => {}
                         }
                     }
                 }
+
+                line_idx = line_idx.saturating_add(1);
             }
-            if open_count >= close_count {
-                paren_depth = paren_depth.saturating_add(open_count.saturating_sub(close_count));
-            } else {
-                paren_depth = paren_depth.saturating_sub(close_count.saturating_sub(open_count));
-            }
+
+            idx = line_idx;
         }
 
-        normalized_lines.join("\n")
+        let mut normalized = normalized_lines.join("\n");
+        if formatted.ends_with('\n') {
+            normalized.push('\n');
+        }
+        normalized
     }
 
-    fn mysql_structural_render_indents(formatted: &str) -> Option<Vec<Option<usize>>> {
-        Self::resolved_line_layouts(formatted, true).map(|layouts| {
+    fn structural_render_indents(
+        formatted: &str,
+        mysql_compatible: bool,
+    ) -> Option<Vec<Option<usize>>> {
+        Self::resolved_line_layouts(formatted, mysql_compatible).map(|layouts| {
             layouts
                 .into_iter()
                 .map(|layout| {
@@ -9751,6 +9744,10 @@ impl SqlEditorWidget {
                 })
                 .collect()
         })
+    }
+
+    fn mysql_structural_render_indents(formatted: &str) -> Option<Vec<Option<usize>>> {
+        Self::structural_render_indents(formatted, true)
     }
 
     fn resolved_line_layouts<'a>(
@@ -42356,6 +42353,59 @@ END;"#;
                 "formatted CREATE TABLE should not regress to `{snippet}`:\n{formatted}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_create_table_body_layout_preserves_nested_frame_depths() {
+        let source = r#"CREATE TABLE t (
+    payload       JSON,
+    generated_doc JSON GENERATED ALWAYS AS (
+        JSON_OBJECT(
+            'kind',
+            IFNULL(
+                JSON_UNQUOTE(JSON_EXTRACT(payload, '$.kind')),
+                'UNKNOWN'
+            )
+        )
+    ) STORED
+);"#;
+
+        let normalized = SqlEditorWidget::normalize_create_table_body_layout(source, true);
+        let lines: Vec<&str> = normalized.lines().collect();
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE t (").expect("CREATE TABLE");
+        let generated_idx =
+            find_line_starting_with(&lines, "generated_doc").expect("generated_doc column");
+        let json_object_idx =
+            find_line_starting_with(&lines, "JSON_OBJECT").expect("generated JSON_OBJECT");
+        let ifnull_idx = find_line_starting_with(&lines, "IFNULL").expect("nested IFNULL");
+        let generated_close_idx =
+            find_line_starting_with(&lines, ") STORED").expect("generated_doc close");
+
+        assert_eq!(
+            leading_spaces(lines[generated_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "CREATE TABLE generated column owner should stay on the table body frame depth, got:\n{normalized}"
+        );
+        assert_eq!(
+            leading_spaces(lines[json_object_idx]),
+            leading_spaces(lines[generated_idx]).saturating_add(4),
+            "nested JSON_OBJECT under CREATE TABLE should stay one frame deeper than the generated column owner, got:\n{normalized}"
+        );
+        assert_eq!(
+            leading_spaces(lines[ifnull_idx]),
+            leading_spaces(lines[json_object_idx]).saturating_add(4),
+            "nested IFNULL under the generated JSON_OBJECT should stay on its child frame depth, got:\n{normalized}"
+        );
+        assert_eq!(
+            leading_spaces(lines[generated_close_idx]),
+            leading_spaces(lines[generated_idx]),
+            "generated expression close should realign with the generated column owner depth, got:\n{normalized}"
+        );
+        assert_eq!(
+            normalized, source,
+            "CREATE TABLE body normalizer should not flatten nested generated-expression frames back to the table body depth"
+        );
     }
 
     #[test]
