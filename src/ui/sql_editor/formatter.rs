@@ -844,6 +844,12 @@ impl ParenFormatFrame {
         self.pending_multiline_child_continuation
     }
 
+    fn wrapped_layout_sibling_body_indent(self) -> Option<usize> {
+        (self.kind == ParenFormatFrameKind::WrappedLayout
+            && self.has_pending_multiline_child_continuation())
+        .then_some(self.open_line_indent.saturating_add(1))
+    }
+
     fn has_simple_multiline_child_tail(self) -> bool {
         self.post_multiline_child_tail_token_count == 1
     }
@@ -2149,6 +2155,15 @@ impl SqlEditorWidget {
         )
     }
 
+    fn starts_with_explicit_case_terminator_tokens(tokens: &[SqlToken]) -> bool {
+        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        matches!(
+            (meaningful.next(), meaningful.next()),
+            (Some(SqlToken::Word(first)), Some(SqlToken::Word(second)))
+                if first.eq_ignore_ascii_case("END") && second.eq_ignore_ascii_case("CASE")
+        )
+    }
+
     fn starts_with_case_terminator(line: &str) -> bool {
         let tokens = Self::tokenize_sql(line);
         Self::starts_with_case_terminator_tokens(&tokens)
@@ -2803,202 +2818,6 @@ impl SqlEditorWidget {
         normalized.push_str(line_trimmed);
         normalized.push_str(&formatted_statement[trim_len..]);
         *formatted_statement = normalized;
-    }
-
-    fn normalize_mysql_compound_declare_layout(formatted_statement: &str) -> String {
-        #[derive(Clone, Copy)]
-        enum HandlerPhase {
-            AwaitingBody,
-            InBlock { nested_depth: usize },
-        }
-
-        #[derive(Clone, Copy)]
-        struct CursorState {
-            header_indent: usize,
-            paren_depth: isize,
-        }
-
-        #[derive(Clone, Copy)]
-        struct HandlerState {
-            header_indent: usize,
-            phase: HandlerPhase,
-        }
-
-        fn leading_spaces(line: &str) -> usize {
-            line.len().saturating_sub(line.trim_start().len())
-        }
-
-        fn rewrite_indent(line: &str, indent_spaces: usize) -> String {
-            format!("{}{}", " ".repeat(indent_spaces), line.trim_start())
-        }
-
-        fn is_comment_or_blank(line: &str) -> bool {
-            let trimmed = line.trim();
-            trimmed.is_empty()
-                || trimmed.starts_with("--")
-                || trimmed.starts_with('#')
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with('*')
-                || trimmed.starts_with("*/")
-        }
-
-        fn starts_with_mysql_query_clause(line: &str) -> bool {
-            matches!(
-                line.split_whitespace().next(),
-                Some(
-                    "SELECT"
-                        | "WITH"
-                        | "FROM"
-                        | "WHERE"
-                        | "GROUP"
-                        | "HAVING"
-                        | "ORDER"
-                        | "CONNECT"
-                        | "START"
-                        | "UNION"
-                        | "INTERSECT"
-                        | "MINUS"
-                        | "EXCEPT"
-                        | "LIMIT"
-                        | "WINDOW"
-                        | "QUALIFY"
-                        | "MODEL"
-                )
-            )
-        }
-
-        fn is_mysql_handler_condition_continuation(line: &str) -> bool {
-            let mut parts = line.split_whitespace();
-            let first = parts.next().unwrap_or_default();
-            let second = parts.next().unwrap_or_default();
-
-            first == "NOT"
-                || first == "FOUND"
-                || first == "SQLSTATE"
-                || first == "VALUE"
-                || first == "SQLEXCEPTION"
-                || first == "SQLWARNING"
-                || first.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-                || first.starts_with('\'')
-                || (first == "NOT" && second == "FOUND")
-        }
-
-        let mut normalized_lines: Vec<String> = Vec::new();
-        let mut cursor_state: Option<CursorState> = None;
-        let mut handler_state: Option<HandlerState> = None;
-
-        for raw_line in formatted_statement.lines() {
-            let trimmed = raw_line.trim_start();
-            let mut line = raw_line.to_string();
-
-            if let Some(state) = handler_state {
-                if !is_comment_or_blank(trimmed) {
-                    match state.phase {
-                        HandlerPhase::AwaitingBody => {
-                            if is_mysql_handler_condition_continuation(trimmed) {
-                                line = rewrite_indent(raw_line, state.header_indent);
-                            } else if trimmed == "BEGIN" {
-                                line = rewrite_indent(raw_line, state.header_indent + 4);
-                                handler_state = Some(HandlerState {
-                                    header_indent: state.header_indent,
-                                    phase: HandlerPhase::InBlock { nested_depth: 1 },
-                                });
-                            } else {
-                                line = rewrite_indent(raw_line, state.header_indent + 4);
-                                if trimmed.ends_with(';') {
-                                    handler_state = None;
-                                }
-                            }
-                        }
-                        HandlerPhase::InBlock { nested_depth } => {
-                            if trimmed == "BEGIN" {
-                                line = rewrite_indent(
-                                    raw_line,
-                                    state.header_indent + 4 + (nested_depth.saturating_sub(1) * 4),
-                                );
-                                handler_state = Some(HandlerState {
-                                    header_indent: state.header_indent,
-                                    phase: HandlerPhase::InBlock {
-                                        nested_depth: nested_depth.saturating_add(1),
-                                    },
-                                });
-                            } else if trimmed.starts_with("END") {
-                                let remaining_depth = nested_depth.saturating_sub(1);
-                                line = rewrite_indent(
-                                    raw_line,
-                                    state.header_indent + 4 + (remaining_depth * 4),
-                                );
-                                handler_state = (remaining_depth > 0).then_some(HandlerState {
-                                    header_indent: state.header_indent,
-                                    phase: HandlerPhase::InBlock {
-                                        nested_depth: remaining_depth,
-                                    },
-                                });
-                            } else {
-                                line = rewrite_indent(
-                                    raw_line,
-                                    state.header_indent + 4 + (nested_depth * 4),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(state) = cursor_state {
-                let trimmed_after_handler = line.trim_start().to_string();
-                if !is_comment_or_blank(&trimmed_after_handler)
-                    && starts_with_mysql_query_clause(&trimmed_after_handler)
-                {
-                    line = rewrite_indent(&line, state.header_indent + 4);
-                }
-
-                let mut next_paren_depth = state.paren_depth;
-                for ch in trimmed_after_handler.chars() {
-                    match ch {
-                        '(' => next_paren_depth += 1,
-                        ')' => next_paren_depth -= 1,
-                        _ => {}
-                    }
-                }
-
-                if trimmed_after_handler.ends_with(';') && next_paren_depth <= 0 {
-                    cursor_state = None;
-                } else {
-                    cursor_state = Some(CursorState {
-                        header_indent: state.header_indent,
-                        paren_depth: next_paren_depth,
-                    });
-                }
-            }
-
-            let normalized_trimmed = line.trim_start();
-            if normalized_trimmed.starts_with("DECLARE")
-                && normalized_trimmed.contains(" CURSOR FOR")
-            {
-                cursor_state = Some(CursorState {
-                    header_indent: leading_spaces(&line),
-                    paren_depth: 0,
-                });
-            }
-
-            if normalized_trimmed.starts_with("DECLARE")
-                && normalized_trimmed.contains(" HANDLER FOR")
-            {
-                handler_state = Some(HandlerState {
-                    header_indent: leading_spaces(&line),
-                    phase: HandlerPhase::AwaitingBody,
-                });
-            }
-
-            normalized_lines.push(line);
-        }
-
-        let mut normalized = normalized_lines.join("\n");
-        if formatted_statement.ends_with('\n') {
-            normalized.push('\n');
-        }
-        normalized
     }
 
     fn normalize_mysql_function_header_layout(formatted_statement: &str) -> String {
@@ -4562,7 +4381,53 @@ impl SqlEditorWidget {
         normalized
     }
 
-    fn normalize_mysql_close_comma_continuation_layout(formatted_statement: &str) -> String {
+    fn mysql_layout_line_starts_values_function_call(
+        line: &str,
+        inside_on_duplicate_call_args: bool,
+    ) -> bool {
+        inside_on_duplicate_call_args
+            && crate::sql_text::starts_with_keyword_token(&line.to_ascii_uppercase(), "VALUES")
+    }
+
+    fn mysql_layout_clause_boundary(
+        line: &str,
+        inside_on_duplicate_call_args: bool,
+    ) -> bool {
+        let trimmed = line.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        let starts_dml_clause = Self::is_dml_clause_starter(upper.as_str())
+            && !Self::mysql_layout_line_starts_values_function_call(
+                trimmed,
+                inside_on_duplicate_call_args,
+            );
+
+        starts_dml_clause
+            || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
+            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                trimmed,
+                &["GROUP", "BY"],
+            )
+            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                trimmed,
+                &["ORDER", "BY"],
+            )
+            || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                trimmed,
+                &["PARTITION", "BY"],
+            )
+            || crate::sql_text::starts_with_keyword_token(&upper, "WINDOW")
+            || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
+            || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
+            || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
+            || trimmed.starts_with("--")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with(')')
+    }
+
+    fn mysql_on_duplicate_parenthesized_line_flags(
+        formatted_statement: &str,
+        original_lines: &[&str],
+    ) -> Vec<bool> {
         fn leading_spaces(line: &str) -> usize {
             line.len().saturating_sub(line.trim_start().len())
         }
@@ -4584,30 +4449,68 @@ impl SqlEditorWidget {
             }
         }
 
-        fn is_clause_boundary(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            let upper = trimmed.to_ascii_uppercase();
-            SqlEditorWidget::is_dml_clause_starter(upper.as_str())
-                || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["GROUP", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["ORDER", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["PARTITION", "BY"],
-                )
-                || crate::sql_text::starts_with_keyword_token(&upper, "WINDOW")
-                || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
-                || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
-                || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
-                || trimmed.starts_with("--")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with(')')
+        let line_starts = line_start_offsets(formatted_statement);
+        let spans =
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted_statement, true);
+        let mut active_paren_stack: Vec<usize> = Vec::new();
+        let mut next_span_idx = 0usize;
+        let mut line_flags = vec![false; original_lines.len()];
+
+        for (line_idx, line) in original_lines.iter().enumerate() {
+            let first_content_offset = line_starts
+                .get(line_idx)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(leading_spaces(line));
+
+            while next_span_idx < spans.len() && spans[next_span_idx].start < first_content_offset {
+                if let SqlToken::Symbol(sym) = &spans[next_span_idx].token {
+                    match sym.as_str() {
+                        "(" => active_paren_stack.push(spans[next_span_idx].start),
+                        ")" => {
+                            let _ = active_paren_stack.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                next_span_idx = next_span_idx.saturating_add(1);
+            }
+
+            line_flags[line_idx] = active_paren_stack.iter().rev().any(|open_offset| {
+                let open_line_idx = line_index_for_offset(&line_starts, *open_offset);
+                original_lines
+                    .get(open_line_idx)
+                    .is_some_and(|open_line| {
+                        crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
+                            open_line.trim_start(),
+                        )
+                    })
+            });
+        }
+
+        line_flags
+    }
+
+    fn normalize_mysql_close_comma_continuation_layout(formatted_statement: &str) -> String {
+        fn leading_spaces(line: &str) -> usize {
+            line.len().saturating_sub(line.trim_start().len())
+        }
+
+        fn line_start_offsets(text: &str) -> Vec<usize> {
+            let mut offsets = vec![0usize];
+            for (idx, byte) in text.bytes().enumerate() {
+                if byte == b'\n' {
+                    offsets.push(idx.saturating_add(1));
+                }
+            }
+            offsets
+        }
+
+        fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
+            match line_starts.binary_search(&offset) {
+                Ok(idx) => idx,
+                Err(idx) => idx.saturating_sub(1),
+            }
         }
 
         fn is_pure_close_comma_line(line: &str) -> bool {
@@ -4632,6 +4535,11 @@ impl SqlEditorWidget {
             .iter()
             .map(|line| (*line).to_string())
             .collect();
+        let on_duplicate_parenthesized_line_flags =
+            Self::mysql_on_duplicate_parenthesized_line_flags(
+                formatted_statement,
+                original_lines.as_slice(),
+            );
         let spans =
             super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted_statement, true);
         let mut paren_stack: Vec<usize> = Vec::new();
@@ -4658,7 +4566,16 @@ impl SqlEditorWidget {
         let line_starts = line_start_offsets(formatted_statement);
         for idx in 1..lines.len() {
             let current_trimmed = lines[idx].trim_start().to_string();
-            if current_trimmed.is_empty() || is_clause_boundary(&current_trimmed) {
+            let current_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
+            if current_trimmed.is_empty()
+                || Self::mysql_layout_clause_boundary(
+                    &current_trimmed,
+                    current_inside_on_duplicate_call_args,
+                )
+            {
                 continue;
             }
 
@@ -4710,36 +4627,25 @@ impl SqlEditorWidget {
             line.len().saturating_sub(line.trim_start().len())
         }
 
-        fn is_clause_boundary(line: &str) -> bool {
-            let trimmed = line.trim_start();
-            let upper = trimmed.to_ascii_uppercase();
-            SqlEditorWidget::is_dml_clause_starter(upper.as_str())
-                || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["GROUP", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["ORDER", "BY"],
-                )
-                || crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    trimmed,
-                    &["PARTITION", "BY"],
-                )
-                || crate::sql_text::starts_with_keyword_token(&upper, "WINDOW")
-                || crate::sql_text::starts_with_keyword_token(&upper, "LIMIT")
-                || crate::sql_text::starts_with_keyword_token(&upper, "FETCH")
-                || crate::sql_text::starts_with_keyword_token(&upper, "OFFSET")
-                || trimmed.starts_with("--")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with(')')
-        }
-
-        let mut lines: Vec<String> = formatted_statement.lines().map(str::to_string).collect();
+        let original_lines: Vec<&str> = formatted_statement.lines().collect();
+        let on_duplicate_parenthesized_line_flags =
+            Self::mysql_on_duplicate_parenthesized_line_flags(
+                formatted_statement,
+                original_lines.as_slice(),
+            );
+        let mut lines: Vec<String> = original_lines.iter().map(|line| (*line).to_string()).collect();
         for idx in 1..lines.len() {
             let current_trimmed = lines[idx].trim_start().to_string();
-            if current_trimmed.is_empty() || is_clause_boundary(&current_trimmed) {
+            let current_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
+            if current_trimmed.is_empty()
+                || Self::mysql_layout_clause_boundary(
+                    &current_trimmed,
+                    current_inside_on_duplicate_call_args,
+                )
+            {
                 continue;
             }
 
@@ -4752,7 +4658,16 @@ impl SqlEditorWidget {
             }
 
             let previous_trimmed = lines[prev_idx].trim_start().to_string();
-            if !previous_trimmed.ends_with(',') || is_clause_boundary(&previous_trimmed) {
+            let previous_inside_on_duplicate_call_args = on_duplicate_parenthesized_line_flags
+                .get(prev_idx)
+                .copied()
+                .unwrap_or(false);
+            if !previous_trimmed.ends_with(',')
+                || Self::mysql_layout_clause_boundary(
+                    &previous_trimmed,
+                    previous_inside_on_duplicate_call_args,
+                )
+            {
                 continue;
             }
 
@@ -5487,6 +5402,9 @@ impl SqlEditorWidget {
                         || sql_text::mysql_compatibility_for_sql(statement, preferred_db_type);
                     let statement_tokens =
                         Self::tokenize_sql_with_mysql_compat(statement, mysql_compatible_statement);
+                    let mysql_compound_statement =
+                        mysql_compatible_statement
+                            && Self::is_mysql_compound_statement(&statement_tokens);
                     let formatted_statement = Self::format_statement(
                         statement,
                         &statement_tokens,
@@ -5495,8 +5413,6 @@ impl SqlEditorWidget {
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     let mut formatted_statement = if mysql_compatible_statement {
-                        let formatted_statement =
-                            Self::normalize_mysql_compound_declare_layout(&formatted_statement);
                         let formatted_statement =
                             Self::normalize_mysql_function_header_layout(&formatted_statement);
                         let formatted_statement =
@@ -5569,7 +5485,16 @@ impl SqlEditorWidget {
                             );
                         let formatted_statement =
                             Self::normalize_mysql_into_target_layout(&formatted_statement);
-                        Self::normalize_mysql_json_table_close_layout(&formatted_statement)
+                        let formatted_statement =
+                            Self::normalize_mysql_json_table_close_layout(&formatted_statement);
+                        if mysql_compound_statement {
+                            // MySQL compound statements now normalize final
+                            // depth through the shared analyzer/frame model,
+                            // including DECLARE/CURSOR/HANDLER families.
+                            Self::apply_parser_depth_indentation(&formatted_statement)
+                        } else {
+                            formatted_statement
+                        }
                     } else {
                         formatted_statement
                     };
@@ -9120,6 +9045,10 @@ impl SqlEditorWidget {
                                         &phase1_wrapped_owner_frames,
                                         paren_stack.len(),
                                     );
+                                let wrapped_layout_sibling_indent =
+                                    paren_stack.last().and_then(|frame| {
+                                        frame.wrapped_layout_sibling_body_indent()
+                                    });
                                 let next_starts_parenthesized_sibling = matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "(");
                                 let allows_compact_close_continuation_comma_break =
                                     matches!(current_clause.as_deref(), Some("SELECT"))
@@ -9174,6 +9103,20 @@ impl SqlEditorWidget {
                                                 indent: select_list_indent,
                                                 hanging_indent_spaces: Some(hanging_indent_spaces),
                                             };
+                                    } else if let Some(sibling_indent) =
+                                        wrapped_layout_sibling_indent
+                                    {
+                                        // Wrapped layout siblings must snap back to the parent
+                                        // frame body depth instead of inheriting clause-local
+                                        // comma indentation from the previous child.
+                                        newline_with(
+                                            &mut out,
+                                            sibling_indent,
+                                            0,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
                                     } else {
                                         newline_with(
                                             &mut out,
@@ -9845,6 +9788,7 @@ impl SqlEditorWidget {
     }
 
     fn classify_paren_layout_frame_kind(
+        line: &str,
         tokens: &[SqlToken],
         open_idx: usize,
         next_code_trimmed: Option<&str>,
@@ -9852,13 +9796,22 @@ impl SqlEditorWidget {
         is_condition_query_owner: bool,
         is_standalone_open_paren_owner: bool,
     ) -> ParenLayoutFrameKind {
+        let line_is_mysql_on_duplicate_key_update = crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
+            crate::sql_text::auto_format_structural_tail(line),
+        );
         let next_non_comment = tokens
             .iter()
             .skip(open_idx.saturating_add(1))
             .find(|token| !matches!(token, SqlToken::Comment(_)));
 
         if let Some(SqlToken::Word(word)) = next_non_comment {
-            if Self::line_starts_query_head(&word.to_ascii_uppercase()) {
+            let word_upper = word.to_ascii_uppercase();
+            if line_is_mysql_on_duplicate_key_update
+                && crate::sql_text::starts_with_keyword_token(&word_upper, "VALUES")
+            {
+                return ParenLayoutFrameKind::General;
+            }
+            if Self::line_starts_query_head(&word_upper) {
                 return if is_condition_query_owner {
                     ParenLayoutFrameKind::ConditionQuery
                 } else {
@@ -9872,6 +9825,16 @@ impl SqlEditorWidget {
                 if is_multiline_clause_owner {
                     return ParenLayoutFrameKind::MultilineClause;
                 }
+                return ParenLayoutFrameKind::General;
+            }
+            if line_is_mysql_on_duplicate_key_update
+                && next_code_trimmed.is_some_and(|next| {
+                    crate::sql_text::starts_with_keyword_token(
+                        &Self::structural_line_upper(next),
+                        "VALUES",
+                    )
+                })
+            {
                 return ParenLayoutFrameKind::General;
             }
             if next_code_trimmed.is_some_and(|next| {
@@ -9939,6 +9902,7 @@ impl SqlEditorWidget {
     }
 
     fn update_paren_layout_frames_for_line(
+        line: &str,
         tokens: &[SqlToken],
         start_idx: usize,
         next_code_trimmed: Option<&str>,
@@ -9958,6 +9922,7 @@ impl SqlEditorWidget {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == "(" => {
                     let kind = Self::classify_paren_layout_frame_kind(
+                        line,
                         tokens,
                         token_idx,
                         next_code_trimmed,
@@ -10164,6 +10129,7 @@ impl SqlEditorWidget {
         trimmed: &str,
         trimmed_upper: &str,
         query_role: AutoFormatQueryRole,
+        line_semantic: AutoFormatLineSemantic,
         starts_query_head: bool,
         starts_with_close_paren: bool,
         current_line_is_condition_boundary: bool,
@@ -10173,17 +10139,24 @@ impl SqlEditorWidget {
         active_owner_relative_frame: Option<OwnerRelativeLayoutFrame>,
         pending_operator_for_line: Option<PendingOperatorLayoutFrame>,
         active_general_paren_frame: Option<ParenLayoutFrame>,
+        active_structural_continuation_depth_for_line: Option<usize>,
     ) -> Option<usize> {
         let frame = active_general_paren_frame?;
+        let general_paren_body_role = query_role == AutoFormatQueryRole::None
+            || (query_role == AutoFormatQueryRole::Continuation
+                && line_semantic == AutoFormatLineSemantic::None);
+        let clause_keyword_rejects_general_paren_body =
+            (Self::is_dml_clause_starter(trimmed_upper)
+                || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTO"))
+                && !general_paren_body_role;
         if starts_with_close_paren
-            || query_role != AutoFormatQueryRole::None
+            || !general_paren_body_role
             || starts_query_head
             || current_line_is_condition_boundary
             || current_line_starts_case
             || Self::starts_with_case_branch_keyword(trimmed_upper)
             || Self::starts_with_case_terminator(trimmed)
-            || Self::is_dml_clause_starter(trimmed_upper)
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTO")
+            || clause_keyword_rejects_general_paren_body
             || current_line_starts_multiline_clause
             || owner_relative_body_header_depth_for_line.is_some()
             || active_owner_relative_frame.is_some()
@@ -10192,7 +10165,17 @@ impl SqlEditorWidget {
             return None;
         }
 
-        Some(frame.continuation_depth)
+        // Explicit structural continuation state (for example a comma sibling
+        // depth chosen from the enclosing owner/list frame) must still act as
+        // a floor for general-paren body lines. But plain general function
+        // bodies such as `OVERLAY (... FROM ... FOR ...)` or `JSON_VALUE (...
+        // RETURNING ...)` also need the ambient paren continuation when the
+        // carried structural depth only reflects the owner line itself.
+        Some(
+            active_structural_continuation_depth_for_line
+                .map(|depth| depth.max(frame.continuation_depth))
+                .unwrap_or(frame.continuation_depth),
+        )
     }
 
     fn resolve_structural_close_line_depth(
@@ -10827,18 +10810,20 @@ impl SqlEditorWidget {
                 Self::starts_with_end_suffix_terminator_tokens(&line_tokens);
             let current_line_starts_case_terminator =
                 Self::starts_with_case_terminator_tokens(&line_tokens);
-            let current_line_is_mysql_on_duplicate_key_update = mysql_compatible
-                && crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["ON", "DUPLICATE", "KEY", "UPDATE"],
-                );
+            let current_line_starts_explicit_case_terminator =
+                Self::starts_with_explicit_case_terminator_tokens(&line_tokens);
+            let current_line_is_mysql_on_duplicate_key_update =
+                mysql_compatible
+                    && crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
+                        structural_trimmed,
+                    );
             let current_line_starts_mysql_custom_delimited_end =
                 Self::starts_with_mysql_custom_delimited_end(trimmed);
             let current_line_starts_block_terminating_end =
                 Self::starts_with_block_terminating_end(trimmed, &line_tokens);
             let current_line_is_mysql_begin_end = mysql_compatible
                 && current_line_starts_block_terminating_end
-                && !current_line_starts_case_terminator;
+                && !current_line_starts_explicit_case_terminator;
             let current_line_split_plain_end_progress =
                 pending_split_plain_end_layout_frame_for_line.and_then(|frame| {
                     Self::split_plain_end_continuation_progress(&line_tokens, frame.kind)
@@ -10847,6 +10832,16 @@ impl SqlEditorWidget {
             let current_line_is_condition_keyword_base =
                 layouts[idx].line_semantic.is_condition_continuation()
                     && !current_line_is_mysql_on_duplicate_key_update;
+            let current_line_is_mysql_declare_handler_header =
+                layouts[idx].line_semantic.is_mysql_declare_handler_header();
+            let current_line_is_mysql_declare_handler_body =
+                layouts[idx].line_semantic.is_mysql_declare_handler_body();
+            let current_line_is_mysql_declare_handler_block_end =
+                layouts[idx].line_semantic.is_mysql_declare_handler_block_end();
+            let current_line_is_mysql_declare_handler_boundary =
+                current_line_is_mysql_declare_handler_header
+                    || current_line_is_mysql_declare_handler_body
+                    || current_line_is_mysql_declare_handler_block_end;
             let current_query_owner_kind = crate::sql_text::contextual_format_query_owner_kind(
                 structural_trimmed,
                 current_line_is_condition_keyword_base,
@@ -11031,14 +11026,14 @@ impl SqlEditorWidget {
             let owner_relative_detection_upper =
                 owner_relative_detection_trimmed.to_ascii_uppercase();
             let current_line_is_exact_bare_window_clause_header =
-                layouts[idx].line_semantic.is_clause()
-                    && crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                        structural_trimmed,
-                        &["WINDOW"],
-                    );
+                crate::sql_text::line_is_format_bare_window_clause_header(structural_trimmed);
             let current_line_is_window_clause_definition_header =
                 pending_window_definition_owner_for_line.is_some()
                     && Self::line_is_window_clause_definition_header(trimmed);
+            let window_definition_owner_depth_for_line =
+                pending_window_definition_owner_for_line
+                    .filter(|_| current_line_is_window_clause_definition_header)
+                    .map(|frame| frame.owner_depth);
             let current_line_tail_is_condition_keyword = starts_with_close_paren
                 && (crate::sql_text::starts_with_keyword_token(
                     &owner_relative_detection_upper,
@@ -11111,6 +11106,10 @@ impl SqlEditorWidget {
                 &paren_layout_frames,
                 layouts[idx].query_base_depth,
             );
+            let current_line_is_general_paren_values_function = active_general_paren_frame
+                .is_some()
+                && layouts[idx].query_role == AutoFormatQueryRole::None
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES");
             let current_line_starts_dml_case_expression = in_dml_statement
                 && current_line_starts_case
                 && current_line_branch_body_depth.is_none()
@@ -11175,11 +11174,13 @@ impl SqlEditorWidget {
                 !suppress_non_subquery_paren_layout_clause
                     && crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed);
             let current_line_structural_header_continuation_kind =
-                (!suppress_non_subquery_paren_layout_clause)
+                (!suppress_non_subquery_paren_layout_clause
+                    && !current_line_is_general_paren_values_function)
                     .then(|| sql_text::format_structural_header_continuation_kind(trimmed))
                     .flatten();
             let current_line_bare_structural_header_continuation_kind =
-                (!suppress_non_subquery_paren_layout_clause)
+                (!suppress_non_subquery_paren_layout_clause
+                    && !current_line_is_general_paren_values_function)
                     .then(|| sql_text::format_bare_structural_header_continuation_kind(trimmed))
                     .flatten();
             let current_line_is_exact_bare_owner_or_pending_header =
@@ -11201,7 +11202,8 @@ impl SqlEditorWidget {
                     || current_line_is_condition_keyword
                     || current_line_is_parenthesized_condition_header
                     || current_line_is_parenthesized_condition_close
-                    || starts_with_close_paren;
+                    || starts_with_close_paren
+                    || current_line_is_mysql_declare_handler_boundary;
             let current_line_clears_structural_continuation_depth =
                 current_line_is_structural_continuation_boundary
                     || current_line_is_join_condition_clause
@@ -11209,7 +11211,8 @@ impl SqlEditorWidget {
                     || current_line_is_parenthesized_condition_header
                     || current_line_is_parenthesized_condition_close
                     || current_line_is_standalone_open_paren
-                    || starts_with_close_paren;
+                    || starts_with_close_paren
+                    || current_line_is_mysql_declare_handler_boundary;
             let active_structural_continuation_depth_for_line =
                 (!current_line_rejects_structural_continuation_depth)
                     .then_some(incoming_structural_continuation_depth)
@@ -11281,7 +11284,24 @@ impl SqlEditorWidget {
             let is_trigger_header_body_end = trigger_header_frame.is_some()
                 && !in_dml_statement
                 && current_line_starts_block_terminating_end;
-            let mut effective_depth = if is_trigger_header_body_start || is_trigger_header_body_end
+            let mysql_declare_handler_depth_for_line =
+                if current_line_is_mysql_declare_handler_header
+                    || current_line_is_mysql_declare_handler_body
+                    || current_line_is_mysql_declare_handler_block_end
+                {
+                    Some(if layouts[idx].query_role != AutoFormatQueryRole::None {
+                        analyzer_query_depth.max(layouts[idx].auto_depth).max(parser_depth)
+                    } else {
+                        layouts[idx].auto_depth.max(parser_depth)
+                    })
+                } else {
+                    None
+                };
+            let mut effective_depth = if let Some(handler_depth) =
+                mysql_declare_handler_depth_for_line
+            {
+                handler_depth
+            } else if is_trigger_header_body_start || is_trigger_header_body_end
             {
                 trigger_header_owner_depth.unwrap_or(parser_depth)
             } else if is_trigger_header_body_line {
@@ -11448,16 +11468,15 @@ impl SqlEditorWidget {
                     effective_depth = effective_depth.max(with_definition_scope_depth);
                 }
             }
-            if let Some(frame) = pending_window_definition_owner_for_line {
-                if current_line_is_window_clause_definition_header {
-                    effective_depth = effective_depth.max(frame.owner_depth);
-                }
+            if let Some(owner_depth) = window_definition_owner_depth_for_line {
+                effective_depth = effective_depth.max(owner_depth);
             }
 
             let effective_depth = Self::normalized_general_paren_body_depth(
                 trimmed,
                 &trimmed_upper,
                 layouts[idx].query_role,
+                layouts[idx].line_semantic,
                 starts_query_head,
                 starts_with_close_paren,
                 current_line_is_condition_keyword || current_line_is_join_condition_clause,
@@ -11467,6 +11486,7 @@ impl SqlEditorWidget {
                 active_owner_relative_frame,
                 pending_operator_for_line,
                 active_general_paren_frame,
+                active_structural_continuation_depth_for_line,
             )
             .unwrap_or(effective_depth);
             let effective_depth =
@@ -11639,6 +11659,9 @@ impl SqlEditorWidget {
             let effective_depth = if !starts_with_close_paren
                 && !current_line_is_condition_keyword
                 && !current_line_is_join_condition_clause
+                && active_structural_continuation_depth_for_line.is_none()
+                && (layouts[idx].query_role == AutoFormatQueryRole::None
+                    || layouts[idx].line_semantic != AutoFormatLineSemantic::None)
                 && (clause_starter_uses_general_paren_continuation
                     || (!Self::is_dml_clause_starter(&trimmed_upper)
                         && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")))
@@ -11647,7 +11670,9 @@ impl SqlEditorWidget {
                 // too (for example `OVER (... ORDER BY ...)` or
                 // `OVERLAY (... FROM ... FOR ...)`). When that happens, keep
                 // the general-paren continuation depth instead of snapping back
-                // to the surrounding query clause depth.
+                // to the surrounding query clause depth. But if an explicit
+                // structural continuation depth is already active (for example
+                // a comma sibling list depth), that typed state must win.
                 active_general_paren_frame
                     .map(|frame| effective_depth.max(frame.continuation_depth))
                     .unwrap_or(effective_depth)
@@ -11697,6 +11722,17 @@ impl SqlEditorWidget {
                     .last()
                     .map(|frame| effective_depth.max(frame.body_depth()))
                     .unwrap_or(effective_depth)
+            };
+            let effective_depth = if current_line_is_mysql_declare_handler_boundary {
+                mysql_declare_handler_depth_for_line.unwrap_or(effective_depth)
+            } else {
+                effective_depth
+            };
+            let effective_depth = if let Some(owner_depth) = window_definition_owner_depth_for_line
+            {
+                effective_depth.max(owner_depth)
+            } else {
+                effective_depth
             };
             let mut continued_plsql_child_query_owner = None;
             let mut continued_multiline_clause_owner = None;
@@ -11797,6 +11833,9 @@ impl SqlEditorWidget {
             }
             if let Some(frame) = pending_operator_for_line {
                 effective_depth = effective_depth.max(frame.owner_depth.saturating_add(1));
+            }
+            if let Some(owner_depth) = window_definition_owner_depth_for_line {
+                effective_depth = effective_depth.max(owner_depth);
             }
             let line_starts_effective_query_head =
                 starts_query_head || pending_query_head_depth_for_line.is_some();
@@ -12202,6 +12241,7 @@ impl SqlEditorWidget {
                     current_query_condition_continuation_depth
                 };
             Self::update_paren_layout_frames_for_line(
+                trimmed,
                 &line_tokens,
                 paren_frame_scan_start_idx,
                 next_code_trimmed,
@@ -14863,6 +14903,108 @@ END;"#;
             "close paren after standalone assignment parens should return to the open paren depth, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn apply_parser_depth_indentation_keeps_on_duplicate_multiline_call_siblings_on_parent_frame_depth_inside_mysql_compound_body(
+    ) {
+        let source = r#"CREATE PROCEDURE p()
+BEGIN
+    INSERT INTO dept (dept_id, parent_dept_id, dept_code, dept_name, sort_no)
+    VALUES (20, 10, 'SALES', 'Sales-upsert-check', 2)
+    ON DUPLICATE KEY UPDATE dept_name = CONCAT(
+        VALUES(dept_name),
+            ' / touched'
+    ),
+        sort_no = VALUES(sort_no);
+END;"#;
+
+        let contexts = crate::db::QueryExecutor::auto_format_line_contexts(source);
+        let multiline_string_prefix_lengths =
+            SqlEditorWidget::multiline_string_continuation_prefix_lengths(
+                source,
+                source.lines().count(),
+            );
+        let mut layouts = SqlEditorWidget::build_line_layouts(
+            source,
+            &contexts,
+            &multiline_string_prefix_lengths,
+        );
+        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        SqlEditorWidget::resolve_code_line_layouts(&mut layouts, &next_code_indices, true);
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let source_lines: Vec<&str> = source.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let layout_debug = |needle: &str| {
+            source_lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .and_then(|idx| layouts.get(idx))
+                .map(|layout| {
+                    format!(
+                        "{needle}: parser={} auto={} final={} query_role={:?} query_base={:?} semantic={:?}",
+                        layout.parser_depth,
+                        layout.auto_depth,
+                        layout.final_depth,
+                        layout.query_role,
+                        layout.query_base_depth,
+                        layout.line_semantic
+                    )
+                })
+                .unwrap_or_else(|| format!("{needle}: <missing>"))
+        };
+        let owner_layout = layout_debug("ON DUPLICATE KEY UPDATE dept_name = CONCAT(");
+        let values_layout = layout_debug("VALUES(dept_name),");
+        let literal_layout = layout_debug("' / touched'");
+        let close_layout = layout_debug("),");
+
+        let owner_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    == "ON DUPLICATE KEY UPDATE dept_name = CONCAT("
+            })
+            .expect("ON DUPLICATE owner line");
+        let values_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "VALUES(dept_name),")
+            .expect("VALUES sibling line");
+        let literal_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "' / touched'")
+            .expect("literal sibling line");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(literal_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("CONCAT close line");
+
+        assert_eq!(
+            indent(lines[values_idx]),
+            indent(lines[owner_idx]).saturating_add(4),
+            "first multiline CONCAT argument should stay one level below the ON DUPLICATE owner, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[literal_idx]),
+            indent(lines[values_idx]),
+            "comma sibling after VALUES() should reuse the parent frame body depth inside the compound body, got:\n{}\n{}\n{}\n{}\n{}",
+            formatted,
+            owner_layout,
+            values_layout,
+            literal_layout,
+            close_layout
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[owner_idx]),
+            "CONCAT close line should realign with the ON DUPLICATE owner depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(SqlEditorWidget::apply_parser_depth_indentation(&formatted), formatted);
     }
 
     #[test]
@@ -31525,6 +31667,106 @@ FROM emp;"#;
     }
 
     #[test]
+    fn apply_parser_depth_indentation_keeps_window_clause_named_definitions_inside_mysql_compound_body()
+    {
+        let source = r#"CREATE PROCEDURE p()
+BEGIN
+    WITH order_base AS (
+        SELECT
+            1 AS emp_id,
+            TIMESTAMP '2024-01-01 00:00:00' AS created_at
+    ),
+    ranked AS (
+        SELECT
+            ob.*,
+            ROW_NUMBER() OVER w_emp AS rn_in_emp
+        FROM order_base AS ob
+        WINDOW
+        w_emp AS (
+            PARTITION BY ob.emp_id
+            ORDER BY ob.created_at
+        )
+    )
+    SELECT *
+    FROM ranked;
+END;"#;
+        let contexts = crate::db::QueryExecutor::auto_format_line_contexts(source);
+        let multiline_string_prefix_lengths =
+            SqlEditorWidget::multiline_string_continuation_prefix_lengths(
+                source,
+                source.lines().count(),
+            );
+        let mut layouts = SqlEditorWidget::build_line_layouts(
+            source,
+            &contexts,
+            &multiline_string_prefix_lengths,
+        );
+        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        SqlEditorWidget::resolve_code_line_layouts(&mut layouts, &next_code_indices, true);
+        let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let source_lines: Vec<&str> = source.lines().collect();
+
+        let window_idx = find_line_starting_with(&lines, "WINDOW").expect("WINDOW line");
+        let named_idx = find_line_starting_with(&lines, "w_emp AS (").expect("named WINDOW line");
+        let partition_idx =
+            find_line_starting_with(&lines, "PARTITION BY ob.emp_id").expect("PARTITION BY line");
+        let window_layout = layouts
+            .get(
+                source_lines
+                    .iter()
+                    .position(|line| line.trim_start() == "WINDOW")
+                    .unwrap_or(0),
+            )
+            .map(|layout| {
+                format!(
+                    "parser={} auto={} final={} query_role={:?} query_base={:?} semantic={:?}",
+                    layout.parser_depth,
+                    layout.auto_depth,
+                    layout.final_depth,
+                    layout.query_role,
+                    layout.query_base_depth,
+                    layout.line_semantic
+                )
+            })
+            .unwrap_or_default();
+        let named_layout = layouts
+            .get(
+                source_lines
+                    .iter()
+                    .position(|line| line.trim_start() == "w_emp AS (")
+                    .unwrap_or(0),
+            )
+            .map(|layout| {
+                format!(
+                    "parser={} auto={} final={} query_role={:?} query_base={:?} semantic={:?}",
+                    layout.parser_depth,
+                    layout.auto_depth,
+                    layout.final_depth,
+                    layout.query_role,
+                    layout.query_base_depth,
+                    layout.line_semantic
+                )
+            })
+            .unwrap_or_default();
+
+        assert_eq!(
+            leading_spaces(lines[named_idx]),
+            leading_spaces(lines[window_idx]).saturating_add(4),
+            "named WINDOW definition should stay one level deeper than bare WINDOW inside MySQL compound bodies, got:\n{}\nwindow_layout={}\nnamed_layout={}",
+            formatted,
+            window_layout,
+            named_layout
+        );
+        assert_eq!(
+            leading_spaces(lines[partition_idx]),
+            leading_spaces(lines[named_idx]).saturating_add(4),
+            "WINDOW body should stay one level deeper than the named WINDOW owner inside MySQL compound bodies, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_nested_window_clause_restores_outer_query_depth() {
         let source = "SELECT * FROM (SELECT e.deptno, SUM(e.sal) OVER w_dept AS dept_sum FROM emp e WINDOW w_dept AS (PARTITION BY e.deptno ORDER BY e.sal DESC, e.empno) QUALIFY ROW_NUMBER() OVER w_dept = 1) ranked WHERE ranked.dept_sum > 0;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -40322,6 +40564,62 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_on_duplicate_multiline_call_siblings_on_parent_frame_depth(
+    ) {
+        let source = r#"INSERT INTO dept (dept_id, parent_dept_id, dept_code, dept_name, sort_no)
+VALUES (20, 10, 'SALES', 'Sales-upsert-check', 2)
+ON DUPLICATE KEY UPDATE dept_name = CONCAT(
+VALUES(dept_name),
+' / touched'
+),
+sort_no = VALUES(sort_no);"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let on_duplicate_idx = find_line_starting_with(
+            &lines,
+            "ON DUPLICATE KEY UPDATE dept_name = CONCAT(",
+        )
+        .expect("ON DUPLICATE KEY UPDATE owner");
+        let values_idx =
+            find_line_starting_with(&lines, "VALUES(dept_name),").expect("VALUES() sibling");
+        let literal_idx =
+            find_line_starting_with(&lines, "' / touched'").expect("literal sibling");
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(literal_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("CONCAT close");
+
+        assert!(
+            leading_spaces(lines[values_idx]) > leading_spaces(lines[on_duplicate_idx]),
+            "VALUES() argument should stay nested under the ON DUPLICATE call owner, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[literal_idx]),
+            leading_spaces(lines[values_idx]),
+            "wrapped call siblings inside ON DUPLICATE KEY UPDATE should reuse the parent frame body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_idx]),
+            leading_spaces(lines[on_duplicate_idx]),
+            "wrapped call close should realign with the ON DUPLICATE owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test2_function_parens_tight() {
         let source = include_str!("../../../test_mariadb/test2.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -41022,6 +41320,100 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_clears_continuation_carry_across_handler_block_boundaries(
+    ) {
+        let source = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1062
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE,
+v_errno = MYSQL_ERRNO,
+v_msg = MESSAGE_TEXT;
+INSERT INTO error_log (step_name, sql_state, mysql_errno, message_text)
+VALUES ('EXPECTED_DUPLICATE', v_state, v_errno, LEFT(v_msg, 512));
+END;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+ROLLBACK;
+END;
+START TRANSACTION;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let duplicate_idx = find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR 1062")
+            .expect("duplicate handler");
+        let duplicate_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler BEGIN");
+        let duplicate_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(duplicate_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("duplicate handler END");
+        let exit_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("exit handler");
+        let exit_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("exit handler BEGIN");
+        let exit_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .expect("exit handler END");
+        let start_tx_idx =
+            find_line_starting_with(&lines, "START TRANSACTION;").expect("START TRANSACTION");
+
+        assert_eq!(
+            leading_spaces(lines[duplicate_end_idx]),
+            leading_spaces(lines[duplicate_begin_idx]),
+            "handler block END should realign with handler BEGIN instead of inheriting a carried continuation depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_idx]),
+            leading_spaces(lines[duplicate_idx]),
+            "sibling handler header after a completed handler block should return to the DECLARE depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_begin_idx]),
+            leading_spaces(lines[exit_idx]).saturating_add(4),
+            "sibling handler body should open one level deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_end_idx]),
+            leading_spaces(lines[exit_begin_idx]),
+            "sibling handler END should realign with its handler BEGIN, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[start_tx_idx]),
+            leading_spaces(lines[duplicate_idx]),
+            "ordinary statement after handler declarations should not inherit handler-body continuation depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_preserves_create_table_keyword_canonicalization() {
         let source = "create table t (profile int not null, `rank` int, generated_col varchar(10) generated always as (concat(profile, `rank`))) engine = innodb;";
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -41591,6 +41983,66 @@ DELIMITER ;"#;
             indent(lines[end_idx]),
             0,
             "routine END should return to depth 0 after WHILE ... DO closes, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_reapplies_structural_depth_after_compound_select_sibling_realignment(
+    ) {
+        let source = r#"DELIMITER $$
+CREATE PROCEDURE demo_proc()
+BEGIN
+SELECT
+        ROW_NUMBER() OVER (
+                    PARTITION BY deptno
+                                ORDER BY sal
+                    ) AS row_no,
+                                                    DENSE_RANK() OVER (
+                                                                        PARTITION BY deptno
+                                                            ORDER BY sal
+                                                    ) AS sal_rank
+FROM emp;
+END$$
+DELIMITER ;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT ROW_NUMBER() OVER ("))
+            .unwrap_or(0);
+        let dense_rank_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DENSE_RANK() OVER (")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM emp;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(lines[dense_rank_idx]),
+            indent(lines[select_idx]).saturating_add(4),
+            "compound analytic sibling should return to the SELECT owner frame body depth after the previous OVER frame closes, got:\n{formatted}"
+        );
+        assert!(
+            indent(lines[from_idx]) < indent(lines[dense_rank_idx]),
+            "FROM should clear the carried compound SELECT list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted,
+            "compound SELECT sibling normalization should stay idempotent once the structural frame depth is fixed"
         );
     }
 

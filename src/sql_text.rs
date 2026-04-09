@@ -1732,6 +1732,72 @@ pub(crate) fn is_mysql_block_label_target(word: &str) -> bool {
     )
 }
 
+pub(crate) fn mysql_labeled_block_target_before_inline_comment(line: &str) -> Option<&str> {
+    fn skip_ws_and_block_comments(bytes: &[u8], mut idx: usize) -> Option<usize> {
+        while idx < bytes.len() {
+            if bytes[idx].is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if sql_line_comment_prefix_len(bytes, idx).is_some() {
+                return None;
+            }
+            if bytes[idx] == b'/' && bytes.get(idx.saturating_add(1)) == Some(&b'*') {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+            break;
+        }
+
+        Some(idx)
+    }
+
+    let bytes = line.as_bytes();
+    let mut idx = skip_ws_and_block_comments(bytes, 0)?;
+    if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+        return None;
+    }
+    idx = idx.saturating_add(1);
+    while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+        idx = idx.saturating_add(1);
+    }
+
+    idx = skip_ws_and_block_comments(bytes, idx)?;
+    if bytes.get(idx) != Some(&b':') {
+        return None;
+    }
+    idx = idx.saturating_add(1);
+
+    idx = skip_ws_and_block_comments(bytes, idx)?;
+    if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
+        return None;
+    }
+    let target_start = idx;
+    idx = idx.saturating_add(1);
+    while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+        idx = idx.saturating_add(1);
+    }
+
+    let target = line.get(target_start..idx)?;
+    is_mysql_block_label_target(target).then_some(target)
+}
+
+pub(crate) fn line_starts_mysql_block_keyword_before_inline_comment(
+    line: &str,
+    keyword: &str,
+) -> bool {
+    line_starts_with_identifier_sequence_before_inline_comment(line, &[keyword])
+        || mysql_labeled_block_target_before_inline_comment(line)
+            .is_some_and(|target| target.eq_ignore_ascii_case(keyword))
+}
+
 #[inline]
 pub(crate) fn sql_line_comment_prefix_len(bytes: &[u8], idx: usize) -> Option<usize> {
     if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-') {
@@ -3585,6 +3651,7 @@ fn starts_with_auto_format_structural_continuation_boundary_without_expression_o
         || starts_with_format_layout_clause(&trimmed_upper)
         || line_starts_with_identifier_sequence(trimmed, &["INTO"])
         || line_starts_with_identifier_sequence(trimmed, &["USING"])
+        || line_is_mysql_on_duplicate_key_update_clause(trimmed)
         || starts_with_format_join_clause(&trimmed_upper)
         || is_format_join_condition_clause(&trimmed_upper)
         || starts_with_format_for_update_clause(&trimmed_upper)
@@ -3659,6 +3726,25 @@ pub(crate) fn line_is_format_window_definition_header(line: &str) -> bool {
     first_word.is_some_and(|word| {
         !word.eq_ignore_ascii_case("WINDOW") && !word.eq_ignore_ascii_case("WITH")
     })
+}
+
+/// Returns true when a line is the exact bare `WINDOW` clause header.
+///
+/// This stays lexical so analyzer and formatter can reuse the same header
+/// anchor for sibling named window definitions inside larger query contexts.
+pub(crate) fn line_is_format_bare_window_clause_header(line: &str) -> bool {
+    let structural_tail = auto_format_structural_tail(line);
+    line_has_exact_identifier_sequence(structural_tail, &["WINDOW"])
+}
+
+/// Returns true when a line starts MySQL's `ON DUPLICATE KEY UPDATE` clause.
+///
+/// The helper normalizes away inline comments first so continuation-boundary
+/// detection can treat this clause like other structural clause starters
+/// instead of leaking a previous `JOIN ... ON` condition depth into it.
+pub(crate) fn line_is_mysql_on_duplicate_key_update_clause(line: &str) -> bool {
+    let structural_tail = auto_format_structural_tail(line);
+    line_starts_with_identifier_sequence(structural_tail, &["ON", "DUPLICATE", "KEY", "UPDATE"])
 }
 
 /// Returns true when a CREATE query-body DDL header line owns the following
@@ -3772,6 +3858,12 @@ pub(crate) enum FormatPlsqlChildQueryOwnerKind {
     ControlBody,
     CursorDeclaration,
     OpenCursorFor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MySqlDeclareOwnerKind {
+    CursorFor,
+    HandlerFor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4065,32 +4157,42 @@ pub(crate) fn format_plsql_child_query_owner_kind(
             .skip(1)
             .any(|word| word.eq_ignore_ascii_case("FOR")))
     .then_some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
-    .or_else(|| {
-        if !first_word.eq_ignore_ascii_case("DECLARE") {
-            return None;
-        }
-
-        let has_cursor = words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("CURSOR"));
-        let has_handler = words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("HANDLER"));
-        let has_for = words
-            .iter()
-            .skip(1)
-            .any(|word| word.eq_ignore_ascii_case("FOR"));
-
-        if has_cursor && has_for {
-            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
-        } else if has_handler && has_for {
-            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
-        } else {
-            None
-        }
+    .or_else(|| match mysql_declare_owner_kind(structural_tail) {
+        Some(MySqlDeclareOwnerKind::CursorFor) => Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor),
+        Some(MySqlDeclareOwnerKind::HandlerFor) => Some(FormatPlsqlChildQueryOwnerKind::ControlBody),
+        None => None,
     })
+}
+
+pub(crate) fn mysql_declare_owner_kind(text_upper: &str) -> Option<MySqlDeclareOwnerKind> {
+    let structural_tail = owner_header_structural_tail(text_upper);
+    let words = meaningful_identifier_words_before_inline_comment(structural_tail, 10);
+    let first_word = words.first().copied()?;
+    if !first_word.eq_ignore_ascii_case("DECLARE") {
+        return None;
+    }
+
+    let has_for = words
+        .iter()
+        .skip(1)
+        .any(|word| word.eq_ignore_ascii_case("FOR"));
+    if !has_for {
+        return None;
+    }
+
+    let has_cursor = words
+        .iter()
+        .skip(1)
+        .any(|word| word.eq_ignore_ascii_case("CURSOR"));
+    if has_cursor {
+        return Some(MySqlDeclareOwnerKind::CursorFor);
+    }
+
+    let has_handler = words
+        .iter()
+        .skip(1)
+        .any(|word| word.eq_ignore_ascii_case("HANDLER"));
+    has_handler.then_some(MySqlDeclareOwnerKind::HandlerFor)
 }
 
 impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
@@ -7994,6 +8096,14 @@ mod tests {
         assert!(starts_with_auto_format_structural_continuation_boundary(
             ") FOR UPDATE"
         ));
+        assert!(
+            starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
+                "ON DUPLICATE KEY UPDATE dept_name = CONCAT("
+            )
+        );
+        assert!(starts_with_auto_format_structural_continuation_boundary(
+            "ON DUPLICATE KEY UPDATE dept_name = CONCAT("
+        ));
         assert!(line_has_mixed_leading_close_continuation(") MULTISET"));
         assert!(line_has_mixed_leading_close_continuation(") CURSOR"));
         assert!(!line_has_mixed_leading_close_continuation("MULTISET"));
@@ -9181,6 +9291,9 @@ mod tests {
 
     #[test]
     fn window_definition_header_helper_tracks_named_window_items_only() {
+        assert!(line_is_format_bare_window_clause_header("WINDOW"));
+        assert!(line_is_format_bare_window_clause_header("WINDOW -- keep"));
+        assert!(!line_is_format_bare_window_clause_header("WINDOW w_emp AS ("));
         assert!(line_is_format_window_definition_header("w_emp AS ("));
         assert!(line_is_format_window_definition_header(
             "/* owner */ w_emp_running AS ("
@@ -9192,6 +9305,12 @@ mod tests {
             "WITH base_emp AS ("
         ));
         assert!(!line_is_format_window_definition_header("w_emp AS"));
+        assert!(line_is_mysql_on_duplicate_key_update_clause(
+            "ON DUPLICATE KEY UPDATE dept_name = VALUES(dept_name)"
+        ));
+        assert!(!line_is_mysql_on_duplicate_key_update_clause(
+            "ON status = 'DUPLICATE KEY UPDATE'"
+        ));
     }
 
     #[test]
@@ -9353,6 +9472,19 @@ mod tests {
     #[test]
     fn format_plsql_child_query_owner_kind_covers_nested_control_and_query_owners() {
         assert_eq!(
+            mysql_declare_owner_kind("DECLARE cur_emp CURSOR FOR"),
+            Some(MySqlDeclareOwnerKind::CursorFor)
+        );
+        assert_eq!(
+            mysql_declare_owner_kind("DECLARE CONTINUE HANDLER FOR NOT FOUND"),
+            Some(MySqlDeclareOwnerKind::HandlerFor)
+        );
+        assert_eq!(
+            mysql_declare_owner_kind("DECLARE EXIT HANDLER FOR SQLEXCEPTION"),
+            Some(MySqlDeclareOwnerKind::HandlerFor)
+        );
+        assert_eq!(mysql_declare_owner_kind("DECLARE v_done INT"), None);
+        assert_eq!(
             format_plsql_child_query_owner_kind("BEGIN"),
             Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
         );
@@ -9428,6 +9560,47 @@ mod tests {
         assert_eq!(format_plsql_child_query_owner_kind("LOOP"), None);
         assert_eq!(format_plsql_child_query_owner_kind("END IF;"), None);
         assert_eq!(format_plsql_child_query_owner_kind("FOR rec IN ("), None);
+    }
+
+    #[test]
+    fn mysql_labeled_block_target_before_inline_comment_recognizes_begin_and_loop_targets() {
+        assert_eq!(
+            mysql_labeled_block_target_before_inline_comment("main_block: BEGIN"),
+            Some("BEGIN")
+        );
+        assert_eq!(
+            mysql_labeled_block_target_before_inline_comment("read_loop /* gap */ : LOOP"),
+            Some("LOOP")
+        );
+        assert_eq!(
+            mysql_labeled_block_target_before_inline_comment("v_label: SELECT"),
+            None
+        );
+        assert_eq!(
+            mysql_labeled_block_target_before_inline_comment("/* note */ main_block: WHILE"),
+            Some("WHILE")
+        );
+    }
+
+    #[test]
+    fn line_starts_mysql_block_keyword_before_inline_comment_keeps_labeled_begin_in_shared_family()
+    {
+        assert!(line_starts_mysql_block_keyword_before_inline_comment(
+            "main_block: BEGIN",
+            "BEGIN",
+        ));
+        assert!(line_starts_mysql_block_keyword_before_inline_comment(
+            "BEGIN",
+            "BEGIN",
+        ));
+        assert!(line_starts_mysql_block_keyword_before_inline_comment(
+            "read_loop: LOOP",
+            "LOOP",
+        ));
+        assert!(!line_starts_mysql_block_keyword_before_inline_comment(
+            "main_block: SET",
+            "BEGIN",
+        ));
     }
 
     #[test]

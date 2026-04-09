@@ -29,6 +29,9 @@ pub(crate) enum AutoFormatLineSemantic {
     JoinClause,
     JoinConditionClause,
     ConditionContinuation,
+    MySqlDeclareHandlerHeader,
+    MySqlDeclareHandlerBody,
+    MySqlDeclareHandlerBlockEnd,
 }
 
 impl AutoFormatLineSemantic {
@@ -68,6 +71,18 @@ impl AutoFormatLineSemantic {
 
     pub(crate) fn is_condition_continuation(self) -> bool {
         matches!(self, Self::ConditionContinuation)
+    }
+
+    pub(crate) fn is_mysql_declare_handler_header(self) -> bool {
+        matches!(self, Self::MySqlDeclareHandlerHeader)
+    }
+
+    pub(crate) fn is_mysql_declare_handler_body(self) -> bool {
+        matches!(self, Self::MySqlDeclareHandlerBody)
+    }
+
+    pub(crate) fn is_mysql_declare_handler_block_end(self) -> bool {
+        matches!(self, Self::MySqlDeclareHandlerBlockEnd)
     }
 
     pub(crate) fn is_clause_boundary(self) -> bool {
@@ -345,6 +360,84 @@ impl PendingConditionCloseContinuationFrame {
     fn continuation_depth(self) -> usize {
         self.header_depth.saturating_add(1)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MySqlDeclareHandlerHeaderState {
+    AwaitingConditionStart,
+    AwaitingNotFoundTail,
+    AwaitingSqlstateValueOrLiteral,
+    AwaitingSqlstateLiteral,
+    AwaitingNextConditionOrBody,
+}
+
+impl MySqlDeclareHandlerHeaderState {
+    fn body_line_pending(self) -> bool {
+        matches!(self, Self::AwaitingNextConditionOrBody)
+    }
+
+    fn consume_word(&mut self, word_upper: &str) {
+        *self = match (*self, word_upper) {
+            (Self::AwaitingConditionStart, "NOT") => Self::AwaitingNotFoundTail,
+            (Self::AwaitingConditionStart, "SQLSTATE") => Self::AwaitingSqlstateValueOrLiteral,
+            (Self::AwaitingConditionStart, _) => Self::AwaitingNextConditionOrBody,
+            (Self::AwaitingNotFoundTail, "FOUND") => Self::AwaitingNextConditionOrBody,
+            (Self::AwaitingNotFoundTail, _) => Self::AwaitingNextConditionOrBody,
+            (Self::AwaitingSqlstateValueOrLiteral, "VALUE") => Self::AwaitingSqlstateLiteral,
+            (Self::AwaitingSqlstateValueOrLiteral, _) => Self::AwaitingNextConditionOrBody,
+            (Self::AwaitingSqlstateLiteral, _) => Self::AwaitingNextConditionOrBody,
+            (Self::AwaitingNextConditionOrBody, _) => Self::AwaitingNextConditionOrBody,
+        };
+    }
+
+    fn consume_literal(&mut self) {
+        *self = match *self {
+            Self::AwaitingConditionStart
+            | Self::AwaitingSqlstateValueOrLiteral
+            | Self::AwaitingSqlstateLiteral => Self::AwaitingNextConditionOrBody,
+            Self::AwaitingNotFoundTail | Self::AwaitingNextConditionOrBody => {
+                Self::AwaitingNextConditionOrBody
+            }
+        };
+    }
+
+    fn on_symbol(&mut self, symbol: u8) {
+        match (*self, symbol) {
+            (Self::AwaitingNextConditionOrBody, b',') => {
+                *self = Self::AwaitingConditionStart;
+            }
+            (_, b';') => {
+                *self = Self::AwaitingNextConditionOrBody;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMySqlDeclareHandlerFrame {
+    owner_depth: usize,
+    header_state: MySqlDeclareHandlerHeaderState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MySqlDeclareHandlerLineKind {
+    Header,
+    Body,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MySqlDeclareHandlerLineProgress {
+    kind: MySqlDeclareHandlerLineKind,
+    next_state: MySqlDeclareHandlerHeaderState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MySqlHandlerScanToken<'a> {
+    Word(&'a str),
+    Number,
+    String,
+    Symbol(u8),
 }
 
 impl OwnerRelativeDepthFrame {
@@ -1226,7 +1319,7 @@ impl QueryExecutor {
                 }
                 continue;
             }
-            let mysql_routine_header_line = mysql_delimiter != ";" && {
+            let mysql_routine_header_line = {
                 let words =
                     sql_text::meaningful_identifier_words_before_inline_comment(trimmed_start, 8);
                 words
@@ -1241,6 +1334,11 @@ impl QueryExecutor {
             };
             let mysql_anonymous_block_header_line =
                 sql_text::line_has_mysql_begin_not_atomic(trimmed_start);
+            let mysql_routine_begin_line =
+                sql_text::line_starts_mysql_block_keyword_before_inline_comment(
+                    trimmed_start,
+                    "BEGIN",
+                );
             if mysql_routine_header_line {
                 mysql_routine_body_pending = true;
             } else if mysql_anonymous_block_header_line {
@@ -1572,7 +1670,7 @@ impl QueryExecutor {
                 }
             });
 
-            if mysql_routine_body_pending && leading_is("BEGIN") {
+            if mysql_routine_body_pending && mysql_routine_begin_line {
                 mysql_routine_body_active = true;
                 mysql_routine_body_pending = false;
             }
@@ -1582,6 +1680,7 @@ impl QueryExecutor {
             }
             if mysql_routine_body_active
                 && leading_starts_end
+                && block_depth_component == 0
                 && Self::statement_ends_with_mysql_delimiter(
                     trimmed_start,
                     mysql_delimiter.as_str(),
@@ -1676,6 +1775,7 @@ impl QueryExecutor {
             paren_stack: &mut [AutoFormatSubqueryParenKind],
             pending_count: &mut usize,
             trimmed_upper: &str,
+            treat_values_as_subquery_head: bool,
         ) {
             if *pending_count == 0 {
                 return;
@@ -1683,7 +1783,10 @@ impl QueryExecutor {
 
             let promote_to_subquery = sql_text::SUBQUERY_HEAD_KEYWORDS
                 .iter()
-                .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword));
+                .any(|keyword| {
+                    (treat_values_as_subquery_head || !keyword.eq_ignore_ascii_case("VALUES"))
+                        && sql_text::starts_with_keyword_token(trimmed_upper, keyword)
+                });
             let mut unresolved = *pending_count;
 
             for paren_kind in paren_stack.iter_mut().rev() {
@@ -1745,6 +1848,9 @@ impl QueryExecutor {
         let mut pending_condition_close_continuation: Option<
             PendingConditionCloseContinuationFrame,
         > = None;
+        let mut pending_mysql_declare_handler_frame: Option<PendingMySqlDeclareHandlerFrame> =
+            None;
+        let mut mysql_declare_handler_block_depths: Vec<usize> = Vec::new();
         let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
         let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
         let mut pending_auto_format_subquery_paren_count = 0usize;
@@ -1752,6 +1858,7 @@ impl QueryExecutor {
         let mut mysql_delimiter = ";".to_string();
         let mut mysql_routine_body_pending = false;
         let mut mysql_routine_body_active = false;
+        let mut mysql_on_duplicate_key_update_active = false;
 
         for (idx, line) in lines.iter().enumerate() {
             let analysis_line = multiline_string_prefix_lengths
@@ -1773,6 +1880,9 @@ impl QueryExecutor {
             let mut active_merge_branch_header = None;
             let mut current_line_is_same_depth_merge_branch_header_fragment = false;
             let mut current_line_suspends_merge_branch_condition = false;
+            let mut current_line_is_mysql_declare_handler_header = false;
+            let mut current_line_is_mysql_declare_handler_body = false;
+            let mut current_line_is_mysql_declare_handler_block_end = false;
 
             if trimmed.is_empty() {
                 contexts.push(context);
@@ -1790,7 +1900,7 @@ impl QueryExecutor {
                 contexts.push(context);
                 continue;
             }
-            let mysql_routine_header_line = mysql_delimiter != ";" && {
+            let mysql_routine_header_line = {
                 let words = sql_text::meaningful_identifier_words_before_inline_comment(trimmed, 8);
                 words
                     .first()
@@ -1804,6 +1914,8 @@ impl QueryExecutor {
             };
             let mysql_anonymous_block_header_line =
                 sql_text::line_has_mysql_begin_not_atomic(trimmed);
+            let current_line_starts_mysql_begin =
+                sql_text::line_starts_mysql_block_keyword_before_inline_comment(trimmed, "BEGIN");
             if mysql_routine_header_line {
                 mysql_routine_body_pending = true;
             } else if mysql_anonymous_block_header_line {
@@ -1833,10 +1945,14 @@ impl QueryExecutor {
             let current_line_starts_end_keyword =
                 sql_text::starts_with_keyword_token(&trimmed_upper, "END")
                     || current_line_is_mysql_custom_delimited_end;
+            let treat_values_as_subquery_head =
+                !(mysql_on_duplicate_key_update_active
+                    && sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES"));
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
                 &mut pending_auto_format_subquery_paren_count,
                 &trimmed_upper,
+                treat_values_as_subquery_head,
             );
             let line_has_leading_close_paren =
                 sql_text::line_has_leading_significant_close_paren(trimmed);
@@ -1846,6 +1962,12 @@ impl QueryExecutor {
             let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
             let mysql_compound_declare = mysql_routine_body_active
                 && sql_text::starts_with_keyword_token(&clause_detection_upper, "DECLARE");
+            let current_line_mysql_declare_owner_kind = mysql_compound_declare
+                .then(|| sql_text::mysql_declare_owner_kind(clause_detection_trimmed))
+                .flatten();
+            let current_line_starts_mysql_handler_declare =
+                current_line_mysql_declare_owner_kind
+                    == Some(sql_text::MySqlDeclareOwnerKind::HandlerFor);
             let inside_non_subquery_paren_context = auto_format_subquery_paren_stack
                 .last()
                 .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery);
@@ -1863,6 +1985,14 @@ impl QueryExecutor {
                     clause_detection_trimmed,
                     &["ELSEIF"],
                 );
+            let current_line_is_mysql_on_duplicate_key_update =
+                sql_text::line_is_mysql_on_duplicate_key_update_clause(
+                    clause_detection_trimmed,
+                );
+            let current_line_is_mysql_on_duplicate_values_function =
+                mysql_on_duplicate_key_update_active
+                    && inside_non_subquery_paren_context
+                    && sql_text::starts_with_keyword_token(&clause_detection_upper, "VALUES");
             let current_line_is_exact_else =
                 sql_text::line_has_exact_identifier_sequence_before_inline_comment(
                     clause_detection_trimmed,
@@ -1878,6 +2008,32 @@ impl QueryExecutor {
                     clause_detection_trimmed,
                     &["EXCEPTION"],
                 );
+            let current_line_is_plain_end =
+                sql_text::starts_with_keyword_token(&clause_detection_upper, "END")
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "IF"],
+                    )
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "CASE"],
+                    )
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "LOOP"],
+                    )
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "WHILE"],
+                    )
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "REPEAT"],
+                    )
+                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
+                        &clause_detection_upper,
+                        &["END", "FOR"],
+                    );
             let is_trigger_header_begin = trigger_header_frame.is_some()
                 && parser_depth == 0
                 && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN");
@@ -1889,7 +2045,9 @@ impl QueryExecutor {
                 && !current_line_starts_end_keyword;
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
-            let clause_kind = if suppress_non_subquery_paren_layout_clause {
+            let clause_kind = if suppress_non_subquery_paren_layout_clause
+                || current_line_is_mysql_on_duplicate_values_function
+            {
                 None
             } else {
                 Self::auto_format_clause_kind(&clause_detection_upper)
@@ -1907,12 +2065,11 @@ impl QueryExecutor {
                     closing_query_close_align_depth = Some(frame.close_align_depth);
                 }
             }
-            let current_line_is_exact_bare_window_clause_header = clause_kind
-                == Some(AutoFormatClauseKind::Window)
-                && sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["WINDOW"],
-                );
+            let current_line_is_exact_bare_window_clause_header =
+                clause_kind == Some(AutoFormatClauseKind::Window)
+                    && sql_text::line_is_format_bare_window_clause_header(
+                        clause_detection_trimmed,
+                    );
             let current_line_is_window_clause_definition_header =
                 pending_window_definition_owner_for_line.is_some()
                     && Self::line_is_window_clause_definition_header(trimmed);
@@ -1938,6 +2095,18 @@ impl QueryExecutor {
                     && !frame.with_main_query_started
                     && parser_depth >= frame.start_parser_depth
             });
+            let active_mysql_declare_handler_frame_for_line = pending_mysql_declare_handler_frame;
+            let current_line_mysql_declare_handler_progress =
+                active_mysql_declare_handler_frame_for_line
+                    .filter(|_| !current_line_starts_mysql_handler_declare)
+                    .map(|frame| Self::mysql_declare_handler_line_progress(frame, trimmed));
+            let current_line_mysql_declare_handler_body_owner_depth =
+                active_mysql_declare_handler_frame_for_line
+                    .zip(current_line_mysql_declare_handler_progress)
+                    .and_then(|(frame, progress)| {
+                        (progress.kind == MySqlDeclareHandlerLineKind::Body)
+                            .then_some(frame.owner_depth)
+                    });
             let active_line_continuation = pending_line_continuation.take();
             let active_inline_comment_line_continuation =
                 pending_inline_comment_line_continuation.take();
@@ -2018,9 +2187,10 @@ impl QueryExecutor {
                 if let Some(frame) = query_frames.last_mut() {
                     frame.pending_same_depth_set_operator_head = false;
                 }
-                let parent_base_depth = pending_query_bases
+                let parent_base_depth = current_line_mysql_declare_handler_body_owner_depth
+                    .or_else(|| pending_query_bases
                     .last()
-                    .map(|frame| frame.owner_base_depth)
+                    .map(|frame| frame.owner_base_depth))
                     .or_else(|| forall_body_frame.map(|frame| frame.owner_depth))
                     .or_else(|| active_frame.map(|frame| frame.query_base_depth));
                 let query_base_depth = parent_base_depth
@@ -2138,8 +2308,8 @@ impl QueryExecutor {
                         &["ELSE"],
                     ));
                 let is_join_clause = Self::auto_format_is_join_clause(&clause_detection_upper);
-                let is_join_condition_clause =
-                    Self::auto_format_is_join_condition_clause(&clause_detection_upper);
+                let is_join_condition_clause = !current_line_is_mysql_on_duplicate_key_update
+                    && Self::auto_format_is_join_condition_clause(&clause_detection_upper);
                 current_line_is_join_clause = is_join_clause;
                 current_line_is_join_condition_clause = is_join_condition_clause;
                 let from_item_list_body_depth = frame
@@ -2154,9 +2324,10 @@ impl QueryExecutor {
                     && matches!(clause_kind, None | Some(AutoFormatClauseKind::Table))
                     && !sql_text::line_has_leading_significant_close_paren(trimmed);
                 let is_query_condition_continuation_clause =
-                    Self::auto_format_is_query_condition_continuation_clause(
-                        &clause_detection_upper,
-                    );
+                    !current_line_is_mysql_on_duplicate_key_update
+                        && Self::auto_format_is_query_condition_continuation_clause(
+                            &clause_detection_upper,
+                        );
                 let current_line_starts_pending_merge_branch_header = frame.head_kind
                     == Some(AutoFormatClauseKind::Merge)
                     && sql_text::format_merge_branch_pending_header_kind(clause_detection_trimmed)
@@ -2334,6 +2505,35 @@ impl QueryExecutor {
                 }
             }
 
+            if current_line_starts_mysql_handler_declare {
+                current_line_is_mysql_declare_handler_header = true;
+            } else if let Some(progress) = current_line_mysql_declare_handler_progress {
+                match (
+                    active_mysql_declare_handler_frame_for_line,
+                    progress.kind,
+                ) {
+                    (Some(frame), MySqlDeclareHandlerLineKind::Header) => {
+                        current_line_is_mysql_declare_handler_header = true;
+                        context.auto_depth = frame.owner_depth;
+                    }
+                    (Some(frame), MySqlDeclareHandlerLineKind::Body) => {
+                        current_line_is_mysql_declare_handler_body = true;
+                        context.auto_depth =
+                            context.auto_depth.max(frame.owner_depth.saturating_add(1));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(handler_block_depth) = mysql_declare_handler_block_depths.last().copied() {
+                if current_line_is_plain_end {
+                    current_line_is_mysql_declare_handler_block_end = true;
+                    context.auto_depth = handler_block_depth;
+                } else if !current_line_is_mysql_declare_handler_body {
+                    context.auto_depth =
+                        context.auto_depth.max(handler_block_depth.saturating_add(1));
+                }
+            }
+
             context.line_semantic = AutoFormatLineSemantic::from_analysis(
                 clause_kind,
                 context.query_role,
@@ -2341,6 +2541,13 @@ impl QueryExecutor {
                 current_line_is_join_condition_clause,
                 current_line_is_query_condition_continuation_clause,
             );
+            if current_line_is_mysql_declare_handler_header {
+                context.line_semantic = AutoFormatLineSemantic::MySqlDeclareHandlerHeader;
+            } else if current_line_is_mysql_declare_handler_body {
+                context.line_semantic = AutoFormatLineSemantic::MySqlDeclareHandlerBody;
+            } else if current_line_is_mysql_declare_handler_block_end {
+                context.line_semantic = AutoFormatLineSemantic::MySqlDeclareHandlerBlockEnd;
+            }
 
             if let Some(frame) = query_frames.last_mut() {
                 if context
@@ -2371,7 +2578,8 @@ impl QueryExecutor {
                     }
                     frame.trailing_comma_continuation =
                         Self::line_ends_with_comma_before_inline_comment(trimmed)
-                            && !sql_text::line_has_leading_significant_close_paren(trimmed);
+                            && !sql_text::line_has_leading_significant_close_paren(trimmed)
+                            && !current_line_is_mysql_on_duplicate_values_function;
                     if clause_kind == Some(AutoFormatClauseKind::From) {
                         frame.from_item_list_body_depth =
                             Some(frame.query_base_depth.saturating_add(1));
@@ -2996,7 +3204,9 @@ impl QueryExecutor {
                 };
 
             let suppress_line_continuation = suppress_non_subquery_paren_layout_clause
-                || current_line_is_same_depth_merge_branch_header_fragment;
+                || current_line_is_same_depth_merge_branch_header_fragment
+                || (current_line_is_mysql_on_duplicate_values_function
+                    && Self::line_ends_with_comma_before_inline_comment(trimmed));
             pending_line_continuation = if suppress_line_continuation {
                 None
             } else if context.query_base_depth.is_some() || clause_kind.is_some() {
@@ -3010,6 +3220,8 @@ impl QueryExecutor {
                 None
             };
             pending_inline_comment_line_continuation = if suppress_non_subquery_paren_layout_clause
+                || (current_line_is_mysql_on_duplicate_values_function
+                    && Self::line_ends_with_comma_before_inline_comment(trimmed))
             {
                 None
             } else {
@@ -3020,6 +3232,40 @@ impl QueryExecutor {
                     next_code_trimmed,
                 )
             };
+
+            pending_mysql_declare_handler_frame = if current_line_starts_mysql_handler_declare {
+                Some(PendingMySqlDeclareHandlerFrame {
+                    owner_depth: context.auto_depth,
+                    header_state: Self::mysql_declare_handler_header_state_after_line(
+                        trimmed,
+                        MySqlDeclareHandlerHeaderState::AwaitingConditionStart,
+                        true,
+                    ),
+                })
+            } else if let (Some(frame), Some(progress)) = (
+                active_mysql_declare_handler_frame_for_line,
+                current_line_mysql_declare_handler_progress,
+            ) {
+                if progress.kind == MySqlDeclareHandlerLineKind::Header {
+                    Some(PendingMySqlDeclareHandlerFrame {
+                        owner_depth: frame.owner_depth,
+                        header_state: progress.next_state,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if current_line_is_mysql_declare_handler_body && current_line_starts_mysql_begin {
+                mysql_declare_handler_block_depths.push(context.auto_depth);
+            } else if !mysql_declare_handler_block_depths.is_empty() && current_line_is_plain_end {
+                let _ = mysql_declare_handler_block_depths.pop();
+            } else if !mysql_declare_handler_block_depths.is_empty()
+                && current_line_starts_mysql_begin
+            {
+                mysql_declare_handler_block_depths.push(context.auto_depth);
+            }
 
             if parser_depth == 0 && Self::is_create_trigger(trimmed) {
                 trigger_header_frame = Some(TriggerHeaderDepthFrame { body_depth: 1 });
@@ -3041,9 +3287,7 @@ impl QueryExecutor {
                 mysql_compound_declare,
             );
 
-            if mysql_routine_body_pending
-                && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-            {
+            if mysql_routine_body_pending && current_line_starts_mysql_begin {
                 mysql_routine_body_active = true;
                 mysql_routine_body_pending = false;
             }
@@ -3053,6 +3297,7 @@ impl QueryExecutor {
             }
             if mysql_routine_body_active
                 && current_line_starts_end_keyword
+                && parser_depth == 0
                 && Self::statement_ends_with_mysql_delimiter(trimmed, mysql_delimiter.as_str())
             {
                 mysql_routine_body_active = false;
@@ -3077,10 +3322,16 @@ impl QueryExecutor {
                 pending_line_continuation = None;
                 pending_inline_comment_line_continuation = None;
                 pending_condition_close_continuation = None;
+                pending_mysql_declare_handler_frame = None;
                 trigger_header_frame = None;
                 forall_body_frame = None;
                 auto_format_subquery_paren_stack.clear();
                 pending_auto_format_subquery_paren_count = 0;
+                mysql_on_duplicate_key_update_active = false;
+            }
+
+            if current_line_is_mysql_on_duplicate_key_update {
+                mysql_on_duplicate_key_update_active = true;
             }
 
             auto_format_paren_observer.process_line_with_byte_observer(
@@ -3640,6 +3891,207 @@ impl QueryExecutor {
         !Self::line_ends_with_open_paren_before_inline_comment(line)
             && (sql_text::format_query_owner_header_kind(line).is_some()
                 || sql_text::line_is_create_query_body_header(line))
+    }
+
+    fn mysql_handler_line_starts_body_keyword(word_upper: &str) -> bool {
+        matches!(
+            word_upper,
+            "BEGIN"
+                | "SET"
+                | "SELECT"
+                | "WITH"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "MERGE"
+                | "CALL"
+                | "IF"
+                | "CASE"
+                | "WHILE"
+                | "LOOP"
+                | "REPEAT"
+                | "LEAVE"
+                | "ITERATE"
+                | "END"
+                | "SIGNAL"
+                | "RESIGNAL"
+                | "GET"
+                | "OPEN"
+                | "FETCH"
+                | "CLOSE"
+                | "RETURN"
+                | "VALUES"
+        )
+    }
+
+    fn scan_mysql_handler_line_tokens<F>(line: &str, mut visit: F)
+    where
+        F: FnMut(MySqlHandlerScanToken<'_>) -> bool,
+    {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() {
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+            }
+            if idx >= bytes.len() {
+                break;
+            }
+
+            if bytes[idx] == b'#' {
+                break;
+            }
+            if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
+                break;
+            }
+            if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+
+            if bytes[idx] == b'\'' {
+                idx = idx.saturating_add(1);
+                while idx < bytes.len() {
+                    if bytes[idx] == b'\'' {
+                        if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                            idx = idx.saturating_add(2);
+                            continue;
+                        }
+                        idx = idx.saturating_add(1);
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                if !visit(MySqlHandlerScanToken::String) {
+                    break;
+                }
+                continue;
+            }
+
+            if bytes[idx].is_ascii_digit() {
+                idx = idx.saturating_add(1);
+                while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                    idx = idx.saturating_add(1);
+                }
+                if !visit(MySqlHandlerScanToken::Number) {
+                    break;
+                }
+                continue;
+            }
+
+            if crate::sql_text::is_identifier_byte(bytes[idx]) {
+                let start = idx;
+                idx = idx.saturating_add(1);
+                while idx < bytes.len() && crate::sql_text::is_identifier_byte(bytes[idx]) {
+                    idx = idx.saturating_add(1);
+                }
+                if let Some(word) = line.get(start..idx) {
+                    if !visit(MySqlHandlerScanToken::Word(word)) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            let symbol = bytes[idx];
+            idx = idx.saturating_add(1);
+            if matches!(symbol, b',' | b';') && !visit(MySqlHandlerScanToken::Symbol(symbol)) {
+                break;
+            }
+        }
+    }
+
+    fn mysql_declare_handler_header_state_after_line(
+        line: &str,
+        initial_state: MySqlDeclareHandlerHeaderState,
+        skip_until_for: bool,
+    ) -> MySqlDeclareHandlerHeaderState {
+        let mut state = initial_state;
+        let mut awaiting_for = skip_until_for;
+
+        Self::scan_mysql_handler_line_tokens(line, |token| {
+            if awaiting_for {
+                if let MySqlHandlerScanToken::Word(word) = token {
+                    if word.eq_ignore_ascii_case("FOR") {
+                        awaiting_for = false;
+                    }
+                }
+                return true;
+            }
+
+            match token {
+                MySqlHandlerScanToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    state.consume_word(&upper);
+                }
+                MySqlHandlerScanToken::Number | MySqlHandlerScanToken::String => {
+                    state.consume_literal();
+                }
+                MySqlHandlerScanToken::Symbol(symbol) => {
+                    state.on_symbol(symbol);
+                }
+            }
+            true
+        });
+
+        state
+    }
+
+    fn mysql_declare_handler_line_is_condition(
+        line: &str,
+        header_state: MySqlDeclareHandlerHeaderState,
+    ) -> bool {
+        let mut result = !header_state.body_line_pending();
+        let mut saw_token = false;
+
+        Self::scan_mysql_handler_line_tokens(line, |token| {
+            saw_token = true;
+            result = match token {
+                MySqlHandlerScanToken::Word(word) => {
+                    let upper = word.to_ascii_uppercase();
+                    !Self::mysql_handler_line_starts_body_keyword(&upper)
+                }
+                MySqlHandlerScanToken::Number | MySqlHandlerScanToken::String => true,
+                MySqlHandlerScanToken::Symbol(_) => false,
+            };
+            false
+        });
+
+        if !saw_token {
+            return false;
+        }
+
+        result
+    }
+
+    fn mysql_declare_handler_line_progress(
+        frame: PendingMySqlDeclareHandlerFrame,
+        line: &str,
+    ) -> MySqlDeclareHandlerLineProgress {
+        if !Self::mysql_declare_handler_line_is_condition(line, frame.header_state) {
+            return MySqlDeclareHandlerLineProgress {
+                kind: MySqlDeclareHandlerLineKind::Body,
+                next_state: frame.header_state,
+            };
+        }
+
+        MySqlDeclareHandlerLineProgress {
+            kind: MySqlDeclareHandlerLineKind::Header,
+            next_state: Self::mysql_declare_handler_header_state_after_line(
+                line,
+                frame.header_state,
+                false,
+            ),
+        }
     }
 
     fn auto_format_next_code_line_indices(
@@ -16092,6 +16544,67 @@ WINDOW
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_window_clause_named_definitions_inside_mysql_compound_body() {
+        let sql = r#"CREATE PROCEDURE p()
+BEGIN
+    WITH order_base AS (
+        SELECT
+            1 AS emp_id,
+            TIMESTAMP '2024-01-01 00:00:00' AS created_at
+    ),
+    ranked AS (
+        SELECT
+            ob.*,
+            ROW_NUMBER () OVER w_emp AS rn_in_emp
+        FROM order_base AS ob
+        WINDOW
+            w_emp AS (
+                PARTITION BY ob.emp_id
+                ORDER BY ob.created_at
+            )
+    )
+    SELECT *
+    FROM ranked;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let rendered_depths = lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                format!("{}:{}:{}", idx, contexts[idx].auto_depth, line.trim_start())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WINDOW")
+            .unwrap_or(0);
+        let named_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "w_emp AS (")
+            .unwrap_or(0);
+        let partition_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "PARTITION BY ob.emp_id")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[named_idx].auto_depth,
+            contexts[window_idx].auto_depth.saturating_add(1),
+            "named WINDOW definition should stay one level deeper than bare WINDOW inside MySQL compound bodies, got:\n{}",
+            rendered_depths
+        );
+        assert_eq!(
+            contexts[partition_idx].auto_depth,
+            contexts[named_idx].auto_depth.saturating_add(1),
+            "WINDOW body should stay one level deeper than the named WINDOW owner inside MySQL compound bodies, got:\n{}",
+            rendered_depths
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_analytic_over_body_on_owner_stack_after_nested_over() {
         let sql = r#"SELECT
     SUM (sal) OVER (
@@ -18653,6 +19166,58 @@ WHERE d.deptno > 0;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_on_duplicate_multiline_call_siblings_on_parent_frame_depth()
+    {
+        let sql = r#"CREATE PROCEDURE p()
+BEGIN
+    INSERT INTO dept (dept_id, parent_dept_id, dept_code, dept_name, sort_no)
+    VALUES (20, 10, 'SALES', 'Sales-upsert-check', 2)
+    ON DUPLICATE KEY UPDATE dept_name = CONCAT(
+        VALUES(dept_name),
+            ' / touched'
+    ),
+        sort_no = VALUES(sort_no);
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start() == needle)
+                .unwrap_or(0)
+        };
+
+        let owner_idx = find_line("ON DUPLICATE KEY UPDATE dept_name = CONCAT(");
+        let values_idx = find_line("VALUES(dept_name),");
+        let literal_idx = find_line("' / touched'");
+        let close_idx = find_line("),");
+
+        assert_eq!(
+            contexts[values_idx].auto_depth,
+            contexts[owner_idx].auto_depth.saturating_add(1),
+            "VALUES() inside ON DUPLICATE multiline call should stay on the parent-frame body depth"
+        );
+        assert_eq!(
+            contexts[literal_idx].auto_depth, contexts[values_idx].auto_depth,
+            "comma sibling after VALUES() should reuse the same parent-frame body depth"
+        );
+        assert_eq!(
+            contexts[literal_idx].query_role,
+            AutoFormatQueryRole::None,
+            "comma sibling after VALUES() inside ON DUPLICATE multiline call must not be promoted to a query continuation"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[owner_idx].auto_depth,
+            "close line after multiline ON DUPLICATE call should realign with the owner depth"
+        );
+        assert!(
+            !contexts[values_idx].line_semantic.is_clause(),
+            "VALUES() inside ON DUPLICATE multiline call must not be promoted to a standalone clause"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_restore_select_item_depth_after_nested_scalar_queries() {
         let sql = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
     WITH dept_path (dept_id, parent_dept_id, dept_path_txt, lvl) AS (
@@ -19254,6 +19819,265 @@ DELIMITER ;"#;
         assert_eq!(
             contexts[end_idx].auto_depth, 0,
             "auto-format depth should keep the custom-delimited procedure END on the owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_mysql_handler_block_end_on_handler_begin_depth() {
+        let sql = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1062
+BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+        INSERT INTO error_log (step_name, sql_state, mysql_errno, message_text)
+        VALUES ('EXPECTED_DUPLICATE', v_state, v_errno, LEFT(v_msg, 512));
+    END;
+END;"#;
+
+        let lines: Vec<&str> = sql.lines().collect();
+        let begin_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "BEGIN")
+            .unwrap_or(0);
+        let handler_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DECLARE CONTINUE HANDLER FOR 1062")
+            .unwrap_or(0);
+        let handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let diag_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "GET DIAGNOSTICS CONDITION 1")
+            .unwrap_or(0);
+        let handler_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(diag_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        assert_eq!(
+            contexts[handler_idx].auto_depth,
+            contexts[begin_idx].auto_depth.saturating_add(1),
+            "handler header should stay on the procedure-body depth"
+        );
+        assert_eq!(
+            contexts[handler_begin_idx].auto_depth,
+            contexts[handler_idx].auto_depth.saturating_add(1),
+            "handler BEGIN should open one structural level below DECLARE ... HANDLER FOR"
+        );
+        assert_eq!(
+            contexts[handler_begin_idx].line_semantic,
+            AutoFormatLineSemantic::MySqlDeclareHandlerBody,
+            "handler BEGIN should be marked as a handler body opener"
+        );
+        assert_eq!(
+            contexts[handler_end_idx].auto_depth,
+            contexts[handler_begin_idx].auto_depth,
+            "handler END should snap back to the handler BEGIN owner depth"
+        );
+        assert_eq!(
+            contexts[handler_end_idx].line_semantic,
+            AutoFormatLineSemantic::MySqlDeclareHandlerBlockEnd,
+            "handler END should carry the dedicated handler block-end semantic"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_consecutive_mysql_handler_headers_and_bodies_on_shared_depths(
+    ) {
+        let sql = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE CONTINUE HANDLER FOR 1062
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE,
+v_errno = MYSQL_ERRNO,
+v_msg = MESSAGE_TEXT;
+END;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+ROLLBACK;
+END;
+START TRANSACTION;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_handler_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DECLARE CONTINUE HANDLER FOR 1062")
+            .unwrap_or(0);
+        let first_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_handler_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let first_diag_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let first_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_diag_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_handler_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .unwrap_or(0);
+        let second_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_handler_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let second_end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(rollback_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let start_tx_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "START TRANSACTION;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[first_begin_idx].auto_depth,
+            contexts[first_handler_idx].auto_depth.saturating_add(1),
+            "first handler BEGIN should open one level below the handler header"
+        );
+        assert_eq!(
+            contexts[first_diag_idx].auto_depth,
+            contexts[first_begin_idx].auto_depth.saturating_add(1),
+            "statements inside the first handler block should stay one level deeper than handler BEGIN"
+        );
+        assert_eq!(
+            contexts[first_end_idx].auto_depth, contexts[first_begin_idx].auto_depth,
+            "first handler END should realign with the handler BEGIN depth"
+        );
+        assert_eq!(
+            contexts[second_handler_idx].auto_depth, contexts[first_handler_idx].auto_depth,
+            "sibling handler header should return to the shared DECLARE depth"
+        );
+        assert_eq!(
+            contexts[second_begin_idx].auto_depth,
+            contexts[second_handler_idx].auto_depth.saturating_add(1),
+            "second handler BEGIN should open one level below the sibling handler header"
+        );
+        assert_eq!(
+            contexts[second_begin_idx].line_semantic,
+            AutoFormatLineSemantic::MySqlDeclareHandlerBody,
+            "second handler BEGIN should keep the dedicated handler-body semantic"
+        );
+        assert_eq!(
+            contexts[rollback_idx].auto_depth,
+            contexts[second_begin_idx].auto_depth.saturating_add(1),
+            "statements inside the second handler block should stay one level deeper than handler BEGIN"
+        );
+        assert_eq!(
+            contexts[second_end_idx].auto_depth, contexts[second_begin_idx].auto_depth,
+            "second handler END should realign with its handler BEGIN depth"
+        );
+        assert_eq!(
+            contexts[start_tx_idx].auto_depth, contexts[first_handler_idx].auto_depth,
+            "ordinary statements after consecutive handler declarations should return to the compound body depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_reset_after_complex_mysql_exit_handler_block_end() {
+        let sql = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE,
+v_errno = MYSQL_ERRNO,
+v_msg = MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO error_log (step_name, sql_state, mysql_errno, message_text)
+VALUES ('UNEXPECTED_EXCEPTION', v_state, v_errno, LEFT(v_msg, 512));
+RESIGNAL;
+END;
+START TRANSACTION;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let handler_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .unwrap_or(0);
+        let begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let diagnostics_idx = lines
+            .iter()
+            .enumerate()
+            .skip(begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("GET DIAGNOSTICS CONDITION 1"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(diagnostics_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END;")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let start_tx_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "START TRANSACTION;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[begin_idx].auto_depth,
+            contexts[handler_idx].auto_depth.saturating_add(1),
+            "complex handler BEGIN should open one level below the handler header"
+        );
+        assert_eq!(
+            contexts[diagnostics_idx].auto_depth,
+            contexts[begin_idx].auto_depth.saturating_add(1),
+            "complex handler statements should stay one level deeper than handler BEGIN"
+        );
+        assert_eq!(
+            contexts[end_idx].auto_depth, contexts[begin_idx].auto_depth,
+            "complex handler END should realign with the handler BEGIN depth"
+        );
+        assert_eq!(
+            contexts[start_tx_idx].auto_depth, contexts[handler_idx].auto_depth,
+            "statement after complex handler END should return to the compound body depth"
         );
     }
 
