@@ -7165,6 +7165,9 @@ mod tests {
         assert!(line_ends_with_semicolon_before_inline_comment(
             "VALUES (1); # keep terminated"
         ));
+        assert!(line_ends_with_semicolon_before_inline_comment(
+            "            ));"
+        ));
         assert!(!line_ends_with_semicolon_before_inline_comment(
             "OPEN c_emp -- keep comment"
         ));

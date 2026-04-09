@@ -35,6 +35,7 @@ struct LineLayout<'a> {
     preserve_raw: bool,
     parser_depth: usize,
     auto_depth: usize,
+    carry_depth: usize,
     query_role: AutoFormatQueryRole,
     line_semantic: AutoFormatLineSemantic,
     query_base_depth: Option<usize>,
@@ -876,12 +877,6 @@ struct JoinConditionLayoutFrame {
 }
 
 #[derive(Clone, Copy)]
-struct StructuralContinuationLayoutFrame {
-    continuation_depth: usize,
-    from_leading_close_comma_list: bool,
-}
-
-#[derive(Clone, Copy)]
 struct PendingControlBranchBodyLayoutFrame {
     body_depth: usize,
 }
@@ -986,13 +981,18 @@ impl ParenLayoutFrame {
 struct PendingGeneralOpenParenLayoutFrame {
     owner_depth: usize,
     standalone_owner: bool,
+    condition_header_owner: bool,
 }
 
 impl PendingGeneralOpenParenLayoutFrame {
-    fn from_paren_layout_frame(frame: ParenLayoutFrame) -> Option<Self> {
+    fn from_paren_layout_frame(
+        frame: ParenLayoutFrame,
+        condition_header_owner: bool,
+    ) -> Option<Self> {
         (frame.kind == ParenLayoutFrameKind::General).then_some(Self {
             owner_depth: frame.owner_depth,
             standalone_owner: frame.standalone_owner,
+            condition_header_owner,
         })
     }
 }
@@ -6423,7 +6423,6 @@ impl SqlEditorWidget {
                             line_indent = line_indent.max(frame.open_line_indent.saturating_add(1));
                         }
                     }
-
                     ensure_indent(&mut out, &mut at_line_start, line_indent);
                     if needs_space {
                         out.push(' ');
@@ -8085,6 +8084,7 @@ impl SqlEditorWidget {
                 preserve_raw,
                 parser_depth: contexts.get(idx).map(|ctx| ctx.parser_depth).unwrap_or(0),
                 auto_depth: contexts.get(idx).map(|ctx| ctx.auto_depth).unwrap_or(0),
+                carry_depth: contexts.get(idx).map(|ctx| ctx.carry_depth).unwrap_or(0),
                 query_role: contexts
                     .get(idx)
                     .map(|ctx| ctx.query_role)
@@ -9434,10 +9434,10 @@ impl SqlEditorWidget {
         let mut pending_forall_body_head = false;
         let mut mysql_routine_block_frames: Vec<MySqlRoutineBlockLayoutFrame> = Vec::new();
         let mut mysql_if_layout_frames: Vec<MySqlIfLayoutFrame> = Vec::new();
-        // Keeps clause/list/body continuation on explicit structural depth
-        // instead of reconstructing it from previous-line shape heuristics.
-        let mut active_structural_continuation_frame: Option<StructuralContinuationLayoutFrame> =
-            None;
+        // Carry the next code line from the previous line's last token depth
+        // instead of storing a typed continuation-depth state machine.
+        let mut previous_code_carry_depth: Option<usize> = None;
+        let mut previous_code_carry_from_leading_close_comma_list = false;
         let mut pending_split_plain_end_layout_frame: Option<PendingSplitPlainEndLayoutFrame> =
             None;
         let mut pending_control_branch_body_frame: Option<PendingControlBranchBodyLayoutFrame> =
@@ -9465,12 +9465,9 @@ impl SqlEditorWidget {
             let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
-            let incoming_structural_continuation_frame = active_structural_continuation_frame;
-            let incoming_structural_continuation_depth =
-                incoming_structural_continuation_frame.map(|frame| frame.continuation_depth);
+            let incoming_structural_continuation_depth = previous_code_carry_depth;
             let incoming_structural_continuation_from_leading_close_comma_list =
-                incoming_structural_continuation_frame
-                    .is_some_and(|frame| frame.from_leading_close_comma_list);
+                previous_code_carry_from_leading_close_comma_list;
             let pending_split_plain_end_layout_frame_for_line =
                 pending_split_plain_end_layout_frame.take();
             let pending_control_branch_body_depth_for_line = pending_control_branch_body_frame
@@ -9992,20 +9989,41 @@ impl SqlEditorWidget {
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let current_line_starts_dml_case_expression = in_dml_statement
                 && current_line_starts_case
-                && current_line_branch_body_depth.is_none()
-                && active_general_paren_frame.is_some();
+                && (current_line_branch_body_depth.is_none()
+                    || pending_general_open_paren_for_line
+                        .is_some_and(|frame| frame.standalone_owner))
+                && (active_general_paren_frame.is_some()
+                    || pending_general_open_paren_for_line.is_some());
             let current_line_dml_case_expression_owner_depth =
                 if current_line_starts_dml_case_expression {
                     // CASE inside a parenthesized DML expression must stay
                     // attached to the active `(` owner frame rather than
                     // reconstructing depth from the previous rendered line.
-                    active_general_paren_frame.map(|frame| frame.owner_depth)
+                    pending_general_open_paren_for_line
+                        .map(|frame| {
+                            if frame.condition_header_owner || frame.standalone_owner {
+                                frame.owner_depth.saturating_add(1)
+                            } else {
+                                frame.owner_depth
+                            }
+                        })
+                        .or_else(|| {
+                            active_general_paren_frame.map(|frame| {
+                                if frame.standalone_owner {
+                                    frame.owner_depth.saturating_add(1)
+                                } else {
+                                    frame.owner_depth
+                                }
+                            })
+                        })
                 } else {
                     None
                 };
             let current_line_dml_case_expression_close_owner_depth =
                 if current_line_starts_dml_case_expression {
-                    active_general_paren_frame.map(|frame| frame.owner_depth)
+                    pending_general_open_paren_for_line
+                        .map(|frame| frame.owner_depth)
+                        .or_else(|| active_general_paren_frame.map(|frame| frame.owner_depth))
                 } else {
                     None
                 };
@@ -10234,9 +10252,7 @@ impl SqlEditorWidget {
                 owner_depth
             } else if starts_with_close_paren && is_paren_case_closer {
                 paren_case_close_frame_depth.unwrap_or(paren_case_base_depth)
-            } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth
-                .filter(|_| active_structural_continuation_depth_for_line.is_none())
-            {
+            } else if let Some(owner_depth) = current_line_dml_case_expression_owner_depth {
                 // CASE inside a parenthesized DML expression inherits the
                 // structural owner line that opened the active `(`. Manual
                 // indent on the CASE line must not add extra depth.
@@ -11319,24 +11335,21 @@ impl SqlEditorWidget {
             });
             let next_structural_from_leading_close_comma_list = starts_with_close_paren
                 && Self::line_ends_with_comma_before_inline_comment(trimmed);
-            active_structural_continuation_frame =
-                if let Some(continuation_depth) = next_structural_continuation_depth {
-                    Some(StructuralContinuationLayoutFrame {
-                        continuation_depth,
-                        from_leading_close_comma_list:
-                            next_structural_from_leading_close_comma_list,
-                    })
-                } else if current_line_clears_structural_continuation_depth {
-                    None
-                } else {
-                    active_structural_continuation_depth_for_line.map(|continuation_depth| {
-                        StructuralContinuationLayoutFrame {
-                            continuation_depth,
-                            from_leading_close_comma_list:
-                                incoming_structural_continuation_from_leading_close_comma_list,
-                        }
-                    })
-                };
+            if let Some(continuation_depth) = next_structural_continuation_depth {
+                previous_code_carry_depth = Some(continuation_depth);
+                previous_code_carry_from_leading_close_comma_list =
+                    next_structural_from_leading_close_comma_list;
+            } else if current_line_clears_structural_continuation_depth {
+                previous_code_carry_depth = None;
+                previous_code_carry_from_leading_close_comma_list = false;
+            } else {
+                previous_code_carry_depth = active_structural_continuation_depth_for_line;
+                previous_code_carry_from_leading_close_comma_list =
+                    previous_code_carry_depth.is_some()
+                        && incoming_structural_continuation_from_leading_close_comma_list;
+            }
+            layouts[idx].carry_depth =
+                previous_code_carry_depth.unwrap_or(layouts[idx].final_depth);
             pending_split_plain_end_layout_frame =
                 if Self::line_opens_split_plain_end_continuation(trimmed, &line_tokens) {
                     Some(PendingSplitPlainEndLayoutFrame {
@@ -11419,7 +11432,12 @@ impl SqlEditorWidget {
                 Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                     .then(|| paren_layout_frames.last().copied())
                     .flatten()
-                    .and_then(PendingGeneralOpenParenLayoutFrame::from_paren_layout_frame);
+                    .and_then(|frame| {
+                        PendingGeneralOpenParenLayoutFrame::from_paren_layout_frame(
+                            frame,
+                            current_line_is_own_condition_header_line,
+                        )
+                    });
 
             if starts_query_head {
                 pending_query_head_frames.clear();
@@ -11731,7 +11749,8 @@ impl SqlEditorWidget {
                 active_merge_query_base_frames.clear();
                 pending_merge_branch_header = None;
                 pending_merge_branch_body_frame = None;
-                active_structural_continuation_frame = None;
+                previous_code_carry_depth = None;
+                previous_code_carry_from_leading_close_comma_list = false;
                 pending_split_plain_end_layout_frame = None;
                 pending_control_branch_body_frame = None;
                 pending_general_open_paren = None;
@@ -41432,12 +41451,116 @@ BEGIN
             .find(|(_, line)| line.trim_start() == "END$$")
             .map(|(idx, _)| idx)
             .unwrap_or(0);
+        let start_tx_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "START TRANSACTION;")
+            .unwrap_or(0);
+        let commit_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "COMMIT;")
+            .unwrap_or(0);
 
         assert_eq!(
             indent(lines[end_idx]),
             indent(lines[begin_idx]),
             "nested MariaDB seed procedure should close on the owner depth, got:\n{formatted}"
         );
+        assert_eq!(
+            indent(lines[commit_idx]),
+            indent(lines[start_tx_idx]),
+            "nested MariaDB seed procedure COMMIT should return to the same procedure-body frame depth as START TRANSACTION, got:\n{formatted}"
+        );
+
+        let auto_formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let auto_lines: Vec<&str> = auto_formatted.lines().collect();
+        let auto_begin_idx = auto_lines
+            .iter()
+            .position(|line| line.trim_start() == "BEGIN")
+            .unwrap_or(0);
+        let auto_end_idx = auto_lines
+            .iter()
+            .enumerate()
+            .skip(auto_begin_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "END$$")
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let auto_start_tx_idx = auto_lines
+            .iter()
+            .position(|line| line.trim_start() == "START TRANSACTION;")
+            .unwrap_or(0);
+        let auto_commit_idx = auto_lines
+            .iter()
+            .position(|line| line.trim_start() == "COMMIT;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            indent(auto_lines[auto_end_idx]),
+            indent(auto_lines[auto_begin_idx]),
+            "auto-format nested MariaDB seed procedure should close on the owner depth, got:\n{auto_formatted}"
+        );
+        assert_eq!(
+            indent(auto_lines[auto_commit_idx]),
+            indent(auto_lines[auto_start_tx_idx]),
+            "auto-format nested MariaDB seed procedure COMMIT should return to the procedure-body frame depth, got:\n{auto_formatted}"
+        );
+    }
+
+    #[test]
+    fn mysql_formatter_keeps_commit_on_procedure_body_depth_after_nested_insert_select() {
+        let source = r#"CREATE PROCEDURE demo_proc()
+BEGIN
+    INSERT INTO boss_audit (event_time, payload_json)
+    SELECT NOW(),
+        JSON_OBJECT('regions', (
+            SELECT COUNT(*)
+            FROM boss_region
+            ), 'customers', (
+                SELECT COUNT(*)
+                FROM boss_customer
+            ));
+                COMMIT;
+END$$"#;
+
+        for formatted in [
+            SqlEditorWidget::format_sql_basic_for_db_type(source, crate::db::connection::DatabaseType::MySQL),
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                source,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+        ] {
+            let lines: Vec<&str> = formatted.lines().collect();
+            let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+            let begin_idx = lines
+                .iter()
+                .position(|line| line.trim_start() == "BEGIN")
+                .unwrap_or(0);
+            let insert_idx = lines
+                .iter()
+                .position(|line| {
+                    line.trim_start() == "INSERT INTO boss_audit (event_time, payload_json)"
+                })
+                .unwrap_or(0);
+            let commit_idx = lines
+                .iter()
+                .position(|line| line.trim_start() == "COMMIT;")
+                .unwrap_or(0);
+
+            assert_eq!(
+                indent(lines[insert_idx]),
+                indent(lines[begin_idx]).saturating_add(4),
+                "INSERT head should stay one frame deeper than BEGIN, got:\n{formatted}"
+            );
+            assert_eq!(
+                indent(lines[commit_idx]),
+                indent(lines[insert_idx]),
+                "COMMIT should return to the same procedure-body frame depth as INSERT after nested SELECT closes, got:\n{formatted}"
+            );
+        }
     }
 
     #[test]

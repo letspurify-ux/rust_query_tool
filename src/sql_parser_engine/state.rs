@@ -873,8 +873,16 @@ impl SplitState {
             self.block_stack.push(BlockKind::Case);
         }
 
+        // `IF(...)` can legally appear as a scalar function / expression head
+        // inside an already-open parenthesized context. In that situation the
+        // token must stay expression-local instead of arming block IF...THEN.
+        let parenthesized_if_expression = upper == "IF" && self.paren_depth > 0;
+
         // IF (opening, not END IF)
-        if upper == "IF" && self.should_arm_if_block(end_token_role) {
+        if upper == "IF"
+            && !parenthesized_if_expression
+            && self.should_arm_if_block(end_token_role)
+        {
             self.if_state = IfState::ExpectConditionStart;
         }
 
