@@ -1781,12 +1781,10 @@ impl QueryExecutor {
                 return;
             }
 
-            let promote_to_subquery = sql_text::SUBQUERY_HEAD_KEYWORDS
-                .iter()
-                .any(|keyword| {
-                    (treat_values_as_subquery_head || !keyword.eq_ignore_ascii_case("VALUES"))
-                        && sql_text::starts_with_keyword_token(trimmed_upper, keyword)
-                });
+            let promote_to_subquery = sql_text::SUBQUERY_HEAD_KEYWORDS.iter().any(|keyword| {
+                (treat_values_as_subquery_head || !keyword.eq_ignore_ascii_case("VALUES"))
+                    && sql_text::starts_with_keyword_token(trimmed_upper, keyword)
+            });
             let mut unresolved = *pending_count;
 
             for paren_kind in paren_stack.iter_mut().rev() {
@@ -1848,8 +1846,7 @@ impl QueryExecutor {
         let mut pending_condition_close_continuation: Option<
             PendingConditionCloseContinuationFrame,
         > = None;
-        let mut pending_mysql_declare_handler_frame: Option<PendingMySqlDeclareHandlerFrame> =
-            None;
+        let mut pending_mysql_declare_handler_frame: Option<PendingMySqlDeclareHandlerFrame> = None;
         let mut mysql_declare_handler_block_depths: Vec<usize> = Vec::new();
         let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
         let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
@@ -1945,9 +1942,8 @@ impl QueryExecutor {
             let current_line_starts_end_keyword =
                 sql_text::starts_with_keyword_token(&trimmed_upper, "END")
                     || current_line_is_mysql_custom_delimited_end;
-            let treat_values_as_subquery_head =
-                !(mysql_on_duplicate_key_update_active
-                    && sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES"));
+            let treat_values_as_subquery_head = !(mysql_on_duplicate_key_update_active
+                && sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES"));
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
                 &mut pending_auto_format_subquery_paren_count,
@@ -1965,9 +1961,8 @@ impl QueryExecutor {
             let current_line_mysql_declare_owner_kind = mysql_compound_declare
                 .then(|| sql_text::mysql_declare_owner_kind(clause_detection_trimmed))
                 .flatten();
-            let current_line_starts_mysql_handler_declare =
-                current_line_mysql_declare_owner_kind
-                    == Some(sql_text::MySqlDeclareOwnerKind::HandlerFor);
+            let current_line_starts_mysql_handler_declare = current_line_mysql_declare_owner_kind
+                == Some(sql_text::MySqlDeclareOwnerKind::HandlerFor);
             let inside_non_subquery_paren_context = auto_format_subquery_paren_stack
                 .last()
                 .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery);
@@ -1986,9 +1981,7 @@ impl QueryExecutor {
                     &["ELSEIF"],
                 );
             let current_line_is_mysql_on_duplicate_key_update =
-                sql_text::line_is_mysql_on_duplicate_key_update_clause(
-                    clause_detection_trimmed,
-                );
+                sql_text::line_is_mysql_on_duplicate_key_update_clause(clause_detection_trimmed);
             let current_line_is_mysql_on_duplicate_values_function =
                 mysql_on_duplicate_key_update_active
                     && inside_non_subquery_paren_context
@@ -2065,11 +2058,9 @@ impl QueryExecutor {
                     closing_query_close_align_depth = Some(frame.close_align_depth);
                 }
             }
-            let current_line_is_exact_bare_window_clause_header =
-                clause_kind == Some(AutoFormatClauseKind::Window)
-                    && sql_text::line_is_format_bare_window_clause_header(
-                        clause_detection_trimmed,
-                    );
+            let current_line_is_exact_bare_window_clause_header = clause_kind
+                == Some(AutoFormatClauseKind::Window)
+                && sql_text::line_is_format_bare_window_clause_header(clause_detection_trimmed);
             let current_line_is_window_clause_definition_header =
                 pending_window_definition_owner_for_line.is_some()
                     && Self::line_is_window_clause_definition_header(trimmed);
@@ -2188,9 +2179,11 @@ impl QueryExecutor {
                     frame.pending_same_depth_set_operator_head = false;
                 }
                 let parent_base_depth = current_line_mysql_declare_handler_body_owner_depth
-                    .or_else(|| pending_query_bases
-                    .last()
-                    .map(|frame| frame.owner_base_depth))
+                    .or_else(|| {
+                        pending_query_bases
+                            .last()
+                            .map(|frame| frame.owner_base_depth)
+                    })
                     .or_else(|| forall_body_frame.map(|frame| frame.owner_depth))
                     .or_else(|| active_frame.map(|frame| frame.query_base_depth));
                 let query_base_depth = parent_base_depth
@@ -2508,10 +2501,7 @@ impl QueryExecutor {
             if current_line_starts_mysql_handler_declare {
                 current_line_is_mysql_declare_handler_header = true;
             } else if let Some(progress) = current_line_mysql_declare_handler_progress {
-                match (
-                    active_mysql_declare_handler_frame_for_line,
-                    progress.kind,
-                ) {
+                match (active_mysql_declare_handler_frame_for_line, progress.kind) {
                     (Some(frame), MySqlDeclareHandlerLineKind::Header) => {
                         current_line_is_mysql_declare_handler_header = true;
                         context.auto_depth = frame.owner_depth;
@@ -2529,8 +2519,9 @@ impl QueryExecutor {
                     current_line_is_mysql_declare_handler_block_end = true;
                     context.auto_depth = handler_block_depth;
                 } else if !current_line_is_mysql_declare_handler_body {
-                    context.auto_depth =
-                        context.auto_depth.max(handler_block_depth.saturating_add(1));
+                    context.auto_depth = context
+                        .auto_depth
+                        .max(handler_block_depth.saturating_add(1));
                 }
             }
 
@@ -19166,8 +19157,7 @@ WHERE d.deptno > 0;"#;
     }
 
     #[test]
-    fn auto_format_line_contexts_keep_on_duplicate_multiline_call_siblings_on_parent_frame_depth()
-    {
+    fn auto_format_line_contexts_keep_on_duplicate_multiline_call_siblings_on_parent_frame_depth() {
         let sql = r#"CREATE PROCEDURE p()
 BEGIN
     INSERT INTO dept (dept_id, parent_dept_id, dept_code, dept_name, sort_no)
@@ -19883,8 +19873,7 @@ END;"#;
             "handler BEGIN should be marked as a handler body opener"
         );
         assert_eq!(
-            contexts[handler_end_idx].auto_depth,
-            contexts[handler_begin_idx].auto_depth,
+            contexts[handler_end_idx].auto_depth, contexts[handler_begin_idx].auto_depth,
             "handler END should snap back to the handler BEGIN owner depth"
         );
         assert_eq!(

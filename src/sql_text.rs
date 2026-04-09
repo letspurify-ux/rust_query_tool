@@ -4158,8 +4158,12 @@ pub(crate) fn format_plsql_child_query_owner_kind(
             .any(|word| word.eq_ignore_ascii_case("FOR")))
     .then_some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
     .or_else(|| match mysql_declare_owner_kind(structural_tail) {
-        Some(MySqlDeclareOwnerKind::CursorFor) => Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor),
-        Some(MySqlDeclareOwnerKind::HandlerFor) => Some(FormatPlsqlChildQueryOwnerKind::ControlBody),
+        Some(MySqlDeclareOwnerKind::CursorFor) => {
+            Some(FormatPlsqlChildQueryOwnerKind::OpenCursorFor)
+        }
+        Some(MySqlDeclareOwnerKind::HandlerFor) => {
+            Some(FormatPlsqlChildQueryOwnerKind::ControlBody)
+        }
         None => None,
     })
 }
@@ -4220,6 +4224,10 @@ impl PendingFormatPlsqlChildQueryOwnerHeaderKind {
         let structural_tail = owner_header_structural_tail(line);
         if structural_tail.is_empty() {
             return owner_header_has_only_leading_close_parens(line);
+        }
+
+        if owner_header_has_only_semicolon_tail_after_leading_close(line) {
+            return true;
         }
 
         if line_ends_with_semicolon_before_inline_comment(structural_tail) {
@@ -5646,6 +5654,17 @@ fn owner_header_has_only_leading_close_parens(line: &str) -> bool {
     let trimmed = trim_leading_sql_comments(line);
     line_has_leading_significant_close_paren(trimmed)
         && trim_after_leading_close_parens(trimmed).is_empty()
+}
+
+fn owner_header_has_only_semicolon_tail_after_leading_close(line: &str) -> bool {
+    let trimmed = trim_leading_sql_comments(line);
+    if !line_has_leading_significant_close_paren(trimmed) {
+        return false;
+    }
+
+    let structural_tail = trim_after_leading_close_parens(trimmed);
+    matches!(first_meaningful_word(structural_tail), Some(";"))
+        && next_meaningful_word(structural_tail, 1).is_none()
 }
 
 /// Returns the meaningful remainder of `line` after consuming any leading
@@ -9293,7 +9312,9 @@ mod tests {
     fn window_definition_header_helper_tracks_named_window_items_only() {
         assert!(line_is_format_bare_window_clause_header("WINDOW"));
         assert!(line_is_format_bare_window_clause_header("WINDOW -- keep"));
-        assert!(!line_is_format_bare_window_clause_header("WINDOW w_emp AS ("));
+        assert!(!line_is_format_bare_window_clause_header(
+            "WINDOW w_emp AS ("
+        ));
         assert!(line_is_format_window_definition_header("w_emp AS ("));
         assert!(line_is_format_window_definition_header(
             "/* owner */ w_emp_running AS ("
@@ -9590,8 +9611,7 @@ mod tests {
             "BEGIN",
         ));
         assert!(line_starts_mysql_block_keyword_before_inline_comment(
-            "BEGIN",
-            "BEGIN",
+            "BEGIN", "BEGIN",
         ));
         assert!(line_starts_mysql_block_keyword_before_inline_comment(
             "read_loop: LOOP",
@@ -9657,6 +9677,7 @@ mod tests {
         assert!(cursor_kind.line_can_continue("p_ename VARCHAR2(30)"));
         assert!(cursor_kind.line_can_continue(")"));
         assert!(cursor_kind.line_can_continue("/* gap */ ) /* wrapper */"));
+        assert!(cursor_kind.line_can_continue(");"));
         assert!(!cursor_kind.line_can_continue("c_emp; -- already terminated"));
         assert!(!cursor_kind.line_can_continue("SELECT empno"));
 
@@ -9665,6 +9686,7 @@ mod tests {
         assert!(open_kind.line_completes("/* gap */FOR"));
         assert!(open_kind.line_completes("FOR /* owner */"));
         assert!(open_kind.line_can_continue("c_emp"));
+        assert!(open_kind.line_can_continue(");"));
         assert!(!open_kind.line_can_continue("c_emp; -- already terminated"));
         assert!(!open_kind.line_can_continue("SELECT empno"));
     }
