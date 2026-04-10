@@ -1863,6 +1863,65 @@ impl SqlEditorWidget {
         None
     }
 
+    fn next_meaningful_word<'a>(tokens: &'a [SqlToken], cursor: &mut usize) -> Option<&'a str> {
+        while let Some(token) = tokens.get(*cursor) {
+            *cursor = cursor.saturating_add(1);
+            if let SqlToken::Word(word) = token {
+                return Some(word.as_str());
+            }
+        }
+        None
+    }
+
+    fn statement_starts_with_package_body_header(tokens: &[SqlToken]) -> bool {
+        let mut cursor = 0usize;
+        let Some(first) = Self::next_meaningful_word(tokens, &mut cursor) else {
+            return false;
+        };
+        if !first.eq_ignore_ascii_case("CREATE") {
+            return false;
+        }
+
+        let Some(mut current) = Self::next_meaningful_word(tokens, &mut cursor) else {
+            return false;
+        };
+
+        if current.eq_ignore_ascii_case("OR") {
+            let Some(replace) = Self::next_meaningful_word(tokens, &mut cursor) else {
+                return false;
+            };
+            if !replace.eq_ignore_ascii_case("REPLACE") {
+                return false;
+            }
+            let Some(after_replace) = Self::next_meaningful_word(tokens, &mut cursor) else {
+                return false;
+            };
+            current = after_replace;
+        }
+
+        while current.eq_ignore_ascii_case("EDITIONABLE")
+            || current.eq_ignore_ascii_case("NONEDITIONABLE")
+        {
+            let Some(next) = Self::next_meaningful_word(tokens, &mut cursor) else {
+                return false;
+            };
+            current = next;
+        }
+
+        if !current.eq_ignore_ascii_case("PACKAGE") {
+            return false;
+        }
+
+        Self::next_meaningful_word(tokens, &mut cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("BODY"))
+    }
+
+    fn statement_contains_keyword(tokens: &[SqlToken], keyword: &str) -> bool {
+        tokens.iter().any(|token| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
+        })
+    }
+
     fn query_like_paren_layout(
         owner_line: &str,
         owner_depth: usize,
@@ -4556,12 +4615,8 @@ impl SqlEditorWidget {
         let mut compound_trigger_state = CompoundTriggerState::default();
         let mut plsql_context_state = ScopedFlag::default();
         let mut inline_comment_continuation_state = InlineCommentContinuationState::None;
-        let is_package_body_statement = {
-            let upper = statement.to_ascii_uppercase();
-            upper.contains("CREATE OR REPLACE PACKAGE BODY")
-                || upper.contains("CREATE PACKAGE BODY")
-        };
-        let statement_has_apply = statement.to_ascii_uppercase().contains(" APPLY");
+        let is_package_body_statement = Self::statement_starts_with_package_body_header(tokens);
+        let statement_has_apply = Self::statement_contains_keyword(tokens, "APPLY");
         let query_apply_flags = Self::query_apply_flags(tokens);
         let token_spans =
             super::query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible);
@@ -11166,6 +11221,74 @@ END fmt_pkg_extreme;"#;
         assert!(
             !formatted.contains("END calc_mode;\n\n    BEGIN\n        g_last_mode :="),
             "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_header_detection_ignores_literals_and_comments() {
+        let package_header_sql = r#"/* lead */ CREATE OR REPLACE PACKAGE BODY pkg_demo AS
+BEGIN
+  NULL;
+END pkg_demo;"#;
+        let package_tokens = SqlEditorWidget::tokenize_sql(package_header_sql);
+        assert!(
+            SqlEditorWidget::statement_starts_with_package_body_header(&package_tokens),
+            "real package body header should be detected from meaningful tokens"
+        );
+
+        let literal_sql = "SELECT 'CREATE OR REPLACE PACKAGE BODY pkg_demo' AS txt FROM dual;";
+        let literal_tokens = SqlEditorWidget::tokenize_sql(literal_sql);
+        assert!(
+            !SqlEditorWidget::statement_starts_with_package_body_header(&literal_tokens),
+            "package-body phrase inside a string literal must not be treated as a structural header"
+        );
+
+        let comment_sql = "-- CREATE OR REPLACE PACKAGE BODY pkg_demo\nSELECT 1 FROM dual;";
+        let comment_tokens = SqlEditorWidget::tokenize_sql(comment_sql);
+        assert!(
+            !SqlEditorWidget::statement_starts_with_package_body_header(&comment_tokens),
+            "package-body phrase inside comments must not be treated as a structural header"
+        );
+    }
+
+    #[test]
+    fn apply_keyword_detection_uses_meaningful_tokens_only() {
+        let apply_sql = "SELECT * FROM src CROSS APPLY (SELECT 1 AS v FROM dual) d;";
+        let apply_tokens = SqlEditorWidget::tokenize_sql(apply_sql);
+        assert!(
+            SqlEditorWidget::statement_contains_keyword(&apply_tokens, "APPLY"),
+            "real APPLY keyword should be detected"
+        );
+
+        let literal_sql = "SELECT ' APPLY' AS hint_txt, AVG (sal) AS avg_sal FROM emp;";
+        let literal_tokens = SqlEditorWidget::tokenize_sql(literal_sql);
+        assert!(
+            !SqlEditorWidget::statement_contains_keyword(&literal_tokens, "APPLY"),
+            "APPLY inside a string literal must not be treated as a statement keyword"
+        );
+
+        let comment_sql = "SELECT AVG (sal) AS avg_sal FROM emp -- APPLY marker";
+        let comment_tokens = SqlEditorWidget::tokenize_sql(comment_sql);
+        assert!(
+            !SqlEditorWidget::statement_contains_keyword(&comment_tokens, "APPLY"),
+            "APPLY inside comments must not be treated as a statement keyword"
+        );
+    }
+
+    #[test]
+    fn aggregate_call_spacing_is_not_tightened_by_apply_text_inside_literal() {
+        let sql = "SELECT ' APPLY' AS hint_txt, AVG (sal) AS avg_sal FROM emp;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("AVG (sal) AS avg_sal"),
+            "literal text containing APPLY should not trigger APPLY-specific aggregate spacing, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("AVG(sal) AS avg_sal"),
+            "formatter should not remove the call gap due to non-structural APPLY text, got:\n{}",
             formatted
         );
     }

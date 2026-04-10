@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-07 (fallback 서술을 residual semantic/lexical family 원칙으로 정리)
+> 최종 업데이트: 2026-04-10 (statement-level 구조 플래그도 token-sequence 기반으로 명시)
 
 ## 0. 이 문서의 역할
 
@@ -138,6 +138,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - statement terminator 판정도 예외가 아니다. `OPEN c_emp; -- done`, `CURSOR c_emp IS; /* impossible but lexical */`, `END; -- block close` 같은 line은 raw `trim_end().ends_with(';')`가 아니라 inline comment를 제거한 뒤의 마지막 meaningful token으로 닫힘 여부를 판정해야 한다.
 - exact bare header / standalone wrapper 판정도 예외가 아니다. `FROM /* gap */`, `WHERE /* gap */`, `ON /* gap */`, `( -- wrapper` 같은 line은 raw `trim()` / `==` 비교가 아니라 shared structural token / wrapper helper로 판정해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
+- line-local helper뿐 아니라 statement-level 구조 플래그도 동일하다. `PACKAGE BODY` 여부, `APPLY` family 활성 같은 전역 판정은 raw statement `contains(...)`가 아니라 meaningful token sequence에서 도출해야 한다. 문자열/주석 안 텍스트가 구조 플래그를 켜면 1.8 위반이다.
 
 ## 2. 구조 계약
 
