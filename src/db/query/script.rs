@@ -57,36 +57,18 @@ impl AutoFormatLineSemantic {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_clause(self) -> bool {
         matches!(self, Self::Clause(_))
     }
 
-    pub(crate) fn is_join_clause(self) -> bool {
-        matches!(self, Self::JoinClause)
-    }
-
+    #[cfg(test)]
     pub(crate) fn is_join_condition_clause(self) -> bool {
         matches!(self, Self::JoinConditionClause)
     }
 
     pub(crate) fn is_condition_continuation(self) -> bool {
         matches!(self, Self::ConditionContinuation)
-    }
-
-    pub(crate) fn is_mysql_declare_handler_header(self) -> bool {
-        matches!(self, Self::MySqlDeclareHandlerHeader)
-    }
-
-    pub(crate) fn is_mysql_declare_handler_body(self) -> bool {
-        matches!(self, Self::MySqlDeclareHandlerBody)
-    }
-
-    pub(crate) fn is_mysql_declare_handler_block_end(self) -> bool {
-        matches!(self, Self::MySqlDeclareHandlerBlockEnd)
-    }
-
-    pub(crate) fn is_clause_boundary(self) -> bool {
-        self.is_clause() || self.is_join_clause()
     }
 }
 
@@ -377,50 +359,48 @@ impl PendingConditionCloseContinuationFrame {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MySqlDeclareHandlerHeaderState {
-    AwaitingConditionStart,
-    AwaitingNotFoundTail,
-    AwaitingSqlstateValueOrLiteral,
-    AwaitingSqlstateLiteral,
-    AwaitingNextConditionOrBody,
+    ConditionStart,
+    NotFoundTail,
+    SqlstateValueOrLiteral,
+    SqlstateLiteral,
+    NextConditionOrBody,
 }
 
 impl MySqlDeclareHandlerHeaderState {
     fn body_line_pending(self) -> bool {
-        matches!(self, Self::AwaitingNextConditionOrBody)
+        matches!(self, Self::NextConditionOrBody)
     }
 
     fn consume_word(&mut self, word_upper: &str) {
         *self = match (*self, word_upper) {
-            (Self::AwaitingConditionStart, "NOT") => Self::AwaitingNotFoundTail,
-            (Self::AwaitingConditionStart, "SQLSTATE") => Self::AwaitingSqlstateValueOrLiteral,
-            (Self::AwaitingConditionStart, _) => Self::AwaitingNextConditionOrBody,
-            (Self::AwaitingNotFoundTail, "FOUND") => Self::AwaitingNextConditionOrBody,
-            (Self::AwaitingNotFoundTail, _) => Self::AwaitingNextConditionOrBody,
-            (Self::AwaitingSqlstateValueOrLiteral, "VALUE") => Self::AwaitingSqlstateLiteral,
-            (Self::AwaitingSqlstateValueOrLiteral, _) => Self::AwaitingNextConditionOrBody,
-            (Self::AwaitingSqlstateLiteral, _) => Self::AwaitingNextConditionOrBody,
-            (Self::AwaitingNextConditionOrBody, _) => Self::AwaitingNextConditionOrBody,
+            (Self::ConditionStart, "NOT") => Self::NotFoundTail,
+            (Self::ConditionStart, "SQLSTATE") => Self::SqlstateValueOrLiteral,
+            (Self::ConditionStart, _) => Self::NextConditionOrBody,
+            (Self::NotFoundTail, "FOUND") => Self::NextConditionOrBody,
+            (Self::NotFoundTail, _) => Self::NextConditionOrBody,
+            (Self::SqlstateValueOrLiteral, "VALUE") => Self::SqlstateLiteral,
+            (Self::SqlstateValueOrLiteral, _) => Self::NextConditionOrBody,
+            (Self::SqlstateLiteral, _) => Self::NextConditionOrBody,
+            (Self::NextConditionOrBody, _) => Self::NextConditionOrBody,
         };
     }
 
     fn consume_literal(&mut self) {
         *self = match *self {
-            Self::AwaitingConditionStart
-            | Self::AwaitingSqlstateValueOrLiteral
-            | Self::AwaitingSqlstateLiteral => Self::AwaitingNextConditionOrBody,
-            Self::AwaitingNotFoundTail | Self::AwaitingNextConditionOrBody => {
-                Self::AwaitingNextConditionOrBody
+            Self::ConditionStart | Self::SqlstateValueOrLiteral | Self::SqlstateLiteral => {
+                Self::NextConditionOrBody
             }
+            Self::NotFoundTail | Self::NextConditionOrBody => Self::NextConditionOrBody,
         };
     }
 
     fn on_symbol(&mut self, symbol: u8) {
         match (*self, symbol) {
-            (Self::AwaitingNextConditionOrBody, b',') => {
-                *self = Self::AwaitingConditionStart;
+            (Self::NextConditionOrBody, b',') => {
+                *self = Self::ConditionStart;
             }
             (_, b';') => {
-                *self = Self::AwaitingNextConditionOrBody;
+                *self = Self::NextConditionOrBody;
             }
             _ => {}
         }
@@ -2030,7 +2010,7 @@ impl QueryExecutor {
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
                 &mut pending_auto_format_subquery_paren_count,
-                &trimmed_upper,
+                trimmed_upper,
                 treat_values_as_subquery_head,
             );
             let line_has_leading_close_paren =
@@ -2050,9 +2030,7 @@ impl QueryExecutor {
                 .last()
                 .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery);
             let suppress_non_subquery_paren_layout_clause = inside_non_subquery_paren_context
-                && sql_text::is_non_subquery_paren_suppressed_layout_clause(
-                    &clause_detection_upper,
-                );
+                && sql_text::is_non_subquery_paren_suppressed_layout_clause(clause_detection_upper);
             let current_line_starts_elsif =
                 sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
@@ -2096,7 +2074,7 @@ impl QueryExecutor {
             {
                 None
             } else {
-                Self::auto_format_clause_kind(&clause_detection_upper)
+                Self::auto_format_clause_kind(clause_detection_upper)
             };
             let mut closing_query_close_align_depth = None;
             while query_frames.last().copied().is_some_and(|frame| {
@@ -2136,7 +2114,7 @@ impl QueryExecutor {
                 &mut owner_relative_frames,
                 parser_depth,
                 clause_kind,
-                &trimmed_upper,
+                trimmed_upper,
             );
             let active_frame = query_frames.last().copied();
             let active_with_plsql_scope = active_frame.is_some_and(|frame| {
@@ -2225,7 +2203,7 @@ impl QueryExecutor {
             let owner_relative_body_header_line =
                 active_owner_relative_frame.is_some_and(|frame| {
                     frame
-                        .body_header_line_state(&owner_relative_detection_upper)
+                        .body_header_line_state(owner_relative_detection_upper)
                         .is_header
                 });
             if let Some(frame) = active_frame {
@@ -2278,7 +2256,7 @@ impl QueryExecutor {
                     from_item_list_body_depth: None,
                     pending_from_item_body: false,
                     multitable_insert_branch_depth: 0,
-                    is_multitable_insert: Self::line_is_multitable_insert_header(&trimmed_upper),
+                    is_multitable_insert: Self::line_is_multitable_insert_header(trimmed_upper),
                     merge_branch_body_depth: None,
                     merge_branch_action: None,
                     pending_merge_branch_header: None,
@@ -2296,11 +2274,11 @@ impl QueryExecutor {
                             && parser_depth == frame.start_parser_depth)
                 });
                 let is_merge_using_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_using_clause(&clause_detection_upper);
+                    && Self::auto_format_is_merge_using_clause(clause_detection_upper);
                 let is_merge_on_clause = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_on_clause(&clause_detection_upper);
+                    && Self::auto_format_is_merge_on_clause(clause_detection_upper);
                 let is_merge_branch_header = frame.head_kind == Some(AutoFormatClauseKind::Merge)
-                    && Self::auto_format_is_merge_branch_header(&clause_detection_upper);
+                    && Self::auto_format_is_merge_branch_header(clause_detection_upper);
                 current_line_suspends_merge_branch_condition =
                     sql_text::line_suspends_active_merge_branch_condition_state(
                         clause_detection_trimmed,
@@ -2345,7 +2323,7 @@ impl QueryExecutor {
                         )
                     );
                 let is_merge_branch_condition_clause = frame.merge_branch_body_depth.is_some()
-                    && Self::auto_format_is_merge_branch_condition_clause(&clause_detection_upper);
+                    && Self::auto_format_is_merge_branch_condition_clause(clause_detection_upper);
                 let is_merge_branch_dml = frame.head_kind == Some(AutoFormatClauseKind::Merge)
                     && matches!(
                         clause_kind,
@@ -2362,15 +2340,15 @@ impl QueryExecutor {
                     );
                 let is_multitable_insert_branch_header = frame.is_multitable_insert
                     && (sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &trimmed_upper,
+                        trimmed_upper,
                         &["WHEN"],
                     ) || sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &trimmed_upper,
+                        trimmed_upper,
                         &["ELSE"],
                     ));
-                let is_join_clause = Self::auto_format_is_join_clause(&clause_detection_upper);
+                let is_join_clause = Self::auto_format_is_join_clause(clause_detection_upper);
                 let is_join_condition_clause = !current_line_is_mysql_on_duplicate_key_update
-                    && Self::auto_format_is_join_condition_clause(&clause_detection_upper);
+                    && Self::auto_format_is_join_condition_clause(clause_detection_upper);
                 current_line_is_join_clause = is_join_clause;
                 current_line_is_join_condition_clause = is_join_condition_clause;
                 let from_item_list_body_depth = frame
@@ -2387,7 +2365,7 @@ impl QueryExecutor {
                 let is_query_condition_continuation_clause =
                     !current_line_is_mysql_on_duplicate_key_update
                         && Self::auto_format_is_query_condition_continuation_clause(
-                            &clause_detection_upper,
+                            clause_detection_upper,
                         );
                 let current_line_starts_pending_merge_branch_header = frame.head_kind
                     == Some(AutoFormatClauseKind::Merge)
@@ -2399,7 +2377,7 @@ impl QueryExecutor {
                         && active_merge_branch_header
                             .is_none_or(|progress| progress.uses_condition_depth);
                 let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
-                    && Self::auto_format_is_for_update_clause(&clause_detection_upper);
+                    && Self::auto_format_is_for_update_clause(clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
                 current_line_is_for_update_update_continuation = is_for_update_update_continuation;
@@ -2559,7 +2537,7 @@ impl QueryExecutor {
 
             if let Some(with_plsql_body_depth) = Self::with_plsql_auto_body_depth_for_line(
                 &with_plsql_auto_format_state,
-                &trimmed_upper,
+                trimmed_upper,
                 current_line_starts_elsif,
                 current_line_starts_elseif,
                 current_line_is_exact_else,
@@ -2656,16 +2634,16 @@ impl QueryExecutor {
                         frame.from_item_list_body_depth =
                             Some(frame.query_base_depth.saturating_add(1));
                         frame.pending_from_item_body =
-                            Self::line_is_standalone_from_clause_header(&trimmed_upper);
+                            Self::line_is_standalone_from_clause_header(trimmed_upper);
                     } else if frame.pending_from_item_body {
                         frame.pending_from_item_body = false;
                     }
                     if frame.is_multitable_insert {
                         if sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                            &trimmed_upper,
+                            trimmed_upper,
                             &["WHEN"],
                         ) || sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                            &trimmed_upper,
+                            trimmed_upper,
                             &["ELSE"],
                         ) {
                             frame.multitable_insert_branch_depth = 1;
@@ -2692,7 +2670,7 @@ impl QueryExecutor {
                             frame.pending_merge_branch_header = Some(pending_kind);
                             frame.merge_branch_body_depth = None;
                             frame.merge_branch_action = None;
-                        } else if Self::auto_format_is_merge_branch_header(&trimmed_upper) {
+                        } else if Self::auto_format_is_merge_branch_header(trimmed_upper) {
                             frame.pending_merge_branch_header = None;
                             frame.merge_branch_body_depth =
                                 Some(frame.query_base_depth.saturating_add(1));
@@ -2718,7 +2696,7 @@ impl QueryExecutor {
                         }
                     }
                     if frame.head_kind == Some(AutoFormatClauseKind::Select) {
-                        if Self::auto_format_is_for_update_split_header(&trimmed_upper) {
+                        if Self::auto_format_is_for_update_split_header(trimmed_upper) {
                             frame.pending_for_update_clause_update_line = true;
                         } else if (frame.pending_for_update_clause_update_line
                             && clause_kind == Some(AutoFormatClauseKind::Update))
@@ -2727,11 +2705,11 @@ impl QueryExecutor {
                             frame.pending_for_update_clause_update_line = false;
                         }
                     }
-                    if Self::auto_format_is_join_condition_clause(&clause_detection_upper) {
+                    if Self::auto_format_is_join_condition_clause(clause_detection_upper) {
                         frame.pending_join_condition_continuation = true;
-                    } else if Self::auto_format_is_join_clause(&clause_detection_upper)
+                    } else if Self::auto_format_is_join_clause(clause_detection_upper)
                         || (!Self::auto_format_is_query_condition_continuation_clause(
-                            &clause_detection_upper,
+                            clause_detection_upper,
                         ) && clause_kind.is_some())
                     {
                         frame.pending_join_condition_continuation = false;
@@ -2872,7 +2850,7 @@ impl QueryExecutor {
                                 .unwrap_or(false)
                         })
                     && sql_text::starts_with_format_model_multiline_owner_tail(
-                        &owner_relative_detection_upper,
+                        owner_relative_detection_upper,
                     );
 
             if let (Some(frame), Some(nested_paren_depth_after_line)) = (
@@ -2974,8 +2952,8 @@ impl QueryExecutor {
                     )
                 }),
                 trigger_header_frame.is_some()
-                    && (sql_text::starts_with_keyword_token(&trimmed_upper, "FOR")
-                        || sql_text::starts_with_keyword_token(&trimmed_upper, "WHEN")),
+                    && (sql_text::starts_with_keyword_token(trimmed_upper, "FOR")
+                        || sql_text::starts_with_keyword_token(trimmed_upper, "WHEN")),
                 &mut pending_condition_headers,
                 &mut active_condition_frames,
             );
@@ -3009,7 +2987,7 @@ impl QueryExecutor {
             let pure_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
                 && !sql_text::line_has_leading_significant_close_paren(line)
-                && Self::auto_format_is_query_condition_continuation_clause(&trimmed_upper)
+                && Self::auto_format_is_query_condition_continuation_clause(trimmed_upper)
                 && pending_condition_close_continuation_for_line.is_some_and(|frame| {
                     Some(frame.header_line_idx) == context.condition_header_line
                         && Some(frame.header_depth) == context.condition_header_depth
@@ -3092,18 +3070,18 @@ impl QueryExecutor {
                 .map(|frame| frame.owner_base_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.owner_base_depth))
                 .or_else(|| completed_plsql_child_query_owner.map(|frame| frame.owner_base_depth))
-                .unwrap_or_else(|| Self::pending_query_owner_base_depth(context, &trimmed_upper));
+                .unwrap_or_else(|| Self::pending_query_owner_base_depth(context, trimmed_upper));
             let next_query_head_depth = pending_split_query_owner_for_line
                 .map(|frame| frame.next_query_head_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.next_query_head_depth))
                 .or_else(|| {
                     completed_plsql_child_query_owner.map(|frame| frame.next_query_head_depth)
                 })
-                .unwrap_or_else(|| Self::next_query_head_depth(context, &trimmed_upper));
+                .unwrap_or_else(|| Self::next_query_head_depth(context, trimmed_upper));
             let line_opens_child_query =
                 Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                     && continued_plsql_child_query_owner.is_none();
-            let owns_next_query = Self::line_owns_next_query(&trimmed_upper)
+            let owns_next_query = Self::line_owns_next_query(trimmed_upper)
                 || current_line_is_generic_split_query_owner
                 || Self::line_ends_with_then_before_inline_comment(trimmed)
                 || Self::line_ends_with_keyword_before_inline_comment_owns_query(trimmed)
@@ -3181,7 +3159,7 @@ impl QueryExecutor {
                 };
 
             if let Some(frame) = owner_relative_frames.last_mut() {
-                frame.note_body_header_line(&owner_relative_detection_upper);
+                frame.note_body_header_line(owner_relative_detection_upper);
             }
             Self::apply_remaining_multiline_owner_relative_paren_profile(
                 &mut owner_relative_frames,
@@ -3265,7 +3243,7 @@ impl QueryExecutor {
                 None
             };
 
-            if sql_text::starts_with_keyword_token(&owner_relative_detection_upper, "MODEL") {
+            if sql_text::starts_with_keyword_token(owner_relative_detection_upper, "MODEL") {
                 owner_relative_frames.push(OwnerRelativeDepthFrame::model_clause(
                     context.auto_depth,
                     parser_depth,
@@ -3347,7 +3325,7 @@ impl QueryExecutor {
                     owner_depth: context.auto_depth,
                     header_state: Self::mysql_declare_handler_header_state_after_line(
                         trimmed,
-                        MySqlDeclareHandlerHeaderState::AwaitingConditionStart,
+                        MySqlDeclareHandlerHeaderState::ConditionStart,
                         true,
                     ),
                 })
@@ -3387,7 +3365,7 @@ impl QueryExecutor {
                     });
                 }
             }
-            if sql_text::starts_with_keyword_token(&trimmed_upper, "FORALL") {
+            if sql_text::starts_with_keyword_token(trimmed_upper, "FORALL") {
                 forall_body_frame = Some(ForallBodyDepthFrame {
                     owner_depth: context.auto_depth,
                 });
@@ -4757,9 +4735,7 @@ impl QueryExecutor {
         let paren_profile = sql_text::significant_paren_profile(trimmed);
         let has_non_leading_paren_events = paren_profile
             .events
-            .iter()
-            .skip(paren_profile.leading_close_count)
-            .next()
+            .get(paren_profile.leading_close_count)
             .is_some();
         let leading_close_comma_list_continuation = paren_profile.leading_close_count > 0
             && Self::line_ends_with_comma_before_inline_comment(trimmed)
@@ -4841,9 +4817,7 @@ impl QueryExecutor {
         let paren_profile = sql_text::significant_paren_profile(trimmed);
         let has_non_leading_paren_events = paren_profile
             .events
-            .iter()
-            .skip(paren_profile.leading_close_count)
-            .next()
+            .get(paren_profile.leading_close_count)
             .is_some();
         let leading_close_comma_list_continuation = paren_profile.leading_close_count > 0
             && Self::line_ends_with_comma_before_inline_comment(trimmed)
@@ -11502,12 +11476,12 @@ from (a
         );
         assert_eq!(
             contexts[inner_join_idx].line_semantic,
-            crate::db::AutoFormatLineSemantic::JoinClause,
+            AutoFormatLineSemantic::JoinClause,
             "INNER JOIN line should be classified once by the analyzer as a join clause"
         );
         assert_eq!(
             contexts[on_idx].line_semantic,
-            crate::db::AutoFormatLineSemantic::JoinConditionClause,
+            AutoFormatLineSemantic::JoinConditionClause,
             "ON line should be classified once by the analyzer as a join condition clause"
         );
         assert_eq!(

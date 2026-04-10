@@ -2828,9 +2828,9 @@ pub(crate) fn meaningful_identifier_words_before_inline_comment(
     identifiers
 }
 
-pub(crate) fn meaningful_identifier_words_array_before_inline_comment<'a, const N: usize>(
-    line: &'a str,
-) -> [Option<&'a str>; N] {
+pub(crate) fn meaningful_identifier_words_array_before_inline_comment<const N: usize>(
+    line: &str,
+) -> [Option<&str>; N] {
     let mut identifiers = [None; N];
     for (slot, word) in identifiers
         .iter_mut()
@@ -3250,6 +3250,7 @@ pub(crate) fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
         || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(line, &["WHEN"])
 }
 
+#[cfg(test)]
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS)
 }
@@ -3709,6 +3710,7 @@ fn starts_with_auto_format_structural_continuation_boundary_without_expression_o
 ///
 /// This intentionally excludes generic expression owners such as `MULTISET`
 /// so callers can keep operator RHS continuation on those lines when needed.
+#[cfg(test)]
 pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
     line: &str,
 ) -> bool {
@@ -3717,6 +3719,7 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
     )
 }
 
+#[cfg(test)]
 pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_for_structural_tail(
     trimmed: &str,
 ) -> bool {
@@ -3975,6 +3978,7 @@ impl FormatQueryOwnerKind {
 
     /// Returns the structural formatter depth for the next nested query head
     /// relative to this owner line and the surrounding resolved query base.
+    #[cfg(test)]
     pub(crate) fn formatter_child_query_head_depth(
         self,
         resolved_owner_depth: usize,
