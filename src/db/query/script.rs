@@ -1853,8 +1853,46 @@ impl QueryExecutor {
 
         let multiline_string_prefix_lengths =
             sql_text::multiline_string_continuation_prefix_lengths(sql, lines.len());
-        let next_code_indices =
-            Self::auto_format_next_code_line_indices(&lines, &multiline_string_prefix_lengths);
+        let analysis_lines: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                multiline_string_prefix_lengths
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|prefix_len| line.get(prefix_len..))
+                    .unwrap_or(line)
+            })
+            .collect();
+        let structural_trimmed_lines: Vec<&str> = analysis_lines
+            .iter()
+            .map(|line| sql_text::auto_format_structural_tail(line.trim_start()))
+            .collect();
+        let structural_upper_lines: Vec<String> = structural_trimmed_lines
+            .iter()
+            .map(|line| line.to_ascii_uppercase())
+            .collect();
+        let leading_identifier_words: Vec<[Option<&str>; 4]> = structural_trimmed_lines
+            .iter()
+            .map(|line| {
+                sql_text::meaningful_identifier_words_array_before_inline_comment::<4>(line)
+            })
+            .collect();
+        let standalone_open_paren_lines: Vec<bool> = structural_trimmed_lines
+            .iter()
+            .map(|line| sql_text::line_is_standalone_open_paren_before_inline_comment(line))
+            .collect();
+        let owner_relative_trimmed_lines: Vec<&str> = structural_trimmed_lines
+            .iter()
+            .map(|line| sql_text::trim_after_leading_close_parens(line))
+            .collect();
+        let owner_relative_upper_lines: Vec<String> = owner_relative_trimmed_lines
+            .iter()
+            .map(|line| line.to_ascii_uppercase())
+            .collect();
+        let (_previous_code_indices, next_code_indices) =
+            Self::auto_format_code_line_neighbors(&analysis_lines);
         let mut contexts = Vec::with_capacity(lines.len());
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
         let mut pending_query_bases: Vec<PendingQueryBaseFrame> = Vec::new();
@@ -1872,8 +1910,7 @@ impl QueryExecutor {
         > = None;
         let mut pending_window_definition_owner: Option<PendingWindowDefinitionOwnerFrame> = None;
         let mut pending_line_continuation: Option<LineCarrySnapshot> = None;
-        let mut pending_inline_comment_line_continuation: Option<LineCarrySnapshot> =
-            None;
+        let mut pending_inline_comment_line_continuation: Option<LineCarrySnapshot> = None;
         let mut trigger_header_frame: Option<TriggerHeaderDepthFrame> = None;
         let mut mysql_trigger_body_frame: Option<MySqlTriggerBodyDepthFrame> = None;
         let mut forall_body_frame: Option<ForallBodyDepthFrame> = None;
@@ -1893,12 +1930,7 @@ impl QueryExecutor {
         let mut mysql_on_duplicate_key_update_active = false;
 
         for (idx, line) in lines.iter().enumerate() {
-            let analysis_line = multiline_string_prefix_lengths
-                .get(idx)
-                .copied()
-                .flatten()
-                .and_then(|prefix_len| line.get(prefix_len..))
-                .unwrap_or(line);
+            let analysis_line = analysis_lines.get(idx).copied().unwrap_or(line);
             let parser_depth = parser_depths.get(idx).copied().unwrap_or(0);
             let trimmed = analysis_line.trim_start();
             let mut context = AutoFormatLineContext {
@@ -1977,12 +2009,24 @@ impl QueryExecutor {
                     "END",
                 );
 
-            let trimmed_upper = sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase();
+            let structural_trimmed = structural_trimmed_lines
+                .get(idx)
+                .copied()
+                .unwrap_or(trimmed);
+            let structural_upper = structural_upper_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or("");
+            let line_words = leading_identifier_words
+                .get(idx)
+                .copied()
+                .unwrap_or([None; 4]);
+            let trimmed_upper = structural_upper;
             let current_line_starts_end_keyword =
-                sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                sql_text::identifier_words_start_with(&line_words, &["END"])
                     || current_line_is_mysql_custom_delimited_end;
             let treat_values_as_subquery_head = !(mysql_on_duplicate_key_update_active
-                && sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES"));
+                && sql_text::identifier_words_first_is(&line_words, "VALUES"));
             resolve_pending_auto_format_subquery_parens(
                 &mut auto_format_subquery_paren_stack,
                 &mut pending_auto_format_subquery_paren_count,
@@ -1993,10 +2037,10 @@ impl QueryExecutor {
                 sql_text::line_has_leading_significant_close_paren(trimmed);
             let leading_close_has_mixed_continuation = line_has_leading_close_paren
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
-            let clause_detection_trimmed = sql_text::auto_format_structural_tail(trimmed);
-            let clause_detection_upper = clause_detection_trimmed.to_ascii_uppercase();
+            let clause_detection_trimmed = structural_trimmed;
+            let clause_detection_upper = structural_upper;
             let mysql_compound_declare = mysql_routine_body_active
-                && sql_text::starts_with_keyword_token(&clause_detection_upper, "DECLARE");
+                && sql_text::identifier_words_first_is(&line_words, "DECLARE");
             let current_line_mysql_declare_owner_kind = mysql_compound_declare
                 .then(|| sql_text::mysql_declare_owner_kind(clause_detection_trimmed))
                 .flatten();
@@ -2010,70 +2054,40 @@ impl QueryExecutor {
                     &clause_detection_upper,
                 );
             let current_line_starts_elsif =
-                sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["ELSIF"],
-                );
+                sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
-                sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["ELSEIF"],
-                );
+                sql_text::identifier_words_start_with(&line_words, &["ELSEIF"]);
             let current_line_is_mysql_on_duplicate_key_update =
-                sql_text::line_is_mysql_on_duplicate_key_update_clause(clause_detection_trimmed);
+                sql_text::identifier_words_start_with(
+                    &line_words,
+                    &["ON", "DUPLICATE", "KEY", "UPDATE"],
+                );
             let current_line_is_mysql_on_duplicate_values_function =
                 mysql_on_duplicate_key_update_active
                     && inside_non_subquery_paren_context
-                    && sql_text::starts_with_keyword_token(&clause_detection_upper, "VALUES");
+                    && sql_text::identifier_words_first_is(&line_words, "VALUES");
             let current_line_is_exact_else =
-                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["ELSE"],
-                );
+                sql_text::identifier_words_exact(&line_words, &["ELSE"]);
             let current_line_is_exact_then =
-                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["THEN"],
-                );
+                sql_text::identifier_words_exact(&line_words, &["THEN"]);
             let current_line_is_exact_exception =
-                sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    clause_detection_trimmed,
-                    &["EXCEPTION"],
-                );
+                sql_text::identifier_words_exact(&line_words, &["EXCEPTION"]);
             let current_line_is_plain_end =
-                sql_text::starts_with_keyword_token(&clause_detection_upper, "END")
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "IF"],
-                    )
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "CASE"],
-                    )
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "LOOP"],
-                    )
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "WHILE"],
-                    )
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "REPEAT"],
-                    )
-                    && !sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                        &clause_detection_upper,
-                        &["END", "FOR"],
-                    );
+                sql_text::identifier_words_start_with(&line_words, &["END"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "IF"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "CASE"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "LOOP"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "WHILE"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "REPEAT"])
+                    && !sql_text::identifier_words_start_with(&line_words, &["END", "FOR"]);
             let is_trigger_header_begin = trigger_header_frame.is_some()
                 && parser_depth == 0
-                && sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN");
+                && sql_text::identifier_words_first_is(&line_words, "BEGIN");
             let is_trigger_header_body_line = trigger_header_frame.is_some()
                 && parser_depth == 0
-                && !sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                && !sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE")
-                && !sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
+                && !sql_text::identifier_words_first_is(&line_words, "BEGIN")
+                && !sql_text::identifier_words_first_is(&line_words, "DECLARE")
+                && !sql_text::identifier_words_first_is(&line_words, "CREATE")
                 && !current_line_starts_end_keyword;
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
@@ -2103,8 +2117,13 @@ impl QueryExecutor {
             let current_line_is_window_clause_definition_header =
                 pending_window_definition_owner_for_line.is_some()
                     && Self::line_is_window_clause_definition_header(trimmed);
-            let split_query_owner_lookahead_kind =
-                Self::split_query_owner_lookahead_kind(&lines, idx, &next_code_indices, trimmed);
+            let split_query_owner_lookahead_kind = Self::split_query_owner_lookahead_kind(
+                idx,
+                &next_code_indices,
+                &structural_upper_lines,
+                &standalone_open_paren_lines,
+                trimmed,
+            );
             let current_line_is_generic_split_query_owner = matches!(
                 split_query_owner_lookahead_kind,
                 Some(sql_text::SplitQueryOwnerLookaheadKind::GenericExpression)
@@ -2144,14 +2163,20 @@ impl QueryExecutor {
                 .get(idx)
                 .copied()
                 .flatten()
-                .and_then(|next_idx| lines.get(next_idx).copied());
-            let current_line_is_standalone_open_paren =
-                Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
+                .and_then(|next_idx| analysis_lines.get(next_idx).copied());
+            let current_line_is_standalone_open_paren = standalone_open_paren_lines
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
             let blocks_structural_line_continuation = ((!suppress_non_subquery_paren_layout_clause
-                && Self::line_starts_continuation_boundary(trimmed))
+                && sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+                    clause_detection_trimmed,
+                ))
                 || (leading_close_has_mixed_continuation
                     && !suppress_non_subquery_paren_layout_clause
-                    && Self::line_starts_continuation_boundary(clause_detection_trimmed)))
+                    && sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+                        clause_detection_trimmed,
+                    )))
                 && !current_line_is_standalone_open_paren;
             let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
                 pending_split_query_owner.take()
@@ -2176,10 +2201,14 @@ impl QueryExecutor {
                         &multiline_clause_paren_profile,
                     )
                 });
-            let owner_relative_detection_trimmed =
-                sql_text::trim_after_leading_close_parens(clause_detection_trimmed);
-            let owner_relative_detection_upper =
-                owner_relative_detection_trimmed.to_ascii_uppercase();
+            let owner_relative_detection_trimmed = owner_relative_trimmed_lines
+                .get(idx)
+                .copied()
+                .unwrap_or(clause_detection_trimmed);
+            let owner_relative_detection_upper = owner_relative_upper_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or("");
             let closes_multiline_clause_owner_depth =
                 Self::consume_leading_multiline_clause_owner_relative_paren_closes(
                     &mut owner_relative_frames,
@@ -2837,9 +2866,10 @@ impl QueryExecutor {
                         .copied()
                         .flatten()
                         .is_some_and(|next_idx| {
-                            Self::line_is_standalone_open_paren_before_inline_comment(
-                                lines[next_idx],
-                            )
+                            standalone_open_paren_lines
+                                .get(next_idx)
+                                .copied()
+                                .unwrap_or(false)
                         })
                     && sql_text::starts_with_format_model_multiline_owner_tail(
                         &owner_relative_detection_upper,
@@ -4214,33 +4244,32 @@ impl QueryExecutor {
         }
     }
 
-    fn auto_format_next_code_line_indices(
-        lines: &[&str],
-        multiline_string_prefix_lengths: &[Option<usize>],
-    ) -> Vec<Option<usize>> {
+    fn auto_format_code_line_neighbors(lines: &[&str]) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
         let mut is_code_line = vec![false; lines.len()];
         let mut in_block_comment = false;
 
         for (idx, line) in lines.iter().enumerate() {
-            let analysis_line = multiline_string_prefix_lengths
-                .get(idx)
-                .copied()
-                .flatten()
-                .and_then(|prefix_len| line.get(prefix_len..))
-                .unwrap_or(line);
-            let trimmed = analysis_line.trim_start();
+            let trimmed = line.trim_start();
 
             if trimmed.is_empty() {
                 continue;
             }
 
-            if sql_text::line_is_comment_only_with_block_state(analysis_line, &mut in_block_comment)
-            {
+            if sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
                 continue;
             }
             sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
 
             is_code_line[idx] = true;
+        }
+
+        let mut previous_code_indices = vec![None; lines.len()];
+        let mut previous_code_idx = None;
+        for idx in 0..lines.len() {
+            previous_code_indices[idx] = previous_code_idx;
+            if is_code_line[idx] {
+                previous_code_idx = Some(idx);
+            }
         }
 
         let mut next_code_indices = vec![None; lines.len()];
@@ -4252,27 +4281,26 @@ impl QueryExecutor {
             }
         }
 
-        next_code_indices
+        (previous_code_indices, next_code_indices)
     }
 
     fn split_query_owner_lookahead_kind(
-        lines: &[&str],
         idx: usize,
         next_code_indices: &[Option<usize>],
+        structural_upper_lines: &[String],
+        standalone_open_paren_lines: &[bool],
         line: &str,
     ) -> Option<sql_text::SplitQueryOwnerLookaheadKind> {
         let open_idx = next_code_indices.get(idx).copied().flatten()?;
         let head_idx = next_code_indices.get(open_idx).copied().flatten()?;
-        let head_upper = Self::structural_line_upper(lines[head_idx]);
         sql_text::split_query_owner_lookahead_kind(
             line,
-            Self::line_is_standalone_open_paren_before_inline_comment(lines[open_idx]),
-            Some(&head_upper),
+            standalone_open_paren_lines
+                .get(open_idx)
+                .copied()
+                .unwrap_or(false),
+            structural_upper_lines.get(head_idx).map(String::as_str),
         )
-    }
-
-    fn structural_line_upper(line: &str) -> String {
-        sql_text::auto_format_structural_tail(line).to_ascii_uppercase()
     }
 
     fn auto_format_multiline_owner_depth(
@@ -4736,7 +4764,8 @@ impl QueryExecutor {
         let leading_close_comma_list_continuation = paren_profile.leading_close_count > 0
             && Self::line_ends_with_comma_before_inline_comment(trimmed)
             && query_base_depth.is_some();
-        if kind.is_none() && !has_non_leading_paren_events && !leading_close_comma_list_continuation {
+        if kind.is_none() && !has_non_leading_paren_events && !leading_close_comma_list_continuation
+        {
             return None;
         }
 
@@ -4774,7 +4803,8 @@ impl QueryExecutor {
                 }
             }
         }
-        if let Some(base_depth) = query_base_depth.filter(|_| leading_close_comma_list_continuation) {
+        if let Some(base_depth) = query_base_depth.filter(|_| leading_close_comma_list_continuation)
+        {
             carry_depth = carry_depth.max(base_depth.saturating_add(1));
         }
         Some(LineCarrySnapshot {
@@ -4818,7 +4848,8 @@ impl QueryExecutor {
         let leading_close_comma_list_continuation = paren_profile.leading_close_count > 0
             && Self::line_ends_with_comma_before_inline_comment(trimmed)
             && query_base_depth.is_some();
-        if kind.is_none() && !has_non_leading_paren_events && !leading_close_comma_list_continuation {
+        if kind.is_none() && !has_non_leading_paren_events && !leading_close_comma_list_continuation
+        {
             return None;
         }
 
@@ -4856,7 +4887,8 @@ impl QueryExecutor {
                 }
             }
         }
-        if let Some(base_depth) = query_base_depth.filter(|_| leading_close_comma_list_continuation) {
+        if let Some(base_depth) = query_base_depth.filter(|_| leading_close_comma_list_continuation)
+        {
             carry_depth = carry_depth.max(base_depth.saturating_add(1));
         }
         Some(LineCarrySnapshot {
@@ -4876,9 +4908,15 @@ impl QueryExecutor {
             return None;
         }
 
-        let continuation_depth = Self::line_continuation_kind(trimmed).map(|kind| {
-            Self::resolve_line_continuation_depth(trimmed, kind, render_depth, query_base_depth)
-        });
+        let structural_trimmed = sql_text::auto_format_structural_tail(trimmed);
+        let structural_trimmed_upper = structural_trimmed.to_ascii_uppercase();
+        let continuation_depth =
+            sql_text::format_inline_comment_continuation_kind_for_structural_tail(
+                structural_trimmed,
+            )
+            .map(|kind| {
+                Self::resolve_line_continuation_depth(trimmed, kind, render_depth, query_base_depth)
+            });
         let paren_profile = sql_text::significant_paren_profile(trimmed);
         let mut carry_depth = continuation_depth.unwrap_or(render_depth);
         for event in paren_profile
@@ -4903,21 +4941,15 @@ impl QueryExecutor {
             .any(|event| matches!(event, sql_text::SignificantParenEvent::Open));
         let starts_body_frame = continuation_depth.is_none()
             && !has_non_leading_open
-            && (sql_text::format_bare_structural_header_continuation_kind(trimmed).is_some()
+            && (sql_text::format_bare_structural_header_continuation_kind_for_structural_tail(
+                structural_trimmed,
+            )
+            .is_some()
                 || Self::line_has_trailing_continuation_operator(trimmed)
                 || line_semantic.is_condition_continuation()
-                || sql_text::starts_with_keyword_token(
-                    &sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase(),
-                    "THEN",
-                )
-                || sql_text::starts_with_keyword_token(
-                    &sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase(),
-                    "ELSE",
-                )
-                || sql_text::starts_with_keyword_token(
-                    &sql_text::auto_format_structural_tail(trimmed).to_ascii_uppercase(),
-                    "EXCEPTION",
-                ));
+                || sql_text::starts_with_keyword_token(&structural_trimmed_upper, "THEN")
+                || sql_text::starts_with_keyword_token(&structural_trimmed_upper, "ELSE")
+                || sql_text::starts_with_keyword_token(&structural_trimmed_upper, "EXCEPTION"));
 
         if starts_body_frame {
             carry_depth = carry_depth.saturating_add(1);
@@ -11157,17 +11189,15 @@ UPDATE OF e.sal NOWAIT;"#;
 
     #[test]
     fn line_continuation_helpers_stop_at_semicolon_before_inline_comment() {
-        assert!(
-            QueryExecutor::line_continuation_for_line(
-                "SELECT",
-                0,
-                Some(0),
-                Some("empno"),
-                AutoFormatConditionRole::None,
-                None,
-            )
-                .is_some()
-        );
+        assert!(QueryExecutor::line_continuation_for_line(
+            "SELECT",
+            0,
+            Some(0),
+            Some("empno"),
+            AutoFormatConditionRole::None,
+            None,
+        )
+        .is_some());
         assert!(QueryExecutor::line_continuation_for_line(
             "SELECT; -- done",
             0,
@@ -20547,7 +20577,9 @@ END$$"#;
             .unwrap_or(0);
         let insert_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "INSERT INTO boss_audit (event_time, payload_json)")
+            .position(|line| {
+                line.trim_start() == "INSERT INTO boss_audit (event_time, payload_json)"
+            })
             .unwrap_or(0);
         let commit_idx = lines
             .iter()
@@ -20596,7 +20628,8 @@ END$$"#;
         let insert_idx = lines
             .iter()
             .position(|line| {
-                line.trim_start() == "INSERT INTO boss_order_item (quantity, unit_price, discount_rate)"
+                line.trim_start()
+                    == "INSERT INTO boss_order_item (quantity, unit_price, discount_rate)"
             })
             .unwrap_or(0);
         let commit_idx = lines

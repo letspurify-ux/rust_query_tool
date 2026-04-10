@@ -2828,6 +2828,43 @@ pub(crate) fn meaningful_identifier_words_before_inline_comment(
     identifiers
 }
 
+pub(crate) fn meaningful_identifier_words_array_before_inline_comment<'a, const N: usize>(
+    line: &'a str,
+) -> [Option<&'a str>; N] {
+    let mut identifiers = [None; N];
+    for (slot, word) in identifiers
+        .iter_mut()
+        .zip(meaningful_identifier_words_before_inline_comment(line, N).into_iter())
+    {
+        *slot = Some(word);
+    }
+
+    identifiers
+}
+
+pub(crate) fn identifier_words_start_with(words: &[Option<&str>], sequence: &[&str]) -> bool {
+    sequence.iter().enumerate().all(|(idx, expected)| {
+        words
+            .get(idx)
+            .copied()
+            .flatten()
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    })
+}
+
+pub(crate) fn identifier_words_exact(words: &[Option<&str>], sequence: &[&str]) -> bool {
+    identifier_words_start_with(words, sequence)
+        && words.get(sequence.len()).copied().flatten().is_none()
+}
+
+pub(crate) fn identifier_words_first_is(words: &[Option<&str>], keyword: &str) -> bool {
+    words
+        .first()
+        .copied()
+        .flatten()
+        .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+}
+
 fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
     let bytes = line.as_bytes();
     let mut idx = 0usize;
@@ -3675,9 +3712,15 @@ fn starts_with_auto_format_structural_continuation_boundary_without_expression_o
 pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner(
     line: &str,
 ) -> bool {
-    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_for_structural_tail(
         auto_format_structural_tail(line),
     )
+}
+
+pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_expression_owner_for_structural_tail(
+    trimmed: &str,
+) -> bool {
+    starts_with_auto_format_structural_continuation_boundary_without_expression_owner_impl(trimmed)
 }
 
 /// Returns true when a line begins any shared structural continuation boundary
@@ -3688,7 +3731,14 @@ pub(crate) fn starts_with_auto_format_structural_continuation_boundary_without_e
 /// and formatter phase 2 can stop clause/list/operator carry through the same
 /// helper.
 pub(crate) fn starts_with_auto_format_structural_continuation_boundary(line: &str) -> bool {
-    let trimmed = auto_format_structural_tail(line);
+    starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+        auto_format_structural_tail(line),
+    )
+}
+
+pub(crate) fn starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+    trimmed: &str,
+) -> bool {
     if trimmed.is_empty() {
         return true;
     }
@@ -6336,7 +6386,7 @@ fn line_is_exact_bare_split_for_update_header(line: &str) -> bool {
         && starts_with_format_for_update_split_header(&trimmed_upper)
 }
 
-fn format_structural_header_continuation_kind_for_structural_tail(
+pub(crate) fn format_structural_header_continuation_kind_for_structural_tail(
     trimmed: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
     if trimmed.is_empty() {
@@ -6378,7 +6428,7 @@ pub(crate) fn format_structural_header_continuation_kind(
     ))
 }
 
-fn format_bare_structural_header_continuation_kind_for_structural_tail(
+pub(crate) fn format_bare_structural_header_continuation_kind_for_structural_tail(
     trimmed: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
     if let Some(kind) = exact_bare_indented_paren_owner_continuation_kind(trimmed) {
@@ -6429,7 +6479,9 @@ pub(crate) fn format_bare_structural_header_continuation_kind(
     )
 }
 
-fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed: &str) -> bool {
+pub(crate) fn line_is_exact_bare_owner_or_pending_header_for_structural_tail(
+    trimmed: &str,
+) -> bool {
     if !line_is_exact_bare_structural_keyword_line(trimmed) {
         return false;
     }
@@ -6456,8 +6508,12 @@ pub(crate) fn line_is_exact_bare_owner_or_pending_header(line: &str) -> bool {
 pub(crate) fn format_inline_comment_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let trimmed = auto_format_structural_tail(line);
+    format_inline_comment_continuation_kind_for_structural_tail(auto_format_structural_tail(line))
+}
 
+pub(crate) fn format_inline_comment_continuation_kind_for_structural_tail(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
     if line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed) {
         if let Some(kind) =
             format_bare_structural_header_continuation_kind_for_structural_tail(trimmed)
@@ -6472,14 +6528,20 @@ pub(crate) fn format_inline_comment_continuation_kind(
         ));
     }
 
-    format_inline_comment_structural_header_continuation_kind(trimmed)
+    format_inline_comment_structural_header_continuation_kind_for_structural_tail(trimmed)
 }
 
 pub(crate) fn format_inline_comment_structural_header_continuation_kind(
     line: &str,
 ) -> Option<FormatInlineCommentHeaderContinuationKind> {
-    let trimmed = auto_format_structural_tail(line);
+    format_inline_comment_structural_header_continuation_kind_for_structural_tail(
+        auto_format_structural_tail(line),
+    )
+}
 
+pub(crate) fn format_inline_comment_structural_header_continuation_kind_for_structural_tail(
+    trimmed: &str,
+) -> Option<FormatInlineCommentHeaderContinuationKind> {
     if line_is_exact_bare_owner_or_pending_header_for_structural_tail(trimmed) {
         if let Some(kind) =
             format_bare_structural_header_continuation_kind_for_structural_tail(trimmed)

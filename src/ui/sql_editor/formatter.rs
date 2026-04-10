@@ -12,6 +12,8 @@ use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
 };
+use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::SqlEditorWidget;
 use super::SqlToken;
@@ -30,6 +32,12 @@ struct LineLayout<'a> {
     raw: &'a str,
     trimmed: &'a str,
     analysis_trimmed: &'a str,
+    structural_trimmed: &'a str,
+    structural_upper: String,
+    owner_relative_trimmed: &'a str,
+    owner_relative_upper: String,
+    leading_words: [Option<&'a str>; 4],
+    is_standalone_open_paren: bool,
     has_leading_close_paren: bool,
     kind: LineLayoutKind,
     preserve_raw: bool,
@@ -186,6 +194,17 @@ struct MeaningfulTokenLinks {
     next: Vec<Option<usize>>,
 }
 
+#[derive(Clone)]
+struct FormatResultCacheEntry {
+    preferred_db_type: Option<DatabaseType>,
+    append_missing_terminator: bool,
+    input: String,
+    output: String,
+}
+
+const FORMAT_RESULT_CACHE_CAPACITY: usize = 8;
+static FORMAT_RESULT_CACHE: OnceLock<Mutex<VecDeque<FormatResultCacheEntry>>> = OnceLock::new();
+
 impl MeaningfulTokenLinks {
     fn build(tokens: &[SqlToken]) -> Self {
         let mut prev = vec![None; tokens.len()];
@@ -216,6 +235,18 @@ impl MeaningfulTokenLinks {
 
     fn next_index(&self, idx: usize) -> Option<usize> {
         self.next.get(idx).copied().flatten()
+    }
+}
+
+fn format_result_cache() -> &'static Mutex<VecDeque<FormatResultCacheEntry>> {
+    FORMAT_RESULT_CACHE
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(FORMAT_RESULT_CACHE_CAPACITY)))
+}
+
+fn format_result_cache_guard() -> MutexGuard<'static, VecDeque<FormatResultCacheEntry>> {
+    match format_result_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -343,19 +374,17 @@ impl FormatterTokenCache {
                 next_non_comment,
                 Some(SqlToken::Word(word)) if crate::sql_text::is_subquery_head_keyword(word)
             );
-            let opens_wrapped_layout_child =
-                SqlEditorWidget::paren_starts_wrapped_layout_head(
-                    tokens,
-                    idx,
-                    Some(meaningful_links),
-                );
-            let opens_owner_relative_child =
-                SqlEditorWidget::paren_multiline_clause_owner_kind(
-                    tokens,
-                    idx,
-                    Some(statement_word_links),
-                )
-                .is_some();
+            let opens_wrapped_layout_child = SqlEditorWidget::paren_starts_wrapped_layout_head(
+                tokens,
+                idx,
+                Some(meaningful_links),
+            );
+            let opens_owner_relative_child = SqlEditorWidget::paren_multiline_clause_owner_kind(
+                tokens,
+                idx,
+                Some(statement_word_links),
+            )
+            .is_some();
             let opens_column_list_child = statement_word_links
                 .prev_word_index(idx)
                 .and_then(|token_idx| tokens.get(token_idx))
@@ -388,7 +417,8 @@ impl FormatterTokenCache {
     }
 
     fn open_paren_multiline_child_head_prefix_counts(&self) -> &[usize] {
-        self.open_paren_multiline_child_head_prefix_counts.as_slice()
+        self.open_paren_multiline_child_head_prefix_counts
+            .as_slice()
     }
 
     fn next_non_comment<'a>(&self, tokens: &'a [SqlToken], idx: usize) -> Option<&'a SqlToken> {
@@ -2291,7 +2321,12 @@ impl SqlEditorWidget {
         std::env::var_os("SPACE_PROFILE_MYSQL_FORMATTER").is_some()
     }
 
-    fn profile_mysql_formatter_stage<F>(stage: &str, input_len: usize, enabled: bool, f: F) -> String
+    fn profile_mysql_formatter_stage<F>(
+        stage: &str,
+        input_len: usize,
+        enabled: bool,
+        f: F,
+    ) -> String
     where
         F: FnOnce() -> String,
     {
@@ -2346,7 +2381,9 @@ impl SqlEditorWidget {
             .or_else(|| Self::previous_word_upper(tokens, prev_idx).map(|(_, idx)| idx));
         second_prev_word_idx
             .and_then(|idx| tokens.get(idx))
-            .is_some_and(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("LOG")))
+            .is_some_and(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("LOG")),
+            )
     }
 
     fn is_multiset_set_operator(
@@ -2379,8 +2416,7 @@ impl SqlEditorWidget {
         if construct.forall_pending.is_active() && keyword == "VALUES" {
             return true;
         }
-        if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx, statement_word_links)
-        {
+        if keyword == "INTO" && Self::is_log_errors_into_clause(tokens, idx, statement_word_links) {
             return true;
         }
         if keyword == "LIMIT" && matches!(prev_word_upper, Some("REJECT")) {
@@ -2403,15 +2439,16 @@ impl SqlEditorWidget {
         false
     }
 
-    fn significant_tokens(tokens: &[SqlToken]) -> Vec<&SqlToken> {
+    fn significant_tokens<'a>(
+        tokens: &'a [SqlToken],
+    ) -> impl DoubleEndedIterator<Item = &'a SqlToken> + 'a {
         tokens
             .iter()
             .filter(|token| !matches!(token, SqlToken::Comment(_)))
-            .collect()
     }
 
     fn starts_with_end_suffix_terminator_tokens(tokens: &[SqlToken]) -> bool {
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         matches!(
             (meaningful.next(), meaningful.next()),
             (Some(SqlToken::Word(first)), Some(SqlToken::Word(second)))
@@ -2446,7 +2483,7 @@ impl SqlEditorWidget {
     }
 
     fn starts_with_plain_end_tokens(tokens: &[SqlToken]) -> bool {
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         matches!(meaningful.next(), Some(SqlToken::Word(first)) if first.eq_ignore_ascii_case("END"))
             && !matches!(
                 meaningful.next(),
@@ -2466,7 +2503,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         matches!(
             (meaningful.next(), meaningful.next()),
             (Some(SqlToken::Word(first)), Some(SqlToken::Word(second)))
@@ -2475,7 +2512,7 @@ impl SqlEditorWidget {
     }
 
     fn starts_with_explicit_case_terminator_tokens(tokens: &[SqlToken]) -> bool {
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         matches!(
             (meaningful.next(), meaningful.next()),
             (Some(SqlToken::Word(first)), Some(SqlToken::Word(second)))
@@ -2489,7 +2526,7 @@ impl SqlEditorWidget {
     }
 
     fn starts_with_bare_end_tokens(tokens: &[SqlToken]) -> bool {
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         match meaningful.next() {
             Some(SqlToken::Word(first)) if first.eq_ignore_ascii_case("END") => {}
             _ => return false,
@@ -3393,6 +3430,53 @@ impl SqlEditorWidget {
         previous.push_str(fragment_trimmed);
     }
 
+    fn format_result_cache_lookup(
+        sql: &str,
+        append_missing_terminator: bool,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> Option<String> {
+        let mut cache = format_result_cache_guard();
+        let entry_idx = cache.iter().position(|entry| {
+            entry.append_missing_terminator == append_missing_terminator
+                && entry.preferred_db_type == preferred_db_type
+                && entry.input == sql
+        })?;
+        let entry = cache.remove(entry_idx)?;
+        let output = entry.output.clone();
+        cache.push_front(entry);
+        Some(output)
+    }
+
+    fn format_result_cache_store(
+        sql: &str,
+        formatted: &str,
+        append_missing_terminator: bool,
+        preferred_db_type: Option<DatabaseType>,
+    ) {
+        let mut cache = format_result_cache_guard();
+        let mut push_entry = |input: &str, output: &str| {
+            if let Some(existing_idx) = cache.iter().position(|entry| {
+                entry.append_missing_terminator == append_missing_terminator
+                    && entry.preferred_db_type == preferred_db_type
+                    && entry.input == input
+            }) {
+                let _ = cache.remove(existing_idx);
+            }
+            cache.push_front(FormatResultCacheEntry {
+                preferred_db_type,
+                append_missing_terminator,
+                input: input.to_string(),
+                output: output.to_string(),
+            });
+            while cache.len() > FORMAT_RESULT_CACHE_CAPACITY {
+                let _ = cache.pop_back();
+            }
+        };
+
+        push_entry(sql, formatted);
+        push_entry(formatted, formatted);
+    }
+
     fn format_sql_basic_for_preferred_db_type(
         sql: &str,
         preferred_db_type: Option<DatabaseType>,
@@ -3405,6 +3489,12 @@ impl SqlEditorWidget {
         append_missing_terminator: bool,
         preferred_db_type: Option<DatabaseType>,
     ) -> String {
+        if let Some(cached) =
+            Self::format_result_cache_lookup(sql, append_missing_terminator, preferred_db_type)
+        {
+            return cached;
+        }
+
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(sql, preferred_db_type),
@@ -3505,6 +3595,12 @@ impl SqlEditorWidget {
             }
         }
 
+        Self::format_result_cache_store(
+            sql,
+            &formatted,
+            append_missing_terminator,
+            preferred_db_type,
+        );
         formatted
     }
 
@@ -3626,11 +3722,13 @@ impl SqlEditorWidget {
     }
 
     fn mysql_labeled_block_target(tokens: &[SqlToken]) -> Option<&str> {
-        let meaningful = Self::significant_tokens(tokens);
-        match meaningful.as_slice() {
-            [SqlToken::Word(_label), SqlToken::Symbol(sym), SqlToken::Word(target), ..]
-                if sym == ":" && crate::sql_text::is_mysql_block_label_target(target) =>
-            {
+        let mut meaningful = Self::significant_tokens(tokens);
+        match (meaningful.next(), meaningful.next(), meaningful.next()) {
+            (
+                Some(SqlToken::Word(_label)),
+                Some(SqlToken::Symbol(sym)),
+                Some(SqlToken::Word(target)),
+            ) if sym == ":" && crate::sql_text::is_mysql_block_label_target(target) => {
                 Some(target.as_str())
             }
             _ => None,
@@ -3660,7 +3758,7 @@ impl SqlEditorWidget {
     }
 
     fn line_ends_with_keyword_before_inline_comment(tokens: &[SqlToken], keyword: &str) -> bool {
-        for token in Self::significant_tokens(tokens).into_iter().rev() {
+        for token in Self::significant_tokens(tokens).rev() {
             match token {
                 SqlToken::Symbol(sym) if sym == ";" => continue,
                 SqlToken::Word(word) => return word.eq_ignore_ascii_case(keyword),
@@ -3672,7 +3770,7 @@ impl SqlEditorWidget {
     }
 
     fn end_suffix_qualifier(tokens: &[SqlToken]) -> Option<&str> {
-        let mut meaningful = Self::significant_tokens(tokens).into_iter();
+        let mut meaningful = Self::significant_tokens(tokens);
         match meaningful.next() {
             Some(SqlToken::Word(first)) if first.eq_ignore_ascii_case("END") => {}
             _ => return None,
@@ -4095,15 +4193,14 @@ impl SqlEditorWidget {
             .or_else(|| Self::previous_meaningful_token_index(tokens, open_paren_idx));
 
         if prev_word == "IF"
-            && prev_meaningful_idx
-                .is_some_and(|if_idx| {
-                    Self::mysql_if_is_scalar_function(
-                        tokens,
-                        if_idx,
-                        meaningful_token_links,
-                        matching_paren_close_indices,
-                    )
-                })
+            && prev_meaningful_idx.is_some_and(|if_idx| {
+                Self::mysql_if_is_scalar_function(
+                    tokens,
+                    if_idx,
+                    meaningful_token_links,
+                    matching_paren_close_indices,
+                )
+            })
         {
             return true;
         }
@@ -4116,12 +4213,11 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let insert_target_column_list =
-            Self::mysql_paren_belongs_to_insert_target_column_list(
-                tokens,
-                open_paren_idx,
-                statement_word_links,
-            );
+        let insert_target_column_list = Self::mysql_paren_belongs_to_insert_target_column_list(
+            tokens,
+            open_paren_idx,
+            statement_word_links,
+        );
         if Self::mysql_paren_follows_named_key_definition(
             tokens,
             open_paren_idx,
@@ -5361,14 +5457,13 @@ impl SqlEditorWidget {
                         && !mysql_declare_handler_for_clause;
                     let mysql_declare_for_clause =
                         mysql_declare_cursor_for_clause || mysql_declare_handler_for_clause;
-                    let mysql_if_exists_modifier =
-                        upper == "IF"
-                            && Self::is_mysql_if_exists_modifier(
-                                tokens,
-                                idx,
-                                next_word,
-                                Some(token_cache.statement_word_links()),
-                            );
+                    let mysql_if_exists_modifier = upper == "IF"
+                        && Self::is_mysql_if_exists_modifier(
+                            tokens,
+                            idx,
+                            next_word,
+                            Some(token_cache.statement_word_links()),
+                        );
                     let mysql_scalar_if_function = mysql_compatible
                         && upper == "IF"
                         && Self::mysql_if_is_scalar_function(
@@ -6314,8 +6409,8 @@ impl SqlEditorWidget {
                                 8,
                                 Some(token_cache.statement_word_links()),
                             )
-                                .iter()
-                                .any(|word| word.eq_ignore_ascii_case("WHILE"))
+                            .iter()
+                            .any(|word| word.eq_ignore_ascii_case("WHILE"))
                         {
                             after_for_while = false;
                             block_stack.push("WHILE".to_string());
@@ -7428,27 +7523,27 @@ impl SqlEditorWidget {
                                 Some(SqlToken::Word(word))
                                     if crate::sql_text::is_subquery_head_keyword(word)
                             );
-                            let wraps_subquery_or_case_head = Self::paren_starts_wrapped_layout_head(
-                                tokens,
-                                idx,
-                                Some(token_cache.meaningful_links()),
-                            );
+                            let wraps_subquery_or_case_head =
+                                Self::paren_starts_wrapped_layout_head(
+                                    tokens,
+                                    idx,
+                                    Some(token_cache.meaningful_links()),
+                                );
                             let is_analytic_over_paren = Self::paren_opens_analytic_layout(
                                 current_clause.as_deref(),
                                 prev_word_upper.as_deref(),
                             );
-                            let multiline_clause_owner_kind = Self::paren_multiline_clause_owner_kind(
-                                tokens,
-                                idx,
-                                Some(token_cache.statement_word_links()),
-                            )
-                                .or_else(
-                                    || {
-                                        (matches!(current_clause.as_deref(), Some("WINDOW"))
-                                            && matches!(prev_word_upper.as_deref(), Some("AS")))
-                                        .then_some(FormatIndentedParenOwnerKind::Window)
-                                    },
-                                );
+                            let multiline_clause_owner_kind =
+                                Self::paren_multiline_clause_owner_kind(
+                                    tokens,
+                                    idx,
+                                    Some(token_cache.statement_word_links()),
+                                )
+                                .or_else(|| {
+                                    (matches!(current_clause.as_deref(), Some("WINDOW"))
+                                        && matches!(prev_word_upper.as_deref(), Some("AS")))
+                                    .then_some(FormatIndentedParenOwnerKind::Window)
+                                });
                             let wrapped_owner_kind = multiline_clause_owner_kind.filter(|kind| {
                                 Self::paren_owner_requires_wrapped_layout(
                                     tokens,
@@ -7456,8 +7551,7 @@ impl SqlEditorWidget {
                                     *kind,
                                     Some(token_cache.matching_paren_close_indices()),
                                     Some(
-                                        token_cache
-                                            .open_paren_multiline_child_head_prefix_counts(),
+                                        token_cache.open_paren_multiline_child_head_prefix_counts(),
                                     ),
                                     Some(token_cache.meaningful_links()),
                                     Some(token_cache.statement_word_links()),
@@ -7488,23 +7582,21 @@ impl SqlEditorWidget {
                                     Some(token_cache.matching_paren_close_indices()),
                                     Some(token_cache.meaningful_links()),
                                 );
-                            let is_call_argument_list =
-                                Self::paren_opens_call_argument_list(
+                            let is_call_argument_list = Self::paren_opens_call_argument_list(
+                                tokens,
+                                idx,
+                                Some(token_cache.statement_word_links()),
+                            )
+                                && Self::paren_body_contains_nested_multiline_child(
                                     tokens,
                                     idx,
+                                    Some(token_cache.matching_paren_close_indices()),
+                                    Some(
+                                        token_cache.open_paren_multiline_child_head_prefix_counts(),
+                                    ),
+                                    Some(token_cache.meaningful_links()),
                                     Some(token_cache.statement_word_links()),
-                                )
-                                    && Self::paren_body_contains_nested_multiline_child(
-                                        tokens,
-                                        idx,
-                                        Some(token_cache.matching_paren_close_indices()),
-                                        Some(
-                                            token_cache
-                                                .open_paren_multiline_child_head_prefix_counts(),
-                                        ),
-                                        Some(token_cache.meaningful_links()),
-                                        Some(token_cache.statement_word_links()),
-                                    );
+                                );
                             let paren_frame_kind = if multiline_clause_owner_kind
                                 == Some(FormatIndentedParenOwnerKind::Window)
                                 || is_call_argument_list
@@ -7827,6 +7919,19 @@ impl SqlEditorWidget {
         }
 
         let profile = mysql_compatible && Self::mysql_formatter_profile_enabled();
+        if mysql_compatible && Self::is_simple_create_table_layout_candidate(formatted) {
+            let normalize_started_at = profile.then(std::time::Instant::now);
+            let normalized = Self::normalize_create_table_body_layout(formatted, mysql_compatible);
+            if let Some(started_at) = normalize_started_at {
+                eprintln!(
+                    "[mysql-formatter] stage=mysql_parser_depth_normalize_create_table input_bytes={} output_bytes={} elapsed_ms={:.3}",
+                    formatted.len(),
+                    normalized.len(),
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return normalized;
+        }
         let rendered_started_at = profile.then(std::time::Instant::now);
         let rendered = Self::resolved_line_layouts(formatted, mysql_compatible)
             .map(|layouts| Self::render_line_layouts(&layouts))
@@ -7855,6 +7960,38 @@ impl SqlEditorWidget {
             );
         }
         normalized
+    }
+
+    fn is_simple_create_table_layout_candidate(formatted: &str) -> bool {
+        let mut in_block_comment = false;
+        let mut saw_create_table_header = false;
+
+        for line in formatted.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if crate::sql_text::line_is_comment_only_with_block_state(line, &mut in_block_comment) {
+                continue;
+            }
+            crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
+
+            if !saw_create_table_header {
+                if !Self::line_starts_create_table_header(trimmed)
+                    || !Self::line_ends_with_open_paren_before_inline_comment(trimmed)
+                {
+                    return false;
+                }
+                saw_create_table_header = true;
+                continue;
+            }
+
+            if Self::line_starts_query_head(&Self::structural_line_upper(trimmed)) {
+                return false;
+            }
+        }
+
+        saw_create_table_header
     }
 
     fn normalize_create_table_body_layout(formatted: &str, mysql_compatible: bool) -> String {
@@ -7976,7 +8113,12 @@ impl SqlEditorWidget {
         let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
 
         let resolve_code_started_at = profile.then(std::time::Instant::now);
-        Self::resolve_code_line_layouts(&mut layouts, &next_code_indices, mysql_compatible);
+        Self::resolve_code_line_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+            mysql_compatible,
+        );
         if let Some(started_at) = resolve_code_started_at {
             eprintln!(
                 "[mysql-formatter] stage=mysql_parser_depth_resolve_code lines={} elapsed_ms={:.3}",
@@ -8033,6 +8175,19 @@ impl SqlEditorWidget {
                 .and_then(|prefix_len| raw.get(prefix_len..))
                 .unwrap_or(raw);
             let analysis_trimmed = analysis_raw.trim_start();
+            let structural_trimmed = crate::sql_text::auto_format_structural_tail(analysis_trimmed);
+            let structural_upper = structural_trimmed.to_ascii_uppercase();
+            let owner_relative_trimmed =
+                crate::sql_text::trim_after_leading_close_parens(structural_trimmed);
+            let owner_relative_upper = owner_relative_trimmed.to_ascii_uppercase();
+            let leading_words =
+                crate::sql_text::meaningful_identifier_words_array_before_inline_comment::<4>(
+                    structural_trimmed,
+                );
+            let is_standalone_open_paren =
+                crate::sql_text::line_is_standalone_open_paren_before_inline_comment(
+                    structural_trimmed,
+                );
             let continuation_line = multiline_string_prefix_lengths
                 .get(idx)
                 .copied()
@@ -8079,6 +8234,12 @@ impl SqlEditorWidget {
                 raw,
                 trimmed,
                 analysis_trimmed,
+                structural_trimmed,
+                structural_upper,
+                owner_relative_trimmed,
+                owner_relative_upper,
+                leading_words,
+                is_standalone_open_paren,
                 has_leading_close_paren,
                 kind,
                 preserve_raw,
@@ -8302,14 +8463,11 @@ impl SqlEditorWidget {
         let line = layouts[idx].analysis_trimmed;
         let open_idx = next_code_indices.get(idx).copied().flatten()?;
         let head_idx = next_code_indices.get(open_idx).copied().flatten()?;
-        let head_upper = Self::structural_line_upper(layouts[head_idx].analysis_trimmed);
 
         crate::sql_text::split_query_owner_lookahead_kind(
             line,
-            Self::line_is_standalone_open_paren_before_inline_comment(
-                layouts[open_idx].analysis_trimmed,
-            ),
-            Some(&head_upper),
+            layouts[open_idx].is_standalone_open_paren,
+            Some(layouts[head_idx].structural_upper.as_str()),
         )
     }
 
@@ -8317,7 +8475,7 @@ impl SqlEditorWidget {
         line: &str,
         tokens: &[SqlToken],
         open_idx: usize,
-        next_code_trimmed: Option<&str>,
+        next_code_upper: Option<&str>,
         is_multiline_clause_owner: bool,
         is_condition_query_owner: bool,
         is_standalone_open_paren_owner: bool,
@@ -8355,18 +8513,13 @@ impl SqlEditorWidget {
                 return ParenLayoutFrameKind::General;
             }
             if line_is_mysql_on_duplicate_key_update
-                && next_code_trimmed.is_some_and(|next| {
-                    crate::sql_text::starts_with_keyword_token(
-                        &Self::structural_line_upper(next),
-                        "VALUES",
-                    )
+                && next_code_upper.is_some_and(|next_upper| {
+                    crate::sql_text::starts_with_keyword_token(next_upper, "VALUES")
                 })
             {
                 return ParenLayoutFrameKind::General;
             }
-            if next_code_trimmed.is_some_and(|next| {
-                Self::line_starts_query_head(&Self::structural_line_upper(next))
-            }) {
+            if next_code_upper.is_some_and(Self::line_starts_query_head) {
                 return if is_condition_query_owner {
                     ParenLayoutFrameKind::ConditionQuery
                 } else {
@@ -8449,7 +8602,7 @@ impl SqlEditorWidget {
         line: &str,
         tokens: &[SqlToken],
         start_idx: usize,
-        next_code_trimmed: Option<&str>,
+        next_code_upper: Option<&str>,
         line_depth: usize,
         general_line_depth: usize,
         ambient_condition_continuation_depth: usize,
@@ -8469,7 +8622,7 @@ impl SqlEditorWidget {
                         line,
                         tokens,
                         token_idx,
-                        next_code_trimmed,
+                        next_code_upper,
                         is_multiline_clause_owner,
                         is_condition_query_owner,
                         is_standalone_open_paren_owner,
@@ -8505,9 +8658,7 @@ impl SqlEditorWidget {
                     };
                     let wraps_child_query_head = kind == ParenLayoutFrameKind::General
                         && is_standalone_open_paren_owner
-                        && next_code_trimmed.is_some_and(|next| {
-                            Self::line_starts_query_head(&Self::structural_line_upper(next))
-                        });
+                        && next_code_upper.is_some_and(Self::line_starts_query_head);
                     let counts_for_condition_continuation = kind == ParenLayoutFrameKind::General
                         && counts_for_condition_continuation
                         && !wraps_child_query_head;
@@ -8565,8 +8716,7 @@ impl SqlEditorWidget {
             return None;
         }
 
-        if line_semantic.is_join_clause()
-            && query_owner_kind == Some(FormatQueryOwnerKind::Clause)
+        if line_semantic.is_join_clause() && query_owner_kind == Some(FormatQueryOwnerKind::Clause)
         {
             // JOIN (...) owns a derived-table child query. Treat it as a
             // FROM-item owner so the child SELECT head stays one frame deeper
@@ -9094,10 +9244,10 @@ impl SqlEditorWidget {
         resolved_query_base_depth: Option<usize>,
         query_base_depth: Option<usize>,
         next_code_trimmed: Option<&str>,
-        next_next_code_trimmed: Option<&str>,
+        next_next_code_upper: Option<&str>,
     ) -> usize {
         if next_code_trimmed.is_some_and(|next| {
-            Self::line_starts_structural_operator_rhs(next, next_next_code_trimmed)
+            Self::line_starts_structural_operator_rhs_with_next_upper(next, next_next_code_upper)
         }) {
             return line_depth;
         }
@@ -9115,28 +9265,36 @@ impl SqlEditorWidget {
             .unwrap_or(line_depth)
     }
 
-    fn structural_header_continuation_depth(
-        line: &str,
+    fn structural_header_continuation_depth_for_structural_tail(
+        structural_trimmed: &str,
         line_depth: usize,
         resolved_query_base_depth: Option<usize>,
         query_base_depth: Option<usize>,
     ) -> Option<usize> {
         let query_base_depth = resolved_query_base_depth.or(query_base_depth);
 
-        sql_text::format_structural_header_continuation_kind(line).map(|kind| {
-            sql_text::resolve_format_header_continuation_depth(kind, line_depth, query_base_depth)
-        })
+        sql_text::format_structural_header_continuation_kind_for_structural_tail(structural_trimmed)
+            .map(|kind| {
+                sql_text::resolve_format_header_continuation_depth(
+                    kind,
+                    line_depth,
+                    query_base_depth,
+                )
+            })
     }
 
-    fn bare_structural_header_continuation_depth(
-        line: &str,
+    fn bare_structural_header_continuation_depth_for_structural_tail(
+        structural_trimmed: &str,
         line_depth: usize,
         resolved_query_base_depth: Option<usize>,
         query_base_depth: Option<usize>,
     ) -> Option<usize> {
         let query_base_depth = resolved_query_base_depth.or(query_base_depth);
 
-        sql_text::format_bare_structural_header_continuation_kind(line).map(|kind| {
+        sql_text::format_bare_structural_header_continuation_kind_for_structural_tail(
+            structural_trimmed,
+        )
+        .map(|kind| {
             sql_text::resolve_format_header_continuation_depth(kind, line_depth, query_base_depth)
         })
     }
@@ -9152,10 +9310,6 @@ impl SqlEditorWidget {
             parenthesized_condition_header_depth.unwrap_or(line_depth)
         };
         owner_depth.saturating_add(1)
-    }
-
-    fn line_starts_structural_continuation_boundary(line: &str) -> bool {
-        sql_text::starts_with_auto_format_structural_continuation_boundary(line)
     }
 
     fn structural_list_continuation_depth(
@@ -9203,7 +9357,7 @@ impl SqlEditorWidget {
         let same_depth_general_paren_sibling_depth = (!line_has_leading_close
             && active_general_paren_frame.is_some()
             && stable_list_depth.is_some_and(|depth| depth > line_depth))
-            .then_some(line_depth);
+        .then_some(line_depth);
 
         let owner_prefers_body_list_depth = active_owner_relative_frame.is_some_and(|frame| {
             matches!(
@@ -9232,7 +9386,10 @@ impl SqlEditorWidget {
         }
     }
 
-    fn line_starts_structural_operator_rhs(line: &str, next_code_trimmed: Option<&str>) -> bool {
+    fn line_starts_structural_operator_rhs_with_next_upper(
+        line: &str,
+        next_code_upper: Option<&str>,
+    ) -> bool {
         // Keep operator-RHS continuation boundaries on the same shared
         // structural taxonomy as the analyzer. Generic expression owners such
         // as `MULTISET` stay intentionally excluded so a caller can still
@@ -9245,12 +9402,16 @@ impl SqlEditorWidget {
             return false;
         }
 
-        next_code_trimmed.is_some_and(|next| {
-            let next_upper = Self::structural_line_upper(next);
+        next_code_upper.is_some_and(|next_upper| {
             crate::sql_text::SUBQUERY_HEAD_KEYWORDS
                 .iter()
-                .any(|keyword| crate::sql_text::starts_with_keyword_token(&next_upper, keyword))
+                .any(|keyword| crate::sql_text::starts_with_keyword_token(next_upper, keyword))
         })
+    }
+
+    fn line_starts_structural_operator_rhs(line: &str, next_code_trimmed: Option<&str>) -> bool {
+        let next_code_upper = next_code_trimmed.map(Self::structural_line_upper);
+        Self::line_starts_structural_operator_rhs_with_next_upper(line, next_code_upper.as_deref())
     }
 
     fn pop_expired_owner_relative_layout_frames(
@@ -9392,6 +9553,7 @@ impl SqlEditorWidget {
 
     fn resolve_code_line_layouts(
         layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
         next_code_indices: &[Option<usize>],
         mysql_compatible: bool,
     ) {
@@ -9450,6 +9612,8 @@ impl SqlEditorWidget {
             }
 
             let trimmed = layouts[idx].analysis_trimmed;
+            let structural_trimmed = layouts[idx].structural_trimmed;
+            let trimmed_upper = layouts[idx].structural_upper.as_str();
             let depth = layouts[idx].parser_depth;
             while with_definition_frames
                 .last()
@@ -9461,8 +9625,6 @@ impl SqlEditorWidget {
                 .last()
                 .copied()
                 .filter(|frame| !frame.main_query_started && depth >= frame.start_parser_depth);
-            let structural_trimmed = crate::sql_text::auto_format_structural_tail(trimmed);
-            let trimmed_upper = structural_trimmed.to_ascii_uppercase();
             let active_pending_query_head = pending_query_head_frames.last().copied();
             let pending_operator_for_line = pending_operator_layout_frames.last().copied();
             let incoming_structural_continuation_depth = previous_code_carry_depth;
@@ -9516,26 +9678,26 @@ impl SqlEditorWidget {
                     layouts[idx].has_leading_close_paren,
                 );
 
-            let current_line_is_standalone_open_paren =
-                Self::line_is_standalone_open_paren_before_inline_comment(trimmed);
+            let current_line_is_standalone_open_paren = layouts[idx].is_standalone_open_paren;
+            let line_words = layouts[idx].leading_words;
             let starts_paren_case_expression =
-                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                crate::sql_text::identifier_words_first_is(&line_words, "CASE")
                     && pending_general_open_paren_for_line.is_some();
             let in_paren_case_expression = case_layout_state.in_parenthesized_case_expression()
                 || starts_paren_case_expression;
-            let starts_dml = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
-                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
+            let starts_dml = crate::sql_text::identifier_words_first_is(&line_words, "SELECT")
+                || crate::sql_text::identifier_words_first_is(&line_words, "INSERT")
+                || crate::sql_text::identifier_words_first_is(&line_words, "UPDATE")
+                || crate::sql_text::identifier_words_first_is(&line_words, "DELETE")
+                || crate::sql_text::identifier_words_first_is(&line_words, "MERGE");
             if starts_dml {
                 in_dml_statement = true;
             }
             let paren_case_extra_indent = if !in_dml_statement
                 && in_paren_case_expression
-                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                && (crate::sql_text::identifier_words_first_is(&line_words, "CASE")
                     || Self::starts_with_case_branch_keyword(&trimmed_upper)
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
+                    || crate::sql_text::identifier_words_first_is(&line_words, "END"))
             {
                 1
             } else {
@@ -9544,15 +9706,15 @@ impl SqlEditorWidget {
             let control_branch_body_depth_for_line = pending_control_branch_body_depth_for_line;
             let current_line_branch_body_depth =
                 control_branch_body_depth_for_line.or(pending_case_branch_body_depth_for_line);
+            let next_code_idx = next_code_indices[idx];
             let next_code_trimmed =
-                next_code_indices[idx].map(|next_idx| layouts[next_idx].analysis_trimmed);
+                next_code_idx.map(|next_idx| layouts[next_idx].analysis_trimmed);
             let current_line_is_standalone_query_head_open = current_line_is_standalone_open_paren
-                && next_code_trimmed.is_some_and(|next| {
-                    Self::line_starts_query_head(&Self::structural_line_upper(next))
+                && next_code_idx.is_some_and(|next_idx| {
+                    Self::line_starts_query_head(layouts[next_idx].structural_upper.as_str())
                 });
-            let next_next_code_trimmed = next_code_indices[idx]
-                .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten())
-                .map(|next_idx| layouts[next_idx].analysis_trimmed);
+            let next_next_code_idx = next_code_idx
+                .and_then(|next_idx| next_code_indices.get(next_idx).copied().flatten());
             let line_tokens = Self::tokenize_sql_with_mysql_compat(trimmed, mysql_compatible);
             // Hot path: reuse the already-uppercased line so statement-head
             // recovery does not build another temporary uppercase String.
@@ -9569,7 +9731,7 @@ impl SqlEditorWidget {
                 && mysql_routine_block_frames
                     .last()
                     .is_some_and(|frame| frame.kind == MySqlRoutineBlockKind::Repeat)
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UNTIL");
+                && crate::sql_text::identifier_words_first_is(&line_words, "UNTIL");
             let current_line_starts_end_suffix_terminator =
                 Self::starts_with_end_suffix_terminator_tokens(&line_tokens);
             let current_line_starts_case_terminator =
@@ -9577,14 +9739,12 @@ impl SqlEditorWidget {
             let current_line_starts_explicit_case_terminator =
                 Self::starts_with_explicit_case_terminator_tokens(&line_tokens);
             let current_line_is_mysql_end_if = mysql_compatible
-                && crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["END", "IF"],
-                );
+                && crate::sql_text::identifier_words_start_with(&line_words, &["END", "IF"]);
             let active_mysql_if_frame = mysql_if_layout_frames.last().copied();
             let current_line_is_mysql_on_duplicate_key_update = mysql_compatible
-                && crate::sql_text::line_is_mysql_on_duplicate_key_update_clause(
-                    structural_trimmed,
+                && crate::sql_text::identifier_words_start_with(
+                    &line_words,
+                    &["ON", "DUPLICATE", "KEY", "UPDATE"],
                 );
             let current_line_starts_mysql_custom_delimited_end =
                 Self::starts_with_mysql_custom_delimited_end(trimmed);
@@ -9607,8 +9767,8 @@ impl SqlEditorWidget {
                     && !current_line_is_mysql_on_duplicate_key_update;
             let current_line_starts_condition_keyword =
                 !current_line_is_mysql_on_duplicate_key_update
-                    && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "AND")
-                        || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OR"));
+                    && (crate::sql_text::identifier_words_first_is(&line_words, "AND")
+                        || crate::sql_text::identifier_words_first_is(&line_words, "OR"));
             let current_line_is_mysql_declare_handler_header =
                 layouts[idx].line_semantic.is_mysql_declare_handler_header();
             let current_line_is_mysql_declare_handler_body =
@@ -9636,8 +9796,7 @@ impl SqlEditorWidget {
                 .last()
                 .is_some_and(|frame| layouts[idx].query_base_depth == Some(frame.query_base_depth))
                 || current_line_has_retained_same_depth_merge_fragment
-                || (starts_dml
-                    && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE"));
+                || (starts_dml && crate::sql_text::identifier_words_first_is(&line_words, "MERGE"));
             let pending_merge_branch_header_progress_for_line =
                 current_line_is_active_merge_base_line
                     .then_some(pending_merge_branch_header_for_line)
@@ -9686,31 +9845,20 @@ impl SqlEditorWidget {
                 pending_partial_multiline_clause_owner = None;
                 pending_partial_query_owner = None;
             }
-            let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
-                let next_upper = Self::structural_line_upper(next);
-                crate::sql_text::starts_with_format_named_plain_end(&next_upper)
+            let next_line_is_named_plain_end = next_code_indices[idx].is_some_and(|next_idx| {
+                crate::sql_text::starts_with_format_named_plain_end(
+                    layouts[next_idx].structural_upper.as_str(),
+                )
             });
             let force_end_suffix_depth = current_line_starts_end_suffix_terminator;
             let current_line_starts_elsif =
-                crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["ELSIF"],
-                );
+                crate::sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
-                crate::sql_text::line_starts_with_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["ELSEIF"],
-                );
+                crate::sql_text::identifier_words_start_with(&line_words, &["ELSEIF"]);
             let current_line_is_exact_else =
-                crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["ELSE"],
-                );
+                crate::sql_text::identifier_words_exact(&line_words, &["ELSE"]);
             let current_line_is_exact_exception =
-                crate::sql_text::line_has_exact_identifier_sequence_before_inline_comment(
-                    structural_trimmed,
-                    &["EXCEPTION"],
-                );
+                crate::sql_text::identifier_words_exact(&line_words, &["EXCEPTION"]);
             // Trigger header WHEN uses the trigger_header_frame instead of
             // existing_indent to determine structural depth.
             let is_trigger_header_when = trigger_header_frame.is_some()
@@ -9720,27 +9868,25 @@ impl SqlEditorWidget {
             let is_trigger_header_body_line = trigger_header_frame.is_some()
                 && depth == 0
                 && !in_dml_statement
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DECLARE")
-                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CREATE")
+                && !crate::sql_text::identifier_words_first_is(&line_words, "BEGIN")
+                && !crate::sql_text::identifier_words_first_is(&line_words, "DECLARE")
+                && !crate::sql_text::identifier_words_first_is(&line_words, "CREATE")
                 && !current_line_starts_block_terminating_end;
             // Detect FORALL body lines structurally via frame.
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
             let force_block_depth = !in_dml_statement
                 && !is_trigger_header_when
-                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXCEPTION")
+                && (crate::sql_text::identifier_words_first_is(&line_words, "EXCEPTION")
                     || Self::starts_with_case_branch_keyword(&trimmed_upper)
                     || current_line_starts_elsif
                     || current_line_starts_elseif
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                    || crate::sql_text::identifier_words_first_is(&line_words, "CASE")
                     || current_line_starts_block_terminating_end
                     || force_end_suffix_depth);
 
             let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = layouts[idx].has_leading_close_paren;
-            let has_structural_tail_after_leading_close = starts_with_close_paren
-                && !crate::sql_text::trim_after_leading_close_parens(trimmed).is_empty();
             let current_line_is_parenthesized_condition =
                 layouts[idx].condition_header_line.is_some();
             let current_line_is_own_condition_header_line =
@@ -9777,7 +9923,7 @@ impl SqlEditorWidget {
                         || header_word.eq_ignore_ascii_case("WHILE")
                 });
             let current_line_mysql_if_header_kind = if mysql_compatible {
-                if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF") {
+                if crate::sql_text::identifier_words_first_is(&line_words, "IF") {
                     Some(MySqlIfBranchKind::If)
                 } else if current_line_starts_elsif || current_line_starts_elseif {
                     Some(MySqlIfBranchKind::ElseIf)
@@ -9809,7 +9955,7 @@ impl SqlEditorWidget {
                 && current_line_mysql_if_header_kind == Some(MySqlIfBranchKind::Else)
                 && active_mysql_if_frame.is_some();
             let current_line_is_mysql_if_owner_header = mysql_compatible
-                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF")
+                && (crate::sql_text::identifier_words_first_is(&line_words, "IF")
                     || current_line_starts_elsif
                     || current_line_starts_elseif
                     || current_line_is_mysql_else_header);
@@ -9824,7 +9970,7 @@ impl SqlEditorWidget {
             let paren_case_base_depth = parser_depth;
             let parser_depth = parser_depth + usize::from(is_paren_case_closer);
             let current_line_starts_case =
-                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
+                crate::sql_text::identifier_words_first_is(&line_words, "CASE");
             let current_line_starts_query_head_token = Self::line_starts_query_head(&trimmed_upper);
             let current_line_is_cte_definition_header =
                 crate::sql_text::line_is_format_cte_definition_header(structural_trimmed);
@@ -9862,10 +10008,10 @@ impl SqlEditorWidget {
                 pending_plsql_child_query_owner_for_line.and_then(|frame| {
                     frame.progress_over_line(trimmed, &multiline_clause_paren_profile)
                 });
-            let owner_relative_detection_trimmed =
-                sql_text::trim_after_leading_close_parens(structural_trimmed);
-            let owner_relative_detection_upper =
-                owner_relative_detection_trimmed.to_ascii_uppercase();
+            let owner_relative_detection_trimmed = layouts[idx].owner_relative_trimmed;
+            let owner_relative_detection_upper = layouts[idx].owner_relative_upper.as_str();
+            let has_structural_tail_after_leading_close =
+                starts_with_close_paren && !owner_relative_detection_trimmed.is_empty();
             let current_line_is_exact_bare_window_clause_header =
                 crate::sql_text::line_is_format_bare_window_clause_header(structural_trimmed);
             let current_line_is_window_clause_definition_header =
@@ -9888,14 +10034,11 @@ impl SqlEditorWidget {
             let previous_code_is_control_condition_close = if current_line_is_condition_keyword
                 && current_line_has_flow_control_condition_header
             {
-                (0..idx)
-                    .rev()
-                    .find(|scan_idx| layouts[*scan_idx].kind == LineLayoutKind::Code)
-                    .is_some_and(|previous_idx| {
-                        layouts[previous_idx].condition_role == AutoFormatConditionRole::Closer
-                            && layouts[previous_idx].condition_header_line
-                                == layouts[idx].condition_header_line
-                    })
+                previous_code_indices[idx].is_some_and(|previous_idx| {
+                    layouts[previous_idx].condition_role == AutoFormatConditionRole::Closer
+                        && layouts[previous_idx].condition_header_line
+                            == layouts[idx].condition_header_line
+                })
             } else {
                 false
             };
@@ -9953,11 +10096,11 @@ impl SqlEditorWidget {
             let leading_close_has_mixed_continuation = starts_with_close_paren
                 && crate::sql_text::line_has_mixed_leading_close_continuation(trimmed);
             let leading_close_starts_with_comma_continuation = starts_with_close_paren
-                && crate::sql_text::trim_after_leading_close_parens(trimmed)
+                && owner_relative_detection_trimmed
                     .trim_start()
                     .starts_with(',');
             let leading_close_tail_starts_statement_terminator = starts_with_close_paren
-                && crate::sql_text::trim_after_leading_close_parens(trimmed)
+                && owner_relative_detection_trimmed
                     .trim_start()
                     .starts_with(';');
             let leading_close_tail_starts_control_owner_alignment = starts_with_close_paren
@@ -10065,24 +10208,36 @@ impl SqlEditorWidget {
                 && !pending_forall_body_head_for_line;
             let current_line_is_structural_continuation_boundary =
                 !suppress_non_subquery_paren_layout_clause
-                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary(
-                        trimmed,
+                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+                        structural_trimmed,
                     );
             let current_line_is_non_expression_structural_boundary =
                 !suppress_non_subquery_paren_layout_clause
-                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner(trimmed);
+                    && crate::sql_text::starts_with_auto_format_structural_continuation_boundary_without_expression_owner_for_structural_tail(
+                        structural_trimmed,
+                    );
             let current_line_structural_header_continuation_kind =
                 (!suppress_non_subquery_paren_layout_clause
                     && !current_line_is_general_paren_values_function)
-                    .then(|| sql_text::format_structural_header_continuation_kind(trimmed))
+                    .then(|| {
+                        sql_text::format_structural_header_continuation_kind_for_structural_tail(
+                            structural_trimmed,
+                        )
+                    })
                     .flatten();
             let current_line_bare_structural_header_continuation_kind =
                 (!suppress_non_subquery_paren_layout_clause
                     && !current_line_is_general_paren_values_function)
-                    .then(|| sql_text::format_bare_structural_header_continuation_kind(trimmed))
+                    .then(|| {
+                        sql_text::format_bare_structural_header_continuation_kind_for_structural_tail(
+                            structural_trimmed,
+                        )
+                    })
                     .flatten();
             let current_line_is_exact_bare_owner_or_pending_header =
-                crate::sql_text::line_is_exact_bare_owner_or_pending_header(trimmed);
+                crate::sql_text::line_is_exact_bare_owner_or_pending_header_for_structural_tail(
+                    structural_trimmed,
+                );
             let current_line_query_owner_keeps_continuation_target = current_query_owner_kind
                 .is_some()
                 && !current_line_is_non_expression_structural_boundary;
@@ -10127,9 +10282,8 @@ impl SqlEditorWidget {
                 !current_line_starts_multiline_clause
                     || incoming_structural_continuation_from_leading_close_comma_list;
             let multiline_owner_structural_floor_depth_for_line =
-                active_structural_continuation_depth_for_line.filter(|_| {
-                    incoming_structural_continuation_from_leading_close_comma_list
-                });
+                active_structural_continuation_depth_for_line
+                    .filter(|_| incoming_structural_continuation_from_leading_close_comma_list);
             let current_line_query_close_align_depth = closing_query_frames_for_line
                 .last()
                 .map(|frame| frame.close_align_depth);
@@ -11293,21 +11447,23 @@ impl SqlEditorWidget {
             let structural_list_body_depth = structural_body_depth_for_line;
             let header_prefix_continuation_depth = current_line_structural_header_continuation_kind
                 .and_then(|_| {
-                    Self::structural_header_continuation_depth(
-                        trimmed,
+                    Self::structural_header_continuation_depth_for_structural_tail(
+                        structural_trimmed,
                         layouts[idx].final_depth,
                         resolved_query_base_depth,
                         layouts[idx].query_base_depth,
                     )
                 });
             let next_header_continuation_depth = next_code_trimmed.and_then(|next| {
-                if Self::line_starts_structural_continuation_boundary(next) {
+                if crate::sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+                    crate::sql_text::auto_format_structural_tail(next),
+                ) {
                     return None;
                 }
 
                 current_line_bare_structural_header_continuation_kind.and_then(|_| {
-                    Self::bare_structural_header_continuation_depth(
-                        trimmed,
+                    Self::bare_structural_header_continuation_depth_for_structural_tail(
+                        structural_trimmed,
                         layouts[idx].final_depth,
                         resolved_query_base_depth,
                         layouts[idx].query_base_depth,
@@ -11344,9 +11500,9 @@ impl SqlEditorWidget {
                 previous_code_carry_from_leading_close_comma_list = false;
             } else {
                 previous_code_carry_depth = active_structural_continuation_depth_for_line;
-                previous_code_carry_from_leading_close_comma_list =
-                    previous_code_carry_depth.is_some()
-                        && incoming_structural_continuation_from_leading_close_comma_list;
+                previous_code_carry_from_leading_close_comma_list = previous_code_carry_depth
+                    .is_some()
+                    && incoming_structural_continuation_from_leading_close_comma_list;
             }
             layouts[idx].carry_depth =
                 previous_code_carry_depth.unwrap_or(layouts[idx].final_depth);
@@ -11369,7 +11525,7 @@ impl SqlEditorWidget {
                     None
                 };
             layouts[idx].retain_following_non_code_scope =
-                    pending_split_plain_end_layout_frame.is_some_and(|frame| {
+                pending_split_plain_end_layout_frame.is_some_and(|frame| {
                     next_code_trimmed.is_some_and(|next| {
                         let next_tokens =
                             Self::tokenize_sql_with_mysql_compat(next, mysql_compatible);
@@ -11416,7 +11572,11 @@ impl SqlEditorWidget {
                 trimmed,
                 &line_tokens,
                 paren_frame_scan_start_idx,
-                next_code_trimmed,
+                next_code_idx.and_then(|next_idx| {
+                    layouts
+                        .get(next_idx)
+                        .map(|layout| layout.structural_upper.as_str())
+                }),
                 effective_depth,
                 current_line_general_paren_depth,
                 current_line_condition_continuation_base_depth,
@@ -11490,18 +11650,18 @@ impl SqlEditorWidget {
                     .or_else(|| {
                         Self::structural_plsql_next_query_head_depth(&layouts[idx], &trimmed_upper)
                     });
-                let frame_based_parenthesized_query_head_depth =
-                    (structural_query_owner_depth.is_none()
-                        && Self::line_ends_with_open_paren_before_inline_comment(trimmed))
-                    .then(|| {
-                        active_general_paren_frame
-                            .map(|frame| {
-                                frame
-                                    .body_depth()
-                                    .max(layouts[idx].final_depth.saturating_add(1))
-                            })
-                            .unwrap_or_else(|| layouts[idx].final_depth.saturating_add(1))
-                    });
+                let frame_based_parenthesized_query_head_depth = (structural_query_owner_depth
+                    .is_none()
+                    && Self::line_ends_with_open_paren_before_inline_comment(trimmed))
+                .then(|| {
+                    active_general_paren_frame
+                        .map(|frame| {
+                            frame
+                                .body_depth()
+                                .max(layouts[idx].final_depth.saturating_add(1))
+                        })
+                        .unwrap_or_else(|| layouts[idx].final_depth.saturating_add(1))
+                });
                 // Deferred child-query heads already carry structural depth
                 // from the analyzer or an explicit owner frame. Existing line
                 // indent must not shift that pending owner stack.
@@ -11672,7 +11832,11 @@ impl SqlEditorWidget {
                 current_line_is_generic_split_query_owner,
                 current_line_is_direct_split_from_item_query_owner,
                 next_code_trimmed,
-                next_next_code_trimmed,
+                next_next_code_idx.and_then(|next_idx| {
+                    layouts
+                        .get(next_idx)
+                        .map(|layout| layout.structural_upper.as_str())
+                }),
             ) {
                 pending_operator_layout_frames.push(PendingOperatorLayoutFrame {
                     owner_depth: Self::continuation_operator_owner_depth(
@@ -11681,7 +11845,11 @@ impl SqlEditorWidget {
                         resolved_query_base_depth,
                         layouts[idx].query_base_depth,
                         next_code_trimmed,
-                        next_next_code_trimmed,
+                        next_next_code_idx.and_then(|next_idx| {
+                            layouts
+                                .get(next_idx)
+                                .map(|layout| layout.structural_upper.as_str())
+                        }),
                     ),
                 });
             }
@@ -11799,8 +11967,8 @@ impl SqlEditorWidget {
             }
 
             let previous_trimmed = layouts[prev_idx].analysis_trimmed;
-            let next_upper = Self::structural_line_upper(layouts[next_idx].analysis_trimmed);
-            let next_is_case_branch = Self::starts_with_case_branch_keyword(&next_upper);
+            let next_is_case_branch =
+                Self::starts_with_case_branch_keyword(layouts[next_idx].structural_upper.as_str());
             if Self::starts_with_case_terminator(previous_trimmed) && next_is_case_branch {
                 layouts[idx].final_depth = layouts[next_idx].final_depth;
                 layouts[idx].anchor_group = layouts[next_idx].anchor_group;
@@ -11923,9 +12091,15 @@ impl SqlEditorWidget {
 
     fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
         let mut out = String::new();
+        let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(layouts);
 
         for (idx, layout) in layouts.iter().enumerate() {
-            if Self::should_skip_blank_line_layout(layouts, idx) {
+            if Self::should_skip_blank_line_layout(
+                layouts,
+                idx,
+                &previous_code_indices,
+                &next_code_indices,
+            ) {
                 continue;
             }
             if idx > 0 {
@@ -11952,7 +12126,12 @@ impl SqlEditorWidget {
         out
     }
 
-    fn should_skip_blank_line_layout(layouts: &[LineLayout<'_>], idx: usize) -> bool {
+    fn should_skip_blank_line_layout(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) -> bool {
         let Some(layout) = layouts.get(idx) else {
             return false;
         };
@@ -11960,11 +12139,8 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let previous_code_idx = (0..idx)
-            .rev()
-            .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
-        let next_code_idx = ((idx + 1)..layouts.len())
-            .find(|candidate| layouts[*candidate].kind == LineLayoutKind::Code);
+        let previous_code_idx = previous_code_indices.get(idx).copied().flatten();
+        let next_code_idx = next_code_indices.get(idx).copied().flatten();
         let (Some(prev_idx), Some(next_idx)) = (previous_code_idx, next_code_idx) else {
             return false;
         };
@@ -11986,8 +12162,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let next_upper = Self::structural_line_upper(next.trimmed);
-        if !crate::sql_text::starts_with_keyword_token(&next_upper, "CASE") {
+        if !crate::sql_text::starts_with_keyword_token(next.structural_upper.as_str(), "CASE") {
             return false;
         }
         if !Self::line_ends_with_comma_before_inline_comment(previous.trimmed) {
@@ -12068,7 +12243,7 @@ impl SqlEditorWidget {
         current_line_is_generic_split_query_owner: bool,
         current_line_is_direct_split_from_item_query_owner: bool,
         next_code_trimmed: Option<&str>,
-        next_next_code_trimmed: Option<&str>,
+        next_next_code_upper: Option<&str>,
     ) -> bool {
         let Some(kind) = crate::sql_text::format_trailing_continuation_operator_kind(line) else {
             return false;
@@ -12087,7 +12262,10 @@ impl SqlEditorWidget {
             || current_line_is_generic_split_query_owner
             || current_line_is_direct_split_from_item_query_owner
             || next_code_trimmed.is_some_and(|next| {
-                Self::line_starts_structural_operator_rhs(next, next_next_code_trimmed)
+                Self::line_starts_structural_operator_rhs_with_next_upper(
+                    next,
+                    next_next_code_upper,
+                )
             }))
         {
             return false;
@@ -12333,13 +12511,11 @@ impl SqlEditorWidget {
                 Some(SqlToken::Word(word))
                     if crate::sql_text::is_subquery_head_keyword(word)
             );
-            let opens_wrapped_layout_child = Self::paren_starts_wrapped_layout_head(
-                tokens,
-                idx,
-                meaningful_token_links,
-            );
+            let opens_wrapped_layout_child =
+                Self::paren_starts_wrapped_layout_head(tokens, idx, meaningful_token_links);
             let opens_owner_relative_child =
-                Self::paren_multiline_clause_owner_kind(tokens, idx, statement_word_links).is_some();
+                Self::paren_multiline_clause_owner_kind(tokens, idx, statement_word_links)
+                    .is_some();
             let prev_word_upper = statement_word_links
                 .and_then(|links| links.prev_word_index(idx))
                 .and_then(|token_idx| tokens.get(token_idx))
@@ -12525,8 +12701,8 @@ impl SqlEditorWidget {
         last_non_comment_token: Option<&SqlToken>,
         has_string_token_before: bool,
     ) -> bool {
-        let previous_token =
-            previous_non_comment_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
+        let previous_token = previous_non_comment_token
+            .and_then(Self::format_trailing_meaningful_token_from_sql_token);
         let last_token =
             last_non_comment_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
 
@@ -13580,9 +13756,11 @@ FROM a;"#;
             SqlEditorWidget::multiline_string_continuation_prefix_lengths(sql, line_count);
         let mut layouts =
             SqlEditorWidget::build_line_layouts(sql, &contexts, &multiline_string_prefix_lengths);
-        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        let (previous_code_indices, next_code_indices) =
+            SqlEditorWidget::line_layout_code_neighbors(&layouts);
         SqlEditorWidget::resolve_code_line_layouts(
             &mut layouts,
+            &previous_code_indices,
             &next_code_indices,
             crate::sql_text::mysql_compatibility_for_sql(sql, None),
         );
@@ -14213,8 +14391,14 @@ END;"#;
             &contexts,
             &multiline_string_prefix_lengths,
         );
-        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
-        SqlEditorWidget::resolve_code_line_layouts(&mut layouts, &next_code_indices, true);
+        let (previous_code_indices, next_code_indices) =
+            SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        SqlEditorWidget::resolve_code_line_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+            true,
+        );
         let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
         let lines: Vec<&str> = formatted.lines().collect();
         let source_lines: Vec<&str> = source.lines().collect();
@@ -24753,9 +24937,11 @@ FROM t x;"#;
             &contexts,
             &multiline_string_prefix_lengths,
         );
-        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        let (previous_code_indices, next_code_indices) =
+            SqlEditorWidget::line_layout_code_neighbors(&layouts);
         SqlEditorWidget::resolve_code_line_layouts(
             &mut layouts,
+            &previous_code_indices,
             &next_code_indices,
             crate::sql_text::mysql_compatibility_for_sql(&formatted, None),
         );
@@ -31132,8 +31318,14 @@ END;"#;
             &contexts,
             &multiline_string_prefix_lengths,
         );
-        let (_, next_code_indices) = SqlEditorWidget::line_layout_code_neighbors(&layouts);
-        SqlEditorWidget::resolve_code_line_layouts(&mut layouts, &next_code_indices, true);
+        let (previous_code_indices, next_code_indices) =
+            SqlEditorWidget::line_layout_code_neighbors(&layouts);
+        SqlEditorWidget::resolve_code_line_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+            true,
+        );
         let formatted = SqlEditorWidget::apply_parser_depth_indentation(source);
         let lines: Vec<&str> = formatted.lines().collect();
         let source_lines: Vec<&str> = source.lines().collect();
@@ -41526,7 +41718,10 @@ BEGIN
 END$$"#;
 
         for formatted in [
-            SqlEditorWidget::format_sql_basic_for_db_type(source, crate::db::connection::DatabaseType::MySQL),
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                source,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
             SqlEditorWidget::format_for_auto_formatting_with_db_type(
                 source,
                 false,
@@ -42392,7 +42587,9 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (")
+            .position(|line| {
+                line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER ("
+            })
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -42522,7 +42719,9 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER (")
+            .position(|line| {
+                line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER ("
+            })
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -42709,9 +42908,8 @@ END $$"#;
                 "scalar subquery close-alias lines should align with the subquery opener owner depth, got:\n{formatted}"
             );
         }
-        for (select_count_idx, from_idx) in count_select_indices
-            .iter()
-            .zip(count_from_indices.iter())
+        for (select_count_idx, from_idx) in
+            count_select_indices.iter().zip(count_from_indices.iter())
         {
             assert_eq!(
                 leading_spaces(lines[*select_count_idx]),
@@ -42844,9 +43042,8 @@ END $$"#;
                 "auto-format scalar subquery close-alias lines should align with the subquery opener owner depth, got:\n{formatted}"
             );
         }
-        for (select_count_idx, from_idx) in count_select_indices
-            .iter()
-            .zip(count_from_indices.iter())
+        for (select_count_idx, from_idx) in
+            count_select_indices.iter().zip(count_from_indices.iter())
         {
             assert_eq!(
                 leading_spaces(lines[*select_count_idx]),
@@ -43139,7 +43336,10 @@ END$$"#;
 
         let values_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("VALUES (v_order_id, v_item_no, v_prod_id,"))
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("VALUES (v_order_id, v_item_no, v_prod_id,")
+            })
             .expect("VALUES owner");
         let case_indices: Vec<usize> = lines
             .iter()
@@ -43998,16 +44198,16 @@ END"#;
         );
         let lines: Vec<&str> = formatted.lines().collect();
 
-        let customers_idx = find_line_starting_with(&lines, "), 'customers', (")
-            .expect("test6 JSON customers key");
-        let products_idx = find_line_starting_with(&lines, "), 'products', (")
-            .expect("test6 JSON products key");
+        let customers_idx =
+            find_line_starting_with(&lines, "), 'customers', (").expect("test6 JSON customers key");
+        let products_idx =
+            find_line_starting_with(&lines, "), 'products', (").expect("test6 JSON products key");
         let orders_idx =
             find_line_starting_with(&lines, "), 'orders', (").expect("test6 JSON orders key");
         let items_idx =
             find_line_starting_with(&lines, "), 'items', (").expect("test6 JSON items key");
-        let payments_idx = find_line_starting_with(&lines, "), 'payments', (")
-            .expect("test6 JSON payments key");
+        let payments_idx =
+            find_line_starting_with(&lines, "), 'payments', (").expect("test6 JSON payments key");
 
         let key_indent = leading_spaces(lines[customers_idx]);
         for idx in [products_idx, orders_idx, items_idx, payments_idx] {
@@ -44074,8 +44274,9 @@ END"#;
             "test6 scalar subquery SELECT heads should stay exactly one frame deeper than sibling JSON key lines, got:\n{formatted}"
         );
 
-        let order_count_idx = find_line_starting_with(&lines, "COUNT(DISTINCT o.order_id) AS order_count,")
-            .expect("test6 customer_spend order_count");
+        let order_count_idx =
+            find_line_starting_with(&lines, "COUNT(DISTINCT o.order_id) AS order_count,")
+                .expect("test6 customer_spend order_count");
         let total_spent_idx = lines
             .iter()
             .enumerate()
@@ -44133,7 +44334,9 @@ END"#;
             .iter()
             .enumerate()
             .skip(count_idx + 1)
-            .find(|(_, line)| line.trim_start() == "ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,")
+            .find(|(_, line)| {
+                line.trim_start() == "ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,"
+            })
             .map(|(idx, _)| idx)
             .expect("test6 JOIN subquery lifetime_net_sales");
         let max_idx = lines
@@ -44190,5 +44393,4 @@ END"#;
             "test6 UPDATE JOIN subquery close should return to JOIN depth, got:\n{formatted}"
         );
     }
-
 }
