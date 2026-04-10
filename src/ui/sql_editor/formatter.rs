@@ -1352,6 +1352,7 @@ impl ExitConditionState {
 #[derive(Clone, PartialEq, Eq)]
 struct WithCteFrame {
     paren_depth: usize,
+    owner_depth: Option<usize>,
     plsql_state: WithPlsqlFormatState,
 }
 
@@ -1686,9 +1687,30 @@ impl WithCteFormatState {
         if starts_cte_definitions {
             self.frames.push(WithCteFrame {
                 paren_depth: 0,
+                owner_depth: None,
                 plsql_state: WithPlsqlFormatState::None,
             });
         }
+    }
+
+    fn record_with_owner_depth(&mut self, owner_depth: usize) {
+        if let Some(frame) = self.frames.last_mut() {
+            if frame.paren_depth == 0
+                && matches!(
+                    frame.plsql_state,
+                    WithPlsqlFormatState::None | WithPlsqlFormatState::AwaitingMainQuery
+                )
+            {
+                frame.owner_depth = Some(owner_depth);
+            }
+        }
+    }
+
+    fn separator_indent(&self, fallback: usize) -> usize {
+        self.frames
+            .last()
+            .and_then(|frame| frame.owner_depth)
+            .unwrap_or(fallback)
     }
 
     fn on_open_paren(&mut self) {
@@ -6740,6 +6762,9 @@ impl SqlEditorWidget {
                     } else {
                         out.push_str(rendered_word);
                     }
+                    if upper == "WITH" && is_keyword && !mysql_keyword_identifier {
+                        with_cte_state.record_with_owner_depth(line_indent);
+                    }
                     needs_space = true;
                     if pending_split_end_suffix_indent.is_some() {
                         if let Some(kind) = pending_split_end_suffix_kind {
@@ -7939,9 +7964,20 @@ impl SqlEditorWidget {
                                 .is_some_and(|frame| frame.is_column_list())
                                 || is_with_cte_separator
                             {
+                                let fallback_with_cte_separator_indent = query_body_clause_base_depth
+                                    .filter(|_| paren_stack.is_empty())
+                                    .unwrap_or_else(|| {
+                                        base_indent(indent_level, open_cursor_state)
+                                    });
+                                let with_cte_separator_indent = if is_with_cte_separator {
+                                    with_cte_state
+                                        .separator_indent(fallback_with_cte_separator_indent)
+                                } else {
+                                    fallback_with_cte_separator_indent
+                                };
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    with_cte_separator_indent,
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -18003,6 +18039,45 @@ ORDER BY rt.PATH;"#;
             leading_spaces(lines[aggregated_select_idx]),
             leading_spaces(lines[aggregated_cte_idx]).saturating_add(4),
             "aggregated CTE body SELECT should stay exactly one level deeper than its CTE header, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_create_view_cte_sibling_on_query_body_depth() {
+        let source = r#"CREATE OR REPLACE VIEW qt_fmt_emp_v AS
+    WITH base_emp AS (
+        SELECT
+            e.emp_id
+        FROM qt_fmt_emp e
+    ),
+sales_agg AS (
+    SELECT
+        s.emp_id
+    FROM qt_fmt_sales s
+)
+    SELECT
+        b.emp_id
+    FROM base_emp b
+    LEFT JOIN sales_agg sa
+    ON sa.emp_id = b.emp_id;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let with_idx = find_line_starting_with(&lines, "WITH base_emp AS (").expect("WITH CTE line");
+        let sales_agg_idx =
+            find_line_starting_with(&lines, "sales_agg AS (").expect("sales_agg CTE line");
+
+        assert_eq!(
+            leading_spaces(lines[with_idx]),
+            4,
+            "CREATE VIEW query body WITH header should be depth 1, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[sales_agg_idx]),
+            leading_spaces(lines[with_idx]),
+            "sibling CTE after close-comma should stay on the same CREATE VIEW query-body depth, got:\n{}",
             formatted
         );
     }
