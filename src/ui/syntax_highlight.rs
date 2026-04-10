@@ -1173,14 +1173,15 @@ fn should_treat_function_name_as_identifier(
         Cow::Borrowed(word)
     };
     let upper = upper.as_ref();
+    let is_sql_keyword =
+        sql_text::is_oracle_sql_keyword(upper) || sql_text::is_mysql_sql_keyword(upper);
 
     if !ORACLE_FUNCTIONS_SET.contains(upper) && !MYSQL_FUNCTIONS_SET.contains(upper) {
         return false;
     }
 
-    if (sql_text::is_oracle_sql_keyword(upper) || sql_text::is_mysql_sql_keyword(upper))
-        && next_significant_token_kind(text, bytes, word_end)
-            == Some(SignificantTokenKind::LeftParen)
+    if is_sql_keyword
+        && next_significant_token_kind(text, bytes, word_end) == Some(SignificantTokenKind::LeftParen)
     {
         return false;
     }
@@ -1193,8 +1194,22 @@ fn should_treat_function_name_as_identifier(
         return true;
     }
 
-    prev_significant_word_upper(text, bytes, word_start)
-        .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str()))
+    let has_relation_context = prev_significant_word_upper(text, bytes, word_start)
+        .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str()));
+    if !has_relation_context {
+        return false;
+    }
+
+    if is_sql_keyword
+        && next_significant_word_upper(text, bytes, word_end).is_some_and(|next_word| {
+            sql_text::is_oracle_sql_keyword(next_word.as_str())
+                || sql_text::is_mysql_sql_keyword(next_word.as_str())
+        })
+    {
+        return false;
+    }
+
+    true
 }
 
 fn should_treat_keyword_as_identifier_context(

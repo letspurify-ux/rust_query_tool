@@ -645,8 +645,6 @@ impl PendingSplitEndSuffixKind {
                         consumed_timing_keyword: true,
                         consumed_each: true,
                     })
-                } else if matches!(word_upper, "ROW" | "STATEMENT") {
-                    None
                 } else {
                     None
                 }
@@ -1917,9 +1915,9 @@ impl SqlEditorWidget {
     }
 
     fn statement_contains_keyword(tokens: &[SqlToken], keyword: &str) -> bool {
-        tokens.iter().any(|token| {
-            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
-        })
+        tokens.iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+        )
     }
 
     fn query_like_paren_layout(
@@ -3623,16 +3621,25 @@ impl SqlEditorWidget {
         let prev_meaningful_idx = meaningful_token_links
             .and_then(|links| links.prev_index(open_paren_idx))
             .or_else(|| Self::previous_meaningful_token_index(tokens, open_paren_idx));
+        let Some(prev_meaningful_idx) = prev_meaningful_idx else {
+            return false;
+        };
+
+        // Tight MySQL word-paren spacing is only valid when the immediate token
+        // before `(` is the callee/type word itself. If an operator/symbol sits
+        // between the nearest word and `(` (e.g. `x = (` or `a + (`), preserve
+        // normal operator spacing.
+        if prev_meaningful_idx != prev_word_idx {
+            return false;
+        }
 
         if prev_word == "IF"
-            && prev_meaningful_idx.is_some_and(|if_idx| {
-                Self::mysql_if_is_scalar_function(
-                    tokens,
-                    if_idx,
-                    meaningful_token_links,
-                    matching_paren_close_indices,
-                )
-            })
+            && Self::mysql_if_is_scalar_function(
+                tokens,
+                prev_meaningful_idx,
+                meaningful_token_links,
+                matching_paren_close_indices,
+            )
         {
             return true;
         }
@@ -4834,9 +4841,7 @@ impl SqlEditorWidget {
                     if opens_unterminated_plsql_label {
                         pending_plsql_label_body_indent =
                             Some(base_indent(indent_level, open_cursor_state));
-                    } else if word.ends_with(">>") {
-                        pending_plsql_label_body_indent = None;
-                    } else if pending_plsql_label_body_indent.is_some() {
+                    } else if word.ends_with(">>") || pending_plsql_label_body_indent.is_some() {
                         pending_plsql_label_body_indent = None;
                     }
                     let mysql_labeled_block_header_word =
@@ -4951,6 +4956,9 @@ impl SqlEditorWidget {
                             || (upper == "ON"
                                 && suppress_comma_break_depth > 0
                                 && !paren_stack.iter().any(|frame| frame.is_query_like())));
+                    let top_level_query_body_base_indent = query_body_clause_base_depth
+                        .filter(|_| paren_stack.is_empty())
+                        .unwrap_or_else(|| base_indent(indent_level, open_cursor_state));
                     let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_cursor_for_clause(
@@ -5210,12 +5218,11 @@ impl SqlEditorWidget {
                         let mut restored_indent_level = None;
                         let mut closed_owner_depth = None;
 
-                        let end_qualifier_is_keyword = end_qualifier.as_deref().is_some_and(
-                            |qualifier| {
+                        let end_qualifier_is_keyword =
+                            end_qualifier.as_deref().is_some_and(|qualifier| {
                                 sql_text::is_oracle_sql_keyword(qualifier)
                                     || sql_text::is_mysql_sql_keyword(qualifier)
-                            },
-                        );
+                            });
                         let case_expression_end = !is_qualified_end
                             && block_stack.last().is_some_and(|s| s == "CASE")
                             && (end_qualifier.is_none() || end_qualifier_is_keyword);
@@ -5734,6 +5741,12 @@ impl SqlEditorWidget {
                             .then(|| control_condition_header_parenthesized_stack.last().copied())
                             .flatten()
                             .unwrap_or(false);
+                        let control_header_previous_token_is_close_paren = matches!(
+                            comment_prefix_cache
+                                .previous_non_comment_token_index(idx)
+                                .and_then(|token_idx| tokens.get(token_idx)),
+                            Some(SqlToken::Symbol(sym)) if sym == ")"
+                        );
                         let clause_base_indent =
                             if let Some(header_indent) = control_header_condition_indent {
                                 header_indent
@@ -5872,8 +5885,10 @@ impl SqlEditorWidget {
                                 {
                                     if control_header_is_parenthesized {
                                         paren_extra.max(1)
-                                    } else {
+                                    } else if control_header_previous_token_is_close_paren {
                                         paren_extra
+                                    } else {
+                                        paren_extra.max(1)
                                     }
                                 } else if in_control_header_condition {
                                     paren_extra.max(1)
@@ -6104,7 +6119,7 @@ impl SqlEditorWidget {
                         if !join_modifier_active {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                top_level_query_body_base_indent,
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -6123,7 +6138,7 @@ impl SqlEditorWidget {
                             if !join_modifier_active {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    top_level_query_body_base_indent,
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -6137,7 +6152,7 @@ impl SqlEditorWidget {
                         {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                top_level_query_body_base_indent,
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -6574,9 +6589,7 @@ impl SqlEditorWidget {
                         mysql_handler_body_indent_pending =
                             Some(mysql_handler_body_indent_pending.unwrap_or(pending_indent));
                     }
-                    if case_branch_body_line {
-                        line_indent = line_indent.saturating_add(1);
-                    } else if exception_branch_body_line {
+                    if case_branch_body_line || exception_branch_body_line {
                         line_indent = line_indent.saturating_add(1);
                     }
                     if mysql_handler_block_begin {
@@ -6888,11 +6901,13 @@ impl SqlEditorWidget {
                         construct.insert_all_active.activate(current_scope);
                     }
 
+                    let create_block_disallowed_for_compound_trigger =
+                        matches!(construct.create_object.as_deref(), Some("TRIGGER"))
+                            && compound_trigger_state.is_in_outer_body();
                     let starts_create_block = matches!(upper, "AS" | "IS")
                         && !as_belongs_to_constructor_result_clause
                         && !trigger_header_state.is_active()
-                        && !(matches!(construct.create_object.as_deref(), Some("TRIGGER"))
-                            && compound_trigger_state.is_in_outer_body())
+                        && !create_block_disallowed_for_compound_trigger
                         && (construct.create_object.is_some()
                             || construct.routine_decl_pending.is_active()
                             || with_plsql_body_starts_here);
@@ -7522,24 +7537,19 @@ impl SqlEditorWidget {
                     out.push_str(rendered_comment_body);
 
                     needs_space = true;
-                    let comment_header_continuation_kind =
-                        if previous_non_comment_token.is_some_and(
-                            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("WITH")),
-                        ) {
-                            Some(
-                                crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
-                            )
-                        } else if previous_non_comment_token.is_some_and(|token| {
-                            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("KEEP"))
-                        }) {
-                            Some(
-                                crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth,
-                            )
-                        } else {
-                            Self::comment_header_continuation_kind_for_prefix(
-                                comment_structural_prefix,
-                            )
-                        };
+                    let previous_token_requires_same_depth =
+                        previous_non_comment_token.is_some_and(|token| match token {
+                            SqlToken::Word(word) => {
+                                word.eq_ignore_ascii_case("WITH")
+                                    || word.eq_ignore_ascii_case("KEEP")
+                            }
+                            _ => false,
+                        });
+                    let comment_header_continuation_kind = if previous_token_requires_same_depth {
+                        Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+                    } else {
+                        Self::comment_header_continuation_kind_for_prefix(comment_structural_prefix)
+                    };
                     keeps_next_line_continuation |= comment_header_continuation_kind.is_some();
                     if hint_after_select {
                         if !out.ends_with('\n') {
@@ -7884,7 +7894,15 @@ impl SqlEditorWidget {
                                                 | "INTO"
                                         )
                                     );
-                                if comma_starts_clause_list_item {
+                                let aligns_clause_list_indent = comma_starts_clause_list_item
+                                    || (line_indent == 0
+                                        && (matches!(
+                                            current_clause.as_deref(),
+                                            Some("SELECT" | "SET")
+                                        ) || select_list_layout_state.has_active_indent()
+                                            || in_column_list
+                                            || previous_is_line_comment));
+                                if aligns_clause_list_indent {
                                     line_indent = active_list_indent(
                                         indent_level,
                                         open_cursor_state,
@@ -7893,20 +7911,12 @@ impl SqlEditorWidget {
                                         construct.merge_active.is_active(),
                                         in_column_list,
                                     );
-                                } else if line_indent == 0
-                                    && (matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
-                                        || select_list_layout_state.has_active_indent()
-                                        || in_column_list
-                                        || previous_is_line_comment)
-                                {
-                                    line_indent = active_list_indent(
-                                        indent_level,
-                                        open_cursor_state,
-                                        select_list_layout_state,
-                                        current_clause.as_deref(),
-                                        construct.merge_active.is_active(),
-                                        in_column_list,
-                                    );
+                                    if paren_stack.is_empty() {
+                                        if let Some(base_depth) = query_body_clause_base_depth {
+                                            line_indent =
+                                                line_indent.max(base_depth.saturating_add(1));
+                                        }
+                                    }
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
                             }
@@ -8089,14 +8099,21 @@ impl SqlEditorWidget {
                                         )
                                     })
                                     .map(|_| {
-                                        active_list_indent(
+                                        let mut list_indent = active_list_indent(
                                             indent_level,
                                             open_cursor_state,
                                             select_list_layout_state,
                                             current_clause.as_deref(),
                                             construct.merge_active.is_active(),
                                             false,
-                                        )
+                                        );
+                                        if paren_stack.is_empty() {
+                                            if let Some(base_depth) = query_body_clause_base_depth {
+                                                list_indent =
+                                                    list_indent.max(base_depth.saturating_add(1));
+                                            }
+                                        }
+                                        list_indent
                                     });
                                     let wrapped_owner_clause_sibling =
                                         paren_stack.last().is_some_and(|frame| {
@@ -8156,6 +8173,37 @@ impl SqlEditorWidget {
                                         Some(SqlToken::Comment(comment))
                                             if comment.trim_start().starts_with("--")
                                     );
+                                    let previous_non_comment_is_case_end =
+                                        comment_prefix_cache
+                                            .previous_non_comment_token_index(idx)
+                                            .and_then(|token_idx| tokens.get(token_idx))
+                                            .is_some_and(|token| {
+                                                matches!(
+                                                    token,
+                                                    SqlToken::Word(word)
+                                                        if word.eq_ignore_ascii_case("END")
+                                                )
+                                            });
+                                    let case_end_sibling_indent = previous_non_comment_is_case_end
+                                        .then_some(())
+                                        .filter(|_| {
+                                            paren_stack
+                                                .last()
+                                                .is_some_and(|frame| frame.suppresses_comma_breaks())
+                                        })
+                                        .and_then(|_| {
+                                            paren_stack
+                                                .last()
+                                                .and_then(|frame| {
+                                                    (!frame.is_query_like()
+                                                        && !frame.is_column_list())
+                                                        .then_some(
+                                                            frame
+                                                                .open_line_indent
+                                                                .saturating_add(1),
+                                                        )
+                                                })
+                                        });
                                     if matches!(current_clause.as_deref(), Some("SET"))
                                         && construct.merge_active.is_active()
                                     {
@@ -8165,6 +8213,19 @@ impl SqlEditorWidget {
                                             &mut out,
                                             base_indent(indent_level, open_cursor_state),
                                             merge_set_continuation_extra,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
+                                    } else if let Some(case_end_sibling_indent) =
+                                        case_end_sibling_indent
+                                    {
+                                        // CASE ... END, inside VALUES must snap the next
+                                        // sibling argument back to the parent call frame.
+                                        newline_with(
+                                            &mut out,
+                                            case_end_sibling_indent,
+                                            0,
                                             &mut at_line_start,
                                             &mut needs_space,
                                             &mut line_indent,
@@ -8617,6 +8678,13 @@ impl SqlEditorWidget {
                                     Some(token_cache.meaningful_links()),
                                     Some(token_cache.statement_word_links()),
                                 ));
+                            let has_nested_analytic_clause_owner_child =
+                                Self::paren_body_contains_nested_analytic_clause_owner(
+                                    tokens,
+                                    idx,
+                                    Some(token_cache.matching_paren_close_indices()),
+                                    Some(token_cache.statement_word_links()),
+                                );
                             let wraps_function_call_child = wraps_subquery_or_case_head
                                 && multiline_clause_owner_kind.is_none()
                                 && wrapped_owner_kind.is_none()
@@ -8653,6 +8721,12 @@ impl SqlEditorWidget {
                                 ParenFormatFrameKind::QueryLike
                             } else if is_column_list || is_multiline_routine_parameter_list {
                                 ParenFormatFrameKind::ColumnList
+                            } else if has_nested_analytic_clause_owner_child {
+                                // Nested owner-relative multiline clauses inside ordinary
+                                // call/expression parens (for example `... OVER (...)`) should
+                                // still open an owner/body frame so sibling arguments can snap
+                                // back to the parent call depth after the nested close.
+                                ParenFormatFrameKind::WrappedLayout
                             } else if wrapped_owner_kind.is_some()
                                 || forced_wrapped_owner_kind.is_some()
                                 || (wraps_subquery_or_case_head && !wraps_function_call_child)
@@ -8783,16 +8857,13 @@ impl SqlEditorWidget {
                                 } else {
                                     rendered_owner_depth
                                 }
-                            } else if matches!(current_clause.as_deref(), Some("VALUES")) {
-                                rendered_owner_depth
-                            } else if matches!(current_clause.as_deref(), Some("FROM")) {
-                                rendered_owner_depth
-                            } else if matches!(
-                                prev_word_upper.as_deref(),
-                                Some("JSON_TABLE" | "XMLTABLE")
-                            ) {
-                                rendered_owner_depth
-                            } else if wrapped_query_owner_paren {
+                            } else if matches!(current_clause.as_deref(), Some("VALUES" | "FROM"))
+                                || matches!(
+                                    prev_word_upper.as_deref(),
+                                    Some("JSON_TABLE" | "XMLTABLE")
+                                )
+                                || wrapped_query_owner_paren
+                            {
                                 rendered_owner_depth
                             } else if matches!(paren_frame_kind, ParenFormatFrameKind::Compact)
                                 || function_like_wrapped_paren
@@ -9557,6 +9628,40 @@ impl SqlEditorWidget {
                 || opens_column_list_child
             {
                 return true;
+            }
+        }
+
+        false
+    }
+
+    fn paren_body_contains_nested_analytic_clause_owner(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+        statement_word_links: Option<&StatementWordLinks>,
+    ) -> bool {
+        let Some(close_idx) =
+            Self::matching_close_paren_index(tokens, open_idx, matching_paren_close_indices)
+        else {
+            return false;
+        };
+
+        for idx in open_idx.saturating_add(1)..close_idx {
+            if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                continue;
+            }
+
+            if let Some(owner_kind) =
+                Self::paren_multiline_clause_owner_kind(tokens, idx, statement_word_links)
+            {
+                if matches!(
+                    owner_kind,
+                    FormatIndentedParenOwnerKind::AnalyticOver
+                        | FormatIndentedParenOwnerKind::WithinGroup
+                        | FormatIndentedParenOwnerKind::Keep
+                ) {
+                    return true;
+                }
             }
         }
 
@@ -29036,8 +29141,11 @@ DELIMITER ;"#;
         let round_idx = lines
             .iter()
             .enumerate()
-            .find(|(_, line)| {
-                line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER ("
+            .find(|(idx, line)| {
+                line.trim_start() == "ROUND("
+                    && lines
+                        .get(idx.saturating_add(1))
+                        .is_some_and(|next| next.trim_start().starts_with("net_sales"))
             })
             .map(|(idx, _)| idx)
             .expect("test6 mom_diff ROUND owner");
@@ -29045,23 +29153,32 @@ DELIMITER ;"#;
             .iter()
             .enumerate()
             .skip(round_idx + 1)
-            .take(6)
+            .take(12)
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("test6 IFNULL fallback argument");
+        let ifnull_owner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_idx + 1)
+            .take(8)
+            .find(|(_, line)| line.trim_start().contains("IFNULL("))
+            .map(|(idx, _)| idx)
+            .expect("test6 IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
             .skip(zero_idx + 1)
-            .take(4)
+            .take(8)
             .find(|(_, line)| line.trim_start() == "2")
             .map(|(idx, _)| idx)
             .expect("test6 ROUND precision argument");
 
         let desired_indent = leading_spaces(lines[round_idx]).saturating_add(4);
+        let ifnull_body_indent = leading_spaces(lines[ifnull_owner_idx]).saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
-            desired_indent,
+            ifnull_body_indent,
             "test6 nested IFNULL fallback after pure `),` should realign with the call body depth, got:\n{formatted}"
         );
         assert_eq!(
@@ -29125,9 +29242,16 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .position(|line| {
-                line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER ("
+            .enumerate()
+            .find(|(idx, line)| {
+                line.trim_start() == "ROUND("
+                    && lines
+                        .iter()
+                        .skip(idx.saturating_add(1))
+                        .take(6)
+                        .any(|next| next.contains("IFNULL("))
             })
+            .map(|(idx, _)| idx)
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -29140,22 +29264,35 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(round_close_alias_idx + 1)
-            .find(|(_, line)| line.trim_start() == "ROUND(SUM(net_sales) OVER (")
+            .find(|(idx, line)| {
+                line.trim_start() == "ROUND("
+                    && lines
+                        .get(idx.saturating_add(1))
+                        .is_some_and(|next| next.trim_start() == "SUM(net_sales) OVER (")
+            })
             .map(|(idx, _)| idx)
             .expect("rolling ROUND owner");
         let zero_idx = lines
             .iter()
             .enumerate()
             .skip(round_owner_idx + 1)
-            .take(8)
+            .take(12)
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("IFNULL fallback");
+        let ifnull_owner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .take(8)
+            .find(|(_, line)| line.trim_start().contains("IFNULL("))
+            .map(|(idx, _)| idx)
+            .expect("IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
             .skip(zero_idx + 1)
-            .take(6)
+            .take(10)
             .find(|(_, line)| line.trim_start() == "2")
             .map(|(idx, _)| idx)
             .expect("ROUND precision");
@@ -29163,16 +29300,18 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(zero_idx + 1)
-            .take(4)
+            .take(8)
             .find(|(_, line)| line.trim_start() == "),")
             .map(|(idx, _)| idx)
             .expect("IFNULL close");
 
         let round_owner_indent = leading_spaces(lines[round_owner_idx]);
         let expected_arg_indent = round_owner_indent.saturating_add(4);
+        let expected_ifnull_owner_indent = leading_spaces(lines[ifnull_owner_idx]);
+        let expected_ifnull_body_indent = expected_ifnull_owner_indent.saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
-            expected_arg_indent,
+            expected_ifnull_body_indent,
             "nested IFNULL fallback should stay on the ROUND call frame body depth, got:\n{formatted}"
         );
         assert_eq!(
@@ -29182,7 +29321,7 @@ ORDER BY month_key,
         );
         assert_eq!(
             leading_spaces(lines[ifnull_close_idx]),
-            expected_arg_indent,
+            expected_ifnull_owner_indent,
             "IFNULL pure-close line should stay on the parent call frame body depth before ROUND sibling arguments, got:\n{formatted}"
         );
         assert_eq!(
@@ -29257,9 +29396,16 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .position(|line| {
-                line.trim_start() == "ROUND(net_sales - IFNULL(LAG(net_sales, 1) OVER ("
+            .enumerate()
+            .find(|(idx, line)| {
+                line.trim_start() == "ROUND("
+                    && lines
+                        .iter()
+                        .skip(idx.saturating_add(1))
+                        .take(6)
+                        .any(|next| next.contains("IFNULL("))
             })
+            .map(|(idx, _)| idx)
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -29272,22 +29418,35 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(round_close_alias_idx + 1)
-            .find(|(_, line)| line.trim_start() == "ROUND(SUM(net_sales) OVER (")
+            .find(|(idx, line)| {
+                line.trim_start() == "ROUND("
+                    && lines
+                        .get(idx.saturating_add(1))
+                        .is_some_and(|next| next.trim_start() == "SUM(net_sales) OVER (")
+            })
             .map(|(idx, _)| idx)
             .expect("rolling ROUND owner");
         let zero_idx = lines
             .iter()
             .enumerate()
             .skip(round_owner_idx + 1)
-            .take(8)
+            .take(12)
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("IFNULL fallback");
+        let ifnull_owner_idx = lines
+            .iter()
+            .enumerate()
+            .skip(round_owner_idx + 1)
+            .take(8)
+            .find(|(_, line)| line.trim_start().contains("IFNULL("))
+            .map(|(idx, _)| idx)
+            .expect("IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
             .skip(zero_idx + 1)
-            .take(6)
+            .take(10)
             .find(|(_, line)| line.trim_start() == "2")
             .map(|(idx, _)| idx)
             .expect("ROUND precision");
@@ -29295,16 +29454,18 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(zero_idx + 1)
-            .take(4)
+            .take(8)
             .find(|(_, line)| line.trim_start() == "),")
             .map(|(idx, _)| idx)
             .expect("IFNULL close");
 
         let round_owner_indent = leading_spaces(lines[round_owner_idx]);
         let expected_arg_indent = round_owner_indent.saturating_add(4);
+        let expected_ifnull_owner_indent = leading_spaces(lines[ifnull_owner_idx]);
+        let expected_ifnull_body_indent = expected_ifnull_owner_indent.saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
-            expected_arg_indent,
+            expected_ifnull_body_indent,
             "auto-format IFNULL fallback should stay on the ROUND call frame body depth, got:\n{formatted}"
         );
         assert_eq!(
@@ -29314,7 +29475,7 @@ ORDER BY month_key,
         );
         assert_eq!(
             leading_spaces(lines[ifnull_close_idx]),
-            expected_arg_indent,
+            expected_ifnull_owner_indent,
             "auto-format IFNULL pure-close line should stay on the parent call frame body depth before ROUND sibling arguments, got:\n{formatted}"
         );
         assert_eq!(
@@ -30067,6 +30228,92 @@ END$$"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test4_view_join_and_split_if_or_on_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let from_idx =
+            find_line_starting_with(&lines, "FROM employees e").expect("test4 view FROM");
+        let join_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx + 1)
+            .find(|(_, line)| line.trim_start() == "JOIN departments d")
+            .map(|(idx, _)| idx)
+            .expect("test4 view JOIN");
+        let left_join_idx = lines
+            .iter()
+            .enumerate()
+            .skip(join_idx + 1)
+            .find(|(_, line)| line.trim_start() == "LEFT JOIN task_log t")
+            .map(|(idx, _)| idx)
+            .expect("test4 view LEFT JOIN");
+        let group_by_idx = lines
+            .iter()
+            .enumerate()
+            .skip(left_join_idx + 1)
+            .find(|(_, line)| line.trim_start() == "GROUP BY e.employee_id,")
+            .map(|(idx, _)| idx)
+            .expect("test4 view GROUP BY");
+        let group_by_item_idx = lines
+            .iter()
+            .enumerate()
+            .skip(group_by_idx + 1)
+            .find(|(_, line)| line.trim_start() == "e.emp_code,")
+            .map(|(idx, _)| idx)
+            .expect("test4 view GROUP BY sibling");
+
+        let if_payload_idx = find_line_starting_with(&lines, "IF NEW.payload IS NULL")
+            .expect("test4 IF NEW.payload");
+        let or_payload_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_payload_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR JSON_VALID(NEW.payload) = 0 THEN")
+            .map(|(idx, _)| idx)
+            .expect("test4 OR payload");
+        let if_note_idx =
+            find_line_starting_with(&lines, "IF NEW.note IS NULL").expect("test4 IF NEW.note");
+        let or_note_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_note_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR CHAR_LENGTH(TRIM(NEW.note)) = 0 THEN")
+            .map(|(idx, _)| idx)
+            .expect("test4 OR note");
+
+        assert_eq!(
+            leading_spaces(lines[join_idx]),
+            leading_spaces(lines[from_idx]),
+            "test4 CREATE VIEW JOIN should stay on the FROM frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[left_join_idx]),
+            leading_spaces(lines[from_idx]),
+            "test4 CREATE VIEW LEFT JOIN should stay on the FROM frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[group_by_item_idx]),
+            leading_spaces(lines[group_by_idx]).saturating_add(4),
+            "test4 GROUP BY sibling columns should stay one frame deeper than GROUP BY, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_payload_idx]),
+            leading_spaces(lines[if_payload_idx]).saturating_add(4),
+            "test4 split IF payload OR line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_note_idx]),
+            leading_spaces(lines[if_note_idx]).saturating_add(4),
+            "test4 split IF note OR line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test5_frame_based_depths_for_create_table_and_handlers(
     ) {
         let source = include_str!("../../../test_mariadb/test5.txt");
@@ -30162,6 +30409,80 @@ END$$"#;
             leading_spaces(lines[rollback_idx]),
             leading_spaces(lines[exit_handler_idx]).saturating_add(8),
             "test5 EXIT HANDLER body statements should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_view_join_and_split_if_or_on_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let from_idx =
+            find_line_starting_with(&lines, "FROM work_item wi").expect("test5 view FROM");
+        let left_join_idx = lines
+            .iter()
+            .enumerate()
+            .skip(from_idx + 1)
+            .find(|(_, line)| line.trim_start() == "LEFT JOIN work_event we")
+            .map(|(idx, _)| idx)
+            .expect("test5 view LEFT JOIN");
+        let group_by_idx = lines
+            .iter()
+            .enumerate()
+            .skip(left_join_idx + 1)
+            .find(|(_, line)| line.trim_start() == "GROUP BY wi.item_id,")
+            .map(|(idx, _)| idx)
+            .expect("test5 view GROUP BY");
+        let group_by_item_idx = lines
+            .iter()
+            .enumerate()
+            .skip(group_by_idx + 1)
+            .find(|(_, line)| line.trim_start() == "wi.project_id,")
+            .map(|(idx, _)| idx)
+            .expect("test5 view GROUP BY sibling");
+
+        let if_points_idx =
+            find_line_starting_with(&lines, "IF NEW.points IS NULL").expect("test5 IF NEW.points");
+        let or_points_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_points_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR NEW.points <= 0 THEN")
+            .map(|(idx, _)| idx)
+            .expect("test5 OR points");
+        let if_detail_idx = find_line_starting_with(&lines, "IF NEW.detail_doc IS NULL")
+            .expect("test5 IF NEW.detail_doc");
+        let or_detail_idx = lines
+            .iter()
+            .enumerate()
+            .skip(if_detail_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR JSON_VALID(NEW.detail_doc) = 0 THEN")
+            .map(|(idx, _)| idx)
+            .expect("test5 OR detail_doc");
+
+        assert_eq!(
+            leading_spaces(lines[left_join_idx]),
+            leading_spaces(lines[from_idx]),
+            "test5 CREATE VIEW LEFT JOIN should stay on the FROM frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[group_by_item_idx]),
+            leading_spaces(lines[group_by_idx]).saturating_add(4),
+            "test5 GROUP BY sibling columns should stay one frame deeper than GROUP BY, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_points_idx]),
+            leading_spaces(lines[if_points_idx]).saturating_add(4),
+            "test5 split IF points OR line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_detail_idx]),
+            leading_spaces(lines[if_detail_idx]).saturating_add(4),
+            "test5 split IF detail_doc OR line should stay on IF condition continuation frame depth, got:\n{formatted}"
         );
     }
 
@@ -30274,6 +30595,60 @@ END$$"#;
             leading_spaces(lines[rollback_idx]),
             leading_spaces(lines[handler_idx]).saturating_add(8),
             "test6 EXIT HANDLER body should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_split_if_or_condition_continuations_on_frame_depth(
+    ) {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let trigger_if_idx = find_line_starting_with(&lines, "IF NEW.quantity IS NULL")
+            .expect("test6 trigger IF NEW.quantity");
+        let trigger_or_idx = lines
+            .iter()
+            .enumerate()
+            .skip(trigger_if_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR NEW.quantity < 1 THEN")
+            .map(|(idx, _)| idx)
+            .expect("test6 trigger OR NEW.quantity");
+
+        let proc_if_idx =
+            find_line_starting_with(&lines, "IF p_from IS NULL").expect("test6 proc IF p_from");
+        let proc_or_to_idx = lines
+            .iter()
+            .enumerate()
+            .skip(proc_if_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR p_to IS NULL")
+            .map(|(idx, _)| idx)
+            .expect("test6 proc OR p_to");
+        let proc_or_order_idx = lines
+            .iter()
+            .enumerate()
+            .skip(proc_or_to_idx + 1)
+            .find(|(_, line)| line.trim_start() == "OR p_from > p_to THEN")
+            .map(|(idx, _)| idx)
+            .expect("test6 proc OR p_from > p_to");
+
+        assert_eq!(
+            leading_spaces(lines[trigger_or_idx]),
+            leading_spaces(lines[trigger_if_idx]).saturating_add(4),
+            "test6 trigger split IF OR line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[proc_or_to_idx]),
+            leading_spaces(lines[proc_if_idx]).saturating_add(4),
+            "test6 procedure split IF OR p_to line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[proc_or_order_idx]),
+            leading_spaces(lines[proc_if_idx]).saturating_add(4),
+            "test6 procedure split IF OR p_from > p_to line should stay on IF condition continuation frame depth, got:\n{formatted}"
         );
     }
 
@@ -30931,4 +31306,140 @@ END"#;
             "test6 UPDATE JOIN subquery close should return to JOIN depth, got:\n{formatted}"
         );
     }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test4_assignment_parenthesized_expression_spacing()
+    {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains("SET v_project = ((v_day + v_emp) MOD 3) + 1;"),
+            "test4 assignment with parenthesized expression should keep operator spacing before `(`, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("SET v_project =((v_day + v_emp) MOD 3) + 1;"),
+            "test4 formatter must not collapse operator spacing into `=(` for parenthesized expression, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_parenthesized_expression_operator_spacing() {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains("SET v_sprint_id = ((v_project_id - 1) * 3) + (((v_seq - 1) MOD 3) + 1);"),
+            "test5 sprint assignment should keep operator spacing before parenthesized expression, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("SET v_assignee_user_id = ((v_seq - 1) MOD 6) + 3;"),
+            "test5 assignee assignment should keep operator spacing before parenthesized expression, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("WHERE wi2.project_id = ("),
+            "test5 scalar subquery predicate should keep space before parenthesized expression, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_parenthesized_operand_spacing_without_call_collapse(
+    ) {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        for expected in [
+            "ROUND(19 + (v_product_id * 7.35) + (MOD(v_product_id, 5) * 3.70), 2)",
+            "ROUND(0.5 + (v_product_id * 0.13), 2)",
+            "ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)",
+        ] {
+            assert!(
+                formatted.contains(expected),
+                "test6 expression operand parens should preserve operator spacing, missing `{expected}` in:\n{formatted}"
+            );
+        }
+        for malformed in [
+            "ROUND(19 +(v_product_id * 7.35) +(MOD(v_product_id, 5) * 3.70), 2)",
+            "ROUND(0.5 +(v_product_id * 0.13), 2)",
+            "ROUND(19 +(v_prod_id * 7.35) +(MOD(v_prod_id, 5) * 3.70), 2)",
+        ] {
+            assert!(
+                !formatted.contains(malformed),
+                "test6 formatter must not collapse operator spacing before parenthesized operands, found malformed `{malformed}` in:\n{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test6_values_case_end_comma_siblings_on_values_frame_depth(
+    ) {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let values_idx = find_line_starting_with(
+            &lines,
+            "VALUES (v_order_id, v_item_no, v_prod_id, 1 + MOD(v_order_id + v_item_no, 4),",
+        )
+        .expect("test6 order_item VALUES head");
+        let end_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .skip(values_idx + 1)
+            .take(40)
+            .filter(|(_, line)| line.trim_start() == "END,")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(
+            end_indices.len(),
+            3,
+            "test6 order_item VALUES payload should keep three CASE END, lines, got:\n{formatted}"
+        );
+        let concat_idx = lines
+            .iter()
+            .enumerate()
+            .skip(end_indices[2] + 1)
+            .find(|(_, line)| {
+                line.trim_start()
+                    == "CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'),"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test6 VALUES CONCAT note sibling");
+        let json_idx = lines
+            .iter()
+            .enumerate()
+            .skip(concat_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start().starts_with(
+                    "JSON_OBJECT('gift', IF(MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'),",
+                )
+            })
+            .map(|(idx, _)| idx)
+            .expect("test6 VALUES JSON_OBJECT sibling");
+
+        let case_owner_indent = leading_spaces(lines[end_indices[2]]);
+        assert_eq!(
+            leading_spaces(lines[concat_idx]),
+            case_owner_indent,
+            "test6 VALUES sibling after CASE END, should return to the parent argument frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[json_idx]),
+            case_owner_indent,
+            "test6 VALUES JSON_OBJECT sibling should stay on the same parent argument frame depth after CASE END,, got:\n{formatted}"
+        );
+    }
+
 }

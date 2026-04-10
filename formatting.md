@@ -118,6 +118,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - idempotence는 별도 미적 요구가 아니라 근본 검증 규칙이다. 새 family를 추가할 때는 "semantic family 판정", "typed pending state 유지", "anchor resolver 적용"뿐 아니라 "두 번 돌려도 같은 결과인지"까지 확인해야 한다.
 - mixed leading-close, owner-relative header chain, comment-glued split owner처럼 phase drift가 잘 생기는 family는 canonical form이 한 번에 고정되어야 한다. 첫 번째 포맷에서 임시 보정하고 두 번째 포맷에서 다시 depth가 바뀌는 구조는 허용하지 않는다.
 - sibling list도 같은 원칙을 따른다. 하나의 list item 안에서 general paren / owner-relative body / function option line 때문에 임시로 더 깊어질 수는 있지만, trailing comma가 item을 닫은 순간 다음 sibling은 항상 stable `list body depth`로 복귀해야 한다. 이전 item의 function-local `RETURNING` carry나 visual hanging indent가 다음 sibling의 anchor가 되면 canonical form이 아니다.
+- 특히 compact argument list의 `CASE ... END,` 뒤 sibling operand는 `WHEN/ELSE` branch literal depth가 아니라 parent frame의 argument body depth로 즉시 복귀해야 한다. `END,` 직후 `CONCAT(...)`/`JSON_OBJECT(...)` 같은 sibling가 branch depth를 상속하면 canonical depth 규칙(1.7)을 위반한다.
 
 ### 1.8 comment와 quoted literal은 구조 이벤트가 아니다
 

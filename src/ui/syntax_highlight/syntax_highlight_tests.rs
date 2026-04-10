@@ -2418,6 +2418,19 @@ END IF;";
 }
 
 #[test]
+fn test_mysql_drop_table_if_exists_highlights_if_as_keyword() {
+    let text = "DROP TABLE IF EXISTS boss_monthly_stats;";
+
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["DROP", "TABLE", "IF", "EXISTS"] {
+        assert_token_has_style(text, &styles, token, STYLE_KEYWORD);
+    }
+}
+
+#[test]
 fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
     let text = load_mariadb_highlight_test_file("test1.txt");
     assert!(
