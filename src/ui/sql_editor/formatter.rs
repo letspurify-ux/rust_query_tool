@@ -4586,6 +4586,7 @@ impl SqlEditorWidget {
         let mut at_line_start = true;
         let mut needs_space = false;
         let mut line_indent = 0usize;
+        let mut line_start_token_paren_depth = 0usize;
         let mut join_modifier_active = false;
         let mut join_on_condition_frames: Vec<(usize, usize)> = Vec::new();
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
@@ -4627,6 +4628,7 @@ impl SqlEditorWidget {
         let query_apply_flags = Self::query_apply_flags(tokens);
         let token_spans =
             super::query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible);
+        let token_paren_depths = paren_depths(tokens);
         let token_cache = FormatterTokenCache::build(tokens);
         let comment_prefix_cache = CommentPrefixCache::build(tokens);
 
@@ -4742,6 +4744,7 @@ impl SqlEditorWidget {
         let mut mysql_begin_not_atomic_header_open = false;
         let mut idx = 0;
         while idx < tokens.len() {
+            let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = FormatScope::new(paren_stack.len(), block_stack.len());
             while between_paren_depths
                 .last()
@@ -4825,6 +4828,9 @@ impl SqlEditorWidget {
                         frame.note_continuation_token();
                     }
                 }
+            }
+            if at_line_start {
+                line_start_token_paren_depth = current_token_paren_depth;
             }
 
             match &tokens[idx] {
@@ -8250,23 +8256,41 @@ impl SqlEditorWidget {
                                                 indent: select_list_indent,
                                                 hanging_indent_spaces: Some(hanging_indent_spaces),
                                             };
+                                    } else if matches!(
+                                        current_clause.as_deref(),
+                                        Some("SELECT" | "SET")
+                                    ) && (current_token_paren_depth
+                                        < line_start_token_paren_depth
+                                        || follows_multiline_child_close)
+                                    {
+                                        // Mixed close-comma SELECT/SET siblings must snap to the
+                                        // active list frame depth after the current line closes
+                                        // one or more frames.
+                                        let frame_based_sibling_indent =
+                                            parent_frame_sibling_indent.unwrap_or_else(|| {
+                                                select_list_layout_state.indentation_or(
+                                                    active_list_indent(
+                                                        indent_level,
+                                                        open_cursor_state,
+                                                        select_list_layout_state,
+                                                        current_clause.as_deref(),
+                                                        construct.merge_active.is_active(),
+                                                        false,
+                                                    ),
+                                                )
+                                            });
+                                        newline_with(
+                                            &mut out,
+                                            frame_based_sibling_indent,
+                                            0,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
                                     } else if let Some(query_like_indent) =
                                         query_like_select_list_indent
                                     {
-                                        let current_line_indent =
-                                            current_output_line_indent(&out, line_indent);
-                                        let current_line_starts_with_close = out
-                                            .rsplit('\n')
-                                            .next()
-                                            .unwrap_or("")
-                                            .trim_start()
-                                            .starts_with(')');
-                                        let resolved_query_like_indent =
-                                            if current_line_starts_with_close {
-                                                query_like_indent.max(current_line_indent)
-                                            } else {
-                                                query_like_indent
-                                            };
+                                        let resolved_query_like_indent = query_like_indent;
                                         if !select_list_layout_state.is_multiline() {
                                             select_list_layout_state =
                                                 SelectListLayoutState::Multiline {
@@ -8277,43 +8301,6 @@ impl SqlEditorWidget {
                                         newline_with(
                                             &mut out,
                                             resolved_query_like_indent,
-                                            0,
-                                            &mut at_line_start,
-                                            &mut needs_space,
-                                            &mut line_indent,
-                                        );
-                                    } else if matches!(
-                                        current_clause.as_deref(),
-                                        Some("SELECT" | "SET")
-                                    ) && out
-                                        .rsplit('\n')
-                                        .next()
-                                        .unwrap_or("")
-                                        .trim_start()
-                                        .starts_with(')')
-                                    {
-                                        // Mixed close-comma SELECT/SET siblings must snap to the
-                                        // active list frame depth, not to the rendered line shape.
-                                        let current_line_indent =
-                                            current_output_line_indent(&out, line_indent);
-                                        let mixed_close_sibling_indent =
-                                            parent_frame_sibling_indent
-                                                .unwrap_or_else(|| {
-                                                    select_list_layout_state.indentation_or(
-                                                        active_list_indent(
-                                                            indent_level,
-                                                            open_cursor_state,
-                                                            select_list_layout_state,
-                                                            current_clause.as_deref(),
-                                                            construct.merge_active.is_active(),
-                                                            false,
-                                                        ),
-                                                    )
-                                                })
-                                                .max(current_line_indent);
-                                        newline_with(
-                                            &mut out,
-                                            mixed_close_sibling_indent,
                                             0,
                                             &mut at_line_start,
                                             &mut needs_space,
@@ -8358,19 +8345,9 @@ impl SqlEditorWidget {
                                                 construct.merge_active.is_active(),
                                                 false,
                                             ));
-                                        let current_line_indent =
-                                            current_output_line_indent(&out, line_indent);
-                                        let current_line_trimmed =
-                                            out.rsplit('\n').next().unwrap_or("").trim_start();
-                                        let sibling_indent =
-                                            if current_line_trimmed.starts_with(')') {
-                                                structural_select_indent.max(current_line_indent)
-                                            } else {
-                                                structural_select_indent
-                                            };
                                         newline_with(
                                             &mut out,
-                                            sibling_indent,
+                                            structural_select_indent,
                                             0,
                                             &mut at_line_start,
                                             &mut needs_space,
@@ -31206,8 +31183,8 @@ END"#;
             .expect("test6 customer_spend MAX(o.order_date)");
         assert_eq!(
             leading_spaces(lines[max_order_date_idx]),
-            leading_spaces(lines[total_spent_idx]),
-            "test6 SELECT-list sibling after mixed close-comma should return to the list frame depth, got:\n{formatted}"
+            leading_spaces(lines[order_count_idx]),
+            "test6 SELECT-list sibling after mixed close-comma should return to the canonical SELECT-list frame depth, got:\n{formatted}"
         );
     }
 
@@ -31304,6 +31281,105 @@ END"#;
             leading_spaces(lines[close_idx]),
             join_indent,
             "test6 UPDATE JOIN subquery close should return to JOIN depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_oracle_db_type_realigns_select_sibling_after_close_comma() {
+        let source = r#"SELECT c.customer_id,
+    c.customer_name,
+    c.region_id,
+    COUNT (DISTINCT o.order_id) AS order_count,
+    ROUND (SUM (
+            CASE
+                WHEN o.status <> 'CANCELLED' THEN o.grand_total
+                ELSE 0
+            END
+        ), 2) AS total_spent,
+        MAX (o.order_date) AS last_order_date
+FROM boss_customer c
+LEFT JOIN boss_order o
+    ON o.customer_id = c.customer_id
+GROUP BY c.customer_id,
+    c.customer_name,
+    c.region_id;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let order_count_idx =
+            find_line_starting_with(&lines, "COUNT (DISTINCT o.order_id) AS order_count,")
+                .expect("oracle order_count");
+        let max_idx = find_line_starting_with(&lines, "MAX (o.order_date) AS last_order_date")
+            .expect("oracle last_order_date");
+
+        assert_eq!(
+            leading_spaces(lines[max_idx]),
+            leading_spaces(lines[order_count_idx]),
+            "oracle SELECT-list sibling after close-comma should return to canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::Oracle,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_realigns_select_sibling_after_close_comma() {
+        let source = r#"SELECT c.customer_id,
+    c.customer_name,
+    c.region_id,
+    COUNT(DISTINCT o.order_id) AS order_count,
+    ROUND(SUM(
+            CASE
+                WHEN o.status <> 'CANCELLED' THEN o.grand_total
+                ELSE 0
+            END
+        ), 2) AS total_spent,
+        MAX(o.order_date) AS last_order_date
+FROM boss_customer c
+LEFT JOIN boss_order o
+    ON o.customer_id = c.customer_id
+GROUP BY c.customer_id,
+    c.customer_name,
+    c.region_id;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let order_count_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().contains("AS order_count,"))
+            .map(|(idx, _)| idx)
+            .expect("mysql order_count");
+        let max_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().contains("AS last_order_date"))
+            .map(|(idx, _)| idx)
+            .expect("mysql last_order_date");
+
+        assert_eq!(
+            leading_spaces(lines[max_idx]),
+            leading_spaces(lines[order_count_idx]),
+            "mysql SELECT-list sibling after close-comma should return to canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
         );
     }
 
