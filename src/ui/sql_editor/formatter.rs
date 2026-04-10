@@ -4543,6 +4543,7 @@ impl SqlEditorWidget {
         let mut query_body_clause_base_depth: Option<usize> = None;
         let mut query_base_stack: Vec<Option<usize>> = vec![None];
         let mut control_condition_header_stack: Vec<usize> = Vec::new();
+        let mut control_condition_header_parenthesized_stack: Vec<bool> = Vec::new();
         let mut insert_all_branch_body_indent: Option<usize> = None;
         let mut pending_split_end_suffix_indent: Option<usize> = None;
         let mut pending_split_end_suffix_kind: Option<PendingSplitEndSuffixKind> = None;
@@ -5674,6 +5675,10 @@ impl SqlEditorWidget {
                                     .last()
                                     .is_some_and(|block| matches!(block.as_str(), "IF" | "WHILE"))
                                 && !matches!(current_clause.as_deref(), Some("SELECT")));
+                        let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
+                            .then(|| control_condition_header_parenthesized_stack.last().copied())
+                            .flatten()
+                            .unwrap_or(false);
                         let clause_base_indent =
                             if let Some(header_indent) = control_header_condition_indent {
                                 header_indent
@@ -5810,7 +5815,11 @@ impl SqlEditorWidget {
                                 let condition_extra = if in_control_header_condition
                                     && matches!(upper, "AND" | "OR")
                                 {
-                                    usize::from(paren_extra > 0)
+                                    if control_header_is_parenthesized {
+                                        paren_extra.max(1)
+                                    } else {
+                                        paren_extra
+                                    }
                                 } else if in_control_header_condition {
                                     paren_extra.max(1)
                                 } else if upper == "ON" {
@@ -6555,6 +6564,10 @@ impl SqlEditorWidget {
                         && control_condition_header_stack.last().copied() != Some(line_indent)
                     {
                         control_condition_header_stack.push(line_indent);
+                        control_condition_header_parenthesized_stack.push(matches!(
+                            next_non_comment,
+                            Some(SqlToken::Symbol(sym)) if sym == "("
+                        ));
                     }
                     if !at_line_start && token_gap_contains_newline(idx) {
                         if let Some(split_end_indent) = pending_split_end_suffix_indent {
@@ -7109,6 +7122,7 @@ impl SqlEditorWidget {
                     }
                     if matches!(upper, "THEN" | "LOOP" | "DO") {
                         let _ = control_condition_header_stack.pop();
+                        let _ = control_condition_header_parenthesized_stack.pop();
                     }
                     if is_create_index_on {
                         construct.create_index_pending.deactivate();
@@ -7524,8 +7538,19 @@ impl SqlEditorWidget {
                             |token| matches!(token, SqlToken::Symbol(sym) if sym == "("),
                         );
                         if starts_after_open_paren && !comment_starts_line {
-                            let opener_body_indent =
-                                current_output_line_indent(&out, line_indent).saturating_add(1);
+                            let opener_body_indent = paren_stack
+                                .last()
+                                .map(|frame| {
+                                    if frame.opens_indented() {
+                                        base_indent(indent_level, open_cursor_state)
+                                    } else {
+                                        current_output_line_indent(&out, line_indent)
+                                            .saturating_add(1)
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    current_output_line_indent(&out, line_indent).saturating_add(1)
+                                });
                             inline_comment_continuation_state =
                                 InlineCommentContinuationState::Operand {
                                     indent: opener_body_indent,
@@ -8283,6 +8308,7 @@ impl SqlEditorWidget {
                             open_for_select_stack.clear();
                             between_paren_depths.clear();
                             control_condition_header_stack.clear();
+                            control_condition_header_parenthesized_stack.clear();
                             insert_all_branch_body_indent = None;
                             let active_exception_blocks = block_stack
                                 .iter()
