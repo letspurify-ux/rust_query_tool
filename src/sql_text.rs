@@ -3978,7 +3978,6 @@ impl FormatQueryOwnerKind {
 
     /// Returns the structural formatter depth for the next nested query head
     /// relative to this owner line and the surrounding resolved query base.
-    #[cfg(test)]
     pub(crate) fn formatter_child_query_head_depth(
         self,
         resolved_owner_depth: usize,
