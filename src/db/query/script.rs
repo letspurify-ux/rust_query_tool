@@ -910,6 +910,11 @@ impl QueryExecutor {
                     continue;
                 }
 
+                if idx + 1 < bytes.len() && bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx += 2;
+                    continue;
+                }
+
                 if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
                     return close_count;
                 }
@@ -18750,6 +18755,54 @@ WHERE 1 = 1;";
         assert_eq!(
             contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
             "outer WHERE should stay on the query owner depth after the comment-prefixed close"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_dedents_after_multiline_block_comment_close_before_closing_paren() {
+        let sql = "SELECT *
+FROM (
+SELECT 1 FROM dual
+/* close
+*/ )
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn auto_format_line_contexts_align_multiline_comment_closed_query_close_with_owner_depth() {
+        let sql = "SELECT *
+FROM (
+SELECT 1
+FROM dual
+/* close
+*/ )
+WHERE 1 = 1;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM (")
+            .unwrap_or(0);
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("*/ )"))
+            .unwrap_or(0);
+        let where_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHERE"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[from_idx].auto_depth,
+            "close paren after a multiline block-comment tail should return to the query owner depth"
+        );
+        assert_eq!(
+            contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
+            "outer WHERE should stay on the query owner depth after the multiline-comment close"
         );
     }
 

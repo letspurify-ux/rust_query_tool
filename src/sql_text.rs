@@ -5626,6 +5626,10 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
             continue;
         }
 
+        if still_in_leading_close_run && current == b'*' && next == Some(b'/') {
+            idx = idx.saturating_add(2);
+            continue;
+        }
         if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
@@ -6901,6 +6905,21 @@ mod tests {
     }
 
     #[test]
+    fn significant_paren_profile_treats_leading_block_comment_close_as_comment_tail() {
+        let profile = significant_paren_profile("*/ ) + (next)");
+
+        assert_eq!(profile.leading_close_count, 1);
+        assert_eq!(
+            profile.events,
+            vec![
+                SignificantParenEvent::Close,
+                SignificantParenEvent::Open,
+                SignificantParenEvent::Close,
+            ]
+        );
+    }
+
+    #[test]
     fn significant_paren_profile_ignores_mysql_backtick_quoted_identifier_parens() {
         let profile = significant_paren_profile("`raw(` + `tail)` + (expr)");
 
@@ -6924,6 +6943,9 @@ mod tests {
     fn line_has_leading_significant_close_paren_ignores_comments_and_detects_real_closes() {
         assert!(line_has_leading_significant_close_paren(
             "/* leading note */ ) AND status = 'A'"
+        ));
+        assert!(line_has_leading_significant_close_paren(
+            "*/ ) AND status = 'A'"
         ));
         assert!(line_has_leading_significant_close_paren(" ) "));
         assert!(!line_has_leading_significant_close_paren(

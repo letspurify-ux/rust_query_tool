@@ -21748,6 +21748,63 @@ END;"#;
     }
 
     #[test]
+    fn plsql_if_multiline_comment_close_and_condition_keyword_keeps_condition_depth() {
+        let input = r#"BEGIN
+    IF (
+        v_ready = 'Y'
+        /* close condition
+        */ ) AND v_dept = 10 THEN
+        NULL;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("IF ("))
+            .expect("should contain IF line");
+        let close_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND v_dept = 10 THEN")
+            .expect("should contain IF continuation line");
+        let null_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "NULL;")
+            .expect("should contain THEN body line");
+        let end_if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END IF;")
+            .expect("should contain END IF line");
+
+        assert_eq!(
+            indent(lines[close_and_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "IF continuation after a multiline block-comment tail should stay one level deeper than IF, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[null_idx]),
+            indent(lines[if_idx]).saturating_add(4),
+            "THEN body should remain exactly one level deeper than IF, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[end_if_idx]),
+            indent(lines[if_idx]),
+            "END IF should align with IF after multiline-comment close + continuation, got:\n{}",
+            formatted
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "formatting should stay stable for multiline-comment close + condition continuation"
+        );
+    }
+
+    #[test]
     fn where_in_subquery_nested_paren_and_or_keeps_correct_depths() {
         let input = r#"SELECT *
 FROM emp
