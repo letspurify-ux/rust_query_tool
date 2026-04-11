@@ -8009,6 +8009,11 @@ impl SqlEditorWidget {
                                 let parent_frame_sibling_indent = paren_stack
                                     .last()
                                     .and_then(|frame| frame.sibling_body_indent());
+                                let clause_list_indent_follows_current_query_frame = paren_stack
+                                    .last()
+                                    .is_none_or(|frame| {
+                                        frame.is_query_like() || frame.is_column_list()
+                                    });
                                 let next_starts_parenthesized_sibling = matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "(");
                                 let keeps_mixed_close_key_subquery_inline =
                                     follows_multiline_child_close
@@ -8140,6 +8145,7 @@ impl SqlEditorWidget {
                                             )
                                         )
                                     })
+                                    .filter(|_| clause_list_indent_follows_current_query_frame)
                                     .map(|_| {
                                         let mut list_indent = active_list_indent(
                                             indent_level,
@@ -30280,6 +30286,92 @@ END$$"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_mysql_keeps_test4_frame_based_depths_for_ddl_and_handlers() {
+        let source = include_str!("../../../test_mariadb/test4.txt");
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE departments (").expect("test4 CREATE");
+        let dept_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("dept_id"))
+            .map(|(idx, _)| idx)
+            .expect("test4 departments dept_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(dept_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test4 departments close");
+        let if_idx =
+            find_line_starting_with(&lines, "IF NEW.hours IS NULL").expect("test4 IF NEW.hours");
+        let or_idx =
+            find_line_starting_with(&lines, "OR NEW.hours <= 0").expect("test4 OR NEW.hours");
+        let while_idx =
+            find_line_starting_with(&lines, "WHILE v_day < 35 DO").expect("test4 outer WHILE");
+        let date_add_idx = find_line_starting_with(
+            &lines,
+            "SET v_work_date = DATE_ADD('2025-01-01', INTERVAL v_day DAY);",
+        )
+        .expect("test4 DATE_ADD body");
+        let handler_idx = find_line_starting_with(&lines, "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .expect("test4 handler header");
+        let handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test4 handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test4 handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[dept_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test4 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test4 auto-format CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[or_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
+            "test4 auto-format split IF condition continuation should stay one frame deeper than the IF header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[date_add_idx]),
+            leading_spaces(lines[while_idx]).saturating_add(4),
+            "test4 auto-format WHILE body line with DATE_ADD should stay on the loop body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[handler_begin_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "test4 auto-format handler BEGIN should open one frame deeper than the DECLARE HANDLER header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(8),
+            "test4 auto-format handler body statements should stay one frame deeper than the handler BEGIN line, got:\n{formatted}"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test4_view_join_and_split_if_or_on_frame_depth() {
         let source = include_str!("../../../test_mariadb/test4.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -30461,6 +30553,106 @@ END$$"#;
             leading_spaces(lines[rollback_idx]),
             leading_spaces(lines[exit_handler_idx]).saturating_add(8),
             "test5 EXIT HANDLER body statements should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_test5_frame_based_depths_for_create_table_and_handlers(
+    ) {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE org_unit (").expect("test5 CREATE");
+        let org_unit_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("org_unit_id"))
+            .map(|(idx, _)| idx)
+            .expect("test5 org_unit_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(org_unit_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test5 org_unit close");
+        let continue_handler_idx =
+            find_line_starting_with(&lines, "DECLARE CONTINUE HANDLER FOR user_error")
+                .expect("test5 CONTINUE HANDLER");
+        let continue_handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test5 handler BEGIN");
+        let diagnostics_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_begin_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start() == "GET DIAGNOSTICS CONDITION 1 v_sqlstate = RETURNED_SQLSTATE,"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test5 GET DIAGNOSTICS");
+        let exit_handler_idx = lines
+            .iter()
+            .enumerate()
+            .skip(continue_handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .map(|(idx, _)| idx)
+            .expect("test5 EXIT HANDLER");
+        let exit_handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test5 exit handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(exit_handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test5 exit handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[org_unit_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test5 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test5 auto-format CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[continue_handler_begin_idx]),
+            leading_spaces(lines[continue_handler_idx]).saturating_add(4),
+            "test5 auto-format CONTINUE HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[diagnostics_idx]),
+            leading_spaces(lines[continue_handler_idx]).saturating_add(8),
+            "test5 auto-format GET DIAGNOSTICS inside the handler should stay on the nested handler body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[exit_handler_begin_idx]),
+            leading_spaces(lines[exit_handler_idx]).saturating_add(4),
+            "test5 auto-format EXIT HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[exit_handler_idx]).saturating_add(8),
+            "test5 auto-format EXIT HANDLER body statements should stay on the nested handler frame depth, got:\n{formatted}"
         );
     }
 
@@ -30647,6 +30839,119 @@ END$$"#;
             leading_spaces(lines[rollback_idx]),
             leading_spaces(lines[handler_idx]).saturating_add(8),
             "test6 EXIT HANDLER body should stay on the nested handler frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_test6_frame_based_depths_for_triggers_and_handlers()
+    {
+        let source = include_str!("../../../test_mariadb/test6.txt");
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let create_idx =
+            find_line_starting_with(&lines, "CREATE TABLE boss_region (").expect("test6 CREATE");
+        let region_id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(create_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("region_id"))
+            .map(|(idx, _)| idx)
+            .expect("test6 region_id");
+        let create_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(region_id_idx + 1)
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .expect("test6 boss_region close");
+        let trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER bi_boss_order_item")
+            .expect("test6 bi trigger");
+        let trigger_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(trigger_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 bi BEGIN");
+        let declare_idx = lines
+            .iter()
+            .enumerate()
+            .skip(trigger_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE v_unit_price DECIMAL(18, 2);")
+            .map(|(idx, _)| idx)
+            .expect("test6 DECLARE v_unit_price");
+        let au_trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER au_boss_order_item")
+            .expect("test6 au trigger");
+        let au_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(au_trigger_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 au BEGIN");
+        let order_change_if_idx = lines
+            .iter()
+            .enumerate()
+            .skip(au_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "IF OLD.order_id <> NEW.order_id THEN")
+            .map(|(idx, _)| idx)
+            .expect("test6 order change IF");
+        let handler_idx = lines
+            .iter()
+            .enumerate()
+            .skip(declare_idx + 1)
+            .find(|(_, line)| line.trim_start() == "DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+            .map(|(idx, _)| idx)
+            .expect("test6 EXIT HANDLER");
+        let handler_begin_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_idx + 1)
+            .find(|(_, line)| line.trim_start() == "BEGIN")
+            .map(|(idx, _)| idx)
+            .expect("test6 handler BEGIN");
+        let rollback_idx = lines
+            .iter()
+            .enumerate()
+            .skip(handler_begin_idx + 1)
+            .find(|(_, line)| line.trim_start() == "ROLLBACK;")
+            .map(|(idx, _)| idx)
+            .expect("test6 handler ROLLBACK");
+
+        assert_eq!(
+            leading_spaces(lines[region_id_idx]),
+            leading_spaces(lines[create_idx]).saturating_add(4),
+            "test6 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[create_close_idx]),
+            leading_spaces(lines[create_idx]),
+            "test6 auto-format CREATE TABLE close should return to the table header depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[declare_idx]),
+            leading_spaces(lines[trigger_begin_idx]).saturating_add(4),
+            "test6 auto-format trigger DECLARE line should stay on the BEGIN body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[order_change_if_idx]),
+            leading_spaces(lines[au_begin_idx]).saturating_add(4),
+            "test6 auto-format trigger IF header should realign with the trigger BEGIN body frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[handler_begin_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(4),
+            "test6 auto-format EXIT HANDLER BEGIN should open one frame deeper than the handler header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[rollback_idx]),
+            leading_spaces(lines[handler_idx]).saturating_add(8),
+            "test6 auto-format EXIT HANDLER body should stay on the nested handler frame depth, got:\n{formatted}"
         );
     }
 
@@ -31151,6 +31456,106 @@ END"#;
             leading_spaces(lines[broken_event_time_idx]),
             leading_spaces(lines[scalar_idx]),
             "test5 subsequent VALUES siblings should keep the same argument frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test5_call_literal_sibling_on_call_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let call_idx = find_line_starting_with(&lines, "CALL sp_assert_eq_decimal(")
+            .expect("test5 CALL sp_assert_eq_decimal");
+        let second_subquery_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(call_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT SUM(total_hours)")
+            .map(|(idx, _)| idx)
+            .expect("test5 SELECT SUM(total_hours)");
+        let second_subquery_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_subquery_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("test5 second subquery close");
+        let scalar_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_subquery_close_idx + 1)
+            .find(|(_, line)| line.trim_start() == "2,")
+            .map(|(idx, _)| idx)
+            .expect("test5 scalar precision arg");
+        let message_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'monthly total_hours sum mismatch'")
+            .map(|(idx, _)| idx)
+            .expect("test5 monthly total_hours message arg");
+
+        assert_eq!(
+            leading_spaces(lines[scalar_idx]),
+            leading_spaces(lines[call_idx]).saturating_add(4),
+            "test5 CALL scalar precision argument should stay one frame deeper than the CALL owner, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[message_idx]),
+            leading_spaces(lines[scalar_idx]),
+            "test5 CALL literal sibling after multiline subquery close-comma should snap back to the call argument frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_test5_call_literal_sibling_on_call_frame_depth() {
+        let source = include_str!("../../../test_mariadb/test5.txt");
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let call_idx = find_line_starting_with(&lines, "CALL sp_assert_eq_decimal(")
+            .expect("test5 auto-format CALL sp_assert_eq_decimal");
+        let second_subquery_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(call_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT SUM(total_hours)")
+            .map(|(idx, _)| idx)
+            .expect("test5 auto-format SELECT SUM(total_hours)");
+        let second_subquery_close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_subquery_select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "),")
+            .map(|(idx, _)| idx)
+            .expect("test5 auto-format second subquery close");
+        let scalar_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_subquery_close_idx + 1)
+            .find(|(_, line)| line.trim_start() == "2,")
+            .map(|(idx, _)| idx)
+            .expect("test5 auto-format scalar precision arg");
+        let message_idx = lines
+            .iter()
+            .enumerate()
+            .skip(scalar_idx + 1)
+            .find(|(_, line)| line.trim_start() == "'monthly total_hours sum mismatch'")
+            .map(|(idx, _)| idx)
+            .expect("test5 auto-format monthly total_hours message arg");
+
+        assert_eq!(
+            leading_spaces(lines[message_idx]),
+            leading_spaces(lines[scalar_idx]),
+            "test5 auto-format CALL literal sibling after multiline subquery close-comma should snap back to the call argument frame depth, got:\n{formatted}"
         );
     }
 

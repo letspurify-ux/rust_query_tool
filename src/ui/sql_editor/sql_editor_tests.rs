@@ -927,6 +927,250 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
 }
 
 #[test]
+fn format_sql_preserves_mariadb_final_boss_v2_script() {
+    let input = load_mariadb_test_file("test4.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test4.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &input,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "USE mdb_finalboss;",
+            "DELIMITER $$",
+            "CREATE PROCEDURE sp_seed_monster_data()",
+            "CREATE PROCEDURE sp_build_monthly_rollup(",
+            "END$$",
+            "DELIMITER ;",
+            "WITH RECURSIVE dept_tree AS (",
+            "CALL sp_assert_eq_bigint(",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test4.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test4.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_seed_monster_data")
+                && stmt.contains("WHILE v_day < 35 DO")
+                && stmt.contains("SET v_work_date = DATE_ADD('2025-01-01', INTERVAL v_day DAY)")
+                && stmt.contains("END WHILE;")
+        }),
+        "Formatting should preserve the main seed procedure execution unit for test4: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_build_monthly_rollup")
+                && stmt.contains("DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+                && stmt.contains("ON DUPLICATE KEY UPDATE")
+                && stmt.contains("JOIN (")
+                && stmt.contains("START TRANSACTION")
+                && stmt.contains("COMMIT")
+        }),
+        "Formatting should preserve the rollup procedure execution unit for test4: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &formatted,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test4.txt"
+    );
+}
+
+#[test]
+fn format_sql_preserves_mariadb_ultra_final_boss_v2_script() {
+    let input = load_mariadb_test_file("test5.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test5.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &input,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "USE mdb_ultra_boss;",
+            "DELIMITER $$",
+            "DELIMITER //",
+            "CREATE PROCEDURE sp_seed_ultra_data()",
+            "CREATE PROCEDURE sp_fault_injection_handled()",
+            "END//",
+            "DELIMITER ;",
+            "CALL sp_assert_eq_decimal(",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test5.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test5.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_seed_ultra_data")
+                && stmt.contains("WHILE v_project_id <= 4 DO")
+                && stmt.contains("WHILE v_sprint_no <= 3 DO")
+                && stmt.contains("END WHILE;")
+        }),
+        "Formatting should preserve the nested seed procedure loops for test5: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_fault_injection_handled")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR user_error")
+                && stmt.contains("GET DIAGNOSTICS CONDITION 1")
+                && stmt.contains("INSERT INTO qa_error_capture")
+        }),
+        "Formatting should preserve diagnostics handler flow for test5: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_rebuild_monthly_stats")
+                && stmt.contains("SAVEPOINT sp_one")
+                && stmt.contains("ROLLBACK TO SAVEPOINT sp_one")
+                && stmt.contains("CALL sp_upsert_one_month_stat")
+                && stmt.contains("COMMIT")
+        }),
+        "Formatting should preserve savepoint recovery flow for test5: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &formatted,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test5.txt"
+    );
+}
+
+#[test]
+fn format_sql_preserves_mariadb_final_boss_v3_script() {
+    let input = load_mariadb_test_file("test6.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test6.txt should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &input,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_contains_all(
+        &formatted,
+        &[
+            "DELIMITER $$",
+            "CREATE FUNCTION fn_month_key(p_date DATE)",
+            "CREATE FUNCTION fn_order_risk(p_order_id INT)",
+            "CREATE PROCEDURE sp_seed_final_boss()",
+            "CREATE PROCEDURE sp_validate_final_boss()",
+            "CREATE PROCEDURE sp_dynamic_month_pivot(IN p_from DATE, IN p_to DATE)",
+            "END$$",
+            "DELIMITER ;",
+            "WITH RECURSIVE region_tree AS (",
+            "JSON_OBJECTAGG(x.segment, x.net_sales) AS segment_to_net_sales",
+        ],
+    );
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test_mariadb/test6.txt: {formatted_statements:?}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for test_mariadb/test6.txt"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_seed_final_boss")
+                && stmt.contains("DECLARE EXIT HANDLER FOR SQLEXCEPTION")
+                && stmt.contains("ELSEIF MOD(v_order_id, 4) = 1 THEN")
+                && stmt.contains("END IF;")
+                && stmt.contains("COMMIT")
+        }),
+        "Formatting should preserve seed procedure branch/handler flow for test6: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE PROCEDURE sp_validate_final_boss")
+                && stmt.contains("DECLARE CONTINUE HANDLER FOR NOT FOUND")
+                && stmt.contains("SET done = 1;")
+                && stmt.contains("OPEN cur;")
+                && stmt.contains("END LOOP;")
+        }),
+        "Formatting should preserve cursor validation flow for test6: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        &formatted,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test_mariadb/test6.txt"
+    );
+}
+
+#[test]
 fn format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths() {
     let input = load_mariadb_test_file("test1.txt");
     assert!(
