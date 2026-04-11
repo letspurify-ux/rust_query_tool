@@ -1044,14 +1044,19 @@ impl ConstructState {
             return true;
         }
         // Non-subquery paren context: suppress function-local clause starters.
-        // `FROM` stays local to the formatter because the active paren stack
-        // tells us when EXTRACT-style bodies are safe to keep inline without
-        // hiding real query `FROM` clauses from the analyzer.
+        // Frame-first rule: once a compact non-query frame is active after the
+        // latest query-like frame, `FROM`/`WITH` plus JSON-transform style
+        // function-local operation starters (`SET`/`INSERT`) are force-
+        // suppressed here to prevent accidental promotion to outer query
+        // anchors. `RETURNING` keeps its dedicated local layout policy.
+        let frame_guarded_function_local_clause_starter =
+            matches!(keyword, "FROM" | "WITH" | "SET" | "INSERT");
+        let non_subquery_paren_clause_starter = keyword == "FROM"
+            || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword);
         if suppress_comma_break_depth > 0
-            && ((inside_function_local_non_query_paren && matches!(keyword, "FROM" | "WITH"))
-                || (!has_subquery_in_paren_stack
-                    && (keyword == "FROM"
-                        || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword))))
+            && ((inside_function_local_non_query_paren
+                && frame_guarded_function_local_clause_starter)
+                || (!has_subquery_in_paren_stack && non_subquery_paren_clause_starter))
         {
             return true;
         }
@@ -24728,6 +24733,10 @@ FROM event_log e;"#;
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
+        let returning_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RETURNING VARCHAR2 (30)"))
+            .unwrap_or_else(|| panic!("nested JSON_VALUE RETURNING option line, got:\n{}", formatted));
         let on_error_idx = lines
             .iter()
             .position(|line| line.contains("ON ERROR"))
@@ -24745,11 +24754,13 @@ FROM event_log e;"#;
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log e;"))
             .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
 
-        assert!(
-            indent(lines[on_error_idx]) > indent(lines[subquery_from_idx]),
-            "function-local JSON_VALUE ON ERROR inside a nested subquery should stay deeper than the child query FROM clause, got:\n{}",
-            formatted
-        );
+        for option_idx in [returning_idx, on_error_idx] {
+            assert!(
+                indent(lines[option_idx]) > indent(lines[subquery_from_idx]),
+                "function-local JSON_VALUE option inside a nested subquery should stay deeper than the child query FROM clause, got:\n{}",
+                formatted
+            );
+        }
         assert_eq!(
             indent(lines[outer_sibling_idx]),
             indent(lines[outer_from_idx]).saturating_add(4),
@@ -24760,6 +24771,68 @@ FROM event_log e;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "nested JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_nested_subquery_json_transform_operations_inside_function_parens(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT JSON_TRANSFORM (
+            x.payload, -- source json
+            INSERT '$.audit.user' = USER, -- audit stamp
+            SET '$.status' = 'DONE'
+        )
+        FROM emp_json x
+    ) AS payload2,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let function_insert_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("INSERT '$.audit.user' = USER")
+            })
+            .unwrap_or_else(|| panic!("nested JSON_TRANSFORM INSERT option line, got:\n{}", formatted));
+        let function_set_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SET '$.status' = 'DONE'"))
+            .unwrap_or_else(|| panic!("nested JSON_TRANSFORM SET option line, got:\n{}", formatted));
+        let subquery_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json x"))
+            .unwrap_or_else(|| panic!("nested subquery FROM clause, got:\n{}", formatted));
+        let outer_sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_TRANSFORM, got:\n{}", formatted));
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        for option_idx in [function_insert_idx, function_set_idx] {
+            assert!(
+                indent(lines[option_idx]) > indent(lines[subquery_from_idx]),
+                "function-local JSON_TRANSFORM operation inside a nested subquery should stay deeper than the child query FROM clause, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            indent(lines[outer_sibling_idx]),
+            indent(lines[outer_from_idx]).saturating_add(4),
+            "outer SELECT-list sibling after nested JSON_TRANSFORM should return to the canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "nested JSON_TRANSFORM option auto-formatting should be idempotent"
         );
     }
 

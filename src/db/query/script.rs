@@ -3738,8 +3738,20 @@ impl QueryExecutor {
                 },
             );
             if line_ends_statement {
-                query_frames.pop();
+                // A statement terminator must retire every closed query frame
+                // on the stack, but WITH frames that still own local
+                // FUNCTION/PROCEDURE declarations stay active until the main
+                // SELECT/VALUES head starts. Mid-line close patterns like
+                // `FROM dual) alias;` can leave multiple closed frames at the
+                // top, so we pop in a loop instead of a single-frame pop.
+                while query_frames.last().is_some_and(|frame| {
+                    !(frame.head_kind == Some(AutoFormatClauseKind::With)
+                        && !frame.with_main_query_started)
+                }) {
+                    let _ = query_frames.pop();
+                }
                 pending_query_bases.clear();
+                non_query_into_continuation_frame = None;
                 pending_split_query_owner = None;
                 pending_partial_query_owner = None;
                 pending_plsql_child_query_owner = None;
@@ -22469,6 +22481,47 @@ END$$"#;
         assert_eq!(
             contexts[commit_idx].auto_depth, contexts[insert_idx].auto_depth,
             "COMMIT auto depth should return to the procedure body frame after CASE-heavy VALUES closes"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_reset_query_frames_after_midline_subquery_close_semicolon() {
+        let sql = r#"SELECT
+    value_col
+FROM (
+    SELECT 1 AS value_col
+    FROM dual) nested_src;
+SELECT
+    2 AS next_value
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let mut top_level_select_indices = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.trim_start() == "SELECT").then_some(idx));
+        let first_select_idx = top_level_select_indices.next().unwrap_or(0);
+        let second_select_idx = top_level_select_indices
+            .next()
+            .unwrap_or(first_select_idx);
+        let second_select_item_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "2 AS next_value")
+            .unwrap_or(second_select_idx);
+
+        assert!(
+            contexts[first_select_idx].starts_query_frame,
+            "the first SELECT should start a query frame"
+        );
+        assert!(
+            contexts[second_select_idx].starts_query_frame,
+            "a semicolon line that closes a nested subquery mid-line must also reset the completed outer query frame before the next SELECT"
+        );
+        assert_eq!(
+            contexts[second_select_item_idx].auto_depth,
+            contexts[second_select_idx].auto_depth.saturating_add(1),
+            "second statement select-list line should follow only the new SELECT frame depth"
         );
     }
 
