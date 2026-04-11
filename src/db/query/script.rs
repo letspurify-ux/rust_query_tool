@@ -3296,7 +3296,10 @@ impl QueryExecutor {
                     && Self::line_ends_with_comma_before_inline_comment(trimmed));
             pending_line_continuation = if suppress_line_continuation {
                 None
-            } else if context.query_base_depth.is_some() || clause_kind.is_some() {
+            } else if context.query_base_depth.is_some()
+                || clause_kind.is_some()
+                || Self::line_has_non_leading_significant_paren_event(trimmed)
+            {
                 Self::line_continuation_for_line(
                     trimmed,
                     context.auto_depth,
@@ -4796,6 +4799,14 @@ impl QueryExecutor {
     fn line_can_continue_across_standalone_open_boundary(line: &str) -> bool {
         Self::line_has_trailing_continuation_operator(line)
             || sql_text::format_bare_structural_header_continuation_kind(line).is_some()
+    }
+
+    fn line_has_non_leading_significant_paren_event(line: &str) -> bool {
+        let paren_profile = sql_text::significant_paren_profile(line);
+        paren_profile
+            .events
+            .get(paren_profile.leading_close_count)
+            .is_some()
     }
 
     fn inline_comment_line_continuation_for_line(
@@ -20708,6 +20719,49 @@ END$$"#;
         assert_eq!(
             contexts[commit_idx].auto_depth, contexts[insert_idx].auto_depth,
             "COMMIT auto depth should return to the procedure body frame after CASE-heavy VALUES closes"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_non_query_parenthesized_assignment_on_paren_frames() {
+        let sql = r#"BEGIN
+    v_total := calc_score(1 + 2,
+        v_bonus,
+        v_penalty);
+    v_after := 0;
+END;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let assign_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "v_total := calc_score(1 + 2,")
+            .unwrap_or(0);
+        let bonus_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "v_bonus,")
+            .unwrap_or(0);
+        let penalty_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "v_penalty);")
+            .unwrap_or(0);
+        let after_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "v_after := 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[bonus_idx].auto_depth,
+            contexts[assign_idx].auto_depth.saturating_add(1),
+            "mid-line `(` in non-query assignments must still open one continuation frame on the next line"
+        );
+        assert_eq!(
+            contexts[penalty_idx].auto_depth, contexts[assign_idx].auto_depth,
+            "non-leading close `)` in the same code line must close the paren frame immediately for final line depth"
+        );
+        assert_eq!(
+            contexts[after_idx].auto_depth, contexts[assign_idx].auto_depth,
+            "after `)` closes the assignment paren, the next sibling statement must return to the owner depth"
         );
     }
 }
