@@ -2351,7 +2351,9 @@ SELECT 1
 FROM t
 WINDOW w AS (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
 ALTER TABLE t ENGINE = InnoDB;
-RELEASE SAVEPOINT sp;";
+RELEASE SAVEPOINT sp;
+SHOW ERRORS;
+SHOW WARNINGS;";
 
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
@@ -2364,6 +2366,8 @@ RELEASE SAVEPOINT sp;";
         "RETURNED_SQLSTATE",
         "MYSQL_ERRNO",
         "MESSAGE_TEXT",
+        "ERRORS",
+        "WARNINGS",
         "WINDOW",
         "GENERATED",
         "ALWAYS",
