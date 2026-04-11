@@ -2812,6 +2812,22 @@ impl QueryExecutor {
                 }
             }
 
+            if suppress_non_subquery_paren_layout_clause {
+                // Non-structural function-local clause words (for example
+                // `RETURNING` inside `JSON_VALUE (...)`) must keep the active
+                // ordinary-paren frame depth instead of dropping back to the
+                // parser/query base when no lexical continuation keyword is
+                // present on the previous line.
+                let non_subquery_paren_depth =
+                    non_subquery_paren_frame_depth_after_leading_closes(
+                        &auto_format_subquery_paren_stack,
+                        leading_significant_close_count,
+                    );
+                context.auto_depth = context
+                    .auto_depth
+                    .max(parser_depth.saturating_add(non_subquery_paren_depth));
+            }
+
             if let Some(frame) = pending_split_query_owner_for_line {
                 // A standalone `(` after a split owner such as `WHERE EXISTS`
                 // or `FROM` remains part of that owner context, not the child
@@ -3372,16 +3388,31 @@ impl QueryExecutor {
                 None
             };
 
-            let suppress_line_continuation = suppress_non_subquery_paren_layout_clause
-                || current_line_is_same_depth_merge_branch_header_fragment
-                || (current_line_is_mysql_on_duplicate_values_function
-                    && Self::line_ends_with_comma_before_inline_comment(trimmed));
-            pending_line_continuation = if suppress_line_continuation {
+            let line_has_non_leading_paren_event =
+                Self::line_has_non_leading_significant_paren_event(trimmed);
+            let suppress_structural_line_continuation =
+                current_line_is_same_depth_merge_branch_header_fragment
+                    || (current_line_is_mysql_on_duplicate_values_function
+                        && Self::line_ends_with_comma_before_inline_comment(trimmed));
+            pending_line_continuation = if suppress_non_subquery_paren_layout_clause {
+                // Function-local clause words inside ordinary parens (for example
+                // `RETURNING VARCHAR2 (`) should not open structural header carry,
+                // but same-line/non-leading paren events still must propagate to
+                // keep frame depth canonical on the next code line.
+                Self::line_continuation_for_line_without_structural_kind(
+                    trimmed,
+                    context.auto_depth,
+                    context.query_base_depth,
+                    next_code_trimmed,
+                    context.condition_role,
+                    context.condition_header_depth,
+                )
+            } else if suppress_structural_line_continuation {
                 None
             } else if context.query_base_depth.is_some()
                 || clause_kind.is_some()
                 || line_has_leading_close_paren
-                || Self::line_has_non_leading_significant_paren_event(trimmed)
+                || line_has_non_leading_paren_event
             {
                 Self::line_continuation_for_line(
                     trimmed,
@@ -4892,6 +4923,45 @@ impl QueryExecutor {
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
     ) -> Option<LineCarrySnapshot> {
+        Self::line_continuation_for_line_with_policy(
+            line,
+            depth,
+            query_base_depth,
+            next_code_trimmed,
+            condition_role,
+            condition_header_depth,
+            true,
+        )
+    }
+
+    fn line_continuation_for_line_without_structural_kind(
+        line: &str,
+        depth: usize,
+        query_base_depth: Option<usize>,
+        next_code_trimmed: Option<&str>,
+        condition_role: AutoFormatConditionRole,
+        condition_header_depth: Option<usize>,
+    ) -> Option<LineCarrySnapshot> {
+        Self::line_continuation_for_line_with_policy(
+            line,
+            depth,
+            query_base_depth,
+            next_code_trimmed,
+            condition_role,
+            condition_header_depth,
+            false,
+        )
+    }
+
+    fn line_continuation_for_line_with_policy(
+        line: &str,
+        depth: usize,
+        query_base_depth: Option<usize>,
+        next_code_trimmed: Option<&str>,
+        condition_role: AutoFormatConditionRole,
+        condition_header_depth: Option<usize>,
+        allow_structural_kind: bool,
+    ) -> Option<LineCarrySnapshot> {
         let trimmed = line.trim_end();
         if trimmed.is_empty() || sql_text::line_ends_with_semicolon_before_inline_comment(trimmed) {
             return None;
@@ -4907,7 +4977,9 @@ impl QueryExecutor {
             return None;
         }
 
-        let kind = Self::line_continuation_kind(trimmed);
+        let kind = allow_structural_kind
+            .then(|| Self::line_continuation_kind(trimmed))
+            .flatten();
         let paren_profile = sql_text::significant_paren_profile(trimmed);
         let has_non_leading_paren_events =
             Self::has_non_leading_significant_paren_event_in_profile(&paren_profile);
@@ -4989,16 +5061,6 @@ impl QueryExecutor {
         }
 
         depth
-    }
-
-    fn has_non_leading_significant_open_event_in_profile(
-        paren_profile: &sql_text::SignificantParenProfile,
-    ) -> bool {
-        paren_profile
-            .events
-            .iter()
-            .skip(paren_profile.leading_close_count)
-            .any(|event| matches!(event, sql_text::SignificantParenEvent::Open))
     }
 
     fn inline_comment_line_continuation_for_line(
@@ -5088,10 +5150,13 @@ impl QueryExecutor {
         carry_depth =
             Self::apply_non_leading_significant_paren_events_to_depth(carry_depth, &paren_profile);
 
-        let has_non_leading_open =
-            Self::has_non_leading_significant_open_event_in_profile(&paren_profile);
+        let has_non_leading_paren_events =
+            Self::has_non_leading_significant_paren_event_in_profile(&paren_profile);
         let starts_body_frame = continuation_depth.is_none()
-            && !has_non_leading_open
+            // Non-leading paren events are explicit structural transitions.
+            // Close-only lines (e.g. `expr )`) must not be canceled by the
+            // generic body-frame fallback.
+            && !has_non_leading_paren_events
             && (sql_text::format_bare_structural_header_continuation_kind_for_structural_tail(
                 structural_trimmed,
             )
@@ -20342,6 +20407,21 @@ FROM qt_fmt_emp e,
     }
 
     #[test]
+    fn line_carry_depth_from_render_depth_preserves_non_leading_close_even_with_condition_semantic()
+    {
+        assert_eq!(
+            QueryExecutor::line_carry_depth_from_render_depth(
+                "payload_expr )",
+                4,
+                None,
+                AutoFormatLineSemantic::ConditionContinuation,
+            ),
+            Some(3),
+            "non-leading close events must remain explicit frame pops in carry depth, even when condition continuation fallback is active"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_split_columns_after_non_leading_close_keep_owner_depth() {
         let sql = r#"SELECT jt.skill
 FROM qt_fmt_emp e,
@@ -20678,6 +20758,55 @@ LIMIT 10;"#;
         assert!(
             contexts[from_idx].auto_depth < contexts[remote_idx].auto_depth,
             "FROM should clear the carried SELECT-item depth after multiline JSON_VALUE siblings"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_function_local_returning_type_paren_frames_balanced() {
+        let sql = r#"SELECT
+    JSON_VALUE (
+        e.json_profile,
+        '$.level'
+        RETURNING VARCHAR2 (
+            30
+        )
+    ) AS profile_level
+FROM qt_fmt_emp e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or(0)
+        };
+
+        let returning_idx = find_line_starting_with("RETURNING VARCHAR2 (");
+        let precision_idx = find_line_starting_with("30");
+        let type_close_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")")
+            .unwrap_or(0);
+        let from_idx = find_line_starting_with("FROM qt_fmt_emp e;");
+
+        assert_eq!(
+            contexts[returning_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "function-local RETURNING inside JSON_VALUE should stay non-structural"
+        );
+        assert_eq!(
+            contexts[precision_idx].auto_depth,
+            contexts[returning_idx].auto_depth.saturating_add(1),
+            "function-local RETURNING type open paren must open one frame even without a clause transition"
+        );
+        assert_eq!(
+            contexts[type_close_idx].auto_depth, contexts[returning_idx].auto_depth,
+            "type close line should pop back to the function-local RETURNING owner depth"
+        );
+        assert!(
+            contexts[from_idx].auto_depth < contexts[precision_idx].auto_depth,
+            "FROM must not inherit function-local RETURNING type frame depth"
         );
     }
 
