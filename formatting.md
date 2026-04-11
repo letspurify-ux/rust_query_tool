@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-10 (statement-level 구조 플래그도 token-sequence 기반으로 명시)
+> 최종 업데이트: 2026-04-11 (괄호 frame 계산도 token-order 적용 원칙으로 명시)
 
 ## 0. 이 문서의 역할
 
@@ -36,6 +36,9 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 
 - 다단계 깊이 변화처럼 보여도 실제 모델은 owner/frame push의 합성이어야 한다.
 - 줄 단위 `final depth` 차이가 2 이상으로 보이는 것은 허용되지만, 그것은 여러 open/close/anchor event가 한 줄에 함께 반영된 결과여야 한다.
+- `(`/`)` event는 반드시 token이 등장한 순서대로 적용해야 한다. 같은 line의 close/open을 signed net delta로 합치면 안 된다.
+- 특히 `close -> open` 순서(`expr ) + (` 같은 형태)는 `saturating_sub` 이후 `+1`이 반영돼야 하므로, 이벤트를 순차 적용하지 않으면 depth가 1단계 낮게 계산될 수 있다.
+- trailing owner open을 별도 처리하는 경로여도, trailing open을 제외한 나머지 same-line paren event는 여전히 token-order로 순차 적용해야 한다.
 
 ### 1.3 pure close align은 pop된 owner depth를 따른다
 

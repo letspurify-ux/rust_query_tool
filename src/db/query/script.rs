@@ -3204,8 +3204,9 @@ impl QueryExecutor {
                     close_align_depth: context.auto_depth,
                 });
                 if !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
-                    let owner_align_depth = context.auto_depth.saturating_add_signed(
-                        Self::same_line_non_leading_paren_frame_delta(trimmed),
+                    let owner_align_depth = Self::apply_same_line_non_leading_paren_events_to_depth(
+                        context.auto_depth,
+                        trimmed,
                     );
                     pending_split_query_owner = Some(PendingSplitQueryOwnerFrame {
                         owner_align_depth,
@@ -3232,9 +3233,11 @@ impl QueryExecutor {
                     pending_partial_query_owner =
                         sql_text::format_query_owner_pending_header_kind(clause_detection_trimmed)
                             .map(|kind| {
-                                let owner_base_depth = context.auto_depth.saturating_add_signed(
-                                    Self::same_line_non_leading_paren_frame_delta(trimmed),
-                                );
+                                let owner_base_depth =
+                                    Self::apply_same_line_non_leading_paren_events_to_depth(
+                                        context.auto_depth,
+                                        trimmed,
+                                    );
                                 PendingPartialQueryOwnerFrame {
                                     kind,
                                     owner_align_depth: owner_base_depth,
@@ -3303,13 +3306,13 @@ impl QueryExecutor {
                         Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
                             PendingMultilineClauseOwnerFrame {
                                 kind,
-                                owner_depth: Self::auto_format_multiline_owner_depth(
-                                    kind,
-                                    context.auto_depth,
-                                    context.query_base_depth,
-                                )
-                                .saturating_add_signed(
-                                    Self::same_line_non_leading_paren_frame_delta(trimmed),
+                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
+                                    Self::auto_format_multiline_owner_depth(
+                                        kind,
+                                        context.auto_depth,
+                                        context.query_base_depth,
+                                    ),
+                                    trimmed,
                                 ),
                             }
                         })
@@ -3318,8 +3321,9 @@ impl QueryExecutor {
                         split_model_multiline_owner_tail.then_some(
                             PendingMultilineClauseOwnerFrame {
                                 kind: sql_text::FormatIndentedParenOwnerKind::ModelSubclause,
-                                owner_depth: context.auto_depth.saturating_add_signed(
-                                    Self::same_line_non_leading_paren_frame_delta(trimmed),
+                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
+                                    context.auto_depth,
+                                    trimmed,
                                 ),
                             },
                         )
@@ -3335,13 +3339,13 @@ impl QueryExecutor {
                         .map(|kind| {
                             PendingPartialMultilineClauseOwnerFrame {
                                 kind,
-                                owner_depth: Self::auto_format_multiline_owner_depth(
-                                    kind.owner_kind(),
-                                    context.auto_depth,
-                                    context.query_base_depth,
-                                )
-                                .saturating_add_signed(
-                                    Self::same_line_non_leading_paren_frame_delta(trimmed),
+                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
+                                    Self::auto_format_multiline_owner_depth(
+                                        kind.owner_kind(),
+                                        context.auto_depth,
+                                        context.query_base_depth,
+                                    ),
+                                    trimmed,
                                 ),
                             }
                         })
@@ -4575,53 +4579,24 @@ impl QueryExecutor {
         aligns_owner_boundary.then_some(frame.owner_align_depth)
     }
 
+    #[cfg(test)]
     fn same_line_paren_frame_delta_before_trailing_open(line: &str) -> isize {
         if !Self::line_ends_with_open_paren_before_inline_comment(line) {
             return 0;
         }
 
-        let paren_profile = sql_text::significant_paren_profile(line);
-        if !matches!(
-            paren_profile.events.last(),
-            Some(sql_text::SignificantParenEvent::Open)
-        ) {
-            return 0;
-        }
-
-        let mut preceding_depth = 0isize;
-        let preceding_event_count = paren_profile
-            .events
-            .len()
-            .saturating_sub(paren_profile.leading_close_count)
-            .saturating_sub(1);
-        for event in paren_profile
-            .events
-            .iter()
-            .skip(paren_profile.leading_close_count)
-            .take(preceding_event_count)
-        {
-            match event {
-                sql_text::SignificantParenEvent::Open => {
-                    preceding_depth = preceding_depth.saturating_add(1);
-                }
-                sql_text::SignificantParenEvent::Close => {
-                    preceding_depth = preceding_depth.saturating_sub(1);
-                }
-            }
-        }
-
-        preceding_depth
+        Self::same_line_significant_paren_frame_delta(line, true)
     }
 
+    #[cfg(test)]
     fn same_line_non_leading_paren_frame_delta(line: &str) -> isize {
-        let paren_profile = sql_text::significant_paren_profile(line);
-        let mut frame_delta = 0isize;
+        Self::same_line_significant_paren_frame_delta(line, false)
+    }
 
-        for event in paren_profile
-            .events
-            .iter()
-            .skip(paren_profile.leading_close_count)
-        {
+    #[cfg(test)]
+    fn same_line_significant_paren_frame_delta(line: &str, exclude_trailing_open: bool) -> isize {
+        let mut frame_delta = 0isize;
+        Self::for_each_same_line_significant_paren_event(line, exclude_trailing_open, |event| {
             match event {
                 sql_text::SignificantParenEvent::Open => {
                     frame_delta = frame_delta.saturating_add(1);
@@ -4630,31 +4605,105 @@ impl QueryExecutor {
                     frame_delta = frame_delta.saturating_sub(1);
                 }
             }
-        }
-
+        });
         frame_delta
     }
 
-    fn same_line_query_owner_paren_frame_delta(line: &str) -> isize {
-        if Self::line_ends_with_open_paren_before_inline_comment(line) {
-            Self::same_line_paren_frame_delta_before_trailing_open(line)
-        } else {
-            Self::same_line_non_leading_paren_frame_delta(line)
+    fn apply_same_line_non_leading_paren_events_to_depth(depth: usize, line: &str) -> usize {
+        Self::apply_same_line_significant_paren_events_to_depth(depth, line, false)
+    }
+
+    fn apply_same_line_query_owner_paren_events_to_depth(depth: usize, line: &str) -> usize {
+        Self::apply_same_line_significant_paren_events_to_depth(
+            depth,
+            line,
+            Self::line_ends_with_open_paren_before_inline_comment(line),
+        )
+    }
+
+    fn same_line_query_owner_has_non_leading_close_event(line: &str) -> bool {
+        Self::same_line_significant_paren_has_close_event(
+            line,
+            Self::line_ends_with_open_paren_before_inline_comment(line),
+        )
+    }
+
+    fn same_line_significant_paren_has_close_event(
+        line: &str,
+        exclude_trailing_open: bool,
+    ) -> bool {
+        let mut has_close = false;
+        Self::for_each_same_line_significant_paren_event(line, exclude_trailing_open, |event| {
+            if event == sql_text::SignificantParenEvent::Close {
+                has_close = true;
+            }
+        });
+        has_close
+    }
+
+    fn apply_same_line_significant_paren_events_to_depth(
+        mut depth: usize,
+        line: &str,
+        exclude_trailing_open: bool,
+    ) -> usize {
+        Self::for_each_same_line_significant_paren_event(line, exclude_trailing_open, |event| {
+            match event {
+                sql_text::SignificantParenEvent::Open => {
+                    depth = depth.saturating_add(1);
+                }
+                sql_text::SignificantParenEvent::Close => {
+                    depth = depth.saturating_sub(1);
+                }
+            }
+        });
+        depth
+    }
+
+    fn for_each_same_line_significant_paren_event(
+        line: &str,
+        exclude_trailing_open: bool,
+        mut on_event: impl FnMut(sql_text::SignificantParenEvent),
+    ) {
+        let paren_profile = sql_text::significant_paren_profile(line);
+        let start = paren_profile
+            .leading_close_count
+            .min(paren_profile.events.len());
+        let mut end = paren_profile.events.len();
+
+        if exclude_trailing_open
+            && end > start
+            && matches!(
+                paren_profile.events.get(end.saturating_sub(1)),
+                Some(sql_text::SignificantParenEvent::Open)
+            )
+        {
+            end = end.saturating_sub(1);
+        }
+
+        for event in paren_profile
+            .events
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+        {
+            on_event(*event);
         }
     }
 
     fn pending_query_owner_base_depth(context: AutoFormatLineContext, line: &str) -> usize {
         let normalized = line.trim_end();
-        let same_line_paren_delta = Self::same_line_query_owner_paren_frame_delta(normalized);
-        let structural_owner_base = context
-            .auto_depth
-            .saturating_add_signed(same_line_paren_delta);
+        let line_ends_with_open_paren =
+            Self::line_ends_with_open_paren_before_inline_comment(normalized);
+        let same_line_has_non_leading_close =
+            Self::same_line_query_owner_has_non_leading_close_event(normalized);
+        let structural_owner_base =
+            Self::apply_same_line_query_owner_paren_events_to_depth(context.auto_depth, normalized);
         let current_line_query_owner_kind = sql_text::contextual_format_query_owner_kind(
             normalized,
             context.line_semantic.is_condition_continuation(),
         );
-        let preserve_non_leading_close_owner_base = same_line_paren_delta < 0
-            && Self::line_ends_with_open_paren_before_inline_comment(normalized)
+        let preserve_non_leading_close_owner_base = same_line_has_non_leading_close
+            && line_ends_with_open_paren
             && !sql_text::line_has_leading_significant_close_paren(normalized);
         if context.condition_role != AutoFormatConditionRole::None {
             if let Some(header_depth) = context.condition_header_depth {
@@ -4662,7 +4711,7 @@ impl QueryExecutor {
                     return structural_owner_base;
                 }
                 if current_line_query_owner_kind.is_some() {
-                    if structural_owner_base > header_depth || same_line_paren_delta < 0 {
+                    if structural_owner_base > header_depth || same_line_has_non_leading_close {
                         // Condition-owned child-query lines such as
                         // `AND EXISTS (` or `expr ) IN (` must anchor the child
                         // query from the current owner line's structural frame
@@ -4672,9 +4721,7 @@ impl QueryExecutor {
                         return structural_owner_base;
                     }
                 }
-                if Self::line_ends_with_open_paren_before_inline_comment(normalized)
-                    && same_line_paren_delta < 0
-                {
+                if line_ends_with_open_paren && same_line_has_non_leading_close {
                     // Lines that continue a condition and open the child query
                     // on the same line (e.g. `expr ) IN (`) still need to
                     // preserve the explicit close-before-open frame delta.
@@ -20647,6 +20694,42 @@ FROM qt_fmt_emp e,
         assert_eq!(
             frame_delta, -1,
             "non-leading close paren should decrement same-line frame delta even without a line break"
+        );
+    }
+
+    #[test]
+    fn apply_same_line_non_leading_paren_events_to_depth_uses_token_order_at_zero_floor() {
+        let line = "payload_expr ) + (";
+
+        assert_eq!(
+            QueryExecutor::same_line_non_leading_paren_frame_delta(line),
+            0,
+            "signed net delta alone cannot represent close-then-open sequencing at depth floor"
+        );
+        assert_eq!(
+            QueryExecutor::apply_same_line_non_leading_paren_events_to_depth(0, line),
+            1,
+            "token-order paren events must clamp close at zero first, then apply the later open"
+        );
+    }
+
+    #[test]
+    fn apply_same_line_query_owner_paren_events_to_depth_uses_token_order_before_trailing_open() {
+        let line = "payload_expr ) + ((";
+
+        assert_eq!(
+            QueryExecutor::same_line_paren_frame_delta_before_trailing_open(line),
+            0,
+            "net signed delta before trailing owner-open can hide close/open order at depth floor"
+        );
+        assert_eq!(
+            QueryExecutor::apply_same_line_query_owner_paren_events_to_depth(0, line),
+            1,
+            "query-owner same-line paren events must be applied in token order before excluding the trailing owner open"
+        );
+        assert!(
+            QueryExecutor::same_line_query_owner_has_non_leading_close_event(line),
+            "non-leading close events should remain explicit even when a later open restores net delta"
         );
     }
 
