@@ -5797,10 +5797,10 @@ fn format_sql_filtered_cte_with_window_function_exact_layout() {
     SELECT *
     FROM enriched
     WHERE (sal > (
-        SELECT AVG (sal)
-        FROM oqt_t_emp
-        WHERE deptno = enriched.deptno
-    ))
+            SELECT AVG (sal)
+            FROM oqt_t_emp
+            WHERE deptno = enriched.deptno
+        ))
         OR (job IN ('MANAGER', 'ANALYST')
             AND sal >= 2500)
 )

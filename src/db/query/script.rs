@@ -3074,14 +3074,16 @@ impl QueryExecutor {
                 .map(|frame| frame.owner_base_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.owner_base_depth))
                 .or_else(|| completed_plsql_child_query_owner.map(|frame| frame.owner_base_depth))
-                .unwrap_or_else(|| Self::pending_query_owner_base_depth(context, trimmed_upper));
+                .unwrap_or_else(|| {
+                    Self::pending_query_owner_base_depth(context, clause_detection_trimmed)
+                });
             let next_query_head_depth = pending_split_query_owner_for_line
                 .map(|frame| frame.next_query_head_depth)
                 .or_else(|| completed_partial_query_owner.map(|frame| frame.next_query_head_depth))
                 .or_else(|| {
                     completed_plsql_child_query_owner.map(|frame| frame.next_query_head_depth)
                 })
-                .unwrap_or_else(|| Self::next_query_head_depth(context, trimmed_upper));
+                .unwrap_or_else(|| Self::next_query_head_depth(context, clause_detection_trimmed));
             let line_opens_child_query =
                 Self::line_ends_with_open_paren_before_inline_comment(trimmed)
                     && continued_plsql_child_query_owner.is_none();
@@ -4422,12 +4424,43 @@ impl QueryExecutor {
         aligns_owner_boundary.then_some(frame.owner_align_depth)
     }
 
-    fn pending_query_owner_base_depth(
-        context: AutoFormatLineContext,
-        trimmed_upper: &str,
-    ) -> usize {
-        let normalized = trimmed_upper.trim_end();
-        let structural_owner_base = context.auto_depth;
+    fn same_line_open_paren_frames_before_trailing_open(line: &str) -> usize {
+        if !Self::line_ends_with_open_paren_before_inline_comment(line) {
+            return 0;
+        }
+
+        let paren_profile = sql_text::significant_paren_profile(line);
+        if !matches!(
+            paren_profile.events.last(),
+            Some(sql_text::SignificantParenEvent::Open)
+        ) {
+            return 0;
+        }
+
+        let mut preceding_depth = 0usize;
+        for event in paren_profile
+            .events
+            .iter()
+            .take(paren_profile.events.len().saturating_sub(1))
+        {
+            match event {
+                sql_text::SignificantParenEvent::Open => {
+                    preceding_depth = preceding_depth.saturating_add(1);
+                }
+                sql_text::SignificantParenEvent::Close => {
+                    preceding_depth = preceding_depth.saturating_sub(1);
+                }
+            }
+        }
+
+        preceding_depth
+    }
+
+    fn pending_query_owner_base_depth(context: AutoFormatLineContext, line: &str) -> usize {
+        let normalized = line.trim_end();
+        let structural_owner_base = context.auto_depth.saturating_add(
+            Self::same_line_open_paren_frames_before_trailing_open(normalized),
+        );
         let current_line_query_owner_kind = sql_text::contextual_format_query_owner_kind(
             normalized,
             context.line_semantic.is_condition_continuation(),
@@ -4467,8 +4500,8 @@ impl QueryExecutor {
             .unwrap_or(structural_owner_base)
     }
 
-    fn next_query_head_depth(context: AutoFormatLineContext, trimmed_upper: &str) -> usize {
-        Self::pending_query_owner_base_depth(context, trimmed_upper).saturating_add(1)
+    fn next_query_head_depth(context: AutoFormatLineContext, line: &str) -> usize {
+        Self::pending_query_owner_base_depth(context, line).saturating_add(1)
     }
 
     fn line_is_multitable_insert_header(trimmed_upper: &str) -> bool {
@@ -19830,6 +19863,12 @@ END;"#;
             find_line("WHERE XMLEXISTS ('/employees/employee[salary > 10000]' PASSING x.xml_data)");
         let outer_order_idx = find_line("ORDER BY x.salary DESC");
         let outer_fetch_idx = find_line("FETCH FIRST 20 ROWS ONLY;");
+        let skills_owner_open_frames =
+            QueryExecutor::same_line_open_paren_frames_before_trailing_open(lines[json_object_idx]);
+        let expected_skills_query_head_depth = contexts[json_object_idx]
+            .auto_depth
+            .saturating_add(skills_owner_open_frames)
+            .saturating_add(1);
 
         assert_eq!(
             contexts[json_object_idx].auto_depth, contexts[xmlquery_idx].auto_depth,
@@ -19837,18 +19876,18 @@ END;"#;
         );
         assert_eq!(
             contexts[json_object_idx].next_query_head_depth,
-            Some(contexts[json_object_idx].auto_depth.saturating_add(1)),
-            "KEY 'skills' VALUE ( owner line should carry the child SELECT head depth"
+            Some(expected_skills_query_head_depth),
+            "KEY 'skills' VALUE ( owner line should carry child SELECT head depth including same-line open-paren frames"
         );
         assert_eq!(
             contexts[skills_select_idx].query_base_depth,
-            Some(contexts[json_object_idx].auto_depth.saturating_add(1)),
-            "child SELECT under KEY 'skills' VALUE ( should inherit the carried query-base depth"
+            Some(expected_skills_query_head_depth),
+            "child SELECT under KEY 'skills' VALUE ( should inherit the carried query-base depth including same-line open-paren frames"
         );
         assert_eq!(
             contexts[skills_select_idx].auto_depth,
-            contexts[json_object_idx].auto_depth.saturating_add(1),
-            "child SELECT under KEY 'skills' VALUE ( should stay exactly one level deeper than the surrounding JSON_OBJECT select item"
+            expected_skills_query_head_depth,
+            "child SELECT under KEY 'skills' VALUE ( should match the carried child-query head depth"
         );
         assert_eq!(
             contexts[skills_from_idx].auto_depth, contexts[skills_select_idx].auto_depth,
@@ -19895,6 +19934,72 @@ END;"#;
         assert_eq!(
             contexts[outer_fetch_idx].auto_depth, contexts[outer_from_idx].auto_depth,
             "outer FETCH should stay on the outer query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_nested_json_object_scalar_subquery_two_levels_deeper_than_owner_line(
+    ) {
+        let sql = r#"SELECT c.customer_id,
+    c.customer_name,
+    JSON_OBJECT('segment', c.segment, 'region', (
+        SELECT r.region_name
+        FROM boss_region r
+        WHERE r.region_id = c.region_id
+    ), 'stats', JSON_OBJECT('orders', COUNT(DISTINCT o.order_id), 'gross', ROUND(SUM(o.grand_total), 2), 'avg', ROUND(AVG(o.grand_total), 2), 'paid_ratio', ROUND(SUM(o.paid_total) / NULLIF(SUM(o.grand_total), 0), 4)), 'latest_orders', JSON_ARRAYAGG(JSON_OBJECT('order_no', o.order_no, 'date', DATE_FORMAT(o.order_date, '%Y-%m-%d'), 'grand_total', o.grand_total, 'risk', fn_order_risk(o.order_id)))) AS customer_doc
+FROM boss_customer c
+JOIN boss_order o
+    ON o.customer_id = c.customer_id
+WHERE o.status <> 'CANCELLED'
+    AND EXISTS (
+        SELECT 1
+        FROM boss_order_item oi
+        WHERE oi.order_id = o.order_id
+            AND oi.discount_rate >= 0.0700
+    )
+GROUP BY c.customer_id,
+    c.customer_name,
+    c.segment,
+    c.region_id
+HAVING COUNT(DISTINCT o.order_id) >= 2
+ORDER BY SUM(o.grand_total) DESC,
+    c.customer_id
+LIMIT 10;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let region_owner_idx = lines
+            .iter()
+            .position(|line| line.contains("'region', ("))
+            .unwrap_or(0);
+        let region_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT r.region_name")
+            .unwrap_or(0);
+        let region_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM boss_region r")
+            .unwrap_or(0);
+        let region_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE r.region_id = c.region_id")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[region_select_idx].auto_depth,
+            contexts[region_owner_idx].auto_depth.saturating_add(2),
+            "JSON_OBJECT owner line already has one open paren; nested `( SELECT ... )` must add another frame so child SELECT is two levels deeper"
+        );
+        assert_eq!(
+            contexts[region_from_idx].auto_depth,
+            contexts[region_select_idx].auto_depth,
+            "scalar subquery FROM should stay aligned with its SELECT under nested JSON_OBJECT parens"
+        );
+        assert_eq!(
+            contexts[region_where_idx].auto_depth,
+            contexts[region_select_idx].auto_depth,
+            "scalar subquery WHERE should stay aligned with its SELECT under nested JSON_OBJECT parens"
         );
     }
 

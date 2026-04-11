@@ -8963,6 +8963,11 @@ impl SqlEditorWidget {
                             let query_like_owner_depth = query_like_owner_line
                                 .as_deref()
                                 .map(|owner_line| {
+                                    let owner_line_open_depth =
+                                        sql_text::significant_paren_depth_after_profile(
+                                            0,
+                                            &sql_text::significant_paren_profile(owner_line),
+                                        );
                                     if standalone_clause_list_query_item {
                                         line_indent
                                     } else if paren_started_at_line_start {
@@ -8985,6 +8990,7 @@ impl SqlEditorWidget {
                                                 .unwrap_or(semantic_open_line_indent)
                                         } else {
                                             rendered_line_indent(owner_line)
+                                                .saturating_add(owner_line_open_depth)
                                         }
                                     } else {
                                         semantic_open_line_indent
@@ -18608,6 +18614,80 @@ ORDER BY d.dept_id;"#;
             SqlEditorWidget::format_for_auto_formatting(expected, false),
             expected,
             "JSON_OBJECT VALUE scalar subquery formatting should remain stable"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_nested_json_object_open_paren_frame_for_scalar_subquery() {
+        let source = r#"SELECT c.customer_id,
+    c.customer_name,
+    JSON_OBJECT('segment', c.segment, 'region', (
+        SELECT r.region_name
+        FROM boss_region r
+        WHERE r.region_id = c.region_id
+    ), 'stats', JSON_OBJECT('orders', COUNT(DISTINCT o.order_id), 'gross', ROUND(SUM(o.grand_total), 2), 'avg', ROUND(AVG(o.grand_total), 2), 'paid_ratio', ROUND(SUM(o.paid_total) / NULLIF(SUM(o.grand_total), 0), 4)), 'latest_orders', JSON_ARRAYAGG(JSON_OBJECT('order_no', o.order_no, 'date', DATE_FORMAT(o.order_date, '%Y-%m-%d'), 'grand_total', o.grand_total, 'risk', fn_order_risk(o.order_id)))) AS customer_doc
+FROM boss_customer c
+JOIN boss_order o
+    ON o.customer_id = c.customer_id
+WHERE o.status <> 'CANCELLED'
+    AND EXISTS (
+        SELECT 1
+        FROM boss_order_item oi
+        WHERE oi.order_id = o.order_id
+            AND oi.discount_rate >= 0.0700
+    )
+GROUP BY c.customer_id,
+    c.customer_name,
+    c.segment,
+    c.region_id
+HAVING COUNT(DISTINCT o.order_id) >= 2
+ORDER BY SUM(o.grand_total) DESC,
+    c.customer_id
+LIMIT 10;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let region_owner_idx = lines
+            .iter()
+            .position(|line| line.contains("'region', ("))
+            .expect("JSON_OBJECT region owner line");
+        let region_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(region_owner_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "SELECT r.region_name")
+            .map(|(idx, _)| idx)
+            .expect("JSON_OBJECT region scalar SELECT line");
+        let region_from_idx = lines
+            .iter()
+            .enumerate()
+            .skip(region_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "FROM boss_region r")
+            .map(|(idx, _)| idx)
+            .expect("JSON_OBJECT region scalar FROM line");
+        let region_where_idx = lines
+            .iter()
+            .enumerate()
+            .skip(region_from_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "WHERE r.region_id = c.region_id")
+            .map(|(idx, _)| idx)
+            .expect("JSON_OBJECT region scalar WHERE line");
+
+        assert_eq!(
+            leading_spaces(lines[region_select_idx]),
+            leading_spaces(lines[region_owner_idx]).saturating_add(8),
+            "JSON_OBJECT + nested scalar subquery must keep both open-paren frames so SELECT stays two levels deeper than the owner line, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[region_from_idx]),
+            leading_spaces(lines[region_select_idx]),
+            "scalar subquery FROM should stay aligned with SELECT under nested JSON_OBJECT paren frames, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[region_where_idx]),
+            leading_spaces(lines[region_select_idx]),
+            "scalar subquery WHERE should stay aligned with SELECT under nested JSON_OBJECT paren frames, got:\n{formatted}"
         );
     }
 
