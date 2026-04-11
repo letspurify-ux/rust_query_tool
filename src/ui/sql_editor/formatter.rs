@@ -597,6 +597,7 @@ struct QueryLikeParenRestoreState {
     clause: Option<String>,
     select_list_layout_state: SelectListLayoutState,
     statement_has_with_clause: bool,
+    query_body_clause_base_depth: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -920,6 +921,7 @@ impl ConstructState {
         in_plsql_block: bool,
         suppress_comma_break_depth: usize,
         has_subquery_in_paren_stack: bool,
+        inside_function_local_non_query_paren: bool,
         current_scope: FormatScope,
         trigger_header_state: &TriggerHeaderState,
         is_analytic_within_group: bool,
@@ -1046,9 +1048,10 @@ impl ConstructState {
         // tells us when EXTRACT-style bodies are safe to keep inline without
         // hiding real query `FROM` clauses from the analyzer.
         if suppress_comma_break_depth > 0
-            && !has_subquery_in_paren_stack
-            && (keyword == "FROM"
-                || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword))
+            && ((inside_function_local_non_query_paren && matches!(keyword, "FROM" | "WITH"))
+                || (!has_subquery_in_paren_stack
+                    && (keyword == "FROM"
+                        || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword))))
         {
             return true;
         }
@@ -1082,6 +1085,19 @@ impl ConstructState {
             return true;
         }
         false
+    }
+
+    fn has_compact_non_query_frame_since_last_query(paren_stack: &[ParenFormatFrame]) -> bool {
+        let start_idx = paren_stack
+            .iter()
+            .rposition(|frame| frame.is_query_like())
+            .map_or(0, |idx| idx.saturating_add(1));
+
+        paren_stack[start_idx..]
+            .iter()
+            .filter(|frame| frame.suppresses_comma_breaks())
+            .count()
+            > 0
     }
 
     /// condition 키워드(ON, AND, OR, WHEN)의 줄바꿈을 억제해야 하는지 판단합니다.
@@ -4899,10 +4915,16 @@ impl SqlEditorWidget {
                         && upper == "BEGIN"
                         && next_word_is("NOT")
                         && third_word.is_some_and(|word| word.eq_ignore_ascii_case("ATOMIC"));
+                    let inside_function_local_non_query_paren =
+                        ConstructState::has_compact_non_query_frame_since_last_query(&paren_stack);
+                    let with_cte_keyword_inside_function_local =
+                        upper == "WITH" && inside_function_local_non_query_paren;
                     let with_plsql_body_starts_here = matches!(upper, "AS" | "IS")
                         && !as_belongs_to_constructor_result_clause
                         && with_cte_state.collecting_routine_declaration_body_start();
-                    with_cte_state.on_word(upper, prev_word_upper.as_deref());
+                    if !with_cte_keyword_inside_function_local {
+                        with_cte_state.on_word(upper, prev_word_upper.as_deref());
+                    }
                     let with_plsql_declaration_header =
                         sql_text::is_with_plsql_declaration_keyword(upper)
                             && (prev_word_upper.as_deref() == Some("WITH")
@@ -4986,8 +5008,7 @@ impl SqlEditorWidget {
                             // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
                             // should not cause a condition line break.
                             || (upper == "ON"
-                                && suppress_comma_break_depth > 0
-                                && !paren_stack.iter().any(|frame| frame.is_query_like())));
+                                && inside_function_local_non_query_paren));
                     let top_level_query_body_base_indent = query_body_clause_base_depth
                         .filter(|_| paren_stack.is_empty())
                         .unwrap_or_else(|| base_indent(indent_level, open_cursor_state));
@@ -5492,6 +5513,7 @@ impl SqlEditorWidget {
                             in_plsql_block,
                             suppress_comma_break_depth,
                             paren_stack.iter().any(|frame| frame.is_query_like()),
+                            inside_function_local_non_query_paren,
                             current_scope,
                             &trigger_header_state,
                             is_analytic_within_group,
@@ -5560,7 +5582,17 @@ impl SqlEditorWidget {
                                             .is_some_and(|frame| !frame.is_query_like())
                                 })
                                 .map(|_| {
-                                    current_output_line_indent(&out, line_indent).saturating_add(1)
+                                    let rendered_indent =
+                                        current_output_line_indent(&out, line_indent);
+                                    let owner_indent = if at_line_start
+                                        && rendered_indent == 0
+                                        && line_indent > 0
+                                    {
+                                        line_indent
+                                    } else {
+                                        rendered_indent
+                                    };
+                                    owner_indent.saturating_add(1)
                                 });
                             let returning_owner_body_indent = (upper == "RETURNING"
                                 && !matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
@@ -6766,7 +6798,11 @@ impl SqlEditorWidget {
                     } else {
                         out.push_str(rendered_word);
                     }
-                    if upper == "WITH" && is_keyword && !mysql_keyword_identifier {
+                    if upper == "WITH"
+                        && is_keyword
+                        && !mysql_keyword_identifier
+                        && !with_cte_keyword_inside_function_local
+                    {
                         with_cte_state.record_with_owner_depth(line_indent);
                     }
                     needs_space = true;
@@ -8306,19 +8342,32 @@ impl SqlEditorWidget {
                                         // Mixed close-comma SELECT/SET siblings must snap to the
                                         // active list frame depth after the current line closes
                                         // one or more frames.
-                                        let frame_based_sibling_indent =
-                                            parent_frame_sibling_indent.unwrap_or_else(|| {
-                                                select_list_layout_state.indentation_or(
-                                                    active_list_indent(
-                                                        indent_level,
-                                                        open_cursor_state,
-                                                        select_list_layout_state,
-                                                        current_clause.as_deref(),
-                                                        construct.merge_active.is_active(),
-                                                        false,
-                                                    ),
-                                                )
+                                        let stable_root_list_indent =
+                                            paren_stack.is_empty().then(|| {
+                                                query_body_clause_base_depth
+                                                    .unwrap_or_else(|| {
+                                                        base_indent(
+                                                            indent_level,
+                                                            open_cursor_state,
+                                                        )
+                                                    })
+                                                    .saturating_add(1)
                                             });
+                                        let frame_based_sibling_indent =
+                                            parent_frame_sibling_indent
+                                                .or(stable_root_list_indent)
+                                                .unwrap_or_else(|| {
+                                                    select_list_layout_state.indentation_or(
+                                                        active_list_indent(
+                                                            indent_level,
+                                                            open_cursor_state,
+                                                            select_list_layout_state,
+                                                            current_clause.as_deref(),
+                                                            construct.merge_active.is_active(),
+                                                            false,
+                                                        ),
+                                                    )
+                                                });
                                         newline_with(
                                             &mut out,
                                             frame_based_sibling_indent,
@@ -9099,6 +9148,7 @@ impl SqlEditorWidget {
                                         clause: current_clause.clone(),
                                         select_list_layout_state,
                                         statement_has_with_clause,
+                                        query_body_clause_base_depth,
                                     })
                                 } else {
                                     None
@@ -9291,6 +9341,8 @@ impl SqlEditorWidget {
                                 current_clause = restore_state.clause;
                                 select_list_layout_state = restore_state.select_list_layout_state;
                                 statement_has_with_clause = restore_state.statement_has_with_clause;
+                                query_body_clause_base_depth =
+                                    restore_state.query_body_clause_base_depth;
                             }
                             if paren_stack.is_empty()
                                 && matches!(
@@ -24062,6 +24114,57 @@ FROM emp_json e;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_nested_subquery_json_query_with_inside_function_parens() {
+        let source = r#"SELECT
+    (
+        SELECT JSON_QUERY (
+            x.payload, '$.items[*]' -- json path
+            WITH WRAPPER
+        )
+        FROM emp_json x
+    ) AS items_json,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH WRAPPER"))
+            .unwrap_or_else(|| panic!("nested JSON_QUERY WITH option line, got:\n{}", formatted));
+        let subquery_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json x"))
+            .unwrap_or_else(|| panic!("nested subquery FROM clause, got:\n{}", formatted));
+        let outer_sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_QUERY, got:\n{}", formatted));
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        assert!(
+            indent(lines[with_idx]) > indent(lines[subquery_from_idx]),
+            "function-local WITH inside a nested subquery function call should stay deeper than the child query FROM clause, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_sibling_idx]),
+            indent(lines[outer_from_idx]).saturating_add(4),
+            "outer SELECT-list sibling after nested JSON_QUERY should return to the canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "nested JSON_QUERY WITH auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
     fn format_sql_json_transform_set_and_insert_stay_inside_function() {
         let source = "SELECT JSON_TRANSFORM(e.payload, SET '$.status' = 'DONE', INSERT '$.audit.user' = USER) AS payload2 FROM emp_json e;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -24462,6 +24565,59 @@ FROM event_log e;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "multiline JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_nested_subquery_json_value_on_error_inside_function_parens()
+    {
+        let source = r#"SELECT
+    (
+        SELECT JSON_VALUE (
+            x.payload, '$.name' -- json path
+            RETURNING VARCHAR2 (30)
+            NULL ON ERROR
+        )
+        FROM event_log x
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let on_error_idx = lines
+            .iter()
+            .position(|line| line.contains("ON ERROR"))
+            .unwrap_or_else(|| panic!("nested JSON_VALUE ON ERROR option line, got:\n{}", formatted));
+        let subquery_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log x"))
+            .unwrap_or_else(|| panic!("nested subquery FROM clause, got:\n{}", formatted));
+        let outer_sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_VALUE, got:\n{}", formatted));
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        assert!(
+            indent(lines[on_error_idx]) > indent(lines[subquery_from_idx]),
+            "function-local JSON_VALUE ON ERROR inside a nested subquery should stay deeper than the child query FROM clause, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_sibling_idx]),
+            indent(lines[outer_from_idx]).saturating_add(4),
+            "outer SELECT-list sibling after nested JSON_VALUE should return to the canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "nested JSON_VALUE option auto-formatting should be idempotent"
         );
     }
 

@@ -21358,6 +21358,55 @@ FROM emp_json e;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_nested_subquery_function_local_with_wrapper_non_structural() {
+        let sql = r#"SELECT
+    (
+        SELECT JSON_QUERY (
+            x.payload,
+            '$.items[*]'
+            WITH WRAPPER
+        )
+        FROM emp_json x
+    ) AS items_json,
+    e.empno
+FROM emp_json e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let with_idx = find_line_starting_with("WITH WRAPPER");
+        let subquery_from_idx = find_line_starting_with("FROM emp_json x");
+        let outer_sibling_idx = find_line_starting_with("e.empno");
+        let outer_from_idx = find_line_starting_with("FROM emp_json e;");
+
+        assert_eq!(
+            contexts[with_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "nested subquery function-local WITH should stay non-structural"
+        );
+        assert_ne!(
+            contexts[with_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "nested subquery function-local WITH must not reopen a query-base frame"
+        );
+        assert!(
+            contexts[with_idx].auto_depth >= contexts[subquery_from_idx].auto_depth,
+            "nested subquery function-local WITH should not collapse below the child query FROM clause"
+        );
+        assert_eq!(
+            contexts[outer_sibling_idx].auto_depth,
+            contexts[outer_from_idx].auto_depth.saturating_add(1),
+            "outer SELECT-list sibling after nested JSON_QUERY should return to the outer query list depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_function_local_extract_from_non_structural() {
         let sql = r#"SELECT
     EXTRACT (
