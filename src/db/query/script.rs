@@ -2417,10 +2417,9 @@ impl QueryExecutor {
                         && sql_text::line_starts_with_format_bare_direct_from_item_query_owner(
                             clause_detection_trimmed,
                         );
-                let keeps_pending_from_item_body_after_leading_close =
-                    line_has_leading_close_paren
-                        && leading_close_has_mixed_continuation
-                        && current_line_is_direct_split_from_item_query_owner;
+                let keeps_pending_from_item_body_after_leading_close = line_has_leading_close_paren
+                    && leading_close_has_mixed_continuation
+                    && current_line_is_direct_split_from_item_query_owner;
                 let current_line_is_pending_from_item_body = frame.pending_from_item_body
                     && matches!(clause_kind, None | Some(AutoFormatClauseKind::Table))
                     && (!line_has_leading_close_paren
@@ -3306,14 +3305,15 @@ impl QueryExecutor {
                         Self::line_multiline_clause_owner_header_kind(trimmed).map(|kind| {
                             PendingMultilineClauseOwnerFrame {
                                 kind,
-                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
-                                    Self::auto_format_multiline_owner_depth(
-                                        kind,
-                                        context.auto_depth,
-                                        context.query_base_depth,
+                                owner_depth:
+                                    Self::apply_same_line_non_leading_paren_events_to_depth(
+                                        Self::auto_format_multiline_owner_depth(
+                                            kind,
+                                            context.auto_depth,
+                                            context.query_base_depth,
+                                        ),
+                                        trimmed,
                                     ),
-                                    trimmed,
-                                ),
                             }
                         })
                     })
@@ -3321,10 +3321,11 @@ impl QueryExecutor {
                         split_model_multiline_owner_tail.then_some(
                             PendingMultilineClauseOwnerFrame {
                                 kind: sql_text::FormatIndentedParenOwnerKind::ModelSubclause,
-                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
-                                    context.auto_depth,
-                                    trimmed,
-                                ),
+                                owner_depth:
+                                    Self::apply_same_line_non_leading_paren_events_to_depth(
+                                        context.auto_depth,
+                                        trimmed,
+                                    ),
                             },
                         )
                     });
@@ -3339,14 +3340,15 @@ impl QueryExecutor {
                         .map(|kind| {
                             PendingPartialMultilineClauseOwnerFrame {
                                 kind,
-                                owner_depth: Self::apply_same_line_non_leading_paren_events_to_depth(
-                                    Self::auto_format_multiline_owner_depth(
-                                        kind.owner_kind(),
-                                        context.auto_depth,
-                                        context.query_base_depth,
+                                owner_depth:
+                                    Self::apply_same_line_non_leading_paren_events_to_depth(
+                                        Self::auto_format_multiline_owner_depth(
+                                            kind.owner_kind(),
+                                            context.auto_depth,
+                                            context.query_base_depth,
+                                        ),
+                                        trimmed,
                                     ),
-                                    trimmed,
-                                ),
                             }
                         })
                     })
@@ -3568,9 +3570,9 @@ impl QueryExecutor {
             let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
             });
-            let line_ends_statement = sql_text::line_ends_with_semicolon_before_inline_comment(
-                trimmed,
-            ) && semicolon_closes_active_query_frame;
+            let line_ends_statement =
+                sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
+                    && semicolon_closes_active_query_frame;
 
             if current_line_is_mysql_on_duplicate_key_update {
                 mysql_on_duplicate_key_update_active = true;
@@ -22142,6 +22144,85 @@ END;"#;
         assert_eq!(
             contexts[after_idx].auto_depth, contexts[owner_idx].auto_depth,
             "line after the second call close should return to the assignment owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_ignore_backtick_parens_inside_non_query_argument_list() {
+        let sql_with_backtick_paren = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        `field(`,
+        1
+    );
+    v_after := 0;
+END;"#;
+        let sql_with_plain_backtick = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        `field`,
+        1
+    );
+    v_after := 0;
+END;"#;
+
+        let contexts_with_backtick_paren =
+            QueryExecutor::auto_format_line_contexts(sql_with_backtick_paren);
+        let contexts_with_plain_backtick =
+            QueryExecutor::auto_format_line_contexts(sql_with_plain_backtick);
+        let lines_with_backtick_paren: Vec<&str> = sql_with_backtick_paren.lines().collect();
+        let lines_with_plain_backtick: Vec<&str> = sql_with_plain_backtick.lines().collect();
+
+        let owner_idx_with_backtick_paren = lines_with_backtick_paren
+            .iter()
+            .position(|line| line.trim_start() == "v_payload := JSON_OBJECT(")
+            .unwrap_or(0);
+        let owner_idx_with_plain_backtick = lines_with_plain_backtick
+            .iter()
+            .position(|line| line.trim_start() == "v_payload := JSON_OBJECT(")
+            .unwrap_or(0);
+        let backtick_arg_idx_with_backtick_paren = lines_with_backtick_paren
+            .iter()
+            .position(|line| line.trim_start() == "`field(`,")
+            .unwrap_or(0);
+        let backtick_arg_idx_with_plain_backtick = lines_with_plain_backtick
+            .iter()
+            .position(|line| line.trim_start() == "`field`,")
+            .unwrap_or(0);
+        let sibling_arg_idx_with_backtick_paren = lines_with_backtick_paren
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+        let sibling_arg_idx_with_plain_backtick = lines_with_plain_backtick
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+        let after_idx_with_backtick_paren = lines_with_backtick_paren
+            .iter()
+            .position(|line| line.trim_start() == "v_after := 0;")
+            .unwrap_or(0);
+        let after_idx_with_plain_backtick = lines_with_plain_backtick
+            .iter()
+            .position(|line| line.trim_start() == "v_after := 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts_with_backtick_paren[owner_idx_with_backtick_paren].auto_depth,
+            contexts_with_plain_backtick[owner_idx_with_plain_backtick].auto_depth,
+            "owner line depth should stay identical regardless of backtick contents"
+        );
+        assert_eq!(
+            contexts_with_backtick_paren[backtick_arg_idx_with_backtick_paren].auto_depth,
+            contexts_with_plain_backtick[backtick_arg_idx_with_plain_backtick].auto_depth,
+            "backtick-quoted identifier contents should not change argument-line depth"
+        );
+        assert_eq!(
+            contexts_with_backtick_paren[sibling_arg_idx_with_backtick_paren].auto_depth,
+            contexts_with_plain_backtick[sibling_arg_idx_with_plain_backtick].auto_depth,
+            "paren characters inside backtick-quoted identifiers must not affect sibling argument depth"
+        );
+        assert_eq!(
+            contexts_with_backtick_paren[after_idx_with_backtick_paren].auto_depth,
+            contexts_with_plain_backtick[after_idx_with_plain_backtick].auto_depth,
+            "after owner close, following sibling statement depth should remain unchanged"
         );
     }
 }

@@ -5561,6 +5561,7 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
     let mut profile = SignificantParenProfile::default();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    let mut in_backtick_quote = false;
     let mut in_block_comment = false;
     let mut q_quote_end: Option<u8> = None;
     let mut still_in_leading_close_run = true;
@@ -5613,6 +5614,18 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
             continue;
         }
 
+        if in_backtick_quote {
+            if current == b'`' {
+                if next == Some(b'`') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_backtick_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
         if sql_line_comment_prefix_len(bytes, idx).is_some() {
             break;
         }
@@ -5652,6 +5665,12 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
         }
         if current == b'"' {
             in_double_quote = true;
+            still_in_leading_close_run = false;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'`' {
+            in_backtick_quote = true;
             still_in_leading_close_run = false;
             idx = idx.saturating_add(1);
             continue;
@@ -6878,6 +6897,17 @@ mod tests {
                 SignificantParenEvent::Open,
                 SignificantParenEvent::Close,
             ]
+        );
+    }
+
+    #[test]
+    fn significant_paren_profile_ignores_mysql_backtick_quoted_identifier_parens() {
+        let profile = significant_paren_profile("`raw(` + `tail)` + (expr)");
+
+        assert_eq!(profile.leading_close_count, 0);
+        assert_eq!(
+            profile.events,
+            vec![SignificantParenEvent::Open, SignificantParenEvent::Close]
         );
     }
 
