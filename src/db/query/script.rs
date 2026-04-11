@@ -92,7 +92,9 @@ pub(crate) struct AutoFormatLineContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AutoFormatSubqueryParenKind {
     NonSubquery,
+    NonSubqueryFromConsumer,
     Pending,
+    PendingFromConsumer,
     Subquery,
 }
 
@@ -1794,6 +1796,46 @@ impl QueryExecutor {
             idx
         }
 
+        fn previous_meaningful_word_range_before_byte(
+            bytes: &[u8],
+            mut idx: usize,
+        ) -> Option<(usize, usize)> {
+            loop {
+                while idx > 0 && bytes[idx.saturating_sub(1)].is_ascii_whitespace() {
+                    idx = idx.saturating_sub(1);
+                }
+
+                if idx >= 2 && bytes[idx.saturating_sub(1)] == b'/' && bytes[idx - 2] == b'*' {
+                    idx = idx.saturating_sub(2);
+                    while idx >= 2 {
+                        if bytes[idx.saturating_sub(2)] == b'/' && bytes[idx - 1] == b'*' {
+                            idx = idx.saturating_sub(2);
+                            break;
+                        }
+                        idx = idx.saturating_sub(1);
+                    }
+                    continue;
+                }
+
+                let end = idx;
+                while idx > 0 && sql_text::is_identifier_byte(bytes[idx.saturating_sub(1)]) {
+                    idx = idx.saturating_sub(1);
+                }
+
+                if idx < end {
+                    return Some((idx, end));
+                }
+
+                return None;
+            }
+        }
+
+        fn paren_opens_from_consuming_function(bytes: &[u8], open_paren_idx: usize) -> bool {
+            previous_meaningful_word_range_before_byte(bytes, open_paren_idx)
+                .and_then(|(start, end)| std::str::from_utf8(bytes.get(start..end)?).ok())
+                .is_some_and(sql_text::is_from_consuming_function)
+        }
+
         fn resolve_pending_auto_format_subquery_parens(
             paren_stack: &mut [AutoFormatSubqueryParenKind],
             pending_count: &mut usize,
@@ -1814,9 +1856,15 @@ impl QueryExecutor {
                 if unresolved == 0 {
                     break;
                 }
-                if *paren_kind == AutoFormatSubqueryParenKind::Pending {
+                if matches!(
+                    *paren_kind,
+                    AutoFormatSubqueryParenKind::Pending
+                        | AutoFormatSubqueryParenKind::PendingFromConsumer
+                ) {
                     *paren_kind = if promote_to_subquery {
                         AutoFormatSubqueryParenKind::Subquery
+                    } else if *paren_kind == AutoFormatSubqueryParenKind::PendingFromConsumer {
+                        AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
                     } else {
                         AutoFormatSubqueryParenKind::NonSubquery
                     };
@@ -1837,7 +1885,9 @@ impl QueryExecutor {
                     matches!(
                         kind,
                         AutoFormatSubqueryParenKind::NonSubquery
+                            | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
                             | AutoFormatSubqueryParenKind::Pending
+                            | AutoFormatSubqueryParenKind::PendingFromConsumer
                     )
                 })
                 .count();
@@ -1845,7 +1895,10 @@ impl QueryExecutor {
             for kind in paren_stack.iter().rev().take(leading_close_count) {
                 if matches!(
                     kind,
-                    AutoFormatSubqueryParenKind::NonSubquery | AutoFormatSubqueryParenKind::Pending
+                    AutoFormatSubqueryParenKind::NonSubquery
+                        | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                        | AutoFormatSubqueryParenKind::Pending
+                        | AutoFormatSubqueryParenKind::PendingFromConsumer
                 ) {
                     non_subquery_depth = non_subquery_depth.saturating_sub(1);
                 }
@@ -1866,7 +1919,26 @@ impl QueryExecutor {
             }
             paren_stack
                 .get(remaining_len - 1)
-                .is_some_and(|paren_kind| *paren_kind == AutoFormatSubqueryParenKind::NonSubquery)
+                .is_some_and(|paren_kind| {
+                    matches!(
+                        *paren_kind,
+                        AutoFormatSubqueryParenKind::NonSubquery
+                            | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                    )
+                })
+        }
+
+        fn inside_from_consuming_non_subquery_paren_context_after_leading_closes(
+            paren_stack: &[AutoFormatSubqueryParenKind],
+            leading_close_count: usize,
+        ) -> bool {
+            let remaining_len = paren_stack.len().saturating_sub(leading_close_count);
+            if remaining_len == 0 {
+                return false;
+            }
+            paren_stack.get(remaining_len - 1).is_some_and(|paren_kind| {
+                *paren_kind == AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+            })
         }
 
         let parser_depths = Self::line_block_depths(sql);
@@ -2092,6 +2164,11 @@ impl QueryExecutor {
                     &auto_format_subquery_paren_stack,
                     leading_significant_close_count,
                 );
+            let inside_from_consuming_non_subquery_paren_context =
+                inside_from_consuming_non_subquery_paren_context_after_leading_closes(
+                    &auto_format_subquery_paren_stack,
+                    leading_significant_close_count,
+                );
             let non_subquery_depth_since_query = non_subquery_paren_depth_after_leading_closes
                 .saturating_sub(
                     query_frames
@@ -2099,9 +2176,23 @@ impl QueryExecutor {
                         .map(|frame| frame.non_subquery_paren_depth_at_start)
                         .unwrap_or(0),
                 );
-            let suppress_non_subquery_paren_clause_start = inside_non_subquery_paren_context
-                && non_subquery_depth_since_query > 0
-                && sql_text::is_non_subquery_paren_suppressed_clause_start(clause_detection_upper);
+            let inside_function_local_non_subquery_paren = inside_non_subquery_paren_context
+                && non_subquery_depth_since_query > 0;
+            let suppress_function_local_from_clause_start =
+                inside_function_local_non_subquery_paren
+                    && inside_from_consuming_non_subquery_paren_context
+                    // Function-local `FROM` is only safe to suppress for
+                    // dedicated FROM-consuming function families. Generic
+                    // non-subquery parens can still appear around real query
+                    // clauses later in the same statement, so they must not
+                    // blanket-suppress `FROM`.
+                    && sql_text::starts_with_keyword_token(clause_detection_upper, "FROM");
+            let suppress_non_subquery_paren_clause_start =
+                inside_function_local_non_subquery_paren
+                    && (suppress_function_local_from_clause_start
+                        || sql_text::is_non_subquery_paren_suppressed_clause_start(
+                            clause_detection_upper,
+                        ));
             let current_line_starts_elsif =
                 sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
@@ -3596,7 +3687,13 @@ impl QueryExecutor {
                         let lookahead =
                             skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
                         let mut word_end = lookahead;
-                        let mut paren_kind = AutoFormatSubqueryParenKind::NonSubquery;
+                        let opens_from_consuming_function =
+                            paren_opens_from_consuming_function(bytes, byte_idx);
+                        let mut paren_kind = if opens_from_consuming_function {
+                            AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                        } else {
+                            AutoFormatSubqueryParenKind::NonSubquery
+                        };
 
                         while word_end < bytes.len()
                             && (bytes[word_end].is_ascii_alphanumeric() || bytes[word_end] == b'_')
@@ -3616,7 +3713,11 @@ impl QueryExecutor {
                                 && lookahead + 1 < bytes.len()
                                 && bytes[lookahead + 1] == b'*')
                         {
-                            paren_kind = AutoFormatSubqueryParenKind::Pending;
+                            paren_kind = if opens_from_consuming_function {
+                                AutoFormatSubqueryParenKind::PendingFromConsumer
+                            } else {
+                                AutoFormatSubqueryParenKind::Pending
+                            };
                             pending_auto_format_subquery_paren_count =
                                 pending_auto_format_subquery_paren_count.saturating_add(1);
                         }
@@ -3624,7 +3725,11 @@ impl QueryExecutor {
                         auto_format_subquery_paren_stack.push(paren_kind);
                     } else if symbol == b')' {
                         if let Some(closed_kind) = auto_format_subquery_paren_stack.pop() {
-                            if closed_kind == AutoFormatSubqueryParenKind::Pending {
+                            if matches!(
+                                closed_kind,
+                                AutoFormatSubqueryParenKind::Pending
+                                    | AutoFormatSubqueryParenKind::PendingFromConsumer
+                            ) {
                                 pending_auto_format_subquery_paren_count =
                                     pending_auto_format_subquery_paren_count.saturating_sub(1);
                             }
@@ -21249,6 +21354,138 @@ FROM emp_json e;"#;
         assert!(
             contexts[from_idx].auto_depth < contexts[json_query_idx].auto_depth,
             "outer FROM should clear the carried SELECT-list depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_function_local_extract_from_non_structural() {
+        let sql = r#"SELECT
+    EXTRACT (
+        YEAR
+        FROM e.hire_date
+    ) AS hire_year,
+    e.empno
+FROM emp e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let extract_idx = find_line_starting_with("EXTRACT (");
+        let function_from_idx = find_line_starting_with("FROM e.hire_date");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let query_from_idx = find_line_starting_with("FROM emp e;");
+
+        assert_eq!(
+            contexts[function_from_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "function-local FROM inside EXTRACT should stay non-structural"
+        );
+        assert_ne!(
+            contexts[function_from_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "function-local FROM inside EXTRACT must not reopen a query-base frame"
+        );
+        assert!(
+            contexts[function_from_idx].auto_depth > contexts[query_from_idx].auto_depth,
+            "function-local FROM inside EXTRACT should stay inside the function paren frame"
+        );
+        assert_eq!(
+            contexts[sibling_idx].auto_depth, contexts[extract_idx].auto_depth,
+            "SELECT-list sibling after multiline EXTRACT should return to the sibling item depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_function_local_trim_from_non_structural() {
+        let sql = r#"SELECT
+    TRIM (
+        LEADING '0'
+        FROM e.emp_code
+    ) AS normalized_code,
+    e.empno
+FROM emp e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let trim_idx = find_line_starting_with("TRIM (");
+        let function_from_idx = find_line_starting_with("FROM e.emp_code");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let query_from_idx = find_line_starting_with("FROM emp e;");
+
+        assert_eq!(
+            contexts[function_from_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "function-local FROM inside TRIM should stay non-structural"
+        );
+        assert_ne!(
+            contexts[function_from_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "function-local FROM inside TRIM must not reopen a query-base frame"
+        );
+        assert!(
+            contexts[function_from_idx].auto_depth > contexts[query_from_idx].auto_depth,
+            "function-local FROM inside TRIM should stay inside the function paren frame"
+        );
+        assert_eq!(
+            contexts[sibling_idx].auto_depth, contexts[trim_idx].auto_depth,
+            "SELECT-list sibling after multiline TRIM should return to the sibling item depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_child_query_from_structural_inside_function_call() {
+        let sql = r#"SELECT
+    TO_CHAR (
+        (
+            SELECT MAX (e.salary)
+            FROM emp e
+        )
+    ) AS max_sal
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let child_select_idx = find_line_starting_with("SELECT MAX (e.salary)");
+        let child_from_idx = find_line_starting_with("FROM emp e");
+        let outer_from_idx = find_line_starting_with("FROM dual;");
+
+        assert_eq!(
+            contexts[child_from_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::From),
+            "real child-query FROM inside function-call parens must remain a structural clause"
+        );
+        assert_eq!(
+            contexts[child_from_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "real child-query FROM inside function-call parens must stay on the child query base"
+        );
+        assert_eq!(
+            contexts[child_from_idx].auto_depth, contexts[child_select_idx].auto_depth,
+            "child-query FROM inside function-call parens should stay aligned with its SELECT head"
+        );
+        assert!(
+            contexts[outer_from_idx].auto_depth < contexts[child_from_idx].auto_depth,
+            "outer FROM should still return to the surrounding query base after the child query closes"
         );
     }
 

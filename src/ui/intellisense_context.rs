@@ -401,10 +401,7 @@ pub(crate) fn analyze_cursor_context(
 /// the function call rather than a SQL clause (e.g. `EXTRACT(YEAR FROM ...)`,
 /// `TRIM(LEADING '0' FROM ...)`, `SUBSTRING(col FROM ...)`).
 fn is_from_consuming_function(name: &str) -> bool {
-    matches!(
-        name,
-        "EXTRACT" | "TRIM" | "SUBSTRING" | "OVERLAY" | "POSITION" | "NORMALIZE" | "TRIM_ARRAY"
-    )
+    sql_text::is_from_consuming_function(name)
 }
 
 /// FROM-clause table functions that may reference left-side row source aliases

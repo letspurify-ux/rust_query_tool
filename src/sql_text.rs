@@ -3389,6 +3389,15 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
         .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
+/// Returns true for functions whose syntax consumes `FROM` inside the
+/// function call rather than starting a SQL `FROM` clause.
+pub(crate) fn is_from_consuming_function(name: &str) -> bool {
+    matches!(
+        name,
+        "EXTRACT" | "TRIM" | "SUBSTRING" | "OVERLAY" | "POSITION" | "NORMALIZE" | "TRIM_ARRAY"
+    )
+}
+
 /// Function-local clause starters can appear inside ordinary parenthesized
 /// expressions (`JSON_QUERY(... WITH WRAPPER)`,
 /// `JSON_VALUE(... RETURNING VARCHAR2 (...))`,
@@ -6838,6 +6847,26 @@ mod tests {
         assert!(!is_non_subquery_paren_suppressed_clause_start(
             "WHERE emp_id = 1"
         ));
+    }
+
+    #[test]
+    fn from_consuming_function_helper_tracks_shared_function_families() {
+        for function_name in [
+            "EXTRACT",
+            "TRIM",
+            "SUBSTRING",
+            "OVERLAY",
+            "POSITION",
+            "NORMALIZE",
+            "TRIM_ARRAY",
+        ] {
+            assert!(
+                is_from_consuming_function(function_name),
+                "{function_name} should keep FROM inside function-local syntax"
+            );
+        }
+        assert!(!is_from_consuming_function("XMLCAST"));
+        assert!(!is_from_consuming_function("JSON_VALUE"));
     }
 
     #[test]
