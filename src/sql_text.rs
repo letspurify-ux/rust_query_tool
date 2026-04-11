@@ -3389,14 +3389,16 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
         .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
-/// Function-local clause words can appear inside ordinary parenthesized
+/// Function-local clause starters can appear inside ordinary parenthesized
 /// expressions (`JSON_QUERY(... WITH WRAPPER)`,
-/// `JSON_VALUE(... RETURNING VARCHAR2 (...))`) without introducing a new
-/// query/layout clause anchor.
-pub(crate) fn is_non_subquery_paren_suppressed_layout_clause(text_upper: &str) -> bool {
-    ["RETURNING", "WITH"]
+/// `JSON_VALUE(... RETURNING VARCHAR2 (...))`,
+/// `JSON_TRANSFORM(... SET ..., INSERT ...)`) without introducing a new
+/// structural clause anchor or clause-break family.
+pub(crate) fn is_non_subquery_paren_suppressed_clause_start(text_upper: &str) -> bool {
+    let sequences: &[&[&str]] = &[&["RETURNING"], &["WITH"], &["SET"], &["INSERT"]];
+    sequences
         .iter()
-        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
+        .any(|sequence| line_starts_with_identifier_sequence(text_upper, sequence))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6817,17 +6819,23 @@ mod tests {
     }
 
     #[test]
-    fn non_subquery_paren_suppressed_layout_clause_covers_function_internal_clauses() {
-        assert!(is_non_subquery_paren_suppressed_layout_clause(
+    fn non_subquery_paren_suppressed_clause_start_covers_function_internal_clauses() {
+        assert!(is_non_subquery_paren_suppressed_clause_start(
             "RETURNING VARCHAR2 (30))"
         ));
-        assert!(is_non_subquery_paren_suppressed_layout_clause(
+        assert!(is_non_subquery_paren_suppressed_clause_start(
             "WITH WRAPPER"
         ));
-        assert!(!is_non_subquery_paren_suppressed_layout_clause(
+        assert!(is_non_subquery_paren_suppressed_clause_start(
+            "SET '$.status' = 'DONE'"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_start(
+            "INSERT '$.audit.user' = USER"
+        ));
+        assert!(!is_non_subquery_paren_suppressed_clause_start(
             "FROM hire_date"
         ));
-        assert!(!is_non_subquery_paren_suppressed_layout_clause(
+        assert!(!is_non_subquery_paren_suppressed_clause_start(
             "WHERE emp_id = 1"
         ));
     }

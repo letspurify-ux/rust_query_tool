@@ -1041,10 +1041,14 @@ impl ConstructState {
         {
             return true;
         }
-        // Non-subquery paren context: suppress function-local options
+        // Non-subquery paren context: suppress function-local clause starters.
+        // `FROM` stays local to the formatter because the active paren stack
+        // tells us when EXTRACT-style bodies are safe to keep inline without
+        // hiding real query `FROM` clauses from the analyzer.
         if suppress_comma_break_depth > 0
             && !has_subquery_in_paren_stack
-            && matches!(keyword, "FROM" | "RETURNING" | "WITH")
+            && (keyword == "FROM"
+                || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword))
         {
             return true;
         }
@@ -24400,6 +24404,135 @@ FROM emp_json e;"#;
             formatted, formatted_again,
             "JSON_VALUE RETURNING ON ERROR formatting should be idempotent, got:\n{}",
             formatted_again
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_multiline_json_value_on_empty_and_error_inside_function_parens(
+    ) {
+        let source = r#"SELECT
+    JSON_VALUE (
+        e.payload, '$.name' -- json path
+        RETURNING VARCHAR2 (30)
+        NULL ON EMPTY -- missing path
+        NULL ON ERROR
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let function_returning_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RETURNING VARCHAR2 (30)"))
+            .unwrap_or_else(|| panic!("JSON_VALUE RETURNING option line, got:\n{}", formatted));
+        let function_on_error_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("NULL ON ERROR"))
+            .unwrap_or_else(|| panic!("JSON_VALUE ON ERROR option line, got:\n{}", formatted));
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| panic!("SELECT-list sibling after JSON_VALUE, got:\n{}", formatted));
+        let query_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        assert!(
+            formatted.contains("NULL ON EMPTY"),
+            "JSON_VALUE ON EMPTY option should remain inside the function call, got:\n{}",
+            formatted
+        );
+        for option_idx in [function_returning_idx, function_on_error_idx] {
+            assert!(
+                indent(lines[option_idx]) > indent(lines[query_from_idx]),
+                "function-local JSON_VALUE option line should not be promoted to outer clause depth, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[query_from_idx]).saturating_add(4),
+            "SELECT-list sibling after multiline JSON_VALUE options should return to list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "multiline JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_multiline_json_transform_operations_inside_function_parens()
+    {
+        let source = r#"SELECT
+    JSON_TRANSFORM (
+        e.payload, -- source json
+        INSERT '$.audit.user' = USER, -- audit stamp
+        SET '$.status' = 'DONE'
+    ) AS payload2,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let function_set_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SET '$.status' = 'DONE',"))
+            .or_else(|| {
+                lines
+                    .iter()
+                    .position(|line| line.trim_start().starts_with("SET '$.status' = 'DONE'"))
+            })
+            .unwrap_or_else(|| panic!("JSON_TRANSFORM SET option line, got:\n{}", formatted));
+        let function_insert_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("INSERT '$.audit.user' = USER,")
+            })
+            .or_else(|| {
+                lines.iter().position(|line| {
+                    line.trim_start()
+                        .starts_with("INSERT '$.audit.user' = USER")
+                })
+            })
+            .unwrap_or_else(|| panic!("JSON_TRANSFORM INSERT option line, got:\n{}", formatted));
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| {
+                panic!(
+                    "SELECT-list sibling after JSON_TRANSFORM, got:\n{}",
+                    formatted
+                )
+            });
+        let query_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        for option_idx in [function_set_idx, function_insert_idx] {
+            assert!(
+                indent(lines[option_idx]) > indent(lines[query_from_idx]),
+                "function-local JSON_TRANSFORM operation line should not be promoted to outer clause depth, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[query_from_idx]).saturating_add(4),
+            "SELECT-list sibling after multiline JSON_TRANSFORM should return to list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "multiline JSON_TRANSFORM auto-formatting should be idempotent"
         );
     }
 

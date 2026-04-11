@@ -2099,9 +2099,9 @@ impl QueryExecutor {
                         .map(|frame| frame.non_subquery_paren_depth_at_start)
                         .unwrap_or(0),
                 );
-            let suppress_non_subquery_paren_layout_clause = inside_non_subquery_paren_context
+            let suppress_non_subquery_paren_clause_start = inside_non_subquery_paren_context
                 && non_subquery_depth_since_query > 0
-                && sql_text::is_non_subquery_paren_suppressed_layout_clause(clause_detection_upper);
+                && sql_text::is_non_subquery_paren_suppressed_clause_start(clause_detection_upper);
             let current_line_starts_elsif =
                 sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
@@ -2140,7 +2140,7 @@ impl QueryExecutor {
                 && !current_line_starts_end_keyword;
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
-            let clause_kind = if suppress_non_subquery_paren_layout_clause
+            let clause_kind = if suppress_non_subquery_paren_clause_start
                 || current_line_is_mysql_on_duplicate_values_function
             {
                 None
@@ -2217,12 +2217,12 @@ impl QueryExecutor {
                 .get(idx)
                 .copied()
                 .unwrap_or(false);
-            let blocks_structural_line_continuation = ((!suppress_non_subquery_paren_layout_clause
+            let blocks_structural_line_continuation = ((!suppress_non_subquery_paren_clause_start
                 && sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
                     clause_detection_trimmed,
                 ))
                 || (leading_close_has_mixed_continuation
-                    && !suppress_non_subquery_paren_layout_clause
+                    && !suppress_non_subquery_paren_clause_start
                     && sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
                         clause_detection_trimmed,
                     )))
@@ -2847,7 +2847,7 @@ impl QueryExecutor {
                 }
             }
 
-            if suppress_non_subquery_paren_layout_clause {
+            if suppress_non_subquery_paren_clause_start {
                 // Non-structural function-local clause words (for example
                 // `RETURNING` inside `JSON_VALUE (...)`) must keep the active
                 // ordinary-paren frame depth instead of dropping back to the
@@ -3430,7 +3430,7 @@ impl QueryExecutor {
             let suppress_structural_line_continuation_for_on_duplicate_values_comma =
                 current_line_is_mysql_on_duplicate_values_function
                     && Self::line_ends_with_comma_before_inline_comment(trimmed);
-            pending_line_continuation = if suppress_non_subquery_paren_layout_clause {
+            pending_line_continuation = if suppress_non_subquery_paren_clause_start {
                 // Function-local clause words inside ordinary parens (for example
                 // `RETURNING VARCHAR2 (`) should not open structural header carry,
                 // but same-line/non-leading paren events still must propagate to
@@ -3483,8 +3483,7 @@ impl QueryExecutor {
             } else {
                 None
             };
-            pending_inline_comment_line_continuation = if suppress_non_subquery_paren_layout_clause
-            {
+            pending_inline_comment_line_continuation = if suppress_non_subquery_paren_clause_start {
                 None
             } else {
                 Self::inline_comment_line_continuation_for_line(
