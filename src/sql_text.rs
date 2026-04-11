@@ -3389,12 +3389,14 @@ pub(crate) fn starts_with_format_layout_clause(text_upper: &str) -> bool {
         .any(|keyword| line_starts_with_identifier_sequence(text_upper, &[*keyword]))
 }
 
-/// Function-local `RETURNING` can appear inside ordinary parenthesized
-/// expressions (`JSON_VALUE(... RETURNING VARCHAR2 (...))`,
-/// `XMLQUERY(... RETURNING CONTENT)`) without introducing a new query/layout
-/// clause anchor.
+/// Function-local clause words can appear inside ordinary parenthesized
+/// expressions (`JSON_QUERY(... WITH WRAPPER)`,
+/// `JSON_VALUE(... RETURNING VARCHAR2 (...))`) without introducing a new
+/// query/layout clause anchor.
 pub(crate) fn is_non_subquery_paren_suppressed_layout_clause(text_upper: &str) -> bool {
-    starts_with_keyword_token(text_upper, "RETURNING")
+    ["RETURNING", "WITH"]
+        .iter()
+        .any(|keyword| starts_with_keyword_token(text_upper, keyword))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6815,9 +6817,12 @@ mod tests {
     }
 
     #[test]
-    fn non_subquery_paren_suppressed_layout_clause_covers_function_internal_returning() {
+    fn non_subquery_paren_suppressed_layout_clause_covers_function_internal_clauses() {
         assert!(is_non_subquery_paren_suppressed_layout_clause(
             "RETURNING VARCHAR2 (30))"
+        ));
+        assert!(is_non_subquery_paren_suppressed_layout_clause(
+            "WITH WRAPPER"
         ));
         assert!(!is_non_subquery_paren_suppressed_layout_clause(
             "FROM hire_date"

@@ -263,6 +263,7 @@ struct QueryBaseDepthFrame {
     query_base_depth: usize,
     close_align_depth: usize,
     start_parser_depth: usize,
+    non_subquery_paren_depth_at_start: usize,
     head_kind: Option<AutoFormatClauseKind>,
     with_main_query_started: bool,
     pending_same_depth_set_operator_head: bool,
@@ -2081,12 +2082,25 @@ impl QueryExecutor {
                 .flatten();
             let current_line_starts_mysql_handler_declare = current_line_mysql_declare_owner_kind
                 == Some(sql_text::MySqlDeclareOwnerKind::HandlerFor);
+            let non_subquery_paren_depth_after_leading_closes =
+                non_subquery_paren_frame_depth_after_leading_closes(
+                    &auto_format_subquery_paren_stack,
+                    leading_significant_close_count,
+                );
             let inside_non_subquery_paren_context =
                 inside_non_subquery_paren_context_after_leading_closes(
                     &auto_format_subquery_paren_stack,
                     leading_significant_close_count,
                 );
+            let non_subquery_depth_since_query = non_subquery_paren_depth_after_leading_closes
+                .saturating_sub(
+                    query_frames
+                        .last()
+                        .map(|frame| frame.non_subquery_paren_depth_at_start)
+                        .unwrap_or(0),
+                );
             let suppress_non_subquery_paren_layout_clause = inside_non_subquery_paren_context
+                && non_subquery_depth_since_query > 0
                 && sql_text::is_non_subquery_paren_suppressed_layout_clause(clause_detection_upper);
             let current_line_starts_elsif =
                 sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
@@ -2305,6 +2319,8 @@ impl QueryExecutor {
                     query_base_depth,
                     close_align_depth,
                     start_parser_depth: parser_depth,
+                    non_subquery_paren_depth_at_start:
+                        non_subquery_paren_depth_after_leading_closes,
                     head_kind: clause_kind,
                     with_main_query_started: clause_kind != Some(AutoFormatClauseKind::With),
                     pending_same_depth_set_operator_head: false,
@@ -2812,13 +2828,8 @@ impl QueryExecutor {
                 if let Some(close_align_depth) = closing_query_close_align_depth {
                     context.auto_depth = close_align_depth;
                 } else {
-                    let non_subquery_paren_depth_after_closes =
-                        non_subquery_paren_frame_depth_after_leading_closes(
-                            &auto_format_subquery_paren_stack,
-                            leading_significant_close_count,
-                        );
                     context.auto_depth =
-                        parser_depth.saturating_add(non_subquery_paren_depth_after_closes);
+                        parser_depth.saturating_add(non_subquery_paren_depth_after_leading_closes);
                 }
             }
 
@@ -2842,13 +2853,9 @@ impl QueryExecutor {
                 // ordinary-paren frame depth instead of dropping back to the
                 // parser/query base when no lexical continuation keyword is
                 // present on the previous line.
-                let non_subquery_paren_depth = non_subquery_paren_frame_depth_after_leading_closes(
-                    &auto_format_subquery_paren_stack,
-                    leading_significant_close_count,
+                context.auto_depth = context.auto_depth.max(
+                    parser_depth.saturating_add(non_subquery_paren_depth_after_leading_closes),
                 );
-                context.auto_depth = context
-                    .auto_depth
-                    .max(parser_depth.saturating_add(non_subquery_paren_depth));
             }
 
             if let Some(frame) = pending_split_query_owner_for_line {
@@ -21189,6 +21196,60 @@ FROM qt_fmt_emp e;"#;
         assert!(
             contexts[from_idx].auto_depth < contexts[precision_idx].auto_depth,
             "FROM must not inherit function-local RETURNING type frame depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_function_local_with_wrapper_non_structural() {
+        let sql = r#"SELECT
+    JSON_QUERY (
+        e.payload,
+        '$.items[*]'
+        WITH WRAPPER
+    ) AS items_json,
+    e.empno
+FROM emp_json e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let json_query_idx = find_line_starting_with("JSON_QUERY (");
+        let with_idx = find_line_starting_with("WITH WRAPPER");
+        let close_idx = find_line_starting_with(") AS items_json,");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM emp_json e;");
+
+        assert_eq!(
+            contexts[with_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "function-local WITH inside JSON_QUERY should stay non-structural"
+        );
+        assert_ne!(
+            contexts[with_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "function-local WITH inside JSON_QUERY must not reopen a query-base frame"
+        );
+        assert!(
+            contexts[with_idx].auto_depth > contexts[from_idx].auto_depth,
+            "function-local WITH should stay inside the JSON_QUERY paren frame"
+        );
+        assert_eq!(
+            contexts[close_idx].auto_depth, contexts[json_query_idx].auto_depth,
+            "JSON_QUERY close line should return to the function call owner depth"
+        );
+        assert_eq!(
+            contexts[sibling_idx].auto_depth, contexts[json_query_idx].auto_depth,
+            "SELECT-list sibling after JSON_QUERY should return to list depth"
+        );
+        assert!(
+            contexts[from_idx].auto_depth < contexts[json_query_idx].auto_depth,
+            "outer FROM should clear the carried SELECT-list depth"
         );
     }
 

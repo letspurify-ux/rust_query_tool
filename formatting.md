@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-11 (괄호 frame 계산도 token-order 적용 원칙으로 명시)
+> 최종 업데이트: 2026-04-11 (괄호 frame 계산 및 function-local option clause의 구조 비승격 원칙으로 명시)
 
 ## 0. 이 문서의 역할
 
@@ -109,7 +109,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - 여기서 `query-base anchor`는 항상 active query frame의 저장 depth와 동일한 값일 필요는 없다. renderer처럼 local formatting context만 가진 caller는 semantic query base를 나타내는 synthetic anchor를 전달할 수 있어야 하며, resolver는 그 차이를 이름과 계약 수준에서 드러내야 한다.
 - renderer/helper wrapper도 이 세 anchor를 하나의 `base indent`로 뭉개면 안 된다. exact bare owner/header family(`REFERENCE`, `WITHIN GROUP`, deferred-wrapper owner 등)에서 `SameDepth`는 현재 owner/header line depth를 써야 하고, clause family(`WHERE`, `FOR UPDATE` 등)의 `query-base+1`만 semantic query base anchor를 써야 한다.
 - raw previous/last-word 기반 continuation helper는 독립 구조가 아니라 residual lexical classifier일 뿐이다. exact bare owner/header/pending classifier가 semantic family를 이미 판정한 line(`AFTER MATCH SKIP -- ...`, `DENSE_RANK LAST -- ...`, `INNER JOIN -- ...` 등)에서는 이 residual classifier가 depth를 다시 결정하면 안 된다.
-- non-subquery 일반 괄호 내부의 function-local `RETURNING`은 구조 clause가 아니다. `JSON_VALUE(... RETURNING VARCHAR2 (...))`, `XMLQUERY(... RETURNING CONTENT)` 같은 line은 function-local option으로만 해석해야 하며, analyzer/query-role/structural-boundary/header-carry helper 중 한 phase라도 이를 top-level clause로 승격하면 다음 sibling list item까지 잘못된 carry가 누수된다.
+- non-subquery 일반 괄호 내부의 function-local option clause는 구조 clause가 아니다. `JSON_VALUE(... RETURNING VARCHAR2 (...))`, `XMLQUERY(... RETURNING CONTENT)`, `JSON_QUERY(... WITH WRAPPER)` 같은 line은 function-local option으로만 해석해야 하며, analyzer/query-role/structural-boundary/header-carry helper 중 한 phase라도 이를 top-level clause로 승격하면 다음 sibling list item까지 잘못된 carry가 누수된다. 단, `FROM`은 scalar subquery 내부에서 실제 구조 clause가 될 수 있으므로 blanket suppress 대상이 아니다.
 
 ### 1.7 formatter output은 canonical하고 idempotent해야 한다
 

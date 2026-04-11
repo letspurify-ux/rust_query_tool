@@ -18452,6 +18452,50 @@ FROM"
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_multiline_extract_from_inside_function_parens() {
+        let source = r#"SELECT
+    EXTRACT (
+        YEAR -- date part
+        FROM d.dt
+    ) AS yyyy,
+    d.empno
+FROM dual d;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let function_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM d.dt"))
+            .unwrap_or_else(|| panic!("EXTRACT FROM option line, got:\n{}", formatted));
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "d.empno")
+            .unwrap_or_else(|| panic!("SELECT-list sibling after EXTRACT, got:\n{}", formatted));
+        let query_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM dual d;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        assert!(
+            indent(lines[function_from_idx]) > indent(lines[query_from_idx]),
+            "function-local FROM should not be promoted to the outer query FROM depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[query_from_idx]).saturating_add(4),
+            "SELECT-list sibling after multiline EXTRACT should return to list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "multiline EXTRACT auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_keeps_json_returning_inline_inside_function() {
         let source =
             "select json_value(e.json_profile, '$.level' returning varchar2(30)) as profile_level from emp e;";
@@ -23966,6 +24010,50 @@ MATCH_RECOGNIZE (
             !formatted.contains("\nWITH WRAPPER"),
             "JSON_QUERY WITH WRAPPER must not be treated as a new WITH clause, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_multiline_json_query_with_inside_function_parens() {
+        let source = r#"SELECT
+    JSON_QUERY (
+        e.payload, '$.items[*]' -- json path
+        WITH WRAPPER
+    ) AS items_json,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let function_with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH WRAPPER"))
+            .unwrap_or_else(|| panic!("JSON_QUERY WITH option line, got:\n{}", formatted));
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "e.empno")
+            .unwrap_or_else(|| panic!("SELECT-list sibling after JSON_QUERY, got:\n{}", formatted));
+        let query_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+
+        assert!(
+            indent(lines[function_with_idx]) > indent(lines[query_from_idx]),
+            "function-local WITH should not be promoted to a query WITH frame, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[query_from_idx]).saturating_add(4),
+            "SELECT-list sibling after multiline JSON_QUERY should return to list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "multiline JSON_QUERY auto-formatting should be idempotent"
         );
     }
 
