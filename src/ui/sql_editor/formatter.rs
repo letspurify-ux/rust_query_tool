@@ -5843,20 +5843,18 @@ impl SqlEditorWidget {
                                 } else {
                                     base_indent(indent_level.saturating_sub(1), open_cursor_state)
                                 }
+                            } else if paren_stack.is_empty() {
+                                top_level_query_body_base_indent
                             } else {
-                                if paren_stack.is_empty() {
-                                    top_level_query_body_base_indent
-                                } else {
-                                    clause_indent(
-                                        indent_level,
-                                        open_cursor_state,
-                                        upper,
-                                        open_cursor_state
-                                            .select_depth()
-                                            .is_some_and(|depth| paren_stack.len() == depth),
-                                        construct.cursor_sql_active.is_active(),
-                                    )
-                                }
+                                clause_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    upper,
+                                    open_cursor_state
+                                        .select_depth()
+                                        .is_some_and(|depth| paren_stack.len() == depth),
+                                    construct.cursor_sql_active.is_active(),
+                                )
                             };
                         let paren_extra = Self::paren_extra_depth(&paren_stack);
                         if construct

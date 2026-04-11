@@ -2621,13 +2621,10 @@ impl QueryExecutor {
                         .saturating_add(frame.multitable_insert_branch_depth);
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
-                } else if current_line_is_bare_direct_from_item_query_owner
-                    && frame.trailing_comma_continuation
+                } else if (current_line_is_bare_direct_from_item_query_owner
+                    && frame.trailing_comma_continuation)
+                    || current_line_is_mixed_leading_close_direct_from_item_query_owner
                 {
-                    context.auto_depth = from_item_list_body_depth;
-                    context.query_role = AutoFormatQueryRole::Continuation;
-                    context.query_base_depth = Some(frame.query_base_depth);
-                } else if current_line_is_mixed_leading_close_direct_from_item_query_owner {
                     context.auto_depth = from_item_list_body_depth;
                     context.query_role = AutoFormatQueryRole::Continuation;
                     context.query_base_depth = Some(frame.query_base_depth);
@@ -3745,8 +3742,8 @@ impl QueryExecutor {
                 // `FROM dual) alias;` can leave multiple closed frames at the
                 // top, so we pop in a loop instead of a single-frame pop.
                 while query_frames.last().is_some_and(|frame| {
-                    !(frame.head_kind == Some(AutoFormatClauseKind::With)
-                        && !frame.with_main_query_started)
+                    frame.head_kind != Some(AutoFormatClauseKind::With)
+                        || frame.with_main_query_started
                 }) {
                     let _ = query_frames.pop();
                 }
@@ -4840,16 +4837,16 @@ impl QueryExecutor {
                 if Self::line_ends_with_then_before_inline_comment(normalized) {
                     return structural_owner_base;
                 }
-                if current_line_query_owner_kind.is_some() {
-                    if structural_owner_base > header_depth || same_line_has_non_leading_close {
-                        // Condition-owned child-query lines such as
-                        // `AND EXISTS (` or `expr ) IN (` must anchor the child
-                        // query from the current owner line's structural frame
-                        // result. Non-leading close-paren events are explicit
-                        // frame pops, so they cannot be collapsed back to the
-                        // older condition header floor.
-                        return structural_owner_base;
-                    }
+                if current_line_query_owner_kind.is_some()
+                    && (structural_owner_base > header_depth || same_line_has_non_leading_close)
+                {
+                    // Condition-owned child-query lines such as
+                    // `AND EXISTS (` or `expr ) IN (` must anchor the child
+                    // query from the current owner line's structural frame
+                    // result. Non-leading close-paren events are explicit
+                    // frame pops, so they cannot be collapsed back to the
+                    // older condition header floor.
+                    return structural_owner_base;
                 }
                 if line_ends_with_open_paren && same_line_has_non_leading_close {
                     // Lines that continue a condition and open the child query
