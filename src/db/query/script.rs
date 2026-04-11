@@ -20048,9 +20048,11 @@ FROM qt_fmt_emp e,
             .map(|(idx, _)| idx)
             .unwrap_or_else(|| panic!("missing standalone COLUMNS open line"));
         let columns_body_idx = find_line_starting_with("grade VARCHAR2 (10) PATH '$.meta.grade'");
-        let header_same_line_open_frames = sql_text::significant_paren_depth_after_profile(
-            0,
-            &sql_text::significant_paren_profile(lines[columns_header_idx]),
+        let header_same_line_open_frames =
+            QueryExecutor::same_line_non_leading_paren_frame_delta(lines[columns_header_idx]);
+        assert_eq!(
+            header_same_line_open_frames, 1,
+            "split COLUMNS header should keep one same-line open-paren frame from JSON_TABLE ("
         );
         let expected_owner_depth = contexts[columns_header_idx]
             .auto_depth
