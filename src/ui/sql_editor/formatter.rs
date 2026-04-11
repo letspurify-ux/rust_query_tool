@@ -4030,7 +4030,10 @@ impl SqlEditorWidget {
             .map_or(statement.len(), |idx| semicolon_start + idx);
         let line = statement[line_start..line_end].trim();
 
-        if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+        if line.starts_with("--")
+            || line.starts_with('#')
+            || Self::is_sqlplus_remark_comment_statement(line)
+        {
             return true;
         }
 
@@ -4064,7 +4067,10 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+            if line.starts_with("--")
+                || line.starts_with('#')
+                || Self::is_sqlplus_remark_comment_statement(line)
+            {
                 rest = rest[line_end..].trim_start();
                 if rest.is_empty() {
                     return true;
@@ -5833,15 +5839,19 @@ impl SqlEditorWidget {
                                     base_indent(indent_level.saturating_sub(1), open_cursor_state)
                                 }
                             } else {
-                                clause_indent(
-                                    indent_level,
-                                    open_cursor_state,
-                                    upper,
-                                    open_cursor_state
-                                        .select_depth()
-                                        .is_some_and(|depth| paren_stack.len() == depth),
-                                    construct.cursor_sql_active.is_active(),
-                                )
+                                if paren_stack.is_empty() {
+                                    top_level_query_body_base_indent
+                                } else {
+                                    clause_indent(
+                                        indent_level,
+                                        open_cursor_state,
+                                        upper,
+                                        open_cursor_state
+                                            .select_depth()
+                                            .is_some_and(|depth| paren_stack.len() == depth),
+                                        construct.cursor_sql_active.is_active(),
+                                    )
+                                }
                             };
                         let paren_extra = Self::paren_extra_depth(&paren_stack);
                         if construct
@@ -15034,6 +15044,20 @@ SELECT 2 FROM dual"
     }
 
     #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_hash_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; # trailing comment"
+        ));
+    }
+
+    #[test]
+    fn source_has_explicit_semicolon_terminator_recognizes_semicolon_before_hash_comment() {
+        assert!(SqlEditorWidget::source_has_explicit_semicolon_terminator(
+            "SELECT 1 FROM dual; # trailing comment"
+        ));
+    }
+
+    #[test]
     fn statement_ends_with_semicolon_recognizes_semicolon_before_slash_and_line_comment() {
         assert!(SqlEditorWidget::statement_ends_with_semicolon(
             "BEGIN\n  NULL;\nEND;\n/\n-- keep"
@@ -15079,6 +15103,30 @@ SELECT 2 FROM dual"
         assert!(
             SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Existing terminator before line comment should remain explicit, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_hash_comment() {
+        let source = "SELECT 1 FROM dual; # keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;"),
+            "Existing semicolon before hash comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("# keep terminator"),
+            "Trailing hash comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing terminator before hash comment should remain explicit, got:\n{}",
             preserved
         );
     }
@@ -22204,6 +22252,100 @@ WHERE (((status = 'A' OR status = 'B')
             indent(lines[on_idx]) + 4,
             "AND after ON should be indented one level deeper than ON, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_create_view_left_join_on_stays_one_frame_deeper_than_join() {
+        let source = r#"CREATE OR REPLACE VIEW v_item_rollup AS
+    SELECT wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points,
+        COUNT(we.event_id) AS event_count,
+        ROUND(COALESCE(SUM(we.delta_hours), 0), 2) AS total_hours,
+        MAX(we.event_at) AS last_event_at
+    FROM work_item wi
+    LEFT JOIN work_event we
+    ON we.item_id = wi.item_id
+    GROUP BY wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let join_idx = find_line_starting_with(&lines, "LEFT JOIN work_event we")
+            .expect("LEFT JOIN work_event we line");
+        let on_idx =
+            find_line_starting_with(&lines, "ON we.item_id = wi.item_id").expect("ON line");
+        let group_by_idx =
+            find_line_starting_with(&lines, "GROUP BY wi.item_id,").expect("GROUP BY line");
+
+        assert_eq!(
+            indent(lines[on_idx]),
+            indent(lines[join_idx]).saturating_add(4),
+            "ON line should stay one frame deeper than LEFT JOIN in CREATE VIEW query body, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[group_by_idx]),
+            indent(lines[join_idx]),
+            "GROUP BY should realign to the FROM/JOIN frame after ON condition closes, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_create_view_left_join_on_stays_one_frame_deeper_than_join() {
+        let source = r#"CREATE OR REPLACE VIEW v_item_rollup AS
+    SELECT wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points,
+        COUNT(we.event_id) AS event_count,
+        ROUND(COALESCE(SUM(we.delta_hours), 0), 2) AS total_hours,
+        MAX(we.event_at) AS last_event_at
+    FROM work_item wi
+    LEFT JOIN work_event we
+    ON we.item_id = wi.item_id
+    GROUP BY wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(source, false, None);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let join_idx = find_line_starting_with(&lines, "LEFT JOIN work_event we")
+            .expect("LEFT JOIN work_event we line");
+        let on_idx =
+            find_line_starting_with(&lines, "ON we.item_id = wi.item_id").expect("ON line");
+        let group_by_idx =
+            find_line_starting_with(&lines, "GROUP BY wi.item_id,").expect("GROUP BY line");
+
+        assert_eq!(
+            indent(lines[on_idx]),
+            indent(lines[join_idx]).saturating_add(4),
+            "auto-format ON line should stay one frame deeper than LEFT JOIN in CREATE VIEW query body, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[group_by_idx]),
+            indent(lines[join_idx]),
+            "auto-format GROUP BY should realign to the FROM/JOIN frame after ON condition closes, got:\n{formatted}"
         );
     }
 

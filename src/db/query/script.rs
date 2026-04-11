@@ -12170,6 +12170,74 @@ from (a
     }
 
     #[test]
+    fn auto_format_line_contexts_create_view_left_join_on_stays_one_level_deeper_than_join() {
+        let sql = r#"CREATE OR REPLACE VIEW v_item_rollup AS
+    SELECT wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points,
+        COUNT(we.event_id) AS event_count,
+        ROUND(COALESCE(SUM(we.delta_hours), 0), 2) AS total_hours,
+        MAX(we.event_at) AS last_event_at
+    FROM work_item wi
+    LEFT JOIN work_event we
+    ON we.item_id = wi.item_id
+    GROUP BY wi.item_id,
+        wi.project_id,
+        wi.sprint_id,
+        wi.assignee_user_id,
+        wi.item_code,
+        wi.status,
+        wi.points;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+
+        let left_join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "LEFT JOIN work_event we")
+            .unwrap_or(0);
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "ON we.item_id = wi.item_id")
+            .unwrap_or(0);
+        let group_by_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("GROUP BY wi.item_id,"))
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[on_idx].line_semantic,
+            AutoFormatLineSemantic::JoinConditionClause,
+            "CREATE VIEW LEFT JOIN ON line should be classified as join-condition clause, got context: {:?}",
+            contexts[on_idx]
+        );
+        assert_eq!(
+            contexts[on_idx].query_role,
+            AutoFormatQueryRole::Continuation,
+            "CREATE VIEW LEFT JOIN ON line should stay continuation role, got context: {:?}",
+            contexts[on_idx]
+        );
+        assert_eq!(
+            contexts[on_idx].auto_depth,
+            contexts[left_join_idx].auto_depth.saturating_add(1),
+            "CREATE VIEW LEFT JOIN ON line should be one level deeper than JOIN, got left_join={:?}, on={:?}",
+            contexts[left_join_idx],
+            contexts[on_idx]
+        );
+        assert_eq!(
+            contexts[group_by_idx].auto_depth,
+            contexts[left_join_idx].auto_depth,
+            "GROUP BY should realign with JOIN/FROM depth after ON condition, got group_by={:?}, left_join={:?}",
+            contexts[group_by_idx],
+            contexts[left_join_idx]
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_indent_all_supported_child_query_heads_from_parent_base() {
         let scenarios = [
             (
