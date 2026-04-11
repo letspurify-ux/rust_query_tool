@@ -3202,7 +3202,10 @@ impl QueryExecutor {
                                     kind,
                                     context.auto_depth,
                                     context.query_base_depth,
-                                ),
+                                )
+                                .saturating_add(Self::same_line_non_leading_paren_frame_delta(
+                                    trimmed,
+                                )),
                             }
                         })
                     })
@@ -3210,7 +3213,11 @@ impl QueryExecutor {
                         split_model_multiline_owner_tail.then_some(
                             PendingMultilineClauseOwnerFrame {
                                 kind: sql_text::FormatIndentedParenOwnerKind::ModelSubclause,
-                                owner_depth: context.auto_depth,
+                                owner_depth: context
+                                    .auto_depth
+                                    .saturating_add(Self::same_line_non_leading_paren_frame_delta(
+                                        trimmed,
+                                    )),
                             },
                         )
                     });
@@ -3229,7 +3236,10 @@ impl QueryExecutor {
                                     kind.owner_kind(),
                                     context.auto_depth,
                                     context.query_base_depth,
-                                ),
+                                )
+                                .saturating_add(Self::same_line_non_leading_paren_frame_delta(
+                                    trimmed,
+                                )),
                             }
                         })
                     })
@@ -4454,6 +4464,28 @@ impl QueryExecutor {
         }
 
         preceding_depth
+    }
+
+    fn same_line_non_leading_paren_frame_delta(line: &str) -> usize {
+        let paren_profile = sql_text::significant_paren_profile(line);
+        let mut frame_delta = 0usize;
+
+        for event in paren_profile
+            .events
+            .iter()
+            .skip(paren_profile.leading_close_count)
+        {
+            match event {
+                sql_text::SignificantParenEvent::Open => {
+                    frame_delta = frame_delta.saturating_add(1);
+                }
+                sql_text::SignificantParenEvent::Close => {
+                    frame_delta = frame_delta.saturating_sub(1);
+                }
+            }
+        }
+
+        frame_delta
     }
 
     fn pending_query_owner_base_depth(context: AutoFormatLineContext, line: &str) -> usize {
@@ -19934,6 +19966,104 @@ END;"#;
         assert_eq!(
             contexts[outer_fetch_idx].auto_depth, contexts[outer_from_idx].auto_depth,
             "outer FETCH should stay on the outer query base depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_apply_same_line_open_frames_to_json_table_columns_owner() {
+        let sql = r#"SELECT jt.skill
+FROM qt_fmt_emp e,
+    JSON_TABLE (e.json_doc, '$' COLUMNS (
+        grade VARCHAR2 (10) PATH '$.meta.grade',
+        NESTED PATH '$.skills[*]' COLUMNS (
+            skill VARCHAR2 (100) PATH '$'
+        )
+    )) jt;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let columns_owner_idx =
+            find_line_starting_with("JSON_TABLE (e.json_doc, '$' COLUMNS (");
+        let columns_body_idx = find_line_starting_with("grade VARCHAR2 (10) PATH '$.meta.grade'");
+        let nested_columns_owner_idx =
+            find_line_starting_with("NESTED PATH '$.skills[*]' COLUMNS (");
+        let nested_columns_body_idx = find_line_starting_with("skill VARCHAR2 (100) PATH '$'");
+        let columns_owner_open_frames = QueryExecutor::same_line_open_paren_frames_before_trailing_open(
+            lines[columns_owner_idx],
+        );
+        let nested_columns_owner_open_frames = QueryExecutor::same_line_open_paren_frames_before_trailing_open(
+            lines[nested_columns_owner_idx],
+        );
+
+        assert_eq!(
+            contexts[columns_body_idx].auto_depth,
+            contexts[columns_owner_idx]
+                .auto_depth
+                .saturating_add(columns_owner_open_frames)
+                .saturating_add(1),
+            "JSON_TABLE COLUMNS body should include same-line open-paren frames before the trailing COLUMNS owner open"
+        );
+        assert_eq!(
+            contexts[nested_columns_body_idx].auto_depth,
+            contexts[nested_columns_owner_idx]
+                .auto_depth
+                .saturating_add(nested_columns_owner_open_frames)
+                .saturating_add(1),
+            "NESTED ... COLUMNS body should include same-line open-paren frames before the trailing COLUMNS owner open"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_apply_same_line_open_frames_to_split_json_table_columns_owner() {
+        let sql = r#"SELECT jt.skill
+FROM qt_fmt_emp e,
+    JSON_TABLE (e.json_doc, '$' COLUMNS
+    (
+        grade VARCHAR2 (10) PATH '$.meta.grade'
+    ) jt;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let columns_header_idx =
+            find_line_starting_with("JSON_TABLE (e.json_doc, '$' COLUMNS");
+        let open_idx = lines
+            .iter()
+            .enumerate()
+            .skip(columns_header_idx.saturating_add(1))
+            .find(|(_, line)| line.trim() == "(")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("missing standalone COLUMNS open line"));
+        let columns_body_idx = find_line_starting_with("grade VARCHAR2 (10) PATH '$.meta.grade'");
+        let header_same_line_open_frames = sql_text::significant_paren_depth_after_profile(
+            0,
+            &sql_text::significant_paren_profile(lines[columns_header_idx]),
+        );
+        let expected_owner_depth = contexts[columns_header_idx]
+            .auto_depth
+            .saturating_add(header_same_line_open_frames);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth, expected_owner_depth,
+            "split COLUMNS standalone open line should include same-line open-paren frames from the COLUMNS header line"
+        );
+        assert_eq!(
+            contexts[columns_body_idx].auto_depth,
+            expected_owner_depth.saturating_add(1),
+            "split COLUMNS body should stay one level deeper than the normalized split owner depth"
         );
     }
 
