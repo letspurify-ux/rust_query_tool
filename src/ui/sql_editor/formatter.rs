@@ -7568,8 +7568,8 @@ impl SqlEditorWidget {
                     out.push_str(rendered_comment_body);
 
                     needs_space = true;
-                    let previous_token_requires_same_depth =
-                        previous_non_comment_token.is_some_and(|token| match token {
+                    let previous_token_requires_same_depth = previous_non_comment_token
+                        .is_some_and(|token| match token {
                             SqlToken::Word(word) => {
                                 word.eq_ignore_ascii_case("WITH")
                                     || word.eq_ignore_ascii_case("KEEP")
@@ -7964,11 +7964,12 @@ impl SqlEditorWidget {
                                 .is_some_and(|frame| frame.is_column_list())
                                 || is_with_cte_separator
                             {
-                                let fallback_with_cte_separator_indent = query_body_clause_base_depth
-                                    .filter(|_| paren_stack.is_empty())
-                                    .unwrap_or_else(|| {
-                                        base_indent(indent_level, open_cursor_state)
-                                    });
+                                let fallback_with_cte_separator_indent =
+                                    query_body_clause_base_depth
+                                        .filter(|_| paren_stack.is_empty())
+                                        .unwrap_or_else(|| {
+                                            base_indent(indent_level, open_cursor_state)
+                                        });
                                 let with_cte_separator_indent = if is_with_cte_separator {
                                     with_cte_state
                                         .separator_indent(fallback_with_cte_separator_indent)
@@ -8009,9 +8010,8 @@ impl SqlEditorWidget {
                                 let parent_frame_sibling_indent = paren_stack
                                     .last()
                                     .and_then(|frame| frame.sibling_body_indent());
-                                let clause_list_indent_follows_current_query_frame = paren_stack
-                                    .last()
-                                    .is_none_or(|frame| {
+                                let clause_list_indent_follows_current_query_frame =
+                                    paren_stack.last().is_none_or(|frame| {
                                         frame.is_query_like() || frame.is_column_list()
                                     });
                                 let next_starts_parenthesized_sibling = matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "(");
@@ -8221,36 +8221,30 @@ impl SqlEditorWidget {
                                         Some(SqlToken::Comment(comment))
                                             if comment.trim_start().starts_with("--")
                                     );
-                                    let previous_non_comment_is_case_end =
-                                        comment_prefix_cache
-                                            .previous_non_comment_token_index(idx)
-                                            .and_then(|token_idx| tokens.get(token_idx))
-                                            .is_some_and(|token| {
-                                                matches!(
-                                                    token,
-                                                    SqlToken::Word(word)
-                                                        if word.eq_ignore_ascii_case("END")
-                                                )
-                                            });
+                                    let previous_non_comment_is_case_end = comment_prefix_cache
+                                        .previous_non_comment_token_index(idx)
+                                        .and_then(|token_idx| tokens.get(token_idx))
+                                        .is_some_and(|token| {
+                                            matches!(
+                                                token,
+                                                SqlToken::Word(word)
+                                                    if word.eq_ignore_ascii_case("END")
+                                            )
+                                        });
                                     let case_end_sibling_indent = previous_non_comment_is_case_end
                                         .then_some(())
                                         .filter(|_| {
-                                            paren_stack
-                                                .last()
-                                                .is_some_and(|frame| frame.suppresses_comma_breaks())
+                                            paren_stack.last().is_some_and(|frame| {
+                                                frame.suppresses_comma_breaks()
+                                            })
                                         })
                                         .and_then(|_| {
-                                            paren_stack
-                                                .last()
-                                                .and_then(|frame| {
-                                                    (!frame.is_query_like()
-                                                        && !frame.is_column_list())
-                                                        .then_some(
-                                                            frame
-                                                                .open_line_indent
-                                                                .saturating_add(1),
-                                                        )
-                                                })
+                                            paren_stack.last().and_then(|frame| {
+                                                (!frame.is_query_like() && !frame.is_column_list())
+                                                    .then_some(
+                                                        frame.open_line_indent.saturating_add(1),
+                                                    )
+                                            })
                                         });
                                     if matches!(current_clause.as_deref(), Some("SET"))
                                         && construct.merge_active.is_active()
@@ -18076,7 +18070,8 @@ sales_agg AS (
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
         let lines: Vec<&str> = formatted.lines().collect();
-        let with_idx = find_line_starting_with(&lines, "WITH base_emp AS (").expect("WITH CTE line");
+        let with_idx =
+            find_line_starting_with(&lines, "WITH base_emp AS (").expect("WITH CTE line");
         let sales_agg_idx =
             find_line_starting_with(&lines, "sales_agg AS (").expect("sales_agg CTE line");
 
@@ -30923,8 +30918,7 @@ END$$"#;
     }
 
     #[test]
-    fn format_for_auto_formatting_mysql_keeps_test6_frame_based_depths_for_triggers_and_handlers()
-    {
+    fn format_for_auto_formatting_mysql_keeps_test6_frame_based_depths_for_triggers_and_handlers() {
         let source = include_str!("../../../test_mariadb/test6.txt");
         let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
             source,
@@ -32077,5 +32071,4 @@ GROUP BY c.customer_id,
             "test6 VALUES JSON_OBJECT sibling should stay on the same parent argument frame depth after CASE END,, got:\n{formatted}"
         );
     }
-
 }

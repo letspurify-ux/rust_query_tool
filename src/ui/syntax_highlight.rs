@@ -1181,7 +1181,8 @@ fn should_treat_function_name_as_identifier(
     }
 
     if is_sql_keyword
-        && next_significant_token_kind(text, bytes, word_end) == Some(SignificantTokenKind::LeftParen)
+        && next_significant_token_kind(text, bytes, word_end)
+            == Some(SignificantTokenKind::LeftParen)
     {
         return false;
     }
