@@ -1994,6 +1994,15 @@ pub(crate) fn line_has_mysql_begin_not_atomic(line: &str) -> bool {
         })
 }
 
+#[inline]
+fn line_ends_with_mysql_vertical_terminator_candidate(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 2
+        && bytes[bytes.len() - 2] == b'\\'
+        && matches!(bytes[bytes.len() - 1], b'g' | b'G')
+}
+
 pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
     sql.as_bytes().contains(&b'`')
         || sql.contains("<=>")
@@ -2003,6 +2012,7 @@ pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
             line_has_mysql_hash_comment(line)
                 || parse_mysql_delimiter_directive(line).is_some()
                 || line_has_mysql_begin_not_atomic(line)
+                || line_ends_with_mysql_vertical_terminator_candidate(line)
         })
 }
 

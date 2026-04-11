@@ -8772,6 +8772,54 @@ fn test_statement_bounds_at_cursor_mysql_source_alias_isolated_from_following_st
 }
 
 #[test]
+fn test_split_script_items_mysql_backslash_g_terminator_splits_statements() {
+    let sql = "SELECT 1\\G\nSELECT 2;\n";
+    let items = QueryExecutor::split_script_items_for_db_type(
+        sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec!["SELECT 1", "SELECT 2"],
+        "MySQL \\G terminator should split statements and be stripped from execution SQL: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mysql_backslash_g_terminator_isolated_from_next_statement() {
+    let sql = "SELECT 1\\G\nSELECT 2;\n";
+    let cursor = sql.find("SELECT 2").unwrap_or(0);
+    let bounds = QueryExecutor::statement_bounds_at_cursor_for_db_type(
+        sql,
+        cursor,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    )
+    .expect("expected statement bounds after MySQL \\G terminator");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert_eq!(
+        statement.trim(),
+        "SELECT 2",
+        "statement after MySQL \\G terminator should not absorb previous statement: {statement:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_mysql_backslash_g_terminator_auto_detects_mysql_mode() {
+    let sql = "SELECT 1\\G\nSELECT 2;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec!["SELECT 1", "SELECT 2"],
+        "auto-detected MySQL mode should treat \\G as a statement terminator: {stmts:?}"
+    );
+}
+
+#[test]
 fn test_parse_tool_command_mysql_delimiter_accepts_leading_block_comment() {
     let command = QueryExecutor::parse_tool_command("/* note */ DELIMITER /* gap */ $$ -- keep");
 

@@ -1830,6 +1830,14 @@ impl QueryExecutor {
                 .unwrap_or(sql.len());
             let line = &sql[line_start..line_end];
             let trimmed = line.trim();
+            let parser_line_owned =
+                if collector.mysql_delimiter == ";" && collector.builder.mysql_mode() {
+                    Self::rewrite_mysql_vertical_terminator_for_parser(line)
+                } else {
+                    None
+                };
+            let parser_line = parser_line_owned.as_deref().unwrap_or(line);
+            let parser_trimmed = parser_line.trim();
 
             if collector.current_is_empty() {
                 if let Some(super::ToolCommand::MysqlDelimiter { delimiter }) =
@@ -1866,7 +1874,7 @@ impl QueryExecutor {
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
-                trimmed,
+                parser_trimmed,
                 collector.builder.is_idle(),
                 collector.builder.block_depth(),
                 collector.current_is_empty(),
@@ -1878,13 +1886,17 @@ impl QueryExecutor {
                 continue;
             }
 
-            collector.builder.prepare_splitter_line_boundary(line);
+            collector
+                .builder
+                .prepare_splitter_line_boundary(parser_line);
 
             match collector
                 .builder
                 .state
-                .splitter_line_boundary_action_for_line(line, collector.builder.current_is_empty())
-            {
+                .splitter_line_boundary_action_for_line(
+                    parser_line,
+                    collector.builder.current_is_empty(),
+                ) {
                 LineBoundaryAction::None => {}
                 LineBoundaryAction::SplitBeforeLine => {
                     if !collector.current_is_empty()
@@ -1910,7 +1922,7 @@ impl QueryExecutor {
 
             if Self::should_force_terminate_lone_semicolon(
                 collector.builder.is_idle(),
-                trimmed,
+                parser_trimmed,
                 collector.builder.in_create_plsql(),
                 collector.builder.block_depth(),
                 collector.current_is_empty(),
@@ -1922,14 +1934,14 @@ impl QueryExecutor {
                 continue;
             }
 
-            let is_alter_session_set_clause =
-                collector.starts_with_alter_set_context() && Self::is_set_clause_line(trimmed);
+            let is_alter_session_set_clause = collector.starts_with_alter_set_context()
+                && Self::is_set_clause_line(parser_trimmed);
 
             if collector.builder.is_idle()
                 && !collector.builder.current_is_empty()
                 && collector.builder.paren_depth() == 0
                 && collector.builder.can_terminate_on_slash()
-                && Self::parse_tool_command(trimmed).is_some()
+                && Self::parse_tool_command(parser_trimmed).is_some()
                 && !collector.force_terminate_current(sql, &mut on_span)
             {
                 return;
@@ -1940,9 +1952,9 @@ impl QueryExecutor {
                 collector.current_is_empty(),
                 collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
                 is_alter_session_set_clause,
-            ) && Self::line_might_be_tool_command_for_bounds(trimmed)
+            ) && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
             {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
+                if let Some(command) = Self::parse_tool_command(parser_trimmed) {
                     if !collector.force_terminate_current(sql, &mut on_span) {
                         return;
                     }
@@ -1961,9 +1973,9 @@ impl QueryExecutor {
                 collector.builder.is_idle(),
                 collector.current_is_empty(),
                 collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
-            ) && Self::line_might_be_tool_command_for_bounds(trimmed)
+            ) && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
             {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
+                if let Some(command) = Self::parse_tool_command(parser_trimmed) {
                     if let ToolCommand::MysqlDelimiter { delimiter } = &command {
                         collector.mysql_delimiter = delimiter.clone();
                     }
@@ -1975,7 +1987,8 @@ impl QueryExecutor {
                 }
             }
 
-            if !collector.process_line(sql, line, line_start, next_line_start, &mut on_span) {
+            if !collector.process_line(sql, parser_line, line_start, next_line_start, &mut on_span)
+            {
                 return;
             }
             line_start = next_line_start;

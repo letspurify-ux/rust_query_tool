@@ -1611,7 +1611,11 @@ impl QueryExecutor {
                 }
             }
 
-            let mysql_parser_line = Self::mysql_parser_visible_line(line, mysql_delimiter.as_str());
+            let mysql_parser_line = if builder.mysql_mode() {
+                Self::mysql_parser_visible_line(line, mysql_delimiter.as_str())
+            } else {
+                None
+            };
             let parser_source_line = mysql_parser_line.as_deref().unwrap_or(line);
             let mysql_compound_declare = mysql_routine_body_active && leading_is("DECLARE");
             let sanitized_line = if mysql_compound_declare {
@@ -6991,6 +6995,13 @@ impl QueryExecutor {
                 preferred_db_type,
                 Some(mysql_delimiter.as_str()),
             );
+            let parser_line_owned = if mysql_delimiter == ";" && builder.mysql_mode() {
+                Self::mysql_parser_visible_line(line, mysql_delimiter.as_str())
+            } else {
+                None
+            };
+            let parser_line = parser_line_owned.as_deref().unwrap_or(line);
+            let parser_trimmed = parser_line.trim();
 
             if builder.is_idle() && builder.current_is_empty() {
                 if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
@@ -7030,7 +7041,7 @@ impl QueryExecutor {
             // Blank-line termination
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
-                trimmed,
+                parser_trimmed,
                 builder.is_idle(),
                 builder.block_depth(),
                 builder.current_is_empty(),
@@ -7043,21 +7054,21 @@ impl QueryExecutor {
 
             // Standalone comment handling (format mode only)
             if builder.is_idle() && builder.current_is_empty() {
-                if trimmed.starts_with("--")
-                    || sql_text::is_sqlplus_comment_line(trimmed)
-                    || trimmed.starts_with('#')
+                if parser_trimmed.starts_with("--")
+                    || sql_text::is_sqlplus_comment_line(parser_trimmed)
+                    || parser_trimmed.starts_with('#')
                 {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }
-                if sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
-                    && trimmed.ends_with("*/")
+                if sql_text::is_mysql_executable_comment_start(parser_trimmed.as_bytes(), 0)
+                    && parser_trimmed.ends_with("*/")
                 {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }
-                if trimmed.starts_with("/*")
-                    && !sql_text::is_mysql_executable_comment_start(trimmed.as_bytes(), 0)
+                if parser_trimmed.starts_with("/*")
+                    && !sql_text::is_mysql_executable_comment_start(parser_trimmed.as_bytes(), 0)
                 {
                     let mut comment = String::new();
                     let mut trailing_after_comment: Option<String> = None;
@@ -7178,8 +7189,8 @@ impl QueryExecutor {
 
             // Delegate to the shared termination-check sequence
             Self::process_split_line(
-                line,
-                trimmed,
+                parser_line,
+                parser_trimmed,
                 &mut builder,
                 &mut sqlblanklines_enabled,
                 &mut items,
@@ -7401,6 +7412,7 @@ impl QueryExecutor {
     ) -> bool {
         mysql_delimiter.is_some_and(|delimiter| delimiter != ";")
             || Self::parse_mysql_tool_command(trimmed).is_some()
+            || Self::statement_ends_with_mysql_vertical_terminator(trimmed)
             || sql_text::mysql_compatibility_for_sql(line, preferred_db_type)
     }
 
@@ -7550,6 +7562,13 @@ impl QueryExecutor {
                 preferred_db_type,
                 Some(mysql_delimiter.as_str()),
             );
+            let parser_line_owned = if mysql_delimiter == ";" && builder.mysql_mode() {
+                Self::mysql_parser_visible_line(line, mysql_delimiter.as_str())
+            } else {
+                None
+            };
+            let parser_line = parser_line_owned.as_deref().unwrap_or(line);
+            let parser_trimmed = parser_line.trim();
 
             if builder.is_idle() && builder.current_is_empty() {
                 if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
@@ -7589,7 +7608,7 @@ impl QueryExecutor {
             // Blank-line termination (SET SQLBLANKLINES OFF)
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
-                trimmed,
+                parser_trimmed,
                 builder.is_idle(),
                 builder.block_depth(),
                 builder.current_is_empty(),
@@ -7601,8 +7620,8 @@ impl QueryExecutor {
             }
 
             Self::process_split_line(
-                line,
-                trimmed,
+                parser_line,
+                parser_trimmed,
                 &mut builder,
                 &mut sqlblanklines_enabled,
                 items,
@@ -7908,6 +7927,67 @@ impl QueryExecutor {
         Self::mysql_trailing_delimiter_range(statement, delimiter).is_some()
     }
 
+    fn mysql_trailing_vertical_terminator_range(statement: &str) -> Option<(usize, usize)> {
+        let bytes = statement.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if bytes[index] == b'#' {
+                index = Self::skip_mysql_line_comment(bytes, index + 1);
+                continue;
+            }
+            if Self::is_mysql_dash_comment_start(bytes, index) {
+                index = Self::skip_mysql_line_comment(bytes, index + 2);
+                continue;
+            }
+            if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                index = Self::skip_mysql_block_comment(bytes, index);
+                continue;
+            }
+            if bytes[index] == b'\'' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'\'', true);
+                continue;
+            }
+            if bytes[index] == b'"' {
+                index = Self::skip_mysql_quoted_literal(bytes, index, b'"', true);
+                continue;
+            }
+            if bytes[index] == b'`' {
+                index = Self::skip_mysql_backtick_identifier(bytes, index);
+                continue;
+            }
+
+            if bytes[index] == b'\\'
+                && matches!(bytes.get(index + 1), Some(b'g' | b'G'))
+                && Self::mysql_delimiter_suffix_is_ignorable(statement, index + 2)
+            {
+                return Some((index, index + 2));
+            }
+
+            index += 1;
+        }
+
+        None
+    }
+
+    fn statement_ends_with_mysql_vertical_terminator(statement: &str) -> bool {
+        Self::mysql_trailing_vertical_terminator_range(statement).is_some()
+    }
+
+    pub(crate) fn rewrite_mysql_vertical_terminator_for_parser(line: &str) -> Option<String> {
+        let (start, end) = Self::mysql_trailing_vertical_terminator_range(line)?;
+
+        let mut rewritten = String::with_capacity(line.len());
+        rewritten.push_str(line.get(..start).unwrap_or_default());
+        rewritten.push(';');
+        // Keep replacement width identical to `\G` so byte-offset based
+        // statement-bound calculations stay aligned with the original line.
+        for _ in start.saturating_add(1)..end {
+            rewritten.push(' ');
+        }
+        rewritten.push_str(line.get(end..).unwrap_or_default());
+        Some(rewritten)
+    }
+
     fn line_starts_with_mysql_delimited_keyword(
         line: &str,
         delimiter: &str,
@@ -7925,7 +8005,10 @@ impl QueryExecutor {
     }
 
     fn mysql_parser_visible_line(line: &str, delimiter: &str) -> Option<String> {
-        if delimiter == ";" || !Self::statement_ends_with_mysql_delimiter(line, delimiter) {
+        if delimiter == ";" {
+            return Self::rewrite_mysql_vertical_terminator_for_parser(line);
+        }
+        if !Self::statement_ends_with_mysql_delimiter(line, delimiter) {
             return None;
         }
 
