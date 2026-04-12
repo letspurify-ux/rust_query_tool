@@ -1,6 +1,8 @@
 use crate::db::QueryExecutor;
 use crate::sql_text;
 
+// AutoFormatClauseKind lives in script.rs (canonical definition); re-exported
+// through mod.rs so the import path stays module-local.
 use super::{AutoFormatClauseKind, EngineLineRecord, Frame, FrameKind};
 
 fn detect_clause_kind(trimmed_upper: &str) -> Option<AutoFormatClauseKind> {
@@ -272,12 +274,35 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
             .or_else(|| parser_depths.last().copied())
             .unwrap_or(0);
 
-        if parser_depth > prev_parser_depth {
+        let trimmed = line.trim_start();
+
+        // Step 1: Consume leading close events FIRST before any structural frame
+        // manipulation (formatting.md 1.4 / 4.1: leading close는 항상 먼저 소비한다).
+        // Paren profile must be computed before parser_depth frame changes so that
+        // close events are applied in the same token order they appear on the line.
+        let paren_profile = if !trimmed.is_empty() {
+            let profile = sql_text::significant_paren_profile(trimmed);
+            for _ in 0..profile.leading_close_count {
+                active_paren_depth = active_paren_depth.saturating_sub(1);
+                pop_latest_paren_frame(&mut stack);
+            }
+            profile
+        } else {
+            sql_text::SignificantParenProfile::default()
+        };
+
+        // Step 2: Apply parser_depth changes after leading close (4.1).
+        // Pop non-Paren frames whose structural scope has ended.
+        pop_to_parser_depth(&mut stack, parser_depth);
+        // Push one Block frame per depth level increase (formatting.md 1.2:
+        // 모든 open event는 정확히 +1이다 — a jump of N levels must produce N
+        // separate frame push events, not a single multi-step push).
+        for intermediate_depth in (prev_parser_depth.saturating_add(1))..=parser_depth {
             let query_base_depth = current_query_base_depth(&stack);
             push_frame(
                 &mut stack,
                 FrameKind::Block,
-                parser_depth,
+                intermediate_depth,
                 active_paren_depth,
                 line_idx,
                 query_base_depth,
@@ -285,9 +310,6 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
         }
         prev_parser_depth = parser_depth;
 
-        pop_to_parser_depth(&mut stack, parser_depth);
-
-        let trimmed = line.trim_start();
         if trimmed.is_empty() {
             records.push(EngineLineRecord {
                 line_idx,
@@ -301,14 +323,9 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
             continue;
         }
 
+        // Step 3: Classify the surviving structural tail after leading close.
         let structural = sql_text::auto_format_structural_tail(trimmed);
         let trimmed_upper = structural.to_ascii_uppercase();
-        let paren_profile = sql_text::significant_paren_profile(trimmed);
-
-        for _ in 0..paren_profile.leading_close_count {
-            active_paren_depth = active_paren_depth.saturating_sub(1);
-            pop_latest_paren_frame(&mut stack);
-        }
 
         if let Some(clause_kind) = detect_clause_kind(&trimmed_upper) {
             if clause_kind.is_query_head() {
@@ -418,6 +435,79 @@ mod tests {
         assert_eq!(
             records[content_idx].stack_depth, records[sibling_idx].stack_depth,
             "leading `)` inside multiline backtick payload must not pop structural frame stack depth"
+        );
+    }
+
+    // Bug regression: leading close must be consumed BEFORE any structural
+    // frame manipulation (formatting.md 1.4 / 4.1).  The Paren frame opened
+    // by a trailing `(` on one line must already be gone from the stack by the
+    // time the leading `)` line is recorded, regardless of what other structural
+    // events (clause pushes, block-depth changes) happen on that same line.
+    #[test]
+    fn scan_once_processes_leading_close_before_block_frame_push() {
+        // The `SELECT (` line opens a Paren frame after its record is captured.
+        // The `) col` line has a leading `)` that must consume that Paren before
+        // the record is taken — the `) col` record should therefore have the
+        // SAME stack depth as the `SELECT (` record (both measured after clause
+        // frames but before the dangling open-paren is counted).
+        let sql = "BEGIN\n    SELECT (\n    ) col\n    FROM dual;\nEND;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT"))
+            .unwrap_or(0);
+        let close_line_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(')'))
+            .unwrap_or(0);
+
+        let records = scan_once(sql);
+
+        // `SELECT (` record is captured before the trailing `(` is processed,
+        // so its stack_depth reflects {Block, QueryBase, SelectBody} = 3.
+        // `) col` must also show stack_depth = 3 because the leading `)` pops
+        // the Paren pushed by `SELECT (` before the record is taken.
+        assert_eq!(
+            records[close_line_idx].stack_depth,
+            records[select_idx].stack_depth,
+            "`) col` stack_depth ({}) must equal `SELECT (` stack_depth ({}) — \
+             leading `)` must consume the trailing paren before the record is captured",
+            records[close_line_idx].stack_depth,
+            records[select_idx].stack_depth,
+        );
+    }
+
+    // Bug regression: a parser_depth jump of N must push N separate Block
+    // frames (formatting.md 1.2: every open event is exactly +1).  A single
+    // push for a multi-level jump leaves the stack_depth lower than expected
+    // and means later pop_to_parser_depth calls remove the wrong frame.
+    #[test]
+    fn scan_once_pushes_one_block_frame_per_depth_level() {
+        // Simulate two nested BEGIN blocks opened before the first code line.
+        // parser_depth for "SELECT 1" would be 2, jumping from 0 in one shot
+        // if the nesting happens in header lines that scan_once skips as empty.
+        // Use a two-level nested PL/SQL anonymous block to exercise this.
+        let sql = "BEGIN\n    BEGIN\n        SELECT 1 FROM dual;\n    END;\nEND;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let inner_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT"))
+            .unwrap_or(0);
+        let outer_end_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("END"))
+            .unwrap_or(0);
+
+        let records = scan_once(sql);
+
+        // The SELECT inside the double-nested block must have a higher
+        // stack_depth than the outer END line.
+        assert!(
+            records[inner_select_idx].stack_depth > records[outer_end_idx].stack_depth,
+            "inner SELECT stack_depth ({}) must be greater than outer END \
+             stack_depth ({}) when each depth level pushes its own Block frame",
+            records[inner_select_idx].stack_depth,
+            records[outer_end_idx].stack_depth,
         );
     }
 }

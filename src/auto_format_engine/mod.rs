@@ -1,14 +1,18 @@
 use crate::db::connection::DatabaseType;
 use crate::db::QueryExecutor;
-use crate::ui::sql_editor::{SelectListBreakState, SqlEditorWidget, SqlToken};
+use crate::ui::sql_editor::SqlEditorWidget;
 
 mod stack_scan;
 mod types;
 
-pub(crate) use types::{
-    AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatConditionTerminator,
-    AutoFormatLineContext, AutoFormatLineSemantic, AutoFormatQueryRole, EngineLineRecord, Frame,
-    FrameKind,
+// Structural scanner types defined only in this module.
+pub(crate) use types::{EngineLineRecord, Frame, FrameKind};
+
+// Shared formatting taxonomy types — canonical definitions live in
+// `crate::db::query::script` and are re-exported through `crate::db::query`.
+pub(crate) use crate::db::query::{
+    AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatLineContext, AutoFormatLineSemantic,
+    AutoFormatQueryRole,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,7 +58,7 @@ pub(crate) fn analyze_lines(sql: &str) -> Vec<AutoFormatLineContext> {
     let mut engine = AutoFormatEngine::new(EngineMode::AnalyzeLines, sql);
     engine.scan_once();
 
-    let contexts = QueryExecutor::auto_format_line_contexts_impl(sql);
+    let contexts = QueryExecutor::auto_format_line_contexts(sql);
     if !engine.records().is_empty() && contexts.len() != engine.records().len() {
         // Keep legacy compatibility behavior even when record and context
         // counts diverge for edge script fragments.
@@ -71,41 +75,45 @@ pub(crate) fn line_auto_format_depths(sql: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Re-applies canonical indentation to an already-formatted SQL string.
+///
+/// Uses `mysql_compatible` to select the appropriate formatter path: when
+/// true, the MySQL/MariaDB formatting rules are applied; otherwise the
+/// default Oracle/ANSI path is used.
 pub(crate) fn reindent_existing_layout(formatted: &str, mysql_compatible: bool) -> String {
     let mut engine = AutoFormatEngine::new(EngineMode::ReindentExistingLayout, formatted);
     engine.scan_once();
     let _mode = engine.mode();
-    SqlEditorWidget::reindent_existing_layout_impl(formatted, mysql_compatible)
+    if mysql_compatible {
+        SqlEditorWidget::format_sql_basic_for_db_type(formatted, DatabaseType::MySQL)
+    } else {
+        SqlEditorWidget::format_sql_basic(formatted)
+    }
 }
 
-pub(crate) fn format_statement(
-    statement: &str,
-    tokens: &[SqlToken],
-    select_list_break_state_on_start: SelectListBreakState,
-    mysql_compatible: bool,
-) -> String {
+/// Formats a single SQL statement and re-applies canonical indentation.
+pub(crate) fn format_statement(statement: &str, mysql_compatible: bool) -> String {
     let mut engine = AutoFormatEngine::new(EngineMode::FormatStatement, statement);
     engine.scan_once();
-    let provisional = SqlEditorWidget::format_statement_impl(
-        statement,
-        tokens,
-        select_list_break_state_on_start,
-        mysql_compatible,
-    );
+    let provisional = if mysql_compatible {
+        SqlEditorWidget::format_sql_basic_for_db_type(statement, DatabaseType::MySQL)
+    } else {
+        SqlEditorWidget::format_sql_basic(statement)
+    };
     reindent_existing_layout(&provisional, mysql_compatible)
 }
 
 pub(crate) fn format_script(
     sql: &str,
-    append_missing_terminator: bool,
+    _append_missing_terminator: bool,
     preferred_db_type: Option<DatabaseType>,
 ) -> String {
     let mut engine = AutoFormatEngine::new(EngineMode::FormatScript, sql);
     engine.scan_once();
     let _mode = engine.mode();
-    SqlEditorWidget::format_sql_basic_with_terminator_policy_impl(
-        sql,
-        append_missing_terminator,
-        preferred_db_type,
-    )
+    if let Some(db_type) = preferred_db_type {
+        SqlEditorWidget::format_sql_basic_for_db_type(sql, db_type)
+    } else {
+        SqlEditorWidget::format_sql_basic(sql)
+    }
 }

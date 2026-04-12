@@ -221,7 +221,7 @@ pub(crate) enum AutoFormatClauseKind {
 }
 
 impl AutoFormatClauseKind {
-    fn is_query_head(self) -> bool {
+    pub(crate) fn is_query_head(self) -> bool {
         matches!(
             self,
             Self::With
@@ -236,14 +236,14 @@ impl AutoFormatClauseKind {
         )
     }
 
-    fn is_set_operator(self) -> bool {
+    pub(crate) fn is_set_operator(self) -> bool {
         matches!(
             self,
             Self::Union | Self::Intersect | Self::Minus | Self::Except
         )
     }
 
-    fn ends_into_continuation(self) -> bool {
+    pub(crate) fn ends_into_continuation(self) -> bool {
         matches!(
             self,
             Self::From
