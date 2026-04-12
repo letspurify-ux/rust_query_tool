@@ -5090,24 +5090,50 @@ impl QueryExecutor {
         )
     }
 
-    fn same_line_query_owner_has_non_leading_close_event(line: &str) -> bool {
-        Self::same_line_significant_paren_has_close_event(
+    fn same_line_query_owner_closes_frame_below_line_start(
+        line: &str,
+        line_start_depth: usize,
+    ) -> bool {
+        Self::same_line_significant_paren_closes_frame_below_line_start(
             line,
+            line_start_depth,
             Self::line_ends_with_open_paren_before_inline_comment(line),
         )
     }
 
-    fn same_line_significant_paren_has_close_event(
+    fn same_line_significant_paren_closes_frame_below_line_start(
         line: &str,
+        line_start_depth: usize,
         exclude_trailing_open: bool,
     ) -> bool {
-        let mut has_close = false;
+        let mut frame_stack = vec![(); line_start_depth];
+        let line_start_frame_depth = frame_stack.len();
+        let mut closes_below_line_start = false;
+
         Self::for_each_same_line_significant_paren_event(line, exclude_trailing_open, |event| {
-            if event == sql_text::SignificantParenEvent::Close {
-                has_close = true;
+            if closes_below_line_start {
+                return;
+            }
+
+            match event {
+                sql_text::SignificantParenEvent::Open => {
+                    frame_stack.push(());
+                }
+                sql_text::SignificantParenEvent::Close => {
+                    if frame_stack.pop().is_some() {
+                        if frame_stack.len() < line_start_frame_depth {
+                            closes_below_line_start = true;
+                        }
+                    } else if line_start_frame_depth == 0 {
+                        // Keep depth math saturating, but still surface that this
+                        // close tried to consume beyond the line-start frame.
+                        closes_below_line_start = true;
+                    }
+                }
             }
         });
-        has_close
+
+        closes_below_line_start
     }
 
     fn apply_same_line_significant_paren_events_to_depth(
@@ -5163,15 +5189,18 @@ impl QueryExecutor {
         let normalized = line.trim_end();
         let line_ends_with_open_paren =
             Self::line_ends_with_open_paren_before_inline_comment(normalized);
-        let same_line_has_non_leading_close =
-            Self::same_line_query_owner_has_non_leading_close_event(normalized);
+        let same_line_closes_frame_below_line_start =
+            Self::same_line_query_owner_closes_frame_below_line_start(
+                normalized,
+                context.auto_depth,
+            );
         let structural_owner_base =
             Self::apply_same_line_query_owner_paren_events_to_depth(context.auto_depth, normalized);
         let current_line_query_owner_kind = sql_text::contextual_format_query_owner_kind(
             normalized,
             context.line_semantic.is_condition_continuation(),
         );
-        let preserve_non_leading_close_owner_base = same_line_has_non_leading_close
+        let preserve_non_leading_close_owner_base = same_line_closes_frame_below_line_start
             && line_ends_with_open_paren
             && !sql_text::line_has_leading_significant_close_paren(normalized);
         if context.condition_role != AutoFormatConditionRole::None {
@@ -5180,7 +5209,8 @@ impl QueryExecutor {
                     return structural_owner_base;
                 }
                 if current_line_query_owner_kind.is_some()
-                    && (structural_owner_base > header_depth || same_line_has_non_leading_close)
+                    && (structural_owner_base > header_depth
+                        || same_line_closes_frame_below_line_start)
                 {
                     // Condition-owned child-query lines such as
                     // `AND EXISTS (` or `expr ) IN (` must anchor the child
@@ -5190,7 +5220,7 @@ impl QueryExecutor {
                     // older condition header floor.
                     return structural_owner_base;
                 }
-                if line_ends_with_open_paren && same_line_has_non_leading_close {
+                if line_ends_with_open_paren && same_line_closes_frame_below_line_start {
                     // Lines that continue a condition and open the child query
                     // on the same line (e.g. `expr ) IN (`) still need to
                     // preserve the explicit close-before-open frame delta.
@@ -22050,8 +22080,18 @@ FROM qt_fmt_emp e,
             "query-owner same-line paren events must be applied in token order before excluding the trailing owner open"
         );
         assert!(
-            QueryExecutor::same_line_query_owner_has_non_leading_close_event(line),
+            QueryExecutor::same_line_query_owner_closes_frame_below_line_start(line, 0),
             "non-leading close events should remain explicit even when a later open restores net delta"
+        );
+    }
+
+    #[test]
+    fn same_line_query_owner_close_detection_ignores_local_balanced_close_before_trailing_open() {
+        let line = "func_call (arg) + (";
+
+        assert!(
+            !QueryExecutor::same_line_query_owner_closes_frame_below_line_start(line, 0),
+            "close that only consumes a same-line local open frame must not be treated as closing below the line-start frame"
         );
     }
 
