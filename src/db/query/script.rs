@@ -3189,7 +3189,7 @@ impl QueryExecutor {
                     && close_comma_query_sibling_depth.is_none())
                 .then_some(frame_stack_close_depth);
                 let tail_starts_with_as =
-                    sql_text::starts_with_keyword_token(leading_close_tail, "AS");
+                    sql_text::starts_with_keyword_token(normalized_leading_close_tail, "AS");
                 let close_list_item_query_depth = context
                     .query_base_depth
                     // Non-comma mixed tails that start inside a multiline
@@ -24544,6 +24544,90 @@ FROM dept d;"#;
             contexts[close_alias_idx].auto_depth,
             contexts[from_idx].auto_depth.saturating_add(1),
             "inline-comment close-AS-alias comma list item should stay exactly one level deeper than the query-base FROM line"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_query_sibling_after_leading_close_block_comment_as_alias_comma(
+    ) {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep as same sibling depth */ AS nested_max_sal,
+    d.deptno
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    == ") /* keep as same sibling depth */ AS nested_max_sal,"
+            })
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "d.deptno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[close_alias_idx].auto_depth,
+            "block-comment close-AS-alias comma line should keep the next SELECT-list sibling on the same depth"
+        );
+        assert_eq!(
+            contexts[close_alias_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "block-comment close-AS-alias comma list item should stay exactly one level deeper than the query-base FROM line"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_query_sibling_after_leading_close_block_comment_quoted_alias_comma_without_as(
+    ) {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep as same sibling depth */ "nested_max_sal",
+    d.deptno
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    == ") /* keep as same sibling depth */ \"nested_max_sal\","
+            })
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "d.deptno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[close_alias_idx].auto_depth,
+            "block-comment close-quoted-alias comma line should keep the next SELECT-list sibling on the same depth"
+        );
+        assert_eq!(
+            contexts[close_alias_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "block-comment close-quoted-alias comma list item should stay exactly one level deeper than the query-base FROM line"
         );
     }
 

@@ -33389,6 +33389,51 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_oracle_db_type_realigns_sibling_after_close_block_comment_as_alias_comma(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* close alias comment */ AS nested_max_sal,
+    d.deptno
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().ends_with("AS nested_max_sal,"))
+            .map(|(idx, _)| idx)
+            .expect("oracle close block-comment AS alias comma");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.deptno").expect("oracle sibling select item");
+
+        assert!(
+            formatted.contains("/* close alias comment */"),
+            "oracle formatter should preserve the block comment, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "oracle sibling after `) /* ... */ AS alias,` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::Oracle,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_realigns_sibling_after_close_alias_comma_without_as() {
         let source = r#"SELECT
     (
@@ -33926,6 +33971,53 @@ FROM dept d;"#;
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[close_alias_idx]),
             "mysql auto-format sibling after `) alias, -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_sibling_depth_after_close_block_comment_as_alias_comma(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* close alias comment */ AS nested_max_sal,
+    d.deptno
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().ends_with("AS nested_max_sal,"))
+            .map(|(idx, _)| idx)
+            .expect("mysql auto-format close block-comment AS alias comma");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.deptno").expect("mysql auto-format sibling");
+
+        assert!(
+            formatted.contains("/* close alias comment */"),
+            "mysql auto-format should preserve the block comment, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "mysql auto-format sibling after `) /* ... */ AS alias,` should stay on the same SELECT-list frame depth, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_for_auto_formatting_with_db_type(
