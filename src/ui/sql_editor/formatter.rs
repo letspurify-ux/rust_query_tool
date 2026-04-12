@@ -9868,11 +9868,46 @@ impl SqlEditorWidget {
         token_idx: usize,
         line_start_depth: usize,
     ) -> bool {
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum DelimiterFrameKind {
+            Unknown,
+            Paren,
+            Bracket,
+            Brace,
+        }
+
+        impl DelimiterFrameKind {
+            fn from_open_char(symbol: char) -> Option<Self> {
+                match symbol {
+                    '(' => Some(Self::Paren),
+                    '[' => Some(Self::Bracket),
+                    '{' => Some(Self::Brace),
+                    _ => None,
+                }
+            }
+
+            fn from_close_char(symbol: char) -> Option<Self> {
+                match symbol {
+                    ')' => Some(Self::Paren),
+                    ']' => Some(Self::Bracket),
+                    '}' => Some(Self::Brace),
+                    _ => None,
+                }
+            }
+
+            fn can_be_closed_by(self, close_kind: Self) -> bool {
+                matches!(self, Self::Unknown) || self == close_kind
+            }
+        }
+
         if line_start_idx >= token_idx {
             return false;
         }
 
-        let mut depth = line_start_depth;
+        // Track delimiter events in strict token order with an explicit frame
+        // stack so close/open chains (`) + (` / `] + [`) are evaluated exactly
+        // as they appear before the comma token.
+        let mut frame_stack = vec![DelimiterFrameKind::Unknown; line_start_depth];
         for token in tokens
             .iter()
             .skip(line_start_idx)
@@ -9883,18 +9918,25 @@ impl SqlEditorWidget {
             };
 
             for sym_ch in symbol.chars() {
-                match sym_ch {
-                    '(' => {
-                        depth = depth.saturating_add(1);
-                    }
-                    ')' => {
-                        let next_depth = depth.saturating_sub(1);
-                        if next_depth < line_start_depth {
-                            return true;
-                        }
-                        depth = next_depth;
-                    }
-                    _ => {}
+                if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
+                    frame_stack.push(open_kind);
+                    continue;
+                }
+
+                let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
+                    continue;
+                };
+
+                if frame_stack.len() <= line_start_depth {
+                    return true;
+                }
+
+                if frame_stack
+                    .last()
+                    .copied()
+                    .is_some_and(|top| top.can_be_closed_by(close_kind))
+                {
+                    frame_stack.pop();
                 }
             }
         }
@@ -33605,6 +33647,43 @@ FROM dept d;"#;
                 &tokens, 0, comma_idx, 0
             ),
             "local balanced call parens at top-level must not be treated as closing a parent frame"
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_tracks_close_then_open_for_brackets() {
+        let tokens = SqlEditorWidget::tokenize_sql("] + [, stable");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in bracket close-open token-order fixture");
+
+        assert!(
+            SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens, 0, comma_idx, 1
+            ),
+            "close->open bracket sequence must report a frame close below the line-start depth before comma"
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_ignores_mismatched_local_close_delimiter(
+    ) {
+        let tokens = SqlEditorWidget::tokenize_sql("( ] , stable");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in mismatched local delimiter fixture");
+
+        assert!(
+            !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens, 0, comma_idx, 1
+            ),
+            "mismatched close delimiter inside a locally opened frame must not be treated as closing a parent frame"
         );
     }
 }
