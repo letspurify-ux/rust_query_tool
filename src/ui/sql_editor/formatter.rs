@@ -9907,7 +9907,36 @@ impl SqlEditorWidget {
         // Track delimiter events in strict token order with an explicit frame
         // stack so close/open chains (`) + (` / `] + [`) are evaluated exactly
         // as they appear before the comma token.
-        let mut frame_stack = vec![DelimiterFrameKind::Unknown; line_start_depth];
+        let mut visible_line_start_stack: Vec<DelimiterFrameKind> = Vec::new();
+        for token in tokens.iter().take(line_start_idx) {
+            let SqlToken::Symbol(symbol) = token else {
+                continue;
+            };
+
+            for sym_ch in symbol.chars() {
+                if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
+                    visible_line_start_stack.push(open_kind);
+                    continue;
+                }
+
+                let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
+                    continue;
+                };
+
+                if visible_line_start_stack
+                    .last()
+                    .copied()
+                    .is_some_and(|top| top == close_kind)
+                {
+                    visible_line_start_stack.pop();
+                }
+            }
+        }
+        let synthetic_missing_depth =
+            line_start_depth.saturating_sub(visible_line_start_stack.len());
+        let mut frame_stack = vec![DelimiterFrameKind::Unknown; synthetic_missing_depth];
+        frame_stack.extend(visible_line_start_stack.iter().copied());
+        let line_start_frame_depth = frame_stack.len();
         for token in tokens
             .iter()
             .skip(line_start_idx)
@@ -9927,16 +9956,17 @@ impl SqlEditorWidget {
                     continue;
                 };
 
-                if frame_stack.len() <= line_start_depth {
-                    return true;
-                }
-
                 if frame_stack
                     .last()
                     .copied()
                     .is_some_and(|top| top.can_be_closed_by(close_kind))
                 {
                     frame_stack.pop();
+                    if frame_stack.len() < line_start_frame_depth {
+                        return true;
+                    }
+                } else if line_start_frame_depth == 0 && frame_stack.is_empty() {
+                    return true;
                 }
             }
         }
@@ -18733,7 +18763,9 @@ FROM dual d;"#,
             let function_from_idx = lines
                 .iter()
                 .position(|line| line.trim_start().starts_with(function_from_prefix))
-                .unwrap_or_else(|| panic!("split {function_name} FROM option line, got:\n{formatted}"));
+                .unwrap_or_else(|| {
+                    panic!("split {function_name} FROM option line, got:\n{formatted}")
+                });
             let sibling_idx = lines
                 .iter()
                 .position(|line| line.trim_start() == "d.empno")
@@ -22186,7 +22218,9 @@ FROM dual;"#;
         let legend_line_idx = lines
             .iter()
             .position(|line| line.contains("LEGEND"))
-            .unwrap_or_else(|| panic!("formatted output should contain LEGEND operand, got:\n{formatted}"));
+            .unwrap_or_else(|| {
+                panic!("formatted output should contain LEGEND operand, got:\n{formatted}")
+            });
         let legend_line = lines[legend_line_idx];
         let next_trimmed = lines
             .get(legend_line_idx.saturating_add(1))
@@ -25039,12 +25073,7 @@ FROM event_log e;"#;
             lines
                 .iter()
                 .position(|line| line.trim_start().starts_with(prefix))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing line starting with `{}`\n{}",
-                        prefix, formatted
-                    )
-                })
+                .unwrap_or_else(|| panic!("missing line starting with `{}`\n{}", prefix, formatted))
         };
         let find_line_containing = |needle: &str| -> usize {
             lines
@@ -25160,7 +25189,9 @@ FROM emp_json e;"#;
             .unwrap_or_else(|| panic!("function-local WITH WRAPPER line, got:\n{}", formatted));
 
         if lines[wrapper_idx].trim_start().starts_with("WITH WRAPPER")
-            || lines[wrapper_idx].trim_start().starts_with(") WITH WRAPPER")
+            || lines[wrapper_idx]
+                .trim_start()
+                .starts_with(") WITH WRAPPER")
         {
             assert!(
                 indent(lines[wrapper_idx]) > indent(lines[outer_from_idx]),
@@ -25273,8 +25304,8 @@ FROM emp_json e;"#;
     }
 
     #[test]
-    fn format_for_auto_formatting_keeps_mixed_close_json_exists_true_false_inside_function_parens(
-    ) {
+    fn format_for_auto_formatting_keeps_mixed_close_json_exists_true_false_inside_function_parens()
+    {
         let source = r#"SELECT
     JSON_EXISTS (
         e.payload,
@@ -33478,8 +33509,8 @@ FROM dual;"#;
         );
         let lines: Vec<&str> = formatted.lines().collect();
 
-        let mixed_close_open_idx = find_line_starting_with(&lines, ") + (")
-            .expect("mixed close-open select item line");
+        let mixed_close_open_idx =
+            find_line_starting_with(&lines, ") + (").expect("mixed close-open select item line");
         let sibling_idx = find_line_starting_with(&lines, "1 AS stable_sibling")
             .expect("select-list sibling after mixed close-open item");
         let second_select_idx = lines
@@ -33665,6 +33696,62 @@ FROM dept d;"#;
                 &tokens, 0, comma_idx, 1
             ),
             "close->open bracket sequence must report a frame close below the line-start depth before comma"
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_respects_known_line_start_frame_kind()
+    {
+        let tokens = SqlEditorWidget::tokenize_sql("(\n] + (, stable");
+        let line_start_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == "]"))
+            .map(|(idx, _)| idx)
+            .expect("line-start mismatched close in typed-frame fixture");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in typed-frame fixture");
+
+        assert!(
+            !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                1
+            ),
+            "known line-start `(` frame must not be popped by mismatched `]` close before comma"
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_tracks_typed_line_start_close_then_open(
+    ) {
+        let tokens = SqlEditorWidget::tokenize_sql("(\n) + (, stable");
+        let line_start_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ")"))
+            .map(|(idx, _)| idx)
+            .expect("line-start close in typed-frame fixture");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in typed-frame close-open fixture");
+
+        assert!(
+            SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                1
+            ),
+            "known line-start `(` frame should be consumed before the later open in `) + (`"
         );
     }
 
