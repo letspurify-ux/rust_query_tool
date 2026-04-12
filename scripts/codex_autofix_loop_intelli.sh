@@ -50,7 +50,7 @@ COMMIT_PREFIX="${COMMIT_PREFIX:-fix: auto-fix}"
 run_codex_fix() {
   local prompt model reasoning_effort
   local -a cmd_args=()
-  prompt="인텔리센스 기능이 처리 못하는 문법/구문이 있는지 검토해줘. 테스트 케이스 추가해서 확인되면 수정해줘. 발견된 버그와 유사한 경우가 더 있는지 검토해보고 한번에 모두 일괄 수정해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘. 수정 내용은 fixed.md에 추가해줘."
+  prompt="인텔리센스 기능이 mysql, maria db, oracle 처리 못하는 문법/구문이 있거나 버그 있는지 검토해줘. 다른 유사 케이스도 고려해서 모두 커버 되도록 일반화해서 근본적으로 개선해줘. 수정 완료 후 cargo test 전체 통과 확인해줘."
 
   if [[ -n "$CODEX_MODEL" ]]; then
     if [[ "$CODEX_MODEL" == *" "* ]]; then

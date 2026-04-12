@@ -675,6 +675,92 @@ fn sqlite_not_indexed_postfix_keeps_alias_after_clause() {
 }
 
 #[test]
+fn mysql_use_index_postfix_keeps_alias_after_clause() {
+    let ctx = analyze("SELECT o.| FROM orders USE INDEX (idx_orders_date) o");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDERS")
+                && table.alias.as_deref() == Some("o")),
+        "USE INDEX postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mysql_force_index_for_join_postfix_keeps_alias_after_clause() {
+    let ctx = analyze(
+        "SELECT o.| FROM orders FORCE INDEX FOR JOIN (idx_orders_date) o \
+         JOIN order_items i ON i.order_id = o.id",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDERS")
+                && table.alias.as_deref() == Some("o")),
+        "FORCE INDEX FOR JOIN postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDER_ITEMS")
+                && table.alias.as_deref() == Some("i")),
+        "JOIN relation should still be parsed after FORCE INDEX clause: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mysql_ignore_key_for_order_by_postfix_keeps_alias_after_clause() {
+    let ctx = analyze("SELECT o.| FROM orders IGNORE KEY FOR ORDER BY (idx_orders_date) o");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDERS")
+                && table.alias.as_deref() == Some("o")),
+        "IGNORE KEY FOR ORDER BY postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mysql_index_hint_without_alias_keeps_join_boundary_intact() {
+    let ctx = analyze(
+        "SELECT c.| FROM orders USE INDEX (idx_orders_date) \
+         JOIN customers c ON c.id = orders.customer_id",
+    );
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "orders table should remain visible with USE INDEX hint: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"CUSTOMERS".to_string()),
+        "JOIN target should remain visible after USE INDEX hint: {:?}",
+        names
+    );
+}
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 
