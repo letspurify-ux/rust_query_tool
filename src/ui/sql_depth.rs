@@ -1,8 +1,84 @@
 use crate::ui::sql_editor::SqlToken;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DelimiterFrameKind {
+    Unknown,
+    Paren,
+    Bracket,
+    Brace,
+}
+
+impl DelimiterFrameKind {
+    fn from_open_char(symbol: char) -> Option<Self> {
+        match symbol {
+            '(' => Some(Self::Paren),
+            '[' => Some(Self::Bracket),
+            '{' => Some(Self::Brace),
+            _ => None,
+        }
+    }
+
+    fn from_close_char(symbol: char) -> Option<Self> {
+        match symbol {
+            ')' => Some(Self::Paren),
+            ']' => Some(Self::Bracket),
+            '}' => Some(Self::Brace),
+            _ => None,
+        }
+    }
+
+    fn can_be_closed_by(self, close_kind: Self) -> bool {
+        matches!(self, Self::Unknown) || self == close_kind
+    }
+}
+
+fn apply_symbol_to_strict_stack(stack: &mut Vec<DelimiterFrameKind>, symbol: &str) {
+    for sym_ch in symbol.chars() {
+        if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
+            stack.push(open_kind);
+            continue;
+        }
+
+        let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
+            continue;
+        };
+
+        if stack.last().copied().is_some_and(|top| top == close_kind) {
+            stack.pop();
+        }
+    }
+}
+
+fn apply_symbol_to_close_detection_stack(
+    stack: &mut Vec<DelimiterFrameKind>,
+    symbol: &str,
+) -> bool {
+    for sym_ch in symbol.chars() {
+        if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
+            stack.push(open_kind);
+            continue;
+        }
+
+        let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
+            continue;
+        };
+
+        if stack
+            .last()
+            .copied()
+            .is_some_and(|top| top.can_be_closed_by(close_kind))
+        {
+            stack.pop();
+            return true;
+        }
+    }
+
+    false
+}
+
 #[derive(Default)]
 pub(crate) struct ParenDepthState {
-    stack: Vec<char>,
+    stack: Vec<DelimiterFrameKind>,
 }
 
 impl ParenDepthState {
@@ -16,38 +92,57 @@ impl ParenDepthState {
             return;
         };
 
-        for sym_ch in symbol.chars() {
-            match sym_ch {
-                '(' | '[' | '{' => {
-                    self.stack.push(sym_ch);
-                }
-                ')' | ']' | '}' => {
-                    self.consume_close(sym_ch);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn consume_close(&mut self, close_ch: char) {
-        let Some(expected_open) = matching_open_for_close(close_ch) else {
-            return;
-        };
-
-        if self.stack.last().copied() == Some(expected_open) {
-            self.stack.pop();
-        }
+        apply_symbol_to_strict_stack(&mut self.stack, symbol);
     }
 }
 
-#[inline]
-fn matching_open_for_close(close_ch: char) -> Option<char> {
-    match close_ch {
-        ')' => Some('('),
-        ']' => Some('['),
-        '}' => Some('{'),
-        _ => None,
+/// Returns true when the token stream between `line_start_idx` and `token_idx`
+/// closes at least one delimiter frame that existed at line start depth before
+/// `token_idx` is reached.
+///
+/// This preserves strict token-order semantics for close/open chains such as
+/// `) + (` and `] + [`, using an explicit frame stack instead of net delta
+/// counting.
+pub(crate) fn line_closes_delimiter_frame_below_depth_before_token(
+    tokens: &[SqlToken],
+    line_start_idx: usize,
+    token_idx: usize,
+    line_start_depth: usize,
+) -> bool {
+    if line_start_idx >= token_idx || line_start_depth == 0 {
+        return false;
     }
+
+    let mut visible_line_start_stack: Vec<DelimiterFrameKind> = Vec::new();
+    for token in tokens.iter().take(line_start_idx) {
+        let SqlToken::Symbol(symbol) = token else {
+            continue;
+        };
+        apply_symbol_to_strict_stack(&mut visible_line_start_stack, symbol);
+    }
+
+    let synthetic_missing_depth = line_start_depth.saturating_sub(visible_line_start_stack.len());
+    let mut frame_stack = vec![DelimiterFrameKind::Unknown; synthetic_missing_depth];
+    frame_stack.extend(visible_line_start_stack.iter().copied());
+    let line_start_frame_depth = frame_stack.len();
+
+    for token in tokens
+        .iter()
+        .skip(line_start_idx)
+        .take(token_idx.saturating_sub(line_start_idx))
+    {
+        let SqlToken::Symbol(symbol) = token else {
+            continue;
+        };
+
+        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol)
+            && frame_stack.len() < line_start_frame_depth
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Returns the parenthesis depth *before* each token is processed.
@@ -237,6 +332,127 @@ mod tests {
             word("x"),
         ];
         assert_eq!(paren_depths(&tokens), vec![0, 0, 0]);
+    }
+
+    fn comma_index(tokens: &[SqlToken]) -> usize {
+        tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    // ── line_closes_delimiter_frame_below_depth_before_token ───────────────
+
+    #[test]
+    fn line_close_detection_tracks_close_then_open_token_order() {
+        let tokens = tokenize_sql(") + (, stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 1),
+            "close->open sequence must report a frame close below the line-start depth before comma"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_ignores_local_balanced_parens() {
+        let tokens = tokenize_sql("ABS(a), stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 0),
+            "locally balanced call parens must not be treated as closing a parent frame"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_does_not_report_parent_close_when_line_start_depth_is_zero() {
+        let tokens = tokenize_sql(") + (, stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 0),
+            "line-start depth 0 has no parent frame to close; unmatched close must not trigger close-detection"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_does_not_report_parent_close_for_brackets_at_depth_zero() {
+        let tokens = tokenize_sql("] + [, stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 0),
+            "line-start depth 0 has no parent frame to close even for bracket close/open sequences"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_tracks_close_then_open_for_brackets() {
+        let tokens = tokenize_sql("] + [, stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 1),
+            "close->open bracket sequence must report a frame close below the line-start depth before comma"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_respects_typed_line_start_frame_kind() {
+        let tokens = tokenize_sql("(\n] + (, stable");
+        let line_start_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == "]"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                1,
+            ),
+            "known line-start `(` frame must not be popped by mismatched `]` before comma"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_tracks_typed_line_start_close_then_open() {
+        let tokens = tokenize_sql("(\n) + (, stable");
+        let line_start_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ")"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            line_closes_delimiter_frame_below_depth_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                1,
+            ),
+            "known line-start `(` frame should be consumed before a later `(` opens again"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_ignores_mismatched_local_close_delimiter() {
+        let tokens = tokenize_sql("( ] , stable");
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 1),
+            "mismatched close inside a local frame must not be treated as closing a parent frame"
+        );
     }
 
     // ── paren_depth_after ─────────────────────────────────────────────────────
