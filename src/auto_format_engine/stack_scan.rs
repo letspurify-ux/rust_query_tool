@@ -66,24 +66,44 @@ fn clause_frame_kind(clause_kind: AutoFormatClauseKind) -> Option<FrameKind> {
     }
 }
 
-fn pop_to_parser_depth(stack: &mut Vec<Frame>, parser_depth: usize) {
+fn pop_to_parser_depth(stack: &mut Vec<Frame>, parser_depth: usize) -> usize {
     // Remove every frame anchored deeper than the current parser depth, even
     // when a Paren frame currently sits on top of the stack. Depth
     // normalization must be frame-anchor based, not "top frame kind" based.
+    // Returns the number of Paren frames removed so the caller can keep
+    // `active_paren_depth` in sync (a Paren inside a closed block would
+    // otherwise leave `active_paren_depth` elevated after the END line).
+    let mut paren_removed = 0usize;
     while let Some(pos) = stack
         .iter()
         .rposition(|frame| frame.parser_anchor_depth > parser_depth)
     {
+        if stack[pos].kind == FrameKind::Paren {
+            paren_removed += 1;
+        }
         stack.remove(pos);
     }
+    paren_removed
 }
 
-fn pop_latest_paren_frame(stack: &mut Vec<Frame>) {
-    if let Some(pos) = stack
-        .iter()
-        .rposition(|frame| frame.kind == FrameKind::Paren)
+fn pop_to_paren_depth(stack: &mut Vec<Frame>, paren_depth: usize) {
+    // Remove every frame — Paren or semantic (QueryBase, SelectBody, FromBody,
+    // WhereBody, etc.) — whose paren scope has ended.  A frame's
+    // `paren_anchor_depth` records the active paren nesting depth at push
+    // time; once `active_paren_depth` drops below that value the frame is
+    // out of scope and must be evicted together with the Paren frame that
+    // owned it.  Leaving semantic frames behind after a Paren close causes
+    // stale inner-subquery depth counts to leak into subsequent lines.
+    //
+    // Frames are pushed in non-decreasing paren_anchor_depth order, so
+    // popping from the end until the condition is false is equivalent to
+    // an rposition-based scan but cheaper.
+    while stack
+        .last()
+        .map(|f| f.paren_anchor_depth > paren_depth)
+        .unwrap_or(false)
     {
-        stack.remove(pos);
+        stack.pop();
     }
 }
 
@@ -288,7 +308,7 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
             let profile = sql_text::significant_paren_profile(trimmed);
             for _ in 0..profile.leading_close_count {
                 active_paren_depth = active_paren_depth.saturating_sub(1);
-                pop_latest_paren_frame(&mut stack);
+                pop_to_paren_depth(&mut stack, active_paren_depth);
             }
             profile
         } else {
@@ -296,8 +316,12 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
         };
 
         // Step 2: Apply parser_depth changes after leading close (4.1).
-        // Pop non-Paren frames whose structural scope has ended.
-        pop_to_parser_depth(&mut stack, parser_depth);
+        // Pop non-Paren frames whose structural scope has ended.  Any Paren
+        // frames inside the closed block are also removed by
+        // `pop_to_parser_depth`; sync `active_paren_depth` so that the
+        // paren counter stays consistent with the surviving stack.
+        let paren_removed = pop_to_parser_depth(&mut stack, parser_depth);
+        active_paren_depth = active_paren_depth.saturating_sub(paren_removed);
         // Push one Block frame per depth level increase (formatting.md 1.2:
         // 모든 open event는 정확히 +1이다 — a jump of N levels must produce N
         // separate frame push events, not a single multi-step push).
@@ -393,7 +417,7 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
                 }
                 sql_text::SignificantParenEvent::Close => {
                     active_paren_depth = active_paren_depth.saturating_sub(1);
-                    pop_latest_paren_frame(&mut stack);
+                    pop_to_paren_depth(&mut stack, active_paren_depth);
                 }
             }
         }
@@ -526,6 +550,85 @@ mod tests {
              stack_depth ({}) when each depth level pushes its own Block frame",
             records[inner_select_idx].stack_depth,
             records[outer_end_idx].stack_depth,
+        );
+    }
+
+    // Bug regression: pop_to_paren_depth must evict ALL frames anchored at the
+    // closed paren depth, not just the Paren frame itself.  Semantic frames
+    // (QueryBase, SelectBody, FromBody, etc.) pushed while inside a subquery
+    // paren carry `paren_anchor_depth > 0` and must be removed together with
+    // the Paren frame when the leading `)` is processed.  If only the Paren
+    // frame is removed, the leaked semantic frames inflate `stack_depth` for
+    // every subsequent line until the end of the statement.
+    //
+    // The "FROM (" record is taken before the trailing `(` is applied, so its
+    // stack already contains [QueryBase, SelectBody, FromBody] (depth 3) but
+    // not yet the Paren.  After the leading `)` on ") sub", all paren=1 frames
+    // must be gone, leaving exactly the same three outer frames (depth 3).
+    #[test]
+    fn scan_once_cleans_inner_subquery_frames_on_leading_paren_close() {
+        let sql =
+            "SELECT *\nFROM (\n    SELECT col\n    FROM t\n) sub\nWHERE x = 1;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM ("))
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") sub"))
+            .unwrap_or(0);
+
+        let records = scan_once(sql);
+
+        assert_eq!(
+            records[close_paren_idx].stack_depth,
+            records[outer_from_idx].stack_depth,
+            "`) sub` stack_depth ({}) must equal outer `FROM (` stack_depth ({}) — \
+             inner subquery frames (QueryBase, SelectBody, FromBody at paren_anchor=1) \
+             must all be evicted when the subquery paren closes",
+            records[close_paren_idx].stack_depth,
+            records[outer_from_idx].stack_depth,
+        );
+    }
+
+    // Bug regression: pop_to_parser_depth must update active_paren_depth when
+    // it removes Paren frames that were opened inside a now-closed block scope.
+    // If the paren counter is not decremented, the next line inside a sibling
+    // block will push its Paren frames at an inflated base depth, corrupting
+    // all subsequent paren-scope cleanup.
+    #[test]
+    fn scan_once_syncs_paren_depth_after_block_close_removes_paren_frame() {
+        // An unclosed `(` inside the first BEGIN block is cleaned up when the
+        // END closes the block.  active_paren_depth must reset to 0 so the
+        // second BEGIN block starts with a clean paren counter.  The SELECT
+        // inside the second block should see the same low stack_depth as the
+        // SELECT inside the first block's sibling scope.
+        let sql =
+            "BEGIN\n    SELECT (\n    FROM t;\nEND;\nBEGIN\n    SELECT 1\n    FROM dual;\nEND;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let first_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT ("))
+            .unwrap_or(0);
+        let second_select_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with("SELECT 1"))
+            .unwrap_or(0);
+
+        let records = scan_once(sql);
+
+        // After the first END closes the block (and the dangling paren with
+        // it), the second SELECT should start at the same structural depth as
+        // the first SELECT.  A drifting active_paren_depth would cause the
+        // second block's Paren frames to nest one level deeper than expected.
+        assert_eq!(
+            records[second_select_idx].stack_depth,
+            records[first_select_idx].stack_depth,
+            "second `SELECT 1` stack_depth ({}) must equal first `SELECT (` stack_depth ({}) — \
+             active_paren_depth must be synced when pop_to_parser_depth removes a Paren frame",
+            records[second_select_idx].stack_depth,
+            records[first_select_idx].stack_depth,
         );
     }
 
