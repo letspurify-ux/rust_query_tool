@@ -1683,7 +1683,10 @@ impl QueryExecutor {
                 }
             });
 
-            if sql_text::line_ends_with_semicolon_before_inline_comment(trimmed_start) {
+            if Self::line_ends_statement_for_auto_format(
+                trimmed_start,
+                mysql_delimiter.as_str(),
+            ) {
                 // Statement boundary must reset query-related paren/CTE frames.
                 // Otherwise stale subquery frame depth can leak into the next
                 // statement line (for example `COMMIT;`) and violate frame-based
@@ -1911,20 +1914,49 @@ impl QueryExecutor {
             paren_stack: &[AutoFormatSubqueryParenKind],
             leading_close_count: usize,
         ) -> Option<usize> {
+            active_non_subquery_paren_segment_after_leading_closes(paren_stack, leading_close_count)
+                .map(|(_, top_idx)| top_idx)
+        }
+
+        fn active_non_subquery_paren_segment_after_leading_closes(
+            paren_stack: &[AutoFormatSubqueryParenKind],
+            leading_close_count: usize,
+        ) -> Option<(usize, usize)> {
             let remaining_len = paren_stack.len().saturating_sub(leading_close_count);
             if remaining_len == 0 {
                 return None;
             }
 
             let top_idx = remaining_len.saturating_sub(1);
-            paren_stack.get(top_idx).and_then(|paren_kind| {
+            let is_non_subquery_kind = |kind: AutoFormatSubqueryParenKind| {
                 matches!(
-                    *paren_kind,
+                    kind,
                     AutoFormatSubqueryParenKind::NonSubquery
                         | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                        | AutoFormatSubqueryParenKind::Pending
+                        | AutoFormatSubqueryParenKind::PendingFromConsumer
                 )
-                .then_some(top_idx)
-            })
+            };
+
+            if !paren_stack
+                .get(top_idx)
+                .copied()
+                .is_some_and(is_non_subquery_kind)
+            {
+                return None;
+            }
+
+            let mut start_idx = top_idx;
+            while start_idx > 0
+                && paren_stack
+                    .get(start_idx.saturating_sub(1))
+                    .copied()
+                    .is_some_and(is_non_subquery_kind)
+            {
+                start_idx = start_idx.saturating_sub(1);
+            }
+
+            Some((start_idx, top_idx))
         }
 
         fn inside_non_subquery_paren_context_after_leading_closes(
@@ -1933,18 +1965,31 @@ impl QueryExecutor {
         ) -> bool {
             // Mixed leading-close lines (e.g. `) RETURNING ...`) must classify
             // structural tail after consuming the visible leading close run.
-            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
-                .is_some()
+            active_non_subquery_paren_segment_after_leading_closes(
+                paren_stack,
+                leading_close_count,
+            )
+            .is_some()
         }
 
         fn inside_from_consuming_non_subquery_paren_context_after_leading_closes(
             paren_stack: &[AutoFormatSubqueryParenKind],
             leading_close_count: usize,
         ) -> bool {
-            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
-                .and_then(|idx| paren_stack.get(idx))
-                .is_some_and(|paren_kind| {
-                    *paren_kind == AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+            active_non_subquery_paren_segment_after_leading_closes(paren_stack, leading_close_count)
+                .is_some_and(|(start_idx, top_idx)| {
+                    (start_idx..=top_idx).rev().any(|idx| {
+                        paren_stack
+                            .get(idx)
+                            .copied()
+                            .is_some_and(|paren_kind| {
+                                matches!(
+                                    paren_kind,
+                                    AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                                        | AutoFormatSubqueryParenKind::PendingFromConsumer
+                                )
+                            })
+                    })
                 })
         }
 
@@ -1953,10 +1998,15 @@ impl QueryExecutor {
             function_local_clause_active_stack: &[bool],
             leading_close_count: usize,
         ) -> bool {
-            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
-                .and_then(|idx| function_local_clause_active_stack.get(idx))
-                .copied()
-                .unwrap_or(false)
+            active_non_subquery_paren_segment_after_leading_closes(paren_stack, leading_close_count)
+                .is_some_and(|(start_idx, top_idx)| {
+                    (start_idx..=top_idx).rev().any(|idx| {
+                        function_local_clause_active_stack
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                })
         }
 
         let parser_depths = Self::line_block_depths(sql);
@@ -3229,13 +3279,13 @@ impl QueryExecutor {
                     || current_line_completes_pending_condition_owner;
             let leading_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
-                && sql_text::line_has_leading_significant_close_paren(line)
+                && sql_text::line_has_leading_significant_close_paren(trimmed)
                 && Self::auto_format_is_query_condition_continuation_clause(
-                    &sql_text::trim_after_leading_close_parens(line).to_ascii_uppercase(),
+                    &sql_text::trim_after_leading_close_parens(trimmed).to_ascii_uppercase(),
                 );
             let pure_close_condition_continuation = context.condition_role
                 == AutoFormatConditionRole::Continuation
-                && !sql_text::line_has_leading_significant_close_paren(line)
+                && !sql_text::line_has_leading_significant_close_paren(trimmed)
                 && Self::auto_format_is_query_condition_continuation_clause(trimmed_upper)
                 && pending_condition_close_continuation_for_line.is_some_and(|frame| {
                     Some(frame.header_line_idx) == context.condition_header_line
@@ -3714,12 +3764,13 @@ impl QueryExecutor {
                 mysql_trigger_body_frame = None;
             }
 
-            let semicolon_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
+            let terminator_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
             });
-            let line_ends_statement =
-                sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
-                    && semicolon_closes_active_query_frame;
+            let line_ends_statement = Self::line_ends_statement_for_auto_format(
+                trimmed,
+                mysql_delimiter.as_str(),
+            ) && terminator_closes_active_query_frame;
 
             if current_line_is_mysql_on_duplicate_key_update {
                 mysql_on_duplicate_key_update_active = true;
@@ -8444,6 +8495,13 @@ impl QueryExecutor {
 
     pub(crate) fn statement_ends_with_mysql_delimiter(statement: &str, delimiter: &str) -> bool {
         Self::mysql_trailing_delimiter_range(statement, delimiter).is_some()
+    }
+
+    fn line_ends_statement_for_auto_format(line: &str, mysql_delimiter: &str) -> bool {
+        sql_text::line_ends_with_semicolon_before_inline_comment(line)
+            || Self::statement_ends_with_mysql_vertical_terminator(line)
+            || (mysql_delimiter != ";"
+                && Self::statement_ends_with_mysql_delimiter(line, mysql_delimiter))
     }
 
     fn mysql_trailing_vertical_terminator_range(statement: &str) -> Option<(usize, usize)> {
@@ -19168,6 +19226,52 @@ END;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_condition_keyword_after_multiline_qquote_tail_close_on_condition_depth(
+    ) {
+        let sql = r#"BEGIN
+    IF (
+        (
+            q'[
+ready
+]' ) AND v_dept = 10
+    ) THEN
+        NULL;
+    END IF;
+END;"#;
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let if_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "IF (")
+            .unwrap_or(0);
+        let close_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "]' ) AND v_dept = 10")
+            .unwrap_or(0);
+        let close_then_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") THEN")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_and_idx].condition_role,
+            AutoFormatConditionRole::Continuation,
+            "same-line q-quote tail close + AND should stay on condition continuation semantics"
+        );
+        assert_eq!(
+            contexts[close_and_idx].auto_depth,
+            contexts[if_idx].auto_depth.saturating_add(1),
+            "same-line q-quote tail close + AND should resolve from the IF condition depth after consuming the close"
+        );
+        assert_eq!(
+            contexts[close_then_idx].condition_role,
+            AutoFormatConditionRole::Closer,
+            "outer IF close line should remain the parenthesized condition closer"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_case_condition_keyword_after_pure_close_line_with_comment_glued_when_header(
     ) {
         let sql = r#"SELECT
@@ -21482,6 +21586,59 @@ FROM event_log e;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_nested_function_local_on_error_non_structural() {
+        let sql = r#"SELECT
+    JSON_VALUE (
+        e.payload,
+        '$.name'
+        RETURNING VARCHAR2 (
+            30
+            ON ERROR NULL
+        )
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let returning_idx = find_line_starting_with("RETURNING VARCHAR2 (");
+        let on_error_idx = find_line_starting_with("ON ERROR NULL");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM event_log e;");
+
+        assert_eq!(
+            contexts[on_error_idx].line_semantic,
+            AutoFormatLineSemantic::None,
+            "nested function-local ON ERROR should stay non-structural even when an inner paren frame is still open"
+        );
+        assert_ne!(
+            contexts[on_error_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "nested function-local ON ERROR must not reopen query-base state"
+        );
+        assert!(
+            contexts[on_error_idx].auto_depth >= contexts[returning_idx].auto_depth,
+            "nested function-local ON ERROR should stay on or inside the active function-local paren frame depth"
+        );
+        assert!(
+            contexts[on_error_idx].auto_depth > contexts[from_idx].auto_depth,
+            "nested function-local ON ERROR should not collapse to the outer FROM depth"
+        );
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "SELECT-list sibling should return to canonical list depth after nested function-local ON ERROR"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_function_local_with_wrapper_non_structural() {
         let sql = r#"SELECT
     JSON_QUERY (
@@ -21815,6 +21972,96 @@ INTO v_emp_id;"#;
             contexts[into_idx].line_semantic,
             AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
             "INTO after RETURNING should remain in the structural DML clause chain after statement reset"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_resets_paren_frames_after_custom_delimiter_with_unclosed_open_paren(
+    ) {
+        let sql = r#"DELIMITER $$
+SELECT ($$
+INSERT INTO qt_fmt_emp_log (emp_id)
+VALUES (1001)
+RETURNING emp_id
+INTO v_emp_id$$
+DELIMITER ;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let insert_idx = find_line_starting_with("INSERT INTO qt_fmt_emp_log (emp_id)");
+        let returning_idx = find_line_starting_with("RETURNING emp_id");
+        let into_idx = find_line_starting_with("INTO v_emp_id$$");
+
+        assert_eq!(
+            contexts[insert_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Insert),
+            "custom-delimited statement after delimiter boundary must start from a fresh structural frame even when the previous statement ended with an unmatched `(`"
+        );
+        assert_eq!(
+            contexts[insert_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "custom-delimited statement after delimiter boundary must re-open its own query base instead of inheriting stale non-subquery paren frames"
+        );
+        assert_eq!(
+            contexts[returning_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Returning),
+            "stale non-subquery paren state must not suppress structural RETURNING classification after a custom-delimited statement boundary"
+        );
+        assert_eq!(
+            contexts[into_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
+            "INTO after RETURNING should remain in the structural DML clause chain after custom-delimited statement reset"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_resets_paren_frames_after_mysql_vertical_terminator_with_unclosed_open_paren(
+    ) {
+        let sql = r#"SELECT (\G
+INSERT INTO qt_fmt_emp_log (emp_id)
+VALUES (1001)
+RETURNING emp_id
+INTO v_emp_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let insert_idx = find_line_starting_with("INSERT INTO qt_fmt_emp_log (emp_id)");
+        let returning_idx = find_line_starting_with("RETURNING emp_id");
+        let into_idx = find_line_starting_with("INTO v_emp_id;");
+
+        assert_eq!(
+            contexts[insert_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Insert),
+            "statement after `\\G` terminator must restart from a fresh structural frame even when the previous statement ended with an unmatched `(`"
+        );
+        assert_eq!(
+            contexts[insert_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "statement after `\\G` terminator must re-open its own query base instead of inheriting stale non-subquery paren frames"
+        );
+        assert_eq!(
+            contexts[returning_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Returning),
+            "stale non-subquery paren state must not suppress structural RETURNING classification after a `\\G` statement boundary"
+        );
+        assert_eq!(
+            contexts[into_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
+            "INTO after RETURNING should remain in the structural DML clause chain after `\\G` statement reset"
         );
     }
 
