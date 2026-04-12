@@ -2064,7 +2064,7 @@ impl QueryExecutor {
             .iter()
             .map(|line| line.to_ascii_uppercase())
             .collect();
-        let (_previous_code_indices, next_code_indices) =
+        let (previous_code_indices, next_code_indices) =
             Self::auto_format_code_line_neighbors(&analysis_lines);
         let mut contexts = Vec::with_capacity(lines.len());
         let mut query_frames: Vec<QueryBaseDepthFrame> = Vec::new();
@@ -2192,6 +2192,15 @@ impl QueryExecutor {
                 .get(idx)
                 .map(String::as_str)
                 .unwrap_or("");
+            let previous_code_line_ends_with_from_consuming_function =
+                previous_code_indices
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|previous_idx| {
+                        structural_trimmed_lines.get(previous_idx).copied()
+                    })
+                    .is_some_and(Self::line_ends_with_from_consuming_function_name);
             let line_words = leading_identifier_words
                 .get(idx)
                 .copied()
@@ -2212,6 +2221,10 @@ impl QueryExecutor {
             let leading_significant_close_count =
                 leading_significant_paren_profile.leading_close_count;
             let line_has_leading_close_paren = leading_significant_close_count > 0;
+            let line_starts_with_open_paren = leading_significant_close_count == 0
+                && structural_trimmed.trim_start().starts_with('(');
+            let split_from_consuming_function_open_paren = line_starts_with_open_paren
+                && previous_code_line_ends_with_from_consuming_function;
             let leading_close_has_mixed_continuation = line_has_leading_close_paren
                 && sql_text::line_has_mixed_leading_close_continuation(trimmed);
             let clause_detection_trimmed = structural_trimmed;
@@ -3767,10 +3780,10 @@ impl QueryExecutor {
             let terminator_closes_active_query_frame = query_frames.last().is_none_or(|frame| {
                 frame.head_kind != Some(AutoFormatClauseKind::With) || frame.with_main_query_started
             });
-            let line_ends_statement = Self::line_ends_statement_for_auto_format(
-                trimmed,
-                mysql_delimiter.as_str(),
-            ) && terminator_closes_active_query_frame;
+            let line_has_statement_terminator =
+                Self::line_ends_statement_for_auto_format(trimmed, mysql_delimiter.as_str());
+            let line_ends_statement =
+                line_has_statement_terminator && terminator_closes_active_query_frame;
 
             if current_line_is_mysql_on_duplicate_key_update {
                 mysql_on_duplicate_key_update_active = true;
@@ -3784,7 +3797,8 @@ impl QueryExecutor {
                             skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
                         let mut word_end = lookahead;
                         let opens_from_consuming_function =
-                            paren_opens_from_consuming_function(bytes, byte_idx);
+                            paren_opens_from_consuming_function(bytes, byte_idx)
+                                || split_from_consuming_function_open_paren;
                         let mut paren_kind = if opens_from_consuming_function {
                             AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
                         } else {
@@ -3835,6 +3849,31 @@ impl QueryExecutor {
                     }
                 },
             );
+            if line_has_statement_terminator {
+                // Statement boundaries must always reset statement-local carry
+                // and paren-frame stacks, even when a parent WITH frame stays
+                // active across local FUNCTION/PROCEDURE declarations.
+                pending_query_bases.clear();
+                non_query_into_continuation_frame = None;
+                pending_split_query_owner = None;
+                pending_partial_query_owner = None;
+                pending_plsql_child_query_owner = None;
+                owner_relative_frames.clear();
+                pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
+                pending_window_definition_owner = None;
+                pending_line_continuation = None;
+                pending_inline_comment_line_continuation = None;
+                pending_condition_close_continuation = None;
+                pending_control_branch_body_frame = None;
+                pending_mysql_declare_handler_frame = None;
+                pending_condition_headers.clear();
+                active_condition_frames.clear();
+                auto_format_subquery_paren_stack.clear();
+                auto_format_function_local_clause_active_stack.clear();
+                pending_auto_format_subquery_paren_count = 0;
+                mysql_on_duplicate_key_update_active = false;
+            }
             if line_ends_statement {
                 // A statement terminator must retire every closed query frame
                 // on the stack, but WITH frames that still own local
@@ -3848,26 +3887,9 @@ impl QueryExecutor {
                 }) {
                     let _ = query_frames.pop();
                 }
-                pending_query_bases.clear();
-                non_query_into_continuation_frame = None;
-                pending_split_query_owner = None;
-                pending_partial_query_owner = None;
-                pending_plsql_child_query_owner = None;
-                owner_relative_frames.clear();
-                pending_multiline_clause_owner = None;
-                pending_partial_multiline_clause_owner = None;
-                pending_window_definition_owner = None;
-                pending_line_continuation = None;
-                pending_inline_comment_line_continuation = None;
-                pending_condition_close_continuation = None;
-                pending_mysql_declare_handler_frame = None;
                 trigger_header_frame = None;
                 mysql_trigger_body_frame = None;
                 forall_body_frame = None;
-                auto_format_subquery_paren_stack.clear();
-                auto_format_function_local_clause_active_stack.clear();
-                pending_auto_format_subquery_paren_count = 0;
-                mysql_on_duplicate_key_update_active = false;
             }
             context.render_depth = context.auto_depth;
             context.carry_depth = Self::line_carry_depth_from_render_depth(
@@ -4386,6 +4408,17 @@ impl QueryExecutor {
 
     fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
         sql_text::line_ends_with_open_paren_before_inline_comment(line)
+    }
+
+    fn line_ends_with_from_consuming_function_name(line: &str) -> bool {
+        let trailing_identifier = sql_text::trailing_identifier_words_before_inline_comment(line, 1)
+            .into_iter()
+            .last();
+
+        trailing_identifier.is_some_and(|identifier| {
+            let upper = identifier.to_ascii_uppercase();
+            sql_text::is_from_consuming_function(upper.as_str())
+        })
     }
 
     fn line_is_standalone_open_paren_before_inline_comment(line: &str) -> bool {
@@ -5299,15 +5332,11 @@ impl QueryExecutor {
             && Self::line_ends_with_comma_before_inline_comment(trimmed);
         let carries_paren_frame_delta =
             has_non_leading_paren_events || leading_close_comma_list_continuation;
-        let next_line_is_standalone_open_paren =
-            Self::line_is_standalone_open_paren_before_inline_comment(next_line);
-        if Self::line_starts_continuation_boundary(next_line)
-            && !(next_line_is_standalone_open_paren
-                && Self::line_can_continue_across_standalone_open_boundary(trimmed))
-            // Preserve same-line paren frame transitions even when the next
-            // line starts with a structural boundary keyword.
-            && !has_non_leading_paren_events
-        {
+        if Self::line_continuation_blocked_by_next_boundary(
+            trimmed,
+            next_line,
+            has_non_leading_paren_events,
+        ) {
             return None;
         }
 
@@ -5353,6 +5382,28 @@ impl QueryExecutor {
     fn line_can_continue_across_standalone_open_boundary(line: &str) -> bool {
         Self::line_has_trailing_continuation_operator(line)
             || sql_text::format_bare_structural_header_continuation_kind(line).is_some()
+    }
+
+    fn line_continuation_blocked_by_next_boundary(
+        line_prefix: &str,
+        next_line: &str,
+        has_non_leading_paren_events: bool,
+    ) -> bool {
+        if !Self::line_starts_continuation_boundary(next_line) {
+            return false;
+        }
+
+        let next_line_is_standalone_open_paren =
+            Self::line_is_standalone_open_paren_before_inline_comment(next_line);
+        if next_line_is_standalone_open_paren
+            && Self::line_can_continue_across_standalone_open_boundary(line_prefix)
+        {
+            return false;
+        }
+
+        // Preserve same-line paren frame transitions even when the next
+        // line starts with a structural boundary keyword.
+        !has_non_leading_paren_events
     }
 
     fn line_has_non_leading_significant_paren_event(line: &str) -> bool {
@@ -5414,7 +5465,11 @@ impl QueryExecutor {
             && Self::line_ends_with_comma_before_inline_comment(trimmed);
         let carries_paren_frame_delta =
             has_non_leading_paren_events || leading_close_comma_list_continuation;
-        if Self::line_starts_continuation_boundary(next_line) && !has_non_leading_paren_events {
+        if Self::line_continuation_blocked_by_next_boundary(
+            trimmed,
+            next_line,
+            has_non_leading_paren_events,
+        ) {
             return None;
         }
 
@@ -11918,6 +11973,68 @@ UPDATE OF e.sal NOWAIT;"#;
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn inline_comment_line_continuation_keeps_standalone_open_boundary_for_operator_prefix() {
+        let carry = QueryExecutor::inline_comment_line_continuation_for_line(
+            "payload + -- keep wrapper",
+            2,
+            Some(1),
+            Some("("),
+            AutoFormatConditionRole::None,
+            None,
+        )
+        .expect("inline-comment operator prefix should carry across standalone open paren");
+
+        assert_eq!(
+            carry.depth, 3,
+            "standalone open line should stay one level deeper when the inline-comment prefix ends with an operator"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(1),
+            "inline-comment continuation should preserve the active query base depth"
+        );
+        assert!(
+            !carry.paren_frame_only,
+            "operator-driven carry across standalone open boundary must stay semantic continuation"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_promote_standalone_open_after_inline_comment_select_header() {
+        let sql = r#"SELECT -- keep list header
+(
+    SELECT 1
+) AS nested_value
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT --"))
+            .unwrap_or(0);
+        let open_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "(")
+            .unwrap_or(0);
+        let nested_select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[open_idx].auto_depth,
+            contexts[select_idx].auto_depth.saturating_add(1),
+            "standalone open paren after `SELECT -- ...` should stay on SELECT-list body depth"
+        );
+        assert_eq!(
+            contexts[nested_select_idx].auto_depth,
+            contexts[open_idx].auto_depth.saturating_add(1),
+            "nested SELECT head under the standalone wrapper should stay one level deeper than the wrapper line"
+        );
     }
 
     #[test]
@@ -21786,6 +21903,71 @@ FROM emp e;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_split_function_local_from_non_structural() {
+        let cases = [
+            (
+                "EXTRACT",
+                r#"SELECT
+    EXTRACT
+    (
+        YEAR
+        FROM e.hire_date
+    ) AS extracted_value,
+    e.empno
+FROM emp e;"#,
+                "FROM e.hire_date",
+            ),
+            (
+                "TRIM",
+                r#"SELECT
+    TRIM
+    (
+        LEADING '0'
+        FROM e.emp_code
+    ) AS extracted_value,
+    e.empno
+FROM emp e;"#,
+                "FROM e.emp_code",
+            ),
+        ];
+
+        for (function_name, sql, function_from_prefix) in cases {
+            let contexts = QueryExecutor::auto_format_line_contexts(sql);
+            let lines: Vec<&str> = sql.lines().collect();
+            let find_line_starting_with = |prefix: &str| -> usize {
+                lines
+                    .iter()
+                    .position(|line| line.trim_start().starts_with(prefix))
+                    .unwrap_or(0)
+            };
+
+            let function_idx = find_line_starting_with(function_name);
+            let function_from_idx = find_line_starting_with(function_from_prefix);
+            let sibling_idx = find_line_starting_with("e.empno");
+            let query_from_idx = find_line_starting_with("FROM emp e;");
+
+            assert_eq!(
+                contexts[function_from_idx].line_semantic,
+                AutoFormatLineSemantic::None,
+                "split {function_name} function-local FROM should stay non-structural"
+            );
+            assert_ne!(
+                contexts[function_from_idx].query_role,
+                AutoFormatQueryRole::Base,
+                "split {function_name} function-local FROM must not reopen query-base state"
+            );
+            assert!(
+                contexts[function_from_idx].auto_depth > contexts[query_from_idx].auto_depth,
+                "split {function_name} function-local FROM should stay inside the function paren frame"
+            );
+            assert_eq!(
+                contexts[sibling_idx].auto_depth, contexts[function_idx].auto_depth,
+                "SELECT-list sibling after split {function_name} should return to the sibling item depth"
+            );
+        }
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_function_local_trim_from_non_structural() {
         let sql = r#"SELECT
     TRIM (
@@ -22062,6 +22244,57 @@ INTO v_emp_id;"#;
             contexts[into_idx].line_semantic,
             AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
             "INTO after RETURNING should remain in the structural DML clause chain after `\\G` statement reset"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_resets_paren_frames_after_semicolon_inside_with_local_function() {
+        let sql = r#"WITH
+    FUNCTION local_fn RETURN NUMBER IS
+        v_emp_id NUMBER;
+    BEGIN
+        v_emp_id := (;
+        INSERT INTO qt_fmt_emp_log (emp_id)
+        VALUES (1001)
+        RETURNING emp_id
+        INTO v_emp_id;
+        RETURN v_emp_id;
+    END;
+SELECT local_fn
+FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let insert_idx = find_line_starting_with("INSERT INTO qt_fmt_emp_log (emp_id)");
+        let returning_idx = find_line_starting_with("RETURNING emp_id");
+        let into_idx = find_line_starting_with("INTO v_emp_id;");
+
+        assert_eq!(
+            contexts[insert_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Insert),
+            "local FUNCTION statement after `v_emp_id := (;` must re-open a fresh query frame instead of inheriting stale non-subquery paren frames"
+        );
+        assert_eq!(
+            contexts[insert_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "INSERT inside WITH local FUNCTION should stay a structural base clause after semicolon reset"
+        );
+        assert_eq!(
+            contexts[returning_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Returning),
+            "stale non-subquery paren state inside WITH local FUNCTION must not suppress RETURNING clause classification"
+        );
+        assert_eq!(
+            contexts[into_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
+            "INTO should remain in the structural DML clause chain after local FUNCTION statement reset"
         );
     }
 

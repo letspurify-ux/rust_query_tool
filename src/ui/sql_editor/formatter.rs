@@ -9229,8 +9229,8 @@ impl SqlEditorWidget {
                             let restore_state = paren_clause_restore_stack.pop().unwrap_or(None);
                             let current_line =
                                 active_query_owner_line(&out, at_line_start).trim_end();
-                            let line_ends_with_end = current_line.ends_with("END")
-                                || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                            let line_ends_with_end =
+                                sql_text::line_ends_with_identifier_sequence_before_inline_comment(
                                     current_line,
                                     &["END"],
                                 );
@@ -18599,6 +18599,58 @@ FROM dual d;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_split_function_local_from_inside_function_parens() {
+        let cases = [(
+            "EXTRACT",
+            r#"SELECT
+    EXTRACT
+    (
+        YEAR -- date part
+        FROM d.dt
+    ) AS extracted_value,
+    d.empno
+FROM dual d;"#,
+            "FROM d.dt",
+        )];
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        for (function_name, source, function_from_prefix) in cases {
+            let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+            let lines: Vec<&str> = formatted.lines().collect();
+
+            let function_from_idx = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(function_from_prefix))
+                .unwrap_or_else(|| panic!("split {function_name} FROM option line, got:\n{formatted}"));
+            let sibling_idx = lines
+                .iter()
+                .position(|line| line.trim_start() == "d.empno")
+                .unwrap_or_else(|| {
+                    panic!("SELECT-list sibling after split {function_name}, got:\n{formatted}")
+                });
+            let query_from_idx = lines
+                .iter()
+                .position(|line| line.trim_start().eq_ignore_ascii_case("FROM dual d;"))
+                .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{formatted}"));
+
+            assert!(
+                indent(lines[function_from_idx]) > indent(lines[query_from_idx]),
+                "split {function_name} function-local FROM should not be promoted to the outer query FROM depth, got:\n{formatted}"
+            );
+            assert_eq!(
+                indent(lines[sibling_idx]),
+                indent(lines[query_from_idx]).saturating_add(4),
+                "SELECT-list sibling after split {function_name} should return to list depth, got:\n{formatted}"
+            );
+            assert_eq!(
+                SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+                formatted,
+                "split {function_name} auto-formatting should be idempotent"
+            );
+        }
+    }
+
+    #[test]
     fn format_sql_basic_keeps_json_returning_inline_inside_function() {
         let source =
             "select json_value(e.json_profile, '$.level' returning varchar2(30)) as profile_level from emp e;";
@@ -22009,6 +22061,39 @@ END;"#;
         assert_eq!(
             reformatted, formatted,
             "formatting should stay stable for multiline q-quote tail close + condition continuation"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_identifier_suffix_end_before_close_paren_stays_inline() {
+        let input = r#"SELECT fn_legend(LEGEND) AS value_col
+FROM dual;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let legend_line_idx = lines
+            .iter()
+            .position(|line| line.contains("LEGEND"))
+            .unwrap_or_else(|| panic!("formatted output should contain LEGEND operand, got:\n{formatted}"));
+        let legend_line = lines[legend_line_idx];
+        let next_trimmed = lines
+            .get(legend_line_idx.saturating_add(1))
+            .map(|line| line.trim());
+
+        assert!(
+            legend_line.contains(')'),
+            "identifier ending with `END` must keep close paren on the same line, got:\n{formatted}"
+        );
+        assert_ne!(
+            next_trimmed,
+            Some(")"),
+            "identifier ending with `END` must not trigger case-close newline logic, got:\n{formatted}"
+        );
+
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            reformatted, formatted,
+            "identifier suffix `END` close-paren formatting should remain idempotent"
         );
     }
 
