@@ -33216,6 +33216,47 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_oracle_db_type_realigns_sibling_after_close_quoted_alias_comma_without_as(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) "nested_max_sal",
+    d.deptno
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().ends_with("\"nested_max_sal\","))
+            .map(|(idx, _)| idx)
+            .expect("oracle close quoted alias comma");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.deptno").expect("oracle sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "oracle sibling after `) \"alias\",` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::Oracle,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_oracle_db_type_realigns_sibling_after_close_alias_comma_with_inline_comment(
     ) {
         let source = r#"SELECT
@@ -33249,6 +33290,50 @@ FROM dept d;"#;
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[close_alias_idx]),
             "oracle sibling after `) alias, -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::Oracle,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_oracle_db_type_realigns_sibling_after_close_quoted_alias_comma_with_inline_comment(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) "nested_max_sal", -- close alias comment
+    d.deptno
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with(") \"nested_max_sal\", -- close alias comment")
+            })
+            .map(|(idx, _)| idx)
+            .expect("oracle close quoted alias comma with inline comment");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.deptno").expect("oracle sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "oracle sibling after `) \"alias\", -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -33333,6 +33418,47 @@ FROM dept d;"#;
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[close_alias_idx]),
             "mysql sibling after `) alias,` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_realigns_sibling_after_close_quoted_alias_comma_without_as(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) "nested_max_sal",
+    d.deptno
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().ends_with("\"nested_max_sal\","))
+            .map(|(idx, _)| idx)
+            .expect("mysql close quoted alias comma");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.deptno").expect("mysql sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "mysql sibling after `) \"alias\",` should stay on the same SELECT-list frame depth, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -33582,6 +33708,49 @@ FROM dual;"#;
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[split_operator_idx]),
             "SELECT-list sibling after split close-open chain should return to the canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_sibling_depth_after_close_quoted_alias_comma_with_inline_comment(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) "nested_max_sal", -- close alias comment
+    d.dname
+FROM dept d;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with(") \"nested_max_sal\", -- close alias comment")
+            })
+            .map(|(idx, _)| idx)
+            .expect("mysql close quoted alias comma with inline comment");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.dname").expect("mysql sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "mysql sibling after `) \"alias\", -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
