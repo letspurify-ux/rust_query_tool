@@ -1305,10 +1305,59 @@ fn phase_replace_into_is_table_context() {
 }
 
 #[test]
+fn phase_replace_low_priority_into_is_table_context() {
+    let ctx = analyze("REPLACE LOW_PRIORITY INTO |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_replace_low_priority_without_into_is_table_context() {
+    let ctx = analyze("REPLACE LOW_PRIORITY |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_insert_ignore_without_into_is_table_context() {
+    let ctx = analyze("INSERT IGNORE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_replace_into_column_list_is_column_context() {
     let ctx = analyze("REPLACE INTO t (|) VALUES (1)");
     assert_eq!(ctx.phase, SqlPhase::InsertColumnList);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn replace_low_priority_modifier_is_not_captured_as_target_table() {
+    let ctx = analyze("REPLACE LOW_PRIORITY INTO audit_emp (|) VALUES (1)");
+    assert_eq!(ctx.phase, SqlPhase::InsertColumnList);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "AUDIT_EMP"),
+        "expected REPLACE target table in scope, got {:?}",
+        names
+    );
+    assert!(
+        names.iter().all(|name| name != "LOW_PRIORITY"),
+        "modifier keyword must not be parsed as target table name: {:?}",
+        names
+    );
+}
+
+#[test]
+fn insert_low_priority_ignore_without_into_on_duplicate_update_is_column_context() {
+    let ctx =
+        analyze("INSERT LOW_PRIORITY IGNORE audit_emp (id) VALUES (1) ON DUPLICATE KEY UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::DmlSetTargetList);
+    assert!(ctx.phase.is_column_context());
+    assert_eq!(ctx.focused_tables, vec!["audit_emp".to_string()]);
 }
 
 #[test]
@@ -1421,10 +1470,96 @@ fn phase_truncate_table_is_table_context() {
 }
 
 #[test]
+fn phase_truncate_table_with_comment_is_table_context() {
+    let ctx = analyze("TRUNCATE /* ddl */ TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_lock_table_is_table_context() {
     let ctx = analyze("LOCK TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
     assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_lock_table_with_comment_is_table_context() {
+    let ctx = analyze("LOCK /* ddl */ TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_mysql_lock_tables_is_table_context() {
+    let ctx = analyze("LOCK TABLES |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_mysql_lock_tables_with_comment_is_table_context() {
+    let ctx = analyze("LOCK /* mariadb */ TABLES |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn mysql_lock_tables_mode_keyword_is_not_parsed_as_alias() {
+    let ctx = analyze("LOCK TABLES emp READ |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("READ")),
+        "LOCK TABLES READ mode keyword must not be parsed as alias: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+#[test]
+fn mysql_lock_tables_with_comment_mode_keyword_is_not_parsed_as_alias() {
+    let ctx = analyze("LOCK /* mariadb */ TABLES emp READ |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("READ")),
+        "LOCK TABLES READ mode keyword must not be parsed as alias when LOCK and TABLES are comment-separated: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+#[test]
+fn mysql_lock_tables_comma_reopens_table_target_context() {
+    let ctx = analyze("LOCK TABLES emp READ, |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn mysql_lock_tables_with_comment_comma_reopens_table_target_context() {
+    let ctx = analyze("LOCK /* mariadb */ TABLES emp READ, |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn mysql_lock_tables_quoted_read_alias_is_preserved() {
+    let ctx = analyze(r"LOCK TABLES emp AS `read` READ, |");
+
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(
+        ctx.tables_in_scope.iter().any(|table| {
+            table
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case("read"))
+        }),
+        "quoted alias named READ should be preserved in LOCK TABLES: {:?}",
+        ctx.tables_in_scope
+    );
 }
 
 #[test]

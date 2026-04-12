@@ -933,6 +933,103 @@ fn is_post_query_lock_clause(
     next_word_upper(tokens, lock_idx + 1).is_none_or(|(next_keyword, _)| next_keyword == "IN")
 }
 
+fn is_mysql_lock_table_mode_keyword(keyword: &str) -> bool {
+    matches!(keyword, "READ" | "WRITE" | "LOCAL" | "LOW_PRIORITY")
+}
+
+fn is_insert_target_modifier_keyword(keyword: &str) -> bool {
+    matches!(keyword, "LOW_PRIORITY" | "HIGH_PRIORITY" | "DELAYED" | "IGNORE")
+}
+
+fn should_promote_insert_modifier_to_target_context(
+    statement_kind: StatementKind,
+    current_phase: SqlPhase,
+    last_word: Option<&str>,
+) -> bool {
+    matches!(statement_kind, StatementKind::Insert)
+        && matches!(current_phase, SqlPhase::Initial)
+        && matches!(
+            last_word,
+            Some(previous)
+                if previous == "INSERT"
+                    || is_insert_target_modifier_keyword(previous)
+        )
+}
+
+fn should_keep_waiting_for_insert_target_after_modifier(
+    statement_kind: StatementKind,
+    current_phase: SqlPhase,
+    relation_state: Expectation,
+    keyword: &str,
+) -> bool {
+    matches!(statement_kind, StatementKind::Insert)
+        && matches!(current_phase, SqlPhase::IntoClause)
+        && relation_state.is_expect_table()
+        && is_insert_target_modifier_keyword(keyword)
+}
+
+fn has_table_target_statement_keyword_before_table(
+    tokens: &[SqlToken],
+    table_idx: usize,
+    last_word: Option<&str>,
+) -> bool {
+    last_word.is_some_and(is_table_target_statement_keyword)
+        || previous_word_upper(tokens, table_idx)
+            .is_some_and(|(keyword, _)| is_table_target_statement_keyword(&keyword))
+}
+
+fn has_lock_keyword_before_table(
+    tokens: &[SqlToken],
+    table_idx: usize,
+    last_word: Option<&str>,
+) -> bool {
+    matches!(last_word, Some("LOCK"))
+        || previous_word_upper(tokens, table_idx).is_some_and(|(keyword, _)| keyword == "LOCK")
+}
+
+fn sanitize_lock_table_alias(
+    tokens: &[SqlToken],
+    alias_start: usize,
+    alias: Option<String>,
+    alias_end: usize,
+    statement_kind: StatementKind,
+    lock_table_list_active: bool,
+) -> (Option<String>, usize) {
+    if !matches!(statement_kind, StatementKind::Lock) || !lock_table_list_active {
+        return (alias, alias_end);
+    }
+
+    let Some(alias_name) = alias else {
+        return (None, alias_end);
+    };
+
+    let upper = alias_name.to_ascii_uppercase();
+    if !is_mysql_lock_table_mode_keyword(upper.as_str()) {
+        return (Some(alias_name), alias_end);
+    }
+
+    // In `LOCK TABLES t READ`, lock-mode tokens are statement modifiers, not
+    // aliases. Keep quoted aliases available (`AS `read``) by checking the raw token.
+    let mut alias_token_idx = alias_end.min(tokens.len());
+    let mut alias_is_quoted = false;
+    while alias_token_idx > alias_start {
+        alias_token_idx -= 1;
+        match tokens.get(alias_token_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Word(raw_alias)) => {
+                alias_is_quoted = is_quoted_identifier(raw_alias);
+                break;
+            }
+            _ => break,
+        }
+    }
+    if alias_is_quoted {
+        (Some(alias_name), alias_end)
+    } else {
+        (None, alias_start)
+    }
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1271,6 +1368,7 @@ struct ParserDepthFrame {
     returning_clause_active: bool,
     locking_clause_active: bool,
     hierarchical_clause_active: bool,
+    lock_table_list_active: bool,
 }
 
 fn reset_relation_lookbehind(
@@ -1811,6 +1909,7 @@ impl Default for ParserDepthFrame {
             returning_clause_active: false,
             locking_clause_active: false,
             hierarchical_clause_active: false,
+            lock_table_list_active: false,
         }
     }
 }
@@ -2168,9 +2267,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
+                let current_statement_kind = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.statement_kind)
+                    .unwrap_or(StatementKind::Unknown);
                 let dml_set_active = depth_frames
                     .get(depth)
                     .is_some_and(|frame| frame.dml_set_active);
+                let lock_table_list_active = depth_frames
+                    .get(depth)
+                    .is_some_and(|frame| frame.lock_table_list_active);
                 if matches!(
                     current_phase,
                     SqlPhase::FromClause
@@ -2182,6 +2288,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     relation_state.expect_table();
                 } else if dml_set_active && matches!(current_phase, SqlPhase::SetClause) {
                     depth_frames[depth].phase = SqlPhase::DmlSetTargetList;
+                } else if matches!(current_statement_kind, StatementKind::Lock)
+                    && lock_table_list_active
+                {
+                    // MySQL/MariaDB `LOCK TABLES t READ, ...` continues with the
+                    // next table target after each comma.
+                    depth_frames[depth].phase = SqlPhase::IntoClause;
+                    relation_state.expect_table();
                 }
                 if matches!(cte_state, CteState::Inactive)
                     && depth_frames
@@ -2386,6 +2499,42 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 }
 
                 let current_phase = depth_frames[depth].phase;
+                let current_statement_kind = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.statement_kind)
+                    .unwrap_or(StatementKind::Unknown);
+
+                if is_insert_target_modifier_keyword(upper.as_str())
+                    && should_promote_insert_modifier_to_target_context(
+                        current_statement_kind,
+                        current_phase,
+                        last_word.as_deref(),
+                    )
+                {
+                    // MySQL/MariaDB allow optional insert-target modifiers before
+                    // the target table (`INSERT LOW_PRIORITY IGNORE t ...`).
+                    // Move into table-target context so the next identifier is
+                    // parsed as relation target even when `INTO` is omitted.
+                    depth_frames[depth].phase = SqlPhase::IntoClause;
+                    relation_state.expect_table();
+                    last_word = Some(upper);
+                    idx += 1;
+                    continue;
+                }
+
+                if should_keep_waiting_for_insert_target_after_modifier(
+                    current_statement_kind,
+                    current_phase,
+                    relation_state,
+                    upper.as_str(),
+                ) {
+                    // Keep waiting for the actual insert/replace target after
+                    // pre-target modifiers (`REPLACE LOW_PRIORITY INTO ...`).
+                    relation_state.expect_table();
+                    last_word = Some(upper);
+                    idx += 1;
+                    continue;
+                }
 
                 if upper == "LATERAL" && matches!(current_phase, SqlPhase::FromClause) {
                     relation_modifier_state.mark_lateral_like();
@@ -2454,6 +2603,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "LOCK" => {
                         depth_frames[depth].postgres_conflict_update_active = false;
+                        depth_frames[depth].lock_table_list_active = false;
                         let is_post_query_lock_modifier =
                             is_post_query_lock_clause(tokens, idx, current_phase);
                         if is_post_query_lock_modifier {
@@ -2473,6 +2623,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             } else {
                                 depth_frames[depth].statement_kind = StatementKind::Lock;
                                 depth_frames[depth].phase = SqlPhase::Initial;
+                                depth_frames[depth].lock_table_list_active = false;
                                 relation_state.clear();
                             }
                         }
@@ -2595,7 +2746,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 current_phase,
                                 SqlPhase::Initial | SqlPhase::WithClause
                             )
-                            && last_word.is_none() =>
+                            && previous_word_upper(tokens, idx).is_none() =>
                     {
                         // Standalone query-head TABLE expressions (including
                         // Oracle `WITH TYPE ...; TABLE (...)`) should reset the
@@ -2669,6 +2820,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // Oracle `LOCK TABLE ... IN <lock_mode> MODE` switches from
                             // table target to lock-mode keywords.
                             depth_frames[depth].phase = SqlPhase::Initial;
+                            depth_frames[depth].lock_table_list_active = false;
+                        }
+                        relation_state.clear();
+                    }
+                    "READ" | "WRITE" | "LOCAL" | "LOW_PRIORITY" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::Lock)
+                            && depth_frames
+                                .get(depth)
+                                .is_some_and(|frame| frame.lock_table_list_active)
+                            && !relation_state.is_expect_table()
+                        {
+                            // MySQL/MariaDB `LOCK TABLES` lock-mode modifiers are
+                            // postfix controls, not relation targets.
+                            depth_frames[depth].phase = SqlPhase::Initial;
                         }
                         relation_state.clear();
                     }
@@ -2710,23 +2879,37 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state = expectation;
                         }
                     }
-                    "TABLE"
-                        if last_word
-                            .as_deref()
-                            .is_some_and(is_table_target_statement_keyword)
-                            || is_comment_on_target(tokens, idx, last_word.as_deref())
-                            || is_create_table_target(tokens, idx) =>
+                    "TABLE" | "TABLES"
+                        if ((upper == "TABLE"
+                            && (has_table_target_statement_keyword_before_table(
+                                tokens,
+                                idx,
+                                last_word.as_deref(),
+                            )
+                                || is_comment_on_target(tokens, idx, last_word.as_deref())
+                                || is_create_table_target(tokens, idx)))
+                            || (upper == "TABLES"
+                                && has_lock_keyword_before_table(
+                                    tokens,
+                                    idx,
+                                    last_word.as_deref(),
+                                ))) =>
                     {
                         // DDL/DCL target object position (`TRUNCATE TABLE ...`,
-                        // `LOCK TABLE ...`, `ALTER TABLE ...`, `DROP TABLE ...`,
+                        // `LOCK TABLE ...`, `LOCK TABLES ...`, `ALTER TABLE ...`,
+                        // `DROP TABLE ...`,
                         // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`,
                         // `CREATE [GLOBAL TEMPORARY] TABLE ...`)
                         // should provide table-name completion.
-                        if matches!(last_word.as_deref(), Some("LOCK")) {
+                        if has_lock_keyword_before_table(tokens, idx, last_word.as_deref()) {
                             depth_frames[depth].statement_kind = StatementKind::Lock;
+                            depth_frames[depth].lock_table_list_active = upper == "TABLES";
                         } else if is_create_table_target(tokens, idx) {
                             depth_frames[depth].statement_kind = StatementKind::CreateTable;
                             depth_frames[depth].current_target_table = None;
+                            depth_frames[depth].lock_table_list_active = false;
+                        } else {
+                            depth_frames[depth].lock_table_list_active = false;
                         }
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
@@ -3282,6 +3465,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     .get(depth)
                                     .map(|frame| frame.statement_kind)
                                     .unwrap_or(StatementKind::Unknown);
+                                let lock_table_list_active = depth_frames
+                                    .get(depth)
+                                    .is_some_and(|frame| frame.lock_table_list_active);
                                 let create_table_target_consumed =
                                     matches!(current_phase, SqlPhase::IntoClause)
                                         && matches!(
@@ -3346,8 +3532,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 let relation_arg_tokens = relation_body_range
                                     .map(|range| token_range_slice(tokens, range));
-                                let (direct_alias, direct_after_alias) =
-                                    parse_alias_deep(tokens, relation_arg_end);
+                                let (direct_alias, direct_after_alias) = parse_alias_deep(
+                                    tokens,
+                                    relation_arg_end,
+                                );
+                                let (direct_alias, direct_after_alias) = sanitize_lock_table_alias(
+                                    tokens,
+                                    relation_arg_end,
+                                    direct_alias,
+                                    direct_after_alias,
+                                    current_statement_kind,
+                                    lock_table_list_active,
+                                );
                                 let derived_alias = parse_alias_after_derived_relation_clauses(
                                     tokens,
                                     relation_arg_end,
