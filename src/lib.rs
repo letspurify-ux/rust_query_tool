@@ -4,9 +4,9 @@
     clippy::type_complexity
 )]
 
-pub(crate) mod auto_format_engine;
 pub mod app;
 pub mod app_icon;
+pub(crate) mod auto_format_engine;
 pub mod db;
 #[cfg(not(feature = "no-splash"))]
 pub mod splash;

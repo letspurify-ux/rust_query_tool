@@ -141,8 +141,7 @@ pub(crate) fn line_closes_delimiter_frame_below_depth_before_token(
             continue;
         };
 
-        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol, line_start_frame_depth)
-        {
+        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol, line_start_frame_depth) {
             return true;
         }
     }

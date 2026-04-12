@@ -488,12 +488,10 @@ mod tests {
         // `) col` must also show stack_depth = 3 because the leading `)` pops
         // the Paren pushed by `SELECT (` before the record is taken.
         assert_eq!(
-            records[close_line_idx].stack_depth,
-            records[select_idx].stack_depth,
+            records[close_line_idx].stack_depth, records[select_idx].stack_depth,
             "`) col` stack_depth ({}) must equal `SELECT (` stack_depth ({}) — \
              leading `)` must consume the trailing paren before the record is captured",
-            records[close_line_idx].stack_depth,
-            records[select_idx].stack_depth,
+            records[close_line_idx].stack_depth, records[select_idx].stack_depth,
         );
     }
 
@@ -552,9 +550,7 @@ mod tests {
             "the surviving frame should be the parser-depth-1 Block anchor"
         );
         assert!(
-            stack
-                .iter()
-                .all(|frame| frame.parser_anchor_depth <= 1),
+            stack.iter().all(|frame| frame.parser_anchor_depth <= 1),
             "no frame anchored deeper than the current parser depth may survive"
         );
     }

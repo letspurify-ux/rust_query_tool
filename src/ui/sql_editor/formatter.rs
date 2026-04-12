@@ -7794,10 +7794,20 @@ impl SqlEditorWidget {
                             }
                         }
                     } else if is_block_comment && next_is_word_like {
-                        let keep_inline_alias_comment = matches!(
-                            (prev_word_upper.as_deref(), tokens.get(idx + 1)),
-                            (Some("AS" | "IS"), Some(SqlToken::Word(_)))
+                        let keep_inline_as_is_alias_comment = matches!(
+                            previous_non_comment_token,
+                            Some(SqlToken::Word(previous_word))
+                                if previous_word.eq_ignore_ascii_case("AS")
+                                    || previous_word.eq_ignore_ascii_case("IS")
                         );
+                        let keep_inline_alias_comment = keep_inline_as_is_alias_comment
+                            || Self::block_comment_keeps_inline_terminal_close_alias_tail(
+                                &out,
+                                tokens,
+                                idx,
+                                current_clause.as_deref(),
+                                Some(token_cache.meaningful_links()),
+                            );
                         if !keep_inline_alias_comment {
                             if keeps_next_line_continuation {
                                 let in_column_list = paren_stack
@@ -9996,6 +10006,125 @@ impl SqlEditorWidget {
                 structural_prefix,
             )
             .is_some()
+    }
+
+    fn next_meaningful_token_index_with_links(
+        tokens: &[SqlToken],
+        idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> Option<usize> {
+        meaningful_token_links
+            .and_then(|links| links.next_index(idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, idx))
+    }
+
+    fn close_alias_tail_token_text(token: &SqlToken) -> Option<&str> {
+        match token {
+            SqlToken::Word(word) => Some(word.as_str()),
+            SqlToken::String(literal) => Some(literal.as_str()),
+            SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+        }
+    }
+
+    fn allows_terminal_close_alias_tail_in_clause(current_clause: Option<&str>) -> bool {
+        matches!(
+            current_clause,
+            Some("SELECT" | "FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
+        )
+    }
+
+    fn token_ends_terminal_close_alias_tail(token: Option<&SqlToken>) -> bool {
+        match token {
+            None => true,
+            Some(SqlToken::Symbol(symbol)) => matches!(symbol.as_str(), "," | ")" | ";"),
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                Self::is_dml_clause_starter(upper.as_str())
+                    || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
+            }
+            Some(SqlToken::String(_) | SqlToken::Comment(_)) => false,
+        }
+    }
+
+    fn block_comment_keeps_inline_terminal_close_alias_tail(
+        out: &str,
+        tokens: &[SqlToken],
+        comment_idx: usize,
+        current_clause: Option<&str>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        if !Self::allows_terminal_close_alias_tail_in_clause(current_clause) {
+            return false;
+        }
+
+        let next_idx = Self::next_meaningful_token_index_with_links(
+            tokens,
+            comment_idx,
+            meaningful_token_links,
+        );
+        let Some(next_idx) = next_idx else {
+            return false;
+        };
+        let Some(next_token) = tokens.get(next_idx) else {
+            return false;
+        };
+        let Some(next_text) = Self::close_alias_tail_token_text(next_token) else {
+            return false;
+        };
+
+        let (alias_tail_suffix, boundary_token) =
+            if next_text.eq_ignore_ascii_case("AS") || next_text.eq_ignore_ascii_case("IS") {
+                let alias_idx = Self::next_meaningful_token_index_with_links(
+                    tokens,
+                    next_idx,
+                    meaningful_token_links,
+                );
+                let Some(alias_idx) = alias_idx else {
+                    return false;
+                };
+                let Some(alias_token) = tokens.get(alias_idx) else {
+                    return false;
+                };
+                let Some(alias_text) = Self::close_alias_tail_token_text(alias_token) else {
+                    return false;
+                };
+                let boundary_idx = Self::next_meaningful_token_index_with_links(
+                    tokens,
+                    alias_idx,
+                    meaningful_token_links,
+                );
+                (
+                    format!("{next_text} {alias_text}"),
+                    boundary_idx.and_then(|idx| tokens.get(idx)),
+                )
+            } else {
+                let boundary_idx = Self::next_meaningful_token_index_with_links(
+                    tokens,
+                    next_idx,
+                    meaningful_token_links,
+                );
+                (
+                    next_text.to_string(),
+                    boundary_idx.and_then(|idx| tokens.get(idx)),
+                )
+            };
+
+        let current_line = current_rendered_line(out).trim_end();
+        if current_line.is_empty() {
+            return false;
+        }
+
+        let mut alias_tail_line = current_line.to_string();
+        if !alias_tail_line.ends_with(' ') && !alias_tail_line.ends_with('\t') {
+            alias_tail_line.push(' ');
+        }
+        alias_tail_line.push_str(alias_tail_suffix.as_str());
+
+        crate::sql_text::line_has_leading_significant_close_paren(alias_tail_line.as_str())
+            && crate::sql_text::auto_format_structural_tail_is_alias_fragment(
+                alias_tail_line.as_str(),
+            )
+            && Self::token_ends_terminal_close_alias_tail(boundary_token)
     }
 
     fn format_trailing_meaningful_token_from_sql_token(
@@ -33619,6 +33748,156 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_close_keyword_like_alias_without_comma_with_block_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep alias casing */ window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mysql close keyword-like alias without comma block comment, got:\n{formatted}"
+                )
+            });
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql FROM after alias");
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ window"),
+            "mysql formatter should preserve keyword-like alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ WINDOW"),
+            "mysql formatter should not uppercase keyword-like close alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql close keyword-like alias block-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_close_keyword_like_as_alias_without_comma_with_block_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep alias casing */ AS window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ AS window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mysql close keyword-like AS alias without comma block comment, got:\n{formatted}"
+                )
+            });
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql FROM after AS alias");
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ AS window"),
+            "mysql formatter should preserve keyword-like AS alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ AS WINDOW"),
+            "mysql formatter should not uppercase keyword-like close AS alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql close keyword-like AS alias block-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_from_close_keyword_like_alias_without_comma_with_block_comment_on_from_depth(
+    ) {
+        let source = r#"SELECT window.id
+FROM (
+    SELECT 1 AS id
+) /* keep alias casing */ window
+WHERE window.id = 1;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!("mysql FROM close keyword-like alias block comment, got:\n{formatted}")
+            });
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ window"),
+            "mysql formatter should preserve keyword-like FROM alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ WINDOW"),
+            "mysql formatter should not uppercase keyword-like FROM close alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            lines[close_alias_idx].trim_start(),
+            ") /* keep alias casing */ window",
+            "mysql formatter should keep close alias fragment on the same line after block comment in FROM alias context, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_realigns_sibling_after_close_quoted_alias_comma_without_as(
     ) {
         let source = r#"SELECT
@@ -34128,8 +34407,7 @@ FROM dept d;"#;
     }
 
     #[test]
-    fn format_for_auto_formatting_mysql_keeps_sibling_depth_after_close_keyword_like_alias_comma(
-    ) {
+    fn format_for_auto_formatting_mysql_keeps_sibling_depth_after_close_keyword_like_alias_comma() {
         let source = r#"SELECT
     (
         SELECT MAX(emp.sal)
@@ -34267,6 +34545,164 @@ FROM dept d;"#;
             leading_spaces(lines[close_alias_idx]),
             leading_spaces(lines[from_idx]).saturating_add(4),
             "mysql auto-format close keyword-like alias inline-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_close_keyword_like_alias_without_comma_with_block_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep alias casing */ window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mysql auto-format close keyword-like alias without comma block comment, got:\n{formatted}"
+                )
+            });
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql auto-format FROM");
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ window"),
+            "mysql auto-format should preserve keyword-like alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ WINDOW"),
+            "mysql auto-format should not uppercase keyword-like close alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql auto-format close keyword-like alias block-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_close_keyword_like_as_alias_without_comma_with_block_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) /* keep alias casing */ AS window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ AS window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mysql auto-format close keyword-like AS alias without comma block comment, got:\n{formatted}"
+                )
+            });
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql auto-format FROM");
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ AS window"),
+            "mysql auto-format should preserve keyword-like AS alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ AS WINDOW"),
+            "mysql auto-format should not uppercase keyword-like close AS alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql auto-format close keyword-like AS alias block-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_from_close_keyword_like_alias_without_comma_with_block_comment_on_from_depth(
+    ) {
+        let source = r#"SELECT window.id
+FROM (
+    SELECT 1 AS id
+) /* keep alias casing */ window
+WHERE window.id = 1;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") /* keep alias casing */ window")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mysql auto-format FROM close keyword-like alias block comment, got:\n{formatted}"
+                )
+            });
+
+        assert!(
+            formatted.contains(") /* keep alias casing */ window"),
+            "mysql auto-format should preserve keyword-like FROM alias casing on close-alias block-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") /* keep alias casing */ WINDOW"),
+            "mysql auto-format should not uppercase keyword-like FROM close alias block-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            lines[close_alias_idx].trim_start(),
+            ") /* keep alias casing */ window",
+            "mysql auto-format should keep close alias fragment on the same line after block comment in FROM alias context, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_for_auto_formatting_with_db_type(

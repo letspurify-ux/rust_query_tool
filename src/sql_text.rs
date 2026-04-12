@@ -2389,7 +2389,11 @@ fn delimiter_as_dollar_quote_tag_bytes(delimiter: &str) -> Option<Vec<u8>> {
 
     bytes
         .get(1..bytes.len().saturating_sub(1))
-        .is_some_and(|middle| middle.iter().all(|byte| is_dollar_quote_tag_char_byte(*byte)))
+        .is_some_and(|middle| {
+            middle
+                .iter()
+                .all(|byte| is_dollar_quote_tag_char_byte(*byte))
+        })
         .then(|| bytes.to_vec())
 }
 
@@ -2572,7 +2576,8 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
                 .is_some_and(|tail| tail.starts_with(tag.as_slice()));
             if closes_here {
                 if line_starts_in_multiline_string && line < line_count {
-                    prefix_lengths[line] = Some(i.saturating_add(tag_len).saturating_sub(line_start));
+                    prefix_lengths[line] =
+                        Some(i.saturating_add(tag_len).saturating_sub(line_start));
                 }
                 dollar_quote_tag = None;
                 i = i.saturating_add(tag_len);
@@ -3561,7 +3566,8 @@ pub(crate) fn is_non_subquery_paren_suppressed_clause_continuation(text_upper: &
     }
 
     let words = meaningful_identifier_words_before_inline_comment(text_upper, 4);
-    let is_error_or_empty = |word: &str| word.eq_ignore_ascii_case("ERROR") || word.eq_ignore_ascii_case("EMPTY");
+    let is_error_or_empty =
+        |word: &str| word.eq_ignore_ascii_case("ERROR") || word.eq_ignore_ascii_case("EMPTY");
     let is_scalar_option_head = |word: &str| {
         word.eq_ignore_ascii_case("ERROR")
             || word.eq_ignore_ascii_case("EMPTY")
@@ -3573,19 +3579,27 @@ pub(crate) fn is_non_subquery_paren_suppressed_clause_continuation(text_upper: &
     };
 
     let starts_scalar_option = words.len() >= 3
-        && words.get(1).is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        && words
+            .get(1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("ON"))
         && words.get(2).is_some_and(|word| is_error_or_empty(word))
-        && words.first().is_some_and(|word| is_scalar_option_head(word));
+        && words
+            .first()
+            .is_some_and(|word| is_scalar_option_head(word));
     if starts_scalar_option {
         return true;
     }
 
     words.len() >= 4
-        && words.first().is_some_and(|word| word.eq_ignore_ascii_case("EMPTY"))
+        && words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("EMPTY"))
         && words.get(1).is_some_and(|word| {
             word.eq_ignore_ascii_case("ARRAY") || word.eq_ignore_ascii_case("OBJECT")
         })
-        && words.get(2).is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        && words
+            .get(2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("ON"))
         && words.get(3).is_some_and(|word| is_error_or_empty(word))
 }
 
@@ -7487,9 +7501,7 @@ mod tests {
         assert!(line_has_mixed_leading_close_continuation(
             ") FOR UPDATE NOWAIT"
         ));
-        assert!(line_has_mixed_leading_close_continuation(
-            ") TRUE ON ERROR"
-        ));
+        assert!(line_has_mixed_leading_close_continuation(") TRUE ON ERROR"));
         assert!(line_has_mixed_leading_close_continuation(
             ") FALSE ON EMPTY"
         ));
@@ -7499,7 +7511,9 @@ mod tests {
 
         assert!(!line_has_mixed_leading_close_continuation(")"));
         assert!(!line_has_mixed_leading_close_continuation("),"));
-        assert!(!line_has_mixed_leading_close_continuation(") # comment only"));
+        assert!(!line_has_mixed_leading_close_continuation(
+            ") # comment only"
+        ));
         assert!(!line_has_mixed_leading_close_continuation(") bonus_view"));
         assert!(!line_has_mixed_leading_close_continuation(") window,"));
         assert!(!line_has_mixed_leading_close_continuation(") THEN"));
@@ -7516,11 +7530,19 @@ mod tests {
         assert!(auto_format_structural_tail_is_simple_alias(
             ") /* gap */ AS `window`,"
         ));
-        assert!(!auto_format_structural_tail_is_alias_fragment(") WINDOW w AS ("));
-        assert!(!auto_format_structural_tail_is_alias_fragment(") ORDER BY empno"));
+        assert!(!auto_format_structural_tail_is_alias_fragment(
+            ") WINDOW w AS ("
+        ));
+        assert!(!auto_format_structural_tail_is_alias_fragment(
+            ") ORDER BY empno"
+        ));
         assert!(!auto_format_structural_tail_is_simple_alias(") window"));
-        assert!(!auto_format_structural_tail_is_simple_alias(") WINDOW w AS ("));
-        assert!(!auto_format_structural_tail_is_simple_alias(") ORDER BY empno"));
+        assert!(!auto_format_structural_tail_is_simple_alias(
+            ") WINDOW w AS ("
+        ));
+        assert!(!auto_format_structural_tail_is_simple_alias(
+            ") ORDER BY empno"
+        ));
     }
 
     #[test]
