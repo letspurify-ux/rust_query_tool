@@ -903,8 +903,8 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "ENFORCED",
     "ENGINE",
     "ENGINES",
-    "ERRORS",
     "ENUM",
+    "ERRORS",
     "ESCAPED",
     "EVENT",
     "EVENTS",
@@ -3407,6 +3407,32 @@ pub(crate) fn is_from_consuming_function(name: &str) -> bool {
 pub(crate) fn is_non_subquery_paren_suppressed_clause_start(text_upper: &str) -> bool {
     let sequences: &[&[&str]] = &[&["RETURNING"], &["WITH"], &["SET"], &["INSERT"]];
     sequences
+        .iter()
+        .any(|sequence| line_starts_with_identifier_sequence(text_upper, sequence))
+}
+
+/// Function-local option continuation lines that can follow a suppressed
+/// clause-start inside the same ordinary-paren frame.
+///
+/// Examples:
+/// - `ON ERROR NULL`
+/// - `ON EMPTY NULL`
+/// - `ERROR ON ERROR`
+/// - `NULL ON EMPTY`
+pub(crate) fn is_non_subquery_paren_suppressed_clause_continuation(text_upper: &str) -> bool {
+    let continuation_sequences: &[&[&str]] = &[
+        &["ON", "ERROR"],
+        &["ON", "EMPTY"],
+        &["ERROR", "ON", "ERROR"],
+        &["ERROR", "ON", "EMPTY"],
+        &["EMPTY", "ON", "ERROR"],
+        &["EMPTY", "ON", "EMPTY"],
+        &["NULL", "ON", "ERROR"],
+        &["NULL", "ON", "EMPTY"],
+        &["DEFAULT", "ON", "ERROR"],
+        &["DEFAULT", "ON", "EMPTY"],
+    ];
+    continuation_sequences
         .iter()
         .any(|sequence| line_starts_with_identifier_sequence(text_upper, sequence))
 }
@@ -6848,6 +6874,28 @@ mod tests {
         ));
         assert!(!is_non_subquery_paren_suppressed_clause_start(
             "WHERE emp_id = 1"
+        ));
+    }
+
+    #[test]
+    fn non_subquery_paren_suppressed_clause_continuation_covers_json_value_on_error_shapes() {
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "ON ERROR NULL"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "ON EMPTY NULL"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "NULL ON ERROR"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "DEFAULT ON EMPTY"
+        ));
+        assert!(!is_non_subquery_paren_suppressed_clause_continuation(
+            "ON deptno = e.deptno"
+        ));
+        assert!(!is_non_subquery_paren_suppressed_clause_continuation(
+            "USING (deptno)"
         ));
     }
 

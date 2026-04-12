@@ -1907,38 +1907,56 @@ impl QueryExecutor {
             non_subquery_depth
         }
 
+        fn non_subquery_paren_frame_index_after_leading_closes(
+            paren_stack: &[AutoFormatSubqueryParenKind],
+            leading_close_count: usize,
+        ) -> Option<usize> {
+            let remaining_len = paren_stack.len().saturating_sub(leading_close_count);
+            if remaining_len == 0 {
+                return None;
+            }
+
+            let top_idx = remaining_len.saturating_sub(1);
+            paren_stack.get(top_idx).and_then(|paren_kind| {
+                matches!(
+                    *paren_kind,
+                    AutoFormatSubqueryParenKind::NonSubquery
+                        | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                )
+                .then_some(top_idx)
+            })
+        }
+
         fn inside_non_subquery_paren_context_after_leading_closes(
             paren_stack: &[AutoFormatSubqueryParenKind],
             leading_close_count: usize,
         ) -> bool {
             // Mixed leading-close lines (e.g. `) RETURNING ...`) must classify
             // structural tail after consuming the visible leading close run.
-            let remaining_len = paren_stack.len().saturating_sub(leading_close_count);
-            if remaining_len == 0 {
-                return false;
-            }
-            paren_stack
-                .get(remaining_len - 1)
-                .is_some_and(|paren_kind| {
-                    matches!(
-                        *paren_kind,
-                        AutoFormatSubqueryParenKind::NonSubquery
-                            | AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
-                    )
-                })
+            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
+                .is_some()
         }
 
         fn inside_from_consuming_non_subquery_paren_context_after_leading_closes(
             paren_stack: &[AutoFormatSubqueryParenKind],
             leading_close_count: usize,
         ) -> bool {
-            let remaining_len = paren_stack.len().saturating_sub(leading_close_count);
-            if remaining_len == 0 {
-                return false;
-            }
-            paren_stack.get(remaining_len - 1).is_some_and(|paren_kind| {
-                *paren_kind == AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
-            })
+            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
+                .and_then(|idx| paren_stack.get(idx))
+                .is_some_and(|paren_kind| {
+                    *paren_kind == AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
+                })
+        }
+
+        fn function_local_non_subquery_clause_active_after_leading_closes(
+            paren_stack: &[AutoFormatSubqueryParenKind],
+            function_local_clause_active_stack: &[bool],
+            leading_close_count: usize,
+        ) -> bool {
+            non_subquery_paren_frame_index_after_leading_closes(paren_stack, leading_close_count)
+                .and_then(|idx| function_local_clause_active_stack.get(idx))
+                .copied()
+                .unwrap_or(false)
         }
 
         let parser_depths = Self::line_block_depths(sql);
@@ -2027,6 +2045,7 @@ impl QueryExecutor {
         let mut mysql_declare_handler_block_depths: Vec<usize> = Vec::new();
         let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
         let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
+        let mut auto_format_function_local_clause_active_stack: Vec<bool> = Vec::new();
         let mut pending_auto_format_subquery_paren_count = 0usize;
         let mut auto_format_paren_observer = SqlParserEngine::new();
         let mut mysql_delimiter = ";".to_string();
@@ -2169,6 +2188,12 @@ impl QueryExecutor {
                     &auto_format_subquery_paren_stack,
                     leading_significant_close_count,
                 );
+            let function_local_non_subquery_clause_active =
+                function_local_non_subquery_clause_active_after_leading_closes(
+                    &auto_format_subquery_paren_stack,
+                    &auto_format_function_local_clause_active_stack,
+                    leading_significant_close_count,
+                );
             let non_subquery_depth_since_query = non_subquery_paren_depth_after_leading_closes
                 .saturating_sub(
                     query_frames
@@ -2176,10 +2201,9 @@ impl QueryExecutor {
                         .map(|frame| frame.non_subquery_paren_depth_at_start)
                         .unwrap_or(0),
                 );
-            let inside_function_local_non_subquery_paren = inside_non_subquery_paren_context
-                && non_subquery_depth_since_query > 0;
-            let suppress_function_local_from_clause_start =
-                inside_function_local_non_subquery_paren
+            let inside_function_local_non_subquery_paren =
+                inside_non_subquery_paren_context && non_subquery_depth_since_query > 0;
+            let suppress_function_local_from_clause_start = inside_function_local_non_subquery_paren
                     && inside_from_consuming_non_subquery_paren_context
                     // Function-local `FROM` is only safe to suppress for
                     // dedicated FROM-consuming function families. Generic
@@ -2187,12 +2211,20 @@ impl QueryExecutor {
                     // clauses later in the same statement, so they must not
                     // blanket-suppress `FROM`.
                     && sql_text::starts_with_keyword_token(clause_detection_upper, "FROM");
-            let suppress_non_subquery_paren_clause_start =
+            let current_line_starts_function_local_suppressed_clause =
                 inside_function_local_non_subquery_paren
-                    && (suppress_function_local_from_clause_start
-                        || sql_text::is_non_subquery_paren_suppressed_clause_start(
-                            clause_detection_upper,
-                        ));
+                    && sql_text::is_non_subquery_paren_suppressed_clause_start(
+                        clause_detection_upper,
+                    );
+            let suppress_function_local_option_clause_continuation =
+                function_local_non_subquery_clause_active
+                    && sql_text::is_non_subquery_paren_suppressed_clause_continuation(
+                        clause_detection_upper,
+                    );
+            let suppress_non_subquery_paren_clause_start = inside_function_local_non_subquery_paren
+                && (suppress_function_local_from_clause_start
+                    || current_line_starts_function_local_suppressed_clause
+                    || suppress_function_local_option_clause_continuation);
             let current_line_starts_elsif =
                 sql_text::identifier_words_start_with(&line_words, &["ELSIF"]);
             let current_line_starts_elseif =
@@ -2206,6 +2238,18 @@ impl QueryExecutor {
                 mysql_on_duplicate_key_update_active
                     && inside_non_subquery_paren_context
                     && sql_text::identifier_words_first_is(&line_words, "VALUES");
+            if current_line_starts_function_local_suppressed_clause {
+                if let Some(frame_idx) = non_subquery_paren_frame_index_after_leading_closes(
+                    &auto_format_subquery_paren_stack,
+                    leading_significant_close_count,
+                ) {
+                    if let Some(active) =
+                        auto_format_function_local_clause_active_stack.get_mut(frame_idx)
+                    {
+                        *active = true;
+                    }
+                }
+            }
             let current_line_is_exact_else =
                 sql_text::identifier_words_exact(&line_words, &["ELSE"]);
             let current_line_is_exact_then =
@@ -2510,8 +2554,10 @@ impl QueryExecutor {
                         trimmed_upper,
                         &["ELSE"],
                     ));
-                let is_join_clause = Self::auto_format_is_join_clause(clause_detection_upper);
+                let is_join_clause = !suppress_non_subquery_paren_clause_start
+                    && Self::auto_format_is_join_clause(clause_detection_upper);
                 let is_join_condition_clause = !current_line_is_mysql_on_duplicate_key_update
+                    && !suppress_non_subquery_paren_clause_start
                     && Self::auto_format_is_join_condition_clause(clause_detection_upper);
                 current_line_is_join_clause = is_join_clause;
                 current_line_is_join_condition_clause = is_join_condition_clause;
@@ -2538,6 +2584,7 @@ impl QueryExecutor {
                         || keeps_pending_from_item_body_after_leading_close);
                 let is_query_condition_continuation_clause =
                     !current_line_is_mysql_on_duplicate_key_update
+                        && !suppress_non_subquery_paren_clause_start
                         && Self::auto_format_is_query_condition_continuation_clause(
                             clause_detection_upper,
                         );
@@ -2550,7 +2597,8 @@ impl QueryExecutor {
                         && !current_line_starts_pending_merge_branch_header
                         && active_merge_branch_header
                             .is_none_or(|progress| progress.uses_condition_depth);
-                let is_for_update_clause = frame.head_kind == Some(AutoFormatClauseKind::Select)
+                let is_for_update_clause = !suppress_non_subquery_paren_clause_start
+                    && frame.head_kind == Some(AutoFormatClauseKind::Select)
                     && Self::auto_format_is_for_update_clause(clause_detection_upper);
                 let is_for_update_update_continuation = frame.pending_for_update_clause_update_line
                     && clause_kind == Some(AutoFormatClauseKind::Update);
@@ -3720,8 +3768,10 @@ impl QueryExecutor {
                         }
 
                         auto_format_subquery_paren_stack.push(paren_kind);
+                        auto_format_function_local_clause_active_stack.push(false);
                     } else if symbol == b')' {
                         if let Some(closed_kind) = auto_format_subquery_paren_stack.pop() {
+                            let _ = auto_format_function_local_clause_active_stack.pop();
                             if matches!(
                                 closed_kind,
                                 AutoFormatSubqueryParenKind::Pending
@@ -3764,6 +3814,7 @@ impl QueryExecutor {
                 mysql_trigger_body_frame = None;
                 forall_body_frame = None;
                 auto_format_subquery_paren_stack.clear();
+                auto_format_function_local_clause_active_stack.clear();
                 pending_auto_format_subquery_paren_count = 0;
                 mysql_on_duplicate_key_update_active = false;
             }
@@ -21381,6 +21432,56 @@ FROM qt_fmt_emp e;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_function_local_on_error_non_structural() {
+        let sql = r#"SELECT
+    JSON_VALUE (
+        e.payload,
+        '$.name'
+        RETURNING VARCHAR2 (30)
+        ON ERROR NULL
+        ON EMPTY NULL
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let on_error_idx = find_line_starting_with("ON ERROR NULL");
+        let on_empty_idx = find_line_starting_with("ON EMPTY NULL");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM event_log e;");
+
+        for option_idx in [on_error_idx, on_empty_idx] {
+            assert_eq!(
+                contexts[option_idx].line_semantic,
+                AutoFormatLineSemantic::None,
+                "function-local JSON_VALUE option should stay non-structural"
+            );
+            assert_ne!(
+                contexts[option_idx].query_role,
+                AutoFormatQueryRole::Base,
+                "function-local JSON_VALUE option should not reopen query-base state"
+            );
+            assert!(
+                contexts[option_idx].auto_depth > contexts[from_idx].auto_depth,
+                "function-local JSON_VALUE option line should stay deeper than outer FROM clause"
+            );
+        }
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "SELECT-list sibling should return to canonical list depth after function-local ON ERROR/ON EMPTY options"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_function_local_with_wrapper_non_structural() {
         let sql = r#"SELECT
     JSON_QUERY (
@@ -22499,9 +22600,7 @@ FROM dual;"#;
             .enumerate()
             .filter_map(|(idx, line)| (line.trim_start() == "SELECT").then_some(idx));
         let first_select_idx = top_level_select_indices.next().unwrap_or(0);
-        let second_select_idx = top_level_select_indices
-            .next()
-            .unwrap_or(first_select_idx);
+        let second_select_idx = top_level_select_indices.next().unwrap_or(first_select_idx);
         let second_select_item_idx = lines
             .iter()
             .position(|line| line.trim_start() == "2 AS next_value")

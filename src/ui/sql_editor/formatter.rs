@@ -1051,8 +1051,8 @@ impl ConstructState {
         // anchors. `RETURNING` keeps its dedicated local layout policy.
         let frame_guarded_function_local_clause_starter =
             matches!(keyword, "FROM" | "WITH" | "SET" | "INSERT");
-        let non_subquery_paren_clause_starter = keyword == "FROM"
-            || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword);
+        let non_subquery_paren_clause_starter =
+            keyword == "FROM" || sql_text::is_non_subquery_paren_suppressed_clause_start(keyword);
         if suppress_comma_break_depth > 0
             && ((inside_function_local_non_query_paren
                 && frame_guarded_function_local_clause_starter)
@@ -5595,14 +5595,13 @@ impl SqlEditorWidget {
                                 .map(|_| {
                                     let rendered_indent =
                                         current_output_line_indent(&out, line_indent);
-                                    let owner_indent = if at_line_start
-                                        && rendered_indent == 0
-                                        && line_indent > 0
-                                    {
-                                        line_indent
-                                    } else {
-                                        rendered_indent
-                                    };
+                                    let owner_indent =
+                                        if at_line_start && rendered_indent == 0 && line_indent > 0
+                                        {
+                                            line_indent
+                                        } else {
+                                            rendered_indent
+                                        };
                                     owner_indent.saturating_add(1)
                                 });
                             let returning_owner_body_indent = (upper == "RETURNING"
@@ -8359,10 +8358,7 @@ impl SqlEditorWidget {
                                             paren_stack.is_empty().then(|| {
                                                 query_body_clause_base_depth
                                                     .unwrap_or_else(|| {
-                                                        base_indent(
-                                                            indent_level,
-                                                            open_cursor_state,
-                                                        )
+                                                        base_indent(indent_level, open_cursor_state)
                                                     })
                                                     .saturating_add(1)
                                             });
@@ -22329,7 +22325,8 @@ WHERE (((status = 'A' OR status = 'B')
         wi.status,
         wi.points;"#;
 
-        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(source, false, None);
+        let formatted =
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(source, false, None);
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
@@ -24285,7 +24282,12 @@ FROM emp_json e;"#;
         let outer_sibling_idx = lines
             .iter()
             .position(|line| line.trim_start() == "e.empno")
-            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_QUERY, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "outer SELECT-list sibling after nested JSON_QUERY, got:\n{}",
+                    formatted
+                )
+            });
         let outer_from_idx = lines
             .iter()
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
@@ -24714,6 +24716,52 @@ FROM event_log e;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_json_value_on_error_prefix_lines_inside_function_parens() {
+        let source = r#"SELECT
+    JSON_VALUE (
+        e.payload, '$.name'
+        RETURNING VARCHAR2 (30) -- type
+        ON ERROR NULL -- policy
+        ON EMPTY NULL -- fallback
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}\n{formatted}"))
+        };
+
+        let on_error_idx = find_line_starting_with("ON ERROR NULL -- policy");
+        let on_empty_idx = find_line_starting_with("ON EMPTY NULL -- fallback");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM event_log e;");
+
+        for option_idx in [on_error_idx, on_empty_idx] {
+            assert!(
+                indent(lines[option_idx]) > indent(lines[from_idx]),
+                "JSON_VALUE ON ERROR/ON EMPTY option line should stay inside function parens, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "SELECT-list sibling after ON-prefixed JSON_VALUE options should return to canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "ON-prefixed JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
     fn format_for_auto_formatting_keeps_nested_subquery_json_value_on_error_inside_function_parens()
     {
         let source = r#"SELECT
@@ -24734,11 +24782,21 @@ FROM event_log e;"#;
         let returning_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("RETURNING VARCHAR2 (30)"))
-            .unwrap_or_else(|| panic!("nested JSON_VALUE RETURNING option line, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "nested JSON_VALUE RETURNING option line, got:\n{}",
+                    formatted
+                )
+            });
         let on_error_idx = lines
             .iter()
             .position(|line| line.contains("ON ERROR"))
-            .unwrap_or_else(|| panic!("nested JSON_VALUE ON ERROR option line, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "nested JSON_VALUE ON ERROR option line, got:\n{}",
+                    formatted
+                )
+            });
         let subquery_from_idx = lines
             .iter()
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log x"))
@@ -24746,7 +24804,12 @@ FROM event_log e;"#;
         let outer_sibling_idx = lines
             .iter()
             .position(|line| line.trim_start() == "e.empno")
-            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_VALUE, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "outer SELECT-list sibling after nested JSON_VALUE, got:\n{}",
+                    formatted
+                )
+            });
         let outer_from_idx = lines
             .iter()
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM event_log e;"))
@@ -24796,11 +24859,18 @@ FROM emp_json e;"#;
                 line.trim_start()
                     .starts_with("INSERT '$.audit.user' = USER")
             })
-            .unwrap_or_else(|| panic!("nested JSON_TRANSFORM INSERT option line, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "nested JSON_TRANSFORM INSERT option line, got:\n{}",
+                    formatted
+                )
+            });
         let function_set_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("SET '$.status' = 'DONE'"))
-            .unwrap_or_else(|| panic!("nested JSON_TRANSFORM SET option line, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!("nested JSON_TRANSFORM SET option line, got:\n{}", formatted)
+            });
         let subquery_from_idx = lines
             .iter()
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json x"))
@@ -24808,7 +24878,12 @@ FROM emp_json e;"#;
         let outer_sibling_idx = lines
             .iter()
             .position(|line| line.trim_start() == "e.empno")
-            .unwrap_or_else(|| panic!("outer SELECT-list sibling after nested JSON_TRANSFORM, got:\n{}", formatted));
+            .unwrap_or_else(|| {
+                panic!(
+                    "outer SELECT-list sibling after nested JSON_TRANSFORM, got:\n{}",
+                    formatted
+                )
+            });
         let outer_from_idx = lines
             .iter()
             .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
