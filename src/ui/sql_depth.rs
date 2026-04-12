@@ -52,6 +52,7 @@ fn apply_symbol_to_strict_stack(stack: &mut Vec<DelimiterFrameKind>, symbol: &st
 fn apply_symbol_to_close_detection_stack(
     stack: &mut Vec<DelimiterFrameKind>,
     symbol: &str,
+    line_start_frame_depth: usize,
 ) -> bool {
     for sym_ch in symbol.chars() {
         if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
@@ -69,7 +70,12 @@ fn apply_symbol_to_close_detection_stack(
             .is_some_and(|top| top.can_be_closed_by(close_kind))
         {
             stack.pop();
-            return true;
+            // Keep consuming the current symbol token in token order. A grouped
+            // symbol like `())(` can cross below line-start depth only on a
+            // later close event inside the same token.
+            if stack.len() < line_start_frame_depth {
+                return true;
+            }
         }
     }
 
@@ -135,8 +141,7 @@ pub(crate) fn line_closes_delimiter_frame_below_depth_before_token(
             continue;
         };
 
-        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol)
-            && frame_stack.len() < line_start_frame_depth
+        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol, line_start_frame_depth)
         {
             return true;
         }
@@ -452,6 +457,16 @@ mod tests {
         assert!(
             !line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, comma_idx, 1),
             "mismatched close inside a local frame must not be treated as closing a parent frame"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_tracks_later_close_inside_single_grouped_symbol_token() {
+        let tokens = [sym("())("), sym(","), word("stable")];
+
+        assert!(
+            line_closes_delimiter_frame_below_depth_before_token(&tokens, 0, 1, 2),
+            "grouped symbol token `())(` should still detect the later close that drops below the line-start frame depth"
         );
     }
 

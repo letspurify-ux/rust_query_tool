@@ -33548,6 +33548,42 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_keeps_sibling_depth_after_multiline_literal_payload_leading_close_then_subquery(
+    ) {
+        let source = r#"SELECT
+    'first line
+) literal payload' || (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) AS nested_max_sal,
+    d.dname
+FROM dept d;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start().starts_with(") AS nested_max_sal,"))
+            .map(|(idx, _)| idx)
+            .expect("close alias after multiline literal payload");
+        let sibling_idx = find_line_starting_with(&lines, "d.dname")
+            .expect("sibling select item after multiline literal payload");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "sibling after multiline-literal payload + subquery close alias must stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic(&formatted),
+            formatted,
+            "formatting should stay idempotent for multiline-literal payload leading-close + subquery owner chain"
+        );
+    }
+
+    #[test]
     fn line_closes_paren_frame_below_line_start_before_token_tracks_close_then_open_token_order() {
         let tokens = SqlEditorWidget::tokenize_sql(") + (, stable");
         let comma_idx = tokens
