@@ -2758,6 +2758,11 @@ impl SqlEditorWidget {
         Self::format_sql_basic_with_terminator_policy_for_db_type(sql, true, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn format_sql_basic_no_cache(sql: &str) -> String {
+        Self::format_sql_basic_no_cache_inner(sql, true, None)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn format_sql_basic_for_db_type(sql: &str, db_type: DatabaseType) -> String {
         Self::format_sql_basic_with_terminator_policy_for_db_type(sql, true, Some(db_type))
@@ -3057,6 +3062,15 @@ impl SqlEditorWidget {
         Self::format_sql_basic_with_terminator_policy_for_db_type(sql, true, preferred_db_type)
     }
 
+    #[cfg(test)]
+    fn format_sql_basic_no_cache_inner(
+        sql: &str,
+        append_missing_terminator: bool,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> String {
+        Self::format_sql_basic_core(sql, append_missing_terminator, preferred_db_type)
+    }
+
     fn format_sql_basic_with_terminator_policy_for_db_type(
         sql: &str,
         append_missing_terminator: bool,
@@ -3068,6 +3082,22 @@ impl SqlEditorWidget {
             return cached;
         }
 
+        let formatted =
+            Self::format_sql_basic_core(sql, append_missing_terminator, preferred_db_type);
+        Self::format_result_cache_store(
+            sql,
+            &formatted,
+            append_missing_terminator,
+            preferred_db_type,
+        );
+        formatted
+    }
+
+    fn format_sql_basic_core(
+        sql: &str,
+        append_missing_terminator: bool,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> String {
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(sql, preferred_db_type),
@@ -3151,12 +3181,6 @@ impl SqlEditorWidget {
             }
         }
 
-        Self::format_result_cache_store(
-            sql,
-            &formatted,
-            append_missing_terminator,
-            preferred_db_type,
-        );
         formatted
     }
 
@@ -8836,6 +8860,15 @@ impl SqlEditorWidget {
                             } else {
                                 ParenFormatFrameKind::Compact
                             };
+                            // CASE is always expanded to multiple lines by the formatter.
+                            // Triggering the promotion only when `paren_body_has_newline` is
+                            // true (i.e. CASE was already multiline in the *input*) creates a
+                            // cycle: first pass keeps `SELECT func(` on one line, formatter
+                            // expands CASE inside, second pass sees the newline and splits
+                            // SELECT from func(. Removing the input-dependent gate makes the
+                            // decision structural: whenever the first SELECT list item opens
+                            // a paren whose first token is CASE, always promote SELECT to its
+                            // own line so both passes produce the same canonical output.
                             let promotes_first_clause_owner_to_body_depth =
                                 matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
                                     && !at_line_start
@@ -8850,17 +8883,16 @@ impl SqlEditorWidget {
                                         is_query_paren,
                                         paren_stack.len(),
                                     )
-                                    && paren_body_has_newline
                                     && matches!(
                                         next_non_comment,
                                         Some(SqlToken::Word(word))
                                             if word.eq_ignore_ascii_case("CASE")
                                     );
                             if promotes_first_clause_owner_to_body_depth {
-                                // Frame-first normalization: when a multiline first list item
-                                // opens on the same clause-header line (`SELECT SUM(`), promote
-                                // it onto the clause body depth so all sibling owners reuse the
-                                // same parent list frame.
+                                // Frame-first normalization: when the first SELECT/SET list
+                                // item opens a paren containing CASE (which is always
+                                // formatted multiline), promote SELECT onto its own line so
+                                // all sibling owners reuse the same parent list frame.
                                 force_select_list_newline(&mut out, &mut select_list_layout_state);
                                 line_indent = active_list_indent(
                                     indent_level,
