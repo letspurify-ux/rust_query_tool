@@ -11,8 +11,7 @@ pub use types::*;
 // as `auto_format_engine`) can reference them without naming the private
 // `script` submodule directly.
 pub(crate) use script::{
-    AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatLineContext, AutoFormatLineSemantic,
-    AutoFormatQueryRole,
+    AutoFormatClauseKind, AutoFormatLineContext,
 };
 
 #[cfg(test)]

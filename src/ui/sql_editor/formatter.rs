@@ -4688,7 +4688,19 @@ impl SqlEditorWidget {
                             needs_space: &mut bool,
                             line_indent: &mut usize| {
             if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
+                let current_line_is_whitespace_only = out
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| !line.is_empty() && line.chars().all(|ch| ch == ' '));
+                if current_line_is_whitespace_only {
+                    if let Some(last_newline_idx) = out.rfind('\n') {
+                        out.truncate(last_newline_idx + 1);
+                    } else {
+                        out.clear();
+                    }
+                } else {
+                    out.push('\n');
+                }
             }
             *line_indent = indent_level + extra;
             *at_line_start = true;
@@ -18695,6 +18707,86 @@ JOIN emp_data e
             !formatted.contains("e.salary,\n\n    CASE"),
             "Formatter should not keep an extra blank line before CASE in the SELECT list, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_oracle_db_type_collapses_blank_line_before_case_after_close_as_alias_comma_with_apply(
+    ) {
+        let source = r#"SELECT
+    e.emp_id,
+    (
+        SELECT MAX(s2.amount)
+        FROM qt_sales s2
+        WHERE s2.emp_id = e.emp_id
+    ) AS max_amount,
+
+    CASE
+        WHEN x.sale_cnt = 0 THEN 'NO_SALES'
+        ELSE 'HAS_SALES'
+    END AS rank_bucket
+FROM qt_employees e
+CROSS APPLY (
+    SELECT COUNT(*) AS sale_cnt
+    FROM qt_sales s
+    WHERE s.emp_id = e.emp_id
+) x;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+
+        assert!(
+            formatted.contains(") AS max_amount,\n    CASE"),
+            "CASE select item should follow close-alias comma without an empty line in APPLY query, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(") AS max_amount,\n\n    CASE"),
+            "Formatter should remove blank line before CASE after close-alias comma in APPLY query, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_collapses_blank_line_before_case_after_close_as_alias_comma_with_apply(
+    ) {
+        let source = r#"SELECT
+    e.emp_id,
+    (
+        SELECT MAX(s2.amount)
+        FROM qt_sales s2
+        WHERE s2.emp_id = e.emp_id
+    ) AS max_amount,
+
+    CASE
+        WHEN x.sale_cnt = 0 THEN 'NO_SALES'
+        ELSE 'HAS_SALES'
+    END AS rank_bucket
+FROM qt_employees e
+CROSS APPLY (
+    SELECT COUNT(*) AS sale_cnt
+    FROM qt_sales s
+    WHERE s.emp_id = e.emp_id
+) x;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert!(
+            formatted.contains(") AS max_amount,\n    CASE"),
+            "Auto-format should keep CASE directly after close-alias comma without an empty line in APPLY query, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(") AS max_amount,\n\n    CASE"),
+            "Auto-format should remove blank line before CASE after close-alias comma in APPLY query, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "Auto-format result should stay stable after removing close-alias CASE blank line in APPLY query"
         );
     }
 

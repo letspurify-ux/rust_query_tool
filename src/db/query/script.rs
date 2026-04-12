@@ -2299,9 +2299,11 @@ impl QueryExecutor {
                 && structural_trimmed.trim_start().starts_with('(');
             let split_from_consuming_function_open_paren =
                 line_starts_with_open_paren && previous_code_line_ends_with_from_consuming_function;
-            let leading_close_tail = line_has_leading_close_paren
-                .then(|| sql_text::trim_after_leading_close_parens(trimmed))
-                .unwrap_or("");
+            let leading_close_tail = if line_has_leading_close_paren {
+                sql_text::trim_after_leading_close_parens(trimmed)
+            } else {
+                ""
+            };
             let active_query_base_depth = query_frames.last().map(|frame| frame.query_base_depth);
             let leading_close_has_terminal_query_alias_tail = line_has_leading_close_paren
                 && Self::leading_close_tail_is_terminal_query_alias_for_query_base(
@@ -4162,10 +4164,7 @@ impl QueryExecutor {
     }
 
     pub fn line_auto_format_depths(sql: &str) -> Vec<usize> {
-        Self::auto_format_line_contexts(sql)
-            .into_iter()
-            .map(|context| context.auto_depth)
-            .collect()
+        crate::auto_format_engine::line_auto_format_depths(sql)
     }
 
     fn auto_format_clause_kind(trimmed_upper: &str) -> Option<AutoFormatClauseKind> {

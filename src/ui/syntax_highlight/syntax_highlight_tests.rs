@@ -665,6 +665,20 @@ fn test_match_recognize_keywords_highlighting() {
 }
 
 #[test]
+fn test_match_recognize_classifier_keyword_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT * FROM qt_sales MATCH_RECOGNIZE (MEASURES CLASSIFIER() AS cls PATTERN (A+) DEFINE A AS A.amount > 0)";
+    let styles = highlighter.generate_styles(text);
+
+    let start = text.find("CLASSIFIER").expect("missing CLASSIFIER token");
+    let end = start + "CLASSIFIER".len();
+    assert!(
+        styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+        "CLASSIFIER should be highlighted as keyword in MATCH_RECOGNIZE"
+    );
+}
+
+#[test]
 fn test_additional_oracle_structural_keywords_highlighting() {
     let highlighter = SqlHighlighter::new();
 

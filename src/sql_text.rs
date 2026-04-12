@@ -62,6 +62,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CHECK",
     "CHUNK",
     "CLASS",
+    "CLASSIFIER",
     "CLEAR",
     "CLOB",
     "CLOSE",
@@ -5773,41 +5774,31 @@ fn auto_format_structural_tail_alias_termination(
 ) -> Option<AutoFormatAliasTailTermination> {
     let tail = owner_header_structural_tail(line);
     let bytes = tail.as_bytes();
-    let Some(mut idx) = skip_alias_tail_whitespace_and_block_comments(bytes, 0) else {
-        return None;
-    };
+    let mut idx = skip_alias_tail_whitespace_and_block_comments(bytes, 0)?;
     if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
         return None;
     }
 
     let token_start = idx;
-    let Some(token_end) = consume_alias_tail_identifier(bytes, token_start) else {
-        return None;
-    };
+    let token_end = consume_alias_tail_identifier(bytes, token_start)?;
     idx = token_end;
 
     if tail
         .get(token_start..token_end)
         .is_some_and(|token| token.eq_ignore_ascii_case("AS"))
     {
-        let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
-            return None;
-        };
+        let next_idx = skip_alias_tail_whitespace_and_block_comments(bytes, idx)?;
         idx = next_idx;
         if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
             return None;
         }
-        let Some(alias_end) = consume_alias_tail_identifier(bytes, idx) else {
-            return None;
-        };
+        let alias_end = consume_alias_tail_identifier(bytes, idx)?;
         idx = alias_end;
     }
 
     let mut saw_trailing_delimiter = false;
     loop {
-        let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
-            return None;
-        };
+        let next_idx = skip_alias_tail_whitespace_and_block_comments(bytes, idx)?;
         idx = next_idx;
         if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
             return Some(if saw_trailing_delimiter {
