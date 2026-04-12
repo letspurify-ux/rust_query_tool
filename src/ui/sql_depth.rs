@@ -130,7 +130,11 @@ pub(crate) fn line_closes_delimiter_frame_below_depth_before_token(
     let synthetic_missing_depth = line_start_depth.saturating_sub(visible_line_start_stack.len());
     let mut frame_stack = vec![DelimiterFrameKind::Unknown; synthetic_missing_depth];
     frame_stack.extend(visible_line_start_stack.iter().copied());
-    let line_start_frame_depth = frame_stack.len();
+    // The caller-provided depth is the contract for "line-start frame depth".
+    // The reconstructed visible stack may be deeper (or shallower) depending on
+    // local token context, so close detection must compare against the explicit
+    // line-start depth instead of the reconstructed stack length.
+    let line_start_frame_depth = line_start_depth;
 
     for token in tokens
         .iter()
@@ -445,6 +449,37 @@ mod tests {
                 1,
             ),
             "known line-start `(` frame should be consumed before a later `(` opens again"
+        );
+    }
+
+    #[test]
+    fn line_close_detection_respects_explicit_line_start_depth_when_visible_stack_is_deeper() {
+        let tokens = tokenize_sql("((\n) + value, tail");
+        let line_start_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ")"))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let comma_idx = comma_index(&tokens);
+
+        assert!(
+            !line_closes_delimiter_frame_below_depth_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                1,
+            ),
+            "line-start depth 1 should not report a close when the stream only drops from visible depth 2 to 1 before comma"
+        );
+        assert!(
+            line_closes_delimiter_frame_below_depth_before_token(
+                &tokens,
+                line_start_idx,
+                comma_idx,
+                2,
+            ),
+            "line-start depth 2 should report the same close because it drops below the explicit line-start frame depth"
         );
     }
 

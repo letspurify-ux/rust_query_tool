@@ -34074,6 +34074,59 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_values_sibling_depth_after_close_open_expression_chain(
+    ) {
+        let source = r#"INSERT INTO ledger (delta_amount, payload)
+VALUES (
+    (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 10
+    ) + (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 20
+    ),
+    JSON_OBJECT('stable', 1)
+);"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let mixed_close_open_idx =
+            find_line_starting_with(&lines, ") + (").expect("VALUES mixed close-open line");
+        let sibling_idx = find_line_starting_with(&lines, "JSON_OBJECT('stable', 1)")
+            .expect("VALUES sibling after mixed close-open line");
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(mixed_close_open_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("SELECT SUM(a.amount)"))
+            .map(|(idx, _)| idx)
+            .expect("VALUES second scalar subquery SELECT head");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[mixed_close_open_idx]),
+            "VALUES sibling after same-line `) + (` should return to the canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[second_select_idx]),
+            leading_spaces(lines[mixed_close_open_idx]).saturating_add(4),
+            "VALUES second scalar subquery under same-line `) + (` should open exactly one frame deeper than the mixed owner line, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_close_open_expression_chain_on_stable_select_list_depth(
     ) {
         let source = r#"SELECT
@@ -34185,6 +34238,37 @@ FROM dual;"#;
             ),
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_order_by_sibling_depth_after_close_open_expression_chain() {
+        let source = r#"SELECT 1
+FROM dual
+ORDER BY
+    (
+        SELECT MAX(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 10
+    ) + (
+        SELECT MAX(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 20
+    ),
+    stable_col;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let mixed_close_open_idx = find_line_starting_with(&lines, ") + (")
+            .expect("ORDER BY mixed close-open expression line");
+        let sibling_idx = find_line_starting_with(&lines, "stable_col")
+            .expect("ORDER BY sibling after mixed close-open expression");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[mixed_close_open_idx]),
+            "ORDER BY sibling after same-line `) + (` should return to canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
 
     #[test]
