@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-11 (괄호 frame 계산 및 function-local option clause의 구조 비승격 원칙으로 명시)
+> 최종 업데이트: 2026-04-12 (leading close 선소비 이후 pending paren 분류 순서를 token-order 계약으로 명시)
 
 ## 0. 이 문서의 역할
 
@@ -57,6 +57,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - `) AND ...`, `) OR ...`, `) FOR UPDATE ...`도 같은 규칙을 따른다.
 - `) FROM`, `) GROUP BY`, `) ORDER BY`, `) WINDOW ... AS (`, `) CURSOR`, `) MULTISET`, `) DENSE_RANK LAST`, `) AFTER MATCH SKIP TO`, `) UNIQUE SINGLE REFERENCE` 같은 exact bare clause/header/owner fragment도 close를 소비한 structural tail 기준으로 bare-header family를 판정해야 한다.
 - mixed leading-close line은 close align과 final depth를 구분해서 해석해야 한다.
+- `pending` paren frame 승격(예: standalone `(` 이후 query/non-query 판정)도 예외가 아니다. leading close로 같은 line에서 바로 닫히는 pending frame은 먼저 pop 대상에 포함하고, 살아남은 frame에 대해서만 structural tail keyword로 승격/비승격을 결정해야 한다.
 - 이 정규화는 caller 습관이 아니라 shared owner/header helper의 책임이어야 한다. caller 한 곳만 `structural tail`로 전처리하고 helper 본문이 raw line을 가정하면 `) REFERENCE ... ON`, `) WINDOW ... AS`, `) OPEN ... FOR`, `) CURSOR`, `) WITHIN GROUP`, `) AFTER MATCH SKIP`, `) RETURN ALL ROWS` 같은 mixed leading-close owner/header가 phase마다 다른 depth를 만들게 된다.
 - 단, close를 소비한 뒤 structural tail이 비었다고 해서 close event 자체가 사라지는 것은 아니다. nested paren을 추적하는 pending header/owner는 pure `)` line을 "빈 줄"이 아니라 "wrapper close continuation step"으로 해석해야 한다.
 

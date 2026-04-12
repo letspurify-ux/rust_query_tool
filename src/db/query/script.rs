@@ -776,6 +776,52 @@ impl<'a> Iterator for TopLevelScanner<'a> {
 }
 
 impl QueryExecutor {
+    fn resolve_pending_frame_stack_with_leading_closes<T, FPending, FResolve>(
+        stack: &mut [T],
+        pending_count: &mut usize,
+        leading_close_count: usize,
+        is_pending: FPending,
+        mut resolve_pending: FResolve,
+    ) -> usize
+    where
+        T: Copy,
+        FPending: Fn(T) -> bool,
+        FResolve: FnMut(T) -> T,
+    {
+        if *pending_count == 0 {
+            return 0;
+        }
+
+        let classify_limit = stack.len().saturating_sub(leading_close_count);
+        let mut unresolved = *pending_count;
+        let mut resolved_count = 0usize;
+
+        for frame in stack.iter_mut().take(classify_limit).rev() {
+            if unresolved == 0 {
+                break;
+            }
+
+            let current = *frame;
+            if !is_pending(current) {
+                continue;
+            }
+
+            let resolved = resolve_pending(current);
+            if !is_pending(resolved) {
+                resolved_count = resolved_count.saturating_add(1);
+            }
+            *frame = resolved;
+            unresolved = unresolved.saturating_sub(1);
+        }
+
+        *pending_count = stack
+            .iter()
+            .filter(|kind| is_pending(**kind))
+            .count();
+
+        resolved_count
+    }
+
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
         #[derive(Copy, Clone, Eq, PartialEq)]
         enum SubqueryParenKind {
@@ -891,25 +937,37 @@ impl QueryExecutor {
             None
         }
 
-        fn leading_close_paren_count(line: &str) -> usize {
+        fn leading_close_paren_count(line: &str, starts_in_block_comment: bool) -> usize {
             let bytes = line.as_bytes();
             let mut idx = 0usize;
             let mut close_count = 0usize;
+            let mut in_block_comment = starts_in_block_comment;
 
             loop {
+                if in_block_comment {
+                    let mut closed = false;
+                    while idx + 1 < bytes.len() {
+                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                            idx += 2;
+                            in_block_comment = false;
+                            closed = true;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if !closed {
+                        return 0;
+                    }
+                    continue;
+                }
+
                 while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
                     idx += 1;
                 }
 
                 if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
                     idx += 2;
-                    while idx + 1 < bytes.len() {
-                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                            idx += 2;
-                            break;
-                        }
-                        idx += 1;
-                    }
+                    in_block_comment = true;
                     continue;
                 }
 
@@ -946,10 +1004,9 @@ impl QueryExecutor {
         }
 
         fn leading_subquery_close_paren_count(
-            line: &str,
+            close_count: usize,
             subquery_paren_stack: &[SubqueryParenKind],
         ) -> usize {
-            let close_count = leading_close_paren_count(line);
             if close_count == 0 || subquery_paren_stack.is_empty() {
                 return 0;
             }
@@ -1388,31 +1445,33 @@ impl QueryExecutor {
                 || ((trimmed_start.starts_with("/*") || trimmed_start.starts_with("*/"))
                     && leading_word.is_none())
                 || in_leading_block_comment_line;
+            let leading_close_parens =
+                leading_close_paren_count(line, was_in_leading_block_comment);
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
                 // VALUES can head a nested query block in dialects that support table value
                 // constructors in FROM/subquery positions.
                 let promote_to_subquery = leading_is_any(sql_text::SUBQUERY_HEAD_KEYWORDS);
+                let promoted_pending_count = Self::resolve_pending_frame_stack_with_leading_closes(
+                    &mut subquery_paren_stack,
+                    &mut pending_subquery_paren,
+                    leading_close_parens,
+                    |kind| kind == SubqueryParenKind::Pending,
+                    |kind| {
+                        if promote_to_subquery && kind == SubqueryParenKind::Pending {
+                            SubqueryParenKind::Subquery
+                        } else if kind == SubqueryParenKind::Pending {
+                            SubqueryParenKind::NonSubquery
+                        } else {
+                            kind
+                        }
+                    },
+                );
                 if promote_to_subquery {
                     subquery_paren_depth =
-                        subquery_paren_depth.saturating_add(pending_subquery_paren);
+                        subquery_paren_depth.saturating_add(promoted_pending_count);
                 }
-                let mut unresolved = pending_subquery_paren;
-                for paren_kind in subquery_paren_stack.iter_mut().rev() {
-                    if unresolved == 0 {
-                        break;
-                    }
-                    if *paren_kind == SubqueryParenKind::Pending {
-                        *paren_kind = if promote_to_subquery {
-                            SubqueryParenKind::Subquery
-                        } else {
-                            SubqueryParenKind::NonSubquery
-                        };
-                        unresolved -= 1;
-                    }
-                }
-                pending_subquery_paren = 0;
             }
 
             // Eagerly resolve pending_end when the current line does NOT continue an
@@ -1550,7 +1609,7 @@ impl QueryExecutor {
             }
 
             let leading_subquery_close_parens =
-                leading_subquery_close_paren_count(line, &subquery_paren_stack);
+                leading_subquery_close_paren_count(leading_close_parens, &subquery_paren_stack);
             let query_paren_component = if subquery_paren_depth > 0 {
                 subquery_paren_depth.saturating_sub(leading_subquery_close_parens)
             } else {
@@ -1852,6 +1911,7 @@ impl QueryExecutor {
             pending_count: &mut usize,
             trimmed_upper: &str,
             treat_values_as_subquery_head: bool,
+            leading_close_count: usize,
         ) {
             if *pending_count == 0 {
                 return;
@@ -1861,29 +1921,29 @@ impl QueryExecutor {
                 (treat_values_as_subquery_head || !keyword.eq_ignore_ascii_case("VALUES"))
                     && sql_text::starts_with_keyword_token(trimmed_upper, keyword)
             });
-            let mut unresolved = *pending_count;
-
-            for paren_kind in paren_stack.iter_mut().rev() {
-                if unresolved == 0 {
-                    break;
-                }
-                if matches!(
-                    *paren_kind,
-                    AutoFormatSubqueryParenKind::Pending
-                        | AutoFormatSubqueryParenKind::PendingFromConsumer
-                ) {
-                    *paren_kind = if promote_to_subquery {
+            let _ = QueryExecutor::resolve_pending_frame_stack_with_leading_closes(
+                paren_stack,
+                pending_count,
+                leading_close_count,
+                |kind| {
+                    matches!(
+                        kind,
+                        AutoFormatSubqueryParenKind::Pending
+                            | AutoFormatSubqueryParenKind::PendingFromConsumer
+                    )
+                },
+                |kind| {
+                    if promote_to_subquery {
                         AutoFormatSubqueryParenKind::Subquery
-                    } else if *paren_kind == AutoFormatSubqueryParenKind::PendingFromConsumer {
+                    } else if kind == AutoFormatSubqueryParenKind::PendingFromConsumer {
                         AutoFormatSubqueryParenKind::NonSubqueryFromConsumer
-                    } else {
+                    } else if kind == AutoFormatSubqueryParenKind::Pending {
                         AutoFormatSubqueryParenKind::NonSubquery
-                    };
-                    unresolved = unresolved.saturating_sub(1);
-                }
-            }
-
-            *pending_count = 0;
+                    } else {
+                        kind
+                    }
+                },
+            );
         }
 
         fn non_subquery_paren_frame_depth_after_leading_closes(
@@ -2246,6 +2306,9 @@ impl QueryExecutor {
             let current_line_starts_end_keyword =
                 sql_text::identifier_words_start_with(&line_words, &["END"])
                     || current_line_is_mysql_custom_delimited_end;
+            let leading_significant_paren_profile = sql_text::significant_paren_profile(trimmed);
+            let leading_significant_close_count =
+                leading_significant_paren_profile.leading_close_count;
             let treat_values_as_subquery_head = !(mysql_on_duplicate_key_update_active
                 && sql_text::identifier_words_first_is(&line_words, "VALUES"));
             resolve_pending_auto_format_subquery_parens(
@@ -2253,10 +2316,8 @@ impl QueryExecutor {
                 &mut pending_auto_format_subquery_paren_count,
                 trimmed_upper,
                 treat_values_as_subquery_head,
+                leading_significant_close_count,
             );
-            let leading_significant_paren_profile = sql_text::significant_paren_profile(trimmed);
-            let leading_significant_close_count =
-                leading_significant_paren_profile.leading_close_count;
             let line_has_leading_close_paren = leading_significant_close_count > 0;
             let line_starts_with_open_paren = leading_significant_close_count == 0
                 && structural_trimmed.trim_start().starts_with('(');
@@ -19225,6 +19286,42 @@ WHERE 1 = 1;";
     }
 
     #[test]
+    fn line_block_depths_ignore_close_paren_inside_open_block_comment_body() {
+        let sql = "SELECT *
+FROM (
+SELECT 1
+/*
+) comment text only
+*/
+FROM dual
+);";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let comment_line_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") comment text only")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[select_idx], depths[from_idx],
+            "inner SELECT and FROM should stay on the same active subquery frame depth"
+        );
+        assert_eq!(
+            depths[comment_line_idx], depths[from_idx],
+            "close paren text inside an open multiline comment must not consume query frame depth"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_align_multiline_comment_closed_query_close_with_owner_depth() {
         let sql = "SELECT *
 FROM (
@@ -19256,6 +19353,42 @@ WHERE 1 = 1;";
         assert_eq!(
             contexts[where_idx].auto_depth, contexts[from_idx].auto_depth,
             "outer WHERE should stay on the query owner depth after the multiline-comment close"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_ignore_close_paren_inside_open_block_comment_body() {
+        let sql = "SELECT *
+FROM (
+SELECT 1
+/*
+) comment text only
+*/
+FROM dual
+);";
+        let lines: Vec<&str> = sql.lines().collect();
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+
+        let comment_line_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") comment text only")
+            .unwrap_or(0);
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "SELECT 1")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth, contexts[from_idx].auto_depth,
+            "inner SELECT and FROM should stay on the same active subquery frame depth"
+        );
+        assert_eq!(
+            contexts[comment_line_idx].auto_depth, contexts[from_idx].auto_depth,
+            "auto-format depth must ignore close-paren text while a multiline block comment is still open"
         );
     }
 
@@ -21230,6 +21363,87 @@ FROM qt_fmt_emp e,
     }
 
     #[test]
+    fn resolve_pending_frame_stack_with_leading_closes_only_resolves_surviving_frames() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum TestFrame {
+            Pending,
+            Resolved,
+            Other,
+        }
+
+        let mut stack = vec![TestFrame::Pending, TestFrame::Other, TestFrame::Pending];
+        let mut pending_count = 2usize;
+
+        let resolved_count = QueryExecutor::resolve_pending_frame_stack_with_leading_closes(
+            &mut stack,
+            &mut pending_count,
+            1,
+            |frame| frame == TestFrame::Pending,
+            |frame| {
+                if frame == TestFrame::Pending {
+                    TestFrame::Resolved
+                } else {
+                    frame
+                }
+            },
+        );
+
+        assert_eq!(
+            resolved_count, 1,
+            "leading close run should shield closing-side pending frames from same-line resolution"
+        );
+        assert_eq!(
+            pending_count, 1,
+            "pending count should retain only frames that survive the leading-close consumption step"
+        );
+        assert_eq!(
+            stack,
+            vec![TestFrame::Resolved, TestFrame::Other, TestFrame::Pending],
+            "frame-stack token order must resolve only the surviving pending frame segment"
+        );
+    }
+
+    #[test]
+    fn resolve_pending_frame_stack_with_leading_closes_resolves_all_without_leading_close() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum TestFrame {
+            Pending,
+            Resolved,
+        }
+
+        let mut stack = vec![TestFrame::Pending, TestFrame::Pending];
+        let mut pending_count = 2usize;
+
+        let resolved_count = QueryExecutor::resolve_pending_frame_stack_with_leading_closes(
+            &mut stack,
+            &mut pending_count,
+            0,
+            |frame| frame == TestFrame::Pending,
+            |frame| {
+                if frame == TestFrame::Pending {
+                    TestFrame::Resolved
+                } else {
+                    frame
+                }
+            },
+        );
+
+        assert_eq!(
+            resolved_count, 2,
+            "without leading closes every pending frame should be resolved on this line"
+        );
+        assert_eq!(
+            pending_count, 0,
+            "resolved pending frame stack should not leak stale pending depth to the next line"
+        );
+        assert_eq!(
+            stack,
+            vec![TestFrame::Resolved, TestFrame::Resolved],
+            "pending resolution should stay deterministic when no leading closes are present"
+        );
+    }
+
+    #[test]
     fn same_line_paren_frame_delta_before_trailing_open_tracks_non_leading_close_before_open() {
         let frame_delta =
             QueryExecutor::same_line_paren_frame_delta_before_trailing_open("arg_expr ) COLUMNS (");
@@ -22301,6 +22515,49 @@ INTO v_emp_id;"#;
         assert_eq!(
             contexts[returning_idx].auto_depth, contexts[values_idx].auto_depth,
             "mixed leading-close RETURNING clause should align with sibling DML clause depth after VALUES list close"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keeps_leading_close_then_from_on_parent_query_depth_after_pending_open(
+    ) {
+        let sql = r#"SELECT
+    JSON_OBJECT (
+        KEY 'k' VALUE 1
+    )
+    (
+    ) FROM dual;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let select_idx = find_line_starting_with("SELECT");
+        let from_idx = find_line_starting_with(") FROM dual;");
+
+        assert_eq!(
+            sql_text::significant_paren_profile(lines[from_idx].trim_start()).leading_close_count,
+            1,
+            "mixed `) FROM ...` line should expose one leading close-paren event"
+        );
+        assert_eq!(
+            contexts[from_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::From),
+            "leading-close `) FROM ...` after a pending standalone `(` must stay a structural FROM clause"
+        );
+        assert_eq!(
+            contexts[from_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "leading-close `) FROM ...` should remain on the parent query base depth"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth, contexts[select_idx].auto_depth,
+            "leading-close `) FROM ...` should align with the parent SELECT depth after consuming the pending frame"
         );
     }
 
