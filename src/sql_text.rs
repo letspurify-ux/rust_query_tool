@@ -1713,13 +1713,87 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
     }
 }
 
-/// Strips surrounding double quotes from SQL identifiers and unescapes doubled quotes.
+/// Returns the wrapping quote delimiter for quoted SQL identifiers.
+///
+/// Supported delimiters:
+/// - `"` (ANSI SQL / Oracle quoted identifiers)
+/// - `` ` `` (MySQL / MariaDB quoted identifiers)
+fn quoted_identifier_inner_is_well_formed(inner: &str, delimiter: char) -> bool {
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != delimiter {
+            continue;
+        }
+
+        if chars.peek().copied() == Some(delimiter) {
+            chars.next();
+            continue;
+        }
+
+        // Unescaped delimiter inside the wrapper means this is not a single
+        // quoted identifier (e.g. `"schema"."table"`).
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn quoted_identifier_delimiter(value: &str) -> Option<char> {
+    let trimmed = value.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    let last = trimmed.chars().next_back()?;
+
+    if first != last || !matches!(first, '"' | '`') {
+        return None;
+    }
+
+    let delimiter_str = match first {
+        '"' => "\"",
+        '`' => "`",
+        _ => return None,
+    };
+    let inner = trimmed
+        .strip_prefix(delimiter_str)
+        .and_then(|v| v.strip_suffix(delimiter_str))?;
+
+    quoted_identifier_inner_is_well_formed(inner, first).then_some(first)
+}
+
+/// Returns true if `value` is wrapped as a quoted identifier.
+pub(crate) fn is_quoted_identifier(value: &str) -> bool {
+    quoted_identifier_delimiter(value).is_some()
+}
+
+/// Strips surrounding identifier quotes and unescapes doubled quote delimiters.
 pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     let trimmed = value.trim();
-    if let Some(inner) = trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return inner.replace("\"\"", "\"");
+    let Some(delimiter) = quoted_identifier_delimiter(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    let delimiter_str = match delimiter {
+        '"' => "\"",
+        '`' => "`",
+        _ => return trimmed.to_string(),
+    };
+
+    let Some(inner) = trimmed
+        .strip_prefix(delimiter_str)
+        .and_then(|v| v.strip_suffix(delimiter_str))
+    else {
+        return trimmed.to_string();
+    };
+
+    match delimiter {
+        '"' => inner.replace("\"\"", "\""),
+        '`' => inner.replace("``", "`"),
+        _ => inner.to_string(),
     }
-    trimmed.to_string()
 }
 
 /// Returns true when a line starts with SQL*Plus `REM`/`REMARK` comment commands.
@@ -7749,6 +7823,16 @@ mod tests {
         assert!(starts_with_keyword_token("EXCEPTION-- GAP", "EXCEPTION"));
         assert!(starts_with_keyword_token("CASE/* GAP */", "CASE"));
         assert!(!starts_with_keyword_token("ELSEIF", "ELSE"));
+    }
+
+    #[test]
+    fn quoted_identifier_helpers_support_double_quotes_and_backticks() {
+        assert!(is_quoted_identifier(r#""Emp Name""#));
+        assert!(is_quoted_identifier("`emp name`"));
+        assert!(!is_quoted_identifier("emp_name"));
+        assert_eq!(strip_identifier_quotes(r#""Emp""Name""#), "Emp\"Name");
+        assert_eq!(strip_identifier_quotes("`emp``name`"), "emp`name");
+        assert_eq!(strip_identifier_quotes("  `emp name`  "), "emp name");
     }
 
     #[test]

@@ -761,6 +761,46 @@ fn mysql_index_hint_without_alias_keeps_join_boundary_intact() {
 }
 
 #[test]
+fn mysql_backtick_quoted_relation_and_alias_resolve_qualifier_tables() {
+    let ctx = analyze("SELECT `o`.| FROM `sales schema`.`orders table` `o`");
+
+    let resolved_alias = resolve_qualifier_tables("o", &ctx.tables_in_scope);
+    assert_eq!(
+        resolved_alias,
+        vec!["sales schema.orders table".to_string()],
+        "tables in scope: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved_quoted_alias = resolve_qualifier_tables("`o`", &ctx.tables_in_scope);
+    assert_eq!(
+        resolved_quoted_alias,
+        vec!["sales schema.orders table".to_string()]
+    );
+
+    let resolved_quoted_name =
+        resolve_qualifier_tables("`sales schema`.`orders table`", &ctx.tables_in_scope);
+    assert_eq!(
+        resolved_quoted_name,
+        vec!["sales schema.orders table".to_string()]
+    );
+}
+
+#[test]
+fn mysql_backtick_quoted_identifier_with_embedded_dot_preserves_name() {
+    let ctx = analyze("SELECT o.| FROM `sales.daily` o");
+
+    let resolved_alias = resolve_qualifier_tables("o", &ctx.tables_in_scope);
+    assert_eq!(resolved_alias, vec!["`sales.daily`".to_string()]);
+
+    let resolved_name = resolve_qualifier_tables("`sales.daily`", &ctx.tables_in_scope);
+    assert_eq!(resolved_name, vec!["`sales.daily`".to_string()]);
+}
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 
@@ -808,6 +848,56 @@ fn phase_for_share_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR SHARE OF |");
     assert_eq!(ctx.phase, SqlPhase::LockingColumnList);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_lock_in_share_mode_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp LOCK IN SHARE MODE |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP to remain visible after LOCK IN SHARE MODE, got {:?}",
+        names
+    );
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "LOCK"),
+        "LOCK clause keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_lock_in_share_mode_prefix_stays_post_query_context() {
+    let ctx = analyze("SELECT * FROM emp LOCK |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "LOCK"),
+        "incomplete LOCK IN SHARE MODE should not treat LOCK as alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn lock_in_share_mode_keeps_existing_table_alias_resolution() {
+    let ctx = analyze("SELECT e.| FROM emp e LOCK IN SHARE MODE");
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["emp".to_string()]);
 }
 
 #[test]

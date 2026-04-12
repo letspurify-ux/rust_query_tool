@@ -887,6 +887,52 @@ fn is_post_query_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     matches!(first_keyword.as_str(), "JSON" | "XML" | "BROWSE")
 }
 
+fn is_mysql_lock_in_share_mode_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
+        return false;
+    };
+    if first_keyword != "IN" {
+        return false;
+    }
+
+    let Some((second_keyword, second_idx)) = next_word_upper(tokens, first_idx + 1) else {
+        return false;
+    };
+    if second_keyword != "SHARE" {
+        return false;
+    }
+
+    matches!(
+        next_word_upper(tokens, second_idx + 1),
+        Some((third_keyword, _)) if third_keyword == "MODE"
+    )
+}
+
+fn is_post_query_lock_clause(
+    tokens: &[SqlToken],
+    lock_idx: usize,
+    current_phase: SqlPhase,
+) -> bool {
+    if !matches!(
+        current_phase,
+        SqlPhase::FromClause
+            | SqlPhase::WhereClause
+            | SqlPhase::GroupByClause
+            | SqlPhase::HavingClause
+            | SqlPhase::OrderByClause
+    ) {
+        return false;
+    }
+
+    if is_mysql_lock_in_share_mode_clause(tokens, lock_idx + 1) {
+        return true;
+    }
+
+    // Keep incomplete `... LOCK` / `... LOCK IN` edits in post-query context
+    // so MySQL/MariaDB lock modifiers are not misclassified as `LOCK TABLE`.
+    next_word_upper(tokens, lock_idx + 1).is_none_or(|(next_keyword, _)| next_keyword == "IN")
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -2408,15 +2454,27 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "LOCK" => {
                         depth_frames[depth].postgres_conflict_update_active = false;
-                        let is_expression_context = current_phase.is_column_context()
-                            || matches!(current_phase, SqlPhase::ValuesClause);
-                        if is_expression_context {
-                            // Inside expressions, LOCK can be a valid identifier/token.
+                        let is_post_query_lock_modifier =
+                            is_post_query_lock_clause(tokens, idx, current_phase);
+                        if is_post_query_lock_modifier {
+                            // MySQL/MariaDB `SELECT ... LOCK IN SHARE MODE` is a trailing
+                            // query modifier, not a standalone `LOCK TABLE` statement.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            depth_frames[depth].locking_clause_active = true;
                             relation_state.clear();
-                        } else {
-                            depth_frames[depth].statement_kind = StatementKind::Lock;
-                            depth_frames[depth].phase = SqlPhase::Initial;
-                            relation_state.clear();
+                        }
+                        if !is_post_query_lock_modifier {
+                            depth_frames[depth].locking_clause_active = false;
+                            let is_expression_context = current_phase.is_column_context()
+                                || matches!(current_phase, SqlPhase::ValuesClause);
+                            if is_expression_context {
+                                // Inside expressions, LOCK can be a valid identifier/token.
+                                relation_state.clear();
+                            } else {
+                                depth_frames[depth].statement_kind = StatementKind::Lock;
+                                depth_frames[depth].phase = SqlPhase::Initial;
+                                relation_state.clear();
+                            }
                         }
                     }
                     "OPEN" => {
@@ -3920,31 +3978,36 @@ fn strip_identifier_quotes(value: &str) -> String {
 }
 
 fn normalize_identifier_for_lookup(value: &str) -> String {
-    strip_identifier_quotes(value).to_ascii_uppercase()
+    let parts = split_identifier_parts_for_lookup(value);
+    if parts.is_empty() {
+        strip_identifier_quotes(value).to_ascii_uppercase()
+    } else {
+        parts.join(".").to_ascii_uppercase()
+    }
 }
 
 fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut chars = value.trim().chars().peekable();
-    let mut in_quotes = false;
+    let mut active_quote: Option<char> = None;
 
     while let Some(ch) = chars.next() {
         match ch {
-            '"' => {
+            '"' | '`' => {
                 current.push(ch);
-                if in_quotes {
-                    if chars.peek().copied() == Some('"') {
-                        current.push('"');
+                if active_quote == Some(ch) {
+                    if chars.peek().copied() == Some(ch) {
+                        current.push(ch);
                         chars.next();
                     } else {
-                        in_quotes = false;
+                        active_quote = None;
                     }
-                } else {
-                    in_quotes = true;
+                } else if active_quote.is_none() {
+                    active_quote = Some(ch);
                 }
             }
-            '.' if !in_quotes => {
+            '.' if active_quote.is_none() => {
                 let segment = strip_identifier_quotes(current.trim());
                 if !segment.is_empty() {
                     parts.push(segment);
@@ -3968,8 +4031,7 @@ fn last_identifier_part_for_lookup(value: &str) -> Option<String> {
 }
 
 fn is_quoted_identifier(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')
+    sql_text::is_quoted_identifier(value)
 }
 
 fn is_identifier_word_token(value: &str) -> bool {
@@ -4007,7 +4069,7 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
             {
                 return Some((wrapped_name, next_idx));
             }
-            let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
+            let is_quoted = is_quoted_identifier(word);
             let upper = word.to_ascii_uppercase();
             // Skip if this is a keyword rather than a table name
             if !is_quoted && (is_join_keyword(&upper) || is_table_stop_keyword(&upper)) {
@@ -4149,7 +4211,7 @@ fn parse_relation_alias_at(
         return (None, idx);
     };
 
-    let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
+    let is_quoted = is_quoted_identifier(word);
     let upper = word.to_ascii_uppercase();
 
     if upper == "AS" {
@@ -4163,8 +4225,7 @@ fn parse_relation_alias_at(
         if !is_identifier_word_token(alias_word) {
             return (None, alias_idx + 1);
         }
-        let alias_is_quoted =
-            alias_word.trim().starts_with('"') && alias_word.trim().ends_with('"');
+        let alias_is_quoted = is_quoted_identifier(alias_word);
         let alias_upper = alias_word.to_ascii_uppercase();
         if !alias_is_quoted && is_relation_alias_breaker(&alias_upper) {
             return (None, alias_idx);
@@ -4455,7 +4516,10 @@ fn skip_mysql_index_hint_clause(tokens: &[SqlToken], start: usize) -> Option<usi
         return None;
     }
 
-    Some(skip_comment_tokens(tokens, skip_parenthesized_clause(tokens, idx)))
+    Some(skip_comment_tokens(
+        tokens,
+        skip_parenthesized_clause(tokens, idx),
+    ))
 }
 
 fn find_top_level_keyword(
@@ -4917,6 +4981,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
                 | "INTO"
                 | "IN"
                 | "OF"
+                | "LOCK"
                 | "PARTITION"
                 | "SUBPARTITION"
                 | "VERSIONS"
@@ -5003,7 +5068,12 @@ pub fn resolve_qualifier_tables(
     }
 
     // If no match found, try the qualifier as a direct table name
-    let normalized = strip_identifier_quotes(qualifier);
+    let qualifier_parts = split_identifier_parts_for_lookup(qualifier);
+    let normalized = if qualifier_parts.is_empty() {
+        strip_identifier_quotes(qualifier)
+    } else {
+        qualifier_parts.join(".")
+    };
     if seen.insert(normalized.to_ascii_uppercase()) {
         return vec![normalized];
     }

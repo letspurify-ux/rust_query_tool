@@ -43,20 +43,21 @@ impl SqlEditorWidget {
 
         while idx < text.len() {
             let ch = text.get(idx..)?.chars().next()?;
-            if ch != '"' {
+            if !matches!(ch, '"' | '`') {
                 idx += ch.len_utf8();
                 continue;
             }
+            let quote = ch;
 
             let start = idx;
-            idx += 1;
+            idx += quote.len_utf8();
 
             while idx < text.len() {
                 let cur = text.get(idx..)?.chars().next()?;
-                if cur == '"' {
+                if cur == quote {
                     let next_idx = idx + cur.len_utf8();
-                    if next_idx < text.len() && text.get(next_idx..)?.starts_with('"') {
-                        idx = next_idx + 1;
+                    if next_idx < text.len() && text.get(next_idx..)?.starts_with(quote) {
+                        idx = next_idx + quote.len_utf8();
                         continue;
                     }
                     let end = next_idx;
@@ -71,6 +72,40 @@ impl SqlEditorWidget {
 
             if idx >= text.len() {
                 return None;
+            }
+        }
+
+        None
+    }
+
+    fn find_quoted_segment_start(
+        text: &str,
+        segment_end: usize,
+        delimiter: char,
+    ) -> Option<usize> {
+        if segment_end == 0 {
+            return None;
+        }
+        let prefix = text.get(..segment_end)?;
+        let mut active_start: Option<usize> = None;
+        let mut iter = prefix.char_indices().peekable();
+
+        while let Some((idx, ch)) = iter.next() {
+            if ch != delimiter {
+                continue;
+            }
+
+            if let Some(start_idx) = active_start {
+                if iter.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    iter.next();
+                    continue;
+                }
+                if idx + ch.len_utf8() == segment_end {
+                    return Some(start_idx);
+                }
+                active_start = None;
+            } else {
+                active_start = Some(idx);
             }
         }
 
@@ -718,12 +753,7 @@ impl SqlEditorWidget {
     }
 
     fn strip_identifier_quotes(value: &str) -> String {
-        let trimmed = value.trim();
-        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-            trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
-        } else {
-            trimmed.to_string()
-        }
+        sql_text::strip_identifier_quotes(value)
     }
 
     fn qualifier_before_word(
@@ -813,26 +843,15 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let bytes = text.as_bytes();
-        if bytes.get(segment_end - 1) == Some(&b'"') {
-            let mut pos = segment_end as isize - 2;
-            while pos >= 0 {
-                let pos_usize = pos as usize;
-                if bytes.get(pos_usize) == Some(&b'"') {
-                    if pos_usize > 0 && bytes.get(pos_usize - 1) == Some(&b'"') {
-                        pos -= 2;
-                        continue;
-                    }
-                    let quoted = text.get(pos_usize..segment_end)?;
-                    let qualifier = Self::strip_identifier_quotes(quoted);
-                    if qualifier.is_empty() {
-                        return None;
-                    }
-                    return Some((qualifier, pos_usize));
-                }
-                pos -= 1;
+        let last_char = text.get(..segment_end)?.chars().next_back();
+        if let Some(delimiter) = last_char.filter(|ch| matches!(ch, '"' | '`')) {
+            let start = Self::find_quoted_segment_start(text, segment_end, delimiter)?;
+            let quoted = text.get(start..segment_end)?;
+            let qualifier = Self::strip_identifier_quotes(quoted);
+            if qualifier.is_empty() {
+                return None;
             }
-            return None;
+            return Some((qualifier, start));
         }
 
         let mut start = segment_end;
@@ -861,23 +880,23 @@ impl SqlEditorWidget {
 
     fn has_unbalanced_identifier_quotes(text: &str) -> bool {
         let mut chars = text.chars().peekable();
-        let mut in_quotes = false;
+        let mut active_quote: Option<char> = None;
         while let Some(ch) = chars.next() {
-            if ch != '"' {
+            if !matches!(ch, '"' | '`') {
                 continue;
             }
 
-            if in_quotes {
-                if chars.peek().copied() == Some('"') {
+            if active_quote == Some(ch) {
+                if chars.peek().copied() == Some(ch) {
                     chars.next();
                 } else {
-                    in_quotes = false;
+                    active_quote = None;
                 }
-            } else {
-                in_quotes = true;
+            } else if active_quote.is_none() {
+                active_quote = Some(ch);
             }
         }
-        in_quotes
+        active_quote.is_some()
     }
 
     fn try_fast_path_intellisense_filter(

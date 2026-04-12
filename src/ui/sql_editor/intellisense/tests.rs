@@ -1680,6 +1680,22 @@ fn mysql_create_table_option_keywords_include_engine_default_and_collate() {
 }
 
 #[test]
+fn mysql_lock_in_share_mode_is_not_classified_as_lock_table_context() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM emp LOCK IN SHARE MODE |");
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
+
+    let context = SqlEditorWidget::classify_intellisense_context(
+        &deep_ctx,
+        deep_ctx.statement_tokens.as_ref(),
+    );
+    assert_ne!(
+        context,
+        SqlContext::TableName,
+        "LOCK IN SHARE MODE must not switch intellisense back to table-name context"
+    );
+}
+
+#[test]
 fn statement_bounds_slash_terminates_create_plsql_block() {
     // After 'CREATE FUNCTION ... IS BEGIN ... END;\n/\n', a subsequent
     // SELECT should be recognised as a separate statement.
@@ -1789,6 +1805,15 @@ fn qualifier_before_word_supports_quoted_identifier() {
 }
 
 #[test]
+fn qualifier_before_word_supports_backtick_quoted_identifier() {
+    let sql_with_cursor = "SELECT `e`.| FROM `Emp Table` `e`";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    assert_eq!(qualifier.as_deref(), Some("e"));
+}
+
+#[test]
 fn qualifier_before_word_rejects_whitespace_between_dot_and_cursor() {
     let sql_with_cursor = "SELECT e.   | FROM emp e";
     let cursor = sql_with_cursor.find('|').unwrap_or(0);
@@ -1843,6 +1868,15 @@ fn qualifier_before_word_supports_multi_part_qualifier_chain_with_quotes() {
 }
 
 #[test]
+fn qualifier_before_word_supports_multi_part_qualifier_chain_with_backticks() {
+    let sql_with_cursor = "SELECT `schema A`.`Emp Table`.| FROM `schema A`.`Emp Table`";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    assert_eq!(qualifier.as_deref(), Some("schema A.Emp Table"));
+}
+
+#[test]
 fn identifier_at_position_supports_unicode_identifier() {
     let sql = "SELECT 사용자 FROM dual";
     let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
@@ -1860,6 +1894,18 @@ fn identifier_at_position_supports_quoted_unicode_identifier() {
 
     let (word, start, _end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
         .expect("quoted unicode identifier should be resolved at cursor");
+    assert_eq!(word, "이름");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(sql, start);
+    assert_eq!(qualifier.as_deref(), Some("사용자"));
+}
+
+#[test]
+fn identifier_at_position_supports_backtick_quoted_identifier() {
+    let sql = "SELECT `사용자`.`이름` FROM dual";
+    let cursor = sql.find("`이름`").unwrap_or(0) + "`이름`".len();
+
+    let (word, start, _end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
+        .expect("backtick-quoted identifier should be resolved at cursor");
     assert_eq!(word, "이름");
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(sql, start);
     assert_eq!(qualifier.as_deref(), Some("사용자"));
@@ -2586,6 +2632,15 @@ fn qualifier_before_word_rejects_unbalanced_quoted_identifier() {
 }
 
 #[test]
+fn qualifier_before_word_rejects_unbalanced_backtick_quoted_identifier() {
+    let sql_with_cursor = "SELECT `e.| FROM emp e";
+    let cursor = sql_with_cursor.find('|').unwrap_or(0);
+    let sql = sql_with_cursor.replace('|', "");
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+    assert_eq!(qualifier, None);
+}
+
+#[test]
 fn identifier_at_position_rejects_unbalanced_quoted_identifier() {
     let sql = r#"SELECT "사용자 FROM dual"#;
     let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
@@ -2594,6 +2649,18 @@ fn identifier_at_position_rejects_unbalanced_quoted_identifier() {
     assert!(
         resolved.is_none(),
         "unbalanced quoted identifier should not be resolved"
+    );
+}
+
+#[test]
+fn identifier_at_position_rejects_unbalanced_backtick_quoted_identifier() {
+    let sql = "SELECT `사용자 FROM dual";
+    let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
+
+    let resolved = SqlEditorWidget::identifier_at_position_in_text(sql, cursor);
+    assert!(
+        resolved.is_none(),
+        "unbalanced backtick-quoted identifier should not be resolved"
     );
 }
 

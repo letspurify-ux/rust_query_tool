@@ -1414,15 +1414,8 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let is_quoted = trimmed.starts_with('"') || trimmed.starts_with('`');
-        let normalized = if let Some(inner) = trimmed
-            .strip_prefix('`')
-            .and_then(|value| value.strip_suffix('`'))
-        {
-            inner.replace("``", "`")
-        } else {
-            sql_text::strip_identifier_quotes(trimmed)
-        };
+        let is_quoted = sql_text::is_quoted_identifier(trimmed);
+        let normalized = sql_text::strip_identifier_quotes(trimmed);
         if normalized.is_empty() {
             return None;
         }
