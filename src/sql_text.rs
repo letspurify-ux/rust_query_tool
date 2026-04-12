@@ -1641,6 +1641,57 @@ pub(crate) fn q_quote_closing_byte(delimiter: u8) -> u8 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QQuotePrefix {
+    prefix_len: usize,
+    closing_delimiter: u8,
+}
+
+#[inline]
+fn is_q_quote_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || !bytes
+            .get(idx.saturating_sub(1))
+            .copied()
+            .is_some_and(is_identifier_byte)
+}
+
+#[inline]
+fn q_quote_prefix_at(bytes: &[u8], idx: usize) -> Option<QQuotePrefix> {
+    if !is_q_quote_prefix_boundary(bytes, idx) {
+        return None;
+    }
+
+    match bytes.get(idx).copied() {
+        Some(b'q' | b'Q') if bytes.get(idx.saturating_add(1)) == Some(&b'\'') => {
+            let delimiter = *bytes.get(idx.saturating_add(2))?;
+            if !is_valid_q_quote_delimiter_byte(delimiter) {
+                return None;
+            }
+
+            Some(QQuotePrefix {
+                prefix_len: 3,
+                closing_delimiter: q_quote_closing_byte(delimiter),
+            })
+        }
+        Some(b'n' | b'N' | b'u' | b'U')
+            if matches!(bytes.get(idx.saturating_add(1)).copied(), Some(b'q' | b'Q'))
+                && bytes.get(idx.saturating_add(2)) == Some(&b'\'') =>
+        {
+            let delimiter = *bytes.get(idx.saturating_add(3))?;
+            if !is_valid_q_quote_delimiter_byte(delimiter) {
+                return None;
+            }
+
+            Some(QQuotePrefix {
+                prefix_len: 4,
+                closing_delimiter: q_quote_closing_byte(delimiter),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Returns true when `text_upper` starts with `keyword` as a standalone token.
 ///
 /// `text_upper` and `keyword` are expected to already be uppercased.
@@ -1897,26 +1948,10 @@ pub(crate) fn line_has_mysql_hash_comment(line: &str) -> bool {
             idx = idx.saturating_add(2);
             continue;
         }
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
         }
         if current == b'\'' {
             in_single_quote = true;
@@ -2266,26 +2301,10 @@ pub(crate) fn trailing_inline_comment_prefix(line: &str) -> Option<&str> {
             continue;
         }
 
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
         }
         if current == b'\'' {
             in_single_quote = true;
@@ -2591,23 +2610,10 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
             continue;
         }
 
-        if (c == b'n' || c == b'N')
-            && matches!(next, Some(b'q') | Some(b'Q'))
-            && bytes.get(i + 2) == Some(&b'\'')
-            && bytes.get(i + 3).is_some()
-        {
-            let delimiter = bytes[i + 3];
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, i) {
             in_q_quote = true;
-            q_quote_end = Some(q_quote_closing(delimiter as char) as u8);
-            i += 4;
-            continue;
-        }
-
-        if (c == b'q' || c == b'Q') && next == Some(b'\'') && bytes.get(i + 2).is_some() {
-            let delimiter = bytes[i + 2];
-            in_q_quote = true;
-            q_quote_end = Some(q_quote_closing(delimiter as char) as u8);
-            i += 3;
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            i += q_quote_start.prefix_len;
             continue;
         }
 
@@ -2925,26 +2931,10 @@ pub(crate) fn meaningful_identifier_words_before_inline_comment(
             idx = idx.saturating_add(2);
             continue;
         }
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
         }
         if current == b'\'' {
             in_single_quote = true;
@@ -5561,26 +5551,10 @@ fn line_trailing_identifiers_before_inline_comment(
             idx = idx.saturating_add(2);
             continue;
         }
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
         }
         if current == b'\'' {
             in_single_quote = true;
@@ -5866,28 +5840,11 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
                 }
             }
         }
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    still_in_leading_close_run = false;
-                    idx = idx.saturating_add(3);
-                    continue;
-                }
-            }
-        }
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    q_quote_end = Some(q_quote_closing_byte(delimiter));
-                    still_in_leading_close_run = false;
-                    idx = idx.saturating_add(4);
-                    continue;
-                }
-            }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            still_in_leading_close_run = false;
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
         }
         if current == b'\'' {
             in_single_quote = true;
@@ -6166,59 +6123,25 @@ fn trailing_meaningful_tokens_before_inline_comment(
         }
 
         let current = bytes[idx];
-        let next = bytes.get(idx.saturating_add(1)).copied();
 
-        if (current == b'q' || current == b'Q') && next == Some(b'\'') {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    let closing = q_quote_closing_byte(delimiter);
-                    let mut local_idx = idx.saturating_add(3);
-                    while local_idx < bytes.len() {
-                        if bytes[local_idx] == closing
-                            && bytes.get(local_idx.saturating_add(1)) == Some(&b'\'')
-                        {
-                            local_idx = local_idx.saturating_add(2);
-                            break;
-                        }
-                        local_idx = local_idx.saturating_add(1);
-                    }
-                    push_format_trailing_meaningful_token(
-                        &mut previous,
-                        &mut last,
-                        FormatTrailingMeaningfulToken::Other,
-                    );
-                    idx = local_idx.min(bytes.len());
-                    continue;
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            let mut local_idx = idx.saturating_add(q_quote_start.prefix_len);
+            while local_idx < bytes.len() {
+                if bytes[local_idx] == q_quote_start.closing_delimiter
+                    && bytes.get(local_idx.saturating_add(1)) == Some(&b'\'')
+                {
+                    local_idx = local_idx.saturating_add(2);
+                    break;
                 }
+                local_idx = local_idx.saturating_add(1);
             }
-        }
-
-        if (current == b'n' || current == b'N' || current == b'u' || current == b'U')
-            && matches!(next, Some(b'q' | b'Q'))
-            && bytes.get(idx.saturating_add(2)) == Some(&b'\'')
-        {
-            if let Some(&delimiter) = bytes.get(idx.saturating_add(3)) {
-                if is_valid_q_quote_delimiter_byte(delimiter) {
-                    let closing = q_quote_closing_byte(delimiter);
-                    let mut local_idx = idx.saturating_add(4);
-                    while local_idx < bytes.len() {
-                        if bytes[local_idx] == closing
-                            && bytes.get(local_idx.saturating_add(1)) == Some(&b'\'')
-                        {
-                            local_idx = local_idx.saturating_add(2);
-                            break;
-                        }
-                        local_idx = local_idx.saturating_add(1);
-                    }
-                    push_format_trailing_meaningful_token(
-                        &mut previous,
-                        &mut last,
-                        FormatTrailingMeaningfulToken::Other,
-                    );
-                    idx = local_idx.min(bytes.len());
-                    continue;
-                }
-            }
+            push_format_trailing_meaningful_token(
+                &mut previous,
+                &mut last,
+                FormatTrailingMeaningfulToken::Other,
+            );
+            idx = local_idx.min(bytes.len());
+            continue;
         }
 
         if current == b'\'' {
@@ -6986,6 +6909,20 @@ mod tests {
     }
 
     #[test]
+    fn multiline_string_prefix_lengths_treat_identifier_suffix_q_quote_like_text_as_single_quote() {
+        let sql = "SELECT colq'xyz\n)payload' ) AS txt\nFROM dual";
+        let prefixes = multiline_string_continuation_prefix_lengths(sql, sql.lines().count());
+
+        assert_eq!(prefixes[0], None);
+        assert_eq!(
+            prefixes[1],
+            Some(")payload'".len()),
+            "identifier suffix `q'` must not be promoted to q-quote prefix; multiline single-quote tail should keep only the literal-closing prefix"
+        );
+        assert_eq!(prefixes[2], None);
+    }
+
+    #[test]
     fn with_non_plsql_clause_keyword_detects_common_oracle_clauses() {
         for keyword in [
             "READ",
@@ -7262,6 +7199,18 @@ mod tests {
         assert_eq!(
             profile.events,
             vec![SignificantParenEvent::Open, SignificantParenEvent::Close]
+        );
+    }
+
+    #[test]
+    fn significant_paren_profile_treats_identifier_suffix_q_quote_like_text_as_single_quote() {
+        let profile = significant_paren_profile("colq'xyz' ) + (");
+
+        assert_eq!(profile.leading_close_count, 0);
+        assert_eq!(
+            profile.events,
+            vec![SignificantParenEvent::Close, SignificantParenEvent::Open],
+            "identifier suffix `q'` must not hide same-line close/open structural events behind an accidental q-quote state"
         );
     }
 
@@ -7599,6 +7548,15 @@ mod tests {
         assert!(line_ends_with_comma_before_inline_comment(
             "q'[/* literal */]' , -- trailing comma"
         ));
+    }
+
+    #[test]
+    fn trailing_inline_comment_prefix_does_not_treat_identifier_suffix_q_as_q_quote() {
+        assert_eq!(
+            trailing_inline_comment_prefix("colq'xyz' ) -- real comment"),
+            Some("colq'xyz' ) "),
+            "identifier suffix `q'` before a single-quoted literal must not hide trailing inline comment detection"
+        );
     }
 
     #[test]
