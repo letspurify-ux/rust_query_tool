@@ -5766,6 +5766,7 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
     let mut in_backtick_quote = false;
     let mut in_block_comment = false;
     let mut q_quote_end: Option<u8> = None;
+    let mut dollar_quote_tag: Option<Vec<u8>> = None;
     let mut still_in_leading_close_run = true;
 
     while idx < bytes.len() {
@@ -5776,6 +5777,20 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
             if current == b'*' && next == Some(b'/') {
                 in_block_comment = false;
                 idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(tag) = dollar_quote_tag.as_ref() {
+            let tag_len = tag.len();
+            let closes_here = bytes
+                .get(idx..)
+                .is_some_and(|tail| tail.starts_with(tag.as_slice()));
+            if closes_here {
+                dollar_quote_tag = None;
+                idx = idx.saturating_add(tag_len);
                 continue;
             }
             idx = idx.saturating_add(1);
@@ -5839,6 +5854,17 @@ pub(crate) fn significant_paren_profile(line: &str) -> SignificantParenProfile {
             in_block_comment = true;
             idx = idx.saturating_add(2);
             continue;
+        }
+        if current == b'$' {
+            if let Some(tag) = parse_dollar_quote_tag_bytes(bytes, idx) {
+                if !looks_like_oracle_conditional_compilation_flag_bytes(bytes, idx) {
+                    still_in_leading_close_run = false;
+                    let tag_len = tag.len();
+                    dollar_quote_tag = Some(tag);
+                    idx = idx.saturating_add(tag_len);
+                    continue;
+                }
+            }
         }
         if (current == b'q' || current == b'Q') && next == Some(b'\'') {
             if let Some(&delimiter) = bytes.get(idx.saturating_add(2)) {
@@ -7220,6 +7246,17 @@ mod tests {
     #[test]
     fn significant_paren_profile_ignores_mysql_backtick_quoted_identifier_parens() {
         let profile = significant_paren_profile("`raw(` + `tail)` + (expr)");
+
+        assert_eq!(profile.leading_close_count, 0);
+        assert_eq!(
+            profile.events,
+            vec![SignificantParenEvent::Open, SignificantParenEvent::Close]
+        );
+    }
+
+    #[test]
+    fn significant_paren_profile_ignores_dollar_quoted_literal_parens() {
+        let profile = significant_paren_profile("$q$raw)($q$ + $fmt$tail($fmt$ + (expr)");
 
         assert_eq!(profile.leading_close_count, 0);
         assert_eq!(
