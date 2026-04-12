@@ -5522,6 +5522,7 @@ impl QueryExecutor {
                 trimmed,
                 &paren_profile,
                 line_starts_inside_non_subquery_paren_context,
+                query_base_depth,
             );
         let carries_paren_frame_delta =
             has_non_leading_paren_events || leading_close_comma_list_continuation;
@@ -5610,6 +5611,7 @@ impl QueryExecutor {
         line: &str,
         paren_profile: &sql_text::SignificantParenProfile,
         line_starts_inside_non_subquery_paren_context: bool,
+        query_base_depth: Option<usize>,
     ) -> bool {
         if paren_profile.leading_close_count == 0
             || !Self::line_ends_with_comma_before_inline_comment(line)
@@ -5618,21 +5620,47 @@ impl QueryExecutor {
         }
 
         let leading_close_tail = sql_text::trim_after_leading_close_parens(line);
-        let has_only_punctuation_tail = leading_close_tail
+        let normalized_tail = sql_text::auto_format_structural_tail(leading_close_tail);
+        let has_only_punctuation_tail = normalized_tail.is_empty()
+            || normalized_tail
             .chars()
             .all(|ch| ch == ',' || ch == ';');
         if has_only_punctuation_tail {
             return true;
         }
 
-        if sql_text::starts_with_keyword_token(leading_close_tail, "AS") {
+        if sql_text::starts_with_keyword_token(normalized_tail, "AS") {
             return true;
         }
 
-        // Frame-stack first: mixed close-comma tails should only carry when
-        // this line starts inside a non-subquery paren frame (function-local
-        // option/list context).
-        line_starts_inside_non_subquery_paren_context
+        if line_starts_inside_non_subquery_paren_context {
+            return true;
+        }
+
+        if query_base_depth.is_none() {
+            return false;
+        }
+
+        // Frame-stack first: query-list close-comma lines can carry sibling
+        // depth even without `AS` (for example `) alias,`), but only when the
+        // surviving tail is a residual list item, not a structural boundary.
+        let has_non_punctuation_tail = normalized_tail
+            .chars()
+            .any(|ch| !ch.is_ascii_whitespace() && ch != ',' && ch != ';');
+        if !has_non_punctuation_tail {
+            return false;
+        }
+
+        let tail_is_structural_boundary =
+            sql_text::starts_with_auto_format_structural_continuation_boundary_for_structural_tail(
+                normalized_tail,
+            ) || sql_text::starts_with_auto_format_owner_boundary(normalized_tail)
+                || sql_text::format_bare_structural_header_continuation_kind_for_structural_tail(
+                    normalized_tail,
+                )
+                .is_some();
+
+        !tail_is_structural_boundary
     }
 
     fn has_non_leading_significant_paren_event_in_profile(
@@ -5703,6 +5731,7 @@ impl QueryExecutor {
                 trimmed,
                 &paren_profile,
                 line_starts_inside_non_subquery_paren_context,
+                query_base_depth,
             );
         let carries_paren_frame_delta =
             has_non_leading_paren_events || leading_close_comma_list_continuation;
@@ -12345,6 +12374,173 @@ FROM dual;"#;
         assert!(
             carry.paren_frame_only,
             "inline-comment paren-only carry must be marked so semantic query continuation is not forced"
+        );
+    }
+
+    #[test]
+    fn line_continuation_without_structural_kind_ignores_comment_glued_leading_close_structural_comma_tail(
+    ) {
+        let carry = QueryExecutor::line_continuation_for_line_without_structural_kind(
+            ") /* gap */ ORDER BY total_spent,",
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        );
+
+        assert!(
+            carry.is_none(),
+            "comment-glued mixed close structural tails must not be downgraded to alias close-comma paren carry"
+        );
+    }
+
+    #[test]
+    fn inline_comment_line_continuation_treats_comment_glued_leading_close_structural_comma_as_semantic_header_carry(
+    ) {
+        let carry = QueryExecutor::inline_comment_line_continuation_for_line(
+            ") /* gap */ ORDER BY total_spent, -- keep",
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        )
+        .expect("inline-comment mixed close structural tail should keep semantic header carry");
+
+        assert_eq!(
+            carry.depth, 2,
+            "inline-comment mixed close structural tail should keep ORDER BY semantic header continuation depth"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(0),
+            "inline-comment mixed close structural tail should preserve query base depth"
+        );
+        assert!(
+            !carry.paren_frame_only,
+            "inline-comment mixed close structural tails must remain semantic header carry, not alias-style paren-only carry"
+        );
+    }
+
+    #[test]
+    fn line_continuation_without_structural_kind_preserves_comment_glued_leading_close_alias_comma_carry(
+    ) {
+        let carry = QueryExecutor::line_continuation_for_line_without_structural_kind(
+            ") /* gap */ nested_alias,",
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        )
+        .expect("comment-glued leading close alias comma should keep query sibling carry");
+
+        assert_eq!(
+            carry.depth, 1,
+            "comment-glued leading close alias comma should carry the parent query-list body depth"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(0),
+            "comment-glued leading close alias comma carry should preserve query base depth"
+        );
+        assert!(
+            carry.paren_frame_only,
+            "comment-glued alias close-comma carry should stay paren-frame carry"
+        );
+    }
+
+    #[test]
+    fn line_continuation_preserves_leading_close_alias_comma_query_sibling_carry() {
+        let carry = QueryExecutor::line_continuation_for_line(
+            ") nested_alias,",
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        )
+        .expect("leading close alias comma should keep query sibling carry");
+
+        assert_eq!(
+            carry.depth, 1,
+            "leading close alias comma should carry the parent query-list body depth"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(0),
+            "leading close alias comma carry should preserve query base depth"
+        );
+        assert!(
+            carry.paren_frame_only,
+            "alias close-comma carry should stay paren-frame carry, not semantic header carry"
+        );
+    }
+
+    #[test]
+    fn line_continuation_preserves_leading_close_quoted_alias_comma_query_sibling_carry() {
+        let carry = QueryExecutor::line_continuation_for_line(
+            r#") "nested_alias","#,
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        )
+        .expect("leading close quoted-alias comma should keep query sibling carry");
+
+        assert_eq!(
+            carry.depth, 1,
+            "leading close quoted-alias comma should carry the parent query-list body depth"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(0),
+            "leading close quoted-alias comma carry should preserve query base depth"
+        );
+        assert!(
+            carry.paren_frame_only,
+            "quoted alias close-comma carry should stay paren-frame carry, not semantic header carry"
+        );
+    }
+
+    #[test]
+    fn inline_comment_line_continuation_preserves_leading_close_alias_comma_query_sibling_carry() {
+        let carry = QueryExecutor::inline_comment_line_continuation_for_line(
+            ") nested_alias, -- keep",
+            1,
+            Some(0),
+            Some("next_item"),
+            AutoFormatConditionRole::None,
+            None,
+            false,
+            false,
+        )
+        .expect("inline-comment leading close alias comma should keep query sibling carry");
+
+        assert_eq!(
+            carry.depth, 1,
+            "inline-comment leading close alias comma should carry the parent query-list body depth"
+        );
+        assert_eq!(
+            carry.query_base_depth,
+            Some(0),
+            "inline-comment leading close alias comma carry should preserve query base depth"
+        );
+        assert!(
+            carry.paren_frame_only,
+            "inline-comment alias close-comma carry should stay paren-frame carry"
         );
     }
 
@@ -24013,6 +24209,44 @@ END;"#;
         assert_eq!(
             contexts[after_idx].auto_depth, contexts[outer_owner_idx].auto_depth,
             "line after outer close should return to the outer owner depth"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_query_sibling_after_leading_close_alias_comma_without_as() {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) nested_max_sal,
+    d.deptno
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") nested_max_sal,")
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "d.deptno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[close_alias_idx].auto_depth,
+            "sibling SELECT-list item after `) alias,` should stay on the same parent list depth"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth,
+            contexts[close_alias_idx].auto_depth.saturating_sub(1),
+            "FROM clause should return to query base after close-alias comma list item"
         );
     }
 
