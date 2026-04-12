@@ -4792,6 +4792,7 @@ impl SqlEditorWidget {
 
         let mut mysql_begin_not_atomic_header_open = false;
         let mut idx = 0;
+        let mut line_start_token_idx = 0usize;
         while idx < tokens.len() {
             let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = FormatScope::new(paren_stack.len(), block_stack.len());
@@ -4880,6 +4881,7 @@ impl SqlEditorWidget {
             }
             if at_line_start {
                 line_start_token_paren_depth = current_token_paren_depth;
+                line_start_token_idx = idx;
             }
 
             match &tokens[idx] {
@@ -8345,7 +8347,13 @@ impl SqlEditorWidget {
                                         Some("SELECT" | "SET")
                                     ) && (current_token_paren_depth
                                         < line_start_token_paren_depth
-                                        || follows_multiline_child_close)
+                                        || follows_multiline_child_close
+                                        || Self::line_closes_paren_frame_below_line_start_before_token(
+                                            tokens,
+                                            line_start_token_idx,
+                                            idx,
+                                            line_start_token_paren_depth,
+                                        ))
                                     {
                                         // Mixed close-comma SELECT/SET siblings must snap to the
                                         // active list frame depth after the current line closes
@@ -9852,6 +9860,46 @@ impl SqlEditorWidget {
             .copied()
             .filter(|frame| frame.counts_for_paren_extra())
             .count()
+    }
+
+    fn line_closes_paren_frame_below_line_start_before_token(
+        tokens: &[SqlToken],
+        line_start_idx: usize,
+        token_idx: usize,
+        line_start_depth: usize,
+    ) -> bool {
+        if line_start_idx >= token_idx {
+            return false;
+        }
+
+        let mut depth = line_start_depth;
+        for token in tokens
+            .iter()
+            .skip(line_start_idx)
+            .take(token_idx.saturating_sub(line_start_idx))
+        {
+            let SqlToken::Symbol(symbol) = token else {
+                continue;
+            };
+
+            for sym_ch in symbol.chars() {
+                match sym_ch {
+                    '(' => {
+                        depth = depth.saturating_add(1);
+                    }
+                    ')' => {
+                        let next_depth = depth.saturating_sub(1);
+                        if next_depth < line_start_depth {
+                            return true;
+                        }
+                        depth = next_depth;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        false
     }
 
     fn token_can_own_wrapped_layout(previous_non_comment: Option<&SqlToken>) -> bool {
@@ -33364,6 +33412,199 @@ FROM dept d;"#;
             leading_spaces(lines[json_idx]),
             case_owner_indent,
             "test6 VALUES JSON_OBJECT sibling should stay on the same parent argument frame depth after CASE END,, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_close_open_expression_chain_on_stable_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 10
+    ) + (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 20
+    ) AS delta_sum,
+    1 AS stable_sibling
+FROM dual;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let mixed_close_open_idx = find_line_starting_with(&lines, ") + (")
+            .expect("mixed close-open select item line");
+        let sibling_idx = find_line_starting_with(&lines, "1 AS stable_sibling")
+            .expect("select-list sibling after mixed close-open item");
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(mixed_close_open_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("SELECT SUM(a.amount)"))
+            .map(|(idx, _)| idx)
+            .expect("second scalar subquery SELECT head");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[mixed_close_open_idx]),
+            "SELECT-list sibling after same-line `) + (` should return to the canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[second_select_idx]),
+            leading_spaces(lines[mixed_close_open_idx]).saturating_add(4),
+            "second scalar subquery under same-line `) + (` should open exactly one frame deeper than the mixed owner line, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_split_close_open_expression_chain_on_stable_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 10
+    ) + -- keep operator continuation
+    (
+        SELECT SUM(a.amount)
+        FROM account_tx a
+        WHERE a.account_id = 20
+    ) AS delta_sum,
+    1 AS stable_sibling
+FROM dual;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let split_operator_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") + --"))
+            .expect("split close-open operator line");
+        let second_open_idx = find_line_starting_with(&lines, "(")
+            .expect("second scalar subquery open after split operator");
+        let second_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(second_open_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("SELECT SUM(a.amount)"))
+            .map(|(idx, _)| idx)
+            .expect("second scalar subquery SELECT head");
+        let sibling_idx = find_line_starting_with(&lines, "1 AS stable_sibling")
+            .expect("select-list sibling after split close-open item");
+
+        assert_eq!(
+            leading_spaces(lines[second_open_idx]),
+            leading_spaces(lines[split_operator_idx]),
+            "standalone `(` after split close-open operator line should stay on the mixed owner depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[second_select_idx]),
+            leading_spaces(lines[second_open_idx]).saturating_add(4),
+            "split close-open second scalar subquery SELECT should be one frame deeper than its standalone open, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[split_operator_idx]),
+            "SELECT-list sibling after split close-open chain should return to the canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_sibling_depth_after_close_alias_comma_with_inline_comment(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) nested_max_sal, -- close alias comment
+    d.dname
+FROM dept d;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with(") nested_max_sal, -- close alias comment")
+            })
+            .map(|(idx, _)| idx)
+            .expect("mysql close alias comma with inline comment");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.dname").expect("mysql sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "mysql sibling after `) alias, -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_tracks_close_then_open_token_order() {
+        let tokens = SqlEditorWidget::tokenize_sql(") + (, stable");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in close-open token-order fixture");
+
+        assert!(
+            SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens, 0, comma_idx, 1
+            ),
+            "close->open sequence must report a frame close below the line-start depth before comma"
+        );
+    }
+
+    #[test]
+    fn line_closes_paren_frame_below_line_start_before_token_ignores_local_balanced_parens() {
+        let tokens = SqlEditorWidget::tokenize_sql("ABS(a), stable");
+        let comma_idx = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
+            .map(|(idx, _)| idx)
+            .expect("comma in local balanced paren fixture");
+
+        assert!(
+            !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
+                &tokens, 0, comma_idx, 0
+            ),
+            "local balanced call parens at top-level must not be treated as closing a parent frame"
         );
     }
 }
