@@ -50,7 +50,7 @@ COMMIT_PREFIX="${COMMIT_PREFIX:-fix: auto-fix}"
 run_codex_fix() {
   local prompt model reasoning_effort
   local -a cmd_args=()
-  prompt=rompt="자동 포멧팅 기능에서 1. 자동 포멧팅 depth 증감 규칙이 formatting.md에 정리되어있는데 수정해야할 부분 있을지 검토해줘. 근본 원칙을 세워서 완벽한 자동 포멧팅 기능을 만들려고 해. 맞는 원칙인지도 고민해줘야해. 2. 모든 구문들이 1번 formatting.md 근본 원칙에 따라 depth +- 되어야하는데 원칙에 어긋나게 구현된 부분 찾아서 근본적으로 수정해줘. 3. 수정이후 cargo test 전체 검증 해줘. 4. 수정 내용은 fix.md에 간단히 요약해서 추가해줘."
+  prompt=rompt="자동 포멧팅 기능에 버그 있을지 검토해줘. 버그가 있다면 다른 유사 케이스도 고려해서 모두 커버 되도록 일반화해서 근본적으로 개선해줘. 버그 발생시 항상 먼저 frame stack 구조로 depth 관리해서 해결 가능한지 우선 검토해줘. 그리고 토큰 순서대로 처리해야 나중에 문제가 안생겨. formatting.md 원칙에 맞게 수정 후 cargo test 검토 해줘."
   if [[ -n "$CODEX_MODEL" ]]; then
     if [[ "$CODEX_MODEL" == *" "* ]]; then
       model="${CODEX_MODEL%% *}"
