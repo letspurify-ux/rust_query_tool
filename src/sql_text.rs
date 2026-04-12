@@ -5674,22 +5674,27 @@ fn consume_alias_tail_identifier(bytes: &[u8], start: usize) -> Option<usize> {
     Some(idx)
 }
 
-/// Returns true when the shared structural tail is exactly an alias fragment:
-/// optional `AS`, then one identifier/quoted identifier, followed only by
-/// a trailing delimiter, punctuation, or comments.
-pub(crate) fn auto_format_structural_tail_is_simple_alias(line: &str) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoFormatAliasTailTermination {
+    Delimited,
+    EndOfTail,
+}
+
+fn auto_format_structural_tail_alias_termination(
+    line: &str,
+) -> Option<AutoFormatAliasTailTermination> {
     let tail = owner_header_structural_tail(line);
     let bytes = tail.as_bytes();
     let Some(mut idx) = skip_alias_tail_whitespace_and_block_comments(bytes, 0) else {
-        return false;
+        return None;
     };
     if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
-        return false;
+        return None;
     }
 
     let token_start = idx;
     let Some(token_end) = consume_alias_tail_identifier(bytes, token_start) else {
-        return false;
+        return None;
     };
     idx = token_end;
 
@@ -5698,14 +5703,14 @@ pub(crate) fn auto_format_structural_tail_is_simple_alias(line: &str) -> bool {
         .is_some_and(|token| token.eq_ignore_ascii_case("AS"))
     {
         let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
-            return false;
+            return None;
         };
         idx = next_idx;
         if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
-            return false;
+            return None;
         }
         let Some(alias_end) = consume_alias_tail_identifier(bytes, idx) else {
-            return false;
+            return None;
         };
         idx = alias_end;
     }
@@ -5713,20 +5718,41 @@ pub(crate) fn auto_format_structural_tail_is_simple_alias(line: &str) -> bool {
     let mut saw_trailing_delimiter = false;
     loop {
         let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
-            return false;
+            return None;
         };
         idx = next_idx;
         if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
-            return saw_trailing_delimiter;
+            return Some(if saw_trailing_delimiter {
+                AutoFormatAliasTailTermination::Delimited
+            } else {
+                AutoFormatAliasTailTermination::EndOfTail
+            });
         }
         match bytes[idx] {
             b',' | b';' => {
                 saw_trailing_delimiter = true;
                 idx = idx.saturating_add(1);
             }
-            _ => return false,
+            _ => return None,
         }
     }
+}
+
+/// Returns true when the shared structural tail is exactly an alias fragment:
+/// optional `AS`, then one identifier/quoted identifier, followed only by
+/// comments or an optional trailing delimiter.
+pub(crate) fn auto_format_structural_tail_is_alias_fragment(line: &str) -> bool {
+    auto_format_structural_tail_alias_termination(line).is_some()
+}
+
+/// Returns true when the shared structural tail is exactly a delimited alias
+/// fragment: optional `AS`, then one identifier/quoted identifier, followed
+/// only by a trailing delimiter, punctuation, or comments.
+pub(crate) fn auto_format_structural_tail_is_simple_alias(line: &str) -> bool {
+    matches!(
+        auto_format_structural_tail_alias_termination(line),
+        Some(AutoFormatAliasTailTermination::Delimited)
+    )
 }
 
 fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
@@ -7482,10 +7508,16 @@ mod tests {
     #[test]
     fn auto_format_structural_tail_simple_alias_helper_accepts_keyword_like_aliases_after_leading_close(
     ) {
+        assert!(auto_format_structural_tail_is_alias_fragment(") window"));
+        assert!(auto_format_structural_tail_is_alias_fragment(
+            ") /* gap */ AS `window` -- keep"
+        ));
         assert!(auto_format_structural_tail_is_simple_alias(") window,"));
         assert!(auto_format_structural_tail_is_simple_alias(
             ") /* gap */ AS `window`,"
         ));
+        assert!(!auto_format_structural_tail_is_alias_fragment(") WINDOW w AS ("));
+        assert!(!auto_format_structural_tail_is_alias_fragment(") ORDER BY empno"));
         assert!(!auto_format_structural_tail_is_simple_alias(") window"));
         assert!(!auto_format_structural_tail_is_simple_alias(") WINDOW w AS ("));
         assert!(!auto_format_structural_tail_is_simple_alias(") ORDER BY empno"));

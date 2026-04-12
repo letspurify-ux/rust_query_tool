@@ -33523,6 +33523,102 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_close_keyword_like_alias_without_comma_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") window")
+            .map(|(idx, _)| idx)
+            .expect("mysql close keyword-like alias without comma");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql FROM after alias");
+
+        assert!(
+            formatted.contains(") window"),
+            "mysql formatter should preserve keyword-like alias casing on close-alias line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") WINDOW"),
+            "mysql formatter should not uppercase keyword-like close alias without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql close keyword-like alias without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_close_keyword_like_alias_without_comma_with_inline_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window -- keep alias casing
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") window -- keep alias casing")
+            .map(|(idx, _)| idx)
+            .expect("mysql close keyword-like alias without comma inline comment");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql FROM after alias");
+
+        assert!(
+            formatted.contains(") window -- keep alias casing"),
+            "mysql formatter should preserve keyword-like alias casing on close-alias inline-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") WINDOW -- keep alias casing"),
+            "mysql formatter should not uppercase keyword-like close alias inline-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql close keyword-like alias inline-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_realigns_sibling_after_close_quoted_alias_comma_without_as(
     ) {
         let source = r#"SELECT
@@ -34071,6 +34167,106 @@ FROM dept d;"#;
             leading_spaces(lines[sibling_idx]),
             leading_spaces(lines[close_alias_idx]),
             "mysql auto-format sibling after `) window,` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_close_keyword_like_alias_without_comma_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") window")
+            .map(|(idx, _)| idx)
+            .expect("mysql auto-format close keyword-like alias without comma");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql auto-format FROM");
+
+        assert!(
+            formatted.contains(") window"),
+            "mysql auto-format should preserve keyword-like alias casing on close-alias line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") WINDOW"),
+            "mysql auto-format should not uppercase keyword-like close alias without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql auto-format close keyword-like alias without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_close_keyword_like_alias_without_comma_with_inline_comment_on_select_list_depth(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window -- keep alias casing
+FROM dept d;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.trim_start() == ") window -- keep alias casing")
+            .map(|(idx, _)| idx)
+            .expect("mysql auto-format close keyword-like alias without comma inline comment");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM dept d;").expect("mysql auto-format FROM");
+
+        assert!(
+            formatted.contains(") window -- keep alias casing"),
+            "mysql auto-format should preserve keyword-like alias casing on close-alias inline-comment line without comma, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(") WINDOW -- keep alias casing"),
+            "mysql auto-format should not uppercase keyword-like close alias inline-comment line without comma into WINDOW clause spelling, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[close_alias_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(4),
+            "mysql auto-format close keyword-like alias inline-comment line without comma should stay exactly one SELECT-list level deeper than FROM, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_for_auto_formatting_with_db_type(

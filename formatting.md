@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-12 (leading close 선소비 token-order 계약, close-comma carry 경계/alias tail 일반화, multiline literal 시작 상태 예외를 명시)
+> 최종 업데이트: 2026-04-12 (leading close 선소비 token-order 계약, terminal close-alias tail query-boundary 일반화, multiline literal 시작 상태 예외를 명시)
 
 ## 0. 이 문서의 역할
 
@@ -212,6 +212,7 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 - close를 소비한 뒤 tail이 비었거나 구두점만 남는 close-only line에서는 `final depth == close align depth`로 볼 수 있다.
 - `) AS alias,`, `) alias,`, `) "alias",`처럼 close 이후 non-punctuation tail이 남는 line은 close-only line이 아니므로, close align을 그대로 투영하지 않고 frame stack/token-order를 다시 적용한 depth를 `final depth`로 사용해야 한다.
+- delimiter가 없는 terminal alias tail(`) window`, `) AS window`)도 예외가 아니다. lexical helper 하나로 bare `WINDOW` clause와 구분하려 하지 말고, active query frame + 다음 code line boundary를 함께 봐서 "현재 select-list item의 닫힘 alias인지 / 다음 structural header chain의 시작인지"를 판정해야 한다.
 - mixed leading-close line에서는 close를 먼저 소비한 뒤 continuation/body/header 규칙으로 다시 해석한 결과가 `final depth`다.
 - 실제 렌더링은 token-level 2단 정렬이 아니라 line-level canonical depth를 사용한다.
 

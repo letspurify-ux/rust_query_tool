@@ -2278,6 +2278,11 @@ impl QueryExecutor {
                 .get(idx)
                 .map(String::as_str)
                 .unwrap_or("");
+            let next_code_trimmed = next_code_indices
+                .get(idx)
+                .copied()
+                .flatten()
+                .and_then(|next_idx| analysis_lines.get(next_idx).copied());
             let previous_code_line_ends_with_from_consuming_function =
                 previous_code_indices
                     .get(idx)
@@ -2312,10 +2317,24 @@ impl QueryExecutor {
                 && structural_trimmed.trim_start().starts_with('(');
             let split_from_consuming_function_open_paren = line_starts_with_open_paren
                 && previous_code_line_ends_with_from_consuming_function;
+            let leading_close_tail = line_has_leading_close_paren
+                .then(|| sql_text::trim_after_leading_close_parens(trimmed))
+                .unwrap_or("");
+            let active_query_base_depth = query_frames.last().map(|frame| frame.query_base_depth);
+            let leading_close_has_terminal_query_alias_tail = line_has_leading_close_paren
+                && Self::leading_close_tail_is_terminal_query_alias_for_query_base(
+                    leading_close_tail,
+                    active_query_base_depth,
+                    parser_depth,
+                    next_code_trimmed,
+                );
             let leading_close_has_mixed_continuation = line_has_leading_close_paren
-                && sql_text::line_has_mixed_leading_close_continuation(trimmed);
+                && sql_text::line_has_mixed_leading_close_continuation(trimmed)
+                && !leading_close_has_terminal_query_alias_tail;
             let leading_close_has_simple_alias_tail = line_has_leading_close_paren
                 && sql_text::auto_format_structural_tail_is_simple_alias(trimmed);
+            let leading_close_has_query_alias_tail =
+                leading_close_has_simple_alias_tail || leading_close_has_terminal_query_alias_tail;
             let clause_detection_trimmed = structural_trimmed;
             let clause_detection_upper = structural_upper;
             let mysql_compound_declare = mysql_routine_body_active
@@ -2443,7 +2462,7 @@ impl QueryExecutor {
             let forall_body_depth =
                 forall_body_frame.map(|frame| frame.owner_depth.saturating_add(1));
             let clause_kind = if suppress_non_subquery_paren_clause_start
-                || leading_close_has_simple_alias_tail
+                || leading_close_has_query_alias_tail
                 || current_line_is_mysql_on_duplicate_values_function
             {
                 None
@@ -2513,11 +2532,6 @@ impl QueryExecutor {
             let active_line_continuation = pending_line_continuation.take();
             let active_inline_comment_line_continuation =
                 pending_inline_comment_line_continuation.take();
-            let next_code_trimmed = next_code_indices
-                .get(idx)
-                .copied()
-                .flatten()
-                .and_then(|next_idx| analysis_lines.get(next_idx).copied());
             let current_line_is_standalone_open_paren = standalone_open_paren_lines
                 .get(idx)
                 .copied()
@@ -3155,6 +3169,13 @@ impl QueryExecutor {
                 let line_ends_with_comma = Self::line_ends_with_comma_before_inline_comment(trimmed);
                 let close_tail_is_simple_alias =
                     sql_text::auto_format_structural_tail_is_simple_alias(leading_close_tail);
+                let close_tail_is_terminal_query_alias =
+                    Self::leading_close_tail_is_terminal_query_alias_for_query_base(
+                        leading_close_tail,
+                        context.query_base_depth,
+                        parser_depth,
+                        next_code_trimmed,
+                    );
                 let close_comma_tail_is_query_list_item =
                     context.query_base_depth == Some(parser_depth)
                         && !current_line_is_pending_from_item_body
@@ -3217,6 +3238,7 @@ impl QueryExecutor {
                             leading_close_tail,
                             context.query_base_depth,
                         )
+                            || close_tail_is_terminal_query_alias
                     })
                     .and_then(|base_depth| {
                         closing_query_close_align_depth
@@ -5338,6 +5360,13 @@ impl QueryExecutor {
         sql_text::starts_with_auto_format_structural_continuation_boundary(line)
     }
 
+    fn next_line_starts_terminal_query_list_boundary(next_line: &str) -> bool {
+        let trimmed = sql_text::trim_leading_sql_comments(next_line);
+        !trimmed.is_empty()
+            && (Self::line_starts_continuation_boundary(trimmed)
+                || sql_text::line_has_leading_significant_close_paren(trimmed))
+    }
+
     fn pop_with_plsql_auto_body_frame(
         active_body_frames: &mut Vec<WithPlsqlAutoBodyFrame>,
         expected_kind: Option<WithPlsqlAutoBodyFrameKind>,
@@ -5800,6 +5829,29 @@ impl QueryExecutor {
             leading_close_tail,
             query_base_depth,
         )
+    }
+
+    fn leading_close_tail_is_terminal_query_alias_for_query_base(
+        leading_close_tail: &str,
+        query_base_depth: Option<usize>,
+        parser_depth: usize,
+        next_code_line: Option<&str>,
+    ) -> bool {
+        if query_base_depth != Some(parser_depth) {
+            return false;
+        }
+
+        if sql_text::auto_format_structural_tail_is_simple_alias(leading_close_tail) {
+            return false;
+        }
+
+        if !sql_text::auto_format_structural_tail_is_alias_fragment(leading_close_tail) {
+            return false;
+        }
+
+        next_code_line
+            .map(Self::next_line_starts_terminal_query_list_boundary)
+            .unwrap_or(true)
     }
 
     fn has_non_leading_significant_paren_event_in_profile(
@@ -24775,6 +24827,64 @@ FROM dept d;"#;
             contexts[close_alias_idx].auto_depth,
             contexts[from_idx].auto_depth.saturating_add(1),
             "close-AS-alias tail without comma should remain on the SELECT-list depth, one level deeper than FROM"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_query_close_keyword_like_alias_without_comma_one_level_deeper_than_query_base(
+    ) {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") window")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_alias_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "close keyword-like alias tail without comma should remain on the SELECT-list depth, one level deeper than FROM"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_query_close_keyword_like_alias_without_comma_with_inline_comment_on_query_depth(
+    ) {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) window -- keep alias casing
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ") window -- keep alias casing")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[close_alias_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "close keyword-like alias tail with inline comment should remain on the SELECT-list depth, one level deeper than FROM"
         );
     }
 
