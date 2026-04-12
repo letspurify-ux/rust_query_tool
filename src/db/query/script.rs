@@ -24506,6 +24506,48 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_query_sibling_after_leading_close_as_alias_comma_with_inline_comment(
+    ) {
+        let sql = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) AS nested_max_sal, -- keep as same sibling depth
+    d.deptno
+FROM dept d;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_alias_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    == ") AS nested_max_sal, -- keep as same sibling depth"
+            })
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "d.deptno")
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dept d;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[close_alias_idx].auto_depth,
+            "inline-comment close-AS-alias comma line should keep the next SELECT-list sibling on the same depth"
+        );
+        assert_eq!(
+            contexts[close_alias_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "inline-comment close-AS-alias comma list item should stay exactly one level deeper than the query-base FROM line"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_query_close_alias_without_comma_one_level_deeper_than_query_base(
     ) {
         let sql = r#"SELECT

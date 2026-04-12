@@ -33548,6 +33548,49 @@ FROM dept d;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_sibling_depth_after_close_as_alias_comma_with_inline_comment(
+    ) {
+        let source = r#"SELECT
+    (
+        SELECT MAX(emp.sal)
+        FROM emp
+        WHERE emp.deptno = d.deptno
+    ) AS nested_max_sal, -- close alias comment
+    d.dname
+FROM dept d;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let close_alias_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with(") AS nested_max_sal, -- close alias comment")
+            })
+            .map(|(idx, _)| idx)
+            .expect("mysql close AS alias comma with inline comment");
+        let sibling_idx =
+            find_line_starting_with(&lines, "d.dname").expect("mysql sibling select item");
+
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_alias_idx]),
+            "mysql sibling after `) AS alias, -- comment` should stay on the same SELECT-list frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_keeps_sibling_depth_after_multiline_literal_payload_leading_close_then_subquery(
     ) {
         let source = r#"SELECT

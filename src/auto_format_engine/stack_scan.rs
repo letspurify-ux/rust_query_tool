@@ -67,10 +67,14 @@ fn clause_frame_kind(clause_kind: AutoFormatClauseKind) -> Option<FrameKind> {
 }
 
 fn pop_to_parser_depth(stack: &mut Vec<Frame>, parser_depth: usize) {
-    while stack.last().is_some_and(|frame| {
-        frame.kind != FrameKind::Paren && frame.parser_anchor_depth > parser_depth
-    }) {
-        stack.pop();
+    // Remove every frame anchored deeper than the current parser depth, even
+    // when a Paren frame currently sits on top of the stack. Depth
+    // normalization must be frame-anchor based, not "top frame kind" based.
+    while let Some(pos) = stack
+        .iter()
+        .rposition(|frame| frame.parser_anchor_depth > parser_depth)
+    {
+        stack.remove(pos);
     }
 }
 
@@ -406,7 +410,23 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_once;
+    use super::{pop_to_parser_depth, scan_once, Frame, FrameKind};
+
+    fn test_frame(kind: FrameKind, parser_anchor_depth: usize) -> Frame {
+        Frame {
+            kind,
+            owner_depth: parser_anchor_depth,
+            body_depth: parser_anchor_depth.saturating_add(1),
+            query_base_depth: None,
+            close_align_depth: parser_anchor_depth,
+            parser_anchor_depth,
+            paren_anchor_depth: 0,
+            line_idx: None,
+            header_continuation_depth: None,
+            pending: false,
+            flags: 0,
+        }
+    }
 
     #[test]
     fn scan_once_tracks_stack_depth_and_line_count() {
@@ -508,6 +528,34 @@ mod tests {
              stack_depth ({}) when each depth level pushes its own Block frame",
             records[inner_select_idx].stack_depth,
             records[outer_end_idx].stack_depth,
+        );
+    }
+
+    #[test]
+    fn pop_to_parser_depth_removes_deeper_frames_even_when_paren_is_on_top() {
+        let mut stack = vec![
+            test_frame(FrameKind::Block, 1),
+            test_frame(FrameKind::Block, 2),
+            test_frame(FrameKind::Paren, 2),
+        ];
+
+        pop_to_parser_depth(&mut stack, 1);
+
+        assert_eq!(
+            stack.len(),
+            1,
+            "parser-depth pop should remove every deeper frame even if the top frame is Paren"
+        );
+        assert_eq!(
+            stack[0].kind,
+            FrameKind::Block,
+            "the surviving frame should be the parser-depth-1 Block anchor"
+        );
+        assert!(
+            stack
+                .iter()
+                .all(|frame| frame.parser_anchor_depth <= 1),
+            "no frame anchored deeper than the current parser depth may survive"
         );
     }
 }
