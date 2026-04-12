@@ -4,6 +4,7 @@
     clippy::type_complexity
 )]
 
+pub(crate) mod auto_format_engine;
 pub mod app;
 pub mod app_icon;
 pub mod db;
