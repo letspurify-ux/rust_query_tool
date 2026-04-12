@@ -5616,6 +5616,119 @@ pub(crate) fn line_ends_with_identifier_sequence_before_inline_comment(
     line_ends_with_identifier_sequence(line, sequence)
 }
 
+fn skip_alias_tail_whitespace_and_block_comments(bytes: &[u8], mut idx: usize) -> Option<usize> {
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+        if current.is_ascii_whitespace() {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'/' && next == Some(b'*') {
+            idx = idx.saturating_add(2);
+            let mut closed_comment = false;
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    closed_comment = true;
+                    break;
+                }
+                idx = idx.saturating_add(1);
+            }
+            if !closed_comment {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+
+    Some(idx)
+}
+
+fn consume_alias_tail_identifier(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    if matches!(quote, b'"' | b'`') {
+        let mut idx = start.saturating_add(1);
+        while idx < bytes.len() {
+            if bytes[idx] == quote {
+                if bytes.get(idx.saturating_add(1)) == Some(&quote) {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                return Some(idx.saturating_add(1));
+            }
+            idx = idx.saturating_add(1);
+        }
+        return None;
+    }
+
+    if !is_identifier_start_byte(quote) {
+        return None;
+    }
+
+    let mut idx = start.saturating_add(1);
+    while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+        idx = idx.saturating_add(1);
+    }
+    Some(idx)
+}
+
+/// Returns true when the shared structural tail is exactly an alias fragment:
+/// optional `AS`, then one identifier/quoted identifier, followed only by
+/// a trailing delimiter, punctuation, or comments.
+pub(crate) fn auto_format_structural_tail_is_simple_alias(line: &str) -> bool {
+    let tail = owner_header_structural_tail(line);
+    let bytes = tail.as_bytes();
+    let Some(mut idx) = skip_alias_tail_whitespace_and_block_comments(bytes, 0) else {
+        return false;
+    };
+    if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
+        return false;
+    }
+
+    let token_start = idx;
+    let Some(token_end) = consume_alias_tail_identifier(bytes, token_start) else {
+        return false;
+    };
+    idx = token_end;
+
+    if tail
+        .get(token_start..token_end)
+        .is_some_and(|token| token.eq_ignore_ascii_case("AS"))
+    {
+        let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
+            return false;
+        };
+        idx = next_idx;
+        if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
+            return false;
+        }
+        let Some(alias_end) = consume_alias_tail_identifier(bytes, idx) else {
+            return false;
+        };
+        idx = alias_end;
+    }
+
+    let mut saw_trailing_delimiter = false;
+    loop {
+        let Some(next_idx) = skip_alias_tail_whitespace_and_block_comments(bytes, idx) else {
+            return false;
+        };
+        idx = next_idx;
+        if idx >= bytes.len() || sql_line_comment_prefix_len(bytes, idx).is_some() {
+            return saw_trailing_delimiter;
+        }
+        match bytes[idx] {
+            b',' | b';' => {
+                saw_trailing_delimiter = true;
+                idx = idx.saturating_add(1);
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return true;
@@ -6039,6 +6152,10 @@ pub(crate) fn line_continues_expression_after_leading_close(line: &str) -> bool 
 pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
     let trimmed_line = trim_leading_sql_comments(line);
     if !line_has_leading_significant_close_paren(trimmed_line) {
+        return false;
+    }
+
+    if auto_format_structural_tail_is_simple_alias(trimmed_line) {
         return false;
     }
 
@@ -7358,7 +7475,20 @@ mod tests {
         assert!(!line_has_mixed_leading_close_continuation("),"));
         assert!(!line_has_mixed_leading_close_continuation(") # comment only"));
         assert!(!line_has_mixed_leading_close_continuation(") bonus_view"));
+        assert!(!line_has_mixed_leading_close_continuation(") window,"));
         assert!(!line_has_mixed_leading_close_continuation(") THEN"));
+    }
+
+    #[test]
+    fn auto_format_structural_tail_simple_alias_helper_accepts_keyword_like_aliases_after_leading_close(
+    ) {
+        assert!(auto_format_structural_tail_is_simple_alias(") window,"));
+        assert!(auto_format_structural_tail_is_simple_alias(
+            ") /* gap */ AS `window`,"
+        ));
+        assert!(!auto_format_structural_tail_is_simple_alias(") window"));
+        assert!(!auto_format_structural_tail_is_simple_alias(") WINDOW w AS ("));
+        assert!(!auto_format_structural_tail_is_simple_alias(") ORDER BY empno"));
     }
 
     #[test]
