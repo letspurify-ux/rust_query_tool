@@ -244,6 +244,20 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
     if lines.is_empty() {
         return Vec::new();
     }
+    let multiline_string_prefix_lengths =
+        sql_text::multiline_string_continuation_prefix_lengths(sql, lines.len());
+    let analysis_lines: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            multiline_string_prefix_lengths
+                .get(idx)
+                .copied()
+                .flatten()
+                .and_then(|prefix_len| line.get(prefix_len..))
+                .unwrap_or(line)
+        })
+        .collect();
 
     let parser_depths = QueryExecutor::line_block_depths(sql);
     let mut records = Vec::with_capacity(lines.len());
@@ -251,7 +265,7 @@ pub(crate) fn scan_once(sql: &str) -> Vec<EngineLineRecord> {
     let mut prev_parser_depth = 0usize;
     let mut active_paren_depth = 0usize;
 
-    for (line_idx, line) in lines.iter().enumerate() {
+    for (line_idx, line) in analysis_lines.iter().enumerate() {
         let parser_depth = parser_depths
             .get(line_idx)
             .copied()
@@ -384,5 +398,26 @@ mod tests {
 
         assert_eq!(records.len(), sql.lines().count());
         assert!(records.iter().any(|record| record.stack_depth > 0));
+    }
+
+    #[test]
+    fn scan_once_ignores_leading_close_inside_multiline_backtick_payload() {
+        let sql = "SELECT\n    JSON_OBJECT (\n        `\n)field`,\n        1\n    ) AS payload,\n    2 AS next_payload\nFROM dual;";
+        let lines: Vec<&str> = sql.lines().collect();
+        let content_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")field`,")
+            .unwrap_or(0);
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+
+        let records = scan_once(sql);
+
+        assert_eq!(
+            records[content_idx].stack_depth, records[sibling_idx].stack_depth,
+            "leading `)` inside multiline backtick payload must not pop structural frame stack depth"
+        );
     }
 }

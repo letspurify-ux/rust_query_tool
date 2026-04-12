@@ -2327,6 +2327,53 @@ pub(crate) fn line_is_standalone_open_paren_before_inline_comment(line: &str) ->
     )
 }
 
+#[inline]
+fn is_dollar_quote_tag_char_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn parse_dollar_quote_tag_bytes(bytes: &[u8], start: usize) -> Option<Vec<u8>> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+
+    let mut idx = start.saturating_add(1);
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        if current == b'$' {
+            return bytes.get(start..=idx).map(|tag| tag.to_vec());
+        }
+        if !is_dollar_quote_tag_char_byte(current) {
+            return None;
+        }
+        idx = idx.saturating_add(1);
+    }
+
+    None
+}
+
+#[inline]
+fn looks_like_oracle_conditional_compilation_flag_bytes(bytes: &[u8], start: usize) -> bool {
+    bytes.get(start) == Some(&b'$')
+        && bytes.get(start.saturating_add(1)) == Some(&b'$')
+        && bytes
+            .get(start.saturating_add(2))
+            .copied()
+            .is_some_and(is_identifier_start_byte)
+}
+
+fn delimiter_as_dollar_quote_tag_bytes(delimiter: &str) -> Option<Vec<u8>> {
+    let bytes = delimiter.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'$') || bytes.last() != Some(&b'$') {
+        return None;
+    }
+
+    bytes
+        .get(1..bytes.len().saturating_sub(1))
+        .is_some_and(|middle| middle.iter().all(|byte| is_dollar_quote_tag_char_byte(*byte)))
+        .then(|| bytes.to_vec())
+}
+
 /// Returns the leading byte length that belongs to an already-open multiline
 /// string / quoted identifier / q-quote for each line.
 ///
@@ -2344,6 +2391,19 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
     }
 
     let lines: Vec<&str> = text.lines().collect();
+    let mysql_delimiter_directive_lines: Vec<bool> = lines
+        .iter()
+        .map(|line| parse_mysql_delimiter_directive(line).is_some())
+        .collect();
+    let mut active_mysql_delimiter = ";".to_string();
+    let mut active_mysql_delimiter_dollar_tags: Vec<Option<Vec<u8>>> = vec![None; line_count];
+    for (line_idx, line_text) in lines.iter().enumerate() {
+        active_mysql_delimiter_dollar_tags[line_idx] =
+            delimiter_as_dollar_quote_tag_bytes(active_mysql_delimiter.as_str());
+        if let Some(delimiter) = parse_mysql_delimiter_directive(line_text) {
+            active_mysql_delimiter = delimiter;
+        }
+    }
     let bytes = text.as_bytes();
     let mut i = 0usize;
     let mut line = 0usize;
@@ -2352,10 +2412,12 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
 
     let mut in_single_quote = false;
     let mut in_double_quote = false;
+    let mut in_backtick_quote = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut in_q_quote = false;
     let mut q_quote_end: Option<u8> = None;
+    let mut dollar_quote_tag: Option<Vec<u8>> = None;
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -2459,6 +2521,56 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
             continue;
         }
 
+        if in_backtick_quote {
+            if c == b'`' {
+                if next == Some(b'`') {
+                    i += 2;
+                    continue;
+                }
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(i.saturating_add(1).saturating_sub(line_start));
+                }
+                in_backtick_quote = false;
+                i += 1;
+                continue;
+            }
+            if c == b'\n' {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(lines[line].len());
+                }
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(tag) = dollar_quote_tag.as_ref() {
+            let tag_len = tag.len();
+            let closes_here = bytes
+                .get(i..)
+                .is_some_and(|tail| tail.starts_with(tag.as_slice()));
+            if closes_here {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(i.saturating_add(tag_len).saturating_sub(line_start));
+                }
+                dollar_quote_tag = None;
+                i = i.saturating_add(tag_len);
+                continue;
+            }
+            if c == b'\n' {
+                if line_starts_in_multiline_string && line < line_count {
+                    prefix_lengths[line] = Some(lines[line].len());
+                }
+                line += 1;
+                line_start = i.saturating_add(1);
+                line_starts_in_multiline_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
         if c == b'\n' {
             line += 1;
             line_start = i.saturating_add(1);
@@ -2499,6 +2611,28 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
             continue;
         }
 
+        let line_is_mysql_delimiter_directive = mysql_delimiter_directive_lines
+            .get(line)
+            .copied()
+            .unwrap_or(false);
+        let active_mysql_delimiter_dollar_tag = active_mysql_delimiter_dollar_tags
+            .get(line)
+            .and_then(|tag| tag.as_ref());
+        if c == b'$' && !line_is_mysql_delimiter_directive {
+            if let Some(tag) = parse_dollar_quote_tag_bytes(bytes, i) {
+                let starts_active_mysql_delimiter = active_mysql_delimiter_dollar_tag
+                    .is_some_and(|delimiter_tag| delimiter_tag.as_slice() == tag.as_slice());
+                if !starts_active_mysql_delimiter
+                    && !looks_like_oracle_conditional_compilation_flag_bytes(bytes, i)
+                {
+                    let tag_len = tag.len();
+                    dollar_quote_tag = Some(tag);
+                    i = i.saturating_add(tag_len);
+                    continue;
+                }
+            }
+        }
+
         if c == b'\'' {
             in_single_quote = true;
             i += 1;
@@ -2510,11 +2644,20 @@ pub(crate) fn multiline_string_continuation_prefix_lengths(
             i += 1;
             continue;
         }
+        if c == b'`' {
+            in_backtick_quote = true;
+            i += 1;
+            continue;
+        }
 
         i += 1;
     }
 
-    if (in_single_quote || in_double_quote || in_q_quote)
+    if (in_single_quote
+        || in_double_quote
+        || in_backtick_quote
+        || in_q_quote
+        || dollar_quote_tag.is_some())
         && line_starts_in_multiline_string
         && line < line_count
     {
@@ -6786,6 +6929,34 @@ mod tests {
             Some("</result>'".len()),
             "the closing line of a multiline literal should expose only the structural SQL tail"
         );
+    }
+
+    #[test]
+    fn multiline_string_prefix_lengths_keep_tail_after_multiline_backtick_identifier_closes() {
+        let sql = "SELECT `dept\n)name` AS quoted_name\nFROM dual";
+        let prefixes = multiline_string_continuation_prefix_lengths(sql, sql.lines().count());
+
+        assert_eq!(prefixes[0], None);
+        assert_eq!(
+            prefixes[1],
+            Some(")name`".len()),
+            "multiline backtick identifier continuation must strip payload prefix and keep only structural tail"
+        );
+        assert_eq!(prefixes[2], None);
+    }
+
+    #[test]
+    fn multiline_string_prefix_lengths_keep_tail_after_multiline_dollar_quote_closes() {
+        let sql = "SELECT $fmt$first line\n)second line$fmt$ AS txt\nFROM dual";
+        let prefixes = multiline_string_continuation_prefix_lengths(sql, sql.lines().count());
+
+        assert_eq!(prefixes[0], None);
+        assert_eq!(
+            prefixes[1],
+            Some(")second line$fmt$".len()),
+            "multiline dollar-quote continuation must strip payload prefix and expose the structural tail"
+        );
+        assert_eq!(prefixes[2], None);
     }
 
     #[test]

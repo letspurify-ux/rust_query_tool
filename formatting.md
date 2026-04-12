@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-12 (leading close 선소비 이후 pending paren 분류 순서를 token-order 계약으로 명시)
+> 최종 업데이트: 2026-04-12 (leading close 선소비 token-order 계약과 multiline literal 시작 상태 예외를 명시)
 
 ## 0. 이 문서의 역할
 
@@ -141,6 +141,7 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - `END /* gap */ IF`, `END -- gap` 다음 suffix line, `) /* gap */ ORDER BY` 같은 형태도 주석을 제거한 structural token sequence로 판정해야 한다.
 - line tail/suffix 판정도 예외가 아니다. `GROUP /* gap */ BY -- ...`, `FOR /* gap */ UPDATE -- ...`, `IF ... /* gap */ THEN`처럼 split header나 trailing terminator를 판정할 때도 raw whitespace split이 아니라 comment-stripped meaningful identifier sequence를 사용해야 한다.
 - statement terminator 판정도 예외가 아니다. `OPEN c_emp; -- done`, `CURSOR c_emp IS; /* impossible but lexical */`, `END; -- block close` 같은 line은 raw `trim_end().ends_with(';')`가 아니라 inline comment를 제거한 뒤의 마지막 meaningful token으로 닫힘 여부를 판정해야 한다.
+- leading close 선소비도 동일하다. line 시작 시 parser lex state가 이미 multiline literal/quoted identifier(`'...'`, `"..."`, `` `...` ``, `q'...'`, `$$...$$`) 내부라면 line head의 `)`는 구조 close가 아니라 literal payload이므로 leading-close event로 집계하면 안 된다.
 - exact bare header / standalone wrapper 판정도 예외가 아니다. `FROM /* gap */`, `WHERE /* gap */`, `ON /* gap */`, `( -- wrapper` 같은 line은 raw `trim()` / `==` 비교가 아니라 shared structural token / wrapper helper로 판정해야 한다.
 - 구조 helper는 필요하면 "원문 문자열"이 아니라 "comment를 제거한 meaningful token sequence"를 기준으로 동작해야 한다.
 - line-local helper뿐 아니라 statement-level 구조 플래그도 동일하다. `PACKAGE BODY` 여부, `APPLY` family 활성 같은 전역 판정은 raw statement `contains(...)`가 아니라 meaningful token sequence에서 도출해야 한다. 문자열/주석 안 텍스트가 구조 플래그를 켜면 1.8 위반이다.

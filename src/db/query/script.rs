@@ -937,70 +937,35 @@ impl QueryExecutor {
             None
         }
 
-        fn leading_close_paren_count(line: &str, starts_in_block_comment: bool) -> usize {
+        fn leading_close_paren_count(
+            line: &str,
+            starts_in_block_comment: bool,
+            starts_in_quoted_literal: bool,
+        ) -> usize {
+            // If the parser is already inside a multiline quoted literal/identifier,
+            // any leading `)` characters are literal content, not structural closes.
+            if starts_in_quoted_literal {
+                return 0;
+            }
+
+            if !starts_in_block_comment {
+                return sql_text::significant_paren_profile(line).leading_close_count;
+            }
+
             let bytes = line.as_bytes();
             let mut idx = 0usize;
-            let mut close_count = 0usize;
-            let mut in_block_comment = starts_in_block_comment;
-
-            loop {
-                if in_block_comment {
-                    let mut closed = false;
-                    while idx + 1 < bytes.len() {
-                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                            idx += 2;
-                            in_block_comment = false;
-                            closed = true;
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    if !closed {
-                        return 0;
-                    }
-                    continue;
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx = idx.saturating_add(2);
+                    return line
+                        .get(idx..)
+                        .map(|tail| sql_text::significant_paren_profile(tail).leading_close_count)
+                        .unwrap_or(0);
                 }
-
-                while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-                    idx += 1;
-                }
-
-                if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
-                    idx += 2;
-                    in_block_comment = true;
-                    continue;
-                }
-
-                if idx + 1 < bytes.len() && bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                    idx += 2;
-                    continue;
-                }
-
-                if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
-                    return close_count;
-                }
-
-                if idx < bytes.len() && sql_text::is_identifier_start_byte(bytes[idx]) {
-                    let start = idx;
-                    idx += 1;
-                    while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
-                        idx += 1;
-                    }
-                    let token = &line[start..idx];
-                    if token.eq_ignore_ascii_case("REM") || token.eq_ignore_ascii_case("REMARK") {
-                        return close_count;
-                    }
-                    return close_count;
-                }
-
-                if idx < bytes.len() && bytes[idx] == b')' {
-                    close_count += 1;
-                    idx += 1;
-                    continue;
-                }
-
-                return close_count;
+                idx = idx.saturating_add(1);
             }
+
+            0
         }
 
         fn leading_subquery_close_paren_count(
@@ -1445,8 +1410,19 @@ impl QueryExecutor {
                 || ((trimmed_start.starts_with("/*") || trimmed_start.starts_with("*/"))
                     && leading_word.is_none())
                 || in_leading_block_comment_line;
-            let leading_close_parens =
-                leading_close_paren_count(line, was_in_leading_block_comment);
+            let starts_in_quoted_literal = matches!(
+                builder.state.lex_mode,
+                crate::sql_parser_engine::LexMode::SingleQuote
+                    | crate::sql_parser_engine::LexMode::DoubleQuote
+                    | crate::sql_parser_engine::LexMode::BacktickQuote
+                    | crate::sql_parser_engine::LexMode::QQuote { .. }
+                    | crate::sql_parser_engine::LexMode::DollarQuote { .. }
+            );
+            let leading_close_parens = leading_close_paren_count(
+                line,
+                was_in_leading_block_comment,
+                starts_in_quoted_literal,
+            );
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
@@ -19760,6 +19736,88 @@ WHERE 1 = 1;";
     }
 
     #[test]
+    fn line_block_depths_ignores_leading_close_paren_inside_multiline_string_content() {
+        let sql = "SELECT *
+FROM (
+  SELECT '
+)still literal' AS txt
+  FROM dual
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let string_continuation_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(")still literal' AS txt"))
+            .unwrap_or(0);
+        let from_dual_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[string_continuation_idx], depths[from_dual_idx],
+            "leading `)` inside multiline string content must not be consumed as a structural close-paren"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_ignores_leading_close_paren_inside_multiline_backtick_content() {
+        let sql = "SELECT *
+FROM (
+  SELECT `
+)still identifier` AS txt
+  FROM dual
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let backtick_continuation_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(")still identifier` AS txt"))
+            .unwrap_or(0);
+        let from_dual_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[backtick_continuation_idx], depths[from_dual_idx],
+            "leading `)` inside multiline backtick content must not be consumed as a structural close-paren"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_ignores_leading_close_paren_inside_multiline_dollar_quote_content() {
+        let sql = "SELECT *
+FROM (
+  SELECT $fmt$
+)still literal
+$fmt$ AS txt
+  FROM dual
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let dollar_quote_continuation_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == ")still literal")
+            .unwrap_or(0);
+        let from_dual_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[dollar_quote_continuation_idx], depths[from_dual_idx],
+            "leading `)` inside multiline dollar-quote content must not be consumed as a structural close-paren"
+        );
+    }
+
+    #[test]
     fn line_block_depths_dedents_package_body_initializer_scope_by_one_level() {
         let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
 g_last_mode VARCHAR2 (30) := 'BOOT';
@@ -23816,6 +23874,144 @@ END;"#;
             contexts_with_backtick_paren[after_idx_with_backtick_paren].auto_depth,
             contexts_with_plain_backtick[after_idx_with_plain_backtick].auto_depth,
             "after owner close, following sibling statement depth should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_ignore_multiline_backtick_leading_close_payload() {
+        let sql_with_leading_close = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        `
+)field`,
+        1
+    );
+    v_after := 0;
+END;"#;
+        let sql_without_leading_close = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        `
+field`,
+        1
+    );
+    v_after := 0;
+END;"#;
+
+        let contexts_with_leading_close =
+            QueryExecutor::auto_format_line_contexts(sql_with_leading_close);
+        let contexts_without_leading_close =
+            QueryExecutor::auto_format_line_contexts(sql_without_leading_close);
+        let lines_with_leading_close: Vec<&str> = sql_with_leading_close.lines().collect();
+        let lines_without_leading_close: Vec<&str> = sql_without_leading_close.lines().collect();
+
+        let payload_line_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == ")field`,")
+            .unwrap_or(0);
+        let payload_line_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "field`,")
+            .unwrap_or(0);
+        let sibling_arg_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+        let sibling_arg_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+        let after_idx_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "v_after := 0;")
+            .unwrap_or(0);
+        let after_idx_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "v_after := 0;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts_with_leading_close[payload_line_with_leading_close].auto_depth,
+            contexts_without_leading_close[payload_line_without_leading_close].auto_depth,
+            "leading `)` in multiline backtick payload must not alter auto-format frame depth"
+        );
+        assert_eq!(
+            contexts_with_leading_close[sibling_arg_with_leading_close].auto_depth,
+            contexts_without_leading_close[sibling_arg_without_leading_close].auto_depth,
+            "sibling argument depth must stay stable regardless of multiline backtick payload text"
+        );
+        assert_eq!(
+            contexts_with_leading_close[after_idx_with_leading_close].auto_depth,
+            contexts_without_leading_close[after_idx_without_leading_close].auto_depth,
+            "line after owner close should remain stable regardless of multiline backtick payload text"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_ignore_multiline_dollar_quote_leading_close_payload() {
+        let sql_with_leading_close = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        $fmt$
+)field
+$fmt$,
+        1
+    );
+    v_after := 0;
+END;"#;
+        let sql_without_leading_close = r#"BEGIN
+    v_payload := JSON_OBJECT(
+        $fmt$
+field
+$fmt$,
+        1
+    );
+    v_after := 0;
+END;"#;
+
+        let contexts_with_leading_close =
+            QueryExecutor::auto_format_line_contexts(sql_with_leading_close);
+        let contexts_without_leading_close =
+            QueryExecutor::auto_format_line_contexts(sql_without_leading_close);
+        let lines_with_leading_close: Vec<&str> = sql_with_leading_close.lines().collect();
+        let lines_without_leading_close: Vec<&str> = sql_without_leading_close.lines().collect();
+
+        let payload_line_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == ")field")
+            .unwrap_or(0);
+        let payload_line_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "field")
+            .unwrap_or(0);
+        let dollar_close_line_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "$fmt$,")
+            .unwrap_or(0);
+        let dollar_close_line_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "$fmt$,")
+            .unwrap_or(0);
+        let sibling_arg_with_leading_close = lines_with_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+        let sibling_arg_without_leading_close = lines_without_leading_close
+            .iter()
+            .position(|line| line.trim_start() == "1")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts_with_leading_close[payload_line_with_leading_close].auto_depth,
+            contexts_without_leading_close[payload_line_without_leading_close].auto_depth,
+            "leading `)` in multiline dollar-quote payload must not alter auto-format frame depth"
+        );
+        assert_eq!(
+            contexts_with_leading_close[dollar_close_line_with_leading_close].auto_depth,
+            contexts_without_leading_close[dollar_close_line_without_leading_close].auto_depth,
+            "dollar-quote closing line depth must stay stable regardless of multiline payload text"
+        );
+        assert_eq!(
+            contexts_with_leading_close[sibling_arg_with_leading_close].auto_depth,
+            contexts_without_leading_close[sibling_arg_without_leading_close].auto_depth,
+            "sibling argument depth must stay stable regardless of multiline dollar-quote payload text"
         );
     }
 }
