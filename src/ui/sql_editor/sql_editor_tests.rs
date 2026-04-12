@@ -8926,19 +8926,122 @@ END$$"#;
         crate::db::connection::DatabaseType::MySQL,
     );
     let lines: Vec<&str> = formatted.lines().collect();
-    let sum_idx = find_line_starting_with(&lines, "SELECT SUM(").expect("SUM owner line");
+    let select_idx = find_line_starting_with(&lines, "SELECT").expect("SELECT line");
+    let first_sum_idx = lines
+        .iter()
+        .enumerate()
+        .skip(select_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SUM(")
+        .map(|(idx, _)| idx)
+        .expect("first SUM owner line");
     let close_idx = lines
         .iter()
         .enumerate()
-        .skip(sum_idx + 1)
+        .skip(first_sum_idx + 1)
         .find(|(_, line)| line.trim() == "),")
         .map(|(idx, _)| idx)
         .expect("SUM close line");
+    let second_sum_idx = lines
+        .iter()
+        .enumerate()
+        .skip(close_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "SUM(")
+        .map(|(idx, _)| idx)
+        .expect("second SUM owner line");
+
+    assert_eq!(
+        leading_spaces(lines[first_sum_idx]),
+        leading_spaces(lines[select_idx]).saturating_add(4),
+        "first multiline SUM should be promoted to SELECT-list body depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[second_sum_idx]),
+        leading_spaces(lines[first_sum_idx]),
+        "SUM siblings should share the same SELECT-list body depth, got:\n{}",
+        formatted
+    );
 
     assert_eq!(
         leading_spaces(lines[close_idx]),
-        leading_spaces(lines[sum_idx]),
+        leading_spaces(lines[first_sum_idx]),
         "MariaDB multiline SUM close line should realign with the SUM owner depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_mysql_multiline_sum_siblings_on_shared_select_list_depth() {
+    let input = r#"CREATE PROCEDURE sp_collect_status_counts(
+    OUT p_done_cnt INT,
+    OUT p_running_cnt INT,
+    OUT p_other_cnt INT
+)
+BEGIN
+    SELECT SUM(
+        CASE
+            WHEN status_code = 'DONE' THEN 1
+            ELSE 0
+        END
+    ),
+        SUM(
+            CASE
+                WHEN status_code = 'RUNNING' THEN 1
+                ELSE 0
+            END
+        ),
+        SUM(
+            CASE
+                WHEN status_code NOT IN ('DONE', 'RUNNING') THEN 1
+                ELSE 0
+            END
+        )
+    INTO p_done_cnt,
+        p_running_cnt,
+        p_other_cnt
+    FROM run_case;
+END$$"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+        input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+    let select_idx = find_line_starting_with(&lines, "SELECT").expect("SELECT line");
+    let sum_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start() == "SUM(")
+        .map(|(idx, _)| idx)
+        .collect();
+
+    assert_eq!(
+        sum_indices.len(),
+        3,
+        "expected three SUM owners in the formatted output, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("SELECT SUM("),
+        "first SUM owner should be rendered on the SELECT-list body line, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[sum_indices[0]]),
+        leading_spaces(lines[select_idx]).saturating_add(4),
+        "first SUM should use SELECT-list body depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[sum_indices[1]]),
+        leading_spaces(lines[sum_indices[0]]),
+        "second SUM should align with the first SUM owner depth, got:\n{}",
+        formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[sum_indices[2]]),
+        leading_spaces(lines[sum_indices[0]]),
+        "third SUM should align with the first SUM owner depth, got:\n{}",
         formatted
     );
 }

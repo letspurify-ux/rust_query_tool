@@ -8836,6 +8836,41 @@ impl SqlEditorWidget {
                             } else {
                                 ParenFormatFrameKind::Compact
                             };
+                            let promotes_first_clause_owner_to_body_depth =
+                                matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                                    && !at_line_start
+                                    && paren_stack.is_empty()
+                                    && suppress_comma_break_depth == 0
+                                    && select_list_layout_state.has_active_indent()
+                                    && !select_list_layout_state.is_multiline()
+                                    // Keep the existing dedicated `SELECT (` first-item path.
+                                    && !Self::paren_starts_first_clause_list_item(
+                                        current_clause.as_deref(),
+                                        prev_word_upper.as_deref(),
+                                        is_query_paren,
+                                        paren_stack.len(),
+                                    )
+                                    && paren_body_has_newline
+                                    && matches!(
+                                        next_non_comment,
+                                        Some(SqlToken::Word(word))
+                                            if word.eq_ignore_ascii_case("CASE")
+                                    );
+                            if promotes_first_clause_owner_to_body_depth {
+                                // Frame-first normalization: when a multiline first list item
+                                // opens on the same clause-header line (`SELECT SUM(`), promote
+                                // it onto the clause body depth so all sibling owners reuse the
+                                // same parent list frame.
+                                force_select_list_newline(&mut out, &mut select_list_layout_state);
+                                line_indent = active_list_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    select_list_layout_state,
+                                    current_clause.as_deref(),
+                                    construct.merge_active.is_active(),
+                                    false,
+                                );
+                            }
                             if Self::paren_starts_first_clause_list_item(
                                 current_clause.as_deref(),
                                 prev_word_upper.as_deref(),
@@ -28545,17 +28580,18 @@ FROM emp_score s;"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         let lines: Vec<&str> = formatted.lines().collect();
-        let round_idx = find_line_starting_with(&lines, "SELECT ROUND(").expect("ROUND owner");
-        let mixed_close_precision_idx =
-            find_line_starting_with(&lines, "), 2").expect("mixed close + precision");
+        let select_idx = find_line_starting_with(&lines, "SELECT").expect("SELECT line");
+        let round_idx = find_line_starting_with(&lines, "ROUND(")
+            .or_else(|| find_line_starting_with(&lines, "SELECT ROUND("))
+            .expect("ROUND owner");
+        let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
         let outer_close_idx = lines
             .iter()
             .enumerate()
-            .skip(mixed_close_precision_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "),")
+            .take(sibling_idx)
+            .rfind(|(_, line)| line.trim_start() == "),")
             .map(|(idx, _)| idx)
             .expect("ROUND close-comma");
-        let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
         let from_idx = find_line_starting_with(&lines, "FROM emp_score s;").expect("FROM line");
 
         assert_eq!(
@@ -28565,8 +28601,8 @@ FROM emp_score s;"#;
         );
         assert_eq!(
             leading_spaces(lines[sibling_idx]),
-            leading_spaces(lines[round_idx]).saturating_add(4),
-            "SELECT sibling after a nested close-comma must realign to the SELECT list frame depth instead of the previous line shape, got:\n{formatted}"
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "SELECT sibling after a nested close-comma must realign to the SELECT-list frame depth, got:\n{formatted}"
         );
         assert!(
             leading_spaces(lines[from_idx]) < leading_spaces(lines[sibling_idx]),
@@ -28600,12 +28636,15 @@ FROM emp_score s;"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         let lines: Vec<&str> = normalized.lines().collect();
-        let round_idx = find_line_starting_with(&lines, "SELECT ROUND(").expect("ROUND owner");
+        let select_idx = find_line_starting_with(&lines, "SELECT").expect("SELECT line");
+        let _round_idx = find_line_starting_with(&lines, "ROUND(")
+            .or_else(|| find_line_starting_with(&lines, "SELECT ROUND("))
+            .expect("ROUND owner");
         let sibling_idx = find_line_starting_with(&lines, "s.ename").expect("SELECT sibling");
 
         assert_eq!(
             leading_spaces(lines[sibling_idx]),
-            leading_spaces(lines[round_idx]).saturating_add(4),
+            leading_spaces(lines[select_idx]).saturating_add(4),
             "MySQL formatter should keep sibling depth after nested close-comma, got:\n{normalized}"
         );
     }
