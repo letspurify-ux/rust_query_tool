@@ -927,6 +927,102 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
 }
 
 #[test]
+fn format_sql_keeps_mariadb_test3_collect_status_counts_select_item_depths() {
+    let input = load_mariadb_test_file("test3.txt");
+    assert!(!input.is_empty(), "test_mariadb/test3.txt should not be empty");
+
+    let formatted = SqlEditorWidget::format_sql_basic_no_cache(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Find the SELECT inside sp_collect_status_counts BEGIN block.
+    // The procedure body SELECT should have SUM items each on their own line.
+    let collect_begin_idx = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.trim_start() == "BEGIN" && {
+            // Must follow sp_collect_status_counts )
+            true
+        })
+        .map(|(i, _)| i)
+        .expect("BEGIN in sp_collect_status_counts");
+
+    // Find the SELECT just after the BEGIN
+    let select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(collect_begin_idx)
+        .find(|(_, line)| line.trim_start() == "SELECT")
+        .map(|(i, _)| i)
+        .expect("SELECT inside sp_collect_status_counts");
+
+    let sum_done_idx = lines
+        .iter()
+        .enumerate()
+        .skip(select_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("SUM("))
+        .map(|(i, _)| i)
+        .expect("first SUM( item");
+
+    let select_indent = leading_spaces(lines[select_idx]);
+    let sum_indent = leading_spaces(lines[sum_done_idx]);
+
+    assert_eq!(
+        sum_indent,
+        select_indent + 4,
+        "SUM( item should be one level deeper than SELECT (depth select+1), got:\n{}",
+        formatted
+    );
+
+    // CASE inside SUM should be one deeper than SUM
+    let case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(sum_done_idx + 1)
+        .find(|(_, line)| line.trim_start() == "CASE")
+        .map(|(i, _)| i)
+        .expect("CASE inside SUM");
+    assert_eq!(
+        leading_spaces(lines[case_idx]),
+        sum_indent + 4,
+        "CASE should be one level deeper than SUM(, got:\n{}",
+        formatted
+    );
+
+    // WHEN inside CASE should be one deeper than CASE
+    let when_idx = lines
+        .iter()
+        .enumerate()
+        .skip(case_idx + 1)
+        .find(|(_, line)| line.trim_start().starts_with("WHEN status_code = 'DONE'"))
+        .map(|(i, _)| i)
+        .expect("WHEN inside CASE");
+    assert_eq!(
+        leading_spaces(lines[when_idx]),
+        leading_spaces(lines[case_idx]) + 4,
+        "WHEN should be one level deeper than CASE, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_basic_no_cache_is_idempotent_for_mariadb_test2_and_test3() {
+    // Cache-bypassing idempotency check for test files that contain SELECT func(CASE ...)
+    // patterns. Previously the formatter produced non-idempotent output for these: the
+    // first pass kept `SELECT SUM(` on one line and the second pass split it, creating
+    // a cycle that only the LRU cache was hiding during single-test runs.
+    for name in &["test2.txt", "test3.txt"] {
+        let input = load_mariadb_test_file(name);
+        let formatted = SqlEditorWidget::format_sql_basic_no_cache(&input);
+        let formatted_again = SqlEditorWidget::format_sql_basic_no_cache(&formatted);
+        assert_eq!(
+            formatted,
+            formatted_again,
+            "format_sql_basic must be idempotent for test_mariadb/{name}"
+        );
+    }
+}
+
+#[test]
 fn format_sql_preserves_mariadb_final_boss_v2_script() {
     let input = load_mariadb_test_file("test4.txt");
     assert!(
