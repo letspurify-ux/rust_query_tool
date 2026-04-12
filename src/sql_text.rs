@@ -6011,7 +6011,7 @@ pub(crate) fn trim_after_leading_close_parens(line: &str) -> &str {
             continue;
         }
 
-        if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
+        if sql_line_comment_prefix_len(bytes, idx).is_some() {
             return "";
         }
 
@@ -7296,6 +7296,7 @@ mod tests {
             "EXCLUDE CURRENT ROW"
         );
         assert_eq!(trim_after_leading_close_parens(") -- comment only"), "");
+        assert_eq!(trim_after_leading_close_parens(") # comment only"), "");
         assert_eq!(
             trim_after_leading_close_parens("PARTITION BY deptno"),
             "PARTITION BY deptno"
@@ -7406,6 +7407,7 @@ mod tests {
 
         assert!(!line_has_mixed_leading_close_continuation(")"));
         assert!(!line_has_mixed_leading_close_continuation("),"));
+        assert!(!line_has_mixed_leading_close_continuation(") # comment only"));
         assert!(!line_has_mixed_leading_close_continuation(") bonus_view"));
         assert!(!line_has_mixed_leading_close_continuation(") THEN"));
     }
