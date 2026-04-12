@@ -3420,21 +3420,40 @@ pub(crate) fn is_non_subquery_paren_suppressed_clause_start(text_upper: &str) ->
 /// - `ERROR ON ERROR`
 /// - `NULL ON EMPTY`
 pub(crate) fn is_non_subquery_paren_suppressed_clause_continuation(text_upper: &str) -> bool {
-    let continuation_sequences: &[&[&str]] = &[
-        &["ON", "ERROR"],
-        &["ON", "EMPTY"],
-        &["ERROR", "ON", "ERROR"],
-        &["ERROR", "ON", "EMPTY"],
-        &["EMPTY", "ON", "ERROR"],
-        &["EMPTY", "ON", "EMPTY"],
-        &["NULL", "ON", "ERROR"],
-        &["NULL", "ON", "EMPTY"],
-        &["DEFAULT", "ON", "ERROR"],
-        &["DEFAULT", "ON", "EMPTY"],
-    ];
-    continuation_sequences
-        .iter()
-        .any(|sequence| line_starts_with_identifier_sequence(text_upper, sequence))
+    let starts_on_error_or_empty =
+        line_starts_with_identifier_sequence(text_upper, &["ON", "ERROR"])
+            || line_starts_with_identifier_sequence(text_upper, &["ON", "EMPTY"]);
+    if starts_on_error_or_empty {
+        return true;
+    }
+
+    let words = meaningful_identifier_words_before_inline_comment(text_upper, 4);
+    let is_error_or_empty = |word: &str| word.eq_ignore_ascii_case("ERROR") || word.eq_ignore_ascii_case("EMPTY");
+    let is_scalar_option_head = |word: &str| {
+        word.eq_ignore_ascii_case("ERROR")
+            || word.eq_ignore_ascii_case("EMPTY")
+            || word.eq_ignore_ascii_case("NULL")
+            || word.eq_ignore_ascii_case("DEFAULT")
+            || word.eq_ignore_ascii_case("TRUE")
+            || word.eq_ignore_ascii_case("FALSE")
+            || word.eq_ignore_ascii_case("UNKNOWN")
+    };
+
+    let starts_scalar_option = words.len() >= 3
+        && words.get(1).is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        && words.get(2).is_some_and(|word| is_error_or_empty(word))
+        && words.first().is_some_and(|word| is_scalar_option_head(word));
+    if starts_scalar_option {
+        return true;
+    }
+
+    words.len() >= 4
+        && words.first().is_some_and(|word| word.eq_ignore_ascii_case("EMPTY"))
+        && words.get(1).is_some_and(|word| {
+            word.eq_ignore_ascii_case("ARRAY") || word.eq_ignore_ascii_case("OBJECT")
+        })
+        && words.get(2).is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        && words.get(3).is_some_and(|word| is_error_or_empty(word))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5910,6 +5929,7 @@ pub(crate) fn line_has_mixed_leading_close_continuation(line: &str) -> bool {
         || starts_with_auto_format_owner_boundary(trimmed)
         || format_bare_structural_header_continuation_kind_for_structural_tail(trimmed).is_some()
         || is_format_comment_continuation_keyword(first_token)
+        || is_non_subquery_paren_suppressed_clause_continuation(trimmed)
 }
 
 /// Returns true when a leading keyword should preserve the next line as a
@@ -6891,6 +6911,21 @@ mod tests {
         assert!(is_non_subquery_paren_suppressed_clause_continuation(
             "DEFAULT ON EMPTY"
         ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "TRUE ON ERROR"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "FALSE ON EMPTY"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "UNKNOWN ON ERROR"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "EMPTY ARRAY ON ERROR"
+        ));
+        assert!(is_non_subquery_paren_suppressed_clause_continuation(
+            "EMPTY OBJECT ON EMPTY"
+        ));
         assert!(!is_non_subquery_paren_suppressed_clause_continuation(
             "ON deptno = e.deptno"
         ));
@@ -7150,6 +7185,15 @@ mod tests {
         ));
         assert!(line_has_mixed_leading_close_continuation(
             ") FOR UPDATE NOWAIT"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") TRUE ON ERROR"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") FALSE ON EMPTY"
+        ));
+        assert!(line_has_mixed_leading_close_continuation(
+            ") EMPTY ARRAY ON ERROR"
         ));
 
         assert!(!line_has_mixed_leading_close_continuation(")"));
@@ -8180,6 +8224,18 @@ mod tests {
         assert_eq!(
             auto_format_structural_tail(") SEQUENTIAL ORDER"),
             "SEQUENTIAL ORDER"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") TRUE ON ERROR"),
+            "TRUE ON ERROR"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") FALSE ON EMPTY"),
+            "FALSE ON EMPTY"
+        );
+        assert_eq!(
+            auto_format_structural_tail(") EMPTY ARRAY ON ERROR"),
+            "EMPTY ARRAY ON ERROR"
         );
         assert_eq!(
             auto_format_structural_tail(") ALL ROWS PER MATCH"),

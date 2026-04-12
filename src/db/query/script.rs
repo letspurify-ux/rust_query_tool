@@ -1321,6 +1321,14 @@ impl QueryExecutor {
                 Self::parse_mysql_delimiter_command(trimmed_start)
             {
                 depths.push(builder.block_depth());
+                // DELIMITER directives are statement boundaries for formatter
+                // depth state. An unfinished prior statement must not leak
+                // stale query/paren frames into the next statement.
+                subquery_paren_depth = 0;
+                pending_subquery_paren = 0;
+                subquery_paren_stack.clear();
+                with_cte_depth = 0;
+                with_cte_paren_stack.clear();
                 mysql_delimiter = delimiter;
                 if mysql_delimiter == ";" {
                     mysql_routine_body_pending = false;
@@ -2135,6 +2143,35 @@ impl QueryExecutor {
             if let Some(ToolCommand::MysqlDelimiter { delimiter }) =
                 Self::parse_mysql_delimiter_command(trimmed)
             {
+                // DELIMITER directives are non-SQL command boundaries. Reset
+                // statement-local frame stacks so unfinished previous statements
+                // cannot leak stale depth into the next SQL statement.
+                query_frames.clear();
+                pending_query_bases.clear();
+                pending_split_query_owner = None;
+                pending_partial_query_owner = None;
+                pending_plsql_child_query_owner = None;
+                non_query_into_continuation_frame = None;
+                pending_condition_headers.clear();
+                active_condition_frames.clear();
+                owner_relative_frames.clear();
+                pending_multiline_clause_owner = None;
+                pending_partial_multiline_clause_owner = None;
+                pending_window_definition_owner = None;
+                pending_line_continuation = None;
+                pending_inline_comment_line_continuation = None;
+                trigger_header_frame = None;
+                mysql_trigger_body_frame = None;
+                forall_body_frame = None;
+                pending_control_branch_body_frame = None;
+                pending_condition_close_continuation = None;
+                pending_mysql_declare_handler_frame = None;
+                mysql_declare_handler_block_depths.clear();
+                with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
+                auto_format_subquery_paren_stack.clear();
+                auto_format_function_local_clause_active_stack.clear();
+                pending_auto_format_subquery_paren_count = 0;
+                mysql_on_duplicate_key_update_active = false;
                 mysql_delimiter = delimiter;
                 if mysql_delimiter == ";" {
                     mysql_routine_body_pending = false;
@@ -2276,9 +2313,11 @@ impl QueryExecutor {
                     && sql_text::starts_with_keyword_token(clause_detection_upper, "FROM");
             let current_line_starts_function_local_suppressed_clause =
                 inside_function_local_non_subquery_paren
-                    && sql_text::is_non_subquery_paren_suppressed_clause_start(
+                    && (sql_text::is_non_subquery_paren_suppressed_clause_start(
                         clause_detection_upper,
-                    );
+                    ) || sql_text::is_non_subquery_paren_suppressed_clause_continuation(
+                        clause_detection_upper,
+                    ));
             let suppress_function_local_option_clause_continuation =
                 function_local_non_subquery_clause_active
                     && sql_text::is_non_subquery_paren_suppressed_clause_continuation(
@@ -21703,6 +21742,106 @@ FROM event_log e;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_keep_json_exists_true_false_on_error_non_structural() {
+        let sql = r#"SELECT
+    JSON_EXISTS (
+        e.payload,
+        '$.items[*]'
+        TRUE ON ERROR
+        FALSE ON EMPTY
+    ) AS has_items,
+    e.empno
+FROM emp_json e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let on_error_idx = find_line_starting_with("TRUE ON ERROR");
+        let on_empty_idx = find_line_starting_with("FALSE ON EMPTY");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM emp_json e;");
+
+        for option_idx in [on_error_idx, on_empty_idx] {
+            assert_eq!(
+                contexts[option_idx].line_semantic,
+                AutoFormatLineSemantic::None,
+                "JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY options should stay non-structural"
+            );
+            assert_ne!(
+                contexts[option_idx].query_role,
+                AutoFormatQueryRole::Base,
+                "JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY options should not reopen query-base state"
+            );
+            assert!(
+                contexts[option_idx].auto_depth > contexts[from_idx].auto_depth,
+                "JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY option lines should stay deeper than outer FROM clause"
+            );
+        }
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "SELECT-list sibling should return to canonical list depth after JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY options"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_mixed_close_json_exists_true_false_non_structural() {
+        let sql = r#"SELECT
+    JSON_EXISTS (
+        e.payload,
+        '$.items[*]'
+        PASSING JSON_OBJECT (
+            KEY 'k' VALUE e.empno
+        ) TRUE ON ERROR
+        FALSE ON EMPTY
+    ) AS has_items,
+    e.empno
+FROM emp_json e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let mixed_on_error_idx = find_line_starting_with(") TRUE ON ERROR");
+        let on_empty_idx = find_line_starting_with("FALSE ON EMPTY");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM emp_json e;");
+
+        for option_idx in [mixed_on_error_idx, on_empty_idx] {
+            assert_eq!(
+                contexts[option_idx].line_semantic,
+                AutoFormatLineSemantic::None,
+                "mixed-close JSON_EXISTS TRUE/FALSE options should stay non-structural"
+            );
+            assert_ne!(
+                contexts[option_idx].query_role,
+                AutoFormatQueryRole::Base,
+                "mixed-close JSON_EXISTS TRUE/FALSE options should not reopen query-base state"
+            );
+            assert!(
+                contexts[option_idx].auto_depth > contexts[from_idx].auto_depth,
+                "mixed-close JSON_EXISTS TRUE/FALSE option lines should stay deeper than outer FROM clause"
+            );
+        }
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "SELECT-list sibling should return to canonical list depth after mixed-close JSON_EXISTS TRUE/FALSE options"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_nested_function_local_on_error_non_structural() {
         let sql = r#"SELECT
     JSON_VALUE (
@@ -21752,6 +21891,57 @@ FROM event_log e;"#;
             contexts[sibling_idx].auto_depth,
             contexts[from_idx].auto_depth.saturating_add(1),
             "SELECT-list sibling should return to canonical list depth after nested function-local ON ERROR"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_keep_mixed_close_function_local_on_error_non_structural() {
+        let sql = r#"SELECT
+    JSON_VALUE (
+        e.payload,
+        '$.name'
+        RETURNING VARCHAR2 (
+            30
+        ) ON ERROR NULL
+        ON EMPTY NULL
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let mixed_on_error_idx = find_line_starting_with(") ON ERROR NULL");
+        let on_empty_idx = find_line_starting_with("ON EMPTY NULL");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM event_log e;");
+
+        for option_idx in [mixed_on_error_idx, on_empty_idx] {
+            assert_eq!(
+                contexts[option_idx].line_semantic,
+                AutoFormatLineSemantic::None,
+                "mixed-close function-local JSON_VALUE option should stay non-structural"
+            );
+            assert_ne!(
+                contexts[option_idx].query_role,
+                AutoFormatQueryRole::Base,
+                "mixed-close function-local JSON_VALUE option must not reopen query-base state"
+            );
+            assert!(
+                contexts[option_idx].auto_depth > contexts[from_idx].auto_depth,
+                "mixed-close function-local JSON_VALUE option line should stay deeper than outer FROM clause"
+            );
+        }
+        assert_eq!(
+            contexts[sibling_idx].auto_depth,
+            contexts[from_idx].auto_depth.saturating_add(1),
+            "SELECT-list sibling after mixed-close function-local options should return to canonical list depth"
         );
     }
 
@@ -22200,6 +22390,56 @@ DELIMITER ;"#;
             contexts[into_idx].line_semantic,
             AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
             "INTO after RETURNING should remain in the structural DML clause chain after custom-delimited statement reset"
+        );
+    }
+
+    #[test]
+    fn auto_format_line_contexts_resets_frames_on_delimiter_command_boundary_without_statement_terminator(
+    ) {
+        let sql = r#"DELIMITER $$
+SELECT (
+DELIMITER ;
+INSERT INTO qt_fmt_emp_log (emp_id)
+VALUES (1001)
+RETURNING emp_id
+INTO v_emp_id;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}"))
+        };
+
+        let insert_idx = find_line_starting_with("INSERT INTO qt_fmt_emp_log (emp_id)");
+        let returning_idx = find_line_starting_with("RETURNING emp_id");
+        let into_idx = find_line_starting_with("INTO v_emp_id;");
+
+        assert_eq!(
+            contexts[insert_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Insert),
+            "DELIMITER command boundary should reset stale query/paren frames so the next statement starts from a fresh INSERT clause"
+        );
+        assert_eq!(
+            contexts[insert_idx].query_role,
+            AutoFormatQueryRole::Base,
+            "statement after DELIMITER command boundary should reopen a fresh query base instead of inheriting stale frame stack depth"
+        );
+        assert_eq!(
+            contexts[insert_idx].auto_depth, 0,
+            "statement after DELIMITER command boundary should realign to top-level depth"
+        );
+        assert_eq!(
+            contexts[returning_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Returning),
+            "RETURNING after DELIMITER command boundary should remain a structural clause and not be suppressed by stale function-local frame carry"
+        );
+        assert_eq!(
+            contexts[into_idx].line_semantic,
+            AutoFormatLineSemantic::Clause(AutoFormatClauseKind::Into),
+            "INTO after RETURNING should remain in the structural DML clause chain after DELIMITER command boundary reset"
         );
     }
 

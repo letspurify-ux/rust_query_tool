@@ -4165,8 +4165,7 @@ impl SqlEditorWidget {
     }
 
     fn delimiter_pairs_are_balanced(tokens: &[SqlToken]) -> bool {
-        let mut paren_depth = 0usize;
-        let mut bracket_depth = 0usize;
+        let mut delimiter_stack: Vec<&'static str> = Vec::new();
 
         for token in tokens {
             let SqlToken::Symbol(symbol) = token else {
@@ -4174,25 +4173,22 @@ impl SqlEditorWidget {
             };
 
             match symbol.as_str() {
-                "(" => paren_depth = paren_depth.saturating_add(1),
-                ")" => {
-                    if paren_depth == 0 {
+                "(" => delimiter_stack.push(")"),
+                "[" => delimiter_stack.push("]"),
+                "{" => delimiter_stack.push("}"),
+                ")" | "]" | "}" => {
+                    let Some(expected_close) = delimiter_stack.pop() else {
+                        return false;
+                    };
+                    if expected_close != symbol.as_str() {
                         return false;
                     }
-                    paren_depth -= 1;
-                }
-                "[" => bracket_depth = bracket_depth.saturating_add(1),
-                "]" => {
-                    if bracket_depth == 0 {
-                        return false;
-                    }
-                    bracket_depth -= 1;
                 }
                 _ => {}
             }
         }
 
-        paren_depth == 0 && bracket_depth == 0
+        delimiter_stack.is_empty()
     }
 
     fn token_can_terminate_statement(token: &SqlToken) -> bool {
@@ -14313,6 +14309,32 @@ FROM DUAL;
         assert!(
             !formatted.trim_end().ends_with(';'),
             "formatter must not append semicolon to malformed statement with unbalanced brackets, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_cross_nested_paren_bracket_delimiters() {
+        let source = "SELECT ([1)] FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with cross-nested delimiters, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_appends_semicolon_for_balanced_mixed_nested_delimiters() {
+        let source = "SELECT ([1]) FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.trim_end().ends_with(';'),
+            "formatter should append semicolon when mixed delimiters are properly nested, got:
 {}",
             formatted
         );
@@ -24904,6 +24926,331 @@ FROM event_log e;"#;
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "ON-prefixed JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_mixed_close_json_value_on_error_inside_function_parens() {
+        let source = r#"SELECT
+    JSON_VALUE (
+        e.payload,
+        '$.name'
+        RETURNING VARCHAR2 (
+            30
+        ) ON ERROR NULL -- policy
+        ON EMPTY NULL -- fallback
+    ) AS name_txt,
+    e.empno
+FROM event_log e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing line starting with `{}`\n{}",
+                        prefix, formatted
+                    )
+                })
+        };
+        let find_line_containing = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing line containing `{needle}`\n{formatted}"))
+        };
+
+        let mixed_on_error_idx = find_line_containing("ON ERROR NULL -- policy");
+        let on_empty_idx = find_line_starting_with("ON EMPTY NULL -- fallback");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM event_log e;");
+
+        let mixed_on_error_trimmed = lines[mixed_on_error_idx].trim_start();
+        let mixed_on_error_is_dedicated_line = mixed_on_error_trimmed
+            .starts_with(") ON ERROR NULL -- policy")
+            || mixed_on_error_trimmed.starts_with("ON ERROR NULL -- policy");
+        if mixed_on_error_is_dedicated_line {
+            assert_eq!(
+                indent(lines[on_empty_idx]),
+                indent(lines[mixed_on_error_idx]),
+                "mixed-close JSON_VALUE option lines should stay on the shared function-local depth, got:\n{}",
+                formatted
+            );
+        } else {
+            assert!(
+                lines[mixed_on_error_idx].contains("JSON_VALUE")
+                    || lines[mixed_on_error_idx].contains("RETURNING")
+                    || lines[mixed_on_error_idx].contains(") ON ERROR"),
+                "mixed-close JSON_VALUE ON ERROR must remain in function-local expression context, got:\n{}",
+                formatted
+            );
+        }
+        assert!(
+            indent(lines[on_empty_idx]) > indent(lines[from_idx]),
+            "mixed-close JSON_VALUE ON EMPTY option should stay inside function parens, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "SELECT-list sibling after mixed-close JSON_VALUE options should return to canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "mixed-close JSON_VALUE option auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_mixed_close_extract_from_inside_function_parens() {
+        let source = r#"SELECT
+    EXTRACT (
+        (YEAR)
+        FROM e.hire_date
+    ) AS hire_year,
+    e.empno
+FROM emp e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+        let function_from_idx = lines
+            .iter()
+            .position(|line| line.contains("FROM e.hire_date"))
+            .unwrap_or_else(|| panic!("function-local EXTRACT FROM line, got:\n{}", formatted));
+
+        if lines[function_from_idx]
+            .trim_start()
+            .starts_with("FROM e.hire_date")
+        {
+            assert!(
+                indent(lines[function_from_idx]) > indent(lines[outer_from_idx]),
+                "mixed-close EXTRACT FROM line should stay inside function parens, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "mixed-close EXTRACT FROM auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_mixed_close_json_query_with_wrapper_inside_function_parens()
+    {
+        let source = r#"SELECT
+    JSON_QUERY (
+        e.payload,
+        '$.items[*]'
+        RETURNING VARCHAR2 (
+            100
+        ) WITH WRAPPER
+    ) AS items_json,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let outer_from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().eq_ignore_ascii_case("FROM emp_json e;"))
+            .unwrap_or_else(|| panic!("outer query FROM clause, got:\n{}", formatted));
+        let wrapper_idx = lines
+            .iter()
+            .position(|line| line.contains("WITH WRAPPER"))
+            .unwrap_or_else(|| panic!("function-local WITH WRAPPER line, got:\n{}", formatted));
+
+        if lines[wrapper_idx].trim_start().starts_with("WITH WRAPPER")
+            || lines[wrapper_idx].trim_start().starts_with(") WITH WRAPPER")
+        {
+            assert!(
+                indent(lines[wrapper_idx]) > indent(lines[outer_from_idx]),
+                "mixed-close JSON_QUERY WITH WRAPPER should stay inside function parens, got:\n{}",
+                formatted
+            );
+        }
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "mixed-close JSON_QUERY WITH WRAPPER auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_function_local_from_under_wrapped_case_frame() {
+        let source = r#"SELECT
+    EXTRACT (
+        (CASE
+            WHEN e.flag = 'Y' THEN YEAR
+            ELSE MONTH
+        END) -- wrapped case result
+        FROM e.hire_date -- function-local from
+    ) AS part_val,
+    e.empno
+FROM emp e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}\n{formatted}"))
+        };
+
+        let function_from_idx = find_line_starting_with("FROM e.hire_date -- function-local from");
+        let outer_from_idx = find_line_starting_with("FROM emp e;");
+        let sibling_idx = find_line_starting_with("e.empno");
+
+        assert!(
+            indent(lines[function_from_idx]) > indent(lines[outer_from_idx]),
+            "EXTRACT function-local FROM under wrapped CASE frame should stay inside the function parens, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[outer_from_idx]).saturating_add(4),
+            "SELECT-list sibling after wrapped CASE EXTRACT should return to canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "wrapped CASE EXTRACT auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_json_exists_true_false_on_error_inside_function_parens() {
+        let source = r#"SELECT
+    JSON_EXISTS (
+        e.payload,
+        '$.items[*]'
+        TRUE ON ERROR
+        FALSE ON EMPTY
+    ) AS has_items,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}\n{formatted}"))
+        };
+
+        assert!(
+            formatted.contains("TRUE ON ERROR"),
+            "JSON_EXISTS TRUE ON ERROR should stay inside the function call, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("FALSE ON EMPTY"),
+            "JSON_EXISTS FALSE ON EMPTY should stay inside the function call, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("\nTRUE ON ERROR"),
+            "JSON_EXISTS TRUE ON ERROR should not be promoted to a top-level clause line, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("\nFALSE ON EMPTY"),
+            "JSON_EXISTS FALSE ON EMPTY should not be promoted to a top-level clause line, got:\n{formatted}"
+        );
+
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM emp_json e;");
+
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "SELECT-list sibling after JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY should return to canonical list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "JSON_EXISTS TRUE/FALSE ON ERROR/ON EMPTY auto-formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_mixed_close_json_exists_true_false_inside_function_parens(
+    ) {
+        let source = r#"SELECT
+    JSON_EXISTS (
+        e.payload,
+        '$.items[*]'
+        PASSING JSON_OBJECT (
+            KEY 'k' VALUE e.empno
+        ) TRUE ON ERROR -- policy
+        FALSE ON EMPTY -- fallback
+    ) AS has_items,
+    e.empno
+FROM emp_json e;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let find_line_starting_with = |prefix: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing line starting with: {prefix}\n{formatted}"))
+        };
+        let find_line_containing = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("missing line containing `{needle}`\n{formatted}"))
+        };
+
+        let mixed_on_error_idx = find_line_containing("TRUE ON ERROR -- policy");
+        let on_empty_idx = find_line_starting_with("FALSE ON EMPTY -- fallback");
+        let sibling_idx = find_line_starting_with("e.empno");
+        let from_idx = find_line_starting_with("FROM emp_json e;");
+
+        let mixed_on_error_trimmed = lines[mixed_on_error_idx].trim_start();
+        let mixed_on_error_is_dedicated_line = mixed_on_error_trimmed
+            .starts_with(") TRUE ON ERROR -- policy")
+            || mixed_on_error_trimmed.starts_with("TRUE ON ERROR -- policy");
+        if mixed_on_error_is_dedicated_line {
+            assert_eq!(
+                indent(lines[on_empty_idx]),
+                indent(lines[mixed_on_error_idx]),
+                "mixed-close JSON_EXISTS TRUE/FALSE option lines should stay on the shared function-local depth, got:\n{}",
+                formatted
+            );
+        } else {
+            assert!(
+                lines[mixed_on_error_idx].contains("JSON_OBJECT")
+                    || lines[mixed_on_error_idx].contains(") TRUE ON ERROR"),
+                "mixed-close JSON_EXISTS TRUE ON ERROR must remain inside function-local expression context, got:\n{}",
+                formatted
+            );
+        }
+        assert!(
+            indent(lines[on_empty_idx]) > indent(lines[from_idx]),
+            "mixed-close JSON_EXISTS FALSE ON EMPTY should stay inside function parens, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[sibling_idx]),
+            indent(lines[from_idx]).saturating_add(4),
+            "SELECT-list sibling after mixed-close JSON_EXISTS options should return to canonical list depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "mixed-close JSON_EXISTS TRUE/FALSE auto-formatting should be idempotent"
         );
     }
 
