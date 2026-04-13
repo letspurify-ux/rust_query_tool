@@ -2153,8 +2153,8 @@ pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
 /// Updates `in_block_comment` state for a single trimmed line.
 ///
 /// This properly handles lines that contain both `*/` (closing) and `/*` (opening)
-/// on the same line (e.g. `*/ SELECT /* ... `).  Both `line_auto_format_depths` and
-/// `apply_parser_depth_indentation` must use this instead of ad-hoc `contains("*/")`.
+/// on the same line (e.g. `*/ SELECT /* ... `). `apply_parser_depth_indentation`
+/// must use this instead of ad-hoc `contains("*/")`.
 pub(crate) fn update_block_comment_state(trimmed: &str, in_block_comment: &mut bool) {
     let bytes = trimmed.as_bytes();
     let mut i = 0usize;

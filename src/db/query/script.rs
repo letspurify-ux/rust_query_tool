@@ -4163,10 +4163,6 @@ impl QueryExecutor {
         contexts
     }
 
-    pub fn line_auto_format_depths(sql: &str) -> Vec<usize> {
-        crate::auto_format_engine::line_auto_format_depths(sql)
-    }
-
     fn auto_format_clause_kind(trimmed_upper: &str) -> Option<AutoFormatClauseKind> {
         if sql_text::starts_with_keyword_token(trimmed_upper, "WITH") {
             Some(AutoFormatClauseKind::With)
@@ -11064,37 +11060,6 @@ ORDER BY rt.PATH;"#;
             .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
         );
-    }
-
-    #[test]
-    fn line_auto_format_depths_adds_into_list_continuation_depth() {
-        let sql = "SELECT col\nINTO v_a,\nv_b\nFROM dual;";
-        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
-
-        assert_eq!(auto_depths.len(), sql.lines().count());
-        // v_b continuation after the comma-terminated INTO line should stay at
-        // the INTO frame stack depth, not drop back to the SELECT level.
-        assert_eq!(auto_depths[2], auto_depths[1]);
-    }
-
-    #[test]
-    fn line_auto_format_depths_adds_dml_comma_continuation_depth() {
-        let sql = "UPDATE t\nSET a = 1,\nb = 2\nWHERE id = 1;";
-        let block_depths = QueryExecutor::line_block_depths(sql);
-        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
-
-        assert_eq!(block_depths.len(), auto_depths.len());
-        assert_eq!(auto_depths[2], block_depths[2].saturating_add(1));
-    }
-
-    #[test]
-    fn line_auto_format_depths_keeps_comma_continuation_after_comment_line() {
-        let sql = "UPDATE t\nSET a = 1,\n-- keep comma depth\nb = 2\nWHERE id = 1;";
-        let block_depths = QueryExecutor::line_block_depths(sql);
-        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
-
-        assert_eq!(block_depths.len(), auto_depths.len());
-        assert_eq!(auto_depths[3], block_depths[3].saturating_add(1));
     }
 
     #[test]

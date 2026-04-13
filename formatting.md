@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-12 (leading close 선소비 token-order 계약, terminal close-alias tail query-boundary 일반화, multiline literal 시작 상태 예외를 명시)
+> 최종 업데이트: 2026-04-13 (runtime formatter structural frame 단일 stack 계약을 명시하고 query/condition/block owner 복원 경로를 통합)
 
 ## 0. 이 문서의 역할
 
@@ -215,6 +215,16 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 - delimiter가 없는 terminal alias tail(`) window`, `) AS window`)도 예외가 아니다. lexical helper 하나로 bare `WINDOW` clause와 구분하려 하지 말고, active query frame + 다음 code line boundary를 함께 봐서 "현재 select-list item의 닫힘 alias인지 / 다음 structural header chain의 시작인지"를 판정해야 한다.
 - mixed leading-close line에서는 close를 먼저 소비한 뒤 continuation/body/header 규칙으로 다시 해석한 결과가 `final depth`다.
 - 실제 렌더링은 token-level 2단 정렬이 아니라 line-level canonical depth를 사용한다.
+
+### 2.7 runtime formatter의 LIFO structural state는 단일 frame stack으로 유지한다
+
+- `formatter.rs`의 실제 auto-format runtime은 구조적 LIFO 상태를 하나의 `Vec<FormatFrame>`로만 관리한다.
+- `Paren`, `Block`, `ConditionOwner`, `OpenCursor` 같은 frame family는 모두 같은 stack에 들어가며, push/pop/scope sync도 이 stack 하나를 통해 수행한다.
+- query-like paren의 restore state, query base depth, wrapped-owner metadata는 별도 벡터가 아니라 해당 `Paren` frame 안에 저장되어야 한다.
+- block kind와 block owner depth도 분리된 pair stack이 아니라 하나의 `Block` frame으로 유지해야 한다.
+- `JOIN/WHERE/CASE/control-condition` owner는 dedicated `ConditionOwner` frame으로 유지하되, 만료 판정은 별도 배열 truncate가 아니라 현재 `(paren_depth, block_depth)`에 대한 stack scan/sync로만 처리해야 한다.
+- 따라서 active query base, parent sibling indent, active wrapped owner kind, CASE/control-header owner depth 같은 파생값도 "각각의 side stack"을 읽어 합성하지 않고, 항상 단일 frame stack을 뒤에서부터 스캔해서 계산해야 한다.
+- non-LIFO 성격의 bool/phase flag는 별도 상태로 남을 수 있지만, 구조 depth와 owner 복원에 관여하는 값은 단일 frame stack 밖에 복제되면 안 된다.
 
 ## 3. 현재 taxonomy / policy
 
