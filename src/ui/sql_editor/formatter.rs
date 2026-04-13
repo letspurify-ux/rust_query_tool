@@ -1229,12 +1229,21 @@ impl FormatFrameStack {
         Some(state)
     }
 
-    fn clear_statement_frames(&mut self) {
-        while self
-            .frames
-            .last()
-            .is_some_and(|frame| !Self::frame_survives_statement_boundary(frame))
-        {
+    /// Clear all non-persistent frames at a statement boundary and restore
+    /// `indent_level` by undoing the indent delta of every paren frame that is
+    /// popped. This keeps symmetric push/pop accounting even when a statement
+    /// ends with dangling open parens (e.g., a mid-statement error).
+    fn clear_statement_frames(&mut self, indent_level: &mut usize) {
+        while let Some(frame) = self.frames.last() {
+            if Self::frame_survives_statement_boundary(frame) {
+                break;
+            }
+            if let FormatFrame::Paren(paren) = frame {
+                if paren.frame.closes_indented() {
+                    *indent_level =
+                        indent_level.saturating_sub(paren.frame.indent_level_delta());
+                }
+            }
             let _ = self.pop_tail_frame();
         }
         self.paren_depth = 0;
@@ -1396,6 +1405,71 @@ impl ScopedFlag {
     }
 }
 
+/// Scoped indent adjustment frame tracking both the activation scope and the
+/// delta that was applied to `indent_level`. Used by `ScopedIndent` to keep
+/// push/pop symmetric automatically, replacing manual `indent_level ±= delta`
+/// pairs around `ScopedFlag` toggles.
+#[derive(Clone, Copy)]
+struct ScopedIndentFrame {
+    scope: FormatScope,
+    delta: usize,
+}
+
+/// A scoped indent bump. Activating increments `indent_level` by a delta;
+/// deactivating, clearing, or exiting the activation scope decrements by the
+/// same delta. This guarantees symmetric indent accounting regardless of which
+/// control path ends the scope.
+#[derive(Default)]
+struct ScopedIndent {
+    frames: Vec<ScopedIndentFrame>,
+}
+
+impl ScopedIndent {
+    fn activate(&mut self, scope: FormatScope, delta: usize, indent_level: &mut usize) {
+        if self
+            .frames
+            .last()
+            .is_some_and(|frame| frame.scope == scope)
+        {
+            return;
+        }
+        *indent_level = indent_level.saturating_add(delta);
+        self.frames.push(ScopedIndentFrame { scope, delta });
+    }
+
+    fn deactivate(&mut self, indent_level: &mut usize) {
+        if let Some(frame) = self.frames.pop() {
+            *indent_level = indent_level.saturating_sub(frame.delta);
+        }
+    }
+
+    fn clear(&mut self, indent_level: &mut usize) {
+        while let Some(frame) = self.frames.pop() {
+            *indent_level = indent_level.saturating_sub(frame.delta);
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    /// Deactivate any active frames whose activation scope no longer contains
+    /// the current scope. This is the scope-based integrity helper: when a
+    /// surrounding block or paren is exited, any outstanding scoped indent
+    /// automatically unwinds in lockstep with the frame stack.
+    fn sync_scope(&mut self, current_scope: FormatScope, indent_level: &mut usize) {
+        while self
+            .frames
+            .last()
+            .is_some_and(|frame| !frame.scope.contains(current_scope))
+        {
+            if let Some(frame) = self.frames.pop() {
+                *indent_level = indent_level.saturating_sub(frame.delta);
+            }
+        }
+    }
+}
+
 struct ScopedValueFrame<T> {
     scope: FormatScope,
     value: T,
@@ -1463,7 +1537,7 @@ struct ConstructState {
     model_active: ScopedFlag,
     model_reference_pending: ScopedFlag,
     merge_active: ScopedFlag,
-    merge_when_branch_active: ScopedFlag,
+    merge_when_branch_active: ScopedIndent,
     returning_active: ScopedFlag,
     search_cycle_clause_active: ScopedFlag,
     match_recognize_paren_depths: Vec<usize>,
@@ -1477,13 +1551,17 @@ struct ConstructState {
     referential_on_active: ScopedFlag,
     execute_immediate_active: ScopedFlag,
     cursor_decl_pending: ScopedFlag,
-    cursor_sql_active: ScopedFlag,
+    cursor_sql_active: ScopedIndent,
     forall_pending: ScopedFlag,
-    forall_body_active: ScopedFlag,
+    forall_body_active: ScopedIndent,
 }
 
 impl ConstructState {
-    fn sync_scope(&mut self, current_scope: FormatScope) {
+    /// Sync all scoped flags and scoped indents to the current scope. Any
+    /// `ScopedIndent` whose activation scope no longer contains the current
+    /// scope auto-deactivates, restoring its indent delta in lockstep with the
+    /// surrounding frame stack.
+    fn sync_scope(&mut self, current_scope: FormatScope, indent_level: &mut usize) {
         self.create_pending.sync_scope(current_scope);
         self.create_object.sync_scope(current_scope);
         self.routine_decl_pending.sync_scope(current_scope);
@@ -1496,7 +1574,8 @@ impl ConstructState {
         self.model_active.sync_scope(current_scope);
         self.model_reference_pending.sync_scope(current_scope);
         self.merge_active.sync_scope(current_scope);
-        self.merge_when_branch_active.sync_scope(current_scope);
+        self.merge_when_branch_active
+            .sync_scope(current_scope, indent_level);
         self.returning_active.sync_scope(current_scope);
         self.search_cycle_clause_active.sync_scope(current_scope);
         self.fetch_active.sync_scope(current_scope);
@@ -1506,9 +1585,11 @@ impl ConstructState {
         self.referential_on_active.sync_scope(current_scope);
         self.execute_immediate_active.sync_scope(current_scope);
         self.cursor_decl_pending.sync_scope(current_scope);
-        self.cursor_sql_active.sync_scope(current_scope);
+        self.cursor_sql_active
+            .sync_scope(current_scope, indent_level);
         self.forall_pending.sync_scope(current_scope);
-        self.forall_body_active.sync_scope(current_scope);
+        self.forall_body_active
+            .sync_scope(current_scope, indent_level);
     }
 
     fn in_match_recognize_paren(&self, paren_depth: usize) -> bool {
@@ -5399,7 +5480,7 @@ impl SqlEditorWidget {
                     frame.record_body_indent(line_indent);
                 }
             }
-            construct.sync_scope(current_scope);
+            construct.sync_scope(current_scope, &mut indent_level);
             let in_plsql_block = format_stack.plsql_context_is_active();
             let current_query_has_apply = query_apply_flags.get(idx).copied().unwrap_or(false);
             if let Some(label_indent) = pending_plsql_label_body_indent {
@@ -6096,9 +6177,10 @@ impl SqlEditorWidget {
                         if construct.forall_pending.is_active()
                             && matches!(upper, "INSERT" | "UPDATE" | "DELETE" | "MERGE")
                         {
-                            indent_level = indent_level.saturating_add(1);
                             construct.forall_pending.deactivate();
-                            construct.forall_body_active.activate(current_scope);
+                            construct
+                                .forall_body_active
+                                .activate(current_scope, 1, &mut indent_level);
                         }
                         if !is_within_group {
                             let insert_all_active_in_scope = construct
@@ -6444,10 +6526,9 @@ impl SqlEditorWidget {
                         .flatten();
                         if is_merge_when {
                             // MERGE WHEN MATCHED/NOT MATCHED: at base indent
-                            if construct.merge_when_branch_active.is_active() {
-                                indent_level = indent_level.saturating_sub(1);
-                                construct.merge_when_branch_active.deactivate();
-                            }
+                            construct
+                                .merge_when_branch_active
+                                .deactivate(&mut indent_level);
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
@@ -6746,8 +6827,9 @@ impl SqlEditorWidget {
                             && !format_stack.last_block_kind_is("CASE")
                         {
                             // MERGE WHEN MATCHED THEN / WHEN NOT MATCHED THEN
-                            indent_level += 1;
-                            construct.merge_when_branch_active.activate(current_scope);
+                            construct
+                                .merge_when_branch_active
+                                .activate(current_scope, 1, &mut indent_level);
                             newline_after_keyword = true;
                         } else if construct
                             .insert_all_active
@@ -6923,8 +7005,9 @@ impl SqlEditorWidget {
                         } else if upper == "OPEN" {
                             open_cursor_state = OpenCursorFormatState::AwaitingFor;
                         } else if upper == "FOR" && mysql_declare_cursor_for_clause {
-                            construct.cursor_sql_active.activate(current_scope);
-                            indent_level += 1;
+                            construct
+                                .cursor_sql_active
+                                .activate(current_scope, 1, &mut indent_level);
                             newline_after_keyword = true;
                         } else if upper == "FOR" && mysql_declare_handler_for_clause {
                             mysql_handler_state.start();
@@ -7470,8 +7553,15 @@ impl SqlEditorWidget {
                     }
                     if matches!(upper, "IS" | "AS") && construct.cursor_decl_pending.is_active() {
                         construct.cursor_decl_pending.deactivate();
-                        construct.cursor_sql_active.activate(current_scope);
-                        indent_level = indent_level.max(line_indent).saturating_add(1);
+                        let cursor_new_indent =
+                            indent_level.max(line_indent).saturating_add(1);
+                        let cursor_delta =
+                            cursor_new_indent.saturating_sub(indent_level);
+                        construct.cursor_sql_active.activate(
+                            current_scope,
+                            cursor_delta,
+                            &mut indent_level,
+                        );
                         newline_after_keyword = true;
                     }
 
@@ -9147,19 +9237,12 @@ impl SqlEditorWidget {
                             construct.insert_all_active.clear();
                             construct.referential_action_pending.clear();
                             construct.referential_on_active.clear();
-                            if construct.merge_when_branch_active.is_active() {
-                                indent_level = indent_level.saturating_sub(1);
-                                construct.merge_when_branch_active.clear();
-                            }
+                            construct
+                                .merge_when_branch_active
+                                .clear(&mut indent_level);
                             construct.merge_active.clear();
-                            if construct.cursor_sql_active.is_active() {
-                                indent_level = indent_level.saturating_sub(1);
-                                construct.cursor_sql_active.clear();
-                            }
-                            if construct.forall_body_active.is_active() {
-                                indent_level = indent_level.saturating_sub(1);
-                                construct.forall_body_active.clear();
-                            }
+                            construct.cursor_sql_active.clear(&mut indent_level);
+                            construct.forall_body_active.clear(&mut indent_level);
                             if pending_package_member_separator
                                 && format_stack.last_block_kind_is("PACKAGE_BODY")
                             {
@@ -9179,16 +9262,11 @@ impl SqlEditorWidget {
                                 pending_package_member_separator = false;
                             }
                             construct.routine_decl_pending.clear();
-                            let dangling_paren_indent = format_stack
-                                .paren_frames()
-                                .map(|frame| frame.indent_level_delta())
-                                .sum::<usize>();
-                            if dangling_paren_indent > 0 {
-                                indent_level = indent_level.saturating_sub(dangling_paren_indent);
-                            }
                             suppress_comma_break_depth = 0;
                             query_body_clause_base_depth = None;
-                            format_stack.clear_statement_frames();
+                            // `clear_statement_frames` restores `indent_level`
+                            // by undoing the delta of each popped paren frame.
+                            format_stack.clear_statement_frames(&mut indent_level);
                             construct.pop_closed_paren_scopes(0);
                             select_list_break_state.clear();
                             let should_reset_paren_tracking =
@@ -11639,7 +11717,77 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_scope_state_tests {
-    use super::{FormatScope, ScopedFlag, ScopedValue, SqlEditorWidget};
+    use super::{FormatScope, ScopedFlag, ScopedIndent, ScopedValue, SqlEditorWidget};
+
+    #[test]
+    fn scoped_indent_activate_deactivate_is_symmetric() {
+        let mut indent = ScopedIndent::default();
+        let scope = FormatScope::new(0, 0);
+        let mut indent_level = 3usize;
+
+        indent.activate(scope, 2, &mut indent_level);
+        assert_eq!(indent_level, 5);
+        assert!(indent.is_active());
+
+        indent.deactivate(&mut indent_level);
+        assert_eq!(indent_level, 3);
+        assert!(!indent.is_active());
+    }
+
+    #[test]
+    fn scoped_indent_same_scope_activation_does_not_double_apply() {
+        let mut indent = ScopedIndent::default();
+        let scope = FormatScope::new(1, 2);
+        let mut indent_level = 0usize;
+
+        indent.activate(scope, 1, &mut indent_level);
+        indent.activate(scope, 1, &mut indent_level);
+        assert_eq!(
+            indent_level, 1,
+            "same-scope re-activation must not double-apply the delta"
+        );
+
+        indent.deactivate(&mut indent_level);
+        assert_eq!(indent_level, 0);
+        assert!(!indent.is_active());
+    }
+
+    #[test]
+    fn scoped_indent_sync_scope_auto_deactivates_expired_frames() {
+        let mut indent = ScopedIndent::default();
+        let outer_scope = FormatScope::new(1, 1);
+        let inner_scope = FormatScope::new(2, 1);
+        let mut indent_level = 0usize;
+
+        indent.activate(outer_scope, 1, &mut indent_level);
+        indent.activate(inner_scope, 3, &mut indent_level);
+        assert_eq!(indent_level, 4);
+
+        // Exiting to the outer scope must pop only the inner frame.
+        indent.sync_scope(outer_scope, &mut indent_level);
+        assert_eq!(indent_level, 1);
+        assert!(indent.is_active());
+
+        // Exiting to a scope that no outer frame contains must pop everything.
+        indent.sync_scope(FormatScope::new(0, 0), &mut indent_level);
+        assert_eq!(indent_level, 0);
+        assert!(!indent.is_active());
+    }
+
+    #[test]
+    fn scoped_indent_clear_unwinds_all_frames() {
+        let mut indent = ScopedIndent::default();
+        let mut indent_level = 0usize;
+
+        indent.activate(FormatScope::new(0, 1), 1, &mut indent_level);
+        indent.activate(FormatScope::new(1, 1), 2, &mut indent_level);
+        indent.activate(FormatScope::new(2, 1), 3, &mut indent_level);
+        assert_eq!(indent_level, 6);
+
+        indent.clear(&mut indent_level);
+        assert_eq!(indent_level, 0);
+        assert!(!indent.is_active());
+    }
 
     #[test]
     fn scoped_flag_same_scope_activation_is_idempotent() {
@@ -36216,7 +36364,7 @@ mod format_frame_stack_tests {
             &mut indent_level,
         );
 
-        stack.clear_statement_frames();
+        stack.clear_statement_frames(&mut indent_level);
 
         assert_eq!(stack.paren_depth(), 0);
         assert_eq!(stack.current_query_base_depth(), None);
