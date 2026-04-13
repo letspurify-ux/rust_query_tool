@@ -1229,12 +1229,21 @@ impl FormatFrameStack {
         Some(state)
     }
 
-    fn clear_statement_frames(&mut self) {
-        while self
-            .frames
-            .last()
-            .is_some_and(|frame| !Self::frame_survives_statement_boundary(frame))
-        {
+    /// Clear all non-persistent frames at a statement boundary and restore
+    /// `indent_level` by undoing the indent delta of every paren frame that is
+    /// popped. This keeps symmetric push/pop accounting even when a statement
+    /// ends with dangling open parens (e.g., a mid-statement error).
+    fn clear_statement_frames(&mut self, indent_level: &mut usize) {
+        while let Some(frame) = self.frames.last() {
+            if Self::frame_survives_statement_boundary(frame) {
+                break;
+            }
+            if let FormatFrame::Paren(paren) = frame {
+                if paren.frame.closes_indented() {
+                    *indent_level =
+                        indent_level.saturating_sub(paren.frame.indent_level_delta());
+                }
+            }
             let _ = self.pop_tail_frame();
         }
         self.paren_depth = 0;
@@ -9179,16 +9188,11 @@ impl SqlEditorWidget {
                                 pending_package_member_separator = false;
                             }
                             construct.routine_decl_pending.clear();
-                            let dangling_paren_indent = format_stack
-                                .paren_frames()
-                                .map(|frame| frame.indent_level_delta())
-                                .sum::<usize>();
-                            if dangling_paren_indent > 0 {
-                                indent_level = indent_level.saturating_sub(dangling_paren_indent);
-                            }
                             suppress_comma_break_depth = 0;
                             query_body_clause_base_depth = None;
-                            format_stack.clear_statement_frames();
+                            // `clear_statement_frames` restores `indent_level`
+                            // by undoing the delta of each popped paren frame.
+                            format_stack.clear_statement_frames(&mut indent_level);
                             construct.pop_closed_paren_scopes(0);
                             select_list_break_state.clear();
                             let should_reset_paren_tracking =
@@ -36216,7 +36220,7 @@ mod format_frame_stack_tests {
             &mut indent_level,
         );
 
-        stack.clear_statement_frames();
+        stack.clear_statement_frames(&mut indent_level);
 
         assert_eq!(stack.paren_depth(), 0);
         assert_eq!(stack.current_query_base_depth(), None);
