@@ -4662,6 +4662,8 @@ impl SqlEditorWidget {
         let mut line_start_token_paren_depth = 0usize;
         let mut join_modifier_active = false;
         let mut join_on_condition_frames: Vec<(usize, usize)> = Vec::new();
+        let mut where_condition_frames: Vec<(usize, usize)> = Vec::new();
+        let mut case_condition_frames: Vec<(usize, usize, usize)> = Vec::new();
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
         let mut prev_word_upper: Option<String> = None;
         let mut construct = ConstructState::default();
@@ -4843,6 +4845,20 @@ impl SqlEditorWidget {
                 .is_some_and(|(paren_depth, _)| *paren_depth > current_scope.paren_depth)
             {
                 join_on_condition_frames.pop();
+            }
+            while where_condition_frames
+                .last()
+                .is_some_and(|(paren_depth, _)| *paren_depth > current_scope.paren_depth)
+            {
+                where_condition_frames.pop();
+            }
+            while case_condition_frames
+                .last()
+                .is_some_and(|(paren_depth, block_depth, _)| {
+                    *paren_depth > current_scope.paren_depth || *block_depth > current_scope.block_depth
+                })
+            {
+                case_condition_frames.pop();
             }
             let top_level_select_item_context =
                 paren_stack.iter().all(|frame| frame.is_query_like());
@@ -5311,7 +5327,8 @@ impl SqlEditorWidget {
                             effective_end_qualifier,
                             Some("LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE")
                         );
-                        let paren_extra = Self::paren_extra_depth(&paren_stack);
+                        let paren_extra =
+                            Self::paren_extra_depth_within_current_query_frame(&paren_stack);
                         let mut closed_block = None;
                         let mut restored_indent_level = None;
                         let mut closed_owner_depth = None;
@@ -5323,7 +5340,9 @@ impl SqlEditorWidget {
                             });
                         let case_expression_end = !is_qualified_end
                             && block_stack.last().is_some_and(|s| s == "CASE")
-                            && (end_qualifier.is_none() || end_qualifier_is_keyword);
+                            && (end_qualifier.is_none()
+                                || end_qualifier_is_keyword
+                                || in_sql_case_clause);
                         let closes_active_package_member = is_package_body_statement
                             && end_qualifier
                                 .as_deref()
@@ -5844,7 +5863,7 @@ impl SqlEditorWidget {
                                 && block_stack
                                     .last()
                                     .is_some_and(|block| matches!(block.as_str(), "IF" | "WHILE"))
-                                && !matches!(current_clause.as_deref(), Some("SELECT")));
+                                && current_clause.is_none());
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| control_condition_header_parenthesized_stack.last().copied())
                             .flatten()
@@ -5971,6 +5990,17 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                         } else {
+                            let where_condition_owner_frame = where_condition_frames
+                                .last()
+                                .copied()
+                                .filter(|(paren_depth, _)| {
+                                    current_scope.paren_depth >= *paren_depth
+                                        && matches!(upper, "AND" | "OR")
+                                        && matches!(
+                                            current_clause.as_deref(),
+                                            Some("WHERE" | "HAVING")
+                                        )
+                                });
                             let join_condition_owner_frame = join_on_condition_frames
                                 .last()
                                 .copied()
@@ -5978,9 +6008,34 @@ impl SqlEditorWidget {
                                     current_scope.paren_depth >= *paren_depth
                                         && matches!(upper, "AND" | "OR")
                                 });
-                            if let Some((owner_paren_depth, owner_depth)) =
-                                join_condition_owner_frame
+                            let case_condition_owner_frame = case_condition_frames
+                                .last()
+                                .copied()
+                                .filter(|(paren_depth, block_depth, _)| {
+                                    current_scope.paren_depth >= *paren_depth
+                                        && current_scope.block_depth >= *block_depth
+                                        && matches!(upper, "AND" | "OR")
+                                });
+                            if let Some((owner_paren_depth, owner_depth)) = where_condition_owner_frame
                             {
+                                newline_with(
+                                    &mut out,
+                                    owner_depth,
+                                    1 + current_scope.paren_depth.saturating_sub(owner_paren_depth),
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else if let Some((owner_paren_depth, owner_depth)) = join_condition_owner_frame {
+                                newline_with(
+                                    &mut out,
+                                    owner_depth,
+                                    1 + current_scope.paren_depth.saturating_sub(owner_paren_depth),
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else if let Some((owner_paren_depth, _, owner_depth)) = case_condition_owner_frame {
                                 newline_with(
                                     &mut out,
                                     owner_depth,
@@ -6737,7 +6792,7 @@ impl SqlEditorWidget {
                     let starts_control_condition_header = in_plsql_block
                         && matches!(upper, "IF" | "WHILE" | "ELSIF" | "ELSEIF")
                         && !mysql_scalar_if_function
-                        && !matches!(current_clause.as_deref(), Some("SELECT" | "VALUES" | "SET"));
+                        && current_clause.is_none();
                     if starts_control_condition_header
                         && control_condition_header_stack.last().copied() != Some(line_indent)
                     {
@@ -6787,7 +6842,7 @@ impl SqlEditorWidget {
                                         | "LOOP"
                                         | "DO"
                                 )
-                                && !matches!(current_clause.as_deref(), Some("SELECT"))
+                                && current_clause.is_none()
                         });
                     if let Some(header_indent) = control_condition_continuation_line {
                         line_indent = line_indent.max(header_indent);
@@ -7340,6 +7395,16 @@ impl SqlEditorWidget {
                             join_on_condition_frames.pop();
                         }
                         join_on_condition_frames.push((current_scope.paren_depth, line_indent));
+                    } else if clause_keywords.contains(&upper) && matches!(upper, "WHERE" | "HAVING") {
+                        while where_condition_frames
+                            .last()
+                            .is_some_and(|(paren_depth, _)| {
+                                *paren_depth >= current_scope.paren_depth
+                            })
+                        {
+                            where_condition_frames.pop();
+                        }
+                        where_condition_frames.push((current_scope.paren_depth, line_indent));
                     } else if upper == join_keyword
                         || upper == "APPLY"
                         || (clause_keywords.contains(&upper) && upper != "ON")
@@ -7352,6 +7417,32 @@ impl SqlEditorWidget {
                         {
                             join_on_condition_frames.pop();
                         }
+                        while where_condition_frames
+                            .last()
+                            .is_some_and(|(paren_depth, _)| {
+                                *paren_depth >= current_scope.paren_depth
+                            })
+                        {
+                            where_condition_frames.pop();
+                        }
+                    }
+                    if upper == "WHEN" && block_stack.last().is_some_and(|block| block == "CASE") {
+                        while case_condition_frames
+                            .last()
+                            .is_some_and(|(paren_depth, block_depth, _)| {
+                                *paren_depth >= current_scope.paren_depth
+                                    && *block_depth >= current_scope.block_depth
+                            })
+                        {
+                            case_condition_frames.pop();
+                        }
+                        case_condition_frames.push((
+                            current_scope.paren_depth,
+                            current_scope.block_depth,
+                            line_indent,
+                        ));
+                    } else if matches!(upper, "THEN" | "ELSE") {
+                        let _ = case_condition_frames.pop();
                     }
 
                     prev_word_upper = Some(upper.to_string());
@@ -9945,6 +10036,19 @@ impl SqlEditorWidget {
 
     fn paren_extra_depth(paren_stack: &[ParenFormatFrame]) -> usize {
         paren_stack
+            .iter()
+            .copied()
+            .filter(|frame| frame.counts_for_paren_extra())
+            .count()
+    }
+
+    fn paren_extra_depth_within_current_query_frame(paren_stack: &[ParenFormatFrame]) -> usize {
+        let query_frame_start = paren_stack
+            .iter()
+            .rposition(|frame| frame.is_query_like())
+            .map_or(0, |idx| idx.saturating_add(1));
+
+        paren_stack[query_frame_start..]
             .iter()
             .copied()
             .filter(|frame| frame.counts_for_paren_extra())
@@ -12555,6 +12659,159 @@ CROSS APPLY (
             indent(lines[where_idx]).saturating_add(4),
             "mixed tab+space indentation should normalize to canonical continuation depth, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_subquery_and_relative_to_its_own_where_frame() {
+        let source = r#"if (1>0) then
+    select 1
+    from (
+            select 1
+            from dual
+            where 1 = 1
+    and 1 = 1
+        )
+    where 1 = 1
+    and 2 = 2;
+end if;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE 1 = 1")
+            .expect("formatted output should contain inner WHERE");
+        let inner_and_idx = lines
+            .iter()
+            .enumerate()
+            .skip(inner_where_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == "AND 1 = 1")
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain inner AND");
+
+        assert_eq!(
+            indent(lines[inner_and_idx]),
+            indent(lines[inner_where_idx]).saturating_add(4),
+            "inner subquery AND should be exactly one level deeper than its own WHERE frame, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_exists_inner_and_relative_to_exists_query_frame() {
+        let source = r#"select 1
+from dual
+where (exists (
+        select *
+        from dual
+        where 1 = 1
+                and 2 = 2
+    ));"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE 1 = 1")
+            .expect("formatted output should contain EXISTS-inner WHERE");
+        let inner_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND 2 = 2")
+            .expect("formatted output should contain EXISTS-inner AND");
+
+        assert_eq!(
+            indent(lines[inner_and_idx]),
+            indent(lines[inner_where_idx]).saturating_add(4),
+            "EXISTS-inner AND should stay one level deeper than the EXISTS-inner WHERE within the same frame, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_case_end_aligned_to_case_owner_depth_inside_subquery() {
+        let source = r#"procedure a (b in number) as
+begin
+    open cv for
+        select 1
+        from (
+                select
+                    case
+                        when 1 = 1 then 1
+                        else 0
+        end b
+                from c
+            ) d
+        where 1 = 1;
+end;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "CASE")
+            .expect("formatted output should contain CASE owner");
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END b"))
+            .expect("formatted output should contain END b");
+
+        assert_eq!(
+            indent(lines[end_idx]),
+            indent(lines[case_idx]),
+            "CASE terminator should align to its CASE owner depth inside the same frame, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_case_condition_and_and_nested_exists_and_isolated_by_frames() {
+        let source = r#"select
+    case
+        when col1 = 1
+        and exists (
+                select 1
+                from dual
+                where 1 = 1
+                        and 2 = 2
+            ) then 'Y'
+        else 'N'
+    end as flag
+from dual;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHEN col1 = 1")
+            .expect("formatted output should contain CASE WHEN header");
+        let case_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND EXISTS (")
+            .expect("formatted output should contain CASE condition AND");
+        let inner_where_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "WHERE 1 = 1")
+            .expect("formatted output should contain nested EXISTS WHERE");
+        let inner_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND 2 = 2")
+            .expect("formatted output should contain nested EXISTS AND");
+
+        assert_eq!(
+            indent(lines[case_and_idx]),
+            indent(lines[when_idx]).saturating_add(4),
+            "CASE condition AND should remain one level deeper than its WHEN owner frame, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[inner_and_idx]),
+            indent(lines[inner_where_idx]).saturating_add(4),
+            "nested EXISTS AND should remain one level deeper than its own WHERE frame without CASE-state leakage, got:\n{formatted}"
         );
     }
 
