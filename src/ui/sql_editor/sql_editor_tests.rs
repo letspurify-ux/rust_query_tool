@@ -1947,6 +1947,93 @@ fn format_sql_breaks_outer_apply_after_from_source() {
 }
 
 #[test]
+fn format_sql_keeps_nested_subquery_where_and_relative_depth_inside_if_block() {
+    let input = "if (1>0) then\n    select 1\n    from (\n            select 1\n            from dual\n            where 1 = 1\n            and 1 = 1\n        )\n    where 1 = 1\n    and 2 = 2;\nend if;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let inner_where_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "WHERE 1 = 1")
+        .unwrap_or(0);
+    let inner_and_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_where_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "AND 1 = 1")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let outer_where_idx = lines
+        .iter()
+        .enumerate()
+        .skip(inner_and_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "WHERE 1 = 1")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let outer_and_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_where_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "AND 2 = 2;")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    assert!(
+        indent(lines[inner_and_idx]) > indent(lines[inner_where_idx]),
+        "inner WHERE child AND must be one level deeper, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[outer_and_idx]) > indent(lines[outer_where_idx]),
+        "outer WHERE child AND must be one level deeper, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_exists_subquery_where_and_relative_depth() {
+    let input = "begin\n    select *\n    from dual\n    where exists (\n        select 1\n        from dual\n        where 1 = 1\n        and 2 = 2\n    )\n    and 3 = 3;\nend;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let exists_where_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "WHERE 1 = 1")
+        .unwrap_or(0);
+    let exists_and_idx = lines
+        .iter()
+        .enumerate()
+        .skip(exists_where_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "AND 2 = 2")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let outer_where_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "WHERE EXISTS (")
+        .unwrap_or(0);
+    let outer_and_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_where_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "AND 3 = 3;")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[exists_and_idx]) > indent(lines[exists_where_idx]),
+        "EXISTS subquery WHERE child AND must keep relative depth, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[outer_and_idx]) > indent(lines[outer_where_idx]),
+        "outer WHERE child AND must keep relative depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_whenever_sqlerror_options() {
     let input = [
         "WHENEVER SQLERROR EXIT SQL.SQLCODE",
