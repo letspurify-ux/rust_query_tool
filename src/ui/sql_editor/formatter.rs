@@ -681,8 +681,9 @@ impl FormatFrameStack {
                 ConditionOwnerKind::ControlHeader => !owner.scope.contains(next_scope),
             },
             FormatFrame::BetweenPending(frame) => frame.paren_depth > next_scope.paren_depth,
-            FormatFrame::TriggerHeader(scope)
-            | FormatFrame::PlsqlContext(scope) => !scope.contains(next_scope),
+            FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
+                !scope.contains(next_scope)
+            }
             FormatFrame::CompoundTrigger(frame) => !frame.scope.contains(next_scope),
             FormatFrame::WithCte(frame) => !frame.scope.contains(next_scope),
             FormatFrame::Paren(_) | FormatFrame::Block(_) | FormatFrame::OpenCursorRestore(_) => {
@@ -733,8 +734,7 @@ impl FormatFrameStack {
         wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
         open_cursor_restore_state: Option<OpenCursorFormatState>,
     ) {
-        let previous_query_base_depth =
-            new_query_base_depth.map(|_| self.current_query_base_depth);
+        let previous_query_base_depth = new_query_base_depth.map(|_| self.current_query_base_depth);
         if let Some(depth) = new_query_base_depth {
             self.current_query_base_depth = Some(depth);
         }
@@ -835,7 +835,8 @@ impl FormatFrameStack {
     }
 
     fn last_block_kind_is(&self, kind: &str) -> bool {
-        self.last_block_kind().is_some_and(|current| current == kind)
+        self.last_block_kind()
+            .is_some_and(|current| current == kind)
     }
 
     fn set_last_block_kind(&mut self, kind: &str) -> bool {
@@ -890,11 +891,16 @@ impl FormatFrameStack {
     }
 
     fn last_case_branch_started(&self) -> bool {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) if frame.kind == "CASE" => Some(frame.case_branch_started),
-            _ => None,
-        })
-        .unwrap_or(false)
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                FormatFrame::Block(frame) if frame.kind == "CASE" => {
+                    Some(frame.case_branch_started)
+                }
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     fn set_last_exception_branch_started(&mut self, started: bool) -> bool {
@@ -914,13 +920,16 @@ impl FormatFrameStack {
     }
 
     fn last_exception_branch_started(&self) -> bool {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) if frame.kind == "EXCEPTION" => {
-                Some(frame.exception_branch_started)
-            }
-            _ => None,
-        })
-        .unwrap_or(false)
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                FormatFrame::Block(frame) if frame.kind == "EXCEPTION" => {
+                    Some(frame.exception_branch_started)
+                }
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     fn last_block_depth_frame(&self) -> Option<FormatBlockDepthFrame> {
@@ -948,12 +957,13 @@ impl FormatFrameStack {
         indent: usize,
         parenthesized: bool,
     ) {
-        self.frames.push(FormatFrame::ConditionOwner(ConditionOwnerFrame {
-            kind,
-            scope,
-            indent,
-            parenthesized,
-        }));
+        self.frames
+            .push(FormatFrame::ConditionOwner(ConditionOwnerFrame {
+                kind,
+                scope,
+                indent,
+                parenthesized,
+            }));
     }
 
     fn pop_condition_owners_for_push(&mut self, kind: ConditionOwnerKind, scope: FormatScope) {
@@ -974,7 +984,10 @@ impl FormatFrameStack {
         }
     }
 
-    fn pop_last_condition_owner(&mut self, kind: ConditionOwnerKind) -> Option<ConditionOwnerFrame> {
+    fn pop_last_condition_owner(
+        &mut self,
+        kind: ConditionOwnerKind,
+    ) -> Option<ConditionOwnerFrame> {
         let Some(FormatFrame::ConditionOwner(frame)) = self.frames.last() else {
             return None;
         };
@@ -996,7 +1009,9 @@ impl FormatFrameStack {
 
     fn push_between_pending(&mut self, paren_depth: usize) {
         self.frames
-            .push(FormatFrame::BetweenPending(BetweenPendingFrame { paren_depth }));
+            .push(FormatFrame::BetweenPending(BetweenPendingFrame {
+                paren_depth,
+            }));
     }
 
     fn between_pending_matches(&self, paren_depth: usize) -> bool {
@@ -1064,10 +1079,11 @@ impl FormatFrameStack {
     }
 
     fn push_compound_trigger(&mut self, scope: FormatScope) {
-        self.frames.push(FormatFrame::CompoundTrigger(CompoundTriggerFrame {
-            scope,
-            phase: CompoundTriggerPhase::AwaitingOuterBodyStart,
-        }));
+        self.frames
+            .push(FormatFrame::CompoundTrigger(CompoundTriggerFrame {
+                scope,
+                phase: CompoundTriggerPhase::AwaitingOuterBodyStart,
+            }));
     }
 
     fn last_compound_trigger_mut(&mut self) -> Option<&mut CompoundTriggerFrame> {
@@ -1118,7 +1134,10 @@ impl FormatFrameStack {
 
     fn compound_trigger_begin_timing_point_body(&mut self) {
         if let Some(frame) = self.last_compound_trigger_mut() {
-            if matches!(frame.phase, CompoundTriggerPhase::AwaitingTimingPointBodyStart) {
+            if matches!(
+                frame.phase,
+                CompoundTriggerPhase::AwaitingTimingPointBodyStart
+            ) {
                 frame.phase = CompoundTriggerPhase::InOuterBody;
             }
         }
@@ -5315,9 +5334,8 @@ impl SqlEditorWidget {
         while idx < tokens.len() {
             let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = format_stack.current_scope();
-            format_stack.pop_between_pending_at_or_above(
-                current_scope.paren_depth.saturating_add(1),
-            );
+            format_stack
+                .pop_between_pending_at_or_above(current_scope.paren_depth.saturating_add(1));
             format_stack.sync_to_scope(current_scope);
             let top_level_select_item_context = format_stack
                 .paren_frames()
@@ -5434,9 +5452,7 @@ impl SqlEditorWidget {
                         && next_word_is("NOT")
                         && third_word.is_some_and(|word| word.eq_ignore_ascii_case("ATOMIC"));
                     let inside_function_local_non_query_paren =
-                        ConstructState::has_compact_non_query_frame_since_last_query(
-                            &format_stack,
-                        );
+                        ConstructState::has_compact_non_query_frame_since_last_query(&format_stack);
                     let with_cte_keyword_inside_function_local =
                         upper == "WITH" && inside_function_local_non_query_paren;
                     let with_plsql_body_starts_here = matches!(upper, "AS" | "IS")
@@ -5817,8 +5833,7 @@ impl SqlEditorWidget {
                             // END LOOP, END IF, END CASE - pop matching block
                             if let Some(top) = format_stack.last_block_kind() {
                                 if block_end_qualifiers.contains(&top) {
-                                    if let Some(popped_block) =
-                                        pop_format_block(&mut format_stack)
+                                    if let Some(popped_block) = pop_format_block(&mut format_stack)
                                     {
                                         closed_mysql_handler_begin |=
                                             popped_block.mysql_handler_begin;
@@ -5830,27 +5845,21 @@ impl SqlEditorWidget {
                                 }
                             }
                         } else if case_expression_end {
-                            if let Some(popped_block) =
-                                pop_format_block(&mut format_stack)
-                            {
+                            if let Some(popped_block) = pop_format_block(&mut format_stack) {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 restored_indent_level =
                                     Some(popped_block.depth_frame.previous_indent_level);
-                                closed_owner_depth =
-                                    Some(popped_block.depth_frame.owner_depth);
+                                closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
                             }
                         } else {
                             // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
                             // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
-                            while let Some(popped_block) =
-                                pop_format_block(&mut format_stack)
-                            {
+                            while let Some(popped_block) = pop_format_block(&mut format_stack) {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 let top = popped_block.kind;
                                 restored_indent_level =
                                     Some(popped_block.depth_frame.previous_indent_level);
-                                closed_owner_depth =
-                                    Some(popped_block.depth_frame.owner_depth);
+                                closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
                                 let reached_package_body =
                                     format_stack.last_block_kind_is("PACKAGE_BODY");
                                 if closes_active_package_member {
@@ -6148,9 +6157,8 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                            } else if let Some(query_body_depth) =
-                                query_body_clause_base_depth
-                                    .filter(|_| format_stack.paren_is_empty())
+                            } else if let Some(query_body_depth) = query_body_clause_base_depth
+                                .filter(|_| format_stack.paren_is_empty())
                             {
                                 newline_with(
                                     &mut out,
@@ -6210,11 +6218,9 @@ impl SqlEditorWidget {
                                             indent_level,
                                             open_cursor_state,
                                             upper,
-                                            open_cursor_state
-                                                .select_depth()
-                                                .is_some_and(|depth| {
-                                                    format_stack.paren_depth() == depth
-                                                }),
+                                            open_cursor_state.select_depth().is_some_and(|depth| {
+                                                format_stack.paren_depth() == depth
+                                            }),
                                             construct.cursor_sql_active.is_active(),
                                         )
                                     }),
@@ -6249,8 +6255,7 @@ impl SqlEditorWidget {
                                 // head after CTE definitions, not to inner SELECTs inside the
                                 // WITH body. Otherwise a later `FOR` in PIVOT/UNPIVOT or
                                 // similar syntax can be misread as a new OPEN ... FOR.
-                                open_cursor_state
-                                    .set_select_depth(format_stack.paren_depth());
+                                open_cursor_state.set_select_depth(format_stack.paren_depth());
                             }
                             if upper == "WITH" {
                                 statement_has_with_clause = true;
@@ -6312,9 +6317,9 @@ impl SqlEditorWidget {
                             .flatten();
                         let in_control_header_condition = control_header_condition_indent.is_some()
                             || (matches!(upper, "AND" | "OR")
-                                && format_stack.last_block_kind().is_some_and(|block| {
-                                    matches!(block, "IF" | "WHILE")
-                                })
+                                && format_stack
+                                    .last_block_kind()
+                                    .is_some_and(|block| matches!(block, "IF" | "WHILE"))
                                 && current_clause.is_none());
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| {
@@ -6330,41 +6335,35 @@ impl SqlEditorWidget {
                                 .and_then(|token_idx| tokens.get(token_idx)),
                             Some(SqlToken::Symbol(sym)) if sym == ")"
                         );
-                        let clause_base_indent =
-                            if let Some(header_indent) = control_header_condition_indent {
-                                header_indent
-                            } else if in_control_header_condition {
-                                if matches!(upper, "AND" | "OR")
-                                    && format_stack.last_block_kind().is_some_and(|block| {
-                                        matches!(block, "IF" | "WHILE")
-                                    })
-                                {
-                                    format_stack
-                                        .last_block_owner_depth()
-                                        .unwrap_or_else(|| {
-                                            base_indent(
-                                                indent_level.saturating_sub(1),
-                                                open_cursor_state,
-                                            )
-                                        })
-                                } else {
+                        let clause_base_indent = if let Some(header_indent) =
+                            control_header_condition_indent
+                        {
+                            header_indent
+                        } else if in_control_header_condition {
+                            if matches!(upper, "AND" | "OR")
+                                && format_stack
+                                    .last_block_kind()
+                                    .is_some_and(|block| matches!(block, "IF" | "WHILE"))
+                            {
+                                format_stack.last_block_owner_depth().unwrap_or_else(|| {
                                     base_indent(indent_level.saturating_sub(1), open_cursor_state)
-                                }
-                            } else if format_stack.paren_is_empty() {
-                                top_level_query_body_base_indent
+                                })
                             } else {
-                                clause_indent(
-                                    indent_level,
-                                    open_cursor_state,
-                                    upper,
-                                    open_cursor_state
-                                        .select_depth()
-                                        .is_some_and(|depth| {
-                                            format_stack.paren_depth() == depth
-                                        }),
-                                    construct.cursor_sql_active.is_active(),
-                                )
-                            };
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                            }
+                        } else if format_stack.paren_is_empty() {
+                            top_level_query_body_base_indent
+                        } else {
+                            clause_indent(
+                                indent_level,
+                                open_cursor_state,
+                                upper,
+                                open_cursor_state
+                                    .select_depth()
+                                    .is_some_and(|depth| format_stack.paren_depth() == depth),
+                                construct.cursor_sql_active.is_active(),
+                            )
+                        };
                         let paren_extra = Self::paren_extra_depth(&format_stack);
                         if construct
                             .insert_all_active
@@ -6373,9 +6372,7 @@ impl SqlEditorWidget {
                         {
                             insert_all_branch_body_indent = None;
                         }
-                        if upper == "WHEN"
-                            && format_stack.last_block_kind_is("CASE")
-                        {
+                        if upper == "WHEN" && format_stack.last_block_kind_is("CASE") {
                             let _ = format_stack.set_last_case_branch_started(true);
                         }
                         let is_merge_when = upper == "WHEN"
@@ -6474,7 +6471,8 @@ impl SqlEditorWidget {
                                         && current_scope.block_depth >= *block_depth
                                         && matches!(upper, "AND" | "OR")
                                 });
-                            if let Some((owner_paren_depth, owner_depth)) = where_condition_owner_frame
+                            if let Some((owner_paren_depth, owner_depth)) =
+                                where_condition_owner_frame
                             {
                                 newline_with(
                                     &mut out,
@@ -6484,7 +6482,9 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                            } else if let Some((owner_paren_depth, owner_depth)) = join_condition_owner_frame {
+                            } else if let Some((owner_paren_depth, owner_depth)) =
+                                join_condition_owner_frame
+                            {
                                 newline_with(
                                     &mut out,
                                     owner_depth,
@@ -6493,7 +6493,9 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                            } else if let Some((owner_paren_depth, _, owner_depth)) = case_condition_owner_frame {
+                            } else if let Some((owner_paren_depth, _, owner_depth)) =
+                                case_condition_owner_frame
+                            {
                                 newline_with(
                                     &mut out,
                                     owner_depth,
@@ -6643,10 +6645,7 @@ impl SqlEditorWidget {
                         let in_if_block = format_stack.last_block_kind_is("IF");
                         let in_case_block = format_stack.last_block_kind_is("CASE");
                         let paren_extra = Self::paren_extra_depth(&format_stack);
-                        if upper == "ELSE"
-                            && in_case_block
-                            && !in_if_block
-                        {
+                        if upper == "ELSE" && in_case_block && !in_if_block {
                             let _ = format_stack.set_last_case_branch_started(true);
                         }
                         if in_if_block {
@@ -6796,19 +6795,17 @@ impl SqlEditorWidget {
                     {
                         // PIVOT/UNPIVOT should start on a new line as a
                         // clause-level keyword at the same depth as FROM.
-                            newline_with(
-                                &mut out,
-                                clause_indent(
-                                    indent_level,
-                                    open_cursor_state,
-                                    upper,
-                                    open_cursor_state
-                                        .select_depth()
-                                        .is_some_and(|depth| {
-                                            format_stack.paren_depth() == depth
-                                        }),
-                                    construct.cursor_sql_active.is_active(),
-                                ),
+                        newline_with(
+                            &mut out,
+                            clause_indent(
+                                indent_level,
+                                open_cursor_state,
+                                upper,
+                                open_cursor_state
+                                    .select_depth()
+                                    .is_some_and(|depth| format_stack.paren_depth() == depth),
+                                construct.cursor_sql_active.is_active(),
+                            ),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6823,8 +6820,8 @@ impl SqlEditorWidget {
                             .in_analytic_over_paren(format_stack.paren_depth())
                             && FormatIndentedParenOwnerKind::AnalyticOver
                                 .starts_phase1_body_header_words(upper, next_word, third_word);
-                        let window_body_header =
-                            construct.in_window_paren(format_stack.paren_depth())
+                        let window_body_header = construct
+                            .in_window_paren(format_stack.paren_depth())
                             && FormatIndentedParenOwnerKind::Window
                                 .starts_phase1_body_header_words(upper, next_word, third_word);
                         if match_recognize_body_header
@@ -7025,10 +7022,9 @@ impl SqlEditorWidget {
                                     .flatten();
                             if in_sql_case_clause {
                                 let paren_extra = Self::paren_extra_depth(&format_stack);
-                                let in_case_branch_body =
-                                    format_stack.last_block_kind_is("CASE")
-                                        && (format_stack.last_case_branch_started()
-                                            || matches!(prev_word_upper.as_deref(), Some("THEN")));
+                                let in_case_branch_body = format_stack.last_block_kind_is("CASE")
+                                    && (format_stack.last_case_branch_started()
+                                        || matches!(prev_word_upper.as_deref(), Some("THEN")));
                                 if let Some(values_case_indent) = values_case_indent {
                                     newline_with(
                                         &mut out,
@@ -7080,9 +7076,8 @@ impl SqlEditorWidget {
                                 }
                             } else if in_plsql_block {
                                 let paren_extra = Self::paren_extra_depth(&format_stack);
-                                let in_case_branch_body =
-                                    format_stack.last_block_kind_is("CASE")
-                                        && format_stack.last_case_branch_started();
+                                let in_case_branch_body = format_stack.last_block_kind_is("CASE")
+                                    && format_stack.last_case_branch_started();
                                 let previous_non_comment_token = comment_prefix_cache
                                     .previous_non_comment_token_index(idx)
                                     .and_then(|token_idx| tokens.get(token_idx));
@@ -7148,12 +7143,12 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                             }
-                    } else if upper == "BEGIN" {
-                        // BEGIN handling: check if we're inside a DECLARE block
-                        let inside_declare = format_stack
-                            .last_block_kind()
-                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
-                        if inside_declare {
+                        } else if upper == "BEGIN" {
+                            // BEGIN handling: check if we're inside a DECLARE block
+                            let inside_declare = format_stack
+                                .last_block_kind()
+                                .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
+                            if inside_declare {
                                 // DECLARE ... BEGIN - BEGIN is at same level as DECLARE.
                                 // PACKAGE BODY initializer BEGIN snaps to package owner depth.
                                 let begin_indent =
@@ -7397,8 +7392,7 @@ impl SqlEditorWidget {
                     if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
                         format_stack.clear_trigger_header();
                         let mut pushed_compound_trigger_block = false;
-                        if !format_stack.last_block_kind_is("COMPOUND_TRIGGER")
-                        {
+                        if !format_stack.last_block_kind_is("COMPOUND_TRIGGER") {
                             push_format_block(
                                 &mut format_stack,
                                 "COMPOUND_TRIGGER",
@@ -7543,12 +7537,7 @@ impl SqlEditorWidget {
 
                     // Handle block start - push to stack and increase indent
                     if should_treat_as_block_start {
-                        push_format_block(
-                            &mut format_stack,
-                            upper,
-                            indent_level,
-                            line_indent,
-                        );
+                        push_format_block(&mut format_stack, upper, indent_level, line_indent);
                         indent_level = indent_level.max(line_indent).saturating_add(1);
                         if upper == "DECLARE" || upper == "IF" {
                             format_stack.push_plsql_context(format_stack.current_scope());
@@ -7628,32 +7617,17 @@ impl SqlEditorWidget {
                         );
                         current_clause = None;
                     } else if upper == "LOOP" {
-                        push_format_block(
-                            &mut format_stack,
-                            "LOOP",
-                            indent_level,
-                            line_indent,
-                        );
+                        push_format_block(&mut format_stack, "LOOP", indent_level, line_indent);
                         indent_level = indent_level.max(line_indent).saturating_add(1);
                         format_stack.push_plsql_context(format_stack.current_scope());
                         current_clause = None;
                     } else if upper == "REPEAT" {
-                        push_format_block(
-                            &mut format_stack,
-                            "REPEAT",
-                            indent_level,
-                            line_indent,
-                        );
+                        push_format_block(&mut format_stack, "REPEAT", indent_level, line_indent);
                         indent_level += 1;
                         format_stack.push_plsql_context(format_stack.current_scope());
                         current_clause = None;
                     } else if upper == "CASE" {
-                        push_format_block(
-                            &mut format_stack,
-                            "CASE",
-                            indent_level,
-                            line_indent,
-                        );
+                        push_format_block(&mut format_stack, "CASE", indent_level, line_indent);
                         indent_level = indent_level.max(line_indent).saturating_add(1);
                         if current_clause.is_none() {
                             format_stack.push_plsql_context(format_stack.current_scope());
@@ -7808,11 +7782,12 @@ impl SqlEditorWidget {
                     if upper == "BETWEEN" {
                         format_stack.push_between_pending(current_scope.paren_depth);
                     } else if upper == "AND" && between_pending {
-                        let _ = format_stack.pop_between_pending_if_matches(current_scope.paren_depth);
+                        let _ =
+                            format_stack.pop_between_pending_if_matches(current_scope.paren_depth);
                     }
                     if matches!(upper, "THEN" | "LOOP" | "DO") {
-                        let _ =
-                            format_stack.pop_last_condition_owner(ConditionOwnerKind::ControlHeader);
+                        let _ = format_stack
+                            .pop_last_condition_owner(ConditionOwnerKind::ControlHeader);
                     }
                     if is_create_index_on {
                         construct.create_index_pending.deactivate();
@@ -7847,7 +7822,9 @@ impl SqlEditorWidget {
                             line_indent,
                             false,
                         );
-                    } else if clause_keywords.contains(&upper) && matches!(upper, "WHERE" | "HAVING") {
+                    } else if clause_keywords.contains(&upper)
+                        && matches!(upper, "WHERE" | "HAVING")
+                    {
                         format_stack.pop_condition_owners_for_push(
                             ConditionOwnerKind::Where,
                             current_scope,
@@ -7872,10 +7849,8 @@ impl SqlEditorWidget {
                         );
                     }
                     if upper == "WHEN" && format_stack.last_block_kind_is("CASE") {
-                        format_stack.pop_condition_owners_for_push(
-                            ConditionOwnerKind::Case,
-                            current_scope,
-                        );
+                        format_stack
+                            .pop_condition_owners_for_push(ConditionOwnerKind::Case, current_scope);
                         format_stack.push_condition_owner(
                             ConditionOwnerKind::Case,
                             current_scope,
@@ -7952,14 +7927,12 @@ impl SqlEditorWidget {
                     );
                     let in_select_list = matches!(current_clause.as_deref(), Some("SELECT"));
                     let in_set_clause = matches!(current_clause.as_deref(), Some("SET"));
-                    let top_level_select_list =
-                        in_select_list
-                            && suppress_comma_break_depth == 0
-                            && format_stack.paren_is_empty();
-                    let top_level_set_list =
-                        in_set_clause
-                            && suppress_comma_break_depth == 0
-                            && format_stack.paren_is_empty();
+                    let top_level_select_list = in_select_list
+                        && suppress_comma_break_depth == 0
+                        && format_stack.paren_is_empty();
+                    let top_level_set_list = in_set_clause
+                        && suppress_comma_break_depth == 0
+                        && format_stack.paren_is_empty();
                     let active_list_layout = select_list_layout_state.has_active_indent();
                     let comment_structural_prefix = comment_prefix_cache.prefix_before(idx);
                     let previous_non_comment_token = comment_prefix_cache
@@ -8156,9 +8129,7 @@ impl SqlEditorWidget {
                                 .and_then(|_| {
                                     format_stack
                                         .last_condition_owner(ConditionOwnerKind::JoinOn)
-                                        .map(|frame| {
-                                            (frame.scope.paren_depth, frame.indent)
-                                        })
+                                        .map(|frame| (frame.scope.paren_depth, frame.indent))
                                 })
                                 .filter(|(paren_depth, _)| {
                                     current_scope.paren_depth >= *paren_depth
@@ -8604,8 +8575,9 @@ impl SqlEditorWidget {
                                             base_indent(indent_level, open_cursor_state)
                                         });
                                 let with_cte_separator_indent = if is_with_cte_separator {
-                                    format_stack
-                                        .with_cte_separator_indent(fallback_with_cte_separator_indent)
+                                    format_stack.with_cte_separator_indent(
+                                        fallback_with_cte_separator_indent,
+                                    )
                                 } else {
                                     fallback_with_cte_separator_indent
                                 };
@@ -8720,20 +8692,20 @@ impl SqlEditorWidget {
                                     && !construct.grant_revoke_active.is_active()
                                     && !format_stack.trigger_header_is_active()
                                 {
-                                        let query_like_select_list_indent = format_stack
-                                            .last_paren()
-                                            .copied()
-                                            .filter(|frame| frame.is_query_like())
-                                            .filter(|_| {
-                                                matches!(
-                                                    current_clause.as_deref(),
-                                                    Some("SELECT" | "SET")
-                                                ) && select_list_layout_state.has_active_indent()
-                                            })
-                                            .map(|_| {
-                                                select_list_layout_state
-                                                    .indentation_or(line_indent.saturating_add(1))
-                                            });
+                                    let query_like_select_list_indent = format_stack
+                                        .last_paren()
+                                        .copied()
+                                        .filter(|frame| frame.is_query_like())
+                                        .filter(|_| {
+                                            matches!(
+                                                current_clause.as_deref(),
+                                                Some("SELECT" | "SET")
+                                            ) && select_list_layout_state.has_active_indent()
+                                        })
+                                        .map(|_| {
+                                            select_list_layout_state
+                                                .indentation_or(line_indent.saturating_add(1))
+                                        });
                                     let current_list_indent = top_level_select_item_context
                                         .then_some(())
                                         .filter(|_| {
@@ -9071,8 +9043,8 @@ impl SqlEditorWidget {
                         }
                         ";" => {
                             format_stack.with_cte_on_separator();
-                            let keep_tight_top_level_spacing =
-                                format_stack.with_cte_keeps_top_level_semicolon_inside_with_definitions();
+                            let keep_tight_top_level_spacing = format_stack
+                                .with_cte_keeps_top_level_semicolon_inside_with_definitions();
                             trim_trailing_space(&mut out);
                             out.push(';');
                             current_clause = None;
@@ -9390,8 +9362,7 @@ impl SqlEditorWidget {
                             // decision structural: whenever the first SELECT list item opens
                             // a paren whose first token is CASE, always promote SELECT to its
                             // own line so both passes produce the same canonical output.
-                            let promotes_first_clause_owner_to_body_depth =
-                                matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                            let promotes_first_clause_owner_to_body_depth = matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
                                     && !at_line_start
                                     && format_stack.paren_is_empty()
                                     && suppress_comma_break_depth == 0
@@ -9952,9 +9923,9 @@ impl SqlEditorWidget {
                                     Self::tokens_continue_plsql_condition_terminator(tokens, idx);
                                 let closes_control_branch_tail = (next_word_is("ELSE")
                                     || next_word_is("WHEN"))
-                                    && format_stack.last_block_kind().is_some_and(|block| {
-                                        matches!(block, "IF" | "WHILE")
-                                    })
+                                    && format_stack
+                                        .last_block_kind()
+                                        .is_some_and(|block| matches!(block, "IF" | "WHILE"))
                                     && format_stack
                                         .last_condition_owner(ConditionOwnerKind::ControlHeader)
                                         .is_some();
@@ -25676,11 +25647,9 @@ FROM emp_json e;"#;
             "e.note = NVL (e.note, EMPTY_CLOB ()) || CHR (10) || 'UPDATED@' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')",
         )
         .expect("second SET item");
-        let child_select_idx = find_line_starting_with(
-            &lines,
-            "SELECT NVL (ROUND (AVG (s.amount) / 100, 2), 0)",
-        )
-        .unwrap_or_else(|| panic!("SET child SELECT line, got:\n{}", formatted));
+        let child_select_idx =
+            find_line_starting_with(&lines, "SELECT NVL (ROUND (AVG (s.amount) / 100, 2), 0)")
+                .unwrap_or_else(|| panic!("SET child SELECT line, got:\n{}", formatted));
         let child_close_idx = find_line_starting_with(&lines, "),")
             .unwrap_or_else(|| panic!("SET child close line, got:\n{}", formatted));
         let exists_select_idx =
@@ -36027,7 +35996,10 @@ mod format_frame_stack_tests {
         assert!(matches!(popped.frame.kind, ParenFormatFrameKind::QueryLike));
         assert_eq!(stack.current_query_base_depth(), Some(2));
         assert_eq!(
-            popped.restore_state.as_ref().and_then(|state| state.clause.as_deref()),
+            popped
+                .restore_state
+                .as_ref()
+                .and_then(|state| state.clause.as_deref()),
             Some("SELECT")
         );
         assert_eq!(
@@ -36079,22 +36051,16 @@ mod format_frame_stack_tests {
             7,
             true,
         );
-        stack.push_condition_owner(
-            ConditionOwnerKind::Where,
-            FormatScope::new(1, 0),
-            3,
-            false,
-        );
-        stack.push_condition_owner(
-            ConditionOwnerKind::Case,
-            FormatScope::new(1, 1),
-            5,
-            false,
-        );
+        stack.push_condition_owner(ConditionOwnerKind::Where, FormatScope::new(1, 0), 3, false);
+        stack.push_condition_owner(ConditionOwnerKind::Case, FormatScope::new(1, 1), 5, false);
         stack.sync_to_scope(FormatScope::new(0, 1));
 
-        assert!(stack.last_condition_owner(ConditionOwnerKind::Where).is_none());
-        assert!(stack.last_condition_owner(ConditionOwnerKind::Case).is_none());
+        assert!(stack
+            .last_condition_owner(ConditionOwnerKind::Where)
+            .is_none());
+        assert!(stack
+            .last_condition_owner(ConditionOwnerKind::Case)
+            .is_none());
         assert_eq!(
             stack
                 .last_condition_owner(ConditionOwnerKind::ControlHeader)
@@ -36108,12 +36074,7 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
 
         stack.push_block("IF", 0, 0);
-        stack.push_condition_owner(
-            ConditionOwnerKind::Where,
-            FormatScope::new(1, 1),
-            2,
-            false,
-        );
+        stack.push_condition_owner(ConditionOwnerKind::Where, FormatScope::new(1, 1), 2, false);
         stack.push_between_pending(1);
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 2, false, 0, None),
@@ -36131,7 +36092,9 @@ mod format_frame_stack_tests {
         ));
         stack.sync_to_scope(FormatScope::new(0, 1));
 
-        assert!(stack.last_condition_owner(ConditionOwnerKind::Where).is_none());
+        assert!(stack
+            .last_condition_owner(ConditionOwnerKind::Where)
+            .is_none());
         assert!(!stack.between_pending_matches(1));
         assert!(stack.last_block_kind_is("IF"));
         assert_eq!(stack.block_depth(), 1);
@@ -36146,12 +36109,7 @@ mod format_frame_stack_tests {
         stack.push_compound_trigger(stack.current_scope());
         stack.push_with_cte_frame(stack.current_scope());
         stack.push_open_cursor_restore(OpenCursorFormatState::AwaitingFor);
-        stack.push_condition_owner(
-            ConditionOwnerKind::Where,
-            stack.current_scope(),
-            2,
-            false,
-        );
+        stack.push_condition_owner(ConditionOwnerKind::Where, stack.current_scope(), 2, false);
         stack.push_between_pending(0);
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 1, false, 0, None),
@@ -36166,9 +36124,13 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_depth(), 0);
         assert_eq!(stack.current_query_base_depth(), None);
         assert!(stack.last_paren().is_none());
-        assert!(stack.last_condition_owner(ConditionOwnerKind::Where).is_none());
+        assert!(stack
+            .last_condition_owner(ConditionOwnerKind::Where)
+            .is_none());
         assert!(stack.plsql_context_is_active());
-        assert!(stack.compound_trigger_is_in_outer_body() || stack.last_compound_trigger().is_some());
+        assert!(
+            stack.compound_trigger_is_in_outer_body() || stack.last_compound_trigger().is_some()
+        );
         assert!(stack.with_cte_in_definitions());
         assert!(stack.last_block_kind_is("DECLARE"));
     }
@@ -36208,20 +36170,16 @@ mod format_frame_stack_tests {
         );
 
         assert_eq!(active_body_frames.len(), 3);
-        assert!(
-            active_body_frames
-                .last()
-                .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Block)
-        );
+        assert!(active_body_frames
+            .last()
+            .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Block));
 
         FormatFrameStack::pop_with_plsql_body_frame(&mut active_body_frames, None);
 
         assert_eq!(active_body_frames.len(), 2);
-        assert!(
-            active_body_frames
-                .last()
-                .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Case)
-        );
+        assert!(active_body_frames
+            .last()
+            .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Case));
 
         FormatFrameStack::pop_with_plsql_body_frame(
             &mut active_body_frames,
@@ -36229,10 +36187,8 @@ mod format_frame_stack_tests {
         );
 
         assert_eq!(active_body_frames.len(), 1);
-        assert!(
-            active_body_frames
-                .last()
-                .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Routine)
-        );
+        assert!(active_body_frames
+            .last()
+            .is_some_and(|frame| frame.kind == WithPlsqlBodyFrameKind::Routine));
     }
 }

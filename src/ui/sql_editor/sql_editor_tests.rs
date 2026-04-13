@@ -929,7 +929,10 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
 #[test]
 fn format_sql_keeps_mariadb_test3_collect_status_counts_select_item_depths() {
     let input = load_mariadb_test_file("test3.txt");
-    assert!(!input.is_empty(), "test_mariadb/test3.txt should not be empty");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test3.txt should not be empty"
+    );
 
     let formatted = SqlEditorWidget::format_sql_basic_no_cache(&input);
     let lines: Vec<&str> = formatted.lines().collect();
@@ -939,9 +942,11 @@ fn format_sql_keeps_mariadb_test3_collect_status_counts_select_item_depths() {
     let collect_begin_idx = lines
         .iter()
         .enumerate()
-        .find(|(_, line)| line.trim_start() == "BEGIN" && {
-            // Must follow sp_collect_status_counts )
-            true
+        .find(|(_, line)| {
+            line.trim_start() == "BEGIN" && {
+                // Must follow sp_collect_status_counts )
+                true
+            }
         })
         .map(|(i, _)| i)
         .expect("BEGIN in sp_collect_status_counts");
@@ -1015,8 +1020,7 @@ fn format_sql_basic_no_cache_is_idempotent_for_mariadb_test2_and_test3() {
         let formatted = SqlEditorWidget::format_sql_basic_no_cache(&input);
         let formatted_again = SqlEditorWidget::format_sql_basic_no_cache(&formatted);
         assert_eq!(
-            formatted,
-            formatted_again,
+            formatted, formatted_again,
             "format_sql_basic must be idempotent for test_mariadb/{name}"
         );
     }

@@ -15,6 +15,12 @@ use crate::ui::theme;
 pub type QueryTabId = u64;
 type TabSelectCallback = Box<dyn FnMut(QueryTabId)>;
 
+// Mirror the FLTK `Fl_Tabs.cxx` width math closely enough to tell whether
+// `Pulldown` overflow handling is actually active before re-applying it.
+const FLTK_TABS_BORDER: i32 = 2;
+const FLTK_TABS_OVERFLOW_BUTTON_BORDER: i32 = 2;
+const FLTK_TABS_EXTRA_SPACE: i32 = 10;
+
 #[derive(Clone)]
 pub struct QueryTabsWidget {
     tabs: Tabs,
@@ -151,25 +157,109 @@ impl QueryTabsWidget {
         }
     }
 
-    fn should_reset_tab_strip_left_anchor(child_count: i32, width: i32, height: i32) -> bool {
-        child_count > 1 && width > 0 && height > 0
+    fn has_actual_tab_strip_overflow(total_tab_width: i32, available_tab_strip_width: i32) -> bool {
+        total_tab_width > available_tab_strip_width.max(0)
+    }
+
+    fn should_reset_tab_strip_left_anchor(
+        child_count: i32,
+        width: i32,
+        height: i32,
+        total_tab_width: i32,
+        available_tab_strip_width: i32,
+    ) -> bool {
+        child_count > 1
+            && width > 0
+            && height > 0
+            && Self::has_actual_tab_strip_overflow(total_tab_width, available_tab_strip_width)
     }
 
     fn should_reapply_tab_overflow_mode_on_wheel(
         child_count: i32,
         width: i32,
         height: i32,
+        total_tab_width: i32,
+        available_tab_strip_width: i32,
     ) -> bool {
-        child_count > 0 && width > 0 && height > 0
+        child_count > 0
+            && width > 0
+            && height > 0
+            && Self::has_actual_tab_strip_overflow(total_tab_width, available_tab_strip_width)
+    }
+
+    fn estimated_tab_strip_width(tabs: &Tabs) -> i32 {
+        let mut total = FLTK_TABS_BORDER;
+        for child in tabs.clone().into_iter() {
+            let Some(group) = child.as_group() else {
+                continue;
+            };
+            if group.was_deleted() {
+                continue;
+            }
+            let (label_w, _) = group.measure_label();
+            total = total
+                .saturating_add(label_w.max(0))
+                .saturating_add(FLTK_TABS_EXTRA_SPACE)
+                .saturating_add(FLTK_TABS_BORDER);
+        }
+        total
+    }
+
+    fn estimated_available_tab_strip_width(tabs: &Tabs) -> i32 {
+        let header_height = tabs
+            .clone()
+            .into_iter()
+            .filter_map(|child| child.as_group())
+            .find_map(|group| {
+                if group.was_deleted() {
+                    None
+                } else {
+                    Some(group.y().saturating_sub(tabs.y()).abs())
+                }
+            })
+            .unwrap_or(TAB_HEADER_HEIGHT)
+            .max(0);
+        tabs.w()
+            .saturating_sub(header_height)
+            .saturating_add(FLTK_TABS_OVERFLOW_BUTTON_BORDER)
+            .max(0)
+    }
+
+    fn should_reset_tab_strip_left_anchor_for_tabs(tabs: &Tabs) -> bool {
+        Self::should_reset_tab_strip_left_anchor(
+            tabs.children(),
+            tabs.w(),
+            tabs.h(),
+            Self::estimated_tab_strip_width(tabs),
+            Self::estimated_available_tab_strip_width(tabs),
+        )
+    }
+
+    fn should_reapply_tab_overflow_mode_on_wheel_for_tabs(tabs: &Tabs) -> bool {
+        Self::should_reapply_tab_overflow_mode_on_wheel(
+            tabs.children(),
+            tabs.w(),
+            tabs.h(),
+            Self::estimated_tab_strip_width(tabs),
+            Self::estimated_available_tab_strip_width(tabs),
+        )
     }
 
     fn tab_strip_left_anchor_reset_mode(
         child_count: i32,
         width: i32,
         height: i32,
+        total_tab_width: i32,
+        available_tab_strip_width: i32,
         defer_until_next_loop: bool,
     ) -> TabStripLeftAnchorResetMode {
-        if !Self::should_reset_tab_strip_left_anchor(child_count, width, height) {
+        if !Self::should_reset_tab_strip_left_anchor(
+            child_count,
+            width,
+            height,
+            total_tab_width,
+            available_tab_strip_width,
+        ) {
             return TabStripLeftAnchorResetMode::None;
         }
 
@@ -225,6 +315,8 @@ impl QueryTabsWidget {
             self.tabs.children(),
             self.tabs.w(),
             self.tabs.h(),
+            Self::estimated_tab_strip_width(&self.tabs),
+            Self::estimated_available_tab_strip_width(&self.tabs),
             defer_until_next_loop,
         );
 
@@ -245,11 +337,7 @@ impl QueryTabsWidget {
                         return;
                     }
 
-                    if !Self::should_reset_tab_strip_left_anchor(
-                        tabs.children(),
-                        tabs.w(),
-                        tabs.h(),
-                    ) {
+                    if !Self::should_reset_tab_strip_left_anchor_for_tabs(&tabs) {
                         return;
                     }
 
@@ -330,11 +418,7 @@ impl QueryTabsWidget {
                 return true;
             }
             if matches!(ev, Event::MouseWheel)
-                && Self::should_reapply_tab_overflow_mode_on_wheel(
-                    tabs.children(),
-                    tabs.w(),
-                    tabs.h(),
-                )
+                && Self::should_reapply_tab_overflow_mode_on_wheel_for_tabs(tabs)
             {
                 Self::advance_tab_strip_reset_generation(&tab_strip_reset_generation_for_cb);
                 Self::apply_tab_strip_left_anchor_reset(tabs);
@@ -516,34 +600,37 @@ mod tests {
     #[test]
     fn tab_strip_left_anchor_reset_requires_real_overflow_state() {
         assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            0, 320, 240
+            0, 320, 240, 420, 280
         ));
         assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            1, 320, 240
+            1, 320, 240, 420, 280
         ));
         assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 0, 240
+            2, 0, 240, 420, 280
         ));
         assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 0
+            2, 320, 0, 420, 280
+        ));
+        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
+            2, 320, 240, 280, 280
         ));
         assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 240
+            2, 320, 240, 420, 280
         ));
     }
 
     #[test]
     fn tab_strip_left_anchor_reset_mode_defers_close_path_only_when_reset_is_needed() {
         assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(1, 320, 240, true),
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(1, 320, 240, 420, 280, true),
             TabStripLeftAnchorResetMode::None
         );
         assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, false),
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, 420, 280, false),
             TabStripLeftAnchorResetMode::Immediate
         );
         assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, true),
+            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, 420, 280, true),
             TabStripLeftAnchorResetMode::Deferred
         );
     }
@@ -551,16 +638,19 @@ mod tests {
     #[test]
     fn mouse_wheel_overflow_reapply_allows_single_tab() {
         assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            0, 320, 240
+            0, 320, 240, 420, 280
+        ));
+        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
+            1, 320, 240, 280, 280
         ));
         assert!(QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 240
+            1, 320, 240, 420, 280
         ));
         assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 0, 240
+            1, 0, 240, 420, 280
         ));
         assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 0
+            1, 320, 0, 420, 280
         ));
     }
 

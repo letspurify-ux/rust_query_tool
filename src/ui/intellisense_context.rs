@@ -938,7 +938,10 @@ fn is_mysql_lock_table_mode_keyword(keyword: &str) -> bool {
 }
 
 fn is_insert_target_modifier_keyword(keyword: &str) -> bool {
-    matches!(keyword, "LOW_PRIORITY" | "HIGH_PRIORITY" | "DELAYED" | "IGNORE")
+    matches!(
+        keyword,
+        "LOW_PRIORITY" | "HIGH_PRIORITY" | "DELAYED" | "IGNORE"
+    )
 }
 
 fn should_promote_insert_modifier_to_target_context(
@@ -2885,8 +2888,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 tokens,
                                 idx,
                                 last_word.as_deref(),
-                            )
-                                || is_comment_on_target(tokens, idx, last_word.as_deref())
+                            ) || is_comment_on_target(tokens, idx, last_word.as_deref())
                                 || is_create_table_target(tokens, idx)))
                             || (upper == "TABLES"
                                 && has_lock_keyword_before_table(
@@ -3532,10 +3534,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 let relation_arg_tokens = relation_body_range
                                     .map(|range| token_range_slice(tokens, range));
-                                let (direct_alias, direct_after_alias) = parse_alias_deep(
-                                    tokens,
-                                    relation_arg_end,
-                                );
+                                let (direct_alias, direct_after_alias) =
+                                    parse_alias_deep(tokens, relation_arg_end);
                                 let (direct_alias, direct_after_alias) = sanitize_lock_table_alias(
                                     tokens,
                                     relation_arg_end,
