@@ -5844,7 +5844,11 @@ impl SqlEditorWidget {
                                 && block_stack
                                     .last()
                                     .is_some_and(|block| matches!(block.as_str(), "IF" | "WHILE"))
-                                && !matches!(current_clause.as_deref(), Some("SELECT")));
+                                && !matches!(current_clause.as_deref(), Some("SELECT"))
+                                // Inside a subquery paren the AND/OR belongs to the SQL WHERE
+                                // condition, not to the enclosing PL/SQL IF/WHILE header. The
+                                // outer block frame must not leak into the inner query scope.
+                                && !paren_stack.iter().any(|frame| frame.is_query_like()));
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| control_condition_header_parenthesized_stack.last().copied())
                             .flatten()
@@ -15809,6 +15813,95 @@ END;"#;
             formatted.contains("\n        SELECT id\n        INTO v_id\n        FROM filt;"),
             "Main SELECT/INTO/FROM after THEN should reuse the shared query base depth, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn plsql_if_then_from_subquery_where_and_uses_inner_query_depth() {
+        // Regression: AND inside a nested FROM subquery inside an IF THEN block
+        // was being aligned to the IF block's owner depth instead of the inner
+        // query's WHERE depth.  The outer IF/WHILE block frame must not leak into
+        // the paren-isolated subquery scope (formatting.md 1.1 / frame isolation).
+        let sql = r#"BEGIN
+  IF (1 > 0) THEN
+    SELECT 1
+    FROM (
+      SELECT 1
+      FROM dual
+      WHERE 1 = 1
+      AND 1 = 1
+    )
+    WHERE 1 = 1
+    AND 2 = 2;
+  END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+        let inner_where_idx = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.trim_start() == "WHERE 1 = 1"
+                    && lines
+                        .get(
+                            lines
+                                .iter()
+                                .position(|l| l.trim_start() == "FROM dual")
+                                .unwrap_or(0),
+                        )
+                        .is_some()
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let inner_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND 1 = 1")
+            .unwrap_or(0);
+        let outer_where_idx = lines
+            .iter()
+            .rposition(|line| line.trim_start() == "WHERE 1 = 1")
+            .unwrap_or(0);
+        let outer_and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND 2 = 2;")
+            .unwrap_or(0);
+
+        assert!(
+            inner_where_idx < inner_and_idx,
+            "inner AND must follow inner WHERE in output, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[inner_and_idx]),
+            indent(lines[inner_where_idx]).saturating_add(4),
+            "inner AND must be one indent level deeper than inner WHERE (subquery frame isolation), got:\n{}",
+            formatted
+        );
+        assert!(
+            outer_where_idx > inner_and_idx,
+            "outer WHERE must follow inner AND in output, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[outer_and_idx]),
+            indent(lines[outer_where_idx]),
+            "outer AND must align with outer WHERE at the IF-body depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            indent(lines[inner_and_idx]) > indent(lines[outer_and_idx]),
+            "inner AND must be deeper than outer AND (frame isolation), got:\n{}",
+            formatted
+        );
+        // Idempotence: formatting the formatted output must not change indentation.
+        let reformatted = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted,
+            reformatted,
+            "formatted output must be stable under re-formatting (idempotent), got:\n{}",
+            reformatted
         );
     }
 
