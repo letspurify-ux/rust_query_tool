@@ -219,10 +219,12 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 ### 2.7 runtime formatter의 LIFO structural state는 단일 frame stack으로 유지한다
 
 - `formatter.rs`의 실제 auto-format runtime은 구조적 LIFO 상태를 하나의 `Vec<FormatFrame>`로만 관리한다.
-- `Paren`, `Block`, `ConditionOwner`, `OpenCursor` 같은 frame family는 모두 같은 stack에 들어가며, push/pop/scope sync도 이 stack 하나를 통해 수행한다.
+- `Paren`, `Block`, `ConditionOwner`, `BetweenPending`, `TriggerHeader`, `PlsqlContext`, `CompoundTrigger`, `WithCte`, `OpenCursor` 같은 frame family는 모두 같은 stack에 들어가며, push/pop/scope sync도 이 stack 하나를 통해 수행한다.
 - query-like paren의 restore state, query base depth, wrapped-owner metadata는 별도 벡터가 아니라 해당 `Paren` frame 안에 저장되어야 한다.
-- block kind와 block owner depth도 분리된 pair stack이 아니라 하나의 `Block` frame으로 유지해야 한다.
-- `JOIN/WHERE/CASE/control-condition` owner는 dedicated `ConditionOwner` frame으로 유지하되, 만료 판정은 별도 배열 truncate가 아니라 현재 `(paren_depth, block_depth)`에 대한 stack scan/sync로만 처리해야 한다.
+- block kind와 block owner depth도 분리된 pair stack이 아니라 하나의 `Block` frame으로 유지해야 하고, `CASE`/`EXCEPTION` branch 시작 여부와 MySQL handler `BEGIN` metadata도 그 frame 안에서 복원되어야 한다.
+- `JOIN/WHERE/CASE/control-condition` owner와 `BETWEEN`, trigger/plsql/compound-trigger/with-cte scoped state는 dedicated frame으로 유지하되, 만료 판정은 별도 배열 truncate가 아니라 현재 `(paren_depth, block_depth)`에 대한 stack scan/sync로만 처리해야 한다.
+- statement boundary cleanup도 별도 side-vector reset이 아니라 stack policy여야 한다. statement-local frame(`Paren`, `ConditionOwner`, `BetweenPending`, `OpenCursor` 등)만 tail-pop으로 제거하고, 살아 있는 `Block`/`PlsqlContext`/`CompoundTrigger`/`WithCte`는 유지해야 한다.
+- scope unwind와 clause-boundary 정리는 중간 `remove(idx)`/`retain(...)`이 아니라 tail-pop 기반 stack discipline으로만 수행해야 한다. 같은 원칙은 `WithCte` frame 내부의 nested body frame에도 적용된다.
 - 따라서 active query base, parent sibling indent, active wrapped owner kind, CASE/control-header owner depth 같은 파생값도 "각각의 side stack"을 읽어 합성하지 않고, 항상 단일 frame stack을 뒤에서부터 스캔해서 계산해야 한다.
 - non-LIFO 성격의 bool/phase flag는 별도 상태로 남을 수 있지만, 구조 depth와 owner 복원에 관여하는 값은 단일 frame stack 밖에 복제되면 안 된다.
 

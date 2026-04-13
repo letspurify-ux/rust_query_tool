@@ -1,4 +1,6 @@
 //! Shared SQL text helpers used across execution, formatting, and IntelliSense.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;

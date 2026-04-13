@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use crate::db::session::{BindDataType, ComputeMode};
 use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
 use crate::sql_text;
