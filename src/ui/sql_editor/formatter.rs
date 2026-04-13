@@ -5844,7 +5844,6 @@ impl SqlEditorWidget {
                                 && block_stack
                                     .last()
                                     .is_some_and(|block| matches!(block.as_str(), "IF" | "WHILE"))
-                                && current_clause.is_none()
                                 && !matches!(current_clause.as_deref(), Some("SELECT")));
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| control_condition_header_parenthesized_stack.last().copied())
