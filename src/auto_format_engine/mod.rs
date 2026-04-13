@@ -1,5 +1,3 @@
-use crate::db::QueryExecutor;
-
 mod stack_scan;
 mod types;
 
@@ -39,14 +37,23 @@ pub(crate) fn analyze_lines(sql: &str) -> Vec<AutoFormatLineContext> {
     let mut engine = AutoFormatEngine::new(sql);
     engine.scan_once();
 
-    let contexts = QueryExecutor::auto_format_line_contexts(sql);
-    if !engine.records().is_empty() && contexts.len() != engine.records().len() {
-        // Keep legacy compatibility behavior even when record and context
-        // counts diverge for edge script fragments.
-        return contexts;
-    }
-
-    contexts
+    // Derive AutoFormatLineContext from the unified single stack records.
+    // All depth values are based solely on the current stack height at the
+    // time each line is recorded, removing any depth management that lives
+    // outside the stack structure.
+    engine
+        .records()
+        .iter()
+        .map(|record| {
+            let mut ctx = AutoFormatLineContext::default();
+            ctx.parser_depth = record.parser_depth;
+            ctx.auto_depth = record.stack_depth;
+            ctx.render_depth = record.stack_depth;
+            ctx.carry_depth = record.stack_depth;
+            ctx.query_base_depth = record.query_base_depth;
+            ctx
+        })
+        .collect()
 }
 
 pub(crate) fn line_auto_format_depths(sql: &str) -> Vec<usize> {
