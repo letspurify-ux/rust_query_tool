@@ -11069,11 +11069,12 @@ ORDER BY rt.PATH;"#;
     #[test]
     fn line_auto_format_depths_adds_into_list_continuation_depth() {
         let sql = "SELECT col\nINTO v_a,\nv_b\nFROM dual;";
-        let block_depths = QueryExecutor::line_block_depths(sql);
         let auto_depths = QueryExecutor::line_auto_format_depths(sql);
 
-        assert_eq!(block_depths.len(), auto_depths.len());
-        assert_eq!(auto_depths[2], block_depths[2].saturating_add(1));
+        assert_eq!(auto_depths.len(), sql.lines().count());
+        // v_b continuation after the comma-terminated INTO line should stay at
+        // the INTO frame stack depth, not drop back to the SELECT level.
+        assert_eq!(auto_depths[2], auto_depths[1]);
     }
 
     #[test]
