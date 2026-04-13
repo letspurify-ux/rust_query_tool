@@ -977,6 +977,24 @@ impl FormatFrameStack {
         self.last_block_depth_frame().map(|frame| frame.owner_depth)
     }
 
+    /// If the innermost surviving block frame is `PACKAGE_BODY`, return the
+    /// indent level at which its direct members (procedures, functions, the
+    /// initializer `BEGIN`) live — one step deeper than the package owner's
+    /// own indent. Returns `None` for any other block kind (or no block).
+    ///
+    /// This is the only legitimate indent-level "reset" path in the main
+    /// loop: PACKAGE_BODY members all share the same target indent
+    /// regardless of the previous member's body depth, so on member
+    /// boundaries we jump straight to this value rather than unwinding
+    /// nested frames.
+    fn package_body_member_indent(&self) -> Option<usize> {
+        if !self.last_block_kind_is("PACKAGE_BODY") {
+            return None;
+        }
+        self.last_block_owner_depth()
+            .map(|depth| depth.saturating_add(1))
+    }
+
     /// Expected `indent_level` at a statement boundary once all non-persistent
     /// frames have been cleared. Equals the innermost surviving block frame's
     /// body indent, or `0` if no block frame remains. Used only in debug
@@ -6026,12 +6044,22 @@ impl SqlEditorWidget {
 
                         // `pop_block` restores `indent_level` atomically from
                         // the frame's `previous_indent_level`, so no explicit
-                        // reassignment is needed on the happy path. The
-                        // fallback only runs when no matching block was found
-                        // (e.g., a stray END), where we conservatively decrement
-                        // to mirror the pre-refactor behavior.
-                        if !any_block_popped {
-                            indent_level = indent_level.saturating_sub(1);
+                        // reassignment is needed on the happy path. When no
+                        // block frame was popped (stray END against an empty
+                        // block stack), `indent_level` must already be 0 under
+                        // the statement-boundary invariant; blindly
+                        // decrementing here would either be a no-op
+                        // (saturating at 0) or introduce drift against
+                        // non-block state, so we leave it alone.
+                        #[cfg(debug_assertions)]
+                        {
+                            if !any_block_popped {
+                                debug_assert_eq!(
+                                    indent_level,
+                                    format_stack.expected_statement_base_indent(),
+                                    "stray END with unexpected indent_level drift"
+                                );
+                            }
                         }
                         let end_line_indent = closed_owner_depth.unwrap_or(indent_level);
                         if is_package_body_statement
@@ -7720,25 +7748,17 @@ impl SqlEditorWidget {
                                         &mut indent_level,
                                     );
                                 }
-                                indent_level = format_stack
-                                    .last_block_kind()
-                                    .filter(|block| *block == "PACKAGE_BODY")
-                                    .and_then(|_| {
-                                        format_stack
-                                            .last_block_owner_depth()
-                                            .map(|depth| depth.saturating_add(1))
-                                    })
-                                    .unwrap_or(1);
+                                indent_level =
+                                    format_stack.package_body_member_indent().unwrap_or(1);
                                 pending_package_member_separator = false;
                             } else if format_stack.last_block_kind_is("DECLARE") {
                                 format_stack.set_last_block_kind("BEGIN");
-                            } else if format_stack.last_block_kind_is("PACKAGE_BODY") {
+                            } else if let Some(member_indent) =
+                                format_stack.package_body_member_indent()
+                            {
                                 // Package initializer body always starts one level under
                                 // the package owner, regardless of prior member-body depth.
-                                indent_level = format_stack
-                                    .last_block_owner_depth()
-                                    .map(|depth| depth.saturating_add(1))
-                                    .unwrap_or(indent_level);
+                                indent_level = member_indent;
                             }
                             // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
                         } else {
@@ -9259,13 +9279,12 @@ impl SqlEditorWidget {
                             construct.merge_active.clear();
                             construct.cursor_sql_active.clear(&mut indent_level);
                             construct.forall_body_active.clear(&mut indent_level);
-                            if pending_package_member_separator
-                                && format_stack.last_block_kind_is("PACKAGE_BODY")
-                            {
-                                indent_level = format_stack
-                                    .last_block_owner_depth()
-                                    .map(|depth| depth.saturating_add(1))
-                                    .unwrap_or(indent_level);
+                            if pending_package_member_separator {
+                                if let Some(member_indent) =
+                                    format_stack.package_body_member_indent()
+                                {
+                                    indent_level = member_indent;
+                                }
                             }
                             let package_initializer_next =
                                 pending_package_member_separator && next_word_is("BEGIN");
