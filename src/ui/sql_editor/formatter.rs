@@ -130,6 +130,10 @@ fn rendered_line_indent(line: &str) -> usize {
 struct FormatBlockDepthFrame {
     owner_depth: usize,
     previous_indent_level: usize,
+    /// The `indent_level` assigned to this block's body when the frame was
+    /// pushed. Used in debug builds to detect drift at statement boundaries
+    /// inside the block (see `FormatFrameStack::expected_statement_base_indent`).
+    body_indent_level: usize,
 }
 
 struct FormatterTokenCache {
@@ -831,6 +835,7 @@ impl FormatFrameStack {
             depth_frame: FormatBlockDepthFrame {
                 owner_depth,
                 previous_indent_level,
+                body_indent_level: new_indent_level,
             },
             case_branch_started: false,
             exception_branch_started: false,
@@ -970,6 +975,17 @@ impl FormatFrameStack {
 
     fn last_block_owner_depth(&self) -> Option<usize> {
         self.last_block_depth_frame().map(|frame| frame.owner_depth)
+    }
+
+    /// Expected `indent_level` at a statement boundary once all non-persistent
+    /// frames have been cleared. Equals the innermost surviving block frame's
+    /// body indent, or `0` if no block frame remains. Used only in debug
+    /// builds to assert drift-free symmetric push/pop accounting.
+    #[cfg(debug_assertions)]
+    fn expected_statement_base_indent(&self) -> usize {
+        self.last_block_depth_frame()
+            .map(|frame| frame.body_indent_level)
+            .unwrap_or(0)
     }
 
     fn contains_block_kind(&self, kind: &str) -> bool {
@@ -9268,6 +9284,23 @@ impl SqlEditorWidget {
                             // by undoing the delta of each popped paren frame.
                             format_stack.clear_statement_frames(&mut indent_level);
                             construct.pop_closed_paren_scopes(0);
+                            // Debug-only invariant: once all non-persistent
+                            // frames and scoped state have been cleared at a
+                            // statement boundary, `indent_level` must match
+                            // the surviving block frame's body indent (or 0
+                            // when at top level). This catches asymmetric
+                            // push/pop drift early in debug builds without
+                            // affecting release behavior.
+                            #[cfg(debug_assertions)]
+                            {
+                                let expected =
+                                    format_stack.expected_statement_base_indent();
+                                debug_assert_eq!(
+                                    indent_level, expected,
+                                    "indent_level drift at statement boundary: \
+                                     got {indent_level}, expected {expected}"
+                                );
+                            }
                             select_list_break_state.clear();
                             let should_reset_paren_tracking =
                                 indent_level == 0 || format_stack.block_depth() == 0;
