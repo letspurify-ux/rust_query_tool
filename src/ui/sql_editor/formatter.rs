@@ -1542,6 +1542,21 @@ impl FormatFrameStack {
         self.expected_indent_level()
     }
 
+    /// Realign `indent_level` to the current `statement_base_indent()`.
+    ///
+    /// This is the only sanctioned way for call sites outside this impl to
+    /// reset `indent_level` to the surviving frame stack's derived base
+    /// without pushing or popping a frame. Under the stack's invariant
+    /// (`indent_level == expected_indent_level()`) this is a no-op in the
+    /// happy path; in release builds it also acts as a defensive realignment
+    /// if a caller has drifted, and in debug builds the post-condition
+    /// assertion makes any residual drift loud.
+    fn realign_indent_level_to_base(&self, indent_level: &mut usize) {
+        *indent_level = self.statement_base_indent();
+        #[cfg(debug_assertions)]
+        self.debug_assert_indent_level(*indent_level);
+    }
+
     fn contains_block_kind(&self, kind: impl BlockKindMatcher) -> bool {
         self.frames.iter().any(|frame| match frame {
             FormatFrame::Block(frame) => kind.matches(frame.kind),
@@ -8728,14 +8743,14 @@ impl SqlEditorWidget {
                                 {
                                     let _ = format_stack.pop_block(&mut indent_level);
                                 }
-                                indent_level = format_stack.statement_base_indent();
+                                format_stack.realign_indent_level_to_base(&mut indent_level);
                                 pending_package_member_separator = false;
                             } else if format_stack.last_block_kind_is(BlockKind::Declare) {
                                 format_stack.set_last_block_kind(BlockKind::Begin);
                             } else if format_stack.package_body_member_indent().is_some() {
                                 // Package initializer body always starts one level under
                                 // the package owner, regardless of prior member-body depth.
-                                indent_level = format_stack.statement_base_indent();
+                                format_stack.realign_indent_level_to_base(&mut indent_level);
                             }
                             // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
                         } else {
