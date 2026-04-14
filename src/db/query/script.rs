@@ -1,6 +1,12 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::db::session::{BindDataType, ComputeMode};
+use crate::sql_format::{
+    clear_mismatched_frame_context, filter_matching_frame_context,
+    prune_mismatched_frame_context_tail, sync_option_frame_context, sync_slice_frame_context,
+    take_matching_frame_context, SqlFormatFrameContext as AutoFormatFrameContext,
+    SqlFormatFrameId as AutoFormatFrameId, SqlFormatFrameIdAllocator as AutoFormatFrameIdAllocator,
+};
 use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
 use crate::sql_text;
 
@@ -143,6 +149,13 @@ struct LineCarrySnapshot {
     depth: usize,
     query_base_depth: Option<usize>,
     paren_frame_only: bool,
+    frame_context: AutoFormatFrameContext,
+}
+
+impl LineCarrySnapshot {
+    fn matches_frame_context(self, current: AutoFormatFrameContext) -> bool {
+        self.frame_context.matches(current)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +277,7 @@ impl AutoFormatClauseKind {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct QueryBaseDepthFrame {
+    id: AutoFormatFrameId,
     query_base_depth: usize,
     close_align_depth: usize,
     start_parser_depth: usize,
@@ -312,6 +326,7 @@ enum OwnerRelativeDepthFrameKind {
 
 #[derive(Clone, Copy, Debug)]
 struct OwnerRelativeDepthFrame {
+    id: AutoFormatFrameId,
     owner_depth: usize,
     kind: OwnerRelativeDepthFrameKind,
     pending_body_header_continuation: Option<sql_text::FormatBodyHeaderContinuationState>,
@@ -321,17 +336,20 @@ struct OwnerRelativeDepthFrame {
 struct PendingMultilineClauseOwnerFrame {
     kind: sql_text::FormatIndentedParenOwnerKind,
     owner_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PendingPartialMultilineClauseOwnerFrame {
     kind: sql_text::PendingFormatIndentedParenOwnerHeaderKind,
     owner_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingWindowDefinitionOwnerFrame {
     owner_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,16 +458,22 @@ enum MySqlHandlerScanToken<'a> {
 }
 
 impl OwnerRelativeDepthFrame {
-    fn model_clause(owner_depth: usize, start_parser_depth: usize) -> Self {
+    fn model_clause(id: AutoFormatFrameId, owner_depth: usize, start_parser_depth: usize) -> Self {
         Self {
+            id,
             owner_depth,
             kind: OwnerRelativeDepthFrameKind::ModelClause { start_parser_depth },
             pending_body_header_continuation: None,
         }
     }
 
-    fn multiline_clause(kind: sql_text::FormatIndentedParenOwnerKind, owner_depth: usize) -> Self {
+    fn multiline_clause(
+        id: AutoFormatFrameId,
+        kind: sql_text::FormatIndentedParenOwnerKind,
+        owner_depth: usize,
+    ) -> Self {
         Self {
+            id,
             owner_depth,
             kind: OwnerRelativeDepthFrameKind::MultilineClause {
                 kind,
@@ -526,6 +550,7 @@ impl OwnerRelativeDepthFrame {
 struct PendingQueryBaseFrame {
     owner_base_depth: usize,
     close_align_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -533,6 +558,7 @@ struct PendingSplitQueryOwnerFrame {
     owner_align_depth: usize,
     owner_base_depth: usize,
     next_query_head_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,6 +567,7 @@ struct PendingPartialQueryOwnerFrame {
     owner_align_depth: usize,
     owner_base_depth: usize,
     next_query_head_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,6 +577,7 @@ struct PendingPlsqlChildQueryOwnerFrame {
     owner_base_depth: usize,
     next_query_head_depth: usize,
     nested_paren_depth: usize,
+    frame_context: AutoFormatFrameContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2134,6 +2162,7 @@ impl QueryExecutor {
         let mut with_plsql_auto_format_state = WithPlsqlAutoFormatState::default();
         let mut auto_format_subquery_paren_stack: Vec<AutoFormatSubqueryParenKind> = Vec::new();
         let mut auto_format_function_local_clause_active_stack: Vec<bool> = Vec::new();
+        let mut frame_id_allocator = AutoFormatFrameIdAllocator::default();
         let mut pending_auto_format_subquery_paren_count = 0usize;
         let mut auto_format_paren_observer = SqlParserEngine::new();
         let mut mysql_delimiter = ";".to_string();
@@ -2473,9 +2502,6 @@ impl QueryExecutor {
             let current_line_is_exact_bare_window_clause_header = clause_kind
                 == Some(AutoFormatClauseKind::Window)
                 && sql_text::line_is_format_bare_window_clause_header(clause_detection_trimmed);
-            let current_line_is_window_clause_definition_header =
-                pending_window_definition_owner_for_line.is_some()
-                    && Self::line_is_window_clause_definition_header(trimmed);
             let split_query_owner_lookahead_kind = Self::split_query_owner_lookahead_kind(
                 idx,
                 &next_code_indices,
@@ -2515,9 +2541,6 @@ impl QueryExecutor {
                         (progress.kind == MySqlDeclareHandlerLineKind::Body)
                             .then_some(frame.owner_depth)
                     });
-            let active_line_continuation = pending_line_continuation.take();
-            let active_inline_comment_line_continuation =
-                pending_inline_comment_line_continuation.take();
             let current_line_is_standalone_open_paren = standalone_open_paren_lines
                 .get(idx)
                 .copied()
@@ -2532,29 +2555,11 @@ impl QueryExecutor {
                         clause_detection_trimmed,
                     )))
                 && !current_line_is_standalone_open_paren;
-            let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
-                pending_split_query_owner.take()
-            } else {
-                None
-            };
-            let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren {
-                pending_multiline_clause_owner.take()
-            } else {
-                None
-            };
             if current_line_is_standalone_open_paren {
                 pending_partial_query_owner = None;
                 pending_partial_multiline_clause_owner = None;
             }
             let multiline_clause_paren_profile = sql_text::significant_paren_profile(trimmed);
-            let pending_plsql_child_query_owner_for_line = pending_plsql_child_query_owner;
-            let pending_plsql_child_query_owner_nested_paren_depth_after_line =
-                pending_plsql_child_query_owner_for_line.map(|frame| {
-                    Self::pending_plsql_child_query_owner_nested_paren_depth_after_line(
-                        frame.nested_paren_depth,
-                        &multiline_clause_paren_profile,
-                    )
-                });
             let owner_relative_detection_trimmed = owner_relative_trimmed_lines
                 .get(idx)
                 .copied()
@@ -2568,14 +2573,95 @@ impl QueryExecutor {
                     &mut owner_relative_frames,
                     &multiline_clause_paren_profile,
                 );
+            let active_owner_relative_frame =
+                Self::active_owner_relative_depth_frame(&owner_relative_frames);
+            let current_frame_context = AutoFormatFrameContext::new(
+                active_frame.map(|frame| frame.id),
+                active_owner_relative_frame.map(|frame| frame.id),
+            );
+            Self::prune_incompatible_pending_query_bases(
+                &mut pending_query_bases,
+                current_frame_context,
+            );
+            clear_mismatched_frame_context(
+                &mut pending_split_query_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            clear_mismatched_frame_context(
+                &mut pending_partial_query_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            clear_mismatched_frame_context(
+                &mut pending_plsql_child_query_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            clear_mismatched_frame_context(
+                &mut pending_multiline_clause_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            clear_mismatched_frame_context(
+                &mut pending_partial_multiline_clause_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            let active_line_continuation = take_matching_frame_context(
+                &mut pending_line_continuation,
+                current_frame_context,
+                |snapshot| snapshot.frame_context,
+            );
+            let active_inline_comment_line_continuation = take_matching_frame_context(
+                &mut pending_inline_comment_line_continuation,
+                current_frame_context,
+                |snapshot| snapshot.frame_context,
+            );
+            let pending_split_query_owner_for_line = if current_line_is_standalone_open_paren {
+                take_matching_frame_context(
+                    &mut pending_split_query_owner,
+                    current_frame_context,
+                    |frame| frame.frame_context,
+                )
+            } else {
+                None
+            };
+            let pending_multiline_clause_for_line = if current_line_is_standalone_open_paren {
+                take_matching_frame_context(
+                    &mut pending_multiline_clause_owner,
+                    current_frame_context,
+                    |frame| frame.frame_context,
+                )
+            } else {
+                None
+            };
+            let pending_plsql_child_query_owner_for_line = filter_matching_frame_context(
+                pending_plsql_child_query_owner,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            let pending_plsql_child_query_owner_nested_paren_depth_after_line =
+                pending_plsql_child_query_owner_for_line.map(|frame| {
+                    Self::pending_plsql_child_query_owner_nested_paren_depth_after_line(
+                        frame.nested_paren_depth,
+                        &multiline_clause_paren_profile,
+                    )
+                });
+            let pending_window_definition_owner_for_line = filter_matching_frame_context(
+                pending_window_definition_owner_for_line,
+                current_frame_context,
+                |frame| frame.frame_context,
+            );
+            let current_line_is_window_clause_definition_header =
+                pending_window_definition_owner_for_line.is_some()
+                    && Self::line_is_window_clause_definition_header(trimmed);
             let multiline_clause_owner_kind = (pending_window_definition_owner_for_line.is_some()
                 && Self::line_is_window_clause_definition_header(owner_relative_detection_trimmed))
             .then_some(sql_text::FormatIndentedParenOwnerKind::Window)
             .or_else(|| Self::line_multiline_clause_owner_kind(owner_relative_detection_trimmed))
             .or(pending_multiline_clause_for_line.map(|frame| frame.kind));
             let starts_multiline_clause = multiline_clause_owner_kind.is_some();
-            let active_owner_relative_frame =
-                Self::active_owner_relative_depth_frame(&owner_relative_frames);
             let owner_relative_body_header_line =
                 active_owner_relative_frame.is_some_and(|frame| {
                     frame
@@ -2621,6 +2707,7 @@ impl QueryExecutor {
                 context.starts_query_frame = true;
                 pending_query_bases.clear();
                 query_frames.push(QueryBaseDepthFrame {
+                    id: frame_id_allocator.next_id(),
                     query_base_depth,
                     close_align_depth,
                     start_parser_depth: parser_depth,
@@ -3218,7 +3305,6 @@ impl QueryExecutor {
                     .filter(|_| !line_starts_inside_multiline_literal)
                     .filter(|_| !leading_close_consumes_non_subquery_frame)
                     .filter(|_| !current_line_is_pending_from_item_body)
-                    .filter(|_| context.query_role == AutoFormatQueryRole::Continuation)
                     .filter(|_| !line_ends_with_comma)
                     .filter(|_| {
                         Self::leading_close_tail_is_query_list_item_for_query_base(
@@ -3417,6 +3503,7 @@ impl QueryExecutor {
                             owner_align_depth: frame.owner_align_depth,
                             owner_base_depth: frame.owner_base_depth,
                             next_query_head_depth: frame.next_query_head_depth,
+                            frame_context: frame.frame_context,
                         });
                     } else {
                         continued_plsql_child_query_owner =
@@ -3426,6 +3513,7 @@ impl QueryExecutor {
                                 owner_base_depth: frame.owner_base_depth,
                                 next_query_head_depth: frame.next_query_head_depth,
                                 nested_paren_depth: nested_paren_depth_after_line,
+                                frame_context: frame.frame_context,
                             });
                     }
                 }
@@ -3456,6 +3544,7 @@ impl QueryExecutor {
                                 owner_align_depth,
                                 owner_base_depth,
                                 next_query_head_depth,
+                                frame_context: frame.frame_context,
                             });
                         } else {
                             continued_partial_query_owner = Some(PendingPartialQueryOwnerFrame {
@@ -3463,6 +3552,7 @@ impl QueryExecutor {
                                 owner_align_depth,
                                 owner_base_depth,
                                 next_query_head_depth,
+                                frame_context: frame.frame_context,
                             });
                         }
                     }
@@ -3477,6 +3567,7 @@ impl QueryExecutor {
                         continued_multiline_clause_owner = Some(PendingMultilineClauseOwnerFrame {
                             kind: frame.kind,
                             owner_depth,
+                            frame_context: frame.frame_context,
                         });
                     }
                 } else if let Some(frame) = pending_partial_multiline_clause_owner {
@@ -3490,12 +3581,14 @@ impl QueryExecutor {
                                 Some(PendingMultilineClauseOwnerFrame {
                                     kind: frame.kind.owner_kind(),
                                     owner_depth,
+                                    frame_context: frame.frame_context,
                                 });
                         } else {
                             continued_partial_multiline_clause_owner =
                                 Some(PendingPartialMultilineClauseOwnerFrame {
                                     kind: frame.kind,
                                     owner_depth,
+                                    frame_context: frame.frame_context,
                                 });
                         }
                     }
@@ -3662,6 +3755,7 @@ impl QueryExecutor {
                 pending_query_bases.push(PendingQueryBaseFrame {
                     owner_base_depth: base_depth_for_child_query,
                     close_align_depth: context.auto_depth,
+                    frame_context: current_frame_context,
                 });
                 if !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
                     let owner_align_depth = Self::apply_same_line_non_leading_paren_events_to_depth(
@@ -3672,6 +3766,7 @@ impl QueryExecutor {
                         owner_align_depth,
                         owner_base_depth: base_depth_for_child_query,
                         next_query_head_depth,
+                        frame_context: current_frame_context,
                     });
                 } else {
                     pending_split_query_owner = None;
@@ -3703,6 +3798,7 @@ impl QueryExecutor {
                                     owner_align_depth: owner_base_depth,
                                     owner_base_depth,
                                     next_query_head_depth: owner_base_depth.saturating_add(1),
+                                    frame_context: current_frame_context,
                                 }
                             });
                 }
@@ -3729,6 +3825,7 @@ impl QueryExecutor {
                                 0,
                                 &multiline_clause_paren_profile,
                             ),
+                        frame_context: current_frame_context,
                     })
                 };
 
@@ -3742,6 +3839,7 @@ impl QueryExecutor {
             if starts_multiline_clause {
                 if let Some(kind) = multiline_clause_owner_kind {
                     owner_relative_frames.push(OwnerRelativeDepthFrame::multiline_clause(
+                        frame_id_allocator.next_id(),
                         kind,
                         pending_multiline_clause_for_line
                             .map(|frame| frame.owner_depth)
@@ -3775,6 +3873,7 @@ impl QueryExecutor {
                                         ),
                                         trimmed,
                                     ),
+                                frame_context: current_frame_context,
                             }
                         })
                     })
@@ -3787,6 +3886,7 @@ impl QueryExecutor {
                                         context.auto_depth,
                                         trimmed,
                                     ),
+                                frame_context: current_frame_context,
                             },
                         )
                     });
@@ -3810,6 +3910,7 @@ impl QueryExecutor {
                                         ),
                                         trimmed,
                                     ),
+                                frame_context: current_frame_context,
                             }
                         })
                     })
@@ -3821,16 +3922,22 @@ impl QueryExecutor {
             pending_window_definition_owner = if current_line_is_exact_bare_window_clause_header {
                 Some(PendingWindowDefinitionOwnerFrame {
                     owner_depth: context.auto_depth.saturating_add(1),
+                    frame_context: current_frame_context,
                 })
             } else if closes_window_definition_with_comma {
-                closes_multiline_clause_owner_depth
-                    .map(|owner_depth| PendingWindowDefinitionOwnerFrame { owner_depth })
+                closes_multiline_clause_owner_depth.map(|owner_depth| {
+                    PendingWindowDefinitionOwnerFrame {
+                        owner_depth,
+                        frame_context: current_frame_context,
+                    }
+                })
             } else {
                 None
             };
 
             if sql_text::starts_with_keyword_token(owner_relative_detection_upper, "MODEL") {
                 owner_relative_frames.push(OwnerRelativeDepthFrame::model_clause(
+                    frame_id_allocator.next_id(),
                     context.auto_depth,
                     parser_depth,
                 ));
@@ -3879,6 +3986,49 @@ impl QueryExecutor {
             let suppress_structural_line_continuation_for_on_duplicate_values_comma =
                 current_line_is_mysql_on_duplicate_values_function
                     && Self::line_ends_with_comma_before_inline_comment(trimmed);
+            let next_line_frame_context = AutoFormatFrameContext::new(
+                query_frames.last().map(|frame| frame.id),
+                owner_relative_frames.last().map(|frame| frame.id),
+            );
+            sync_slice_frame_context(
+                &mut pending_query_bases,
+                next_line_frame_context,
+                |frame, next| {
+                    frame.frame_context = next;
+                },
+            );
+            sync_option_frame_context(
+                &mut pending_split_query_owner,
+                next_line_frame_context,
+                |frame, next| {
+                    frame.frame_context = next;
+                },
+            );
+            sync_option_frame_context(
+                &mut pending_partial_query_owner,
+                next_line_frame_context,
+                |frame, next| frame.frame_context = next,
+            );
+            sync_option_frame_context(
+                &mut pending_plsql_child_query_owner,
+                next_line_frame_context,
+                |frame, next| frame.frame_context = next,
+            );
+            sync_option_frame_context(
+                &mut pending_multiline_clause_owner,
+                next_line_frame_context,
+                |frame, next| frame.frame_context = next,
+            );
+            sync_option_frame_context(
+                &mut pending_partial_multiline_clause_owner,
+                next_line_frame_context,
+                |frame, next| frame.frame_context = next,
+            );
+            sync_option_frame_context(
+                &mut pending_window_definition_owner,
+                next_line_frame_context,
+                |frame, next| frame.frame_context = next,
+            );
             pending_line_continuation = if suppress_non_subquery_paren_clause_start {
                 // Function-local clause words inside ordinary parens (for example
                 // `RETURNING VARCHAR2 (`) should not open structural header carry,
@@ -3888,6 +4038,7 @@ impl QueryExecutor {
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
+                    next_line_frame_context,
                     next_code_trimmed,
                     context.condition_role,
                     context.condition_header_depth,
@@ -3902,6 +4053,7 @@ impl QueryExecutor {
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
+                    next_line_frame_context,
                     next_code_trimmed,
                     context.condition_role,
                     context.condition_header_depth,
@@ -3916,6 +4068,7 @@ impl QueryExecutor {
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
+                    next_line_frame_context,
                     next_code_trimmed,
                     context.condition_role,
                     context.condition_header_depth,
@@ -3931,6 +4084,7 @@ impl QueryExecutor {
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
+                    next_line_frame_context,
                     next_code_trimmed,
                     context.condition_role,
                     context.condition_header_depth,
@@ -3947,6 +4101,7 @@ impl QueryExecutor {
                     trimmed,
                     context.auto_depth,
                     context.query_base_depth,
+                    next_line_frame_context,
                     next_code_trimmed,
                     context.condition_role,
                     context.condition_header_depth,
@@ -4974,6 +5129,15 @@ impl QueryExecutor {
         }
     }
 
+    fn prune_incompatible_pending_query_bases(
+        pending_query_bases: &mut Vec<PendingQueryBaseFrame>,
+        current_frame_context: AutoFormatFrameContext,
+    ) {
+        prune_mismatched_frame_context_tail(pending_query_bases, current_frame_context, |frame| {
+            frame.frame_context
+        });
+    }
+
     fn pop_expired_owner_relative_depth_frames(
         owner_relative_frames: &mut Vec<OwnerRelativeDepthFrame>,
         parser_depth: usize,
@@ -5564,6 +5728,7 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
+        frame_context: AutoFormatFrameContext,
         next_code_trimmed: Option<&str>,
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
@@ -5574,6 +5739,7 @@ impl QueryExecutor {
             line,
             depth,
             query_base_depth,
+            frame_context,
             next_code_trimmed,
             condition_role,
             condition_header_depth,
@@ -5587,6 +5753,7 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
+        frame_context: AutoFormatFrameContext,
         next_code_trimmed: Option<&str>,
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
@@ -5597,6 +5764,7 @@ impl QueryExecutor {
             line,
             depth,
             query_base_depth,
+            frame_context,
             next_code_trimmed,
             condition_role,
             condition_header_depth,
@@ -5610,6 +5778,7 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
+        frame_context: AutoFormatFrameContext,
         next_code_trimmed: Option<&str>,
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
@@ -5632,6 +5801,7 @@ impl QueryExecutor {
             kind,
             depth,
             query_base_depth,
+            frame_context,
             condition_role,
             condition_header_depth,
             line_starts_inside_non_subquery_paren_context,
@@ -5645,6 +5815,7 @@ impl QueryExecutor {
         continuation_kind: Option<InlineCommentContinuationKind>,
         depth: usize,
         query_base_depth: Option<usize>,
+        frame_context: AutoFormatFrameContext,
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
         line_starts_inside_non_subquery_paren_context: bool,
@@ -5703,6 +5874,7 @@ impl QueryExecutor {
             depth: carry_depth,
             query_base_depth,
             paren_frame_only,
+            frame_context,
         })
     }
 
@@ -5877,6 +6049,7 @@ impl QueryExecutor {
         line: &str,
         depth: usize,
         query_base_depth: Option<usize>,
+        frame_context: AutoFormatFrameContext,
         next_code_trimmed: Option<&str>,
         condition_role: AutoFormatConditionRole,
         condition_header_depth: Option<usize>,
@@ -5897,6 +6070,7 @@ impl QueryExecutor {
             kind,
             depth,
             query_base_depth,
+            frame_context,
             condition_role,
             condition_header_depth,
             line_starts_inside_non_subquery_paren_context,
@@ -10831,8 +11005,9 @@ mod tests {
     use crate::sql_text;
 
     use super::{
-        AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatLineSemantic, AutoFormatQueryRole,
-        FormatItem, InlineCommentContinuationKind, QueryExecutor,
+        AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatFrameContext,
+        AutoFormatLineSemantic, AutoFormatQueryRole, FormatItem, InlineCommentContinuationKind,
+        LineCarrySnapshot, PendingQueryBaseFrame, QueryExecutor,
     };
 
     #[test]
@@ -12303,6 +12478,7 @@ UPDATE OF e.sal NOWAIT;"#;
             "SELECT",
             0,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("empno"),
             AutoFormatConditionRole::None,
             None,
@@ -12314,6 +12490,7 @@ UPDATE OF e.sal NOWAIT;"#;
             "SELECT; -- done",
             0,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("empno"),
             AutoFormatConditionRole::None,
             None,
@@ -12325,6 +12502,7 @@ UPDATE OF e.sal NOWAIT;"#;
             "SELECT -- done",
             0,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("empno"),
             AutoFormatConditionRole::None,
             None,
@@ -12336,6 +12514,7 @@ UPDATE OF e.sal NOWAIT;"#;
             "SELECT; -- done",
             0,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("empno"),
             AutoFormatConditionRole::None,
             None,
@@ -12346,11 +12525,54 @@ UPDATE OF e.sal NOWAIT;"#;
     }
 
     #[test]
+    fn line_carry_snapshot_requires_matching_frame_context() {
+        let snapshot = LineCarrySnapshot {
+            depth: 3,
+            query_base_depth: Some(1),
+            paren_frame_only: false,
+            frame_context: AutoFormatFrameContext::new(Some(10), Some(20)),
+        };
+
+        assert!(snapshot.matches_frame_context(AutoFormatFrameContext::new(Some(10), Some(20))));
+        assert!(!snapshot.matches_frame_context(AutoFormatFrameContext::new(Some(11), Some(20),)));
+        assert!(!snapshot.matches_frame_context(AutoFormatFrameContext::new(Some(10), Some(21),)));
+    }
+
+    #[test]
+    fn prune_incompatible_pending_query_bases_drops_sibling_scope_tail() {
+        let mut pending_query_bases = vec![
+            PendingQueryBaseFrame {
+                owner_base_depth: 1,
+                close_align_depth: 1,
+                frame_context: AutoFormatFrameContext::new(Some(1), None),
+            },
+            PendingQueryBaseFrame {
+                owner_base_depth: 2,
+                close_align_depth: 2,
+                frame_context: AutoFormatFrameContext::new(Some(2), None),
+            },
+        ];
+
+        QueryExecutor::prune_incompatible_pending_query_bases(
+            &mut pending_query_bases,
+            AutoFormatFrameContext::new(Some(1), None),
+        );
+
+        assert_eq!(pending_query_bases.len(), 1);
+        assert_eq!(pending_query_bases[0].owner_base_depth, 1);
+        assert_eq!(
+            pending_query_bases[0].frame_context,
+            AutoFormatFrameContext::new(Some(1), None)
+        );
+    }
+
+    #[test]
     fn inline_comment_line_continuation_keeps_standalone_open_boundary_for_operator_prefix() {
         let carry = QueryExecutor::inline_comment_line_continuation_for_line(
             "payload + -- keep wrapper",
             2,
             Some(1),
+            AutoFormatFrameContext::default(),
             Some("("),
             AutoFormatConditionRole::None,
             None,
@@ -12416,6 +12638,7 @@ FROM dual;"#;
             "payload )",
             3,
             Some(1),
+            AutoFormatFrameContext::default(),
             Some("RETURNING VARCHAR2 (30)"),
             AutoFormatConditionRole::None,
             None,
@@ -12445,6 +12668,7 @@ FROM dual;"#;
             "payload ) -- keep",
             3,
             Some(1),
+            AutoFormatFrameContext::default(),
             Some("RETURNING VARCHAR2 (30)"),
             AutoFormatConditionRole::None,
             None,
@@ -12475,6 +12699,7 @@ FROM dual;"#;
             ") /* gap */ ORDER BY total_spent,",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12495,6 +12720,7 @@ FROM dual;"#;
             ") /* gap */ ORDER BY total_spent, -- keep",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12525,6 +12751,7 @@ FROM dual;"#;
             ") /* gap */ nested_alias,",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12554,6 +12781,7 @@ FROM dual;"#;
             ") nested_alias,",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12583,6 +12811,7 @@ FROM dual;"#;
             ") AS nested_alias,",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12612,6 +12841,7 @@ FROM dual;"#;
             r#") "nested_alias","#,
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12641,6 +12871,7 @@ FROM dual;"#;
             ") window,",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12670,6 +12901,7 @@ FROM dual;"#;
             ") nested_alias, -- keep",
             1,
             Some(0),
+            AutoFormatFrameContext::default(),
             Some("next_item"),
             AutoFormatConditionRole::None,
             None,
@@ -12699,6 +12931,7 @@ FROM dual;"#;
             "WHERE amount =",
             2,
             Some(1),
+            AutoFormatFrameContext::default(),
             Some("123"),
             AutoFormatConditionRole::None,
             None,
