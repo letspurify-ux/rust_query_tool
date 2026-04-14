@@ -1776,13 +1776,87 @@ impl FormatFrameStack {
         }
     }
 
-    fn remove_frame_at(&mut self, idx: usize) -> Option<FormatFrame> {
+    fn remove_frame_at_unchecked(&mut self, idx: usize) -> Option<FormatFrame> {
         if idx >= self.frames.len() {
             return None;
         }
         let frame = self.frames.remove(idx);
         self.frame_index_cache.remove(&frame, idx);
         Some(frame)
+    }
+
+    fn remove_indexed_auxiliary_frame_at(&mut self, idx: usize) -> Option<FormatFrame> {
+        let frame = self.frames.get(idx)?;
+        debug_assert!(
+            matches!(
+                frame,
+                FormatFrame::ConstructFlag(_)
+                    | FormatFrame::ConstructValue(_)
+                    | FormatFrame::PendingSplitEndSuffix(_)
+                    | FormatFrame::PendingPlsqlLabel(_)
+                    | FormatFrame::MySqlHandlerPendingBodyIndent(_)
+            ),
+            "indexed auxiliary removal must not be used for structural or indent-bearing frames"
+        );
+        self.remove_frame_at_unchecked(idx)
+    }
+
+    fn remove_scoped_indent_frame_at(&mut self, idx: usize) -> Option<ScopedIndentFrame> {
+        let frame = self.frames.get(idx)?;
+        debug_assert!(
+            matches!(frame, FormatFrame::ScopedIndent(_)),
+            "scoped-indent removal must only target scoped-indent frames"
+        );
+        match self.remove_frame_at_unchecked(idx) {
+            Some(FormatFrame::ScopedIndent(frame)) => Some(frame),
+            _ => None,
+        }
+    }
+
+    fn remove_auxiliary_frames_matching(
+        &mut self,
+        mut should_remove: impl FnMut(&FormatFrame) -> bool,
+    ) -> usize {
+        let indices: Vec<usize> = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, frame)| should_remove(frame).then_some(idx))
+            .collect();
+        let mut removed = 0usize;
+        for idx in indices.into_iter().rev() {
+            if self.remove_indexed_auxiliary_frame_at(idx).is_some() {
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
+    fn rebuild_structural_state_from_frames(&mut self) {
+        self.paren_depth = self
+            .frames
+            .iter()
+            .filter(|frame| matches!(frame, FormatFrame::Paren(_)))
+            .count();
+        self.block_depth = self
+            .frames
+            .iter()
+            .filter(|frame| matches!(frame, FormatFrame::Block(_)))
+            .count();
+        self.current_paren_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::Paren(frame) => Some(frame.id),
+            _ => None,
+        });
+        self.current_block_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::Block(frame) => Some(frame.id),
+            _ => None,
+        });
+        self.rebuild_frame_index_cache();
+    }
+
+    fn retain_frames_matching(&mut self, mut should_keep: impl FnMut(&FormatFrame) -> bool) {
+        self.frames.retain(|frame| should_keep(frame));
+        self.rebuild_structural_state_from_frames();
     }
 
     fn pop_tail_frame(&mut self) -> Option<FormatFrame> {
@@ -1948,7 +2022,7 @@ impl FormatFrameStack {
         else {
             return false;
         };
-        self.remove_frame_at(idx).is_some()
+        self.remove_indexed_auxiliary_frame_at(idx).is_some()
     }
 
     fn deactivate_construct_flag_at_or_above_paren_depth(
@@ -1956,14 +2030,13 @@ impl FormatFrameStack {
         kind: ConstructFlagKind,
         paren_depth: usize,
     ) {
-        self.frames.retain(|frame| {
-            !matches!(
+        let _ = self.remove_auxiliary_frames_matching(|frame| {
+            matches!(
                 frame,
                 FormatFrame::ConstructFlag(frame)
                     if frame.kind == kind && frame.scope.paren_depth >= paren_depth
             )
         });
-        self.rebuild_frame_index_cache();
     }
 
     fn construct_flag_is_active(&self, kind: ConstructFlagKind) -> bool {
@@ -2017,10 +2090,9 @@ impl FormatFrameStack {
     }
 
     fn clear_construct_value(&mut self, kind: ConstructValueKind) {
-        self.frames.retain(
-            |frame| !matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
+        let _ = self.remove_auxiliary_frames_matching(
+            |frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
         );
-        self.rebuild_frame_index_cache();
     }
 
     fn construct_value_is_some(&self, kind: ConstructValueKind) -> bool {
@@ -2632,7 +2704,7 @@ impl FormatFrameStack {
         else {
             return false;
         };
-        self.remove_frame_at(idx).is_some()
+        self.remove_indexed_auxiliary_frame_at(idx).is_some()
     }
 
     fn advance_pending_split_end_suffix(&mut self, word_upper: &str) {
@@ -2655,7 +2727,7 @@ impl FormatFrameStack {
                 }
             }
             None => {
-                let _ = self.remove_frame_at(idx);
+                let _ = self.remove_indexed_auxiliary_frame_at(idx);
             }
         }
     }
@@ -2688,7 +2760,7 @@ impl FormatFrameStack {
         else {
             return false;
         };
-        self.remove_frame_at(idx).is_some()
+        self.remove_indexed_auxiliary_frame_at(idx).is_some()
     }
 
     fn mysql_handler_pending_body_indent(&self) -> Option<usize> {
@@ -2718,7 +2790,7 @@ impl FormatFrameStack {
         else {
             return false;
         };
-        self.remove_frame_at(idx).is_some()
+        self.remove_indexed_auxiliary_frame_at(idx).is_some()
     }
 
     fn push_scoped_indent(
@@ -2728,13 +2800,10 @@ impl FormatFrameStack {
         delta: usize,
         indent_level: &mut usize,
     ) {
-        if self.frames.last().is_some_and(|frame| {
-            matches!(
-                frame,
-                FormatFrame::ScopedIndent(frame)
-                    if frame.kind == kind && frame.scope == scope
-            )
-        }) {
+        if self
+            .last_scoped_indent(kind)
+            .is_some_and(|frame| frame.scope == scope)
+        {
             return;
         }
         *indent_level = indent_level.saturating_add(delta);
@@ -2756,6 +2825,16 @@ impl FormatFrameStack {
             .is_some()
     }
 
+    fn last_scoped_indent(&self, kind: ScopedIndentKind) -> Option<ScopedIndentFrame> {
+        self.frame_index_cache.scoped_indent_indices[kind.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::ScopedIndent(frame) => Some(*frame),
+                _ => None,
+            })
+    }
+
     fn deactivate_scoped_indent(
         &mut self,
         kind: ScopedIndentKind,
@@ -2767,12 +2846,10 @@ impl FormatFrameStack {
         else {
             return false;
         };
-        let delta = match self.frames.get(idx) {
-            Some(FormatFrame::ScopedIndent(frame)) => frame.delta,
-            _ => return false,
-        };
-        *indent_level = indent_level.saturating_sub(delta);
-        let _ = self.remove_frame_at(idx);
+        if self.remove_scoped_indent_frame_at(idx).is_none() {
+            return false;
+        }
+        self.realign_indent_level_to_base(indent_level);
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity();
@@ -2787,13 +2864,11 @@ impl FormatFrameStack {
             .last()
             .copied()
         {
-            let delta = match self.frames.get(idx) {
-                Some(FormatFrame::ScopedIndent(frame)) => frame.delta,
-                _ => break,
-            };
-            *indent_level = indent_level.saturating_sub(delta);
-            let _ = self.remove_frame_at(idx);
+            if self.remove_scoped_indent_frame_at(idx).is_none() {
+                break;
+            }
         }
+        self.realign_indent_level_to_base(indent_level);
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity();
@@ -2992,27 +3067,7 @@ impl FormatFrameStack {
     /// recounted from the retained frames to stay structurally consistent
     /// even if a caller accidentally forgets to pop a nested frame.
     fn clear_statement_frames(&mut self, indent_level: &mut usize) {
-        self.frames
-            .retain(|frame| frame.survives_statement_boundary());
-        self.paren_depth = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Paren(_)))
-            .count();
-        self.block_depth = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Block(_)))
-            .count();
-        self.current_paren_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => Some(frame.id),
-            _ => None,
-        });
-        self.current_block_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.id),
-            _ => None,
-        });
-        self.rebuild_frame_index_cache();
+        self.retain_frames_matching(|frame| frame.survives_statement_boundary());
         self.current_query_base_depth = None;
         *indent_level = self.statement_base_indent();
         #[cfg(debug_assertions)]
@@ -13822,8 +13877,9 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod formatter_scope_state_tests {
     use super::{
-        ConstructFlagKind, ConstructValueKind, FormatFrameStack, FormatScope, ParenFormatFrame,
-        ParenFormatFrameKind, ParenSemanticFlags, ScopedIndentKind, SqlEditorWidget,
+        BlockKind, ConstructFlagKind, ConstructValueKind, FormatFrameStack, FormatScope,
+        ParenFormatFrame, ParenFormatFrameKind, ParenSemanticFlags, ScopedIndentKind,
+        SqlEditorWidget,
     };
 
     #[test]
@@ -13851,6 +13907,29 @@ mod formatter_scope_state_tests {
         let _ = stack.deactivate_scoped_indent(ScopedIndentKind::CursorSql, &mut indent_level);
         assert_eq!(indent_level, 0);
         assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+    }
+
+    #[test]
+    fn format_frame_stack_scoped_indent_same_scope_activation_ignores_intervening_auxiliary_frame()
+    {
+        let mut stack = FormatFrameStack::default();
+        let scope = FormatScope::new(1, 2);
+        let mut indent_level = 0usize;
+
+        stack.push_scoped_indent(ScopedIndentKind::CursorSql, scope, 1, &mut indent_level);
+        stack.push_between_pending(scope);
+        stack.push_scoped_indent(ScopedIndentKind::CursorSql, scope, 1, &mut indent_level);
+
+        assert_eq!(
+            indent_level, 1,
+            "same-scope re-activation must stay idempotent even when an auxiliary frame sits above the existing indent"
+        );
+        assert!(stack.between_pending_matches(scope));
+
+        let _ = stack.deactivate_scoped_indent(ScopedIndentKind::CursorSql, &mut indent_level);
+        assert_eq!(indent_level, 0);
+        assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert!(stack.between_pending_matches(scope));
     }
 
     #[test]
@@ -13996,6 +14075,91 @@ mod formatter_scope_state_tests {
 
         stack.sync_to_scope(stack.current_scope(), &mut indent_level);
         assert!(!stack.construct_flag_is_active(ConstructFlagKind::ModelActive));
+    }
+
+    #[test]
+    fn format_frame_stack_deactivate_construct_flag_at_or_above_paren_depth_keeps_outer_flag_and_indent(
+    ) {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        let outer_scope = stack.current_scope();
+        stack.activate_construct_flag(ConstructFlagKind::CreatePending, outer_scope);
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+        let inner_scope = stack.current_scope();
+        stack.activate_construct_flag(ConstructFlagKind::CreatePending, inner_scope);
+        stack.push_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            inner_scope,
+            1,
+            &mut indent_level,
+        );
+
+        stack.deactivate_construct_flag_at_or_above_paren_depth(
+            ConstructFlagKind::CreatePending,
+            1,
+        );
+
+        assert_eq!(indent_level, 3);
+        assert_eq!(
+            stack.last_construct_flag_scope(ConstructFlagKind::CreatePending),
+            Some(outer_scope)
+        );
+        assert!(stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert_eq!(stack.paren_depth(), 1);
+        assert_eq!(stack.block_depth(), 1);
+    }
+
+    #[test]
+    fn format_frame_stack_clear_construct_value_keeps_surviving_indent_frames() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        let outer_scope = stack.current_scope();
+        stack.replace_construct_value(
+            ConstructValueKind::CreateObject,
+            outer_scope,
+            "OUTER".to_string(),
+        );
+        stack.push_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            outer_scope,
+            1,
+            &mut indent_level,
+        );
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+        stack.replace_construct_value(
+            ConstructValueKind::CreateObject,
+            stack.current_scope(),
+            "INNER".to_string(),
+        );
+
+        stack.clear_construct_value(ConstructValueKind::CreateObject);
+
+        assert_eq!(indent_level, 3);
+        assert!(!stack.construct_value_is_some(ConstructValueKind::CreateObject));
+        assert!(stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert!(stack.last_block_kind_is("BEGIN"));
+        assert_eq!(stack.paren_depth(), 1);
+        assert_eq!(stack.block_depth(), 1);
     }
 
     #[test]
@@ -38703,6 +38867,41 @@ mod format_frame_stack_tests {
     }
 
     #[test]
+    fn format_frame_stack_statement_cleanup_rebuilds_indent_from_surviving_handler_body_scope() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        stack.push_scoped_indent(
+            ScopedIndentKind::MySqlHandlerBody,
+            stack.current_scope(),
+            1,
+            &mut indent_level,
+        );
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+        stack.activate_construct_flag(ConstructFlagKind::CreatePending, stack.current_scope());
+        stack.set_current_query_base_depth(Some(7));
+
+        stack.clear_statement_frames(&mut indent_level);
+
+        assert_eq!(indent_level, 3);
+        assert_eq!(stack.paren_depth(), 0);
+        assert_eq!(stack.block_depth(), 1);
+        assert!(stack.last_block_kind_is("BEGIN"));
+        assert!(stack.scoped_indent_is_active(ScopedIndentKind::MySqlHandlerBody));
+        assert!(!stack.construct_flag_is_active(ConstructFlagKind::CreatePending));
+        assert_eq!(stack.current_query_base_depth(), None);
+    }
+
+    #[test]
     fn format_frame_stack_scope_sync_expires_pending_auxiliary_frames() {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
@@ -38783,6 +38982,43 @@ mod format_frame_stack_tests {
         assert_eq!(popped_case.kind, BlockKind::Case);
         assert_eq!(stack.block_depth(), 0);
         assert_eq!(indent_level, 0);
+    }
+
+    #[test]
+    fn format_frame_stack_deactivate_scoped_indent_realigns_to_surviving_block_indent() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+        let scope = FormatScope::new(0, 0);
+
+        stack.push_scoped_indent(ScopedIndentKind::CursorSql, scope, 2, &mut indent_level);
+        stack.push_block(BlockKind::Begin, 0, 5, &mut indent_level);
+
+        let removed =
+            stack.deactivate_scoped_indent(ScopedIndentKind::CursorSql, &mut indent_level);
+
+        assert!(removed);
+        assert_eq!(indent_level, 5);
+        assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert!(stack.last_block_kind_is("BEGIN"));
+        assert_eq!(stack.block_depth(), 1);
+    }
+
+    #[test]
+    fn format_frame_stack_clear_scoped_indent_realigns_to_surviving_block_indent() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+        let scope = FormatScope::new(0, 0);
+
+        stack.push_scoped_indent(ScopedIndentKind::CursorSql, scope, 1, &mut indent_level);
+        stack.push_scoped_indent(ScopedIndentKind::CursorSql, scope, 2, &mut indent_level);
+        stack.push_block(BlockKind::Begin, 0, 4, &mut indent_level);
+
+        stack.clear_scoped_indent(ScopedIndentKind::CursorSql, &mut indent_level);
+
+        assert_eq!(indent_level, 4);
+        assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert!(stack.last_block_kind_is("BEGIN"));
+        assert_eq!(stack.block_depth(), 1);
     }
 
     #[test]
@@ -38959,5 +39195,28 @@ mod format_frame_stack_tests {
         ));
         assert_eq!(stack.current_clause(), Some("SELECT"));
         assert_eq!(indent_level, 0);
+    }
+
+    #[test]
+    fn format_frame_stack_deactivate_construct_flag_keeps_surviving_indent_frames() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        stack.activate_construct_flag(ConstructFlagKind::CreatePending, stack.current_scope());
+        stack.push_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            stack.current_scope(),
+            1,
+            &mut indent_level,
+        );
+
+        let removed = stack.deactivate_construct_flag(ConstructFlagKind::CreatePending);
+
+        assert!(removed);
+        assert_eq!(indent_level, 3);
+        assert!(stack.last_block_kind_is("BEGIN"));
+        assert!(stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
+        assert_eq!(stack.block_depth(), 1);
     }
 }
