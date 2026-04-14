@@ -668,39 +668,6 @@ struct FormatRuntimeState {
     open_cursor_state: OpenCursorFormatState,
 }
 
-impl FormatRuntimeState {
-    fn capture(
-        current_clause: &Option<String>,
-        select_list_layout_state: SelectListLayoutState,
-        statement_has_with_clause: bool,
-        query_body_clause_base_depth: Option<usize>,
-        open_cursor_state: OpenCursorFormatState,
-    ) -> Self {
-        Self {
-            current_clause: current_clause.clone(),
-            select_list_layout_state,
-            statement_has_with_clause,
-            query_body_clause_base_depth,
-            open_cursor_state,
-        }
-    }
-
-    fn restore(
-        self,
-        current_clause: &mut Option<String>,
-        select_list_layout_state: &mut SelectListLayoutState,
-        statement_has_with_clause: &mut bool,
-        query_body_clause_base_depth: &mut Option<usize>,
-        open_cursor_state: &mut OpenCursorFormatState,
-    ) {
-        *current_clause = self.current_clause;
-        *select_list_layout_state = self.select_list_layout_state;
-        *statement_has_with_clause = self.statement_has_with_clause;
-        *query_body_clause_base_depth = self.query_body_clause_base_depth;
-        *open_cursor_state = self.open_cursor_state;
-    }
-}
-
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct ParenSemanticFlags {
     match_recognize: bool,
@@ -879,12 +846,52 @@ impl FormatFrameStack {
         self.current_query_base_depth = depth;
     }
 
-    fn sync_runtime_state(&mut self, runtime_state: FormatRuntimeState) {
-        self.runtime_state = runtime_state;
+    fn current_clause(&self) -> Option<&str> {
+        self.runtime_state.current_clause.as_deref()
     }
 
-    fn runtime_state(&self) -> &FormatRuntimeState {
-        &self.runtime_state
+    fn set_current_clause(&mut self, current_clause: Option<String>) {
+        self.runtime_state.current_clause = current_clause;
+    }
+
+    fn select_list_layout_state(&self) -> SelectListLayoutState {
+        self.runtime_state.select_list_layout_state
+    }
+
+    fn select_list_layout_state_mut(&mut self) -> &mut SelectListLayoutState {
+        &mut self.runtime_state.select_list_layout_state
+    }
+
+    fn set_select_list_layout_state(&mut self, select_list_layout_state: SelectListLayoutState) {
+        self.runtime_state.select_list_layout_state = select_list_layout_state;
+    }
+
+    fn statement_has_with_clause(&self) -> bool {
+        self.runtime_state.statement_has_with_clause
+    }
+
+    fn set_statement_has_with_clause(&mut self, statement_has_with_clause: bool) {
+        self.runtime_state.statement_has_with_clause = statement_has_with_clause;
+    }
+
+    fn query_body_clause_base_depth(&self) -> Option<usize> {
+        self.runtime_state.query_body_clause_base_depth
+    }
+
+    fn set_query_body_clause_base_depth(&mut self, query_body_clause_base_depth: Option<usize>) {
+        self.runtime_state.query_body_clause_base_depth = query_body_clause_base_depth;
+    }
+
+    fn open_cursor_state(&self) -> OpenCursorFormatState {
+        self.runtime_state.open_cursor_state
+    }
+
+    fn open_cursor_state_mut(&mut self) -> &mut OpenCursorFormatState {
+        &mut self.runtime_state.open_cursor_state
+    }
+
+    fn set_open_cursor_state(&mut self, open_cursor_state: OpenCursorFormatState) {
+        self.runtime_state.open_cursor_state = open_cursor_state;
     }
 
     fn activate_construct_flag(&mut self, kind: ConstructFlagKind, scope: FormatScope) {
@@ -2055,8 +2062,9 @@ struct ConstructValueFrame {
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
 const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum OpenCursorFormatState {
+    #[default]
     None,
     AwaitingFor,
     InSelect {
@@ -2065,19 +2073,14 @@ enum OpenCursorFormatState {
     },
 }
 
-impl Default for OpenCursorFormatState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectListBreakState {
     None,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SelectListLayoutState {
+    #[default]
     Inactive,
     Pending {
         anchor: usize,
@@ -2087,12 +2090,6 @@ enum SelectListLayoutState {
         indent: usize,
         hanging_indent_spaces: Option<usize>,
     },
-}
-
-impl Default for SelectListLayoutState {
-    fn default() -> Self {
-        Self::Inactive
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5845,16 +5842,11 @@ impl SqlEditorWidget {
         let mut join_modifier_active = false;
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
         let mut prev_word_upper: Option<String> = None;
-        let mut current_clause: Option<String> = None;
         let mut pending_package_member_separator = false;
         let mut active_package_member_name: Option<String> = None;
-        let mut open_cursor_state = OpenCursorFormatState::None;
         let mut mysql_handler_state = MySqlHandlerFormatState::None;
-        let mut select_list_layout_state = SelectListLayoutState::Inactive;
         let mut select_list_break_state = select_list_break_state_on_start;
         let mut exit_condition_state = ExitConditionState::None;
-        let mut statement_has_with_clause = false;
-        let mut query_body_clause_base_depth: Option<usize> = None;
         let mut insert_all_branch_body_indent: Option<usize> = None;
         let mut pending_split_end_suffix_indent: Option<usize> = None;
         let mut pending_split_end_suffix_kind: Option<PendingSplitEndSuffixKind> = None;
@@ -5871,7 +5863,6 @@ impl SqlEditorWidget {
         let token_paren_depths = paren_depths(tokens);
         let token_cache = FormatterTokenCache::build(tokens);
         let comment_prefix_cache = CommentPrefixCache::build(tokens);
-
         let newline_with = |out: &mut String,
                             indent_level: usize,
                             extra: usize,
@@ -5911,52 +5902,75 @@ impl SqlEditorWidget {
             *needs_space = false;
         };
 
-        let base_indent = |indent_level: usize, open_cursor_state: OpenCursorFormatState| {
-            open_cursor_state.base_indent(indent_level)
-        };
-
-        let clause_indent =
-            |indent_level: usize,
-             open_cursor_state: OpenCursorFormatState,
-             _keyword: &str,
-             _open_for_select_active: bool,
-             _in_cursor_sql: bool| base_indent(indent_level, open_cursor_state);
-
-        let list_item_indent =
-            |indent_level: usize,
-             open_cursor_state: OpenCursorFormatState,
-             select_list_layout_state: SelectListLayoutState| {
-                let base = base_indent(indent_level, open_cursor_state);
-                select_list_layout_state.indentation_or(base + 1)
+        macro_rules! base_indent {
+            ($indent_level:expr) => {
+                format_stack.open_cursor_state().base_indent($indent_level)
             };
-        let clause_list_indent = |indent_level: usize,
-                                  open_cursor_state: OpenCursorFormatState,
-                                  select_list_layout_state: SelectListLayoutState,
-                                  _current_clause: Option<&str>,
-                                  merge_active: bool| {
-            let base = base_indent(indent_level, open_cursor_state);
-            let _ = merge_active;
-            list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
-                .max(base + 1)
-        };
-        let active_list_indent = |indent_level: usize,
-                                  open_cursor_state: OpenCursorFormatState,
-                                  select_list_layout_state: SelectListLayoutState,
-                                  current_clause: Option<&str>,
-                                  merge_active: bool,
-                                  in_column_list: bool| {
-            if in_column_list {
-                base_indent(indent_level, open_cursor_state)
-            } else {
-                clause_list_indent(
-                    indent_level,
-                    open_cursor_state,
-                    select_list_layout_state,
-                    current_clause,
-                    merge_active,
-                )
-            }
-        };
+        }
+        macro_rules! current_clause {
+            () => {
+                format_stack.current_clause()
+            };
+        }
+        macro_rules! open_cursor_state {
+            () => {
+                format_stack.open_cursor_state()
+            };
+        }
+        macro_rules! select_list_layout_state {
+            () => {
+                format_stack.select_list_layout_state()
+            };
+        }
+        macro_rules! statement_has_with_clause {
+            () => {
+                format_stack.statement_has_with_clause()
+            };
+        }
+        macro_rules! query_body_clause_base_depth {
+            () => {
+                format_stack.query_body_clause_base_depth()
+            };
+        }
+        macro_rules! clause_indent {
+            ($indent_level:expr, $open_cursor_state:expr, $keyword:expr, $open_for_select_active:expr, $in_cursor_sql:expr $(,)?) => {{
+                let _ = ($open_cursor_state, $keyword, $open_for_select_active, $in_cursor_sql);
+                base_indent!($indent_level)
+            }};
+        }
+        macro_rules! list_item_indent {
+            ($indent_level:expr, $open_cursor_state:expr, $select_list_layout_state:expr $(,)?) => {{
+                let _ = ($open_cursor_state, $select_list_layout_state);
+                let base = base_indent!($indent_level);
+                format_stack
+                    .select_list_layout_state()
+                    .indentation_or(base + 1)
+            }};
+        }
+        macro_rules! clause_list_indent {
+            ($indent_level:expr, $open_cursor_state:expr, $select_list_layout_state:expr, $current_clause:expr, $merge_active:expr $(,)?) => {{
+                let _ = ($open_cursor_state, $select_list_layout_state, $current_clause, $merge_active);
+                let base = base_indent!($indent_level);
+                list_item_indent!($indent_level, $open_cursor_state, $select_list_layout_state)
+                    .max(base + 1)
+            }};
+        }
+        macro_rules! active_list_indent {
+            ($indent_level:expr, $open_cursor_state:expr, $select_list_layout_state:expr, $current_clause:expr, $merge_active:expr, $in_column_list:expr $(,)?) => {{
+                let _ = ($open_cursor_state, $select_list_layout_state);
+                if $in_column_list {
+                    base_indent!($indent_level)
+                } else {
+                    clause_list_indent!(
+                        $indent_level,
+                        $open_cursor_state,
+                        $select_list_layout_state,
+                        $current_clause,
+                        $merge_active
+                    )
+                }
+            }};
+        }
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
                 out.push_str(&" ".repeat(line_indent * 4));
@@ -5988,10 +6002,51 @@ impl SqlEditorWidget {
                 .get(previous_end..current_span.start)
                 .is_some_and(|gap| gap.contains('\n'))
         };
-        let force_select_list_newline =
-            |out: &mut String, select_list_layout_state: &mut SelectListLayoutState| {
-                *select_list_layout_state = select_list_layout_state.force_newline_if_possible(out);
-            };
+        macro_rules! set_current_clause {
+            ($value:expr) => {{
+                format_stack.set_current_clause($value);
+            }};
+        }
+        macro_rules! clear_select_list_layout_state {
+            () => {{
+                format_stack.select_list_layout_state_mut().clear();
+            }};
+        }
+        macro_rules! activate_select_list_layout_state {
+            ($anchor:expr, $indent:expr) => {{
+                format_stack
+                    .select_list_layout_state_mut()
+                    .activate($anchor, $indent);
+            }};
+        }
+        macro_rules! set_select_list_layout_state {
+            ($value:expr) => {{
+                format_stack.set_select_list_layout_state($value);
+            }};
+        }
+        macro_rules! set_open_cursor_state {
+            ($value:expr) => {{
+                format_stack.set_open_cursor_state($value);
+            }};
+        }
+        macro_rules! set_statement_has_with_clause {
+            ($value:expr) => {{
+                format_stack.set_statement_has_with_clause($value);
+            }};
+        }
+        macro_rules! set_query_body_clause_base_depth {
+            ($value:expr) => {{
+                format_stack.set_query_body_clause_base_depth($value);
+            }};
+        }
+        macro_rules! force_select_list_newline {
+            ($out:expr) => {{
+                let next_layout = format_stack
+                    .select_list_layout_state()
+                    .force_newline_if_possible($out);
+                format_stack.set_select_list_layout_state(next_layout);
+            }};
+        }
         macro_rules! construct_flag_active {
             ($kind:ident) => {
                 format_stack.construct_flag_is_active(ConstructFlagKind::$kind)
@@ -6058,8 +6113,8 @@ impl SqlEditorWidget {
             let top_level_select_item_context = format_stack
                 .paren_frames()
                 .all(|frame| frame.is_query_like());
-            if top_level_select_item_context && select_list_layout_state.has_active_indent() {
-                let current_clause_name = if matches!(current_clause.as_deref(), Some("SET")) {
+            if top_level_select_item_context && select_list_layout_state!().has_active_indent() {
+                let current_clause_name = if matches!(format_stack.current_clause(), Some("SET")) {
                     "SET"
                 } else {
                     "SELECT"
@@ -6076,7 +6131,7 @@ impl SqlEditorWidget {
                     _ => false,
                 };
                 if !token_keeps_clause_structural {
-                    current_clause = Some(current_clause_name.to_string());
+                    set_current_clause!(Some(current_clause_name.to_string()));
                 }
             }
             if at_line_start {
@@ -6146,7 +6201,7 @@ impl SqlEditorWidget {
                         word.starts_with("<<") && !word.ends_with(">>");
                     if opens_unterminated_plsql_label {
                         pending_plsql_label_body_indent =
-                            Some(base_indent(indent_level, open_cursor_state));
+                            Some(base_indent!(indent_level));
                     } else if word.ends_with(">>") || pending_plsql_label_body_indent.is_some() {
                         pending_plsql_label_body_indent = None;
                     }
@@ -6162,7 +6217,7 @@ impl SqlEditorWidget {
                         && Self::mysql_keyword_should_render_as_identifier(
                             tokens,
                             idx,
-                            current_clause.as_deref(),
+                            format_stack.current_clause(),
                             on_duplicate_key_update_active,
                             Some(token_cache.meaningful_links()),
                         );
@@ -6188,7 +6243,7 @@ impl SqlEditorWidget {
                             && (prev_word_upper.as_deref() == Some("WITH")
                                 || format_stack.with_cte_collecting_plsql_declaration_header());
                     let in_sql_case_clause = matches!(
-                        current_clause.as_deref(),
+                        format_stack.current_clause(),
                         Some(
                             "SELECT"
                                 | "WHERE"
@@ -6206,7 +6261,7 @@ impl SqlEditorWidget {
                         && Self::formatter_keyword_should_render_as_identifier(
                             tokens,
                             idx,
-                            current_clause.as_deref(),
+                            format_stack.current_clause(),
                             Some(token_cache.meaningful_links()),
                         );
                     let is_analytic_within_group = upper == "GROUP"
@@ -6274,9 +6329,9 @@ impl SqlEditorWidget {
                             // should not cause a condition line break.
                             || (upper == "ON"
                                 && inside_function_local_non_query_paren));
-                    let top_level_query_body_base_indent = query_body_clause_base_depth
+                    let top_level_query_body_base_indent = query_body_clause_base_depth!()
                         .filter(|_| format_stack.paren_is_empty())
-                        .unwrap_or_else(|| base_indent(indent_level, open_cursor_state));
+                        .unwrap_or_else(|| base_indent!(indent_level));
                     let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_cursor_for_clause(
@@ -6327,11 +6382,11 @@ impl SqlEditorWidget {
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
-                        current_clause.as_deref(),
+                        format_stack.current_clause(),
                         Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
                     );
                     let mut closed_control_header_body_indent = None;
-                    let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
+                    let in_select_clause = matches!(format_stack.current_clause(), Some("SELECT"));
                     let next_word_is_clause_keyword = next_word.is_none_or(|word| {
                         let next_upper = word.to_ascii_uppercase();
                         is_formatter_keyword(next_upper.as_str())
@@ -6359,7 +6414,7 @@ impl SqlEditorWidget {
                                     && next_token_ends_select_item)
                                 || (next_token_is_dot
                                     && matches!(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         Some(
                                             "SELECT"
                                                 | "FROM"
@@ -6395,7 +6450,7 @@ impl SqlEditorWidget {
                         let handler_body_indent =
                             mysql_handler_body_indent_pending.unwrap_or_else(|| {
                                 let base =
-                                    line_indent.max(base_indent(indent_level, open_cursor_state));
+                                    line_indent.max(base_indent!(indent_level));
                                 if mysql_handler_block_begin {
                                     base
                                 } else {
@@ -6414,7 +6469,7 @@ impl SqlEditorWidget {
                     if mysql_labeled_block_header_word && !at_line_start {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6669,7 +6724,7 @@ impl SqlEditorWidget {
                         };
                         newline_with(
                             &mut out,
-                            base_indent(end_line_indent, open_cursor_state),
+                            base_indent!(end_line_indent),
                             end_extra + usize::from(closed_owner_depth.is_none()) * paren_extra,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6730,7 +6785,7 @@ impl SqlEditorWidget {
                         format_stack.compound_trigger_start_timing_point();
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6741,7 +6796,7 @@ impl SqlEditorWidget {
                     {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             1,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6750,7 +6805,7 @@ impl SqlEditorWidget {
                     } else if mysql_create_function_header_attribute {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -6766,8 +6821,8 @@ impl SqlEditorWidget {
                     {
                         // MERGE UPDATE SET keeps SET inline with UPDATE, but we still need
                         // SET clause context so following list comments/commas align correctly.
-                        current_clause = Some(upper.to_string());
-                        select_list_layout_state.clear();
+                        set_current_clause!(Some(upper.to_string()));
+                        clear_select_list_layout_state!();
                     } else if upper == "ORDER"
                         && active_phase1_wrapped_owner_kind
                             == Some(FormatIndentedParenOwnerKind::WithinGroup)
@@ -6775,7 +6830,7 @@ impl SqlEditorWidget {
                         let owner_relative_body_indent = format_stack
                             .last_paren()
                             .map(|frame| frame.open_line_indent.saturating_add(1))
-                            .unwrap_or_else(|| base_indent(indent_level, open_cursor_state));
+                            .unwrap_or_else(|| base_indent!(indent_level));
                         if let Some(frame) = format_stack.last_paren_mut() {
                             frame.record_body_indent(owner_relative_body_indent);
                         }
@@ -6787,8 +6842,8 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                        current_clause = Some(upper.to_string());
-                        select_list_layout_state.clear();
+                        set_current_clause!(Some(upper.to_string()));
+                        clear_select_list_layout_state!();
                     } else if clause_keywords.contains(&upper)
                         && !keyword_suppresses_structural_handling
                         && !mysql_declare_for_clause
@@ -6856,7 +6911,7 @@ impl SqlEditorWidget {
                                     rendered_line_indent(owner_line).saturating_add(1)
                                 });
                             if let Some(base_depth) = create_query_body_base_depth {
-                                query_body_clause_base_depth = Some(base_depth);
+                                set_query_body_clause_base_depth!(Some(base_depth));
                             }
                             let window_body_header_indent = format_stack
                                 .in_window_paren()
@@ -6872,7 +6927,7 @@ impl SqlEditorWidget {
                             let returning_function_option_indent = (upper == "RETURNING")
                                 .then_some(())
                                 .filter(|_| {
-                                    matches!(current_clause.as_deref(), Some("SELECT"))
+                                    matches!(format_stack.current_clause(), Some("SELECT"))
                                         && format_stack
                                             .last_paren()
                                             .is_some_and(|frame| !frame.is_query_like())
@@ -6890,8 +6945,8 @@ impl SqlEditorWidget {
                                     owner_indent.saturating_add(1)
                                 });
                             let returning_owner_body_indent = (upper == "RETURNING"
-                                && !matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
-                                && !open_cursor_state.in_select()
+                                && !matches!(format_stack.current_clause(), Some("SELECT" | "SET"))
+                                && !format_stack.open_cursor_state().in_select()
                                 && !format_stack
                                     .scoped_indent_is_active(ScopedIndentKind::CursorSql))
                             .then(|| {
@@ -6933,7 +6988,7 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                            } else if let Some(query_body_depth) = query_body_clause_base_depth
+                            } else if let Some(query_body_depth) = query_body_clause_base_depth!()
                                 .filter(|_| format_stack.paren_is_empty())
                             {
                                 newline_with(
@@ -6964,10 +7019,10 @@ impl SqlEditorWidget {
                                 );
                             } else {
                                 let select_clause_header_indent =
-                                    matches!(current_clause.as_deref(), Some("SELECT"))
+                                    matches!(format_stack.current_clause(), Some("SELECT"))
                                         .then_some(())
                                         .filter(|_| {
-                                            select_list_layout_state.has_active_indent()
+                                            select_list_layout_state!().has_active_indent()
                                                 && matches!(
                                                     upper,
                                                     "FROM"
@@ -6980,7 +7035,7 @@ impl SqlEditorWidget {
                                                 )
                                         })
                                         .map(|_| {
-                                            select_list_layout_state
+                                            select_list_layout_state!()
                                                 .indentation_or(current_output_line_indent(
                                                     &out,
                                                     line_indent,
@@ -6990,11 +7045,11 @@ impl SqlEditorWidget {
                                 newline_with(
                                     &mut out,
                                     select_clause_header_indent.unwrap_or_else(|| {
-                                        clause_indent(
+                                        clause_indent!(
                                             indent_level,
-                                            open_cursor_state,
+                                            open_cursor_state!(),
                                             upper,
-                                            open_cursor_state.select_depth().is_some_and(|depth| {
+                                            format_stack.open_cursor_state().select_depth().is_some_and(|depth| {
                                                 format_stack.paren_depth() == depth
                                             }),
                                             format_stack.scoped_indent_is_active(
@@ -7020,25 +7075,28 @@ impl SqlEditorWidget {
                                     current_scope.paren_depth
                                 );
                             }
-                            current_clause = Some(upper.to_string());
+                            set_current_clause!(Some(upper.to_string()));
                             if upper != "SELECT" {
-                                select_list_layout_state.clear();
+                                clear_select_list_layout_state!();
                             }
                             if crate::sql_text::is_subquery_head_keyword(upper) {
                                 format_stack.set_current_query_base_depth(Some(line_indent));
                             }
                             if upper == "SELECT"
-                                && open_cursor_state.in_select()
+                                && format_stack.open_cursor_state().in_select()
                                 && !format_stack.with_cte_in_definitions()
                             {
                                 // OPEN ... FOR WITH ... SELECT should anchor to the main query
                                 // head after CTE definitions, not to inner SELECTs inside the
                                 // WITH body. Otherwise a later `FOR` in PIVOT/UNPIVOT or
                                 // similar syntax can be misread as a new OPEN ... FOR.
-                                open_cursor_state.set_select_depth(format_stack.paren_depth());
+                                let current_paren_depth = format_stack.paren_depth();
+                                format_stack
+                                    .open_cursor_state_mut()
+                                    .set_select_depth(current_paren_depth);
                             }
                             if upper == "WITH" {
-                                statement_has_with_clause = true;
+                                set_statement_has_with_clause!(true);
                             }
                             if upper == "MODEL"
                                 && !construct_flag_active_at_paren_depth!(
@@ -7068,10 +7126,10 @@ impl SqlEditorWidget {
                     } else if is_analytic_within_group {
                         newline_with(
                             &mut out,
-                            list_item_indent(
+                            list_item_indent!(
                                 indent_level,
-                                open_cursor_state,
-                                select_list_layout_state,
+                                open_cursor_state!(),
+                                select_list_layout_state!(),
                             ),
                             0,
                             &mut at_line_start,
@@ -7082,7 +7140,7 @@ impl SqlEditorWidget {
                         // Trigger WHEN clause: align with other trigger header keywords
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             1,
                             &mut at_line_start,
                             &mut needs_space,
@@ -7101,7 +7159,7 @@ impl SqlEditorWidget {
                                 && format_stack.last_block_kind().is_some_and(|block| {
                                     matches!(block, BlockKind::If | BlockKind::While)
                                 })
-                                && current_clause.is_none());
+                                && format_stack.current_clause().is_none());
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| {
                                 format_stack
@@ -7127,19 +7185,19 @@ impl SqlEditorWidget {
                                 })
                             {
                                 format_stack.last_block_owner_depth().unwrap_or_else(|| {
-                                    base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                                    base_indent!(indent_level.saturating_sub(1))
                                 })
                             } else {
-                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                                base_indent!(indent_level.saturating_sub(1))
                             }
                         } else if format_stack.paren_is_empty() {
                             top_level_query_body_base_indent
                         } else {
-                            clause_indent(
+                            clause_indent!(
                                 indent_level,
-                                open_cursor_state,
+                                open_cursor_state!(),
                                 upper,
-                                open_cursor_state
+                                open_cursor_state!()
                                     .select_depth()
                                     .is_some_and(|depth| format_stack.paren_depth() == depth),
                                 format_stack.scoped_indent_is_active(ScopedIndentKind::CursorSql),
@@ -7185,14 +7243,14 @@ impl SqlEditorWidget {
                             );
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
                             );
                         } else if let Some(owner_depth) = pending_create_query_body_owner_depth {
-                            query_body_clause_base_depth = Some(owner_depth.saturating_add(1));
+                            set_query_body_clause_base_depth!(Some(owner_depth.saturating_add(1)));
                             newline_with(
                                 &mut out,
                                 owner_depth,
@@ -7227,7 +7285,7 @@ impl SqlEditorWidget {
                                     current_scope.paren_depth >= *paren_depth
                                         && matches!(upper, "AND" | "OR")
                                         && matches!(
-                                            current_clause.as_deref(),
+                                            format_stack.current_clause(),
                                             Some("WHERE" | "HAVING")
                                         )
                                 });
@@ -7314,13 +7372,13 @@ impl SqlEditorWidget {
                             }
                         }
                         if upper == "ON" {
-                            current_clause = Some(upper.to_string());
-                            select_list_layout_state.clear();
+                            set_current_clause!(Some(upper.to_string()));
+                            clear_select_list_layout_state!();
                         }
                     } else if upper == "EXCEPTION" && in_plsql_block {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level.saturating_sub(1), open_cursor_state),
+                            base_indent!(indent_level.saturating_sub(1)),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -7332,7 +7390,7 @@ impl SqlEditorWidget {
                     {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             1,
                             &mut at_line_start,
                             &mut needs_space,
@@ -7391,7 +7449,7 @@ impl SqlEditorWidget {
                         if !at_line_start {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 1,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -7415,7 +7473,7 @@ impl SqlEditorWidget {
                         if !at_line_start && !follows_type_method_modifier {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -7434,7 +7492,7 @@ impl SqlEditorWidget {
                         if in_if_block {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level.saturating_sub(1), open_cursor_state),
+                                base_indent!(indent_level.saturating_sub(1)),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -7457,7 +7515,7 @@ impl SqlEditorWidget {
                             } else {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     paren_extra + 1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7467,7 +7525,7 @@ impl SqlEditorWidget {
                         }
                         if upper == "ELSE"
                             && in_plsql_block
-                            && !matches!(current_clause.as_deref(), Some("SELECT"))
+                            && !matches!(format_stack.current_clause(), Some("SELECT"))
                         {
                             newline_after_keyword = true;
                             if in_case_block {
@@ -7502,7 +7560,7 @@ impl SqlEditorWidget {
                             newline_after_keyword = true;
                             newline_after_keyword_extra = 1;
                         } else if in_plsql_block
-                            && !matches!(current_clause.as_deref(), Some("SELECT"))
+                            && !matches!(format_stack.current_clause(), Some("SELECT"))
                         {
                             newline_after_keyword = true;
                             if format_stack.last_block_kind().is_some_and(|s| {
@@ -7575,7 +7633,7 @@ impl SqlEditorWidget {
                         // new line at the WITH-clause level.
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -7590,11 +7648,11 @@ impl SqlEditorWidget {
                         // clause-level keyword at the same depth as FROM.
                         newline_with(
                             &mut out,
-                            clause_indent(
+                            clause_indent!(
                                 indent_level,
-                                open_cursor_state,
+                                open_cursor_state!(),
                                 upper,
-                                open_cursor_state
+                                open_cursor_state!()
                                     .select_depth()
                                     .is_some_and(|depth| format_stack.paren_depth() == depth),
                                 format_stack.scoped_indent_is_active(ScopedIndentKind::CursorSql),
@@ -7627,7 +7685,7 @@ impl SqlEditorWidget {
                             newline_with(
                                 &mut out,
                                 owner_relative_body_indent.unwrap_or_else(|| {
-                                    base_indent(indent_level, open_cursor_state)
+                                    base_indent!(indent_level)
                                 }),
                                 usize::from(owner_relative_body_indent.is_none()),
                                 &mut at_line_start,
@@ -7647,7 +7705,7 @@ impl SqlEditorWidget {
                             }
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 1,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -7658,14 +7716,14 @@ impl SqlEditorWidget {
                         }) {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
                             );
                         } else if upper == "OPEN" {
-                            open_cursor_state = OpenCursorFormatState::AwaitingFor;
+                            set_open_cursor_state!(OpenCursorFormatState::AwaitingFor);
                         } else if upper == "FOR" && mysql_declare_cursor_for_clause {
                             format_stack.push_scoped_indent(
                                 ScopedIndentKind::CursorSql,
@@ -7686,7 +7744,7 @@ impl SqlEditorWidget {
                             // FOR UPDATE gets its own line at clause base indent.
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -7702,7 +7760,7 @@ impl SqlEditorWidget {
                             if upper == "FOR" && format_stack.trigger_header_is_active() {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7710,20 +7768,20 @@ impl SqlEditorWidget {
                                 );
                                 after_for_while = false;
                             } else if upper == "FOR"
-                                && open_cursor_state == OpenCursorFormatState::AwaitingFor
+                                && format_stack.open_cursor_state() == OpenCursorFormatState::AwaitingFor
                             {
-                                format_stack.push_open_cursor_restore(open_cursor_state);
-                                open_cursor_state = OpenCursorFormatState::InSelect {
+                                format_stack.push_open_cursor_restore(open_cursor_state!());
+                                set_open_cursor_state!(OpenCursorFormatState::InSelect {
                                     anchor_indent: line_indent.saturating_add(1),
                                     select_paren_depth: None,
-                                };
+                                });
                                 newline_after_keyword = true;
                             } else {
                                 // FOR/WHILE starts a line, LOOP will follow on same line
                                 if !mysql_labeled_block_target_word {
                                     newline_with(
                                         &mut out,
-                                        base_indent(indent_level, open_cursor_state),
+                                        base_indent!(indent_level),
                                         0,
                                         &mut at_line_start,
                                         &mut needs_space,
@@ -7752,7 +7810,7 @@ impl SqlEditorWidget {
                             if !after_for_while && !mysql_labeled_loop {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7767,7 +7825,7 @@ impl SqlEditorWidget {
                             if !mysql_labeled_block_target_word {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7803,7 +7861,7 @@ impl SqlEditorWidget {
                         } else if upper == "CASE" {
                             // CASE in PL/SQL block vs SELECT context
                             let values_case_indent =
-                                matches!(current_clause.as_deref(), Some("VALUES"))
+                                matches!(format_stack.current_clause(), Some("VALUES"))
                                     .then(|| {
                                         format_stack
                                             .paren_frames()
@@ -7861,7 +7919,7 @@ impl SqlEditorWidget {
                                 } else {
                                     newline_with(
                                         &mut out,
-                                        base_indent(indent_level, open_cursor_state),
+                                        base_indent!(indent_level),
                                         1 + paren_extra,
                                         &mut at_line_start,
                                         &mut needs_space,
@@ -7916,7 +7974,7 @@ impl SqlEditorWidget {
                                 newline_with(
                                     &mut out,
                                     parenthesized_case_indent.unwrap_or_else(|| {
-                                        base_indent(indent_level, open_cursor_state)
+                                        base_indent!(indent_level)
                                     }),
                                     0,
                                     &mut at_line_start,
@@ -7926,7 +7984,7 @@ impl SqlEditorWidget {
                             }
                             // In SELECT context, CASE stays inline
                         } else if should_treat_as_block_start {
-                            let block_header_indent = base_indent(indent_level, open_cursor_state);
+                            let block_header_indent = base_indent!(indent_level);
                             if !at_line_start || line_indent < block_header_indent {
                                 newline_with(
                                     &mut out,
@@ -7955,7 +8013,7 @@ impl SqlEditorWidget {
                                     };
                                 newline_with(
                                     &mut out,
-                                    base_indent(begin_indent, open_cursor_state),
+                                    base_indent!(begin_indent),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7965,7 +8023,7 @@ impl SqlEditorWidget {
                                 // BEGIN inside block statements should align with current block depth.
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -7979,7 +8037,7 @@ impl SqlEditorWidget {
                         && in_plsql_block
                         && format_stack.last_block_kind_is("CASE")
                         && format_stack.last_case_branch_started()
-                        && line_indent <= base_indent(indent_level, open_cursor_state)
+                        && line_indent <= base_indent!(indent_level)
                         && !word
                             .as_bytes()
                             .first()
@@ -7989,9 +8047,9 @@ impl SqlEditorWidget {
                         && in_plsql_block
                         && format_stack.last_block_kind_is("EXCEPTION")
                         && format_stack.last_exception_branch_started()
-                        && !open_cursor_state.in_select()
+                        && !format_stack.open_cursor_state().in_select()
                         && !format_stack.scoped_indent_is_active(ScopedIndentKind::CursorSql)
-                        && line_indent <= base_indent(indent_level, open_cursor_state)
+                        && line_indent <= base_indent!(indent_level)
                         && !matches!(upper, "WHEN" | "END");
                     let mysql_handler_header_word = if mysql_declare_handler_for_clause {
                         false
@@ -8011,7 +8069,7 @@ impl SqlEditorWidget {
                         let handler_body_indent =
                             mysql_handler_body_indent_pending.unwrap_or_else(|| {
                                 line_indent
-                                    .max(base_indent(indent_level, open_cursor_state))
+                                    .max(base_indent!(indent_level))
                                     .saturating_add(1)
                             });
                         line_indent = line_indent.max(handler_body_indent);
@@ -8024,7 +8082,7 @@ impl SqlEditorWidget {
                         let handler_body_indent =
                             mysql_handler_body_indent_pending.unwrap_or_else(|| {
                                 line_indent
-                                    .max(base_indent(indent_level, open_cursor_state))
+                                    .max(base_indent!(indent_level))
                                     .saturating_add(1)
                             });
                         line_indent = line_indent.max(handler_body_indent);
@@ -8042,7 +8100,7 @@ impl SqlEditorWidget {
                     let starts_control_condition_header = in_plsql_block
                         && matches!(upper, "IF" | "WHILE" | "ELSIF" | "ELSEIF")
                         && !mysql_scalar_if_function
-                        && current_clause.is_none();
+                        && format_stack.current_clause().is_none();
                     let pending_control_header_parenthesized = starts_control_condition_header
                         .then_some(
                             matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "("),
@@ -8090,7 +8148,7 @@ impl SqlEditorWidget {
                                         | "LOOP"
                                         | "DO"
                                 )
-                                && current_clause.is_none()
+                                && format_stack.current_clause().is_none()
                         });
                     if let Some(header_indent) = control_condition_continuation_line {
                         line_indent = line_indent.max(header_indent);
@@ -8175,9 +8233,9 @@ impl SqlEditorWidget {
                             next_word.map(|word| word.to_ascii_uppercase());
                     }
                     if upper == "SELECT" {
-                        select_list_layout_state.activate(out.len(), line_indent.saturating_add(1));
+                        activate_select_list_layout_state!(out.len(), line_indent.saturating_add(1));
                     } else if upper == "WINDOW"
-                        && matches!(current_clause.as_deref(), Some("WINDOW"))
+                        && matches!(format_stack.current_clause(), Some("WINDOW"))
                     {
                         newline_after_keyword = true;
                         newline_after_keyword_extra = 1;
@@ -8302,7 +8360,7 @@ impl SqlEditorWidget {
                     }
 
                     // MERGE tracking
-                    if upper == "MERGE" && matches!(current_clause.as_deref(), None | Some("MERGE"))
+                    if upper == "MERGE" && matches!(format_stack.current_clause(), None | Some("MERGE"))
                     {
                         activate_construct_flag!(MergeActive, current_scope);
                     }
@@ -8347,7 +8405,7 @@ impl SqlEditorWidget {
                         if matches!(upper, "BEGIN" | "DECLARE" | "IF") {
                             format_stack.push_plsql_context(format_stack.current_scope());
                         }
-                        current_clause = None;
+                        set_current_clause!(None);
                     } else if upper == "BEGIN" {
                         if matches!(construct_value_as_deref!(CreateObject), Some("TRIGGER")) {
                             format_stack.clear_trigger_header();
@@ -8400,7 +8458,7 @@ impl SqlEditorWidget {
                             clear_construct_value!(CreateObject);
                             deactivate_construct_flag!(RoutineDeclPending);
                         }
-                        current_clause = None;
+                        set_current_clause!(None);
                     } else if upper == "EXCEPTION" {
                         push_format_block(
                             &mut format_stack,
@@ -8409,7 +8467,7 @@ impl SqlEditorWidget {
                             indent_level,
                             &mut indent_level,
                         );
-                        current_clause = None;
+                        set_current_clause!(None);
                     } else if upper == "LOOP" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         push_format_block(
@@ -8420,7 +8478,7 @@ impl SqlEditorWidget {
                             &mut indent_level,
                         );
                         format_stack.push_plsql_context(format_stack.current_scope());
-                        current_clause = None;
+                        set_current_clause!(None);
                     } else if upper == "REPEAT" {
                         push_format_block(
                             &mut format_stack,
@@ -8430,7 +8488,7 @@ impl SqlEditorWidget {
                             &mut indent_level,
                         );
                         format_stack.push_plsql_context(format_stack.current_scope());
-                        current_clause = None;
+                        set_current_clause!(None);
                     } else if upper == "CASE" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         push_format_block(
@@ -8440,7 +8498,7 @@ impl SqlEditorWidget {
                             new_indent_level,
                             &mut indent_level,
                         );
-                        if current_clause.is_none() {
+                        if format_stack.current_clause().is_none() {
                             format_stack.push_plsql_context(format_stack.current_scope());
                         }
                     } else if starts_create_block {
@@ -8498,7 +8556,7 @@ impl SqlEditorWidget {
                         format_stack.push_plsql_context(format_stack.current_scope());
                         clear_construct_value!(CreateObject);
                         deactivate_construct_flag!(RoutineDeclPending);
-                        current_clause = None;
+                        set_current_clause!(None);
                         newline_with(
                             &mut out,
                             indent_level,
@@ -8520,7 +8578,7 @@ impl SqlEditorWidget {
                         if !mysql_begin_not_atomic_header {
                             newline_with(
                                 &mut out,
-                                base_indent(indent_level, open_cursor_state),
+                                base_indent!(indent_level),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -8538,7 +8596,7 @@ impl SqlEditorWidget {
                         mysql_begin_not_atomic_header_open = false;
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -8584,7 +8642,7 @@ impl SqlEditorWidget {
                             &mut out,
                             case_branch_body_indent
                                 .or(control_condition_body_indent)
-                                .unwrap_or_else(|| base_indent(indent_level, open_cursor_state)),
+                                .unwrap_or_else(|| base_indent!(indent_level)),
                             usize::from(
                                 control_condition_body_indent.is_none()
                                     && case_branch_body_indent.is_none(),
@@ -8620,8 +8678,8 @@ impl SqlEditorWidget {
                         )
                     {
                         on_duplicate_key_update_active = true;
-                        current_clause = Some(upper.to_string());
-                        select_list_layout_state.clear();
+                        set_current_clause!(Some(upper.to_string()));
+                        clear_select_list_layout_state!();
                     }
                     if should_break_condition
                         && upper == "ON"
@@ -8692,7 +8750,7 @@ impl SqlEditorWidget {
                         let handler_body_indent =
                             mysql_handler_body_indent_pending.unwrap_or_else(|| {
                                 line_indent
-                                    .max(base_indent(indent_level, open_cursor_state))
+                                    .max(base_indent!(indent_level))
                                     .saturating_add(1)
                             });
                         line_indent = line_indent.max(handler_body_indent);
@@ -8740,15 +8798,15 @@ impl SqlEditorWidget {
                         tokens.get(idx + 1),
                         Some(SqlToken::Word(_) | SqlToken::String(_))
                     );
-                    let in_select_list = matches!(current_clause.as_deref(), Some("SELECT"));
-                    let in_set_clause = matches!(current_clause.as_deref(), Some("SET"));
+                    let in_select_list = matches!(format_stack.current_clause(), Some("SELECT"));
+                    let in_set_clause = matches!(format_stack.current_clause(), Some("SET"));
                     let top_level_select_list = in_select_list
                         && suppress_comma_break_depth == 0
                         && format_stack.paren_is_empty();
                     let top_level_set_list = in_set_clause
                         && suppress_comma_break_depth == 0
                         && format_stack.paren_is_empty();
-                    let active_list_layout = select_list_layout_state.has_active_indent();
+                    let active_list_layout = select_list_layout_state!().has_active_indent();
                     let comment_structural_prefix = comment_prefix_cache.prefix_before(idx);
                     let previous_non_comment_token = comment_prefix_cache
                         .previous_non_comment_token_index(idx)
@@ -8780,7 +8838,7 @@ impl SqlEditorWidget {
                         && !is_hint_comment
                         && !attached_previous_keeps_inline
                     {
-                        force_select_list_newline(&mut out, &mut select_list_layout_state);
+                        force_select_list_newline!(&mut out);
                     }
 
                     if is_multiline_block_comment
@@ -8806,7 +8864,7 @@ impl SqlEditorWidget {
                         trim_trailing_space(&mut out);
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, open_cursor_state),
+                            base_indent!(indent_level),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -8821,22 +8879,22 @@ impl SqlEditorWidget {
 
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
-                        let base = base_indent(indent_level, open_cursor_state);
+                        let base = base_indent!(indent_level);
                         let paren_extra = Self::paren_extra_depth(&format_stack);
                         let in_column_list = format_stack
                             .last_paren()
                             .is_some_and(|frame| frame.is_column_list());
                         let current_list_indent =
-                            if matches!(current_clause.as_deref(), Some("SET"))
+                            if matches!(format_stack.current_clause(), Some("SET"))
                                 && construct_flag_active!(MergeActive)
                             {
                                 base
                             } else {
-                                active_list_indent(
+                                active_list_indent!(
                                     indent_level,
-                                    open_cursor_state,
-                                    select_list_layout_state,
-                                    current_clause.as_deref(),
+                                    open_cursor_state!(),
+                                    select_list_layout_state!(),
+                                    format_stack.current_clause(),
                                     construct_flag_active!(MergeActive),
                                     in_column_list,
                                 )
@@ -8872,14 +8930,14 @@ impl SqlEditorWidget {
                                     || w.eq_ignore_ascii_case("EXCEPTION")
                         );
                         let in_clause_list_body = matches!(
-                            current_clause.as_deref(),
+                            format_stack.current_clause(),
                             Some("FROM" | "GROUP" | "HAVING" | "ORDER" | "WINDOW" | "INTO")
                         );
                         let in_confirmed_list = in_set_clause
                             || in_clause_list_body
                             || in_column_list
                             || ((in_select_list || active_list_layout)
-                                && select_list_layout_state.is_multiline())
+                                && select_list_layout_state!().is_multiline())
                             || next_is_comma
                             || next_is_condition_keyword;
                         let top_level_trailing_comment = next_non_comment.is_none()
@@ -8913,9 +8971,9 @@ impl SqlEditorWidget {
                             line_indent = if next_is_exception {
                                 // EXCEPTION always drops to the enclosing
                                 // BEGIN level regardless of block type.
-                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                                base_indent!(indent_level.saturating_sub(1))
                             } else if in_if_block {
-                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                                base_indent!(indent_level.saturating_sub(1))
                             } else if in_case_block {
                                 format_stack
                                     .last_block_owner_depth()
@@ -8995,19 +9053,19 @@ impl SqlEditorWidget {
                         Self::comment_header_continuation_kind_for_prefix(comment_structural_prefix)
                     };
                     keeps_next_line_continuation |= comment_header_continuation_kind.is_some();
-                    if hint_after_select {
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                        at_line_start = true;
-                        needs_space = false;
-                        line_indent =
-                            base_indent(indent_level, open_cursor_state).saturating_add(1);
-                        select_list_layout_state = SelectListLayoutState::Multiline {
-                            indent: line_indent,
-                            hanging_indent_spaces: None,
-                        };
-                    } else if is_multiline_block_comment {
+                        if hint_after_select {
+                            if !out.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            at_line_start = true;
+                            needs_space = false;
+                            line_indent =
+                                base_indent!(indent_level).saturating_add(1);
+                            set_select_list_layout_state!(SelectListLayoutState::Multiline {
+                                indent: line_indent,
+                                hanging_indent_spaces: None,
+                            });
+                        } else if is_multiline_block_comment {
                         at_line_start = true;
                         needs_space = false;
                         if !out.ends_with('\n') {
@@ -9022,23 +9080,23 @@ impl SqlEditorWidget {
                             || in_column_list
                             || hint_after_select
                         {
-                            let list_indent = active_list_indent(
+                            let list_indent = active_list_indent!(
                                 indent_level,
-                                open_cursor_state,
-                                select_list_layout_state,
-                                current_clause.as_deref(),
+                                open_cursor_state!(),
+                                select_list_layout_state!(),
+                                format_stack.current_clause(),
                                 construct_flag_active!(MergeActive),
                                 in_column_list,
                             );
                             line_indent = list_indent;
                             if hint_after_select {
-                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                set_select_list_layout_state!(SelectListLayoutState::Multiline {
                                     indent: list_indent,
                                     hanging_indent_spaces: None,
-                                };
+                                });
                             }
                         } else {
-                            line_indent = base_indent(indent_level, open_cursor_state);
+                            line_indent = base_indent!(indent_level);
                         }
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
@@ -9051,7 +9109,7 @@ impl SqlEditorWidget {
                                 .last_paren()
                                 .map(|frame| {
                                     if frame.opens_indented() {
-                                        base_indent(indent_level, open_cursor_state)
+                                        base_indent!(indent_level)
                                     } else {
                                         current_output_line_indent(&out, line_indent)
                                             .saturating_add(1)
@@ -9068,18 +9126,18 @@ impl SqlEditorWidget {
                             let in_column_list = format_stack
                                 .last_paren()
                                 .is_some_and(|frame| frame.is_column_list());
-                            let base = base_indent(indent_level, open_cursor_state);
+                            let base = base_indent!(indent_level);
                             let list_continuation_indent =
-                                if matches!(current_clause.as_deref(), Some("SET"))
+                                if matches!(format_stack.current_clause(), Some("SET"))
                                     && construct_flag_active!(MergeActive)
                                 {
                                     base
                                 } else {
-                                    active_list_indent(
+                                    active_list_indent!(
                                         indent_level,
-                                        open_cursor_state,
-                                        select_list_layout_state,
-                                        current_clause.as_deref(),
+                                        open_cursor_state!(),
+                                        select_list_layout_state!(),
+                                        format_stack.current_clause(),
                                         construct_flag_active!(MergeActive),
                                         in_column_list,
                                     )
@@ -9096,11 +9154,11 @@ impl SqlEditorWidget {
                                 || hint_after_select
                             {
                                 list_continuation_indent
-                            } else if matches!(current_clause.as_deref(), Some("ON" | "USING")) {
+                            } else if matches!(format_stack.current_clause(), Some("ON" | "USING")) {
                                 line_indent
                             } else if comment_header_continuation_kind.is_some() {
                                 let fallback_indent = base.saturating_add(usize::from(
-                                    current_clause.is_some() || suppress_comma_break_depth > 0,
+                                    format_stack.current_clause().is_some() || suppress_comma_break_depth > 0,
                                 ));
                                 let min_indent = Self::resolve_comment_header_continuation_indent(
                                     comment_header_continuation_kind,
@@ -9113,7 +9171,7 @@ impl SqlEditorWidget {
                             } else {
                                 line_indent.max(
                                     base.saturating_add(usize::from(
-                                        current_clause.is_some() || suppress_comma_break_depth > 0,
+                                        format_stack.current_clause().is_some() || suppress_comma_break_depth > 0,
                                     )),
                                 )
                             };
@@ -9133,26 +9191,26 @@ impl SqlEditorWidget {
                             {
                                 let list_indent =
                                     if in_set_clause && construct_flag_active!(MergeActive) {
-                                        base_indent(indent_level, open_cursor_state)
+                                        base_indent!(indent_level)
                                     } else {
-                                        active_list_indent(
+                                        active_list_indent!(
                                             indent_level,
-                                            open_cursor_state,
-                                            select_list_layout_state,
-                                            current_clause.as_deref(),
+                                            open_cursor_state!(),
+                                            select_list_layout_state!(),
+                                            format_stack.current_clause(),
                                             construct_flag_active!(MergeActive),
                                             in_column_list,
                                         )
                                     };
                                 line_indent = list_indent;
                                 if (in_select_list || in_set_clause)
-                                    && !select_list_layout_state.is_multiline()
+                                    && !select_list_layout_state!().is_multiline()
                                     && comment_starts_line
                                 {
-                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                    set_select_list_layout_state!(SelectListLayoutState::Multiline {
                                         indent: list_indent,
                                         hanging_indent_spaces: None,
-                                    };
+                                    });
                                 }
                             }
                         }
@@ -9168,7 +9226,7 @@ impl SqlEditorWidget {
                                 &out,
                                 tokens,
                                 idx,
-                                current_clause.as_deref(),
+                                format_stack.current_clause(),
                                 Some(token_cache.meaningful_links()),
                             );
                         if !keep_inline_alias_comment {
@@ -9176,7 +9234,7 @@ impl SqlEditorWidget {
                                 let in_column_list = format_stack
                                     .last_paren()
                                     .is_some_and(|frame| frame.is_column_list());
-                                let base = base_indent(indent_level, open_cursor_state);
+                                let base = base_indent!(indent_level);
                                 let starts_after_open_paren =
                                     previous_non_comment_token.is_some_and(
                                         |token| {
@@ -9184,16 +9242,16 @@ impl SqlEditorWidget {
                                         },
                                     );
                                 let list_continuation_indent =
-                                    if matches!(current_clause.as_deref(), Some("SET"))
+                                    if matches!(format_stack.current_clause(), Some("SET"))
                                         && construct_flag_active!(MergeActive)
                                     {
                                         base
                                     } else {
-                                        active_list_indent(
+                                        active_list_indent!(
                                             indent_level,
-                                            open_cursor_state,
-                                            select_list_layout_state,
-                                            current_clause.as_deref(),
+                                            open_cursor_state!(),
+                                            select_list_layout_state!(),
+                                            format_stack.current_clause(),
                                             construct_flag_active!(MergeActive),
                                             in_column_list,
                                         )
@@ -9220,14 +9278,14 @@ impl SqlEditorWidget {
                                 {
                                     list_continuation_indent
                                 } else if matches!(
-                                    current_clause.as_deref(),
+                                    format_stack.current_clause(),
                                     Some("ON" | "USING")
                                 ) {
                                     line_indent
                                 } else if comment_header_continuation_kind.is_some() {
                                     let fallback_indent =
                                         base.saturating_add(usize::from(
-                                            current_clause.is_some()
+                                            format_stack.current_clause().is_some()
                                                 || suppress_comma_break_depth > 0,
                                         ));
                                     let min_indent =
@@ -9242,7 +9300,7 @@ impl SqlEditorWidget {
                                 } else {
                                     line_indent.max(
                                         base.saturating_add(usize::from(
-                                            current_clause.is_some()
+                                            format_stack.current_clause().is_some()
                                                 || suppress_comma_break_depth > 0,
                                         )),
                                     )
@@ -9269,21 +9327,21 @@ impl SqlEditorWidget {
                                     || in_column_list
                                     || hint_after_select
                                 {
-                                    active_list_indent(
+                                    active_list_indent!(
                                         indent_level,
-                                        open_cursor_state,
-                                        select_list_layout_state,
-                                        current_clause.as_deref(),
+                                        open_cursor_state!(),
+                                        select_list_layout_state!(),
+                                        format_stack.current_clause(),
                                         construct_flag_active!(MergeActive),
                                         in_column_list,
                                     )
-                                    .saturating_sub(base_indent(indent_level, open_cursor_state))
+                                    .saturating_sub(base_indent!(indent_level))
                                 } else {
                                     0
                                 };
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     list_extra,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -9291,10 +9349,10 @@ impl SqlEditorWidget {
                                 );
                             }
                             if hint_after_select {
-                                select_list_layout_state = SelectListLayoutState::Multiline {
-                                    indent: base_indent(indent_level, open_cursor_state) + 1,
+                                set_select_list_layout_state!(SelectListLayoutState::Multiline {
+                                    indent: base_indent!(indent_level) + 1,
                                     hanging_indent_spaces: None,
-                                };
+                                });
                             }
                         }
                     } else if comment_starts_line {
@@ -9319,12 +9377,12 @@ impl SqlEditorWidget {
                                 tokens.get(idx + 1),
                                 Some(SqlToken::Comment(comment)) if comment.starts_with('\n')
                             );
-                            if statement_has_with_clause
-                                && matches!(current_clause.as_deref(), Some("SELECT"))
-                                && !open_cursor_state.in_select()
+                            if statement_has_with_clause!()
+                                && matches!(format_stack.current_clause(), Some("SELECT"))
+                                && !format_stack.open_cursor_state().in_select()
                                 && suppress_comma_break_depth == 0
                             {
-                                force_select_list_newline(&mut out, &mut select_list_layout_state);
+                                force_select_list_newline!(&mut out);
                             }
                             trim_trailing_space(&mut out);
                             if out.ends_with('\n') || at_line_start {
@@ -9338,7 +9396,7 @@ impl SqlEditorWidget {
                                 );
                                 let comma_starts_clause_list_item = previous_is_line_comment
                                     && matches!(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         Some(
                                             "FROM"
                                                 | "GROUP"
@@ -9351,22 +9409,22 @@ impl SqlEditorWidget {
                                 let aligns_clause_list_indent = comma_starts_clause_list_item
                                     || (line_indent == 0
                                         && (matches!(
-                                            current_clause.as_deref(),
+                                            format_stack.current_clause(),
                                             Some("SELECT" | "SET")
-                                        ) || select_list_layout_state.has_active_indent()
+                                        ) || select_list_layout_state!().has_active_indent()
                                             || in_column_list
                                             || previous_is_line_comment));
                                 if aligns_clause_list_indent {
-                                    line_indent = active_list_indent(
+                                    line_indent = active_list_indent!(
                                         indent_level,
-                                        open_cursor_state,
-                                        select_list_layout_state,
-                                        current_clause.as_deref(),
+                                        open_cursor_state!(),
+                                        select_list_layout_state!(),
+                                        format_stack.current_clause(),
                                         construct_flag_active!(MergeActive),
                                         in_column_list,
                                     );
                                     if format_stack.paren_is_empty() {
-                                        if let Some(base_depth) = query_body_clause_base_depth {
+                                        if let Some(base_depth) = query_body_clause_base_depth!() {
                                             line_indent =
                                                 line_indent.max(base_depth.saturating_add(1));
                                         }
@@ -9383,10 +9441,10 @@ impl SqlEditorWidget {
                                 || is_with_cte_separator
                             {
                                 let fallback_with_cte_separator_indent =
-                                    query_body_clause_base_depth
+                                    query_body_clause_base_depth!()
                                         .filter(|_| format_stack.paren_is_empty())
                                         .unwrap_or_else(|| {
-                                            base_indent(indent_level, open_cursor_state)
+                                            base_indent!(indent_level)
                                         });
                                 let with_cte_separator_indent = if is_with_cte_separator {
                                     format_stack.with_cte_separator_indent(
@@ -9405,16 +9463,16 @@ impl SqlEditorWidget {
                                 );
                             } else if next_is_inline_comment {
                                 needs_space = true;
-                                if matches!(current_clause.as_deref(), Some("SELECT")) {
+                                if matches!(format_stack.current_clause(), Some("SELECT")) {
                                     let select_list_indent =
-                                        base_indent(indent_level, open_cursor_state) + 1;
-                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        base_indent!(indent_level) + 1;
+                                    set_select_list_layout_state!(SelectListLayoutState::Multiline {
                                         indent: select_list_indent,
                                         hanging_indent_spaces: current_query_has_apply.then_some(
-                                            select_list_layout_state
+                                            select_list_layout_state!()
                                                 .hanging_indent_spaces(&out, select_list_indent),
                                         ),
-                                    };
+                                    });
                                 }
                             } else {
                                 let follows_multiline_child_close =
@@ -9478,10 +9536,10 @@ impl SqlEditorWidget {
                                                     if word.eq_ignore_ascii_case("KEY")
                                             ));
                                 let allows_compact_close_continuation_comma_break =
-                                    matches!(current_clause.as_deref(), Some("SELECT"))
+                                    matches!(format_stack.current_clause(), Some("SELECT"))
                                         && follows_multiline_child_close
-                                        && (select_list_layout_state.is_multiline()
-                                            || open_cursor_state.in_select()
+                                        && (select_list_layout_state!().is_multiline()
+                                            || format_stack.open_cursor_state().in_select()
                                             || format_stack.scoped_indent_is_active(
                                                 ScopedIndentKind::CursorSql,
                                             ));
@@ -9490,14 +9548,14 @@ impl SqlEditorWidget {
                                     .copied()
                                     .filter(|frame| frame.suppresses_comma_breaks())
                                     .is_some_and(|frame| {
-                                        matches!(current_clause.as_deref(), Some("VALUES"))
+                                        matches!(format_stack.current_clause(), Some("VALUES"))
                                             && current_output_line_indent(&out, line_indent)
                                                 > frame.open_line_indent
                                     });
                                 let allows_structural_sibling_comma_break =
                                     follows_multiline_child_close
                                         && (next_starts_parenthesized_sibling
-                                            || matches!(current_clause.as_deref(), Some("VALUES")))
+                                            || matches!(format_stack.current_clause(), Some("VALUES")))
                                         || keeps_multiline_values_argument_comma_break;
                                 if (suppress_comma_break_depth == 0
                                     || allows_compact_close_continuation_comma_break
@@ -9514,34 +9572,34 @@ impl SqlEditorWidget {
                                         .filter(|frame| frame.is_query_like())
                                         .filter(|_| {
                                             matches!(
-                                                current_clause.as_deref(),
+                                                format_stack.current_clause(),
                                                 Some("SELECT" | "SET")
-                                            ) && select_list_layout_state.has_active_indent()
+                                            ) && select_list_layout_state!().has_active_indent()
                                         })
                                         .map(|_| {
-                                            select_list_layout_state
+                                            select_list_layout_state!()
                                                 .indentation_or(line_indent.saturating_add(1))
                                         });
                                     let current_list_indent = top_level_select_item_context
                                         .then_some(())
                                         .filter(|_| {
                                             matches!(
-                                                current_clause.as_deref(),
+                                                format_stack.current_clause(),
                                                 Some("SELECT" | "SET")
                                             )
                                         })
                                         .map(|_| {
-                                            active_list_indent(
+                                            active_list_indent!(
                                                 indent_level,
-                                                open_cursor_state,
-                                                select_list_layout_state,
-                                                current_clause.as_deref(),
+                                                open_cursor_state!(),
+                                                select_list_layout_state!(),
+                                                format_stack.current_clause(),
                                                 construct_flag_active!(MergeActive),
                                                 false,
                                             )
                                         });
                                     let clause_list_indent = matches!(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         Some(
                                             "FROM"
                                                 | "GROUP"
@@ -9568,16 +9626,16 @@ impl SqlEditorWidget {
                                     })
                                     .filter(|_| clause_list_indent_follows_current_query_frame)
                                     .map(|_| {
-                                        let mut list_indent = active_list_indent(
+                                        let mut list_indent = active_list_indent!(
                                             indent_level,
-                                            open_cursor_state,
-                                            select_list_layout_state,
-                                            current_clause.as_deref(),
+                                            open_cursor_state!(),
+                                            select_list_layout_state!(),
+                                            format_stack.current_clause(),
                                             construct_flag_active!(MergeActive),
                                             false,
                                         );
                                         if format_stack.paren_is_empty() {
-                                            if let Some(base_depth) = query_body_clause_base_depth {
+                                            if let Some(base_depth) = query_body_clause_base_depth!() {
                                                 list_indent =
                                                     list_indent.max(base_depth.saturating_add(1));
                                             }
@@ -9590,7 +9648,7 @@ impl SqlEditorWidget {
                                                 frame.kind,
                                                 ParenFormatFrameKind::WrappedLayout
                                             ) && matches!(
-                                                current_clause.as_deref(),
+                                                format_stack.current_clause(),
                                                 Some("WINDOW" | "ORDER" | "GROUP")
                                             )
                                         });
@@ -9614,12 +9672,13 @@ impl SqlEditorWidget {
                                     if let Some(list_indent) =
                                         query_like_select_list_indent.or(current_list_indent)
                                     {
-                                        if !select_list_layout_state.is_multiline() {
-                                            select_list_layout_state =
+                                        if !select_list_layout_state!().is_multiline() {
+                                            set_select_list_layout_state!(
                                                 SelectListLayoutState::Multiline {
                                                     indent: list_indent,
                                                     hanging_indent_spaces: None,
-                                                };
+                                                }
+                                            );
                                         }
                                     }
                                     let comma_extra_indent = if mysql_handler_condition_separator
@@ -9630,7 +9689,7 @@ impl SqlEditorWidget {
                                                     | FormatIndentedParenOwnerKind::Keep
                                             )
                                         )
-                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                        || (matches!(format_stack.current_clause(), Some("SELECT"))
                                             && format_stack.scoped_indent_is_active(
                                                 ScopedIndentKind::CursorSql,
                                             )) {
@@ -9668,14 +9727,14 @@ impl SqlEditorWidget {
                                                     )
                                             })
                                         });
-                                    if matches!(current_clause.as_deref(), Some("SET"))
+                                    if matches!(format_stack.current_clause(), Some("SET"))
                                         && construct_flag_active!(MergeActive)
                                     {
                                         let merge_set_continuation_extra =
                                             usize::from(!comma_follows_line_comment);
                                         newline_with(
                                             &mut out,
-                                            base_indent(indent_level, open_cursor_state),
+                                            base_indent!(indent_level),
                                             merge_set_continuation_extra,
                                             &mut at_line_start,
                                             &mut needs_space,
@@ -9695,12 +9754,12 @@ impl SqlEditorWidget {
                                             &mut line_indent,
                                         );
                                     } else if current_query_has_apply
-                                        && matches!(current_clause.as_deref(), Some("SELECT"))
+                                        && matches!(format_stack.current_clause(), Some("SELECT"))
                                     {
                                         // The select list is already multiline after the first comma.
                                         let select_list_indent =
-                                            base_indent(indent_level, open_cursor_state) + 1;
-                                        let hanging_indent_spaces = select_list_layout_state
+                                            base_indent!(indent_level) + 1;
+                                        let hanging_indent_spaces = select_list_layout_state!()
                                             .hanging_indent_spaces(&out, select_list_indent);
                                         newline_with_spaces(
                                             &mut out,
@@ -9709,13 +9768,14 @@ impl SqlEditorWidget {
                                             &mut needs_space,
                                             &mut line_indent,
                                         );
-                                        select_list_layout_state =
+                                        set_select_list_layout_state!(
                                             SelectListLayoutState::Multiline {
                                                 indent: select_list_indent,
                                                 hanging_indent_spaces: Some(hanging_indent_spaces),
-                                            };
+                                            }
+                                        );
                                     } else if matches!(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         Some("SELECT" | "SET")
                                     ) && (current_token_paren_depth
                                         < line_start_token_paren_depth
@@ -9732,9 +9792,9 @@ impl SqlEditorWidget {
                                         // one or more frames.
                                         let stable_root_list_indent =
                                             format_stack.paren_is_empty().then(|| {
-                                                query_body_clause_base_depth
+                                                query_body_clause_base_depth!()
                                                     .unwrap_or_else(|| {
-                                                        base_indent(indent_level, open_cursor_state)
+                                                        base_indent!(indent_level)
                                                     })
                                                     .saturating_add(1)
                                             });
@@ -9742,12 +9802,12 @@ impl SqlEditorWidget {
                                             parent_frame_sibling_indent
                                                 .or(stable_root_list_indent)
                                                 .unwrap_or_else(|| {
-                                                    select_list_layout_state.indentation_or(
-                                                        active_list_indent(
+                                                    select_list_layout_state!().indentation_or(
+                                                        active_list_indent!(
                                                             indent_level,
-                                                            open_cursor_state,
-                                                            select_list_layout_state,
-                                                            current_clause.as_deref(),
+                                                            open_cursor_state!(),
+                                                            select_list_layout_state!(),
+                                                            format_stack.current_clause(),
                                                             construct_flag_active!(MergeActive),
                                                             false,
                                                         ),
@@ -9765,12 +9825,13 @@ impl SqlEditorWidget {
                                         query_like_select_list_indent
                                     {
                                         let resolved_query_like_indent = query_like_indent;
-                                        if !select_list_layout_state.is_multiline() {
-                                            select_list_layout_state =
+                                        if !select_list_layout_state!().is_multiline() {
+                                            set_select_list_layout_state!(
                                                 SelectListLayoutState::Multiline {
                                                     indent: resolved_query_like_indent,
                                                     hanging_indent_spaces: None,
-                                                };
+                                                }
+                                            );
                                         }
                                         newline_with(
                                             &mut out,
@@ -9805,17 +9866,18 @@ impl SqlEditorWidget {
                                         );
                                     } else if top_level_select_item_context
                                         && matches!(
-                                            current_clause.as_deref(),
+                                            format_stack.current_clause(),
                                             Some("SELECT" | "SET")
                                         )
-                                        && select_list_layout_state.has_active_indent()
+                                        && select_list_layout_state!().has_active_indent()
                                     {
-                                        let structural_select_indent = select_list_layout_state
-                                            .indentation_or(active_list_indent(
+                                        let structural_select_indent =
+                                            select_list_layout_state!()
+                                            .indentation_or(active_list_indent!(
                                                 indent_level,
-                                                open_cursor_state,
-                                                select_list_layout_state,
-                                                current_clause.as_deref(),
+                                                open_cursor_state!(),
+                                                select_list_layout_state!(),
+                                                format_stack.current_clause(),
                                                 construct_flag_active!(MergeActive),
                                                 false,
                                             ));
@@ -9843,7 +9905,7 @@ impl SqlEditorWidget {
                                     } else {
                                         newline_with(
                                             &mut out,
-                                            base_indent(indent_level, open_cursor_state),
+                                            base_indent!(indent_level),
                                             comma_extra_indent,
                                             &mut at_line_start,
                                             &mut needs_space,
@@ -9864,13 +9926,13 @@ impl SqlEditorWidget {
                                 .with_cte_keeps_top_level_semicolon_inside_with_definitions();
                             trim_trailing_space(&mut out);
                             out.push(';');
-                            current_clause = None;
+                            set_current_clause!(None);
                             pending_split_end_suffix_indent = None;
                             pending_split_end_suffix_kind = None;
                             on_duplicate_key_update_active = false;
                             mysql_handler_state.clear();
-                            select_list_layout_state.clear();
-                            open_cursor_state = OpenCursorFormatState::None;
+                            clear_select_list_layout_state!();
+                            set_open_cursor_state!(OpenCursorFormatState::None);
                             format_stack.pop_between_pending_at_or_above(FormatScope::new(0, 0));
                             insert_all_branch_body_indent = None;
                             exit_condition_state.clear();
@@ -9885,17 +9947,10 @@ impl SqlEditorWidget {
                                 pending_package_member_separator = false;
                             }
                             suppress_comma_break_depth = 0;
-                            query_body_clause_base_depth = None;
+                            set_query_body_clause_base_depth!(None);
                             // `clear_statement_frames` restores `indent_level`
                             // by undoing the delta of each popped paren frame.
                             format_stack.clear_statement_frames(&mut indent_level);
-                            format_stack.sync_runtime_state(FormatRuntimeState::capture(
-                                &current_clause,
-                                select_list_layout_state,
-                                statement_has_with_clause,
-                                query_body_clause_base_depth,
-                                open_cursor_state,
-                            ));
                             // Debug-only invariant: once all non-persistent
                             // frames and scoped state have been cleared at a
                             // statement boundary, `indent_level` must match
@@ -9967,7 +10022,7 @@ impl SqlEditorWidget {
                                 Some(token_cache.matching_paren_close_indices()),
                             );
                             let is_analytic_over_paren = Self::paren_opens_analytic_layout(
-                                current_clause.as_deref(),
+                                format_stack.current_clause(),
                                 prev_word_upper.as_deref(),
                             );
                             let multiline_clause_owner_kind =
@@ -9977,7 +10032,7 @@ impl SqlEditorWidget {
                                     Some(token_cache.statement_word_links()),
                                 )
                                 .or_else(|| {
-                                    (matches!(current_clause.as_deref(), Some("WINDOW"))
+                                    (matches!(format_stack.current_clause(), Some("WINDOW"))
                                         && matches!(prev_word_upper.as_deref(), Some("AS")))
                                     .then_some(FormatIndentedParenOwnerKind::Window)
                                 });
@@ -10159,15 +10214,15 @@ impl SqlEditorWidget {
                             // decision structural: whenever the first SELECT list item opens
                             // a paren whose first token is CASE, always promote SELECT to its
                             // own line so both passes produce the same canonical output.
-                            let promotes_first_clause_owner_to_body_depth = matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                            let promotes_first_clause_owner_to_body_depth = matches!(format_stack.current_clause(), Some("SELECT" | "SET"))
                                     && !at_line_start
                                     && format_stack.paren_is_empty()
                                     && suppress_comma_break_depth == 0
-                                    && select_list_layout_state.has_active_indent()
-                                    && !select_list_layout_state.is_multiline()
+                                    && select_list_layout_state!().has_active_indent()
+                                    && !select_list_layout_state!().is_multiline()
                                     // Keep the existing dedicated `SELECT (` first-item path.
                                     && !Self::paren_starts_first_clause_list_item(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         prev_word_upper.as_deref(),
                                         is_query_paren,
                                         format_stack.paren_depth(),
@@ -10182,25 +10237,25 @@ impl SqlEditorWidget {
                                 // item opens a paren containing CASE (which is always
                                 // formatted multiline), promote SELECT onto its own line so
                                 // all sibling owners reuse the same parent list frame.
-                                force_select_list_newline(&mut out, &mut select_list_layout_state);
-                                line_indent = active_list_indent(
+                                force_select_list_newline!(&mut out);
+                                line_indent = active_list_indent!(
                                     indent_level,
-                                    open_cursor_state,
-                                    select_list_layout_state,
-                                    current_clause.as_deref(),
+                                    open_cursor_state!(),
+                                    select_list_layout_state!(),
+                                    format_stack.current_clause(),
                                     construct_flag_active!(MergeActive),
                                     false,
                                 );
                             }
                             if Self::paren_starts_first_clause_list_item(
-                                current_clause.as_deref(),
+                                format_stack.current_clause(),
                                 prev_word_upper.as_deref(),
                                 is_query_paren,
                                 format_stack.paren_depth(),
                             ) {
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
+                                    base_indent!(indent_level),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -10252,7 +10307,7 @@ impl SqlEditorWidget {
                                 .last_paren()
                                 .and_then(|frame| frame.sibling_body_indent());
                             let clause_family_body_indent = matches!(
-                                current_clause.as_deref(),
+                                format_stack.current_clause(),
                                 Some(
                                     "SELECT"
                                         | "SET"
@@ -10265,11 +10320,11 @@ impl SqlEditorWidget {
                                 )
                             )
                             .then(|| {
-                                active_list_indent(
+                                active_list_indent!(
                                     indent_level,
-                                    open_cursor_state,
-                                    select_list_layout_state,
-                                    current_clause.as_deref(),
+                                    open_cursor_state!(),
+                                    select_list_layout_state!(),
+                                    format_stack.current_clause(),
                                     construct_flag_active!(MergeActive),
                                     in_column_list,
                                 )
@@ -10298,7 +10353,7 @@ impl SqlEditorWidget {
                                 } else if let Some(parent_sibling_indent) =
                                     parent_frame_sibling_indent
                                 {
-                                    if matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                                    if matches!(format_stack.current_clause(), Some("SELECT" | "SET"))
                                         && matches!(
                                             paren_frame_kind,
                                             ParenFormatFrameKind::WrappedLayout
@@ -10314,7 +10369,7 @@ impl SqlEditorWidget {
                                 } else {
                                     rendered_owner_depth
                                 }
-                            } else if matches!(current_clause.as_deref(), Some("VALUES" | "FROM"))
+                            } else if matches!(format_stack.current_clause(), Some("VALUES" | "FROM"))
                                 || matches!(
                                     prev_word_upper.as_deref(),
                                     Some("JSON_TABLE" | "XMLTABLE")
@@ -10343,7 +10398,7 @@ impl SqlEditorWidget {
                                         rendered_owner_depth
                                     }
                                 } else if matches!(
-                                    current_clause.as_deref(),
+                                    format_stack.current_clause(),
                                     Some(
                                         "SELECT"
                                             | "SET"
@@ -10355,7 +10410,7 @@ impl SqlEditorWidget {
                                             | "RETURNING"
                                     )
                                 ) {
-                                    base_indent(indent_level, open_cursor_state).saturating_add(1)
+                                    base_indent!(indent_level).saturating_add(1)
                                 } else if previous_meaningful_is_open_paren {
                                     parent_frame_sibling_indent
                                         .unwrap_or_else(|| line_indent.saturating_add(1))
@@ -10382,18 +10437,18 @@ impl SqlEditorWidget {
                             let standalone_clause_list_query_item = paren_started_at_line_start
                                 && paren_frame_kind.is_query_like()
                                 && !standalone_owner_follows_opener
-                                && ((matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
-                                    && select_list_layout_state.has_active_indent())
+                                && ((matches!(format_stack.current_clause(), Some("SELECT" | "SET"))
+                                    && select_list_layout_state!().has_active_indent())
                                     || matches!(
-                                        current_clause.as_deref(),
+                                        format_stack.current_clause(),
                                         Some("ORDER" | "GROUP" | "HAVING" | "WINDOW" | "INTO")
                                     ));
                             if standalone_clause_list_query_item {
-                                line_indent = active_list_indent(
+                                line_indent = active_list_indent!(
                                     indent_level,
-                                    open_cursor_state,
-                                    select_list_layout_state,
-                                    current_clause.as_deref(),
+                                    open_cursor_state!(),
+                                    select_list_layout_state!(),
+                                    format_stack.current_clause(),
                                     construct_flag_active!(MergeActive),
                                     false,
                                 );
@@ -10401,8 +10456,7 @@ impl SqlEditorWidget {
                             let query_like_owner_depth = query_like_owner_line
                                 .as_deref()
                                 .map(|owner_line| {
-                                    let inline_clause_owner_depth = current_clause
-                                        .as_deref()
+                                    let inline_clause_owner_depth = current_clause!()
                                         .filter(|clause| {
                                             matches!(*clause, "SELECT" | "SET" | "FROM")
                                                 && sql_text::starts_with_keyword_token(
@@ -10411,7 +10465,7 @@ impl SqlEditorWidget {
                                                 )
                                         })
                                         .map(|_| {
-                                            base_indent(indent_level, open_cursor_state)
+                                            base_indent!(indent_level)
                                                 .saturating_add(1)
                                         });
                                     let owner_line_open_depth =
@@ -10530,15 +10584,6 @@ impl SqlEditorWidget {
                                     == Some(FormatIndentedParenOwnerKind::Window),
                                 keep: is_keep_paren,
                             };
-                            if capture_runtime_state {
-                                format_stack.sync_runtime_state(FormatRuntimeState::capture(
-                                    &current_clause,
-                                    select_list_layout_state,
-                                    statement_has_with_clause,
-                                    query_body_clause_base_depth,
-                                    open_cursor_state,
-                                ));
-                            }
                             format_stack.push_paren(
                                 ParenFormatFrame::new(
                                     paren_frame_kind,
@@ -10573,7 +10618,7 @@ impl SqlEditorWidget {
                                     ) {
                                         semantic_open_line_indent.saturating_add(1)
                                     } else {
-                                        base_indent(indent_level, open_cursor_state)
+                                        base_indent!(indent_level)
                                     };
                                 } else {
                                     let next_line_indent = query_like_layout
@@ -10586,7 +10631,7 @@ impl SqlEditorWidget {
                                             ) {
                                                 semantic_open_line_indent.saturating_add(1)
                                             } else {
-                                                base_indent(indent_level, open_cursor_state)
+                                                base_indent!(indent_level)
                                             }
                                         });
                                     newline_with(
@@ -10607,7 +10652,7 @@ impl SqlEditorWidget {
                             format_stack.with_cte_on_close_paren();
                             trim_trailing_space(&mut out);
                             let popped_paren = format_stack.pop_paren(&mut indent_level);
-                            let (paren_frame_kind, restored_runtime_state, open_cursor_restore_state) =
+                            let (paren_frame_kind, _restored_runtime_state, open_cursor_restore_state) =
                                 popped_paren
                                     .map(|frame| {
                                         (
@@ -10670,7 +10715,7 @@ impl SqlEditorWidget {
                                 let close_indent = if paren_frame_kind.close_indent() > 0 {
                                     paren_frame_kind.close_indent()
                                 } else {
-                                    base_indent(indent_level, open_cursor_state)
+                                    base_indent!(indent_level)
                                 };
                                 newline_with(
                                     &mut out,
@@ -10742,38 +10787,30 @@ impl SqlEditorWidget {
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
                             }
-                            if restored_runtime_state {
-                                let restored_runtime_state = format_stack.runtime_state().clone();
-                                restored_runtime_state.restore(
-                                    &mut current_clause,
-                                    &mut select_list_layout_state,
-                                    &mut statement_has_with_clause,
-                                    &mut query_body_clause_base_depth,
-                                    &mut open_cursor_state,
-                                );
-                            }
-                            if open_cursor_state
+                            if open_cursor_state!()
                                 .select_depth()
                                 .is_some_and(|depth| format_stack.paren_depth() < depth)
                             {
-                                open_cursor_state = format_stack
+                                let restored_open_cursor_state = format_stack
                                     .pop_open_cursor_restore()
                                     .or(open_cursor_restore_state)
                                     .unwrap_or(OpenCursorFormatState::None);
+                                set_open_cursor_state!(restored_open_cursor_state);
                             }
                             if format_stack.paren_is_empty()
                                 && matches!(
                                     next_non_comment,
                                     Some(SqlToken::Symbol(sym)) if sym == ","
                                 )
-                                && select_list_layout_state.has_active_indent()
+                                && select_list_layout_state!().has_active_indent()
                             {
-                                current_clause =
-                                    Some(if matches!(current_clause.as_deref(), Some("SET")) {
+                                set_current_clause!(Some(
+                                    if matches!(format_stack.current_clause(), Some("SET")) {
                                         "SET".to_string()
                                     } else {
                                         "SELECT".to_string()
-                                    });
+                                    }
+                                ));
                             }
                             if at_line_start
                                 && !paren_frame_kind.closes_indented()
@@ -37041,7 +37078,11 @@ mod format_frame_stack_tests {
         };
 
         stack.set_current_query_base_depth(Some(2));
-        stack.sync_runtime_state(runtime_state.clone());
+        stack.set_current_clause(runtime_state.current_clause.clone());
+        stack.set_select_list_layout_state(runtime_state.select_list_layout_state);
+        stack.set_statement_has_with_clause(runtime_state.statement_has_with_clause);
+        stack.set_query_body_clause_base_depth(runtime_state.query_body_clause_base_depth);
+        stack.set_open_cursor_state(runtime_state.open_cursor_state);
         let mut indent_level = 0usize;
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 2, false, 3, Some(2)),
@@ -37054,13 +37095,11 @@ mod format_frame_stack_tests {
         );
 
         assert_eq!(stack.current_query_base_depth(), Some(7));
-        stack.sync_runtime_state(FormatRuntimeState {
-            current_clause: Some("WHERE".to_string()),
-            select_list_layout_state: SelectListLayoutState::Inactive,
-            statement_has_with_clause: false,
-            query_body_clause_base_depth: Some(9),
-            open_cursor_state: OpenCursorFormatState::None,
-        });
+        stack.set_current_clause(Some("WHERE".to_string()));
+        stack.set_select_list_layout_state(SelectListLayoutState::Inactive);
+        stack.set_statement_has_with_clause(false);
+        stack.set_query_body_clause_base_depth(Some(9));
+        stack.set_open_cursor_state(OpenCursorFormatState::None);
 
         let popped = stack
             .pop_paren(&mut indent_level)
@@ -37068,16 +37107,12 @@ mod format_frame_stack_tests {
 
         assert!(matches!(popped.frame.kind, ParenFormatFrameKind::QueryLike));
         assert_eq!(stack.current_query_base_depth(), Some(2));
-        assert_eq!(
-            stack.runtime_state().current_clause.as_deref(),
-            Some("SELECT")
-        );
-        assert_eq!(
-            stack.runtime_state().query_body_clause_base_depth,
-            Some(4)
-        );
+        assert_eq!(stack.current_clause(), Some("SELECT"));
+        assert!(stack.select_list_layout_state() == runtime_state.select_list_layout_state);
+        assert!(stack.statement_has_with_clause());
+        assert_eq!(stack.query_body_clause_base_depth(), Some(4));
         assert!(matches!(
-            stack.runtime_state().open_cursor_state,
+            stack.open_cursor_state(),
             OpenCursorFormatState::AwaitingFor
         ));
     }
