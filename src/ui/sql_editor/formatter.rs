@@ -863,7 +863,9 @@ impl FormatFrameStack {
             }
             FormatFrame::CompoundTrigger(frame) => !frame.scope.contains(next_scope),
             FormatFrame::WithCte(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::Paren(_) | FormatFrame::Block(_) | FormatFrame::OpenCursorRestore(_) => false,
+            FormatFrame::Paren(_) | FormatFrame::Block(_) | FormatFrame::OpenCursorRestore(_) => {
+                false
+            }
         }
     }
 
@@ -915,7 +917,10 @@ impl FormatFrameStack {
             return;
         }
         self.frames
-            .push(FormatFrame::ConstructFlag(ConstructFlagFrame { kind, scope }));
+            .push(FormatFrame::ConstructFlag(ConstructFlagFrame {
+                kind,
+                scope,
+            }));
     }
 
     fn deactivate_construct_flag(&mut self, kind: ConstructFlagKind) -> bool {
@@ -955,7 +960,9 @@ impl FormatFrameStack {
         paren_depth: usize,
     ) -> bool {
         self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ConstructFlag(frame) if frame.kind == kind => Some(frame.scope.paren_depth),
+            FormatFrame::ConstructFlag(frame) if frame.kind == kind => {
+                Some(frame.scope.paren_depth)
+            }
             _ => None,
         }) == Some(paren_depth)
     }
@@ -973,10 +980,9 @@ impl FormatFrameStack {
         scope: FormatScope,
         value: String,
     ) {
-        let existing_idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind));
+        let existing_idx = self.frames.iter().rposition(
+            |frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
+        );
         if let Some(idx) = existing_idx {
             match self.frames.get_mut(idx) {
                 Some(FormatFrame::ConstructValue(frame)) if frame.scope == scope => {
@@ -986,17 +992,18 @@ impl FormatFrameStack {
                 _ => {}
             }
         }
-        self.frames.push(FormatFrame::ConstructValue(ConstructValueFrame {
-            kind,
-            scope,
-            value,
-        }));
+        self.frames
+            .push(FormatFrame::ConstructValue(ConstructValueFrame {
+                kind,
+                scope,
+                value,
+            }));
     }
 
     fn clear_construct_value(&mut self, kind: ConstructValueKind) {
-        self.frames.retain(|frame| {
-            !matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind)
-        });
+        self.frames.retain(
+            |frame| !matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
+        );
     }
 
     fn construct_value_is_some(&self, kind: ConstructValueKind) -> bool {
@@ -1211,7 +1218,9 @@ impl FormatFrameStack {
                 )),
                 _ => None,
             })
-            .unwrap_or_else(|| FormatScope::new(self.paren_depth, self.block_depth.saturating_sub(1)));
+            .unwrap_or_else(|| {
+                FormatScope::new(self.paren_depth, self.block_depth.saturating_sub(1))
+            });
         self.pop_tail_auxiliary_frames_for_scope(next_scope, indent_level);
         let Some(FormatFrame::Block(frame)) = self.pop_tail_frame() else {
             return None;
@@ -1356,26 +1365,28 @@ impl FormatFrameStack {
     }
 
     fn expected_indent_level(&self) -> usize {
-        self.frames.iter().fold(0usize, |indent_level, frame| match frame {
-            FormatFrame::Paren(frame) => {
-                if frame.frame.opens_indented() {
-                    indent_level.saturating_add(frame.frame.indent_level_delta())
-                } else {
-                    indent_level
+        self.frames
+            .iter()
+            .fold(0usize, |indent_level, frame| match frame {
+                FormatFrame::Paren(frame) => {
+                    if frame.frame.opens_indented() {
+                        indent_level.saturating_add(frame.frame.indent_level_delta())
+                    } else {
+                        indent_level
+                    }
                 }
-            }
-            FormatFrame::Block(frame) => frame.depth_frame.body_indent_level,
-            FormatFrame::ScopedIndent(frame) => indent_level.saturating_add(frame.delta),
-            FormatFrame::ConstructFlag(_)
-            | FormatFrame::ConstructValue(_)
-            | FormatFrame::ConditionOwner(_)
-            | FormatFrame::BetweenPending(_)
-            | FormatFrame::TriggerHeader(_)
-            | FormatFrame::PlsqlContext(_)
-            | FormatFrame::CompoundTrigger(_)
-            | FormatFrame::WithCte(_)
-            | FormatFrame::OpenCursorRestore(_) => indent_level,
-        })
+                FormatFrame::Block(frame) => frame.depth_frame.body_indent_level,
+                FormatFrame::ScopedIndent(frame) => indent_level.saturating_add(frame.delta),
+                FormatFrame::ConstructFlag(_)
+                | FormatFrame::ConstructValue(_)
+                | FormatFrame::ConditionOwner(_)
+                | FormatFrame::BetweenPending(_)
+                | FormatFrame::TriggerHeader(_)
+                | FormatFrame::PlsqlContext(_)
+                | FormatFrame::CompoundTrigger(_)
+                | FormatFrame::WithCte(_)
+                | FormatFrame::OpenCursorRestore(_) => indent_level,
+            })
     }
 
     fn statement_base_indent(&self) -> usize {
@@ -2887,8 +2898,7 @@ impl SqlEditorWidget {
         if format_stack.construct_flag_is_active_at_paren_depth(
             ConstructFlagKind::ModelActive,
             current_scope.paren_depth,
-        )
-            && keyword == "UPDATE"
+        ) && keyword == "UPDATE"
             && matches!(prev_word_upper, Some("RULES"))
         {
             return true;
@@ -2943,9 +2953,8 @@ impl SqlEditorWidget {
         }
         if keyword == "ON"
             && (matches!(prev_word_upper, Some("REFERENCES"))
-                || format_stack.construct_flag_is_active(
-                    ConstructFlagKind::ReferentialActionPending,
-                ))
+                || format_stack
+                    .construct_flag_is_active(ConstructFlagKind::ReferentialActionPending))
         {
             return true;
         }
@@ -3093,9 +3102,7 @@ impl SqlEditorWidget {
         if keyword == "SET" && matches!(prev_word_upper, Some("CHARACTER")) {
             return true;
         }
-        if keyword == "SET"
-            && Self::is_mysql_signal_set_clause(tokens, idx, statement_word_links)
-        {
+        if keyword == "SET" && Self::is_mysql_signal_set_clause(tokens, idx, statement_word_links) {
             return true;
         }
         if keyword == "UPDATE"
@@ -4413,6 +4420,169 @@ impl SqlEditorWidget {
         sql_text::is_oracle_sql_keyword(word) || sql_text::is_mysql_sql_keyword(word)
     }
 
+    fn token_is_alias_keyword(token: Option<&SqlToken>) -> bool {
+        matches!(
+            token,
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("AS") || word.eq_ignore_ascii_case("IS")
+        )
+    }
+
+    fn next_word_sequence_starts_join_clause(
+        tokens: &[SqlToken],
+        start_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        let mut prefix_words: Vec<String> = Vec::new();
+        let mut cursor = Some(start_idx);
+
+        while let Some(token_idx) = cursor {
+            let Some(token) = tokens.get(token_idx) else {
+                break;
+            };
+            match token {
+                SqlToken::Word(word) => {
+                    prefix_words.push(word.to_ascii_uppercase());
+                    if prefix_words.len() >= 4 {
+                        break;
+                    }
+                    cursor = Self::next_meaningful_token_index_with_links(
+                        tokens,
+                        token_idx,
+                        meaningful_token_links,
+                    );
+                }
+                SqlToken::Comment(_) => {
+                    cursor = Self::next_meaningful_token_index_with_links(
+                        tokens,
+                        token_idx,
+                        meaningful_token_links,
+                    );
+                }
+                SqlToken::String(_) | SqlToken::Symbol(_) => break,
+            }
+        }
+
+        !prefix_words.is_empty()
+            && crate::sql_text::starts_with_format_join_clause(prefix_words.join(" ").as_str())
+    }
+
+    fn token_ends_identifier_slot(
+        tokens: &[SqlToken],
+        idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        let next_idx =
+            Self::next_meaningful_token_index_with_links(tokens, idx, meaningful_token_links);
+        let Some(next_idx) = next_idx else {
+            return true;
+        };
+        let Some(next_token) = tokens.get(next_idx) else {
+            return true;
+        };
+
+        match next_token {
+            SqlToken::Symbol(sym) => matches!(sym.as_str(), "," | ")" | ";"),
+            SqlToken::Word(word) => {
+                let upper = word.to_ascii_uppercase();
+                upper == "ON"
+                    || upper == "USING"
+                    || Self::is_dml_clause_starter(upper.as_str())
+                    || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
+                    || Self::next_word_sequence_starts_join_clause(
+                        tokens,
+                        next_idx,
+                        meaningful_token_links,
+                    )
+            }
+            SqlToken::String(_) | SqlToken::Comment(_) => false,
+        }
+    }
+
+    fn formatter_keyword_should_render_as_identifier(
+        tokens: &[SqlToken],
+        idx: usize,
+        current_clause: Option<&str>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+            return false;
+        };
+
+        let upper = word.to_ascii_uppercase();
+        let keyword_can_be_identifier = matches!(
+            upper.as_str(),
+            "MODEL"
+                | "WINDOW"
+                | "MATCH_RECOGNIZE"
+                | "QUALIFY"
+                | "PIVOT"
+                | "UNPIVOT"
+                | "SEARCH"
+                | "CYCLE"
+        );
+        if !keyword_can_be_identifier {
+            return false;
+        }
+
+        let prev_idx = meaningful_token_links
+            .and_then(|links| links.prev_index(idx))
+            .or_else(|| Self::previous_meaningful_token_index(tokens, idx));
+        let prev_token = prev_idx.and_then(|prev_idx| tokens.get(prev_idx));
+        let next_token =
+            Self::next_meaningful_token_index_with_links(tokens, idx, meaningful_token_links)
+                .and_then(|next_idx| tokens.get(next_idx));
+        let prev_is_boundary = matches!(
+            prev_token,
+            Some(SqlToken::Symbol(sym)) if Self::mysql_identifier_left_boundary_symbol(sym)
+        );
+        let next_token_is_dot = matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == ".");
+        let prev_token_is_dot = matches!(prev_token, Some(SqlToken::Symbol(sym)) if sym == ".");
+        let previous_is_current_clause_head = matches!(
+            (prev_token, current_clause),
+            (Some(SqlToken::Word(prev_word)), Some(current_clause_word))
+                if prev_word.eq_ignore_ascii_case(current_clause_word)
+        );
+        let follows_alias_keyword = Self::token_is_alias_keyword(prev_token);
+        let next_is_alias_keyword = Self::token_is_alias_keyword(next_token);
+        let next_ends_identifier_slot =
+            Self::token_ends_identifier_slot(tokens, idx, meaningful_token_links);
+        let in_select_clause = matches!(current_clause, Some("SELECT"));
+        let in_table_alias_clause = matches!(
+            current_clause,
+            Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
+        );
+        let in_identifier_qualified_clause = matches!(
+            current_clause,
+            Some("SELECT" | "FROM" | "WHERE" | "ON" | "GROUP" | "HAVING" | "ORDER")
+        );
+        let in_alias_capable_clause = in_identifier_qualified_clause
+            || matches!(current_clause, Some("SET"))
+            || in_table_alias_clause;
+
+        if (next_token_is_dot || prev_token_is_dot) && in_identifier_qualified_clause {
+            return true;
+        }
+
+        if matches!(
+            current_clause,
+            Some("SELECT" | "WHERE" | "HAVING" | "ON" | "SET" | "GROUP" | "ORDER")
+        ) && (prev_is_boundary || previous_is_current_clause_head)
+            && (next_ends_identifier_slot || next_is_alias_keyword)
+        {
+            return true;
+        }
+
+        if follows_alias_keyword && in_alias_capable_clause {
+            return true;
+        }
+
+        (in_select_clause || in_table_alias_clause)
+            && !prev_is_boundary
+            && !previous_is_current_clause_head
+            && next_ends_identifier_slot
+    }
+
     fn mysql_keyword_should_render_as_identifier(
         tokens: &[SqlToken],
         idx: usize,
@@ -4449,6 +4619,15 @@ impl SqlEditorWidget {
             return upper == "VALUES" && on_duplicate_key_update_active;
         }
 
+        if Self::formatter_keyword_should_render_as_identifier(
+            tokens,
+            idx,
+            current_clause,
+            meaningful_token_links,
+        ) {
+            return true;
+        }
+
         let prev_is_boundary = matches!(
             prev_token,
             Some(SqlToken::Symbol(sym)) if Self::mysql_identifier_left_boundary_symbol(sym)
@@ -4462,35 +4641,21 @@ impl SqlEditorWidget {
             (Some(SqlToken::Word(prev_word)), Some(current_clause_word))
                 if prev_word.eq_ignore_ascii_case(current_clause_word)
         );
-        let follows_alias_keyword = matches!(
-            prev_token,
-            Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("AS")
-                || prev_word.eq_ignore_ascii_case("IS")
-        );
-        let next_is_alias_keyword = matches!(
-            next_token,
-            Some(SqlToken::Word(next_word))
-                if next_word.eq_ignore_ascii_case("AS") || next_word.eq_ignore_ascii_case("IS")
-        );
-        let next_is_clause_keyword = matches!(
-            next_token,
-            Some(SqlToken::Word(next_word))
-                if Self::is_dml_clause_starter(next_word.to_ascii_uppercase().as_str())
-                    || crate::sql_text::is_format_set_operator_keyword(
-                        next_word.to_ascii_uppercase().as_str(),
-                    )
-        );
+        let follows_alias_keyword = Self::token_is_alias_keyword(prev_token);
+        let next_is_alias_keyword = Self::token_is_alias_keyword(next_token);
         let in_select_clause = matches!(current_clause, Some("SELECT"));
         let in_table_alias_clause = matches!(
             current_clause,
             Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
         );
+        let next_ends_identifier_slot =
+            Self::token_ends_identifier_slot(tokens, idx, meaningful_token_links);
 
         if matches!(
             current_clause,
             Some("SELECT" | "WHERE" | "HAVING" | "ON" | "SET" | "GROUP" | "ORDER")
         ) && (prev_is_boundary || previous_is_current_clause_head)
-            && (next_is_boundary || next_is_clause_keyword || next_is_alias_keyword)
+            && (next_is_boundary || next_is_alias_keyword || next_ends_identifier_slot)
         {
             return true;
         }
@@ -4502,7 +4667,7 @@ impl SqlEditorWidget {
         if (in_select_clause || in_table_alias_clause)
             && !prev_is_boundary
             && !previous_is_current_clause_head
-            && (next_is_boundary || next_is_clause_keyword)
+            && (next_is_boundary || next_ends_identifier_slot)
         {
             return true;
         }
@@ -5801,10 +5966,8 @@ impl SqlEditorWidget {
         }
         macro_rules! construct_flag_active_at_paren_depth {
             ($kind:ident, $paren_depth:expr) => {
-                format_stack.construct_flag_is_active_at_paren_depth(
-                    ConstructFlagKind::$kind,
-                    $paren_depth,
-                )
+                format_stack
+                    .construct_flag_is_active_at_paren_depth(ConstructFlagKind::$kind, $paren_depth)
             };
         }
         macro_rules! activate_construct_flag {
@@ -6001,6 +6164,13 @@ impl SqlEditorWidget {
                         )
                     );
                     let is_keyword = is_formatter_keyword(upper);
+                    let formatter_keyword_identifier = is_keyword
+                        && Self::formatter_keyword_should_render_as_identifier(
+                            tokens,
+                            idx,
+                            current_clause.as_deref(),
+                            Some(token_cache.meaningful_links()),
+                        );
                     let is_analytic_within_group = upper == "GROUP"
                         && matches!(prev_word_upper.as_deref(), Some("WITHIN"))
                         && {
@@ -6167,6 +6337,11 @@ impl SqlEditorWidget {
                     let follows_alias_control_keyword = follows_alias_keyword
                         && sql_text::is_plsql_control_keyword(upper)
                         && !next_word_is("THEN");
+                    let keyword_preserves_original_case =
+                        mysql_keyword_identifier || formatter_keyword_identifier;
+                    let keyword_suppresses_structural_handling = keyword_preserves_original_case
+                        || treat_control_keyword_as_identifier
+                        || follows_alias_control_keyword;
                     let mysql_create_function_header_attribute = mysql_compatible
                         && matches!(construct_value_as_deref!(CreateObject), Some("FUNCTION"))
                         && matches!(upper, "RETURNS" | "DETERMINISTIC");
@@ -6577,7 +6752,7 @@ impl SqlEditorWidget {
                         current_clause = Some(upper.to_string());
                         select_list_layout_state.clear();
                     } else if clause_keywords.contains(&upper)
-                        && !mysql_keyword_identifier
+                        && !keyword_suppresses_structural_handling
                         && !mysql_declare_for_clause
                         // VALUES() inside ON DUPLICATE KEY UPDATE is a function, not a clause
                         && (!on_duplicate_key_update_active || upper != "VALUES")
@@ -6875,7 +7050,7 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if should_break_condition {
+                    } else if should_break_condition && !keyword_suppresses_structural_handling {
                         let control_header_condition_indent = matches!(upper, "AND" | "OR")
                             .then(|| {
                                 format_stack
@@ -6936,8 +7111,7 @@ impl SqlEditorWidget {
                         if construct_flag_active_at_paren_depth!(
                             InsertAllActive,
                             current_scope.paren_depth
-                        )
-                            && matches!(upper, "WHEN" | "ELSE")
+                        ) && matches!(upper, "WHEN" | "ELSE")
                         {
                             insert_all_branch_body_indent = None;
                         }
@@ -7189,7 +7363,11 @@ impl SqlEditorWidget {
                         if matches!(upper, "PROCEDURE" | "FUNCTION") {
                             activate_construct_flag!(RoutineDeclPending, current_scope);
                         } else if upper == "PACKAGE" {
-                            replace_construct_value!(CreateObject, current_scope, upper.to_string());
+                            replace_construct_value!(
+                                CreateObject,
+                                current_scope,
+                                upper.to_string()
+                            );
                         }
                     } else if matches!(upper, "PROCEDURE" | "FUNCTION")
                         && (format_stack.last_block_kind_is("DECLARE")
@@ -7277,8 +7455,7 @@ impl SqlEditorWidget {
                         } else if construct_flag_active_at_paren_depth!(
                             InsertAllActive,
                             current_scope.paren_depth
-                        )
-                        {
+                        ) {
                             // INSERT ALL/FIRST branch bodies should stay one
                             // level deeper than WHEN ... THEN headers.
                             insert_all_branch_body_indent = Some(
@@ -7303,7 +7480,9 @@ impl SqlEditorWidget {
                             newline_after_keyword = true;
                             newline_after_keyword_extra = 1;
                         }
-                    } else if upper == join_keyword || upper == "APPLY" {
+                    } else if (upper == join_keyword || upper == "APPLY")
+                        && !keyword_suppresses_structural_handling
+                    {
                         if !join_modifier_active {
                             newline_with(
                                 &mut out,
@@ -7315,7 +7494,9 @@ impl SqlEditorWidget {
                             );
                         }
                         join_modifier_active = false;
-                    } else if join_modifiers.contains(&upper) {
+                    } else if join_modifiers.contains(&upper)
+                        && !keyword_suppresses_structural_handling
+                    {
                         let next_leads_to_join = next_word_is("JOIN")
                             || next_word_is("OUTER")
                             || next_word_is("APPLY")
@@ -7335,7 +7516,7 @@ impl SqlEditorWidget {
                             }
                             join_modifier_active = true;
                         }
-                    } else if upper == outer_keyword {
+                    } else if upper == outer_keyword && !keyword_suppresses_structural_handling {
                         if (next_word_is("JOIN") || next_word_is("APPLY")) && !join_modifier_active
                         {
                             newline_with(
@@ -7348,7 +7529,9 @@ impl SqlEditorWidget {
                             );
                             join_modifier_active = true;
                         }
-                    } else if upper == "SEARCH" || upper == "CYCLE" {
+                    } else if (upper == "SEARCH" || upper == "CYCLE")
+                        && !keyword_suppresses_structural_handling
+                    {
                         activate_construct_flag!(SearchCycleClauseActive, current_scope);
                         // SEARCH/CYCLE after recursive CTE should start on a
                         // new line at the WITH-clause level.
@@ -7361,6 +7544,7 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     } else if matches!(upper, "PIVOT" | "UNPIVOT")
+                        && !keyword_suppresses_structural_handling
                         && suppress_comma_break_depth == 0
                         && !construct_flag_active!(CreateSynonymActive)
                     {
@@ -7415,9 +7599,8 @@ impl SqlEditorWidget {
                         } else if construct_flag_active_at_paren_depth!(
                             ModelActive,
                             current_scope.paren_depth
-                        )
-                            && FormatIndentedParenOwnerKind::ModelSubclause
-                                .starts_phase1_body_header_words(upper, next_word, third_word)
+                        ) && FormatIndentedParenOwnerKind::ModelSubclause
+                            .starts_phase1_body_header_words(upper, next_word, third_word)
                         {
                             if upper == "REFERENCE" {
                                 activate_construct_flag!(ModelReferencePending, current_scope);
@@ -7897,7 +8080,7 @@ impl SqlEditorWidget {
                     if needs_space {
                         out.push(' ');
                     }
-                    let rendered_word = if is_keyword && !mysql_keyword_identifier {
+                    let rendered_word = if is_keyword && !keyword_preserves_original_case {
                         upper
                     } else {
                         word
@@ -7928,7 +8111,7 @@ impl SqlEditorWidget {
                     }
                     if upper == "WITH"
                         && is_keyword
-                        && !mysql_keyword_identifier
+                        && !keyword_preserves_original_case
                         && !with_cte_keyword_inside_function_local
                     {
                         format_stack.with_cte_record_owner_depth(line_indent);
@@ -8227,8 +8410,10 @@ impl SqlEditorWidget {
                             format_stack.clear_trigger_header();
                         }
                         // Treat AS/IS in CREATE PACKAGE/PROC/FUNC/TYPE/TRIGGER and package-body routines as declaration section start
-                        let is_package_body =
-                            matches!(construct_value_as_deref!(CreateObject), Some("PACKAGE_BODY"));
+                        let is_package_body = matches!(
+                            construct_value_as_deref!(CreateObject),
+                            Some("PACKAGE_BODY")
+                        );
                         let package_member_owner_depth = is_package_body_statement
                             .then_some(())
                             .filter(|_| !is_package_body)
@@ -21673,6 +21858,110 @@ ORDER BY u.dept_id,
 {}",
             formatted
         );
+    }
+
+    #[test]
+    fn formatter_keyword_like_relation_aliases_stay_inline_before_join_and_on() {
+        let aliases = [
+            "model",
+            "window",
+            "match_recognize",
+            "qualify",
+            "pivot",
+            "unpivot",
+            "search",
+            "cycle",
+        ];
+
+        for alias in aliases {
+            let join_boundary_source =
+                format!("select * from t1 {alias} join t2 b on {alias}.id = b.id;");
+            let on_boundary_source =
+                format!("select * from t1 a join t2 {alias} on 1 = 1 and {alias}.a = 2;");
+
+            for (label, formatted) in [
+                (
+                    "format_sql_basic/join-boundary",
+                    SqlEditorWidget::format_sql_basic(join_boundary_source.as_str()),
+                ),
+                (
+                    "auto-format/join-boundary",
+                    SqlEditorWidget::format_for_auto_formatting(
+                        join_boundary_source.as_str(),
+                        false,
+                    ),
+                ),
+                (
+                    "format_sql_basic/on-boundary",
+                    SqlEditorWidget::format_sql_basic(on_boundary_source.as_str()),
+                ),
+                (
+                    "auto-format/on-boundary",
+                    SqlEditorWidget::format_for_auto_formatting(on_boundary_source.as_str(), false),
+                ),
+            ] {
+                assert!(
+                    formatted.contains(format!("FROM t1 {alias}\nJOIN t2 b").as_str())
+                        || formatted.contains(format!("JOIN t2 {alias}\n    ON 1 = 1").as_str()),
+                    "{label} should keep keyword-like relation alias `{alias}` inline with its relation owner, got:\n{formatted}"
+                );
+                assert!(
+                    formatted.contains(format!("{alias}.id = b.id").as_str())
+                        || formatted.contains(format!("{alias}.a = 2").as_str()),
+                    "{label} should preserve relation alias references for `{alias}`, got:\n{formatted}"
+                );
+                assert!(
+                    !formatted.contains(format!("\n{}\n", alias.to_ascii_uppercase()).as_str()),
+                    "{label} should not split keyword-like relation alias `{alias}` into a standalone clause line, got:\n{formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn formatter_keyword_like_select_aliases_stay_inline_before_from_clause() {
+        let aliases = [
+            "model",
+            "window",
+            "match_recognize",
+            "qualify",
+            "pivot",
+            "unpivot",
+            "search",
+            "cycle",
+        ];
+
+        for alias in aliases {
+            let source = format!("select 1 {alias}, 2 keep_alias from dual;");
+
+            for (label, formatted) in [
+                (
+                    "format_sql_basic",
+                    SqlEditorWidget::format_sql_basic(source.as_str()),
+                ),
+                (
+                    "auto-format",
+                    SqlEditorWidget::format_for_auto_formatting(source.as_str(), false),
+                ),
+            ] {
+                assert!(
+                    formatted.contains(format!("1 {alias},").as_str()),
+                    "{label} should keep keyword-like select alias `{alias}` attached to the select item, got:\n{formatted}"
+                );
+                assert!(
+                    formatted.contains("2 keep_alias"),
+                    "{label} should keep the sibling select item after keyword-like alias `{alias}`, got:\n{formatted}"
+                );
+                assert!(
+                    formatted.contains("FROM DUAL;"),
+                    "{label} should still realign the FROM clause after keyword-like alias `{alias}`, got:\n{formatted}"
+                );
+                assert!(
+                    !formatted.contains(format!("\n{}\n", alias.to_ascii_uppercase()).as_str()),
+                    "{label} should not split keyword-like select alias `{alias}` into a clause line, got:\n{formatted}"
+                );
+            }
+        }
     }
 
     #[test]
