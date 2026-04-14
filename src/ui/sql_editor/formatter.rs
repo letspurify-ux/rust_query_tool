@@ -1385,6 +1385,7 @@ impl ActiveParenMetrics {
             next.query_like_count = next.query_like_count.saturating_add(1);
             next.compact_non_query_since_last_query = 0;
             next.paren_extra_since_last_query = 0;
+            next.last_compact_open_line_indent = None;
             return next;
         }
 
@@ -1425,6 +1426,7 @@ struct ParenStackFrame {
     frame: ParenFormatFrame,
     semantic_flags: ParenSemanticFlags,
     runtime_state_snapshot: Option<FormatRuntimeState>,
+    applied_query_base_depth: Option<usize>,
     previous_active_paren_metrics: ActiveParenMetrics,
     previous_paren_frame_id: Option<SqlFormatFrameId>,
     previous_query_base_depth: Option<Option<usize>>,
@@ -2002,6 +2004,10 @@ impl FormatFrameStack {
             FormatFrame::Block(frame) => Some(frame.id),
             _ => None,
         });
+        self.current_query_base_depth = self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::Paren(frame) => frame.applied_query_base_depth,
+            _ => None,
+        });
         self.rebuild_frame_index_cache();
     }
 
@@ -2132,10 +2138,6 @@ impl FormatFrameStack {
         self.runtime_state.select_list_layout_state
     }
 
-    fn select_list_layout_state_mut(&mut self) -> &mut SelectListLayoutState {
-        &mut self.runtime_state.select_list_layout_state
-    }
-
     fn set_select_list_layout_state(&mut self, select_list_layout_state: SelectListLayoutState) {
         self.runtime_state.select_list_layout_state = select_list_layout_state;
     }
@@ -2158,10 +2160,6 @@ impl FormatFrameStack {
 
     fn open_cursor_state(&self) -> OpenCursorFormatState {
         self.runtime_state.open_cursor_state
-    }
-
-    fn open_cursor_state_mut(&mut self) -> &mut OpenCursorFormatState {
-        &mut self.runtime_state.open_cursor_state
     }
 
     fn set_open_cursor_state(&mut self, open_cursor_state: OpenCursorFormatState) {
@@ -2319,6 +2317,7 @@ impl FormatFrameStack {
             frame,
             semantic_flags,
             runtime_state_snapshot: capture_runtime_state.then(|| self.runtime_state.clone()),
+            applied_query_base_depth: new_query_base_depth,
             previous_active_paren_metrics,
             previous_paren_frame_id: self.current_paren_frame_id,
             previous_query_base_depth,
@@ -3207,6 +3206,7 @@ impl FormatFrameStack {
 
     fn sync_to_scope(&mut self, current_scope: FormatScope, indent_level: &mut usize) {
         self.pop_tail_auxiliary_frames_for_scope(current_scope, indent_level);
+        self.realign_indent_level_to_base(indent_level);
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity_for_scope(current_scope);
@@ -7731,14 +7731,16 @@ impl SqlEditorWidget {
         }
         macro_rules! clear_select_list_layout_state {
             () => {{
-                format_stack.select_list_layout_state_mut().clear();
+                let mut next_layout = format_stack.select_list_layout_state();
+                next_layout.clear();
+                format_stack.set_select_list_layout_state(next_layout);
             }};
         }
         macro_rules! activate_select_list_layout_state {
             ($anchor:expr, $indent:expr) => {{
-                format_stack
-                    .select_list_layout_state_mut()
-                    .activate($anchor, $indent);
+                let mut next_layout = format_stack.select_list_layout_state();
+                next_layout.activate($anchor, $indent);
+                format_stack.set_select_list_layout_state(next_layout);
             }};
         }
         macro_rules! set_select_list_layout_state {
@@ -8801,9 +8803,9 @@ impl SqlEditorWidget {
                                 // WITH body. Otherwise a later `FOR` in PIVOT/UNPIVOT or
                                 // similar syntax can be misread as a new OPEN ... FOR.
                                 let current_paren_depth = format_stack.paren_depth();
-                                format_stack
-                                    .open_cursor_state_mut()
-                                    .set_select_depth(current_paren_depth);
+                                let mut next_open_cursor_state = format_stack.open_cursor_state();
+                                next_open_cursor_state.set_select_depth(current_paren_depth);
+                                format_stack.set_open_cursor_state(next_open_cursor_state);
                             }
                             if upper == "WITH" {
                                 set_statement_has_with_clause!(true);
@@ -38906,6 +38908,7 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_extra_depth(), 0);
         assert_eq!(stack.paren_extra_depth_within_current_query_frame(), 0);
         assert!(!stack.has_compact_non_query_frame_since_last_query());
+        assert_eq!(stack.last_compact_paren_open_line_indent(), None);
 
         stack.push_paren(
             compact,
@@ -38922,6 +38925,7 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_extra_depth(), 1);
         assert_eq!(stack.paren_extra_depth_within_current_query_frame(), 1);
         assert!(stack.has_compact_non_query_frame_since_last_query());
+        assert_eq!(stack.last_compact_paren_open_line_indent(), Some(0));
 
         stack.push_paren(
             query_like,
@@ -38938,6 +38942,7 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_extra_depth(), 1);
         assert_eq!(stack.paren_extra_depth_within_current_query_frame(), 0);
         assert!(!stack.has_compact_non_query_frame_since_last_query());
+        assert_eq!(stack.last_compact_paren_open_line_indent(), None);
 
         let popped_query_like = stack.pop_paren(&mut indent_level);
         assert!(popped_query_like.is_some());
@@ -38945,6 +38950,7 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_extra_depth(), 1);
         assert_eq!(stack.paren_extra_depth_within_current_query_frame(), 1);
         assert!(stack.has_compact_non_query_frame_since_last_query());
+        assert_eq!(stack.last_compact_paren_open_line_indent(), Some(0));
 
         let popped_compact = stack.pop_paren(&mut indent_level);
         assert!(popped_compact.is_some());
@@ -38953,6 +38959,7 @@ mod format_frame_stack_tests {
         assert_eq!(stack.paren_extra_depth(), 0);
         assert_eq!(stack.paren_extra_depth_within_current_query_frame(), 0);
         assert!(!stack.has_compact_non_query_frame_since_last_query());
+        assert_eq!(stack.last_compact_paren_open_line_indent(), None);
     }
 
     #[test]
@@ -39126,6 +39133,89 @@ mod format_frame_stack_tests {
         assert!(!stack.between_pending_matches(FormatScope::new(1, 1)));
         assert!(stack.last_block_kind_is("IF"));
         assert_eq!(stack.block_depth(), 1);
+    }
+
+    #[test]
+    fn format_frame_stack_rebuild_restores_query_base_depth_from_nearest_active_paren_payload() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 0, false, 2, None),
+            ParenSemanticFlags::default(),
+            false,
+            Some(1),
+            None,
+            None,
+            &mut indent_level,
+        );
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+
+        stack.current_query_base_depth = None;
+        stack.rebuild_structural_state_from_frames();
+
+        assert_eq!(stack.current_query_base_depth(), Some(1));
+    }
+
+    #[test]
+    fn format_frame_stack_sync_to_scope_realigns_indent_level_to_surviving_frames() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        stack.push_scoped_indent(
+            ScopedIndentKind::MySqlHandlerBody,
+            stack.current_scope(),
+            1,
+            &mut indent_level,
+        );
+        assert_eq!(indent_level, 3);
+
+        indent_level = 99;
+        stack.sync_to_scope(stack.current_scope(), &mut indent_level);
+
+        assert_eq!(indent_level, 3);
+        assert_eq!(stack.block_depth(), 1);
+        assert!(stack.scoped_indent_is_active(ScopedIndentKind::MySqlHandlerBody));
+    }
+
+    #[test]
+    fn format_frame_stack_rebuild_prefers_innermost_active_query_base_depth_payload() {
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 0, false, 2, None),
+            ParenSemanticFlags::default(),
+            false,
+            Some(2),
+            None,
+            None,
+            &mut indent_level,
+        );
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 0, false, 2, None),
+            ParenSemanticFlags::default(),
+            false,
+            Some(6),
+            None,
+            None,
+            &mut indent_level,
+        );
+
+        stack.current_query_base_depth = None;
+
+        stack.rebuild_structural_state_from_frames();
+
+        assert_eq!(stack.current_query_base_depth(), Some(6));
     }
 
     #[test]
