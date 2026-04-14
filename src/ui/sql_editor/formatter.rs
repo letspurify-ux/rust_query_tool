@@ -226,7 +226,7 @@ impl IndentCache {
     fn spaces(&mut self, count: usize) -> &str {
         if self.spaces.len() < count {
             self.spaces
-                .extend(std::iter::repeat(' ').take(count.saturating_sub(self.spaces.len())));
+                .extend(std::iter::repeat_n(' ', count.saturating_sub(self.spaces.len())));
         }
         &self.spaces[..count]
     }
@@ -500,7 +500,7 @@ impl FormatterTokenCache {
         let mut wrapped_layout_heads = vec![false; tokens.len()];
         let mut head_scan_cache = vec![None; tokens.len()];
 
-        for idx in 0..tokens.len() {
+        for (idx, is_wrapped_layout_head) in wrapped_layout_heads.iter_mut().enumerate() {
             if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                 continue;
             }
@@ -525,7 +525,7 @@ impl FormatterTokenCache {
                 continue;
             };
 
-            wrapped_layout_heads[idx] = word.eq_ignore_ascii_case("CASE")
+            *is_wrapped_layout_head = word.eq_ignore_ascii_case("CASE")
                 || (scan.saw_wrapper_paren && crate::sql_text::is_subquery_head_keyword(word));
         }
 
@@ -1534,7 +1534,7 @@ struct ScopedIndentFrame {
 
 #[derive(Clone)]
 enum FormatFrame {
-    Paren(ParenStackFrame),
+    Paren(Box<ParenStackFrame>),
     Block(BlockStackFrame),
     ScopedIndent(ScopedIndentFrame),
     ConstructFlag(ConstructFlagFrame),
@@ -1846,7 +1846,7 @@ impl FrameIndexCache {
         Self::shift_indices(&mut self.with_cte_indices, removed_idx);
     }
 
-    fn shift_indices(indices: &mut Vec<usize>, removed_idx: usize) {
+    fn shift_indices(indices: &mut [usize], removed_idx: usize) {
         for stored in indices.iter_mut() {
             if *stored > removed_idx {
                 *stored = stored.saturating_sub(1);
@@ -2312,7 +2312,7 @@ impl FormatFrameStack {
             *indent_level = indent_level.saturating_add(frame.indent_level_delta());
         }
         self.active_paren_metrics = self.active_paren_metrics.after_push(frame);
-        self.push_frame(FormatFrame::Paren(ParenStackFrame {
+        self.push_frame(FormatFrame::Paren(Box::new(ParenStackFrame {
             id: frame_id,
             frame,
             semantic_flags,
@@ -2323,7 +2323,7 @@ impl FormatFrameStack {
             previous_query_base_depth,
             wrapped_owner_kind,
             open_cursor_restore_state,
-        }));
+        })));
         self.paren_depth = self.paren_depth.saturating_add(1);
         self.current_paren_frame_id = Some(frame_id);
         #[cfg(debug_assertions)]
@@ -2367,6 +2367,7 @@ impl FormatFrameStack {
         let Some(FormatFrame::Paren(frame)) = self.pop_tail_frame() else {
             return None;
         };
+        let frame = *frame;
         if frame.frame.closes_indented() {
             *indent_level = indent_level.saturating_sub(frame.frame.indent_level_delta());
         }
@@ -5128,15 +5129,15 @@ impl SqlEditorWidget {
         let mut formatted_idx = 0usize;
         let last_source_idx = max_source_idx.min(source_spans.len().saturating_sub(1));
 
-        for source_idx in 0..=last_source_idx {
-            let Some(source_span) = source_spans.get(source_idx) else {
-                break;
-            };
-
+        for (source_span, alignment_slot) in source_spans
+            .iter()
+            .zip(alignment.iter_mut())
+            .take(last_source_idx.saturating_add(1))
+        {
             while let Some(formatted_span) = formatted_spans.get(formatted_idx) {
                 if Self::cursor_mapping_tokens_equivalent(&source_span.token, &formatted_span.token)
                 {
-                    alignment[source_idx] = Some(formatted_idx);
+                    *alignment_slot = Some(formatted_idx);
                     formatted_idx = formatted_idx.saturating_add(1);
                     break;
                 }
@@ -7945,7 +7946,7 @@ impl SqlEditorWidget {
                             Some(token_cache.meaningful_links()),
                         );
                     let as_belongs_to_constructor_result_clause = upper == "AS"
-                        && matches!(prev_word_upper.as_deref(), Some("SELF"))
+                        && matches!(prev_word_upper, Some("SELF"))
                         && next_word_is("RESULT");
                     let mysql_begin_not_atomic_header = mysql_compatible
                         && upper == "BEGIN"
@@ -7959,11 +7960,11 @@ impl SqlEditorWidget {
                         && !as_belongs_to_constructor_result_clause
                         && format_stack.with_cte_collecting_routine_declaration_body_start();
                     if !with_cte_keyword_inside_function_local {
-                        format_stack.with_cte_on_word(upper, prev_word_upper.as_deref());
+                        format_stack.with_cte_on_word(upper, prev_word_upper);
                     }
                     let with_plsql_declaration_header =
                         sql_text::is_with_plsql_declaration_keyword(upper)
-                            && (prev_word_upper.as_deref() == Some("WITH")
+                            && (prev_word_upper == Some("WITH")
                                 || format_stack.with_cte_collecting_plsql_declaration_header());
                     let in_sql_case_clause = matches!(
                         format_stack.current_clause(),
@@ -7988,10 +7989,10 @@ impl SqlEditorWidget {
                             Some(token_cache.meaningful_links()),
                         );
                     let is_analytic_within_group = upper == "GROUP"
-                        && matches!(prev_word_upper.as_deref(), Some("WITHIN"))
+                        && matches!(prev_word_upper, Some("WITHIN"))
                         && token_cache.within_group_has_over(idx);
                     let is_within_group = upper == "GROUP"
-                        && matches!(prev_word_upper.as_deref(), Some("WITHIN"))
+                        && matches!(prev_word_upper, Some("WITHIN"))
                         && !is_analytic_within_group;
                     let active_phase1_wrapped_owner_kind =
                         Self::active_phase1_wrapped_owner_kind_at_depth(
@@ -8009,7 +8010,7 @@ impl SqlEditorWidget {
                             || Self::suppresses_condition_break(
                                 &format_stack,
                                 upper,
-                                prev_word_upper.as_deref(),
+                                prev_word_upper,
                                 format_stack.trigger_header_is_active(),
                             )
                             // ON inside non-subquery parens (e.g. JSON_VALUE ... ON ERROR)
@@ -8067,7 +8068,7 @@ impl SqlEditorWidget {
                     let is_create_index_on =
                         upper == "ON" && construct_flag_active!(CreateIndexPending);
                     let follows_alias_keyword =
-                        matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
+                        matches!(prev_word_upper, Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
                         format_stack.current_clause(),
                         Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
@@ -8171,7 +8172,7 @@ impl SqlEditorWidget {
                             || treat_control_keyword_as_identifier
                             || follows_alias_control_keyword);
                     let follows_type_method_modifier = matches!(
-                        prev_word_upper.as_deref(),
+                        prev_word_upper,
                         Some("MEMBER" | "STATIC" | "CONSTRUCTOR")
                     );
                     let at_package_body_member_depth =
@@ -8515,7 +8516,7 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     } else if is_trigger_event_keyword
-                        && matches!(prev_word_upper.as_deref(), Some("BEFORE" | "AFTER" | "OF"))
+                        && matches!(prev_word_upper, Some("BEFORE" | "AFTER" | "OF"))
                     {
                         // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
                     } else if format_stack
@@ -8557,7 +8558,7 @@ impl SqlEditorWidget {
                             tokens,
                             idx,
                             upper,
-                            prev_word_upper.as_deref(),
+                            prev_word_upper,
                             in_plsql_block,
                             suppress_comma_break_depth,
                             format_stack.has_query_like_paren(),
@@ -9585,7 +9586,7 @@ impl SqlEditorWidget {
                                 let paren_extra = Self::paren_extra_depth(&format_stack);
                                 let in_case_branch_body = format_stack.last_block_kind_is("CASE")
                                     && (format_stack.last_case_branch_started()
-                                        || matches!(prev_word_upper.as_deref(), Some("THEN")));
+                                        || matches!(prev_word_upper, Some("THEN")));
                                 if let Some(values_case_indent) = values_case_indent {
                                     newline_with(
                                         &mut out,
@@ -9963,7 +9964,7 @@ impl SqlEditorWidget {
                         newline_after_keyword_extra = 1;
                     }
 
-                    if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
+                    if prev_word_upper == Some("COMPOUND") && upper == "TRIGGER" {
                         format_stack.clear_trigger_header();
                         if !format_stack.last_block_kind_is("COMPOUND_TRIGGER") {
                             format_stack.push_block(
@@ -10089,7 +10090,7 @@ impl SqlEditorWidget {
 
                     // INSERT ALL/FIRST tracking
                     if matches!(upper, "ALL" | "FIRST")
-                        && matches!(prev_word_upper.as_deref(), Some("INSERT"))
+                        && matches!(prev_word_upper, Some("INSERT"))
                         && !construct_flag_active_at_paren_depth!(
                             InsertAllActive,
                             current_scope.paren_depth
@@ -10304,7 +10305,7 @@ impl SqlEditorWidget {
                         mysql_begin_not_atomic_header_open = true;
                     } else if mysql_begin_not_atomic_header_open
                         && upper == "ATOMIC"
-                        && matches!(prev_word_upper.as_deref(), Some("NOT"))
+                        && matches!(prev_word_upper, Some("NOT"))
                     {
                         mysql_begin_not_atomic_header_open = false;
                         newline_with(
@@ -10501,7 +10502,7 @@ impl SqlEditorWidget {
                         trimmed_comment.starts_with("/*") && trimmed_comment.ends_with("*/");
                     let is_hint_comment = trimmed_comment.starts_with("/*+");
                     let hint_after_select =
-                        is_hint_comment && matches!(prev_word_upper.as_deref(), Some("SELECT"));
+                        is_hint_comment && matches!(prev_word_upper, Some("SELECT"));
                     if hint_after_select {
                         has_leading_newline = false;
                         trim_trailing_space(&mut out);
@@ -10664,7 +10665,7 @@ impl SqlEditorWidget {
                         let next_word_upper = next_non_comment_idx
                             .and_then(|token_idx| token_cache.upper_word(token_idx));
                         let next_is_condition_keyword =
-                            if let Some(upper) = next_word_upper.as_deref() {
+                            if let Some(upper) = next_word_upper {
                                 condition_keywords.contains(&upper)
                                     && !(upper == "AND"
                                         && format_stack.between_pending_matches(current_scope))
@@ -10718,7 +10719,7 @@ impl SqlEditorWidget {
                             let in_if_block = format_stack.last_block_kind_is("IF");
                             let in_case_block = format_stack.last_block_kind_is("CASE");
                             let next_is_exception =
-                                next_word_upper.as_deref().is_some_and(|w| w == "EXCEPTION");
+                                next_word_upper.is_some_and(|w| w == "EXCEPTION");
                             line_indent = if next_is_exception {
                                 // EXCEPTION always drops to the enclosing
                                 // BEGIN level regardless of block type.
@@ -10738,7 +10739,6 @@ impl SqlEditorWidget {
                             // indented at base+1, matching the token
                             // handler's paren_extra offset.
                             let case_branch_indent = next_word_upper
-                                .as_deref()
                                 .filter(|word| *word == "WHEN")
                                 .filter(|_| format_stack.last_block_kind_is("CASE"))
                                 .and_then(|_| {
@@ -10747,7 +10747,6 @@ impl SqlEditorWidget {
                                         .map(|depth| depth.saturating_add(1))
                                 });
                             let join_condition_indent = next_word_upper
-                                .as_deref()
                                 .filter(|word| matches!(*word, "AND" | "OR"))
                                 .and_then(|_| {
                                     format_stack
@@ -11753,7 +11752,7 @@ impl SqlEditorWidget {
                                 token_cache.paren_body_contains_newline(idx);
                             let is_analytic_over_paren = Self::paren_opens_analytic_layout(
                                 format_stack.current_clause(),
-                                prev_word_upper.as_deref(),
+                                prev_word_upper,
                             );
                             let multiline_clause_owner_kind =
                                 Self::paren_multiline_clause_owner_kind(
@@ -11763,7 +11762,7 @@ impl SqlEditorWidget {
                                 )
                                 .or_else(|| {
                                     (matches!(format_stack.current_clause(), Some("WINDOW"))
-                                        && matches!(prev_word_upper.as_deref(), Some("AS")))
+                                        && matches!(prev_word_upper, Some("AS")))
                                     .then_some(FormatIndentedParenOwnerKind::Window)
                                 });
                             let wrapped_owner_kind = multiline_clause_owner_kind.filter(|kind| {
@@ -11790,7 +11789,7 @@ impl SqlEditorWidget {
                                 && body_contains_query_like_child;
                             let forced_wrapped_owner_kind = force_within_group_wrapped_layout
                                 .then_some(FormatIndentedParenOwnerKind::WithinGroup);
-                            let is_keep_paren = matches!(prev_word_upper.as_deref(), Some("KEEP"));
+                            let is_keep_paren = matches!(prev_word_upper, Some("KEEP"));
                             let is_multiline_clause_paren = matches!(
                                 multiline_clause_owner_kind,
                                 Some(
@@ -11803,7 +11802,7 @@ impl SqlEditorWidget {
                             ) || is_analytic_over_paren;
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
                             let is_column_list = Self::paren_opens_structured_column_list(
-                                prev_word_upper.as_deref(),
+                                prev_word_upper,
                                 construct_flag_active!(CreateTableParenExpected),
                             );
                             let preserves_mysql_on_duplicate_multiline_call = mysql_compatible
@@ -11839,7 +11838,7 @@ impl SqlEditorWidget {
                                 && !is_call_argument_list
                                 && !preserves_mysql_on_duplicate_multiline_call
                                 && !matches!(
-                                    prev_word_upper.as_deref(),
+                                    prev_word_upper,
                                     Some(
                                         "IF" | "THEN"
                                             | "ELSE"
@@ -11899,7 +11898,7 @@ impl SqlEditorWidget {
                                     // Keep the existing dedicated `SELECT (` first-item path.
                                     && !Self::paren_starts_first_clause_list_item(
                                         format_stack.current_clause(),
-                                        prev_word_upper.as_deref(),
+                                        prev_word_upper,
                                         is_query_paren,
                                         format_stack.paren_depth(),
                                     )
@@ -11925,7 +11924,7 @@ impl SqlEditorWidget {
                             }
                             if Self::paren_starts_first_clause_list_item(
                                 format_stack.current_clause(),
-                                prev_word_upper.as_deref(),
+                                prev_word_upper,
                                 is_query_paren,
                                 format_stack.paren_depth(),
                             ) {
@@ -12050,7 +12049,7 @@ impl SqlEditorWidget {
                                 format_stack.current_clause(),
                                 Some("VALUES" | "FROM")
                             ) || matches!(
-                                prev_word_upper.as_deref(),
+                                prev_word_upper,
                                 Some("JSON_TABLE" | "XMLTABLE")
                             ) || wrapped_query_owner_paren
                             {
@@ -12211,7 +12210,7 @@ impl SqlEditorWidget {
                             );
                             let keeps_aggregate_call_tight = statement_has_apply
                                 && matches!(
-                                    prev_word_upper.as_deref(),
+                                    prev_word_upper,
                                     Some("AVG" | "COUNT" | "MAX" | "MIN")
                                 );
                             let keeps_count_star_call_tight =
@@ -12252,7 +12251,7 @@ impl SqlEditorWidget {
                                 });
                             let branch_wrapper_close_indent = (paren_started_at_line_start
                                 && format_stack.last_block_kind_is("CASE")
-                                && matches!(prev_word_upper.as_deref(), Some("THEN" | "ELSE")))
+                                && matches!(prev_word_upper, Some("THEN" | "ELSE")))
                             .then_some(semantic_open_line_indent.saturating_sub(1));
                             let paren_close_indent_override = query_like_layout
                                 .map(|layout| layout.close_depth)

@@ -810,11 +810,11 @@ impl SqlEditorWidget {
             }
         }
 
-        for scope_id in 0..scopes.len() {
-            let Some(decl_start_idx) = scopes[scope_id].decl_start_idx else {
+        for (scope_id, scope) in scopes.iter().enumerate() {
+            let Some(decl_start_idx) = scope.decl_start_idx else {
                 continue;
             };
-            let Some(decl_end_idx) = scopes[scope_id].decl_end_idx else {
+            let Some(decl_end_idx) = scope.decl_end_idx else {
                 continue;
             };
             if decl_start_idx >= decl_end_idx || decl_start_idx >= token_spans.len() {
