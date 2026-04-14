@@ -259,11 +259,7 @@ fn sql_editor_alert_calls_use_wrapper_function() {
         "mod.rs should call fltk::dialog::alert_default only inside queue drain"
     );
 
-    let file_checks = [
-        ("execution.rs", include_str!("execution.rs")),
-        ("dba_tools.rs", include_str!("dba_tools.rs")),
-        ("session_monitor.rs", include_str!("session_monitor.rs")),
-    ];
+    let file_checks = [("execution.rs", include_str!("execution.rs"))];
 
     for (name, source) in file_checks {
         assert_eq!(

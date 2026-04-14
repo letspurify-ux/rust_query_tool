@@ -33,7 +33,6 @@ use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
 
-mod dba_tools;
 mod execution;
 mod formatter;
 mod intellisense;
@@ -41,7 +40,6 @@ mod intellisense_host;
 mod intellisense_state;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
 pub(crate) mod query_text;
-mod session_monitor;
 
 use self::intellisense_state::{
     IntellisenseCompletionRange, IntellisensePopupTransitionState, IntellisenseRuntimeState,

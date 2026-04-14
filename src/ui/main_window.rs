@@ -1021,14 +1021,6 @@ impl MainWindow {
         explain_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&explain_btn, BUTTON_WIDTH);
 
-        let mut clear_btn = Button::default()
-            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
-            .with_label("Clear");
-        clear_btn.set_color(theme::button_subtle());
-        clear_btn.set_label_color(theme::text_secondary());
-        clear_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&clear_btn, BUTTON_WIDTH_SMALL);
-
         let mut commit_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Commit");
@@ -1165,7 +1157,7 @@ impl MainWindow {
 
         let mut query_close_tab_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close Query");
+            .with_label("Close");
         query_close_tab_btn.set_color(theme::button_subtle());
         query_close_tab_btn.set_label_color(theme::text_secondary());
         query_close_tab_btn.set_frame(FrameType::RFlatBox);
@@ -1202,7 +1194,7 @@ impl MainWindow {
 
         let mut close_tab_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close Result");
+            .with_label("Close");
         close_tab_btn.set_color(theme::button_subtle());
         close_tab_btn.set_label_color(theme::text_secondary());
         close_tab_btn.set_frame(FrameType::RFlatBox);
@@ -1590,17 +1582,6 @@ impl MainWindow {
                 if let Some(editor) = acquire_sql_editor_if_idle(&state_for_explain) {
                     editor.explain_current();
                 }
-            }
-        });
-
-        let weak_state_for_clear_btn = Arc::downgrade(&state);
-        clear_btn.set_callback(move |_| {
-            if let Some(state_for_clear_btn) = weak_state_for_clear_btn.upgrade() {
-                state_for_clear_btn
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .clear();
             }
         });
 
@@ -2920,7 +2901,7 @@ impl MainWindow {
         choice: &str,
     ) -> bool {
         match choice {
-            "File/Connect..." => {
+            "File/Connect" => {
                 let (popups, connection) = {
                     let s = state
                         .lock()
@@ -3011,7 +2992,7 @@ impl MainWindow {
                 MainWindow::transition_to_disconnected_state(&mut s, None);
                 true
             }
-            "File/Open SQL File..." => {
+            "File/Open SQL File" => {
                 let mut dialog = FileDialog::new(FileDialogType::BrowseFile);
                 dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
                 dialog.show();
@@ -3037,7 +3018,7 @@ impl MainWindow {
                 }
                 true
             }
-            "File/Save SQL File..." => {
+            "File/Save SQL File" => {
                 let tab_id = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3047,7 +3028,7 @@ impl MainWindow {
                 }
                 true
             }
-            "File/Save SQL File As..." => {
+            "File/Save SQL File As" => {
                 let tab_id = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3221,7 +3202,7 @@ impl MainWindow {
                 }
                 true
             }
-            "Query/New Tab" => {
+            "File/New SQL File" => {
                 let created_tab_id = {
                     let mut s = state
                         .lock()
@@ -3242,7 +3223,7 @@ impl MainWindow {
                 }
                 true
             }
-            "Query/Close Tab" => {
+            "File/Close SQL File" => {
                 let tab_id = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3305,16 +3286,7 @@ impl MainWindow {
                 MainWindow::start_connection_metadata_refresh(&mut s, schema_sender);
                 true
             }
-            "Tools/Session Lock Monitor..."
-            | "Tools/Cursor Plan Analyzer..."
-            | "Tools/SQL Monitor Dashboard..."
-            | "Tools/Storage Dashboard..."
-            | "Tools/Scheduler Manager..."
-            | "Tools/Security Manager..."
-            | "Tools/RMAN Dashboard..."
-            | "Tools/AWR/ASH Dashboard..."
-            | "Tools/Data Guard Dashboard..." => true,
-            "Tools/Export Results..." => {
+            "Tools/Export Results" => {
                 let has_data = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3355,7 +3327,7 @@ impl MainWindow {
                 });
                 true
             }
-            "Edit/Find..." => {
+            "Edit/Find" => {
                 let (mut editor, mut buffer, popups) = {
                     let s = state
                         .lock()
@@ -3387,7 +3359,7 @@ impl MainWindow {
                 }
                 true
             }
-            "Edit/Replace..." => {
+            "Edit/Replace" => {
                 let (mut editor, mut buffer, popups) = {
                     let s = state
                         .lock()
@@ -3441,11 +3413,11 @@ impl MainWindow {
                     .show_intellisense();
                 true
             }
-            "Tools/Query History..." => {
+            "Tools/Query History" => {
                 MainWindow::open_query_history_dialog(state);
                 true
             }
-            "Tools/Application Log..." => {
+            "Tools/Application Log" => {
                 let popups = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3506,7 +3478,7 @@ impl MainWindow {
                 s.status_bar.set_label(&format_status(status, &conn_info));
                 true
             }
-            "Settings/Preferences..." => {
+            "Settings/Preferences" => {
                 let config_snapshot = {
                     let s = state
                         .lock()
@@ -3576,7 +3548,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('n')
                     || k == fltk::enums::Key::from_char('N')) =>
             {
-                Some("File/Connect...")
+                Some("File/Connect")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('d')
@@ -3588,21 +3560,21 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('o')
                     || k == fltk::enums::Key::from_char('O')) =>
             {
-                Some("File/Open SQL File...")
+                Some("File/Open SQL File")
             }
             k if ctrl_or_cmd
                 && !shift
                 && (k == fltk::enums::Key::from_char('s')
                     || k == fltk::enums::Key::from_char('S')) =>
             {
-                Some("File/Save SQL File...")
+                Some("File/Save SQL File")
             }
             k if ctrl_or_cmd
                 && shift
                 && (k == fltk::enums::Key::from_char('s')
                     || k == fltk::enums::Key::from_char('S')) =>
             {
-                Some("File/Save SQL File As...")
+                Some("File/Save SQL File As")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('q')
@@ -3665,7 +3637,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('h')
                     || k == fltk::enums::Key::from_char('H')) =>
             {
-                Some("Edit/Replace...")
+                Some("Edit/Replace")
             }
             k if ctrl_or_cmd
                 && shift
@@ -3678,7 +3650,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('f')
                     || k == fltk::enums::Key::from_char('F')) =>
             {
-                Some("Edit/Find...")
+                Some("Edit/Find")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('/')
@@ -3708,13 +3680,13 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('t')
                     || k == fltk::enums::Key::from_char('T')) =>
             {
-                Some("Query/New Tab")
+                Some("File/New SQL File")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('w')
                     || k == fltk::enums::Key::from_char('W')) =>
             {
-                Some("Query/Close Tab")
+                Some("File/Close SQL File")
             }
             fltk::enums::Key::F5 => Some("Query/Execute"),
             k if ctrl_or_cmd
@@ -3731,7 +3703,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('e')
                     || k == fltk::enums::Key::from_char('E')) =>
             {
-                Some("Tools/Export Results...")
+                Some("Tools/Export Results")
             }
             _ => None,
         }
@@ -4544,7 +4516,7 @@ mod tests {
             Shortcut::Ctrl,
         );
 
-        assert_eq!(action, Some("Edit/Find..."));
+        assert_eq!(action, Some("Edit/Find"));
     }
 
     #[test]
@@ -4555,7 +4527,7 @@ mod tests {
             Shortcut::Ctrl,
         );
 
-        assert_eq!(action, Some("Edit/Find..."));
+        assert_eq!(action, Some("Edit/Find"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use fltk::{
     app,
-    enums::{Event, Key},
+    enums::{Align, Event, Key},
+    frame::Frame,
     group::{Flex, FlexType},
     input::Input,
     prelude::*,
@@ -126,6 +127,7 @@ pub struct ObjectBrowserWidget {
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
     filter_input: Input,
+    filter_label: Frame,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
@@ -145,12 +147,25 @@ impl ObjectBrowserWidget {
         flex.set_type(FlexType::Column);
         flex.set_spacing(DIALOG_SPACING);
 
+        let mut filter_row = Flex::default();
+        filter_row.set_type(FlexType::Row);
+        filter_row.set_spacing(DIALOG_SPACING);
+
+        let mut filter_label = Frame::default().with_label("Filter");
+        filter_label.set_label_color(theme::text_secondary());
+        filter_label.set_label_font(configured_editor_profile().normal);
+        filter_label.set_label_size(configured_ui_font_size());
+        filter_label.set_align(Align::Inside | Align::Left);
+        filter_row.fixed(&filter_label, 44);
+
         // Filter input with modern styling
         let mut filter_input = Input::default();
         filter_input.set_color(theme::input_bg());
         filter_input.set_text_color(theme::text_primary());
         filter_input.set_tooltip("Type to filter objects...");
-        flex.fixed(&filter_input, FILTER_INPUT_HEIGHT);
+        filter_row.resizable(&filter_input);
+        filter_row.end();
+        flex.fixed(&filter_row, FILTER_INPUT_HEIGHT);
 
         // Tree view with modern styling
         let mut tree = Tree::default();
@@ -192,6 +207,7 @@ impl ObjectBrowserWidget {
             tree,
             connection,
             filter_input,
+            filter_label,
             object_cache,
             current_db_type,
             pending_tree_refresh,
@@ -215,6 +231,8 @@ impl ObjectBrowserWidget {
     pub fn apply_font_settings(&mut self, profile: FontProfile, ui_size: i32) {
         self.filter_input.set_text_font(profile.normal);
         self.filter_input.set_text_size(ui_size);
+        self.filter_label.set_label_font(profile.normal);
+        self.filter_label.set_label_size(ui_size);
         self.tree.set_item_label_font(profile.normal);
         self.tree.set_item_label_size(ui_size);
         let canceled_pending_refresh = self.clear_pending_tree_refresh();
@@ -236,6 +254,7 @@ impl ObjectBrowserWidget {
         self.tree.resize(x, y, w, h);
         self.flex.layout();
         self.filter_input.redraw();
+        self.filter_label.redraw();
         self.tree.redraw();
         if canceled_pending_refresh {
             self.emit_status("Object browser metadata refresh completed");

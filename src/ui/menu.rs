@@ -120,7 +120,7 @@ impl MenuBarBuilder {
 
         // File menu
         menu.add(
-            "&File/&Connect...",
+            "&File/&Connect",
             Shortcut::Ctrl | Shortcut::Command | 'n',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -138,20 +138,32 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Open SQL File...",
+            "&File/&Open SQL File",
             Shortcut::Ctrl | Shortcut::Command | 'o',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Save SQL File...",
+            "&File/&New SQL File",
+            Shortcut::Command | 't',
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&File/&Save SQL File",
             Shortcut::Ctrl | Shortcut::Command | 's',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/Save SQL File &As...",
+            "&File/Save SQL File &As",
             Shortcut::Ctrl | Shortcut::Command | Shortcut::Shift | 's',
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&File/&Close SQL File",
+            Shortcut::Command | 'w',
             MenuFlag::Normal,
             forward_menu_callback,
         );
@@ -230,7 +242,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Find...",
+            "&Edit/&Find",
             Shortcut::Ctrl | Shortcut::Command | 'f',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -242,7 +254,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Replace...",
+            "&Edit/&Replace",
             Shortcut::Ctrl | Shortcut::Command | 'h',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -285,24 +297,6 @@ impl MenuBarBuilder {
         );
 
         // Query menu
-        menu.add(
-            "&Query/&New Tab",
-            Shortcut::Command | 't',
-            MenuFlag::Normal,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Query/&Close Tab",
-            Shortcut::Command | 'w',
-            MenuFlag::Normal,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Query/",
-            Shortcut::None,
-            MenuFlag::MenuDivider,
-            forward_menu_callback,
-        );
         menu.add(
             "&Query/&Execute",
             Shortcut::from_key(fltk::enums::Key::F5),
@@ -378,19 +372,19 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Export Results...",
+            "&Tools/&Export Results",
             Shortcut::Ctrl | Shortcut::Command | 'e',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Query History...",
+            "&Tools/&Query History",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/Application &Log...",
+            "&Tools/Application &Log",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
@@ -410,7 +404,7 @@ impl MenuBarBuilder {
 
         // Settings menu
         menu.add(
-            "&Settings/&Preferences...",
+            "&Settings/&Preferences",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
@@ -433,9 +427,11 @@ impl MenuBarBuilder {
                     File:\n\
                     Ctrl+N - Connect\n\
                     Ctrl+D - Disconnect\n\
+                    Ctrl+T - New SQL File\n\
                     Ctrl+O - Open SQL File\n\
                     Ctrl+S - Save SQL File\n\
                     Ctrl+Shift+S - Save SQL File As\n\
+                    Ctrl+W - Close SQL File\n\
                     Ctrl+Q - Exit\n\n\
                     Edit (SQL Editor):\n\
                     Ctrl+Z - Undo\n\
@@ -458,8 +454,6 @@ impl MenuBarBuilder {
                     Alt+Up/Down - Query History Prev/Next\n\
                     Ctrl+Click - Quick Describe at Cursor\n\n\
                     Query:\n\
-                    Ctrl+T - New Query Tab\n\
-                    Ctrl+W - Close Query Tab\n\
                     Ctrl+Enter - Execute Statement\n\
                     F5 - Execute Script\n\
                     F9 - Execute Statement\n\
