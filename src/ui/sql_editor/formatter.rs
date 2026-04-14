@@ -8219,6 +8219,19 @@ impl SqlEditorWidget {
                             &mut line_indent,
                         );
                     }
+                    if mysql_handler_body_line_pending
+                        && at_line_start
+                        && !mysql_handler_block_begin
+                    {
+                        let handler_body_indent = format_stack
+                            .mysql_handler_pending_body_indent()
+                            .unwrap_or_else(|| {
+                                line_indent
+                                    .max(base_indent!(indent_level))
+                                    .saturating_add(1)
+                            });
+                        line_indent = line_indent.max(handler_body_indent);
+                    }
                     if mysql_labeled_block_header_word && !at_line_start {
                         newline_with(
                             &mut out,
@@ -8656,9 +8669,6 @@ impl SqlEditorWidget {
                                     && insert_all_branch_indent.is_none()
                                     && matches!(upper, "INTO" | "VALUES"),
                             );
-                            let mysql_handler_body_extra = usize::from(
-                                mysql_handler_body_line_pending && !mysql_handler_block_begin,
-                            );
                             let create_query_body_base_depth =
                                 (crate::sql_text::is_subquery_head_keyword(upper)
                                     && format_stack.paren_is_empty())
@@ -8777,7 +8787,7 @@ impl SqlEditorWidget {
                                 newline_with(
                                     &mut out,
                                     branch_indent,
-                                    mysql_handler_body_extra,
+                                    0,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -8786,6 +8796,7 @@ impl SqlEditorWidget {
                                 let plsql_statement_body_indent = (in_plsql_block
                                     && at_line_start
                                     && format_stack.current_clause().is_none()
+                                    && !format_stack.open_cursor_state().in_select()
                                     && format_stack.paren_is_empty())
                                 .then_some(line_indent);
                                 let select_clause_header_indent =
@@ -8834,7 +8845,7 @@ impl SqlEditorWidget {
                                     plsql_statement_body_indent
                                         .map(|indent| indent.max(clause_header_indent))
                                         .unwrap_or(clause_header_indent),
-                                    insert_all_extra + mysql_handler_body_extra,
+                                    insert_all_extra,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -10444,6 +10455,8 @@ impl SqlEditorWidget {
                                 )
                             })
                             .unwrap_or(0);
+                        let current_output_line = out.rsplit('\n').next().unwrap_or("");
+                        let previous_output_line = out.rsplit('\n').nth(1).unwrap_or("");
                         let case_branch_body_indent = (in_plsql_block
                             && format_stack.last_block_kind_is("CASE")
                             && matches!(upper, "THEN" | "ELSE"))
@@ -10454,7 +10467,20 @@ impl SqlEditorWidget {
                             .then(|| {
                                 let rendered_body_indent =
                                     current_output_line_indent.saturating_add(1);
-                                let control_owner_body_indent = closed_control_header_body_indent
+                                let split_close_condition_body_indent = matches!(upper, "THEN")
+                                    .then_some(())
+                                    .filter(|_| {
+                                        let trimmed_current = current_output_line.trim_start();
+                                        let trimmed_previous = previous_output_line.trim_end();
+                                        (trimmed_current == "AND"
+                                            || trimmed_current.starts_with("AND ")
+                                            || trimmed_current == "OR"
+                                            || trimmed_current.starts_with("OR "))
+                                            && trimmed_previous.ends_with(')')
+                                    })
+                                    .map(|_| rendered_body_indent);
+                                closed_control_header_body_indent
+                                    .or(split_close_condition_body_indent)
                                     .or_else(|| {
                                         matches!(upper, "THEN")
                                             .then(|| {
@@ -10466,8 +10492,6 @@ impl SqlEditorWidget {
                                             })
                                             .flatten()
                                     })
-                                    .map(|indent| indent.max(rendered_body_indent));
-                                control_owner_body_indent
                                     .or_else(|| matches!(upper, "LOOP" | "DO").then_some(rendered_body_indent))
                             })
                             .flatten();
