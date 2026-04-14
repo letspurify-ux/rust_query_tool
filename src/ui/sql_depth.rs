@@ -1,106 +1,10 @@
+use crate::sql_delimiter::{
+    line_closes_delimiter_frame_below_snapshot_before_token, line_start_snapshot_before_token,
+    DelimiterFrameState,
+};
 use crate::ui::sql_editor::SqlToken;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DelimiterFrameKind {
-    Unknown,
-    Paren,
-    Bracket,
-    Brace,
-}
-
-impl DelimiterFrameKind {
-    fn from_open_char(symbol: char) -> Option<Self> {
-        match symbol {
-            '(' => Some(Self::Paren),
-            '[' => Some(Self::Bracket),
-            '{' => Some(Self::Brace),
-            _ => None,
-        }
-    }
-
-    fn from_close_char(symbol: char) -> Option<Self> {
-        match symbol {
-            ')' => Some(Self::Paren),
-            ']' => Some(Self::Bracket),
-            '}' => Some(Self::Brace),
-            _ => None,
-        }
-    }
-
-    fn can_be_closed_by(self, close_kind: Self) -> bool {
-        matches!(self, Self::Unknown) || self == close_kind
-    }
-}
-
-fn apply_symbol_to_strict_stack(stack: &mut Vec<DelimiterFrameKind>, symbol: &str) {
-    for sym_ch in symbol.chars() {
-        if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
-            stack.push(open_kind);
-            continue;
-        }
-
-        let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
-            continue;
-        };
-
-        if stack.last().copied().is_some_and(|top| top == close_kind) {
-            stack.pop();
-        }
-    }
-}
-
-fn apply_symbol_to_close_detection_stack(
-    stack: &mut Vec<DelimiterFrameKind>,
-    symbol: &str,
-    line_start_frame_depth: usize,
-) -> bool {
-    for sym_ch in symbol.chars() {
-        if let Some(open_kind) = DelimiterFrameKind::from_open_char(sym_ch) {
-            stack.push(open_kind);
-            continue;
-        }
-
-        let Some(close_kind) = DelimiterFrameKind::from_close_char(sym_ch) else {
-            continue;
-        };
-
-        if stack
-            .last()
-            .copied()
-            .is_some_and(|top| top.can_be_closed_by(close_kind))
-        {
-            stack.pop();
-            // Keep consuming the current symbol token in token order. A grouped
-            // symbol like `())(` can cross below line-start depth only on a
-            // later close event inside the same token.
-            if stack.len() < line_start_frame_depth {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-#[derive(Default)]
-pub(crate) struct ParenDepthState {
-    stack: Vec<DelimiterFrameKind>,
-}
-
-impl ParenDepthState {
-    #[inline]
-    pub(crate) fn depth(&self) -> usize {
-        self.stack.len()
-    }
-
-    pub(crate) fn apply_token(&mut self, token: &SqlToken) {
-        let SqlToken::Symbol(symbol) = token else {
-            return;
-        };
-
-        apply_symbol_to_strict_stack(&mut self.stack, symbol);
-    }
-}
+pub(crate) type ParenDepthState = DelimiterFrameState;
 
 /// Returns true when the token stream between `line_start_idx` and `token_idx`
 /// closes at least one delimiter frame that existed at line start depth before
@@ -109,48 +13,21 @@ impl ParenDepthState {
 /// This preserves strict token-order semantics for close/open chains such as
 /// `) + (` and `] + [`, using an explicit frame stack instead of net delta
 /// counting.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn line_closes_delimiter_frame_below_depth_before_token(
     tokens: &[SqlToken],
     line_start_idx: usize,
     token_idx: usize,
     line_start_depth: usize,
 ) -> bool {
-    if line_start_idx >= token_idx || line_start_depth == 0 {
-        return false;
-    }
-
-    let mut visible_line_start_stack: Vec<DelimiterFrameKind> = Vec::new();
-    for token in tokens.iter().take(line_start_idx) {
-        let SqlToken::Symbol(symbol) = token else {
-            continue;
-        };
-        apply_symbol_to_strict_stack(&mut visible_line_start_stack, symbol);
-    }
-
-    let synthetic_missing_depth = line_start_depth.saturating_sub(visible_line_start_stack.len());
-    let mut frame_stack = vec![DelimiterFrameKind::Unknown; synthetic_missing_depth];
-    frame_stack.extend(visible_line_start_stack.iter().copied());
-    // The caller-provided depth is the contract for "line-start frame depth".
-    // The reconstructed visible stack may be deeper (or shallower) depending on
-    // local token context, so close detection must compare against the explicit
-    // line-start depth instead of the reconstructed stack length.
-    let line_start_frame_depth = line_start_depth;
-
-    for token in tokens
-        .iter()
-        .skip(line_start_idx)
-        .take(token_idx.saturating_sub(line_start_idx))
-    {
-        let SqlToken::Symbol(symbol) = token else {
-            continue;
-        };
-
-        if apply_symbol_to_close_detection_stack(&mut frame_stack, symbol, line_start_frame_depth) {
-            return true;
-        }
-    }
-
-    false
+    let line_start_snapshot =
+        line_start_snapshot_before_token(tokens, line_start_idx, line_start_depth);
+    line_closes_delimiter_frame_below_snapshot_before_token(
+        tokens,
+        line_start_idx,
+        token_idx,
+        &line_start_snapshot,
+    )
 }
 
 /// Returns the parenthesis depth *before* each token is processed.

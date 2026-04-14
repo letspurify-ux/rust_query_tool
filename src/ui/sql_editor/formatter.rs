@@ -1,5 +1,9 @@
 use crate::db::connection::DatabaseType;
 use crate::db::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
+use crate::sql_delimiter::{
+    line_closes_delimiter_frame_below_snapshot_before_token, line_start_snapshot_before_token,
+    DelimiterLineStartSnapshot,
+};
 use crate::sql_format::{SqlFormatFrameId, SqlFormatFrameIdAllocator, SqlFormatScopedFrame};
 use crate::sql_text::{
     self, FormatIndentedParenOwnerKind, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS,
@@ -7,8 +11,8 @@ use crate::sql_text::{
     FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
 use crate::ui::sql_depth::{
-    is_depth, is_top_level_depth, line_closes_delimiter_frame_below_depth_before_token,
-    paren_depths, split_top_level_keyword_groups, split_top_level_symbol_groups,
+    is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
+    split_top_level_symbol_groups,
 };
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -835,7 +839,7 @@ impl FormatFrameStack {
     ) {
         let mut retained_frames = Vec::with_capacity(self.frames.len());
         for frame in self.frames.drain(..) {
-            if Self::frame_expires_for_scope(&frame, next_scope) {
+            if frame.expires_for_scope(next_scope) {
                 if let FormatFrame::ScopedIndent(frame) = &frame {
                     *indent_level = indent_level.saturating_sub(frame.delta);
                 }
@@ -844,44 +848,6 @@ impl FormatFrameStack {
             retained_frames.push(frame);
         }
         self.frames = retained_frames;
-    }
-
-    fn frame_expires_for_scope(frame: &FormatFrame, next_scope: FormatScope) -> bool {
-        match frame {
-            FormatFrame::ConditionOwner(owner) => match owner.kind {
-                ConditionOwnerKind::JoinOn | ConditionOwnerKind::Where => {
-                    !owner.scope.contains(next_scope)
-                }
-                ConditionOwnerKind::Case => !owner.scope.contains(next_scope),
-                ConditionOwnerKind::ControlHeader => !owner.scope.contains(next_scope),
-            },
-            FormatFrame::BetweenPending(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::ScopedIndent(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::ConstructFlag(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::ConstructValue(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
-                !scope.contains(next_scope)
-            }
-            FormatFrame::CompoundTrigger(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::WithCte(frame) => !frame.scope.contains(next_scope),
-            FormatFrame::Paren(_) | FormatFrame::Block(_) | FormatFrame::OpenCursorRestore(_) => {
-                false
-            }
-        }
-    }
-
-    fn frame_survives_statement_boundary(frame: &FormatFrame) -> bool {
-        matches!(
-            frame,
-            FormatFrame::Block(_)
-                | FormatFrame::ScopedIndent(ScopedIndentFrame {
-                    kind: ScopedIndentKind::MySqlHandlerBody,
-                    ..
-                })
-                | FormatFrame::PlsqlContext(_)
-                | FormatFrame::CompoundTrigger(_)
-                | FormatFrame::WithCte(_)
-        )
     }
 
     fn current_scope(&self) -> FormatScope {
@@ -1752,7 +1718,7 @@ impl FormatFrameStack {
     fn clear_statement_frames(&mut self, indent_level: &mut usize) {
         let mut retained_frames = Vec::with_capacity(self.frames.len());
         for frame in self.frames.drain(..) {
-            if Self::frame_survives_statement_boundary(&frame) {
+            if frame.survives_statement_boundary() {
                 retained_frames.push(frame);
                 continue;
             }
@@ -1882,7 +1848,7 @@ impl FormatFrameStack {
         self.debug_assert_integrity();
         for frame in &self.frames {
             debug_assert!(
-                Self::frame_survives_statement_boundary(frame),
+                frame.survives_statement_boundary(),
                 "non-persistent frame survived statement boundary cleanup"
             );
         }
@@ -2000,6 +1966,45 @@ impl FormatScope {
             SqlFormatScopedFrame::new(other.paren_depth, other.paren_frame_id),
         ) && SqlFormatScopedFrame::new(self.block_depth, self.block_frame_id).contains(
             SqlFormatScopedFrame::new(other.block_depth, other.block_frame_id),
+        )
+    }
+}
+
+impl FormatFrame {
+    fn expires_for_scope(&self, next_scope: FormatScope) -> bool {
+        match self {
+            FormatFrame::ConditionOwner(owner) => match owner.kind {
+                ConditionOwnerKind::JoinOn
+                | ConditionOwnerKind::Where
+                | ConditionOwnerKind::Case
+                | ConditionOwnerKind::ControlHeader => !owner.scope.contains(next_scope),
+            },
+            FormatFrame::BetweenPending(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::ScopedIndent(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::ConstructFlag(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::ConstructValue(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
+                !scope.contains(next_scope)
+            }
+            FormatFrame::CompoundTrigger(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::WithCte(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::Paren(_) | FormatFrame::Block(_) | FormatFrame::OpenCursorRestore(_) => {
+                false
+            }
+        }
+    }
+
+    fn survives_statement_boundary(&self) -> bool {
+        matches!(
+            self,
+            FormatFrame::Block(_)
+                | FormatFrame::ScopedIndent(ScopedIndentFrame {
+                    kind: ScopedIndentKind::MySqlHandlerBody,
+                    ..
+                })
+                | FormatFrame::PlsqlContext(_)
+                | FormatFrame::CompoundTrigger(_)
+                | FormatFrame::WithCte(_)
         )
     }
 }
@@ -5836,6 +5841,7 @@ impl SqlEditorWidget {
         let mut needs_space = false;
         let mut line_indent = 0usize;
         let mut line_start_token_paren_depth = 0usize;
+        let mut line_start_delimiter_snapshot = DelimiterLineStartSnapshot::default();
         let mut join_modifier_active = false;
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
         let mut prev_word_upper: Option<String> = None;
@@ -6120,6 +6126,11 @@ impl SqlEditorWidget {
             if at_line_start {
                 line_start_token_paren_depth = current_token_paren_depth;
                 line_start_token_idx = idx;
+                line_start_delimiter_snapshot = line_start_snapshot_before_token(
+                    tokens,
+                    line_start_token_idx,
+                    line_start_token_paren_depth,
+                );
             }
 
             match &tokens[idx] {
@@ -9713,7 +9724,7 @@ impl SqlEditorWidget {
                                             tokens,
                                             line_start_token_idx,
                                             idx,
-                                            line_start_token_paren_depth,
+                                            &line_start_delimiter_snapshot,
                                         ))
                                     {
                                         // Mixed close-comma SELECT/SET siblings must snap to the
@@ -11254,13 +11265,13 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         line_start_idx: usize,
         token_idx: usize,
-        line_start_depth: usize,
+        line_start_snapshot: &DelimiterLineStartSnapshot,
     ) -> bool {
-        line_closes_delimiter_frame_below_depth_before_token(
+        line_closes_delimiter_frame_below_snapshot_before_token(
             tokens,
             line_start_idx,
             token_idx,
-            line_start_depth,
+            line_start_snapshot,
         )
     }
 
@@ -19000,6 +19011,7 @@ ORDER BY v.amt DESC;"#;
 
 #[cfg(test)]
 mod format_indent_gap_tests {
+    use crate::sql_delimiter::line_start_snapshot_before_token;
     use crate::ui::sql_editor::SqlEditorWidget;
     use crate::ui::SqlToken;
 
@@ -36848,10 +36860,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in close-open token-order fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, 0, 1);
 
         assert!(
             SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
-                &tokens, 0, comma_idx, 1
+                &tokens,
+                0,
+                comma_idx,
+                &line_start_snapshot,
             ),
             "close->open sequence must report a frame close below the line-start depth before comma"
         );
@@ -36866,10 +36882,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in local balanced paren fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, 0, 0);
 
         assert!(
             !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
-                &tokens, 0, comma_idx, 0
+                &tokens,
+                0,
+                comma_idx,
+                &line_start_snapshot,
             ),
             "local balanced call parens at top-level must not be treated as closing a parent frame"
         );
@@ -36885,10 +36905,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in root close-open fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, 0, 0);
 
         assert!(
             !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
-                &tokens, 0, comma_idx, 0
+                &tokens,
+                0,
+                comma_idx,
+                &line_start_snapshot,
             ),
             "line-start depth 0 has no parent frame to close; unmatched close-open chain must not trigger close detection"
         );
@@ -36903,10 +36927,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in bracket close-open token-order fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, 0, 1);
 
         assert!(
             SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
-                &tokens, 0, comma_idx, 1
+                &tokens,
+                0,
+                comma_idx,
+                &line_start_snapshot,
             ),
             "close->open bracket sequence must report a frame close below the line-start depth before comma"
         );
@@ -36928,13 +36956,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in typed-frame fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, line_start_idx, 1);
 
         assert!(
             !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
                 &tokens,
                 line_start_idx,
                 comma_idx,
-                1
+                &line_start_snapshot,
             ),
             "known line-start `(` frame must not be popped by mismatched `]` close before comma"
         );
@@ -36956,13 +36985,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in typed-frame close-open fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, line_start_idx, 1);
 
         assert!(
             SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
                 &tokens,
                 line_start_idx,
                 comma_idx,
-                1
+                &line_start_snapshot,
             ),
             "known line-start `(` frame should be consumed before the later open in `) + (`"
         );
@@ -36978,10 +37008,14 @@ FROM dept d;"#;
             .find(|(_, token)| matches!(token, SqlToken::Symbol(sym) if sym == ","))
             .map(|(idx, _)| idx)
             .expect("comma in mismatched local delimiter fixture");
+        let line_start_snapshot = line_start_snapshot_before_token(&tokens, 0, 1);
 
         assert!(
             !SqlEditorWidget::line_closes_paren_frame_below_line_start_before_token(
-                &tokens, 0, comma_idx, 1
+                &tokens,
+                0,
+                comma_idx,
+                &line_start_snapshot,
             ),
             "mismatched close delimiter inside a locally opened frame must not be treated as closing a parent frame"
         );

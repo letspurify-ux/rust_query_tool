@@ -9,6 +9,7 @@ pub mod app_icon;
 pub mod db;
 #[cfg(not(feature = "no-splash"))]
 pub mod splash;
+pub(crate) mod sql_delimiter;
 pub mod sql_format;
 pub mod sql_parser_engine;
 pub mod sql_text;
