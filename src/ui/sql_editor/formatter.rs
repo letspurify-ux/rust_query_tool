@@ -209,7 +209,12 @@ impl RenderedLineTracker {
 }
 
 fn rendered_line_indent(line: &str) -> usize {
-    SqlEditorWidget::safe_indent_div(line.chars().take_while(|ch| *ch == ' ').count())
+    // Leading indentation is always plain ASCII spaces, so byte-iteration is
+    // both byte-offset compliant (per CLAUDE.md) and avoids per-call UTF-8
+    // decoding on a hot path that runs once per token rendering.
+    SqlEditorWidget::safe_indent_div(
+        line.bytes().take_while(|b| *b == b' ').count(),
+    )
 }
 
 #[derive(Default)]
@@ -7607,7 +7612,7 @@ impl SqlEditorWidget {
                 let current_line_is_whitespace_only = out
                     .rsplit('\n')
                     .next()
-                    .is_some_and(|line| !line.is_empty() && line.chars().all(|ch| ch == ' '));
+                    .is_some_and(|line| !line.is_empty() && line.bytes().all(|b| b == b' '));
                 if current_line_is_whitespace_only {
                     if let Some(last_newline_idx) = out.rfind('\n') {
                         out.truncate(last_newline_idx + 1);
@@ -10325,7 +10330,7 @@ impl SqlEditorWidget {
                             .next()
                             .map(|line| {
                                 Self::safe_indent_div(
-                                    line.chars().take_while(|ch| *ch == ' ').count(),
+                                    line.bytes().take_while(|b| *b == b' ').count(),
                                 )
                             })
                             .unwrap_or(0);
@@ -12642,12 +12647,15 @@ impl SqlEditorWidget {
                 SqlToken::Comment(comment) if comment.contains('\n') => {}
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) => {
-                    for ch in sym.chars() {
-                        match ch {
-                            '(' => paren_depth = paren_depth.saturating_add(1),
-                            ')' => paren_depth = paren_depth.saturating_sub(1),
-                            ',' if paren_depth == 0 => return true,
-                            ';' if paren_depth == 0 => return false,
+                    // Matched bytes are all ASCII; UTF-8 guarantees ASCII bytes
+                    // never appear inside multi-byte sequences, so byte iteration
+                    // is equivalent and avoids per-char UTF-8 decoding.
+                    for &b in sym.as_bytes() {
+                        match b {
+                            b'(' => paren_depth = paren_depth.saturating_add(1),
+                            b')' => paren_depth = paren_depth.saturating_sub(1),
+                            b',' if paren_depth == 0 => return true,
+                            b';' if paren_depth == 0 => return false,
                             _ => {}
                         }
                     }
