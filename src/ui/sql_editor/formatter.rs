@@ -134,10 +134,12 @@ fn rendered_line_indent(line: &str) -> usize {
 #[derive(Clone, Copy, Default)]
 struct FormatBlockDepthFrame {
     owner_depth: usize,
-    /// The `indent_level` assigned to this block's body when the frame was
-    /// pushed. Used in debug builds to detect drift at statement boundaries
-    /// inside the block (see `FormatFrameStack::statement_base_indent`).
-    body_indent_level: usize,
+    /// Additional indent this block contributes on top of the frame stack's
+    /// surrounding context. Stored as a delta (rather than an absolute
+    /// `indent_level`) so `FormatFrameStack::expected_indent_level` is a pure
+    /// sum of per-frame deltas. This keeps the block body's indent correct
+    /// even when auxiliary frames below the block expire before it is popped.
+    indent_delta: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -726,7 +728,7 @@ struct BetweenPendingFrame {
     scope: FormatScope,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ScopedIndentKind {
     MergeWhenBranch,
     CursorSql,
@@ -1155,8 +1157,12 @@ impl FormatFrameStack {
     /// Push a block frame and atomically update `indent_level`.
     ///
     /// `new_indent_level` is the indent level that should be active while the
-    /// block is open. `pop_block` reconstructs the surviving indent from the
-    /// remaining frame stack instead of replaying a captured pre-push value.
+    /// block is open. The block's contribution is stored as a **delta**
+    /// relative to the pre-push indent (= the surrounding frame stack's
+    /// contribution) so that `expected_indent_level` remains a pure sum of
+    /// per-frame deltas. `pop_block` reconstructs the surviving indent from
+    /// the remaining frame stack instead of replaying a captured pre-push
+    /// value.
     fn push_block(
         &mut self,
         kind: BlockKind,
@@ -1165,13 +1171,14 @@ impl FormatFrameStack {
         indent_level: &mut usize,
     ) {
         let frame_id = self.next_frame_id();
+        let indent_delta = new_indent_level.saturating_sub(*indent_level);
         *indent_level = new_indent_level;
         self.frames.push(FormatFrame::Block(BlockStackFrame {
             id: frame_id,
             kind,
             depth_frame: FormatBlockDepthFrame {
                 owner_depth,
-                body_indent_level: new_indent_level,
+                indent_delta,
             },
             previous_block_frame_id: self.current_block_frame_id,
             case_branch_started: false,
@@ -1363,7 +1370,9 @@ impl FormatFrameStack {
                         indent_level
                     }
                 }
-                FormatFrame::Block(frame) => frame.depth_frame.body_indent_level,
+                FormatFrame::Block(frame) => {
+                    indent_level.saturating_add(frame.depth_frame.indent_delta)
+                }
                 FormatFrame::ScopedIndent(frame) => indent_level.saturating_add(frame.delta),
                 FormatFrame::ConstructFlag(_)
                 | FormatFrame::ConstructValue(_)
@@ -1469,6 +1478,10 @@ impl FormatFrameStack {
         }
     }
 
+    /// Push a scoped indent frame, enforcing kind-uniqueness: at most one
+    /// frame of any given `ScopedIndentKind` is active at a time. If a frame
+    /// of this `kind` already exists (at any scope), the push is a no-op so
+    /// that `deactivate_scoped_indent` can match by kind unambiguously.
     fn push_scoped_indent(
         &mut self,
         kind: ScopedIndentKind,
@@ -1476,13 +1489,16 @@ impl FormatFrameStack {
         delta: usize,
         indent_level: &mut usize,
     ) {
-        if self.frames.last().is_some_and(|frame| {
-            matches!(
-                frame,
-                FormatFrame::ScopedIndent(frame)
-                    if frame.kind == kind && frame.scope == scope
-            )
+        if let Some(existing) = self.frames.iter().find_map(|frame| match frame {
+            FormatFrame::ScopedIndent(frame) if frame.kind == kind => Some(frame),
+            _ => None,
         }) {
+            debug_assert!(
+                existing.scope.contains(scope),
+                "scoped indent {:?} re-pushed at scope not contained by existing frame",
+                kind
+            );
+            let _ = existing;
             return;
         }
         *indent_level = indent_level.saturating_add(delta);
@@ -1506,12 +1522,19 @@ impl FormatFrameStack {
             .any(|frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind))
     }
 
+    /// Deactivate the unique scoped-indent frame of the given `kind`.
+    ///
+    /// Relies on the kind-uniqueness invariant established by
+    /// `push_scoped_indent`: at most one `ScopedIndent` frame exists per kind.
+    /// After removal, debug builds assert that no further frame of the same
+    /// kind remains, so that callers matching by `kind` alone are always
+    /// unambiguous.
     fn deactivate_scoped_indent(
         &mut self,
         kind: ScopedIndentKind,
         indent_level: &mut usize,
     ) -> bool {
-        let Some(idx) = self.frames.iter().rposition(
+        let Some(idx) = self.frames.iter().position(
             |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
         ) else {
             return false;
@@ -1524,29 +1547,18 @@ impl FormatFrameStack {
         self.frames.remove(idx);
         #[cfg(debug_assertions)]
         {
+            debug_assert!(
+                !self.frames.iter().any(|frame| matches!(
+                    frame,
+                    FormatFrame::ScopedIndent(frame) if frame.kind == kind
+                )),
+                "multiple scoped-indent frames active for kind {:?}",
+                kind
+            );
             self.debug_assert_integrity();
             self.debug_assert_indent_level(*indent_level);
         }
         true
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn clear_scoped_indent(&mut self, kind: ScopedIndentKind, indent_level: &mut usize) {
-        while let Some(idx) = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
-        ) {
-            let delta = match self.frames.get(idx) {
-                Some(FormatFrame::ScopedIndent(frame)) => frame.delta,
-                _ => break,
-            };
-            *indent_level = indent_level.saturating_sub(delta);
-            self.frames.remove(idx);
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.debug_assert_integrity();
-            self.debug_assert_indent_level(*indent_level);
-        }
     }
 
     fn push_trigger_header(&mut self, scope: FormatScope) {
@@ -12457,31 +12469,45 @@ mod formatter_scope_state_tests {
     }
 
     #[test]
-    fn format_frame_stack_clear_scoped_indent_unwinds_all_matching_frames() {
+    fn format_frame_stack_scoped_indent_is_unique_per_kind() {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
+        let outer_scope = FormatScope::new(0, 1);
         stack.push_scoped_indent(
             ScopedIndentKind::CursorSql,
-            FormatScope::new(0, 1),
+            outer_scope,
             1,
             &mut indent_level,
         );
+        // A second push of the same kind at a scope contained by the existing
+        // frame must not stack another delta: the kind is structurally unique.
+        let inner_scope = FormatScope::new(1, 1);
+        assert!(outer_scope.contains(inner_scope));
         stack.push_scoped_indent(
             ScopedIndentKind::CursorSql,
-            FormatScope::new(1, 1),
+            inner_scope,
             2,
             &mut indent_level,
         );
+        assert_eq!(
+            indent_level, 1,
+            "kind-unique scoped indent must not re-apply delta on re-push"
+        );
+
         stack.push_scoped_indent(
             ScopedIndentKind::ForallBody,
             FormatScope::new(2, 1),
             3,
             &mut indent_level,
         );
-        assert_eq!(indent_level, 6);
+        assert_eq!(indent_level, 4);
 
-        stack.clear_scoped_indent(ScopedIndentKind::CursorSql, &mut indent_level);
+        let removed = stack.deactivate_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            &mut indent_level,
+        );
+        assert!(removed);
         assert_eq!(indent_level, 3);
         assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
         assert!(stack.scoped_indent_is_active(ScopedIndentKind::ForallBody));
@@ -37282,6 +37308,58 @@ mod format_frame_stack_tests {
 
         assert_eq!(popped_case.kind, BlockKind::Case);
         assert_eq!(stack.block_depth(), 0);
+        assert_eq!(indent_level, 0);
+    }
+
+    #[test]
+    fn format_frame_stack_block_indent_tracks_scoped_indent_expiring_below_it() {
+        // Push a ScopedIndent first, then a Block above it. If the scoped
+        // indent later expires while the block is still open, the block's
+        // delta-based contribution must keep `expected_indent_level` correct
+        // without re-adding the expired scoped-indent delta.
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        // Simulate an outer paren that owns a scoped indent (e.g. cursor SQL).
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+        let outer_scope = stack.current_scope();
+        stack.push_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            outer_scope,
+            1,
+            &mut indent_level,
+        );
+        assert_eq!(indent_level, 1);
+
+        // Push a Block on top. Its delta should be computed relative to the
+        // post-scoped-indent level (=1), so the block body sits at 2.
+        stack.push_block(BlockKind::Begin, 0, 2, &mut indent_level);
+        assert_eq!(indent_level, 2);
+
+        // Expire the scoped indent explicitly. The Block's stored delta (=1)
+        // must now yield `expected_indent_level() == 1`, reflecting the loss
+        // of the scoped-indent contribution below it — not the pre-expiry
+        // absolute level of 2.
+        let removed = stack.deactivate_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            &mut indent_level,
+        );
+        assert!(removed);
+        assert_eq!(
+            indent_level, 1,
+            "block delta must compose with remaining frames, not stash an absolute indent"
+        );
+
+        // Popping the block returns us to the paren-only indent (=0).
+        let _ = stack.pop_block(&mut indent_level).expect("begin block");
         assert_eq!(indent_level, 0);
     }
 
