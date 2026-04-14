@@ -46,6 +46,20 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    pub(crate) fn clear_secret(secret: &mut String) {
+        // Overwrite the secret bytes with zeros before releasing the allocation.
+        // SAFETY: 0x00 bytes are valid UTF-8 code points, so the String's UTF-8
+        // invariant is preserved during zeroing. We immediately clear and shrink the
+        // Vec to release the underlying allocation that held the secret.
+        let vec = unsafe { secret.as_mut_vec() };
+        for b in vec.iter_mut() {
+            // write_volatile prevents the compiler from optimizing away the zeroing.
+            unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
+        }
+        vec.clear();
+        vec.shrink_to_fit();
+    }
+
     pub fn new(
         name: &str,
         username: &str,
@@ -125,17 +139,7 @@ impl ConnectionInfo {
     /// Securely clear the password from memory by overwriting with zeros
     /// then releasing the allocation.
     pub fn clear_password(&mut self) {
-        // Overwrite the password bytes with zeros before releasing the allocation.
-        // SAFETY: 0x00 bytes are valid UTF-8 code points, so the String's UTF-8
-        // invariant is preserved during zeroing. We immediately clear and shrink the
-        // Vec to release the underlying allocation that held the password.
-        let vec = unsafe { self.password.as_mut_vec() };
-        for b in vec.iter_mut() {
-            // write_volatile prevents the compiler from optimizing away the zeroing.
-            unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
-        }
-        vec.clear();
-        vec.shrink_to_fit();
+        Self::clear_secret(&mut self.password);
     }
 }
 
@@ -161,6 +165,7 @@ pub enum DbConnection {
 pub struct DatabaseConnection {
     connection: Option<DbConnection>,
     info: ConnectionInfo,
+    session_password: String,
     connected: bool,
     auto_commit: bool,
     session: Arc<Mutex<SessionState>>,
@@ -188,6 +193,7 @@ impl DatabaseConnection {
         Self {
             connection: None,
             info: ConnectionInfo::default(),
+            session_password: String::new(),
             connected: false,
             auto_commit: false,
             session: Arc::new(Mutex::new(SessionState::default())),
@@ -229,6 +235,13 @@ impl DatabaseConnection {
         // during reconnect attempts.
         self.connection = Some(db_conn);
         let db_type = info.db_type;
+        let new_session_password = if db_type == DatabaseType::MySQL {
+            info.password.clone()
+        } else {
+            String::new()
+        };
+        ConnectionInfo::clear_secret(&mut self.session_password);
+        self.session_password = new_session_password;
         self.info = info;
         // Clear password from memory now that the connection is established
         self.info.clear_password();
@@ -299,6 +312,7 @@ impl DatabaseConnection {
         self.connected = false;
         self.last_disconnect_reason = disconnect_reason;
         self.info = ConnectionInfo::default();
+        ConnectionInfo::clear_secret(&mut self.session_password);
         self.auto_commit = false;
         match self.session.lock() {
             Ok(mut guard) => guard.reset(),
@@ -389,6 +403,19 @@ impl DatabaseConnection {
 
     pub fn get_info(&self) -> &ConnectionInfo {
         &self.info
+    }
+
+    pub fn mysql_runtime_connection_info(&self) -> Option<ConnectionInfo> {
+        if self.info.db_type != DatabaseType::MySQL
+            || !self.connected
+            || !matches!(self.connection, Some(DbConnection::MySQL(_)))
+        {
+            return None;
+        }
+
+        let mut info = self.info.clone();
+        info.password = self.session_password.clone();
+        Some(info)
     }
 
     pub fn connection_generation(&self) -> u64 {

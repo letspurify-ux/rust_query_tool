@@ -315,6 +315,19 @@ enum UiActionResult {
     QueryAlreadyRunning,
     ConnectionBusy,
 }
+
+#[derive(Clone)]
+struct MySqlQueryCancelContext {
+    connection_info: ConnectionInfo,
+    connection_id: u32,
+}
+
+impl Drop for MySqlQueryCancelContext {
+    fn drop(&mut self) {
+        self.connection_info.clear_password();
+    }
+}
+
 include!("highlighting.rs");
 
 #[derive(Clone)]
@@ -331,6 +344,7 @@ pub struct SqlEditorWidget {
     ui_action_sender: mpsc::Sender<UiActionResult>,
     query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
@@ -634,6 +648,7 @@ impl SqlEditorWidget {
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
         let intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
@@ -667,6 +682,7 @@ impl SqlEditorWidget {
             ui_action_sender,
             query_running: query_running.clone(),
             current_query_connection,
+            current_mysql_cancel_context,
             cancel_flag,
             intellisense_data,
             intellisense_popup,
@@ -1057,10 +1073,12 @@ impl SqlEditorWidget {
 
         store_mutex_bool(&self.cancel_flag, false);
 
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let connection = self.connection.clone();
         let sender = self.ui_action_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
 
         set_cursor(Cursor::Wait);
@@ -1093,15 +1111,21 @@ impl SqlEditorWidget {
                         }
                         Err(message) => Err(message),
                     },
-                    crate::db::DatabaseType::MySQL => conn_guard
-                        .get_mysql_connection_mut()
-                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-                        .and_then(|mysql_conn| {
-                            crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
-                                mysql_conn, &sql,
-                            )
-                            .map_err(|err| err.to_string())
-                        }),
+                    crate::db::DatabaseType::MySQL => {
+                        SqlEditorWidget::run_mysql_action_with_timeout(
+                            &mut conn_guard,
+                            &current_mysql_cancel_context,
+                            &cancel_flag,
+                            query_timeout,
+                            "Generating explain plan",
+                            |mysql_conn| {
+                                crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
+                                    mysql_conn,
+                                    &sql,
+                                )
+                            },
+                        )
+                    }
                 };
 
                 let _ = sender.send(UiActionResult::ExplainPlan(result));
@@ -1109,6 +1133,7 @@ impl SqlEditorWidget {
             }));
 
             SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::set_current_mysql_cancel_context(&current_mysql_cancel_context, None);
             SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
             if let Err(payload) = result {
@@ -1293,6 +1318,7 @@ impl SqlEditorWidget {
         make_ui_result: fn(Result<(), String>) -> UiActionResult,
         oracle_action: F,
         mysql_sql: &'static str,
+        query_timeout: Option<Duration>,
     ) where
         F: FnOnce(Arc<Connection>) -> Result<(), String> + Send + 'static,
     {
@@ -1310,6 +1336,7 @@ impl SqlEditorWidget {
         let sender = self.ui_action_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
 
         set_cursor(Cursor::Wait);
@@ -1340,14 +1367,16 @@ impl SqlEditorWidget {
                         }
                         Err(message) => Err(message),
                     },
-                    crate::db::DatabaseType::MySQL => conn_guard
-                        .get_mysql_connection_mut()
-                        .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-                        .and_then(|mysql_conn| {
-                            mysql_conn
-                                .query_drop(mysql_sql)
-                                .map_err(|err| err.to_string())
-                        }),
+                    crate::db::DatabaseType::MySQL => {
+                        SqlEditorWidget::run_mysql_action_with_timeout(
+                            &mut conn_guard,
+                            &current_mysql_cancel_context,
+                            &cancel_flag,
+                            query_timeout,
+                            activity_label,
+                            |mysql_conn| mysql_conn.query_drop(mysql_sql),
+                        )
+                    }
                 };
 
                 let _ = sender.send(make_ui_result(result));
@@ -1355,6 +1384,7 @@ impl SqlEditorWidget {
             }));
 
             SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::set_current_mysql_cancel_context(&current_mysql_cancel_context, None);
             SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
             if let Err(payload) = result {
@@ -1385,22 +1415,26 @@ impl SqlEditorWidget {
     }
 
     pub fn commit(&self) {
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         self.spawn_tracked_transaction_action(
             "Commit transaction",
             "sql_editor::commit",
             UiActionResult::Commit,
             |db_conn| db_conn.commit().map_err(|err| err.to_string()),
             "COMMIT",
+            query_timeout,
         );
     }
 
     pub fn rollback(&self) {
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         self.spawn_tracked_transaction_action(
             "Rollback transaction",
             "sql_editor::rollback",
             UiActionResult::Rollback,
             |db_conn| db_conn.rollback().map_err(|err| err.to_string()),
             "ROLLBACK",
+            query_timeout,
         );
     }
 
@@ -1409,14 +1443,20 @@ impl SqlEditorWidget {
         store_mutex_bool(&self.cancel_flag, true);
 
         let current_query_connection = self.current_query_connection.clone();
+        let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
         thread::spawn(move || {
             let mut conn =
                 SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+            let mut mysql_cancel_context =
+                SqlEditorWidget::clone_current_mysql_cancel_context(&current_mysql_cancel_context);
 
-            if !SqlEditorWidget::is_query_running_flag(&query_running) && conn.is_none() {
+            if !SqlEditorWidget::is_query_running_flag(&query_running)
+                && conn.is_none()
+                && mysql_cancel_context.is_none()
+            {
                 // Execution can still be transitioning into "running" and may not
                 // have published current_query_connection yet. Wait briefly so a
                 // cancel click that races with query start can still interrupt.
@@ -1430,13 +1470,19 @@ impl SqlEditorWidget {
                     thread::sleep(Duration::from_millis(25));
                     conn =
                         SqlEditorWidget::clone_current_query_connection(&current_query_connection);
-                    if conn.is_some() {
+                    mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
+                        &current_mysql_cancel_context,
+                    );
+                    if conn.is_some() || mysql_cancel_context.is_some() {
                         break;
                     }
                 }
             }
 
-            if !SqlEditorWidget::is_query_running_flag(&query_running) && conn.is_none() {
+            if !SqlEditorWidget::is_query_running_flag(&query_running)
+                && conn.is_none()
+                && mysql_cancel_context.is_none()
+            {
                 // This editor is idle. Do not attempt to cancel through the
                 // global DB connection because that can interrupt a query that
                 // is currently running in a different editor tab.
@@ -1446,7 +1492,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() {
+            if conn.is_none() && mysql_cancel_context.is_none() {
                 // Execution may still be initializing the DB connection.
                 // Wait briefly so a single cancel click can still interrupt reliably.
                 for _ in 0..40 {
@@ -1456,7 +1502,10 @@ impl SqlEditorWidget {
                     thread::sleep(Duration::from_millis(25));
                     conn =
                         SqlEditorWidget::clone_current_query_connection(&current_query_connection);
-                    if conn.is_some() {
+                    mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
+                        &current_mysql_cancel_context,
+                    );
+                    if conn.is_some() || mysql_cancel_context.is_some() {
                         break;
                     }
                 }
@@ -1471,7 +1520,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() {
+            if conn.is_none() && mysql_cancel_context.is_none() {
                 // The worker has not published a break-able connection yet.
                 // Keep cancel requested so execution stops at the first safe
                 // cancellation point, and surface a status update instead of
@@ -1481,7 +1530,11 @@ impl SqlEditorWidget {
                 return;
             }
 
-            let result = SqlEditorWidget::break_current_query_connection(conn);
+            let result = if conn.is_some() {
+                SqlEditorWidget::break_current_query_connection(conn)
+            } else {
+                SqlEditorWidget::break_current_mysql_query(mysql_cancel_context, &cancel_flag)
+            };
 
             let _ = sender.send(UiActionResult::Cancel(result));
             app::awake();
@@ -1504,12 +1557,48 @@ impl SqlEditorWidget {
         }
     }
 
+    fn clone_current_mysql_cancel_context(
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+    ) -> Option<MySqlQueryCancelContext> {
+        match current_mysql_cancel_context.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: MySQL cancel context lock was poisoned; recovering.");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
     fn break_current_query_connection(connection: Option<Arc<Connection>>) -> Result<(), String> {
         if let Some(db_conn) = connection {
             db_conn.break_execution().map_err(|err| err.to_string())
         } else {
             // No published connection yet. Keep cancel_flag set and let execution
             // stop at the first safe cancellation point.
+            Ok(())
+        }
+    }
+
+    fn break_current_mysql_query(
+        context: Option<MySqlQueryCancelContext>,
+        cancel_flag: &Arc<Mutex<bool>>,
+    ) -> Result<(), String> {
+        if !load_mutex_bool(cancel_flag) {
+            if let Some(mut context) = context {
+                context.connection_info.clear_password();
+            }
+            return Ok(());
+        }
+
+        if let Some(mut context) = context {
+            let result = crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
+                &context.connection_info,
+                context.connection_id,
+            )
+            .map_err(|err| err.to_string());
+            context.connection_info.clear_password();
+            result
+        } else {
             Ok(())
         }
     }
@@ -1525,6 +1614,28 @@ impl SqlEditorWidget {
             Err(poisoned) => {
                 eprintln!("Warning: current query connection lock was poisoned; recovering.");
                 *poisoned.into_inner() = value;
+            }
+        }
+    }
+
+    fn set_current_mysql_cancel_context(
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        value: Option<MySqlQueryCancelContext>,
+    ) {
+        match current_mysql_cancel_context.lock() {
+            Ok(mut guard) => {
+                if let Some(current) = guard.as_mut() {
+                    current.connection_info.clear_password();
+                }
+                *guard = value;
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: MySQL cancel context lock was poisoned; recovering.");
+                let mut guard = poisoned.into_inner();
+                if let Some(current) = guard.as_mut() {
+                    current.connection_info.clear_password();
+                }
+                *guard = value;
             }
         }
     }
@@ -1934,6 +2045,12 @@ mod execution_state_tests {
     #[test]
     fn break_current_query_connection_without_connection_is_noop() {
         assert!(SqlEditorWidget::break_current_query_connection(None).is_ok());
+    }
+
+    #[test]
+    fn break_current_mysql_query_without_context_is_noop() {
+        let cancel_flag = Arc::new(Mutex::new(true));
+        assert!(SqlEditorWidget::break_current_mysql_query(None, &cancel_flag).is_ok());
     }
 
     #[test]

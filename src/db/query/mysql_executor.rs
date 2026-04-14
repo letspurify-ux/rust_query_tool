@@ -2,6 +2,7 @@ use mysql::prelude::*;
 use mysql::{Conn, Error as MysqlError, Row, Value as MysqlValue};
 use std::time::{Duration, Instant};
 
+use crate::db::connection::ConnectionInfo;
 use crate::sql_text;
 
 use super::executor::{ConstraintInfo, IndexInfo, QueryExecutor, TableColumnDetail};
@@ -31,6 +32,49 @@ struct MysqlResultSetSnapshot {
 }
 
 impl MysqlExecutor {
+    fn timeout_millis(timeout: Option<Duration>) -> u128 {
+        timeout.map(|value| value.as_millis()).unwrap_or(0)
+    }
+
+    fn mysql_timeout_statement(timeout: Option<Duration>) -> String {
+        format!(
+            "SET SESSION MAX_EXECUTION_TIME = {}",
+            Self::timeout_millis(timeout)
+        )
+    }
+
+    fn mariadb_timeout_statement(timeout: Option<Duration>) -> String {
+        let timeout_seconds = timeout.map(|value| value.as_secs_f64()).unwrap_or(0.0);
+        format!("SET SESSION max_statement_time = {:.3}", timeout_seconds)
+    }
+
+    fn is_unknown_system_variable_error(err: &MysqlError, variable_name: &str) -> bool {
+        match err {
+            MysqlError::MySqlError(server_err) => {
+                server_err.code == 1193
+                    || server_err
+                        .message
+                        .contains(&format!("Unknown system variable '{variable_name}'"))
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn apply_session_timeout(
+        conn: &mut Conn,
+        timeout: Option<Duration>,
+    ) -> Result<(), MysqlError> {
+        let statement = Self::mysql_timeout_statement(timeout);
+        match conn.query_drop(statement.as_str()) {
+            Ok(()) => Ok(()),
+            Err(err) if Self::is_unknown_system_variable_error(&err, "MAX_EXECUTION_TIME") => {
+                let fallback = Self::mariadb_timeout_statement(timeout);
+                conn.query_drop(fallback.as_str())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn classify_statement(sql: &str) -> MysqlStatementKind {
         let normalized = QueryExecutor::normalize_sql_for_execute(sql);
         if QueryExecutor::is_select_statement(&normalized) {
@@ -460,6 +504,31 @@ impl MysqlExecutor {
         ))
     }
 
+    fn build_cancel_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
+        let mut opts = mysql::OptsBuilder::new()
+            .ip_or_hostname(Some(&info.host))
+            .tcp_port(info.port)
+            .user(Some(&info.username))
+            .pass(Some(&info.password));
+
+        let database = info.service_name.trim();
+        if !database.is_empty() {
+            opts = opts.db_name(Some(database));
+        }
+
+        opts
+    }
+
+    pub fn cancel_running_query(
+        info: &ConnectionInfo,
+        connection_id: u32,
+    ) -> Result<(), MysqlError> {
+        let opts = Self::build_cancel_opts(info);
+        let mut cancel_conn = mysql::Conn::new(opts)?;
+        let kill_sql = format!("KILL QUERY {connection_id}");
+        cancel_conn.query_drop(kill_sql.as_str())
+    }
+
     /// Extract the database name from a `USE <db>` statement for display purposes.
     /// Handles backtick-quoted identifiers, including names containing spaces.
     fn extract_use_database_name(trimmed_use_sql: &str) -> String {
@@ -552,9 +621,23 @@ impl MysqlExecutor {
 
     /// Check if a MySQL error is a timeout/cancelled error.
     pub fn is_timeout_error(err: &MysqlError) -> bool {
-        let msg = err.to_string();
-        msg.contains("Query execution was interrupted")
-            || msg.contains("Lock wait timeout exceeded")
+        let lowered = err.to_string().to_ascii_lowercase();
+        matches!(err, MysqlError::MySqlError(server_err) if server_err.code == 3024)
+            || lowered.contains("max_execution_time")
+            || lowered.contains("max statement time exceeded")
+            || lowered.contains("maximum statement execution time exceeded")
+            || lowered.contains("query timed out")
+    }
+
+    pub fn is_cancel_error(err: &MysqlError) -> bool {
+        if Self::is_timeout_error(err) {
+            return false;
+        }
+
+        let lowered = err.to_string().to_ascii_lowercase();
+        matches!(err, MysqlError::MySqlError(server_err) if server_err.code == 1317)
+            || lowered.contains("query execution was interrupted")
+            || lowered.contains("query was killed")
     }
 }
 
@@ -1847,7 +1930,7 @@ impl MysqlObjectBrowser {
 mod tests {
     use super::{MysqlExecutor, MysqlObjectBrowser, MysqlResultSetSnapshot};
     use crate::db::query::types::ColumnInfo;
-    use mysql::Value as MysqlValue;
+    use mysql::{Error as MysqlError, MySqlError, Value as MysqlValue};
     use std::time::Duration;
 
     #[test]
@@ -1931,6 +2014,38 @@ mod tests {
             ),
             super::MysqlStatementKind::Dml
         );
+    }
+
+    #[test]
+    fn mysql_timeout_statement_uses_millisecond_session_setting() {
+        assert_eq!(
+            MysqlExecutor::mysql_timeout_statement(Some(Duration::from_secs(5))),
+            "SET SESSION MAX_EXECUTION_TIME = 5000"
+        );
+        assert_eq!(
+            MysqlExecutor::mysql_timeout_statement(None),
+            "SET SESSION MAX_EXECUTION_TIME = 0"
+        );
+    }
+
+    #[test]
+    fn mysql_error_detection_distinguishes_timeout_from_cancel() {
+        let timeout_err = MysqlError::MySqlError(MySqlError {
+            state: "HY000".to_string(),
+            code: 3024,
+            message: "Query execution was interrupted, maximum statement execution time exceeded"
+                .to_string(),
+        });
+        assert!(MysqlExecutor::is_timeout_error(&timeout_err));
+        assert!(!MysqlExecutor::is_cancel_error(&timeout_err));
+
+        let cancel_err = MysqlError::MySqlError(MySqlError {
+            state: "70100".to_string(),
+            code: 1317,
+            message: "Query execution was interrupted".to_string(),
+        });
+        assert!(MysqlExecutor::is_cancel_error(&cancel_err));
+        assert!(!MysqlExecutor::is_timeout_error(&cancel_err));
     }
 
     #[test]

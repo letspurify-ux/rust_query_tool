@@ -8,6 +8,7 @@ use fltk::{
     input::Input,
     prelude::*,
 };
+use mysql::Error as MysqlError;
 use oracle::{Connection, Error as OracleError};
 use std::env;
 use std::fs;
@@ -84,6 +85,7 @@ struct ExecutionStartupPolicy {
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
@@ -94,12 +96,14 @@ impl QueryExecutionCleanupGuard {
     fn new(
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
     ) -> Self {
         Self {
             sender,
             current_query_connection,
+            current_mysql_cancel_context,
             cancel_flag,
             query_running,
             timeout_connection: None,
@@ -121,6 +125,7 @@ impl QueryExecutionCleanupGuard {
 impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
+        SqlEditorWidget::set_current_mysql_cancel_context(&self.current_mysql_cancel_context, None);
         store_mutex_bool(&self.cancel_flag, false);
         // Keep execution state fail-safe even if the UI progress poller has
         // stopped (e.g. tab closed while worker thread is still unwinding).
@@ -698,10 +703,11 @@ impl SqlEditorWidget {
         sql_text: &str,
         conn_name: &str,
         session: &Arc<Mutex<SessionState>>,
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
         script_mode: bool,
         initial_mysql_delimiter_override: Option<String>,
-        _query_timeout: Option<Duration>,
+        query_timeout: Option<Duration>,
         initial_auto_commit: bool,
         db_activity: &str,
     ) {
@@ -736,11 +742,20 @@ impl SqlEditorWidget {
         let execute_mysql_sql = |sql: &str| -> Result<Vec<QueryResult>, String> {
             let mut conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
-            let mysql_conn = conn_guard
-                .get_mysql_connection_mut()
-                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())?;
-            crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
-                .map_err(|err| err.to_string())
+            SqlEditorWidget::run_mysql_action_with_timeout(
+                &mut conn_guard,
+                current_mysql_cancel_context,
+                cancel_flag,
+                query_timeout,
+                db_activity,
+                |mysql_conn| crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql),
+            )
+        };
+        let mysql_interruption_flags = |message: &str| {
+            (
+                message == SqlEditorWidget::cancel_message(),
+                message == SqlEditorWidget::timeout_message(query_timeout),
+            )
         };
 
         while !frames.is_empty() {
@@ -1402,6 +1417,7 @@ impl SqlEditorWidget {
                                     app::awake();
                                 }
                                 Err(message) => {
+                                    let (cancelled, timed_out) = mysql_interruption_flags(&message);
                                     SqlEditorWidget::emit_script_message(
                                         sender,
                                         session,
@@ -1409,6 +1425,9 @@ impl SqlEditorWidget {
                                         &format!("Error: {}", message),
                                     );
                                     command_error = true;
+                                    if cancelled || timed_out {
+                                        stop_execution = true;
+                                    }
                                 }
                             }
                         }
@@ -1500,6 +1519,7 @@ impl SqlEditorWidget {
                                     result_index += 1;
                                 }
                                 Err(message) => {
+                                    let (cancelled, timed_out) = mysql_interruption_flags(&message);
                                     let emitted = SqlEditorWidget::emit_non_select_result(
                                         sender,
                                         session,
@@ -1508,13 +1528,16 @@ impl SqlEditorWidget {
                                         sql.as_str(),
                                         format!("Error: {}", message),
                                         false,
-                                        false,
+                                        timed_out,
                                         script_mode,
                                     );
                                     if emitted || script_mode {
                                         result_index += 1;
                                     }
                                     command_error = true;
+                                    if cancelled || timed_out {
+                                        stop_execution = true;
+                                    }
                                 }
                             }
                         }
@@ -1688,15 +1711,16 @@ impl SqlEditorWidget {
                             );
                         }
                         Err(message) => {
+                            let (cancelled, timed_out) = mysql_interruption_flags(&message);
                             let emitted = SqlEditorWidget::emit_non_select_result(
                                 sender,
                                 session,
                                 &conn_name,
                                 result_index,
                                 &sql_text,
-                                format!("Error: {}", message),
+                                message,
                                 false,
-                                false,
+                                timed_out,
                                 script_mode,
                             );
                             if emitted || script_mode {
@@ -1707,7 +1731,7 @@ impl SqlEditorWidget {
                                 session,
                                 statement_start.elapsed(),
                             );
-                            if !continue_on_error {
+                            if cancelled || timed_out || !continue_on_error {
                                 stop_execution = true;
                             }
                         }
@@ -1776,6 +1800,7 @@ impl SqlEditorWidget {
         let sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
@@ -1790,6 +1815,7 @@ impl SqlEditorWidget {
                 let mut cleanup = QueryExecutionCleanupGuard::new(
                     sender.clone(),
                     current_query_connection.clone(),
+                    current_mysql_cancel_context.clone(),
                     cancel_flag.clone(),
                     query_running.clone(),
                 );
@@ -1839,6 +1865,7 @@ impl SqlEditorWidget {
                         &sql_text,
                         &conn_name,
                         &session,
+                        &current_mysql_cancel_context,
                         &cancel_flag,
                         script_mode,
                         initial_mysql_delimiter_for_worker.clone(),
@@ -7294,6 +7321,97 @@ impl SqlEditorWidget {
         "Query cancelled".to_string()
     }
 
+    pub(super) fn abort_if_cancelled(cancel_flag: &Arc<Mutex<bool>>) -> Result<(), String> {
+        if load_mutex_bool(cancel_flag) {
+            Err(Self::cancel_message())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reset_mysql_timeout_on_connection(
+        mysql_conn: &mut mysql::Conn,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+    ) {
+        if query_timeout.is_none() {
+            return;
+        }
+
+        if let Err(err) =
+            crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(mysql_conn, None)
+        {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("Failed to reset MySQL session timeout: {err}"),
+            );
+        }
+    }
+
+    fn reset_mysql_timeout(
+        conn_guard: &mut crate::db::DatabaseConnection,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+    ) {
+        if let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() {
+            Self::reset_mysql_timeout_on_connection(mysql_conn, query_timeout, log_context);
+        }
+    }
+
+    pub(super) fn run_mysql_action_with_timeout<T, F>(
+        conn_guard: &mut crate::db::DatabaseConnection,
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+        action: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(&mut mysql::Conn) -> Result<T, MysqlError>,
+    {
+        let connection_id = {
+            let mysql_conn = conn_guard
+                .get_mysql_connection_mut()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())?;
+            crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                mysql_conn,
+                query_timeout,
+            )
+            .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout))?;
+            if let Err(cancelled) = Self::abort_if_cancelled(cancel_flag) {
+                Self::reset_mysql_timeout_on_connection(mysql_conn, query_timeout, log_context);
+                return Err(cancelled);
+            }
+            mysql_conn.connection_id()
+        };
+
+        let connection_info = match conn_guard.mysql_runtime_connection_info() {
+            Some(info) => info,
+            None => {
+                Self::reset_mysql_timeout(conn_guard, query_timeout, log_context);
+                return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
+            }
+        };
+
+        Self::set_current_mysql_cancel_context(
+            current_mysql_cancel_context,
+            Some(MySqlQueryCancelContext {
+                connection_info,
+                connection_id,
+            }),
+        );
+
+        let result = match conn_guard.get_mysql_connection_mut() {
+            Some(mysql_conn) => action(mysql_conn)
+                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout)),
+            None => Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+        };
+
+        Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
+        Self::reset_mysql_timeout(conn_guard, query_timeout, log_context);
+        result
+    }
+
     pub(super) fn choose_execution_error_message(
         cancelled: bool,
         timed_out: bool,
@@ -7309,7 +7427,13 @@ impl SqlEditorWidget {
         }
     }
 
-    fn parse_timeout(value: &str) -> Option<Duration> {
+    pub(super) fn mysql_error_message(err: &MysqlError, timeout: Option<Duration>) -> String {
+        let cancelled = crate::db::query::mysql_executor::MysqlExecutor::is_cancel_error(err);
+        let timed_out = crate::db::query::mysql_executor::MysqlExecutor::is_timeout_error(err);
+        Self::choose_execution_error_message(cancelled, timed_out, timeout, err.to_string())
+    }
+
+    pub(super) fn parse_timeout(value: &str) -> Option<Duration> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
@@ -7342,10 +7466,14 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod query_execution_cleanup_tests {
-    use super::{QueryExecutionCleanupGuard, QueryProgress};
+    use super::{
+        MySqlQueryCancelContext, QueryExecutionCleanupGuard, QueryProgress, SqlEditorWidget,
+    };
+    use mysql::{Error as MysqlError, MySqlError};
     use oracle::Connection;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn cleanup_guard_resets_cancel_and_emits_batch_finished_on_drop() {
@@ -7354,11 +7482,14 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
 
         {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection.clone(),
+                current_mysql_cancel_context.clone(),
                 cancel_flag.clone(),
                 query_running.clone(),
             );
@@ -7380,6 +7511,10 @@ mod query_execution_cleanup_tests {
             .lock()
             .expect("connection mutex should not be poisoned")
             .is_none());
+        assert!(current_mysql_cancel_context
+            .lock()
+            .expect("MySQL cancel context mutex should not be poisoned")
+            .is_none());
     }
 
     #[test]
@@ -7389,15 +7524,19 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
 
         let unwind_result = panic::catch_unwind(AssertUnwindSafe({
             let cancel_flag = cancel_flag.clone();
             let current_query_connection = current_query_connection;
+            let current_mysql_cancel_context = current_mysql_cancel_context;
             let query_running = query_running.clone();
             move || {
                 let _guard = QueryExecutionCleanupGuard::new(
                     sender,
                     current_query_connection,
+                    current_mysql_cancel_context,
                     cancel_flag,
                     query_running,
                 );
@@ -7429,11 +7568,14 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
 
         let drop_result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection,
+                current_mysql_cancel_context,
                 cancel_flag.clone(),
                 query_running.clone(),
             );
@@ -7457,6 +7599,8 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
 
         let poison_target = current_query_connection.clone();
         let _ = panic::catch_unwind(AssertUnwindSafe(move || {
@@ -7470,6 +7614,7 @@ mod query_execution_cleanup_tests {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection,
+                current_mysql_cancel_context,
                 cancel_flag.clone(),
                 query_running.clone(),
             );
@@ -7487,6 +7632,40 @@ mod query_execution_cleanup_tests {
             .try_recv()
             .expect("BatchFinished should be emitted");
         assert!(matches!(msg, QueryProgress::BatchFinished));
+    }
+
+    #[test]
+    fn abort_if_cancelled_returns_cancel_message_when_flag_is_set() {
+        let cancel_flag = Arc::new(Mutex::new(true));
+
+        let result = SqlEditorWidget::abort_if_cancelled(&cancel_flag);
+
+        assert_eq!(result, Err(SqlEditorWidget::cancel_message()));
+    }
+
+    #[test]
+    fn mysql_error_message_normalizes_timeout_and_cancel_errors() {
+        let timeout = Some(Duration::from_secs(5));
+        let timeout_err = MysqlError::MySqlError(MySqlError {
+            state: "HY000".to_string(),
+            code: 3024,
+            message: "Query execution was interrupted, maximum statement execution time exceeded"
+                .to_string(),
+        });
+        let cancel_err = MysqlError::MySqlError(MySqlError {
+            state: "70100".to_string(),
+            code: 1317,
+            message: "Query execution was interrupted".to_string(),
+        });
+
+        assert_eq!(
+            SqlEditorWidget::mysql_error_message(&timeout_err, timeout),
+            SqlEditorWidget::timeout_message(timeout)
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_error_message(&cancel_err, timeout),
+            SqlEditorWidget::cancel_message()
+        );
     }
 }
 
