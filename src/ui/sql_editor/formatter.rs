@@ -137,6 +137,83 @@ struct FormatBlockDepthFrame {
     body_indent_level: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockKind {
+    Begin,
+    Case,
+    CompoundTrigger,
+    Declare,
+    Exception,
+    If,
+    Loop,
+    PackageBody,
+    Repeat,
+    While,
+}
+
+impl BlockKind {
+    fn from_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "BEGIN" => Some(Self::Begin),
+            "CASE" => Some(Self::Case),
+            "COMPOUND_TRIGGER" => Some(Self::CompoundTrigger),
+            "DECLARE" => Some(Self::Declare),
+            "EXCEPTION" => Some(Self::Exception),
+            "IF" => Some(Self::If),
+            "LOOP" => Some(Self::Loop),
+            "PACKAGE_BODY" => Some(Self::PackageBody),
+            "REPEAT" => Some(Self::Repeat),
+            "WHILE" => Some(Self::While),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::Case => "CASE",
+            Self::CompoundTrigger => "COMPOUND_TRIGGER",
+            Self::Declare => "DECLARE",
+            Self::Exception => "EXCEPTION",
+            Self::If => "IF",
+            Self::Loop => "LOOP",
+            Self::PackageBody => "PACKAGE_BODY",
+            Self::Repeat => "REPEAT",
+            Self::While => "WHILE",
+        }
+    }
+
+    fn supports_qualified_end(self) -> bool {
+        matches!(
+            self,
+            Self::Case | Self::If | Self::Loop | Self::Repeat | Self::While
+        )
+    }
+
+    fn closes_plain_end(self) -> bool {
+        matches!(
+            self,
+            Self::Begin | Self::CompoundTrigger | Self::Declare | Self::PackageBody
+        )
+    }
+}
+
+trait BlockKindMatcher {
+    fn matches(&self, kind: BlockKind) -> bool;
+}
+
+impl BlockKindMatcher for BlockKind {
+    fn matches(&self, kind: BlockKind) -> bool {
+        *self == kind
+    }
+}
+
+impl BlockKindMatcher for &'static str {
+    fn matches(&self, kind: BlockKind) -> bool {
+        kind.as_str() == *self
+    }
+}
+
 struct FormatterTokenCache {
     meaningful_links: MeaningfulTokenLinks,
     statement_word_links: StatementWordLinks,
@@ -569,11 +646,40 @@ struct QueryLikeParenLayout {
 }
 
 #[derive(Clone)]
-struct QueryLikeParenRestoreState {
-    clause: Option<String>,
+struct FormatSessionState {
+    current_clause: Option<String>,
     select_list_layout_state: SelectListLayoutState,
     statement_has_with_clause: bool,
     query_body_clause_base_depth: Option<usize>,
+}
+
+impl FormatSessionState {
+    fn capture(
+        current_clause: &Option<String>,
+        select_list_layout_state: SelectListLayoutState,
+        statement_has_with_clause: bool,
+        query_body_clause_base_depth: Option<usize>,
+    ) -> Self {
+        Self {
+            current_clause: current_clause.clone(),
+            select_list_layout_state,
+            statement_has_with_clause,
+            query_body_clause_base_depth,
+        }
+    }
+
+    fn restore(
+        self,
+        current_clause: &mut Option<String>,
+        select_list_layout_state: &mut SelectListLayoutState,
+        statement_has_with_clause: &mut bool,
+        query_body_clause_base_depth: &mut Option<usize>,
+    ) {
+        *current_clause = self.current_clause;
+        *select_list_layout_state = self.select_list_layout_state;
+        *statement_has_with_clause = self.statement_has_with_clause;
+        *query_body_clause_base_depth = self.query_body_clause_base_depth;
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -589,7 +695,7 @@ struct ParenStackFrame {
     id: SqlFormatFrameId,
     frame: ParenFormatFrame,
     semantic_flags: ParenSemanticFlags,
-    restore_state: Option<QueryLikeParenRestoreState>,
+    session_state: Option<FormatSessionState>,
     previous_paren_frame_id: Option<SqlFormatFrameId>,
     previous_query_base_depth: Option<Option<usize>>,
     wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
@@ -599,7 +705,7 @@ struct ParenStackFrame {
 #[derive(Clone)]
 struct BlockStackFrame {
     id: SqlFormatFrameId,
-    kind: String,
+    kind: BlockKind,
     depth_frame: FormatBlockDepthFrame,
     previous_block_frame_id: Option<SqlFormatFrameId>,
     case_branch_started: bool,
@@ -608,7 +714,7 @@ struct BlockStackFrame {
 }
 
 struct PoppedBlockFrame {
-    kind: String,
+    kind: BlockKind,
     depth_frame: FormatBlockDepthFrame,
     mysql_handler_begin: bool,
 }
@@ -665,7 +771,7 @@ enum FormatFrame {
 
 struct PoppedParenFrame {
     frame: ParenFormatFrame,
-    restore_state: Option<QueryLikeParenRestoreState>,
+    session_state: Option<FormatSessionState>,
     open_cursor_restore_state: Option<OpenCursorFormatState>,
 }
 
@@ -793,7 +899,7 @@ impl FormatFrameStack {
         &mut self,
         frame: ParenFormatFrame,
         semantic_flags: ParenSemanticFlags,
-        restore_state: Option<QueryLikeParenRestoreState>,
+        session_state: Option<FormatSessionState>,
         new_query_base_depth: Option<usize>,
         wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
         open_cursor_restore_state: Option<OpenCursorFormatState>,
@@ -811,7 +917,7 @@ impl FormatFrameStack {
             id: frame_id,
             frame,
             semantic_flags,
-            restore_state,
+            session_state,
             previous_paren_frame_id: self.current_paren_frame_id,
             previous_query_base_depth,
             wrapped_owner_kind,
@@ -844,7 +950,7 @@ impl FormatFrameStack {
         }
         let popped = Some(PoppedParenFrame {
             frame: frame.frame,
-            restore_state: frame.restore_state,
+            session_state: frame.session_state,
             open_cursor_restore_state: frame.open_cursor_restore_state,
         });
         #[cfg(debug_assertions)]
@@ -924,7 +1030,7 @@ impl FormatFrameStack {
     /// frame so `pop_block` can restore it without reconstruction.
     fn push_block(
         &mut self,
-        kind: &str,
+        kind: BlockKind,
         owner_depth: usize,
         new_indent_level: usize,
         indent_level: &mut usize,
@@ -934,7 +1040,7 @@ impl FormatFrameStack {
         *indent_level = new_indent_level;
         self.frames.push(FormatFrame::Block(BlockStackFrame {
             id: frame_id,
-            kind: kind.to_string(),
+            kind,
             depth_frame: FormatBlockDepthFrame {
                 owner_depth,
                 previous_indent_level,
@@ -979,19 +1085,19 @@ impl FormatFrameStack {
         popped
     }
 
-    fn last_block_kind(&self) -> Option<&str> {
+    fn last_block_kind(&self) -> Option<BlockKind> {
         self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.kind.as_str()),
+            FormatFrame::Block(frame) => Some(frame.kind),
             _ => None,
         })
     }
 
-    fn last_block_kind_is(&self, kind: &str) -> bool {
+    fn last_block_kind_is(&self, kind: impl BlockKindMatcher) -> bool {
         self.last_block_kind()
-            .is_some_and(|current| current == kind)
+            .is_some_and(|current| kind.matches(current))
     }
 
-    fn set_last_block_kind(&mut self, kind: &str) -> bool {
+    fn set_last_block_kind(&mut self, kind: BlockKind) -> bool {
         let idx = self
             .frames
             .iter()
@@ -1001,7 +1107,7 @@ impl FormatFrameStack {
         };
         match self.frames.get_mut(idx) {
             Some(FormatFrame::Block(frame)) => {
-                frame.kind = kind.to_string();
+                frame.kind = kind;
                 true
             }
             _ => false,
@@ -1026,10 +1132,9 @@ impl FormatFrameStack {
     }
 
     fn set_last_case_branch_started(&mut self, started: bool) -> bool {
-        let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::Block(frame) if frame.kind == "CASE"));
+        let idx = self.frames.iter().rposition(
+            |frame| matches!(frame, FormatFrame::Block(frame) if frame.kind == BlockKind::Case),
+        );
         let Some(idx) = idx else {
             return false;
         };
@@ -1047,7 +1152,7 @@ impl FormatFrameStack {
             .iter()
             .rev()
             .find_map(|frame| match frame {
-                FormatFrame::Block(frame) if frame.kind == "CASE" => {
+                FormatFrame::Block(frame) if frame.kind == BlockKind::Case => {
                     Some(frame.case_branch_started)
                 }
                 _ => None,
@@ -1057,7 +1162,9 @@ impl FormatFrameStack {
 
     fn set_last_exception_branch_started(&mut self, started: bool) -> bool {
         let idx = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::Block(frame) if frame.kind == "EXCEPTION"),
+            |frame| {
+                matches!(frame, FormatFrame::Block(frame) if frame.kind == BlockKind::Exception)
+            },
         );
         let Some(idx) = idx else {
             return false;
@@ -1076,7 +1183,7 @@ impl FormatFrameStack {
             .iter()
             .rev()
             .find_map(|frame| match frame {
-                FormatFrame::Block(frame) if frame.kind == "EXCEPTION" => {
+                FormatFrame::Block(frame) if frame.kind == BlockKind::Exception => {
                     Some(frame.exception_branch_started)
                 }
                 _ => None,
@@ -1106,7 +1213,7 @@ impl FormatFrameStack {
     /// boundaries we jump straight to this value rather than unwinding
     /// nested frames.
     fn package_body_member_indent(&self) -> Option<usize> {
-        if !self.last_block_kind_is("PACKAGE_BODY") {
+        if !self.last_block_kind_is(BlockKind::PackageBody) {
             return None;
         }
         self.last_block_owner_depth()
@@ -1124,9 +1231,9 @@ impl FormatFrameStack {
             .unwrap_or(0)
     }
 
-    fn contains_block_kind(&self, kind: &str) -> bool {
+    fn contains_block_kind(&self, kind: impl BlockKindMatcher) -> bool {
         self.frames.iter().any(|frame| match frame {
-            FormatFrame::Block(frame) => frame.kind == kind,
+            FormatFrame::Block(frame) => kind.matches(frame.kind),
             _ => false,
         })
     }
@@ -1584,7 +1691,7 @@ impl FormatFrameStack {
 
 fn push_format_block(
     format_stack: &mut FormatFrameStack,
-    kind: &str,
+    kind: BlockKind,
     owner_depth: usize,
     new_indent_level: usize,
     indent_level: &mut usize,
@@ -6077,10 +6184,12 @@ impl SqlEditorWidget {
                         if let Some(qualifier) = end_qualifier.as_deref() {
                             match qualifier {
                                 "LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE" => {
-                                    let qualifier_belongs_to_case_end =
-                                        active_end_block == Some("CASE") && qualifier == "CASE";
-                                    let qualifier_is_case_expression_follower =
-                                        active_end_block == Some("CASE") && qualifier != "CASE";
+                                    let qualifier_belongs_to_case_end = active_end_block
+                                        == Some(BlockKind::Case)
+                                        && qualifier == "CASE";
+                                    let qualifier_is_case_expression_follower = active_end_block
+                                        == Some(BlockKind::Case)
+                                        && qualifier != "CASE";
                                     if qualifier_belongs_to_case_end
                                         || !qualifier_is_case_expression_follower
                                     {
@@ -6166,7 +6275,9 @@ impl SqlEditorWidget {
                         if is_qualified_end {
                             // END LOOP, END IF, END CASE - pop matching block
                             if let Some(top) = format_stack.last_block_kind() {
-                                if block_end_qualifiers.contains(&top) {
+                                if top.supports_qualified_end()
+                                    && block_end_qualifiers.contains(&top.as_str())
+                                {
                                     if let Some(popped_block) =
                                         pop_format_block(&mut format_stack, &mut indent_level)
                                     {
@@ -6197,23 +6308,19 @@ impl SqlEditorWidget {
                                 closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
                                 any_block_popped = true;
                                 let reached_package_body =
-                                    format_stack.last_block_kind_is("PACKAGE_BODY");
+                                    format_stack.last_block_kind_is(BlockKind::PackageBody);
                                 if closes_active_package_member {
                                     if reached_package_body {
                                         closed_block = Some(top);
                                         break;
                                     }
-                                } else if top == "BEGIN"
-                                    || top == "DECLARE"
-                                    || top == "PACKAGE_BODY"
-                                    || top == "COMPOUND_TRIGGER"
-                                {
+                                } else if top.closes_plain_end() {
                                     closed_block = Some(top);
                                     break;
                                 }
                             }
-                            if matches!(closed_block.as_deref(), Some("BEGIN" | "DECLARE"))
-                                && (format_stack.last_block_kind_is("PACKAGE_BODY")
+                            if matches!(closed_block, Some(BlockKind::Begin | BlockKind::Declare))
+                                && (format_stack.last_block_kind_is(BlockKind::PackageBody)
                                     || at_package_body_member_depth)
                             {
                                 pending_package_member_separator = true;
@@ -6684,9 +6791,9 @@ impl SqlEditorWidget {
                             .flatten();
                         let in_control_header_condition = control_header_condition_indent.is_some()
                             || (matches!(upper, "AND" | "OR")
-                                && format_stack
-                                    .last_block_kind()
-                                    .is_some_and(|block| matches!(block, "IF" | "WHILE"))
+                                && format_stack.last_block_kind().is_some_and(|block| {
+                                    matches!(block, BlockKind::If | BlockKind::While)
+                                })
                                 && current_clause.is_none());
                         let control_header_is_parenthesized = matches!(upper, "AND" | "OR")
                             .then(|| {
@@ -6708,9 +6815,9 @@ impl SqlEditorWidget {
                             header_indent
                         } else if in_control_header_condition {
                             if matches!(upper, "AND" | "OR")
-                                && format_stack
-                                    .last_block_kind()
-                                    .is_some_and(|block| matches!(block, "IF" | "WHILE"))
+                                && format_stack.last_block_kind().is_some_and(|block| {
+                                    matches!(block, BlockKind::If | BlockKind::While)
+                                })
                             {
                                 format_stack.last_block_owner_depth().unwrap_or_else(|| {
                                     base_indent(indent_level.saturating_sub(1), open_cursor_state)
@@ -7089,10 +7196,9 @@ impl SqlEditorWidget {
                             && !matches!(current_clause.as_deref(), Some("SELECT"))
                         {
                             newline_after_keyword = true;
-                            if format_stack
-                                .last_block_kind()
-                                .is_some_and(|s| s == "CASE" || s == "EXCEPTION")
-                            {
+                            if format_stack.last_block_kind().is_some_and(|s| {
+                                matches!(s, BlockKind::Case | BlockKind::Exception)
+                            }) {
                                 newline_after_keyword_extra = 1;
                                 if format_stack.last_block_kind_is("EXCEPTION") {
                                     let _ = format_stack.set_last_exception_branch_started(true);
@@ -7371,7 +7477,7 @@ impl SqlEditorWidget {
                                 .map(|frame| frame.indent.saturating_add(1));
                             push_format_block(
                                 &mut format_stack,
-                                "WHILE",
+                                BlockKind::While,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -7517,9 +7623,9 @@ impl SqlEditorWidget {
                             }
                         } else if upper == "BEGIN" {
                             // BEGIN handling: check if we're inside a DECLARE block
-                            let inside_declare = format_stack
-                                .last_block_kind()
-                                .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
+                            let inside_declare = format_stack.last_block_kind().is_some_and(|s| {
+                                matches!(s, BlockKind::Declare | BlockKind::PackageBody)
+                            });
                             if inside_declare {
                                 // DECLARE ... BEGIN - BEGIN is at same level as DECLARE.
                                 // PACKAGE BODY initializer BEGIN snaps to package owner depth.
@@ -7685,7 +7791,7 @@ impl SqlEditorWidget {
                     {
                         let package_owner_depth = format_stack
                             .last_block_kind()
-                            .filter(|block| *block == "PACKAGE_BODY")
+                            .filter(|block| *block == BlockKind::PackageBody)
                             .and_then(|_| format_stack.last_block_owner_depth())
                             .unwrap_or(0);
                         line_indent = package_owner_depth;
@@ -7766,7 +7872,7 @@ impl SqlEditorWidget {
                         if !format_stack.last_block_kind_is("COMPOUND_TRIGGER") {
                             push_format_block(
                                 &mut format_stack,
-                                "COMPOUND_TRIGGER",
+                                BlockKind::CompoundTrigger,
                                 indent_level,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -7912,13 +8018,15 @@ impl SqlEditorWidget {
                     // Handle block start - push to stack and increase indent
                     if should_treat_as_block_start {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
-                        push_format_block(
-                            &mut format_stack,
-                            upper,
-                            line_indent,
-                            new_indent_level,
-                            &mut indent_level,
-                        );
+                        if let Some(block_kind) = BlockKind::from_keyword(upper) {
+                            push_format_block(
+                                &mut format_stack,
+                                block_kind,
+                                line_indent,
+                                new_indent_level,
+                                &mut indent_level,
+                            );
+                        }
                         if upper == "DECLARE" || upper == "IF" {
                             format_stack.push_plsql_context(format_stack.current_scope());
                         }
@@ -7928,25 +8036,24 @@ impl SqlEditorWidget {
                             format_stack.clear_trigger_header();
                         }
                         let package_initializer_begin = pending_package_member_separator;
-                        let inside_declare = format_stack
-                            .last_block_kind()
-                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY")
-                            || package_initializer_begin;
+                        let inside_declare = format_stack.last_block_kind().is_some_and(|s| {
+                            matches!(s, BlockKind::Declare | BlockKind::PackageBody)
+                        }) || package_initializer_begin;
                         if inside_declare {
                             // DECLARE ... BEGIN - same block depth.
                             // PACKAGE BODY initialization BEGIN is also same depth as PACKAGE_BODY.
                             if package_initializer_begin {
                                 while format_stack
                                     .last_block_kind()
-                                    .is_some_and(|block| block != "PACKAGE_BODY")
+                                    .is_some_and(|block| block != BlockKind::PackageBody)
                                 {
                                     let _ = pop_format_block(&mut format_stack, &mut indent_level);
                                 }
                                 let _ =
                                     format_stack.rebase_to_package_member_indent(&mut indent_level);
                                 pending_package_member_separator = false;
-                            } else if format_stack.last_block_kind_is("DECLARE") {
-                                format_stack.set_last_block_kind("BEGIN");
+                            } else if format_stack.last_block_kind_is(BlockKind::Declare) {
+                                format_stack.set_last_block_kind(BlockKind::Begin);
                             } else if format_stack.package_body_member_indent().is_some() {
                                 // Package initializer body always starts one level under
                                 // the package owner, regardless of prior member-body depth.
@@ -7958,7 +8065,7 @@ impl SqlEditorWidget {
                             // Standalone BEGIN block
                             push_format_block(
                                 &mut format_stack,
-                                "BEGIN",
+                                BlockKind::Begin,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -7982,7 +8089,7 @@ impl SqlEditorWidget {
                     } else if upper == "EXCEPTION" {
                         push_format_block(
                             &mut format_stack,
-                            "EXCEPTION",
+                            BlockKind::Exception,
                             line_indent,
                             indent_level,
                             &mut indent_level,
@@ -7992,7 +8099,7 @@ impl SqlEditorWidget {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         push_format_block(
                             &mut format_stack,
-                            "LOOP",
+                            BlockKind::Loop,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8002,7 +8109,7 @@ impl SqlEditorWidget {
                     } else if upper == "REPEAT" {
                         push_format_block(
                             &mut format_stack,
-                            "REPEAT",
+                            BlockKind::Repeat,
                             line_indent,
                             indent_level.saturating_add(1),
                             &mut indent_level,
@@ -8013,7 +8120,7 @@ impl SqlEditorWidget {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         push_format_block(
                             &mut format_stack,
-                            "CASE",
+                            BlockKind::Case,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8032,7 +8139,7 @@ impl SqlEditorWidget {
                             .then_some(())
                             .filter(|_| !is_package_body)
                             .and_then(|_| format_stack.last_block_kind())
-                            .filter(|block| *block == "PACKAGE_BODY")
+                            .filter(|block| *block == BlockKind::PackageBody)
                             .and_then(|_| {
                                 format_stack
                                     .last_block_owner_depth()
@@ -8048,7 +8155,7 @@ impl SqlEditorWidget {
                         if starts_compound_trigger_body {
                             push_format_block(
                                 &mut format_stack,
-                                "COMPOUND_TRIGGER",
+                                BlockKind::CompoundTrigger,
                                 indent_level,
                                 new_indent_level,
                                 &mut indent_level,
@@ -8057,7 +8164,7 @@ impl SqlEditorWidget {
                         } else if is_package_body {
                             push_format_block(
                                 &mut format_stack,
-                                "PACKAGE_BODY",
+                                BlockKind::PackageBody,
                                 line_indent,
                                 new_indent_level,
                                 &mut indent_level,
@@ -8065,7 +8172,7 @@ impl SqlEditorWidget {
                         } else {
                             push_format_block(
                                 &mut format_stack,
-                                "DECLARE",
+                                BlockKind::Declare,
                                 package_member_owner_depth.unwrap_or(line_indent),
                                 new_indent_level,
                                 &mut indent_level,
@@ -10121,15 +10228,15 @@ impl SqlEditorWidget {
                             let paren_close_indent_override = query_like_layout
                                 .map(|layout| layout.close_depth)
                                 .or(branch_wrapper_close_indent);
-                            let paren_restore_state = if paren_frame_kind.is_query_like()
+                            let paren_session_state = if paren_frame_kind.is_query_like()
                                 || multiline_clause_owner_kind.is_some()
                             {
-                                Some(QueryLikeParenRestoreState {
-                                    clause: current_clause.clone(),
+                                Some(FormatSessionState::capture(
+                                    &current_clause,
                                     select_list_layout_state,
                                     statement_has_with_clause,
                                     query_body_clause_base_depth,
-                                })
+                                ))
                             } else {
                                 None
                             };
@@ -10153,7 +10260,7 @@ impl SqlEditorWidget {
                                     paren_close_indent_override,
                                 ),
                                 paren_semantic_flags,
-                                paren_restore_state,
+                                paren_session_state,
                                 new_query_base_depth,
                                 wrapped_owner_kind.or(forced_wrapped_owner_kind),
                                 None,
@@ -10211,12 +10318,12 @@ impl SqlEditorWidget {
                             format_stack.with_cte_on_close_paren();
                             trim_trailing_space(&mut out);
                             let popped_paren = format_stack.pop_paren(&mut indent_level);
-                            let (paren_frame_kind, restore_state, open_cursor_restore_state) =
+                            let (paren_frame_kind, session_state, open_cursor_restore_state) =
                                 popped_paren
                                     .map(|frame| {
                                         (
                                             frame.frame,
-                                            frame.restore_state,
+                                            frame.session_state,
                                             frame.open_cursor_restore_state,
                                         )
                                     })
@@ -10316,9 +10423,9 @@ impl SqlEditorWidget {
                                     Self::tokens_continue_plsql_condition_terminator(tokens, idx);
                                 let closes_control_branch_tail = (next_word_is("ELSE")
                                     || next_word_is("WHEN"))
-                                    && format_stack
-                                        .last_block_kind()
-                                        .is_some_and(|block| matches!(block, "IF" | "WHILE"))
+                                    && format_stack.last_block_kind().is_some_and(|block| {
+                                        matches!(block, BlockKind::If | BlockKind::While)
+                                    })
                                     && format_stack
                                         .last_condition_owner(ConditionOwnerKind::ControlHeader)
                                         .is_some();
@@ -10355,12 +10462,13 @@ impl SqlEditorWidget {
                                     .or(open_cursor_restore_state)
                                     .unwrap_or(OpenCursorFormatState::None);
                             }
-                            if let Some(restore_state) = restore_state {
-                                current_clause = restore_state.clause;
-                                select_list_layout_state = restore_state.select_list_layout_state;
-                                statement_has_with_clause = restore_state.statement_has_with_clause;
-                                query_body_clause_base_depth =
-                                    restore_state.query_body_clause_base_depth;
+                            if let Some(session_state) = session_state {
+                                session_state.restore(
+                                    &mut current_clause,
+                                    &mut select_list_layout_state,
+                                    &mut statement_has_with_clause,
+                                    &mut query_body_clause_base_depth,
+                                );
                             }
                             if format_stack.paren_is_empty()
                                 && matches!(
@@ -36458,10 +36566,10 @@ mod format_frame_stack_tests {
     use super::*;
 
     #[test]
-    fn format_frame_stack_restores_query_base_and_restore_state_from_same_paren_frame() {
+    fn format_frame_stack_restores_query_base_and_session_state_from_same_paren_frame() {
         let mut stack = FormatFrameStack::default();
-        let restore_state = QueryLikeParenRestoreState {
-            clause: Some("SELECT".to_string()),
+        let session_state = FormatSessionState {
+            current_clause: Some("SELECT".to_string()),
             select_list_layout_state: SelectListLayoutState::Multiline {
                 indent: 6,
                 hanging_indent_spaces: None,
@@ -36475,7 +36583,7 @@ mod format_frame_stack_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 2, false, 3, Some(2)),
             ParenSemanticFlags::default(),
-            Some(restore_state.clone()),
+            Some(session_state.clone()),
             Some(7),
             Some(FormatIndentedParenOwnerKind::WithinGroup),
             None,
@@ -36492,14 +36600,14 @@ mod format_frame_stack_tests {
         assert_eq!(stack.current_query_base_depth(), Some(2));
         assert_eq!(
             popped
-                .restore_state
+                .session_state
                 .as_ref()
-                .and_then(|state| state.clause.as_deref()),
+                .and_then(|state| state.current_clause.as_deref()),
             Some("SELECT")
         );
         assert_eq!(
             popped
-                .restore_state
+                .session_state
                 .as_ref()
                 .map(|state| state.query_body_clause_base_depth),
             Some(Some(4))
@@ -36511,7 +36619,7 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
-        stack.push_block("CASE", 1, 2, &mut indent_level);
+        stack.push_block(BlockKind::Case, 1, 2, &mut indent_level);
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 3, false, 0, None),
             ParenSemanticFlags::default(),
@@ -36538,7 +36646,7 @@ mod format_frame_stack_tests {
             .pop_block(&mut indent_level)
             .expect("case block frame");
 
-        assert_eq!(popped_block.kind, "CASE");
+        assert_eq!(popped_block.kind, BlockKind::Case);
         assert_eq!(popped_block.depth_frame.owner_depth, 1);
         assert_eq!(stack.block_depth(), 0);
         assert_eq!(indent_level, 0);
@@ -36578,7 +36686,7 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
-        stack.push_block("IF", 0, 1, &mut indent_level);
+        stack.push_block(BlockKind::If, 0, 1, &mut indent_level);
         stack.push_condition_owner(ConditionOwnerKind::Where, FormatScope::new(1, 1), 2, false);
         stack.push_between_pending(FormatScope::new(1, 1));
         stack.push_paren(
@@ -36614,7 +36722,7 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
-        stack.push_block("DECLARE", 0, 1, &mut indent_level);
+        stack.push_block(BlockKind::Declare, 0, 1, &mut indent_level);
         stack.push_plsql_context(stack.current_scope());
         stack.push_compound_trigger(stack.current_scope());
         stack.push_with_cte_frame(stack.current_scope());
@@ -36652,9 +36760,9 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
-        stack.push_block("CASE", 1, 2, &mut indent_level);
+        stack.push_block(BlockKind::Case, 1, 2, &mut indent_level);
         let _ = stack.set_last_case_branch_started(true);
-        stack.push_block("BEGIN", 2, 3, &mut indent_level);
+        stack.push_block(BlockKind::Begin, 2, 3, &mut indent_level);
         let _ = stack.mark_last_block_mysql_handler_begin();
         assert_eq!(indent_level, 3);
 
@@ -36662,14 +36770,14 @@ mod format_frame_stack_tests {
             .pop_block(&mut indent_level)
             .expect("handler begin block");
 
-        assert_eq!(popped_begin.kind, "BEGIN");
+        assert_eq!(popped_begin.kind, BlockKind::Begin);
         assert!(popped_begin.mysql_handler_begin);
         assert!(stack.last_case_branch_started());
         assert_eq!(indent_level, 2);
 
         let popped_case = stack.pop_block(&mut indent_level).expect("case block");
 
-        assert_eq!(popped_case.kind, "CASE");
+        assert_eq!(popped_case.kind, BlockKind::Case);
         assert_eq!(stack.block_depth(), 0);
         assert_eq!(indent_level, 0);
     }
