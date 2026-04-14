@@ -212,6 +212,54 @@ fn rendered_line_indent(line: &str) -> usize {
     SqlEditorWidget::safe_indent_div(line.chars().take_while(|ch| *ch == ' ').count())
 }
 
+#[derive(Default)]
+struct IndentCache {
+    spaces: String,
+}
+
+impl IndentCache {
+    fn spaces(&mut self, count: usize) -> &str {
+        if self.spaces.len() < count {
+            self.spaces
+                .extend(std::iter::repeat(' ').take(count.saturating_sub(self.spaces.len())));
+        }
+        &self.spaces[..count]
+    }
+
+    fn indent(&mut self, level: usize) -> &str {
+        self.spaces(level.saturating_mul(4))
+    }
+}
+
+fn newline_with_cached_spaces(
+    out: &mut String,
+    indent_spaces: usize,
+    at_line_start: &mut bool,
+    needs_space: &mut bool,
+    line_indent: &mut usize,
+    indent_cache: &mut IndentCache,
+) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(indent_cache.spaces(indent_spaces));
+    *line_indent = SqlEditorWidget::safe_indent_div(indent_spaces);
+    *at_line_start = false;
+    *needs_space = false;
+}
+
+fn ensure_cached_indent(
+    out: &mut String,
+    at_line_start: &mut bool,
+    line_indent: usize,
+    indent_cache: &mut IndentCache,
+) {
+    if *at_line_start {
+        out.push_str(indent_cache.indent(line_indent));
+        *at_line_start = false;
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct FormatBlockDepthFrame {
     owner_depth: usize,
@@ -798,10 +846,8 @@ impl FormatterTokenCache {
         self.matching_paren_close_indices.as_slice()
     }
 
-    fn next_non_comment<'a>(&self, tokens: &'a [SqlToken], idx: usize) -> Option<&'a SqlToken> {
-        self.meaningful_links
-            .next_index(idx)
-            .and_then(|next_idx| tokens.get(next_idx))
+    fn next_non_comment_index(&self, idx: usize) -> Option<usize> {
+        self.meaningful_links.next_index(idx)
     }
 
     fn next_word<'a>(&self, tokens: &'a [SqlToken], idx: usize) -> Option<&'a str> {
@@ -947,7 +993,6 @@ struct CommentPrefixCache {
     prefix_len_before_token: Vec<usize>,
     previous_non_comment_token: Vec<Option<usize>>,
     second_previous_non_comment_token: Vec<Option<usize>>,
-    has_string_token_before: Vec<bool>,
 }
 
 impl CommentPrefixCache {
@@ -956,16 +1001,13 @@ impl CommentPrefixCache {
         let mut prefix_len_before_token = vec![0usize; tokens.len()];
         let mut previous_non_comment_token = vec![None; tokens.len()];
         let mut second_previous_non_comment_token = vec![None; tokens.len()];
-        let mut has_string_token_before = vec![false; tokens.len()];
         let mut prev_non_comment = None;
         let mut prev_prev_non_comment = None;
-        let mut saw_string_token = false;
 
         for (idx, token) in tokens.iter().enumerate() {
             prefix_len_before_token[idx] = prefix_text.len();
             previous_non_comment_token[idx] = prev_non_comment;
             second_previous_non_comment_token[idx] = prev_prev_non_comment;
-            has_string_token_before[idx] = saw_string_token;
 
             if matches!(token, SqlToken::Comment(_)) {
                 continue;
@@ -976,10 +1018,7 @@ impl CommentPrefixCache {
             }
             match token {
                 SqlToken::Word(word) => prefix_text.push_str(word),
-                SqlToken::String(literal) => {
-                    prefix_text.push_str(literal);
-                    saw_string_token = true;
-                }
+                SqlToken::String(literal) => prefix_text.push_str(literal),
                 SqlToken::Symbol(symbol) => prefix_text.push_str(symbol),
                 SqlToken::Comment(_) => {}
             }
@@ -992,7 +1031,6 @@ impl CommentPrefixCache {
             prefix_len_before_token,
             previous_non_comment_token,
             second_previous_non_comment_token,
-            has_string_token_before,
         }
     }
 
@@ -1014,13 +1052,6 @@ impl CommentPrefixCache {
             .get(idx)
             .copied()
             .flatten()
-    }
-
-    fn has_string_token_before(&self, idx: usize) -> bool {
-        self.has_string_token_before
-            .get(idx)
-            .copied()
-            .unwrap_or(false)
     }
 }
 
@@ -6881,7 +6912,7 @@ impl SqlEditorWidget {
         let mut line_start_delimiter_snapshot = DelimiterLineStartSnapshot::default();
         let mut join_modifier_active = false;
         let mut after_for_while = false; // Track FOR/WHILE for LOOP on same line
-        let mut prev_word_upper: Option<String> = None;
+        let mut prev_word_idx: Option<usize> = None;
         let mut pending_package_member_separator = false;
         let mut active_package_member_name: Option<String> = None;
         let mut mysql_handler_state = MySqlHandlerFormatState::None;
@@ -6899,6 +6930,7 @@ impl SqlEditorWidget {
             FormatterTokenCache::build(tokens, token_spans, statement, &token_paren_depths);
         let comment_prefix_cache = CommentPrefixCache::build(tokens);
         let mut rendered_line_tracker = RenderedLineTracker::default();
+        let mut indent_cache = IndentCache::default();
         let newline_with = |out: &mut String,
                             indent_level: usize,
                             extra: usize,
@@ -6924,20 +6956,6 @@ impl SqlEditorWidget {
             *at_line_start = true;
             *needs_space = false;
         };
-        let newline_with_spaces = |out: &mut String,
-                                   indent_spaces: usize,
-                                   at_line_start: &mut bool,
-                                   needs_space: &mut bool,
-                                   line_indent: &mut usize| {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&" ".repeat(indent_spaces));
-            *line_indent = Self::safe_indent_div(indent_spaces);
-            *at_line_start = false;
-            *needs_space = false;
-        };
-
         macro_rules! base_indent {
             ($indent_level:expr) => {
                 format_stack.open_cursor_state().base_indent($indent_level)
@@ -7017,13 +7035,6 @@ impl SqlEditorWidget {
                 }
             }};
         }
-        let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
-            if *at_line_start {
-                out.push_str(&" ".repeat(line_indent * 4));
-                *at_line_start = false;
-            }
-        };
-
         let trim_trailing_space = |out: &mut String| {
             while out.ends_with(' ') {
                 out.pop();
@@ -7143,6 +7154,8 @@ impl SqlEditorWidget {
         while idx < tokens.len() {
             let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = format_stack.sync_for_token_entry(&mut indent_level);
+            let prev_word_upper =
+                prev_word_idx.and_then(|prev_idx| token_cache.upper_word(prev_idx));
             let top_level_select_item_context = format_stack
                 .paren_frames()
                 .all(|frame| frame.is_query_like());
@@ -7192,9 +7205,10 @@ impl SqlEditorWidget {
                     inline_comment_continuation_state = InlineCommentContinuationState::None;
                 }
             }
+            let next_non_comment_idx = token_cache.next_non_comment_index(idx);
             let next_word = token_cache.next_word(tokens, idx);
             let third_word = token_cache.second_next_word(tokens, idx);
-            let next_non_comment = token_cache.next_non_comment(tokens, idx);
+            let next_non_comment = next_non_comment_idx.and_then(|next_idx| tokens.get(next_idx));
             let next_word_is =
                 |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
             let marks_multiline_child_continuation = match &tokens[idx] {
@@ -7730,7 +7744,12 @@ impl SqlEditorWidget {
                         );
 
                         // Output "END"
-                        ensure_indent(&mut out, &mut at_line_start, line_indent);
+                        ensure_cached_indent(
+                            &mut out,
+                            &mut at_line_start,
+                            line_indent,
+                            &mut indent_cache,
+                        );
                         out.push_str("END");
 
                         // If qualified (END LOOP/IF/CASE/REPEAT/BEFORE/AFTER), output tail and skip it.
@@ -9188,7 +9207,12 @@ impl SqlEditorWidget {
                     }
                     let opens_unterminated_plsql_label_with_embedded_lines =
                         opens_unterminated_plsql_label && word.contains('\n');
-                    ensure_indent(&mut out, &mut at_line_start, line_indent);
+                    ensure_cached_indent(
+                        &mut out,
+                        &mut at_line_start,
+                        line_indent,
+                        &mut indent_cache,
+                    );
                     if needs_space {
                         out.push(' ');
                     }
@@ -9217,7 +9241,12 @@ impl SqlEditorWidget {
                             if segment.is_empty() {
                                 continue;
                             }
-                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            ensure_cached_indent(
+                                &mut out,
+                                &mut at_line_start,
+                                line_indent,
+                                &mut indent_cache,
+                            );
                             out.push_str(segment);
                         }
                     } else {
@@ -9737,7 +9766,7 @@ impl SqlEditorWidget {
                         let _ = format_stack.pop_last_condition_owner(ConditionOwnerKind::Case);
                     }
 
-                    prev_word_upper = Some(upper.to_string());
+                    prev_word_idx = Some(idx);
                 }
                 SqlToken::String(literal) => {
                     let mysql_handler_body_line_pending =
@@ -9764,7 +9793,12 @@ impl SqlEditorWidget {
                         line_indent = line_indent.max(handler_body_indent);
                         let _ = format_stack.clear_mysql_handler_pending_body_indent();
                     }
-                    ensure_indent(&mut out, &mut at_line_start, line_indent);
+                    ensure_cached_indent(
+                        &mut out,
+                        &mut at_line_start,
+                        line_indent,
+                        &mut indent_cache,
+                    );
                     if needs_space {
                         out.push(' ');
                     }
@@ -9822,13 +9856,44 @@ impl SqlEditorWidget {
                     let second_previous_non_comment_token = comment_prefix_cache
                         .second_previous_non_comment_token_index(idx)
                         .and_then(|token_idx| tokens.get(token_idx));
-                    let mut keeps_next_line_continuation =
-                        Self::comment_keeps_next_line_continuation_for_prefix(
-                            comment_structural_prefix,
-                            second_previous_non_comment_token,
-                            previous_non_comment_token,
-                            comment_prefix_cache.has_string_token_before(idx),
-                        );
+                    let previous_token_requires_same_depth = previous_non_comment_token
+                        .is_some_and(|token| match token {
+                            SqlToken::Word(word) => {
+                                word.eq_ignore_ascii_case("WITH")
+                                    || word.eq_ignore_ascii_case("KEEP")
+                            }
+                            _ => false,
+                        });
+                    let previous_token = second_previous_non_comment_token
+                        .and_then(Self::format_trailing_meaningful_token_from_sql_token);
+                    let last_token = previous_non_comment_token
+                        .and_then(Self::format_trailing_meaningful_token_from_sql_token);
+                    let trailing_operator_continuation = last_token.is_some_and(|last| {
+                        crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
+                            previous_token,
+                            last,
+                        )
+                        .is_some()
+                    });
+                    let continuation_keyword = previous_non_comment_token
+                        .and_then(|token| match token {
+                            SqlToken::Word(word) => Some(word),
+                            _ => None,
+                        })
+                        .map(|word| word.to_ascii_uppercase())
+                        .is_some_and(|last_upper: String| {
+                            crate::sql_text::is_format_comment_continuation_keyword(
+                                last_upper.as_str(),
+                            )
+                        });
+                    let comment_header_continuation_kind = if previous_token_requires_same_depth {
+                        Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
+                    } else {
+                        Self::comment_header_continuation_kind_for_prefix(comment_structural_prefix)
+                    };
+                    let keeps_next_line_continuation = trailing_operator_continuation
+                        || continuation_keyword
+                        || comment_header_continuation_kind.is_some();
                     let attachment = Self::classify_comment_attachment(
                         &out,
                         at_line_start,
@@ -9915,13 +9980,8 @@ impl SqlEditorWidget {
                             next_non_comment,
                             Some(SqlToken::Symbol(s)) if s == ")"
                         );
-                        let next_word_upper = next_non_comment.and_then(|token| {
-                            if let SqlToken::Word(w) = token {
-                                Some(w.to_ascii_uppercase())
-                            } else {
-                                None
-                            }
-                        });
+                        let next_word_upper = next_non_comment_idx
+                            .and_then(|token_idx| token_cache.upper_word(token_idx));
                         let next_is_condition_keyword =
                             if let Some(upper) = next_word_upper.as_deref() {
                                 condition_keywords.contains(&upper)
@@ -10034,7 +10094,12 @@ impl SqlEditorWidget {
                                 .and_then(|frame| frame.sibling_body_indent())
                                 .unwrap_or(base);
                         }
-                        ensure_indent(&mut out, &mut at_line_start, line_indent);
+                        ensure_cached_indent(
+                            &mut out,
+                            &mut at_line_start,
+                            line_indent,
+                            &mut indent_cache,
+                        );
                     }
 
                     let rendered_comment_body = if matches!(attachment, CommentAttachment::Previous)
@@ -10049,20 +10114,6 @@ impl SqlEditorWidget {
                     out.push_str(rendered_comment_body);
 
                     needs_space = true;
-                    let previous_token_requires_same_depth = previous_non_comment_token
-                        .is_some_and(|token| match token {
-                            SqlToken::Word(word) => {
-                                word.eq_ignore_ascii_case("WITH")
-                                    || word.eq_ignore_ascii_case("KEEP")
-                            }
-                            _ => false,
-                        });
-                    let comment_header_continuation_kind = if previous_token_requires_same_depth {
-                        Some(crate::sql_text::FormatInlineCommentHeaderContinuationKind::SameDepth)
-                    } else {
-                        Self::comment_header_continuation_kind_for_prefix(comment_structural_prefix)
-                    };
-                    keeps_next_line_continuation |= comment_header_continuation_kind.is_some();
                     if hint_after_select {
                         if !out.ends_with('\n') {
                             out.push('\n');
@@ -10447,7 +10498,12 @@ impl SqlEditorWidget {
                                         }
                                     }
                                 }
-                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                                ensure_cached_indent(
+                                    &mut out,
+                                    &mut at_line_start,
+                                    line_indent,
+                                    &mut indent_cache,
+                                );
                             }
                             out.push(',');
                             format_stack.pop_between_pending_at_or_above(current_scope);
@@ -10787,12 +10843,13 @@ impl SqlEditorWidget {
                                             base_indent!(indent_level) + 1;
                                         let hanging_indent_spaces = select_list_layout_state!()
                                             .hanging_indent_spaces(&out, select_list_indent);
-                                        newline_with_spaces(
+                                        newline_with_cached_spaces(
                                             &mut out,
                                             hanging_indent_spaces,
                                             &mut at_line_start,
                                             &mut needs_space,
                                             &mut line_indent,
+                                            &mut indent_cache,
                                         );
                                         set_select_list_layout_state!(
                                             SelectListLayoutState::Multiline {
@@ -11465,7 +11522,12 @@ impl SqlEditorWidget {
                                     .map(|layout| layout.close_depth)
                                     .unwrap_or(query_like_owner_depth);
                             }
-                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            ensure_cached_indent(
+                                &mut out,
+                                &mut at_line_start,
+                                line_indent,
+                                &mut indent_cache,
+                            );
                             let keeps_aggregate_call_tight = statement_has_apply
                                 && matches!(
                                     prev_word_upper.as_deref(),
@@ -11672,7 +11734,12 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                                ensure_cached_indent(
+                                    &mut out,
+                                    &mut at_line_start,
+                                    line_indent,
+                                    &mut indent_cache,
+                                );
                             } else if close_compact_continuation_on_newline
                                 && !close_follows_child_close_line
                             {
@@ -11697,7 +11764,12 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
-                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                                ensure_cached_indent(
+                                    &mut out,
+                                    &mut at_line_start,
+                                    line_indent,
+                                    &mut indent_cache,
+                                );
                             }
                             if close_case_paren_on_newline {
                                 let closes_plsql_condition_terminator =
@@ -11732,7 +11804,12 @@ impl SqlEditorWidget {
                                         &mut line_indent,
                                     );
                                 }
-                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                                ensure_cached_indent(
+                                    &mut out,
+                                    &mut at_line_start,
+                                    line_indent,
+                                    &mut indent_cache,
+                                );
                             }
                             if open_cursor_state!()
                                 .select_depth()
@@ -11790,7 +11867,12 @@ impl SqlEditorWidget {
                                     paren_frame_kind.compact_multiline_close_indent()
                                 };
                             }
-                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            ensure_cached_indent(
+                                &mut out,
+                                &mut at_line_start,
+                                line_indent,
+                                &mut indent_cache,
+                            );
                             out.push(')');
                             if let Some(parent_frame) = format_stack.last_paren_mut() {
                                 if paren_frame_kind.contributes_multiline_close()
@@ -11807,7 +11889,12 @@ impl SqlEditorWidget {
                             needs_space = false;
                         }
                         _ => {
-                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            ensure_cached_indent(
+                                &mut out,
+                                &mut at_line_start,
+                                line_indent,
+                                &mut indent_cache,
+                            );
                             let is_mysql_block_label_colon =
                                 Self::is_mysql_block_label_colon(tokens, idx, sym);
                             let is_plsql_attribute_prefix =
@@ -12349,42 +12436,6 @@ impl SqlEditorWidget {
         }
 
         (!prefix.is_empty()).then_some(prefix)
-    }
-
-    fn comment_keeps_next_line_continuation_for_prefix(
-        structural_prefix: &str,
-        previous_non_comment_token: Option<&SqlToken>,
-        last_non_comment_token: Option<&SqlToken>,
-        has_string_token_before: bool,
-    ) -> bool {
-        let previous_token = previous_non_comment_token
-            .and_then(Self::format_trailing_meaningful_token_from_sql_token);
-        let last_token =
-            last_non_comment_token.and_then(Self::format_trailing_meaningful_token_from_sql_token);
-
-        if last_token.is_some_and(|last| {
-            crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
-                previous_token,
-                last,
-            )
-            .is_some()
-        }) {
-            return true;
-        }
-
-        if let Some(SqlToken::Word(last_word)) = last_non_comment_token {
-            let last_upper = last_word.to_ascii_uppercase();
-            if crate::sql_text::is_format_comment_continuation_keyword(last_upper.as_str()) {
-                return true;
-            }
-        }
-
-        !has_string_token_before
-            && !structural_prefix.is_empty()
-            && crate::sql_text::format_inline_comment_structural_header_continuation_kind(
-                structural_prefix,
-            )
-            .is_some()
     }
 
     fn next_meaningful_token_index_with_links(
