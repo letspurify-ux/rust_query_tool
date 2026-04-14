@@ -91,7 +91,12 @@ impl DelimiterFrameState {
                 continue;
             };
 
-            if self.stack.last().copied().is_some_and(|top| top == close_kind) {
+            if self
+                .stack
+                .last()
+                .copied()
+                .is_some_and(|top| top == close_kind)
+            {
                 let _ = self.stack.pop();
             }
         }
@@ -170,8 +175,7 @@ pub(crate) fn line_closes_delimiter_frame_below_snapshot_before_token(
 #[cfg(test)]
 mod tests {
     use super::{
-        line_closes_delimiter_frame_below_snapshot_before_token,
-        line_start_snapshot_before_token,
+        line_closes_delimiter_frame_below_snapshot_before_token, line_start_snapshot_before_token,
     };
     use crate::ui::sql_editor::query_text::tokenize_sql;
     use crate::ui::sql_editor::SqlToken;
@@ -199,14 +203,12 @@ mod tests {
         let shallow_snapshot = line_start_snapshot_before_token(&tokens, line_start_idx, 1);
         let deep_snapshot = line_start_snapshot_before_token(&tokens, line_start_idx, 2);
 
-        assert!(
-            !line_closes_delimiter_frame_below_snapshot_before_token(
-                &tokens,
-                line_start_idx,
-                comma_idx,
-                &shallow_snapshot,
-            )
-        );
+        assert!(!line_closes_delimiter_frame_below_snapshot_before_token(
+            &tokens,
+            line_start_idx,
+            comma_idx,
+            &shallow_snapshot,
+        ));
         assert!(line_closes_delimiter_frame_below_snapshot_before_token(
             &tokens,
             line_start_idx,

@@ -114,17 +114,98 @@ impl StatementWordLinks {
     }
 }
 
-fn current_rendered_line(out: &str) -> &str {
-    out.rsplit('\n').next().unwrap_or(out)
+#[derive(Default)]
+struct RenderedLineTracker {
+    line_starts: Vec<usize>,
+    scanned_len: usize,
 }
 
-fn active_query_owner_line(out: &str, opener_starts_new_line: bool) -> &str {
-    if !opener_starts_new_line {
-        return current_rendered_line(out);
+impl RenderedLineTracker {
+    fn sync(&mut self, out: &str) {
+        if self.line_starts.is_empty() {
+            self.line_starts.push(0);
+        }
+
+        if out.len() < self.scanned_len {
+            self.scanned_len = out.len();
+            while self.line_starts.len() > 1
+                && self
+                    .line_starts
+                    .last()
+                    .copied()
+                    .is_some_and(|start| start > self.scanned_len)
+            {
+                let _ = self.line_starts.pop();
+            }
+        }
+
+        if self.scanned_len >= out.len() {
+            return;
+        }
+
+        let suffix_start = self.scanned_len;
+        let Some(suffix) = out.get(suffix_start..) else {
+            self.line_starts.clear();
+            self.line_starts.push(0);
+            self.scanned_len = 0;
+            self.sync(out);
+            return;
+        };
+
+        for (offset, byte) in suffix.bytes().enumerate() {
+            if byte == b'\n' {
+                self.line_starts.push(suffix_start + offset + 1);
+            }
+        }
+        self.scanned_len = out.len();
     }
 
-    let trimmed = out.trim_end_matches('\n');
-    trimmed.rsplit('\n').next().unwrap_or(trimmed)
+    fn current_line<'a>(&mut self, out: &'a str) -> &'a str {
+        self.sync(out);
+        let line_start = self.line_starts.last().copied().unwrap_or(0);
+        out.get(line_start..).unwrap_or("")
+    }
+
+    fn line_before_trailing_newlines<'a>(&mut self, out: &'a str) -> &'a str {
+        self.sync(out);
+        let trimmed_len = out.trim_end_matches('\n').len();
+        self.line_ending_at(out, trimmed_len)
+    }
+
+    fn active_query_owner_line<'a>(
+        &mut self,
+        out: &'a str,
+        opener_starts_new_line: bool,
+    ) -> &'a str {
+        if opener_starts_new_line {
+            self.line_before_trailing_newlines(out)
+        } else {
+            self.current_line(out)
+        }
+    }
+
+    fn current_line_indent(&mut self, out: &str, fallback: usize) -> usize {
+        let line = self.current_line(out);
+        if line.is_empty() {
+            fallback
+        } else {
+            rendered_line_indent(line)
+        }
+    }
+
+    fn line_ending_at<'a>(&mut self, out: &'a str, end: usize) -> &'a str {
+        if end == 0 {
+            return "";
+        }
+
+        self.sync(out);
+        let line_idx = self
+            .line_starts
+            .partition_point(|line_start| *line_start < end)
+            .saturating_sub(1);
+        let line_start = self.line_starts.get(line_idx).copied().unwrap_or(0);
+        out.get(line_start..end).unwrap_or("")
+    }
 }
 
 fn rendered_line_indent(line: &str) -> usize {
@@ -3763,7 +3844,7 @@ impl SqlEditorWidget {
         source: &str,
         formatted: &str,
         original_pos: i32,
-        selected_only: bool,
+        _selected_only: bool,
         preferred_db_type: Option<DatabaseType>,
     ) -> i32 {
         if original_pos <= 0 {
@@ -3782,14 +3863,19 @@ impl SqlEditorWidget {
             return Self::clamp_to_char_boundary(formatted, scaled_pos as usize) as i32;
         }
 
-        let source_prefix = &source[..source_pos];
-        let formatted_prefix = if selected_only {
-            Self::format_for_auto_formatting_with_db_type(source_prefix, true, preferred_db_type)
-        } else {
-            Self::format_sql_basic_for_preferred_db_type(source_prefix, preferred_db_type)
-        };
-        let mut formatted_pos = formatted_prefix.len().min(formatted.len());
-        formatted_pos = Self::clamp_to_char_boundary(formatted, formatted_pos);
+        let mut formatted_pos = Self::map_cursor_after_format_linear_for_db_type(
+            source,
+            source_pos,
+            formatted,
+            preferred_db_type,
+        )
+        .unwrap_or_else(|| {
+            (source_pos as u128)
+                .saturating_mul(formatted.len() as u128)
+                .checked_div(source.len().max(1) as u128)
+                .unwrap_or(0) as usize
+        });
+        formatted_pos = Self::clamp_to_char_boundary(formatted, formatted_pos.min(formatted.len()));
         formatted_pos = Self::advance_over_inserted_layout_whitespace(
             source,
             source_pos,
@@ -3797,6 +3883,143 @@ impl SqlEditorWidget {
             formatted_pos,
         );
         formatted_pos as i32
+    }
+
+    fn map_cursor_after_format_linear_for_db_type(
+        source: &str,
+        source_pos: usize,
+        formatted: &str,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> Option<usize> {
+        if formatted.is_empty() {
+            return Some(0);
+        }
+
+        let mysql_compatible = sql_text::mysql_compatibility_for_sql(source, preferred_db_type);
+        let source_spans =
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(source, mysql_compatible);
+        let formatted_spans =
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted, mysql_compatible);
+        if source_spans.is_empty() || formatted_spans.is_empty() {
+            return Some(source_pos.min(formatted.len()));
+        }
+
+        let next_source_idx = source_spans.partition_point(|span| span.end <= source_pos);
+        let previous_source_idx = next_source_idx.checked_sub(1);
+        let anchor_source_idx = if source_spans
+            .get(next_source_idx)
+            .is_some_and(|span| source_pos >= span.start)
+        {
+            Some(next_source_idx)
+        } else {
+            None
+        };
+        let max_source_idx = anchor_source_idx.or(previous_source_idx).or_else(|| {
+            (!source_spans.is_empty()).then_some(source_spans.len().saturating_sub(1))
+        })?;
+
+        let token_alignment = Self::build_cursor_mapping_token_alignment(
+            &source_spans,
+            &formatted_spans,
+            max_source_idx,
+        );
+
+        let formatted_pos = if let Some(source_idx) = anchor_source_idx {
+            let source_span = source_spans.get(source_idx)?;
+            let formatted_idx = token_alignment.get(source_idx).copied().flatten()?;
+            let formatted_span = formatted_spans.get(formatted_idx)?;
+            let token_offset = source_pos.saturating_sub(source_span.start);
+            formatted_span.start.saturating_add(
+                token_offset.min(formatted_span.end.saturating_sub(formatted_span.start)),
+            )
+        } else if let Some(source_idx) = (next_source_idx < source_spans.len())
+            .then_some(next_source_idx)
+            .filter(|_| {
+                source
+                    .as_bytes()
+                    .get(source_pos)
+                    .is_none_or(|byte| !byte.is_ascii_whitespace())
+            })
+        {
+            token_alignment
+                .get(source_idx)
+                .copied()
+                .flatten()
+                .and_then(|formatted_idx| formatted_spans.get(formatted_idx))
+                .map(|span| span.start)
+                .or_else(|| {
+                    previous_source_idx
+                        .and_then(|prev_idx| token_alignment.get(prev_idx).copied().flatten())
+                        .and_then(|formatted_idx| formatted_spans.get(formatted_idx))
+                        .map(|span| span.end)
+                })?
+        } else if let Some(previous_idx) = previous_source_idx {
+            token_alignment
+                .get(previous_idx)
+                .copied()
+                .flatten()
+                .and_then(|formatted_idx| formatted_spans.get(formatted_idx))
+                .map(|span| span.end)
+                .unwrap_or(0)
+        } else {
+            token_alignment
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|formatted_idx| formatted_spans.get(formatted_idx))
+                .map(|span| span.start)
+                .unwrap_or(0)
+        };
+
+        Some(formatted_pos.min(formatted.len()))
+    }
+
+    fn build_cursor_mapping_token_alignment(
+        source_spans: &[SqlTokenSpan],
+        formatted_spans: &[SqlTokenSpan],
+        max_source_idx: usize,
+    ) -> Vec<Option<usize>> {
+        let mut alignment = vec![None; source_spans.len()];
+        let mut formatted_idx = 0usize;
+        let last_source_idx = max_source_idx.min(source_spans.len().saturating_sub(1));
+
+        for source_idx in 0..=last_source_idx {
+            let Some(source_span) = source_spans.get(source_idx) else {
+                break;
+            };
+
+            while let Some(formatted_span) = formatted_spans.get(formatted_idx) {
+                if Self::cursor_mapping_tokens_equivalent(&source_span.token, &formatted_span.token)
+                {
+                    alignment[source_idx] = Some(formatted_idx);
+                    formatted_idx = formatted_idx.saturating_add(1);
+                    break;
+                }
+
+                if Self::cursor_mapping_can_skip_formatted_token(&formatted_span.token) {
+                    formatted_idx = formatted_idx.saturating_add(1);
+                    continue;
+                }
+
+                formatted_idx = formatted_idx.saturating_add(1);
+            }
+        }
+
+        alignment
+    }
+
+    fn cursor_mapping_tokens_equivalent(source: &SqlToken, formatted: &SqlToken) -> bool {
+        match (source, formatted) {
+            (SqlToken::Word(left), SqlToken::Word(right)) => left.eq_ignore_ascii_case(right),
+            (SqlToken::String(left), SqlToken::String(right))
+            | (SqlToken::Comment(left), SqlToken::Comment(right))
+            | (SqlToken::Symbol(left), SqlToken::Symbol(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn cursor_mapping_can_skip_formatted_token(token: &SqlToken) -> bool {
+        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
     }
 
     pub(super) fn advance_over_inserted_layout_whitespace(
@@ -4021,52 +4244,75 @@ impl SqlEditorWidget {
 
         let spans = super::query_text::tokenize_sql_spanned(formatted);
         let mut split_points: Vec<usize> = Vec::new();
+        let bytes = formatted.as_bytes();
+        let mut previous_end = 0usize;
+        let mut pending_split_after_semicolon: Option<usize> = None;
+        let line_is_non_sql = |line_start: usize| {
+            let line_start = line_start.min(formatted.len());
+            let line_end = formatted[line_start..]
+                .find('\n')
+                .map_or(formatted.len(), |offset| line_start + offset);
+            let current_line = formatted.get(line_start..line_end).unwrap_or("");
+            let trimmed = current_line.trim();
+            trimmed.starts_with("--")
+                || trimmed.starts_with('#')
+                || Self::is_sqlplus_remark_comment_statement(trimmed)
+                || QueryExecutor::parse_tool_command(trimmed)
+                    .is_some_and(|command| !matches!(command, ToolCommand::Unsupported { .. }))
+        };
+        let mut current_line_is_non_sql = line_is_non_sql(0);
 
-        for (idx, span) in spans.iter().enumerate() {
-            if !matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                || Self::semicolon_belongs_to_non_sql_line(formatted, span.start)
-            {
+        for span in &spans {
+            let Some(gap) = formatted.get(previous_end..span.start) else {
+                previous_end = span.end;
                 continue;
+            };
+            if let Some(last_newline_offset) = gap.rfind('\n') {
+                pending_split_after_semicolon = None;
+                current_line_is_non_sql = line_is_non_sql(previous_end + last_newline_offset + 1);
             }
 
-            let line_end = formatted[span.end..]
-                .find('\n')
-                .map_or(formatted.len(), |offset| span.end + offset);
-            let mut split_at = None;
-
-            for next_span in spans.iter().skip(idx.saturating_add(1)) {
-                if next_span.start >= line_end {
-                    break;
-                }
-
-                match &next_span.token {
-                    SqlToken::Comment(comment) if comment.contains('\n') => break,
+            if let Some(semicolon_end) = pending_split_after_semicolon {
+                match &span.token {
+                    SqlToken::Comment(comment) if comment.contains('\n') => {
+                        pending_split_after_semicolon = None;
+                    }
                     SqlToken::Comment(_) => {}
                     _ => {
-                        let mut candidate = next_span.start;
-                        while candidate > span.end {
-                            match formatted.as_bytes().get(candidate.saturating_sub(1)) {
-                                Some(b' ' | b'\t') => candidate = candidate.saturating_sub(1),
+                        let mut split_at = span.start;
+                        while split_at > semicolon_end {
+                            match bytes.get(split_at.saturating_sub(1)) {
+                                Some(b' ' | b'\t') => split_at = split_at.saturating_sub(1),
                                 _ => break,
                             }
                         }
-                        split_at = Some(candidate.max(span.end));
-                        break;
+                        split_points.push(split_at.max(semicolon_end));
+                        pending_split_after_semicolon = None;
                     }
                 }
             }
 
-            if let Some(split_at) = split_at {
-                split_points.push(split_at);
+            if matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && !current_line_is_non_sql
+            {
+                pending_split_after_semicolon = Some(span.end);
             }
+
+            let Some(token_text) = formatted.get(span.start..span.end) else {
+                previous_end = span.end;
+                continue;
+            };
+            if let Some(last_newline_offset) = token_text.rfind('\n') {
+                pending_split_after_semicolon = None;
+                current_line_is_non_sql = line_is_non_sql(span.start + last_newline_offset + 1);
+            }
+
+            previous_end = span.end;
         }
 
         if split_points.is_empty() {
             return formatted.to_string();
         }
-
-        split_points.sort_unstable();
-        split_points.dedup();
 
         let mut out = String::with_capacity(formatted.len().saturating_add(split_points.len()));
         let mut cursor = 0usize;
@@ -4452,8 +4698,15 @@ impl SqlEditorWidget {
                         || sql_text::mysql_compatibility_for_sql(statement, preferred_db_type);
                     let mysql_profile =
                         mysql_compatible_statement && Self::mysql_formatter_profile_enabled();
-                    let statement_tokens =
-                        Self::tokenize_sql_with_mysql_compat(statement, mysql_compatible_statement);
+                    let statement_token_spans =
+                        super::query_text::tokenize_sql_spanned_with_mysql_compat(
+                            statement,
+                            mysql_compatible_statement,
+                        );
+                    let statement_tokens: Vec<SqlToken> = statement_token_spans
+                        .iter()
+                        .map(|span| span.token.clone())
+                        .collect();
                     let formatted_statement = Self::profile_mysql_formatter_stage(
                         "format_statement",
                         statement.len(),
@@ -4462,6 +4715,7 @@ impl SqlEditorWidget {
                             Self::format_statement(
                                 statement,
                                 &statement_tokens,
+                                &statement_token_spans,
                                 select_list_break_state,
                                 mysql_compatible_statement,
                             )
@@ -6120,6 +6374,7 @@ impl SqlEditorWidget {
     fn format_statement(
         statement: &str,
         tokens: &[SqlToken],
+        token_spans: &[SqlTokenSpan],
         select_list_break_state_on_start: SelectListBreakState,
         mysql_compatible: bool,
     ) -> String {
@@ -6166,11 +6421,10 @@ impl SqlEditorWidget {
         let is_package_body_statement = Self::statement_starts_with_package_body_header(tokens);
         let statement_has_apply = Self::statement_contains_keyword(tokens, "APPLY");
         let query_apply_flags = Self::query_apply_flags(tokens);
-        let token_spans =
-            super::query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible);
         let token_paren_depths = paren_depths(tokens);
         let token_cache = FormatterTokenCache::build(tokens);
         let comment_prefix_cache = CommentPrefixCache::build(tokens);
+        let mut rendered_line_tracker = RenderedLineTracker::default();
         let newline_with = |out: &mut String,
                             indent_level: usize,
                             extra: usize,
@@ -6300,12 +6554,6 @@ impl SqlEditorWidget {
             while out.ends_with(' ') {
                 out.pop();
             }
-        };
-        let current_output_line_indent = |out: &str, fallback: usize| {
-            out.rsplit('\n')
-                .next()
-                .map(|line| Self::safe_indent_div(line.chars().take_while(|ch| *ch == ' ').count()))
-                .unwrap_or(fallback)
         };
         let token_gap_contains_newline = |idx: usize| -> bool {
             let Some(current_span) = token_spans.get(idx) else {
@@ -6962,9 +7210,7 @@ impl SqlEditorWidget {
                                 }
                             }
                         } else if case_expression_end {
-                            if let Some(popped_block) =
-                                format_stack.pop_block(&mut indent_level)
-                            {
+                            if let Some(popped_block) = format_stack.pop_block(&mut indent_level) {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
                                 any_block_popped = true;
@@ -6972,8 +7218,7 @@ impl SqlEditorWidget {
                         } else {
                             // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
                             // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
-                            while let Some(popped_block) =
-                                format_stack.pop_block(&mut indent_level)
+                            while let Some(popped_block) = format_stack.pop_block(&mut indent_level)
                             {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 let top = popped_block.kind;
@@ -7219,7 +7464,10 @@ impl SqlEditorWidget {
                             let create_query_body_base_depth =
                                 (crate::sql_text::is_subquery_head_keyword(upper)
                                     && format_stack.paren_is_empty())
-                                .then(|| active_query_owner_line(&out, at_line_start))
+                                .then(|| {
+                                    rendered_line_tracker
+                                        .active_query_owner_line(&out, at_line_start)
+                                })
                                 .filter(|owner_line| {
                                     sql_text::line_is_create_query_body_header(owner_line)
                                 })
@@ -7249,8 +7497,8 @@ impl SqlEditorWidget {
                                             .is_some_and(|frame| !frame.is_query_like())
                                 })
                                 .map(|_| {
-                                    let rendered_indent =
-                                        current_output_line_indent(&out, line_indent);
+                                    let rendered_indent = rendered_line_tracker
+                                        .current_line_indent(&out, line_indent);
                                     let owner_indent =
                                         if at_line_start && rendered_indent == 0 && line_indent > 0
                                         {
@@ -7355,10 +7603,10 @@ impl SqlEditorWidget {
                                         })
                                         .map(|_| {
                                             select_list_layout_state!()
-                                                .indentation_or(current_output_line_indent(
-                                                    &out,
-                                                    line_indent,
-                                                ))
+                                                .indentation_or(
+                                                    rendered_line_tracker
+                                                        .current_line_indent(&out, line_indent),
+                                                )
                                                 .saturating_sub(1)
                                         });
                                 newline_with(
@@ -7545,7 +7793,7 @@ impl SqlEditorWidget {
                             let _ = format_stack.set_last_exception_branch_started(false);
                         }
                         let pending_create_query_body_owner_depth = (upper == "ON")
-                            .then(|| current_rendered_line(&out))
+                            .then(|| rendered_line_tracker.current_line(&out))
                             .filter(|owner_line| {
                                 matches!(
                                     sql_text::format_query_owner_pending_header_kind(owner_line),
@@ -7877,7 +8125,9 @@ impl SqlEditorWidget {
                             // INSERT ALL/FIRST branch bodies should stay one
                             // level deeper than WHEN ... THEN headers.
                             insert_all_branch_body_indent = Some(
-                                current_output_line_indent(&out, line_indent).saturating_add(1),
+                                rendered_line_tracker
+                                    .current_line_indent(&out, line_indent)
+                                    .saturating_add(1),
                             );
                             newline_after_keyword = true;
                             newline_after_keyword_extra = 1;
@@ -8171,7 +8421,8 @@ impl SqlEditorWidget {
                             closed_control_header_body_indent = format_stack
                                 .pop_last_condition_owner(ConditionOwnerKind::ControlHeader)
                                 .map(|frame| frame.indent.saturating_add(1));
-                            format_stack.push_block(BlockKind::While,
+                            format_stack.push_block(
+                                BlockKind::While,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8376,8 +8627,9 @@ impl SqlEditorWidget {
                         mysql_handler_state.consume_word(upper)
                     };
                     if mysql_handler_state.body_line_pending() {
-                        let pending_indent =
-                            current_output_line_indent(&out, line_indent).saturating_add(1);
+                        let pending_indent = rendered_line_tracker
+                            .current_line_indent(&out, line_indent)
+                            .saturating_add(1);
                         let pending_indent = format_stack
                             .mysql_handler_pending_body_indent()
                             .unwrap_or(pending_indent);
@@ -8566,7 +8818,8 @@ impl SqlEditorWidget {
                     if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
                         format_stack.clear_trigger_header();
                         if !format_stack.last_block_kind_is("COMPOUND_TRIGGER") {
-                            format_stack.push_block(BlockKind::CompoundTrigger,
+                            format_stack.push_block(
+                                BlockKind::CompoundTrigger,
                                 indent_level,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8715,7 +8968,8 @@ impl SqlEditorWidget {
                     if should_treat_as_block_start {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         if let Some(block_kind) = BlockKind::from_keyword(upper) {
-                            format_stack.push_block(block_kind,
+                            format_stack.push_block(
+                                block_kind,
                                 line_indent,
                                 new_indent_level,
                                 &mut indent_level,
@@ -8755,7 +9009,8 @@ impl SqlEditorWidget {
                             // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
                         } else {
                             // Standalone BEGIN block
-                            format_stack.push_block(BlockKind::Begin,
+                            format_stack.push_block(
+                                BlockKind::Begin,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8777,7 +9032,8 @@ impl SqlEditorWidget {
                         }
                         set_current_clause!(None);
                     } else if upper == "EXCEPTION" {
-                        format_stack.push_block(BlockKind::Exception,
+                        format_stack.push_block(
+                            BlockKind::Exception,
                             line_indent,
                             indent_level,
                             &mut indent_level,
@@ -8785,7 +9041,8 @@ impl SqlEditorWidget {
                         set_current_clause!(None);
                     } else if upper == "LOOP" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
-                        format_stack.push_block(BlockKind::Loop,
+                        format_stack.push_block(
+                            BlockKind::Loop,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8793,7 +9050,8 @@ impl SqlEditorWidget {
                         format_stack.push_plsql_context(format_stack.current_scope());
                         set_current_clause!(None);
                     } else if upper == "REPEAT" {
-                        format_stack.push_block(BlockKind::Repeat,
+                        format_stack.push_block(
+                            BlockKind::Repeat,
                             line_indent,
                             indent_level.saturating_add(1),
                             &mut indent_level,
@@ -8802,7 +9060,8 @@ impl SqlEditorWidget {
                         set_current_clause!(None);
                     } else if upper == "CASE" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
-                        format_stack.push_block(BlockKind::Case,
+                        format_stack.push_block(
+                            BlockKind::Case,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8837,20 +9096,23 @@ impl SqlEditorWidget {
                             indent_level.max(line_indent).saturating_add(1)
                         };
                         if starts_compound_trigger_body {
-                            format_stack.push_block(BlockKind::CompoundTrigger,
+                            format_stack.push_block(
+                                BlockKind::CompoundTrigger,
                                 indent_level,
                                 new_indent_level,
                                 &mut indent_level,
                             );
                             format_stack.compound_trigger_enter_outer_body();
                         } else if is_package_body {
-                            format_stack.push_block(BlockKind::PackageBody,
+                            format_stack.push_block(
+                                BlockKind::PackageBody,
                                 line_indent,
                                 new_indent_level,
                                 &mut indent_level,
                             );
                         } else {
-                            format_stack.push_block(BlockKind::Declare,
+                            format_stack.push_block(
+                                BlockKind::Declare,
                                 package_member_owner_depth.unwrap_or(line_indent),
                                 new_indent_level,
                                 &mut indent_level,
@@ -9044,8 +9306,9 @@ impl SqlEditorWidget {
                         at_line_start && mysql_handler_state.body_line_pending();
                     let mysql_handler_header_literal = mysql_handler_state.consume_string();
                     if mysql_handler_state.body_line_pending() {
-                        let pending_indent =
-                            current_output_line_indent(&out, line_indent).saturating_add(1);
+                        let pending_indent = rendered_line_tracker
+                            .current_line_indent(&out, line_indent)
+                            .saturating_add(1);
                         let pending_indent = format_stack
                             .mysql_handler_pending_body_indent()
                             .unwrap_or(pending_indent);
@@ -9419,12 +9682,15 @@ impl SqlEditorWidget {
                                     if frame.opens_indented() {
                                         base_indent!(indent_level)
                                     } else {
-                                        current_output_line_indent(&out, line_indent)
+                                        rendered_line_tracker
+                                            .current_line_indent(&out, line_indent)
                                             .saturating_add(1)
                                     }
                                 })
                                 .unwrap_or_else(|| {
-                                    current_output_line_indent(&out, line_indent).saturating_add(1)
+                                    rendered_line_tracker
+                                        .current_line_indent(&out, line_indent)
+                                        .saturating_add(1)
                                 });
                             inline_comment_continuation_state =
                                 InlineCommentContinuationState::Operand {
@@ -9533,7 +9799,7 @@ impl SqlEditorWidget {
                         );
                         let keep_inline_alias_comment = keep_inline_as_is_alias_comment
                             || Self::block_comment_keeps_inline_terminal_close_alias_tail(
-                                &out,
+                                rendered_line_tracker.current_line(&out),
                                 tokens,
                                 idx,
                                 format_stack.current_clause(),
@@ -9568,7 +9834,10 @@ impl SqlEditorWidget {
                                     };
                                 let continuation_indent = if starts_after_open_paren {
                                     let opener_body_indent =
-                                        current_output_line_indent(&out, line_indent)
+                                        rendered_line_tracker.current_line_indent(
+                                            &out,
+                                            line_indent,
+                                        )
                                             .saturating_add(1);
                                     format_stack
                                         .last_paren()
@@ -9862,7 +10131,8 @@ impl SqlEditorWidget {
                                     .filter(|frame| frame.suppresses_comma_breaks())
                                     .is_some_and(|frame| {
                                         matches!(format_stack.current_clause(), Some("VALUES"))
-                                            && current_output_line_indent(&out, line_indent)
+                                            && rendered_line_tracker
+                                                .current_line_indent(&out, line_indent)
                                                 > frame.open_line_indent
                                     });
                                 let allows_structural_sibling_comma_break =
@@ -10310,7 +10580,7 @@ impl SqlEditorWidget {
                                 );
                             let paren_body_has_newline = Self::paren_body_contains_newline(
                                 tokens,
-                                token_spans.as_slice(),
+                                token_spans,
                                 statement,
                                 idx,
                                 Some(token_cache.matching_paren_close_indices()),
@@ -10421,7 +10691,7 @@ impl SqlEditorWidget {
                             let is_multiline_routine_parameter_list = mysql_compatible
                                 && Self::paren_opens_multiline_routine_parameter_list(
                                     tokens,
-                                    token_spans.as_slice(),
+                                    token_spans,
                                     statement,
                                     idx,
                                     Some(token_cache.matching_paren_close_indices()),
@@ -10573,7 +10843,7 @@ impl SqlEditorWidget {
                             let function_like_wrapped_paren =
                                 matches!(paren_frame_kind, ParenFormatFrameKind::WrappedLayout)
                                     && wraps_function_call_child;
-                            let rendered_owner_line = current_rendered_line(&out);
+                            let rendered_owner_line = rendered_line_tracker.current_line(&out);
                             let wrapped_query_owner_paren = !paren_started_at_line_start
                                 && matches!(paren_frame_kind, ParenFormatFrameKind::WrappedLayout)
                                 && {
@@ -10724,7 +10994,8 @@ impl SqlEditorWidget {
                             };
                             let query_like_owner_line =
                                 paren_frame_kind.is_query_like().then(|| {
-                                    active_query_owner_line(&out, paren_started_at_line_start)
+                                    rendered_line_tracker
+                                        .active_query_owner_line(&out, paren_started_at_line_start)
                                         .to_string()
                                 });
                             let standalone_owner_follows_opener = query_like_owner_line
@@ -10973,8 +11244,9 @@ impl SqlEditorWidget {
                                     false,
                                     None,
                                 ));
-                            let current_line =
-                                active_query_owner_line(&out, at_line_start).trim_end();
+                            let current_line = rendered_line_tracker
+                                .active_query_owner_line(&out, at_line_start)
+                                .trim_end();
                             let line_ends_with_end =
                                 sql_text::line_ends_with_identifier_sequence_before_inline_comment(
                                     current_line,
@@ -11003,7 +11275,7 @@ impl SqlEditorWidget {
                                         Some(SqlToken::Symbol(sym)) if sym == ")"
                                     );
                             let close_follows_child_close_line =
-                                current_rendered_line(&out).trim() == ")";
+                                rendered_line_tracker.current_line(&out).trim() == ")";
                             if paren_frame_kind.suppresses_comma_breaks() {
                                 suppress_comma_break_depth =
                                     suppress_comma_break_depth.saturating_sub(1);
@@ -11774,7 +12046,7 @@ impl SqlEditorWidget {
     }
 
     fn block_comment_keeps_inline_terminal_close_alias_tail(
-        out: &str,
+        current_line: &str,
         tokens: &[SqlToken],
         comment_idx: usize,
         current_clause: Option<&str>,
@@ -11836,7 +12108,7 @@ impl SqlEditorWidget {
                 )
             };
 
-        let current_line = current_rendered_line(out).trim_end();
+        let current_line = current_line.trim_end();
         if current_line.is_empty() {
             return false;
         }
@@ -37689,7 +37961,8 @@ mod format_frame_stack_tests {
     }
 
     #[test]
-    fn format_frame_stack_sync_for_token_entry_expires_sibling_auxiliary_frames_and_records_trace() {
+    fn format_frame_stack_sync_for_token_entry_expires_sibling_auxiliary_frames_and_records_trace()
+    {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
@@ -37715,14 +37988,13 @@ mod format_frame_stack_tests {
             2,
             &mut indent_level,
         );
-        stack.set_pending_split_end_suffix(
-            sibling_scope,
-            2,
-            PendingSplitEndSuffixKind::SingleWord,
-        );
+        stack.set_pending_split_end_suffix(sibling_scope, 2, PendingSplitEndSuffixKind::SingleWord);
 
         let returned_scope = stack.sync_for_token_entry(&mut indent_level);
-        let event = *stack.transition_trace().last().expect("token-entry sync event");
+        let event = *stack
+            .transition_trace()
+            .last()
+            .expect("token-entry sync event");
 
         assert_eq!(returned_scope, current_scope);
         assert_eq!(indent_level, 0);
@@ -37767,7 +38039,10 @@ mod format_frame_stack_tests {
         ));
         assert!(stack.last_block_kind_is("DECLARE"));
         assert_eq!(indent_level, 1);
-        assert_eq!(event.kind, FormatFrameTransitionKind::StatementBoundaryReset);
+        assert_eq!(
+            event.kind,
+            FormatFrameTransitionKind::StatementBoundaryReset
+        );
         assert_eq!(event.scope_before, scope_before);
         assert_eq!(event.scope_after, stack.current_scope());
         assert_eq!(event.indent_before, 1);
