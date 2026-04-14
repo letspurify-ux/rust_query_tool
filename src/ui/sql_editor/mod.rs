@@ -1120,8 +1120,7 @@ impl SqlEditorWidget {
                             "Generating explain plan",
                             |mysql_conn| {
                                 crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(
-                                    mysql_conn,
-                                    &sql,
+                                    mysql_conn, &sql,
                                 )
                             },
                         )

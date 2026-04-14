@@ -748,7 +748,9 @@ impl SqlEditorWidget {
                 cancel_flag,
                 query_timeout,
                 db_activity,
-                |mysql_conn| crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql),
+                |mysql_conn| {
+                    crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
+                },
             )
         };
         let mysql_interruption_flags = |message: &str| {

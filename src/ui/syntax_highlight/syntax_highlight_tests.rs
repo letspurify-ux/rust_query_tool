@@ -196,6 +196,31 @@ fn test_if_alias_member_access_is_not_highlighted_as_keyword() {
 }
 
 #[test]
+fn test_long_line_if_alias_member_access_stays_non_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let mut text = String::from("SELECT ");
+    for idx in 0..2048usize {
+        if idx > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&format!("if.col_{idx:04}"));
+    }
+    text.push_str(" FROM tablename if");
+
+    let styles = highlighter.generate_styles(&text);
+
+    for idx in [0usize, 511, 1023, 1535, 2047] {
+        let token = format!("if.col_{idx:04}");
+        let start = text.find(&token).unwrap_or(0);
+        let alias_end = start + 2;
+        assert!(
+            styles[start..alias_end].chars().all(|c| c != STYLE_KEYWORD),
+            "IF alias in `{token}` must not be highlighted as keyword on long lines"
+        );
+    }
+}
+
+#[test]
 fn test_trim_cte_alias_and_qualified_access_are_not_function_highlighted() {
     let highlighter = SqlHighlighter::new();
     let text = "WITH trim AS\n\
@@ -314,6 +339,37 @@ fn test_keyword_like_alias_before_dot_is_not_highlighted_as_keyword() {
             .all(|c| c != STYLE_KEYWORD && c != STYLE_FUNCTION),
         "alias `from` used before dot should not be highlighted as keyword"
     );
+}
+
+#[test]
+fn test_long_line_keyword_like_aliases_after_as_stay_non_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let mut text = String::from("SELECT ");
+    let mut alias_positions: Vec<(usize, &'static str)> = Vec::new();
+    for idx in 0..1024usize {
+        if idx > 0 {
+            text.push_str(", ");
+        }
+        let alias = if idx % 2 == 0 { "if" } else { "end" };
+        let fragment = format!("{idx} AS {alias}");
+        text.push_str(&fragment);
+        if matches!(idx, 0 | 255 | 511 | 767 | 1023) {
+            alias_positions.push((text.len().saturating_sub(alias.len()), alias));
+        }
+    }
+    text.push_str(" FROM dual");
+
+    let styles = highlighter.generate_styles(&text);
+
+    for (start, alias) in alias_positions {
+        let end = start + alias.len();
+        assert!(
+            styles[start..end]
+                .chars()
+                .all(|c| c != STYLE_KEYWORD && c != STYLE_FUNCTION),
+            "alias `{alias}` must remain identifier-highlighted on long lines"
+        );
+    }
 }
 
 #[test]

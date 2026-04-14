@@ -879,7 +879,8 @@ impl FormatterTokenCache {
         statement: &str,
         token_spans: &[SqlTokenSpan],
     ) -> Vec<bool> {
-        let Some((start_counts, end_counts)) = Self::build_token_newline_counts(statement, token_spans)
+        let Some((start_counts, end_counts)) =
+            Self::build_token_newline_counts(statement, token_spans)
         else {
             return vec![false; token_spans.len()];
         };
@@ -1389,8 +1390,7 @@ impl ActiveParenMetrics {
         }
         if frame.counts_for_paren_extra() {
             next.paren_extra_count = next.paren_extra_count.saturating_add(1);
-            next.paren_extra_since_last_query =
-                next.paren_extra_since_last_query.saturating_add(1);
+            next.paren_extra_since_last_query = next.paren_extra_since_last_query.saturating_add(1);
         }
 
         next
@@ -1982,13 +1982,13 @@ impl FormatFrameStack {
             .iter()
             .filter(|frame| matches!(frame, FormatFrame::Block(_)))
             .count();
-        self.active_paren_metrics = self
-            .frames
-            .iter()
-            .fold(ActiveParenMetrics::default(), |metrics, frame| match frame {
+        self.active_paren_metrics = self.frames.iter().fold(
+            ActiveParenMetrics::default(),
+            |metrics, frame| match frame {
                 FormatFrame::Paren(frame) => metrics.after_push(frame.frame),
                 _ => metrics,
-            });
+            },
+        );
         self.current_paren_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::Paren(frame) => Some(frame.id),
             _ => None,
@@ -8195,13 +8195,17 @@ impl SqlEditorWidget {
                                     end_tail.push(qualifier.to_string());
                                     let next_suffix_word_idx = end_qualifier_idx
                                         .and_then(|qualifier_idx| {
-                                            token_cache.next_same_line_non_comment_index(qualifier_idx)
+                                            token_cache
+                                                .next_same_line_non_comment_index(qualifier_idx)
                                         })
                                         .filter(|lookahead_idx| {
-                                            matches!(tokens.get(*lookahead_idx), Some(SqlToken::Word(_)))
+                                            matches!(
+                                                tokens.get(*lookahead_idx),
+                                                Some(SqlToken::Word(_))
+                                            )
                                         });
-                                    if let Some(qualifier_part) = next_suffix_word_idx.and_then(
-                                        |lookahead_idx| {
+                                    if let Some(qualifier_part) =
+                                        next_suffix_word_idx.and_then(|lookahead_idx| {
                                             token_cache
                                                 .upper_word(lookahead_idx)
                                                 .map(str::to_string)
@@ -8211,18 +8215,17 @@ impl SqlEditorWidget {
                                                     }
                                                     _ => None,
                                                 })
-                                        },
-                                    ) {
+                                        })
+                                    {
                                         if qualifier_part == "STATEMENT" {
                                             end_tail.push(qualifier_part);
                                         } else if qualifier_part == "EACH" {
                                             end_tail.push(qualifier_part);
                                             let row_word = next_suffix_word_idx
                                                 .and_then(|qualifier_idx| {
-                                                    token_cache
-                                                        .next_same_line_non_comment_index(
-                                                            qualifier_idx,
-                                                        )
+                                                    token_cache.next_same_line_non_comment_index(
+                                                        qualifier_idx,
+                                                    )
                                                 })
                                                 .filter(|lookahead_idx| {
                                                     matches!(
@@ -8237,9 +8240,7 @@ impl SqlEditorWidget {
                                                         .or_else(|| {
                                                             match tokens.get(lookahead_idx) {
                                                                 Some(SqlToken::Word(word)) => {
-                                                                    Some(
-                                                                        word.to_ascii_uppercase(),
-                                                                    )
+                                                                    Some(word.to_ascii_uppercase())
                                                                 }
                                                                 _ => None,
                                                             }
@@ -14253,10 +14254,8 @@ mod formatter_scope_state_tests {
             &mut indent_level,
         );
 
-        stack.deactivate_construct_flag_at_or_above_paren_depth(
-            ConstructFlagKind::CreatePending,
-            1,
-        );
+        stack
+            .deactivate_construct_flag_at_or_above_paren_depth(ConstructFlagKind::CreatePending, 1);
 
         assert_eq!(indent_level, 3);
         assert_eq!(
@@ -38815,8 +38814,7 @@ mod format_frame_stack_tests {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
         let compact = ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None);
-        let query_like =
-            ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 0, false, 2, None);
+        let query_like = ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 0, false, 2, None);
 
         assert!(stack.all_paren_frames_are_query_like());
         assert!(!stack.has_query_like_paren());
