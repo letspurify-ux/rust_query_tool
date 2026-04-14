@@ -2032,7 +2032,10 @@ impl FormatFrameStack {
         self.current_query_base_depth = None;
         *indent_level = self.statement_base_indent();
         #[cfg(debug_assertions)]
-        self.debug_assert_statement_boundary_integrity();
+        {
+            self.debug_assert_statement_boundary_integrity();
+            self.debug_assert_indent_level(*indent_level);
+        }
     }
 
     fn reset_for_statement_boundary(&mut self, indent_level: &mut usize) {
@@ -2044,15 +2047,6 @@ impl FormatFrameStack {
         self.pop_between_pending_at_or_above(FormatScope::new(0, 0));
         self.reset_runtime_state_for_statement_boundary(preserve_with_clause);
         self.clear_statement_frames(indent_level);
-        #[cfg(debug_assertions)]
-        {
-            let expected = self.statement_base_indent();
-            debug_assert_eq!(
-                *indent_level, expected,
-                "indent_level drift at statement boundary: got {}, expected {}",
-                *indent_level, expected
-            );
-        }
         #[cfg(test)]
         self.record_transition(
             FormatFrameTransitionKind::StatementBoundaryReset,
@@ -2177,23 +2171,6 @@ impl FormatFrameStack {
             );
         }
     }
-}
-
-fn push_format_block(
-    format_stack: &mut FormatFrameStack,
-    kind: BlockKind,
-    owner_depth: usize,
-    new_indent_level: usize,
-    indent_level: &mut usize,
-) {
-    format_stack.push_block(kind, owner_depth, new_indent_level, indent_level);
-}
-
-fn pop_format_block(
-    format_stack: &mut FormatFrameStack,
-    indent_level: &mut usize,
-) -> Option<PoppedBlockFrame> {
-    format_stack.pop_block(indent_level)
 }
 
 #[derive(Clone, Copy)]
@@ -6959,7 +6936,7 @@ impl SqlEditorWidget {
                                     && block_end_qualifiers.contains(&top.as_str())
                                 {
                                     if let Some(popped_block) =
-                                        pop_format_block(&mut format_stack, &mut indent_level)
+                                        format_stack.pop_block(&mut indent_level)
                                     {
                                         closed_mysql_handler_begin |=
                                             popped_block.mysql_handler_begin;
@@ -6971,7 +6948,7 @@ impl SqlEditorWidget {
                             }
                         } else if case_expression_end {
                             if let Some(popped_block) =
-                                pop_format_block(&mut format_stack, &mut indent_level)
+                                format_stack.pop_block(&mut indent_level)
                             {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
@@ -6981,7 +6958,7 @@ impl SqlEditorWidget {
                             // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
                             // Pop until we find BEGIN or DECLARE/PACKAGE_BODY
                             while let Some(popped_block) =
-                                pop_format_block(&mut format_stack, &mut indent_level)
+                                format_stack.pop_block(&mut indent_level)
                             {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 let top = popped_block.kind;
@@ -8179,9 +8156,7 @@ impl SqlEditorWidget {
                             closed_control_header_body_indent = format_stack
                                 .pop_last_condition_owner(ConditionOwnerKind::ControlHeader)
                                 .map(|frame| frame.indent.saturating_add(1));
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::While,
+                            format_stack.push_block(BlockKind::While,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8576,9 +8551,7 @@ impl SqlEditorWidget {
                     if prev_word_upper.as_deref() == Some("COMPOUND") && upper == "TRIGGER" {
                         format_stack.clear_trigger_header();
                         if !format_stack.last_block_kind_is("COMPOUND_TRIGGER") {
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::CompoundTrigger,
+                            format_stack.push_block(BlockKind::CompoundTrigger,
                                 indent_level,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8727,9 +8700,7 @@ impl SqlEditorWidget {
                     if should_treat_as_block_start {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
                         if let Some(block_kind) = BlockKind::from_keyword(upper) {
-                            push_format_block(
-                                &mut format_stack,
-                                block_kind,
+                            format_stack.push_block(block_kind,
                                 line_indent,
                                 new_indent_level,
                                 &mut indent_level,
@@ -8755,7 +8726,7 @@ impl SqlEditorWidget {
                                     .last_block_kind()
                                     .is_some_and(|block| block != BlockKind::PackageBody)
                                 {
-                                    let _ = pop_format_block(&mut format_stack, &mut indent_level);
+                                    let _ = format_stack.pop_block(&mut indent_level);
                                 }
                                 indent_level = format_stack.statement_base_indent();
                                 pending_package_member_separator = false;
@@ -8769,9 +8740,7 @@ impl SqlEditorWidget {
                             // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
                         } else {
                             // Standalone BEGIN block
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::Begin,
+                            format_stack.push_block(BlockKind::Begin,
                                 line_indent,
                                 indent_level.saturating_add(1),
                                 &mut indent_level,
@@ -8793,9 +8762,7 @@ impl SqlEditorWidget {
                         }
                         set_current_clause!(None);
                     } else if upper == "EXCEPTION" {
-                        push_format_block(
-                            &mut format_stack,
-                            BlockKind::Exception,
+                        format_stack.push_block(BlockKind::Exception,
                             line_indent,
                             indent_level,
                             &mut indent_level,
@@ -8803,9 +8770,7 @@ impl SqlEditorWidget {
                         set_current_clause!(None);
                     } else if upper == "LOOP" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
-                        push_format_block(
-                            &mut format_stack,
-                            BlockKind::Loop,
+                        format_stack.push_block(BlockKind::Loop,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8813,9 +8778,7 @@ impl SqlEditorWidget {
                         format_stack.push_plsql_context(format_stack.current_scope());
                         set_current_clause!(None);
                     } else if upper == "REPEAT" {
-                        push_format_block(
-                            &mut format_stack,
-                            BlockKind::Repeat,
+                        format_stack.push_block(BlockKind::Repeat,
                             line_indent,
                             indent_level.saturating_add(1),
                             &mut indent_level,
@@ -8824,9 +8787,7 @@ impl SqlEditorWidget {
                         set_current_clause!(None);
                     } else if upper == "CASE" {
                         let new_indent_level = indent_level.max(line_indent).saturating_add(1);
-                        push_format_block(
-                            &mut format_stack,
-                            BlockKind::Case,
+                        format_stack.push_block(BlockKind::Case,
                             line_indent,
                             new_indent_level,
                             &mut indent_level,
@@ -8861,26 +8822,20 @@ impl SqlEditorWidget {
                             indent_level.max(line_indent).saturating_add(1)
                         };
                         if starts_compound_trigger_body {
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::CompoundTrigger,
+                            format_stack.push_block(BlockKind::CompoundTrigger,
                                 indent_level,
                                 new_indent_level,
                                 &mut indent_level,
                             );
                             format_stack.compound_trigger_enter_outer_body();
                         } else if is_package_body {
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::PackageBody,
+                            format_stack.push_block(BlockKind::PackageBody,
                                 line_indent,
                                 new_indent_level,
                                 &mut indent_level,
                             );
                         } else {
-                            push_format_block(
-                                &mut format_stack,
-                                BlockKind::Declare,
+                            format_stack.push_block(BlockKind::Declare,
                                 package_member_owner_depth.unwrap_or(line_indent),
                                 new_indent_level,
                                 &mut indent_level,
