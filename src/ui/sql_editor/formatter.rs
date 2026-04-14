@@ -655,8 +655,8 @@ struct QueryLikeParenLayout {
     close_depth: usize,
 }
 
-#[derive(Clone)]
-struct FormatAmbientState {
+#[derive(Clone, Default)]
+struct FormatRuntimeState {
     current_clause: Option<String>,
     select_list_layout_state: SelectListLayoutState,
     statement_has_with_clause: bool,
@@ -664,7 +664,7 @@ struct FormatAmbientState {
     open_cursor_state: OpenCursorFormatState,
 }
 
-impl FormatAmbientState {
+impl FormatRuntimeState {
     fn capture(
         current_clause: &Option<String>,
         select_list_layout_state: SelectListLayoutState,
@@ -710,7 +710,7 @@ struct ParenStackFrame {
     id: SqlFormatFrameId,
     frame: ParenFormatFrame,
     semantic_flags: ParenSemanticFlags,
-    ambient_state: Option<FormatAmbientState>,
+    runtime_state_snapshot: Option<FormatRuntimeState>,
     previous_paren_frame_id: Option<SqlFormatFrameId>,
     previous_query_base_depth: Option<Option<usize>>,
     wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
@@ -788,7 +788,7 @@ enum FormatFrame {
 
 struct PoppedParenFrame {
     frame: ParenFormatFrame,
-    ambient_state: Option<FormatAmbientState>,
+    restored_runtime_state: bool,
     open_cursor_restore_state: Option<OpenCursorFormatState>,
 }
 
@@ -800,6 +800,7 @@ struct FormatFrameStack {
     current_paren_frame_id: Option<SqlFormatFrameId>,
     current_block_frame_id: Option<SqlFormatFrameId>,
     current_query_base_depth: Option<usize>,
+    runtime_state: FormatRuntimeState,
     frame_id_allocator: SqlFormatFrameIdAllocator,
 }
 
@@ -910,6 +911,14 @@ impl FormatFrameStack {
 
     fn set_current_query_base_depth(&mut self, depth: Option<usize>) {
         self.current_query_base_depth = depth;
+    }
+
+    fn sync_runtime_state(&mut self, runtime_state: FormatRuntimeState) {
+        self.runtime_state = runtime_state;
+    }
+
+    fn runtime_state(&self) -> &FormatRuntimeState {
+        &self.runtime_state
     }
 
     fn activate_construct_flag(&mut self, kind: ConstructFlagKind, scope: FormatScope) {
@@ -1027,7 +1036,7 @@ impl FormatFrameStack {
         &mut self,
         frame: ParenFormatFrame,
         semantic_flags: ParenSemanticFlags,
-        ambient_state: Option<FormatAmbientState>,
+        capture_runtime_state: bool,
         new_query_base_depth: Option<usize>,
         wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
         open_cursor_restore_state: Option<OpenCursorFormatState>,
@@ -1045,7 +1054,7 @@ impl FormatFrameStack {
             id: frame_id,
             frame,
             semantic_flags,
-            ambient_state,
+            runtime_state_snapshot: capture_runtime_state.then(|| self.runtime_state.clone()),
             previous_paren_frame_id: self.current_paren_frame_id,
             previous_query_base_depth,
             wrapped_owner_kind,
@@ -1086,9 +1095,15 @@ impl FormatFrameStack {
         if frame.frame.closes_indented() {
             *indent_level = indent_level.saturating_sub(frame.frame.indent_level_delta());
         }
+        let restored_runtime_state = if let Some(runtime_state) = frame.runtime_state_snapshot {
+            self.runtime_state = runtime_state;
+            true
+        } else {
+            false
+        };
         let popped = Some(PoppedParenFrame {
             frame: frame.frame,
-            ambient_state: frame.ambient_state,
+            restored_runtime_state,
             open_cursor_restore_state: frame.open_cursor_restore_state,
         });
         #[cfg(debug_assertions)]
@@ -2045,6 +2060,12 @@ enum OpenCursorFormatState {
     },
 }
 
+impl Default for OpenCursorFormatState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectListBreakState {
     None,
@@ -2061,6 +2082,12 @@ enum SelectListLayoutState {
         indent: usize,
         hanging_indent_spaces: Option<usize>,
     },
+}
+
+impl Default for SelectListLayoutState {
+    fn default() -> Self {
+        Self::Inactive
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -9851,6 +9878,13 @@ impl SqlEditorWidget {
                             // `clear_statement_frames` restores `indent_level`
                             // by undoing the delta of each popped paren frame.
                             format_stack.clear_statement_frames(&mut indent_level);
+                            format_stack.sync_runtime_state(FormatRuntimeState::capture(
+                                &current_clause,
+                                select_list_layout_state,
+                                statement_has_with_clause,
+                                query_body_clause_base_depth,
+                                open_cursor_state,
+                            ));
                             // Debug-only invariant: once all non-persistent
                             // frames and scoped state have been cleared at a
                             // statement boundary, `indent_level` must match
@@ -10472,19 +10506,8 @@ impl SqlEditorWidget {
                             let paren_close_indent_override = query_like_layout
                                 .map(|layout| layout.close_depth)
                                 .or(branch_wrapper_close_indent);
-                            let paren_ambient_state = if paren_frame_kind.is_query_like()
-                                || multiline_clause_owner_kind.is_some()
-                            {
-                                Some(FormatAmbientState::capture(
-                                    &current_clause,
-                                    select_list_layout_state,
-                                    statement_has_with_clause,
-                                    query_body_clause_base_depth,
-                                    open_cursor_state,
-                                ))
-                            } else {
-                                None
-                            };
+                            let capture_runtime_state = paren_frame_kind.is_query_like()
+                                || multiline_clause_owner_kind.is_some();
                             let new_query_base_depth = query_like_layout
                                 .map(|layout| layout.child_head_depth)
                                 .filter(|_| paren_frame_kind.opens_indented());
@@ -10496,6 +10519,15 @@ impl SqlEditorWidget {
                                     == Some(FormatIndentedParenOwnerKind::Window),
                                 keep: is_keep_paren,
                             };
+                            if capture_runtime_state {
+                                format_stack.sync_runtime_state(FormatRuntimeState::capture(
+                                    &current_clause,
+                                    select_list_layout_state,
+                                    statement_has_with_clause,
+                                    query_body_clause_base_depth,
+                                    open_cursor_state,
+                                ));
+                            }
                             format_stack.push_paren(
                                 ParenFormatFrame::new(
                                     paren_frame_kind,
@@ -10506,7 +10538,7 @@ impl SqlEditorWidget {
                                 )
                                 .with_query_like_layout(query_like_layout),
                                 paren_semantic_flags,
-                                paren_ambient_state,
+                                capture_runtime_state,
                                 new_query_base_depth,
                                 wrapped_owner_kind.or(forced_wrapped_owner_kind),
                                 None,
@@ -10564,12 +10596,12 @@ impl SqlEditorWidget {
                             format_stack.with_cte_on_close_paren();
                             trim_trailing_space(&mut out);
                             let popped_paren = format_stack.pop_paren(&mut indent_level);
-                            let (paren_frame_kind, ambient_state, open_cursor_restore_state) =
+                            let (paren_frame_kind, restored_runtime_state, open_cursor_restore_state) =
                                 popped_paren
                                     .map(|frame| {
                                         (
                                             frame.frame,
-                                            frame.ambient_state,
+                                            frame.restored_runtime_state,
                                             frame.open_cursor_restore_state,
                                         )
                                     })
@@ -10581,7 +10613,7 @@ impl SqlEditorWidget {
                                             0,
                                             None,
                                         ),
-                                        None,
+                                        false,
                                         None,
                                     ));
                             let current_line =
@@ -10699,8 +10731,9 @@ impl SqlEditorWidget {
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
                             }
-                            if let Some(ambient_state) = ambient_state {
-                                ambient_state.restore(
+                            if restored_runtime_state {
+                                let restored_runtime_state = format_stack.runtime_state().clone();
+                                restored_runtime_state.restore(
                                     &mut current_clause,
                                     &mut select_list_layout_state,
                                     &mut statement_has_with_clause,
@@ -12346,7 +12379,7 @@ mod formatter_scope_state_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -12363,7 +12396,7 @@ mod formatter_scope_state_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -12460,7 +12493,7 @@ mod formatter_scope_state_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -12472,7 +12505,7 @@ mod formatter_scope_state_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -36960,9 +36993,9 @@ mod format_frame_stack_tests {
     use super::*;
 
     #[test]
-    fn format_frame_stack_restores_query_base_and_ambient_state_from_same_paren_frame() {
+    fn format_frame_stack_restores_query_base_and_runtime_state_from_same_paren_frame() {
         let mut stack = FormatFrameStack::default();
-        let ambient_state = FormatAmbientState {
+        let runtime_state = FormatRuntimeState {
             current_clause: Some("SELECT".to_string()),
             select_list_layout_state: SelectListLayoutState::Multiline {
                 indent: 6,
@@ -36974,11 +37007,12 @@ mod format_frame_stack_tests {
         };
 
         stack.set_current_query_base_depth(Some(2));
+        stack.sync_runtime_state(runtime_state.clone());
         let mut indent_level = 0usize;
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::QueryLike, 2, false, 3, Some(2)),
             ParenSemanticFlags::default(),
-            Some(ambient_state.clone()),
+            true,
             Some(7),
             Some(FormatIndentedParenOwnerKind::WithinGroup),
             None,
@@ -36986,6 +37020,13 @@ mod format_frame_stack_tests {
         );
 
         assert_eq!(stack.current_query_base_depth(), Some(7));
+        stack.sync_runtime_state(FormatRuntimeState {
+            current_clause: Some("WHERE".to_string()),
+            select_list_layout_state: SelectListLayoutState::Inactive,
+            statement_has_with_clause: false,
+            query_body_clause_base_depth: Some(9),
+            open_cursor_state: OpenCursorFormatState::None,
+        });
 
         let popped = stack
             .pop_paren(&mut indent_level)
@@ -36994,25 +37035,16 @@ mod format_frame_stack_tests {
         assert!(matches!(popped.frame.kind, ParenFormatFrameKind::QueryLike));
         assert_eq!(stack.current_query_base_depth(), Some(2));
         assert_eq!(
-            popped
-                .ambient_state
-                .as_ref()
-                .and_then(|state| state.current_clause.as_deref()),
+            stack.runtime_state().current_clause.as_deref(),
             Some("SELECT")
         );
         assert_eq!(
-            popped
-                .ambient_state
-                .as_ref()
-                .map(|state| state.query_body_clause_base_depth),
-            Some(Some(4))
+            stack.runtime_state().query_body_clause_base_depth,
+            Some(4)
         );
         assert!(matches!(
-            popped
-                .ambient_state
-                .as_ref()
-                .map(|state| state.open_cursor_state),
-            Some(OpenCursorFormatState::AwaitingFor)
+            stack.runtime_state().open_cursor_state,
+            OpenCursorFormatState::AwaitingFor
         ));
     }
 
@@ -37025,7 +37057,7 @@ mod format_frame_stack_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 3, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -37094,7 +37126,7 @@ mod format_frame_stack_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 2, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
@@ -37134,7 +37166,7 @@ mod format_frame_stack_tests {
         stack.push_paren(
             ParenFormatFrame::new(ParenFormatFrameKind::Compact, 1, false, 0, None),
             ParenSemanticFlags::default(),
-            None,
+            false,
             None,
             None,
             None,
