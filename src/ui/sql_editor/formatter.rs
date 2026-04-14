@@ -2001,34 +2001,30 @@ impl FormatFrameStack {
     }
 
     /// Clear all non-persistent frames at a statement boundary and restore
-    /// `indent_level` by undoing the indent delta of every paren frame that is
-    /// popped. This keeps symmetric push/pop accounting even when a statement
-    /// ends with dangling open parens (e.g., a mid-statement error).
+    /// `indent_level` from the surviving frame stack via
+    /// `statement_base_indent()`. Surviving frames (`Block`, MySQL handler
+    /// scoped indent, `PlsqlContext`, `CompoundTrigger`, `WithCte`) remain the
+    /// single source of truth for the base indent, so we simply discard the
+    /// rest and let `statement_base_indent()` recompute. Counters are
+    /// recounted from the retained frames to stay structurally consistent
+    /// even if a caller accidentally forgets to pop a nested frame.
     fn clear_statement_frames(&mut self, indent_level: &mut usize) {
-        let mut retained_frames = Vec::with_capacity(self.frames.len());
-        for frame in self.frames.drain(..) {
-            if frame.survives_statement_boundary() {
-                retained_frames.push(frame);
-                continue;
-            }
-            match &frame {
-                FormatFrame::Paren(paren) if paren.frame.closes_indented() => {
-                    *indent_level = indent_level.saturating_sub(paren.frame.indent_level_delta());
-                }
-                FormatFrame::ScopedIndent(frame) => {
-                    *indent_level = indent_level.saturating_sub(frame.delta);
-                }
-                _ => {}
-            }
-        }
-        self.frames = retained_frames;
-        self.paren_depth = 0;
+        self.frames
+            .retain(|frame| frame.survives_statement_boundary());
+        self.paren_depth = self
+            .frames
+            .iter()
+            .filter(|frame| matches!(frame, FormatFrame::Paren(_)))
+            .count();
         self.block_depth = self
             .frames
             .iter()
             .filter(|frame| matches!(frame, FormatFrame::Block(_)))
             .count();
-        self.current_paren_frame_id = None;
+        self.current_paren_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::Paren(frame) => Some(frame.id),
+            _ => None,
+        });
         self.current_block_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::Block(frame) => Some(frame.id),
             _ => None,
