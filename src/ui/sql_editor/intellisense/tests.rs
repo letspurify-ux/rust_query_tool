@@ -140,7 +140,11 @@ fn collect_virtual_columns_from_ctes(
             connection,
         );
         if !columns.is_empty() {
-            virtual_table_columns.insert(cte.name.clone(), columns);
+            SqlEditorWidget::insert_virtual_table_columns(
+                &mut virtual_table_columns,
+                &cte.name,
+                columns,
+            );
         }
     }
     virtual_table_columns
@@ -172,7 +176,11 @@ fn collect_virtual_columns_from_relations(
                 connection,
             );
             if !columns.is_empty() {
-                body_virtual_table_columns.insert(cte.name.clone(), columns);
+                SqlEditorWidget::insert_virtual_table_columns(
+                    &mut body_virtual_table_columns,
+                    &cte.name,
+                    columns,
+                );
             }
         }
         let (columns, _) = SqlEditorWidget::collect_virtual_relation_columns_for_completion(
@@ -185,7 +193,11 @@ fn collect_virtual_columns_from_relations(
             connection,
         );
         if !columns.is_empty() {
-            virtual_table_columns.insert(subq.alias.clone(), columns);
+            SqlEditorWidget::insert_virtual_table_columns(
+                &mut virtual_table_columns,
+                &subq.alias,
+                columns,
+            );
         }
     }
 
@@ -307,7 +319,11 @@ fn test7_nested_inline_view_wildcard_expands_columns_from_nested_cte() {
             &connection,
         );
         if !columns.is_empty() {
-            body_virtual_table_columns.insert(cte.name.clone(), columns);
+            SqlEditorWidget::insert_virtual_table_columns(
+                &mut body_virtual_table_columns,
+                &cte.name,
+                columns,
+            );
         }
     }
     let body_tables_in_scope = body_ctx.tables_in_scope.clone();
@@ -2225,11 +2241,9 @@ fn with_function_followed_by_cte_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("recursive_tree")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "recursive_tree")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "CTE columns after WITH FUNCTION should stay available for completion: {:?}",
         virtual_table_columns
     );
@@ -2270,11 +2284,9 @@ SELECT recursive_tree.__CODEX_CURSOR__id FROM recursive_tree"#;
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("recursive_tree")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "recursive_tree")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "CTE columns after WITH FUNCTION nested DECLARE block should stay available for completion: {:?}",
         virtual_table_columns
     );
@@ -2307,11 +2319,9 @@ fn with_function_followed_by_explicit_with_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("recursive_tree")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "recursive_tree")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "explicit WITH CTE columns after WITH FUNCTION should stay available for completion: {:?}",
         virtual_table_columns
     );
@@ -2343,11 +2353,9 @@ fn insert_with_cte_source_query_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("recent")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "recent")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "insert-source CTE columns should stay available for completion: {:?}",
         virtual_table_columns
     );
@@ -2380,9 +2388,9 @@ fn recursive_cte_body_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns.get("r").is_some_and(|columns| columns
+        virtual_columns_for(&virtual_table_columns, "r")
             .iter()
-            .any(|column| column.eq_ignore_ascii_case("n"))),
+            .any(|column| column.eq_ignore_ascii_case("n")),
         "recursive CTE columns should stay available inside its own body: {:?}",
         virtual_table_columns
     );
@@ -2456,11 +2464,9 @@ fn outer_cte_in_nested_from_subquery_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("outer_cte")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "outer_cte")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "outer CTE columns should stay available inside nested FROM subquery completion: {:?}",
         virtual_table_columns
     );
@@ -2492,11 +2498,9 @@ fn outer_cte_in_second_set_operator_operand_keeps_virtual_columns_visible() {
         collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
 
     assert!(
-        virtual_table_columns
-            .get("outer_cte")
-            .is_some_and(|columns| columns
-                .iter()
-                .any(|column| column.eq_ignore_ascii_case("id"))),
+        virtual_columns_for(&virtual_table_columns, "outer_cte")
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case("id")),
         "outer CTE columns should stay available in later set-operator operand completion: {:?}",
         virtual_table_columns
     );
@@ -2531,10 +2535,7 @@ fn lateral_subquery_star_virtual_columns_exclude_outer_scope_columns() {
     let virtual_table_columns =
         collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
 
-    let columns = virtual_table_columns
-        .get("src")
-        .cloned()
-        .unwrap_or_default();
+    let columns = virtual_columns_for(&virtual_table_columns, "src").clone();
     assert_has_case_insensitive(&columns, "ID");
     assert_has_case_insensitive(&columns, "PARENT_ID");
     assert_has_case_insensitive(&columns, "CHILD_ONLY");
@@ -3550,6 +3551,37 @@ END;"#,
     );
 
     assert_has_case_insensitive(&suggestions, "e_missing_data");
+}
+
+#[test]
+fn local_symbol_suggestions_rank_inner_scope_before_outer_scope() {
+    let suggestions = SqlEditorWidget::collect_local_symbol_suggestions_for_test(
+        r#"DECLARE
+    v_outer NUMBER := 1;
+BEGIN
+    DECLARE
+        v_inner NUMBER := 2;
+    BEGIN
+        __CODEX_CURSOR__NULL;
+    END;
+END;"#,
+        &[],
+    );
+
+    let inner_idx = suggestions
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("v_inner"));
+    let outer_idx = suggestions
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("v_outer"));
+
+    assert!(inner_idx.is_some(), "inner scope symbol should be suggested");
+    assert!(outer_idx.is_some(), "outer scope symbol should be suggested");
+    assert!(
+        inner_idx < outer_idx,
+        "inner scope symbol should rank before outer scope symbol: {:?}",
+        suggestions
+    );
 }
 
 #[test]
@@ -5280,8 +5312,9 @@ CROSS APPLY (
     let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
 
     let mut virtual_table_columns = HashMap::new();
-    virtual_table_columns.insert(
-        "jt".to_string(),
+    SqlEditorWidget::insert_virtual_table_columns(
+        &mut virtual_table_columns,
+        "jt",
         vec![
             "order_id".to_string(),
             "sku".to_string(),
@@ -5412,10 +5445,7 @@ CROSS APPLY (
     let connection = create_shared_connection();
     let virtual_table_columns =
         collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
-    let columns = virtual_table_columns
-        .get("src")
-        .cloned()
-        .unwrap_or_default();
+    let columns = virtual_columns_for(&virtual_table_columns, "src").clone();
 
     for expected in ["id", "parent_only", "child_only"] {
         assert_has_case_insensitive(&columns, expected);
@@ -5466,10 +5496,7 @@ CROSS APPLY (
     let connection = create_shared_connection();
     let virtual_table_columns =
         collect_virtual_columns_from_relations(&deep_ctx, &data, &sender, &connection);
-    let columns = virtual_table_columns
-        .get("src")
-        .cloned()
-        .unwrap_or_default();
+    let columns = virtual_columns_for(&virtual_table_columns, "src").clone();
 
     for expected in ["id", "parent_only"] {
         assert_has_case_insensitive(&columns, expected);

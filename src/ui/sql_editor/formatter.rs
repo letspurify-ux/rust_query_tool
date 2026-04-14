@@ -5377,11 +5377,23 @@ impl SqlEditorWidget {
         Self::append_statement_terminator(formatted_statement, ";", false);
     }
 
-    fn split_inline_statement_separators(formatted: &str) -> String {
-        if formatted.is_empty() {
-            return String::new();
+    fn has_inline_statement_separator_candidate(formatted: &str) -> bool {
+        let mut saw_semicolon_on_line = false;
+
+        for byte in formatted.bytes() {
+            match byte {
+                b';' => saw_semicolon_on_line = true,
+                b'\n' | b'\r' => saw_semicolon_on_line = false,
+                b' ' | b'\t' if saw_semicolon_on_line => {}
+                _ if saw_semicolon_on_line => return true,
+                _ => {}
+            }
         }
 
+        false
+    }
+
+    fn collect_inline_statement_split_points(formatted: &str) -> Vec<usize> {
         let spans = super::query_text::tokenize_sql_spanned(formatted);
         let mut split_points: Vec<usize> = Vec::new();
         let bytes = formatted.as_bytes();
@@ -5450,8 +5462,20 @@ impl SqlEditorWidget {
             previous_end = span.end;
         }
 
+        split_points
+    }
+
+    fn split_inline_statement_separators(mut formatted: String) -> String {
+        formatted.truncate(formatted.trim_end().len());
+        if formatted.is_empty()
+            || !Self::has_inline_statement_separator_candidate(&formatted)
+        {
+            return formatted;
+        }
+
+        let split_points = Self::collect_inline_statement_split_points(&formatted);
         if split_points.is_empty() {
-            return formatted.to_string();
+            return formatted;
         }
 
         let mut out = String::with_capacity(formatted.len().saturating_add(split_points.len()));
@@ -5472,6 +5496,11 @@ impl SqlEditorWidget {
         out.push_str(&formatted[cursor..]);
 
         out
+    }
+
+    #[cfg(test)]
+    fn split_inline_statement_separators_for_test(formatted: &str) -> String {
+        Self::split_inline_statement_separators(formatted.to_string())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -12596,7 +12625,7 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        Self::split_inline_statement_separators(out.trim_end())
+        Self::split_inline_statement_separators(out)
     }
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
@@ -14021,6 +14050,54 @@ impl SqlEditorWidget {
 
     pub(super) fn escape_sql_literal(value: &str) -> String {
         value.replace('\'', "''")
+    }
+}
+
+#[cfg(test)]
+mod inline_statement_separator_tests {
+    use super::SqlEditorWidget;
+
+    #[test]
+    fn inline_statement_separator_candidate_guard_skips_terminal_semicolons() {
+        assert!(!SqlEditorWidget::has_inline_statement_separator_candidate(
+            "SELECT 1;"
+        ));
+        assert!(!SqlEditorWidget::has_inline_statement_separator_candidate(
+            "SELECT 1;   \n"
+        ));
+        assert!(!SqlEditorWidget::has_inline_statement_separator_candidate(
+            "SELECT 1;\nSELECT 2;"
+        ));
+    }
+
+    #[test]
+    fn inline_statement_separator_candidate_guard_detects_same_line_followups() {
+        assert!(SqlEditorWidget::has_inline_statement_separator_candidate(
+            "SELECT 1; SELECT 2;"
+        ));
+        assert!(SqlEditorWidget::has_inline_statement_separator_candidate(
+            "SELECT 1; -- note"
+        ));
+    }
+
+    #[test]
+    fn split_inline_statement_separators_keeps_same_line_comments_attached() {
+        assert_eq!(
+            SqlEditorWidget::split_inline_statement_separators_for_test(
+                "SELECT 1; -- note"
+            ),
+            "SELECT 1; -- note"
+        );
+    }
+
+    #[test]
+    fn split_inline_statement_separators_breaks_same_line_statements() {
+        assert_eq!(
+            SqlEditorWidget::split_inline_statement_separators_for_test(
+                "SELECT 1; SELECT 2;"
+            ),
+            "SELECT 1;\n SELECT 2;"
+        );
     }
 }
 

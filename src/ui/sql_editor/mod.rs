@@ -255,6 +255,7 @@ pub(crate) struct LocalScope {
     parent: Option<usize>,
     start: usize,
     end: usize,
+    depth: usize,
     kind: LocalScopeKind,
 }
 

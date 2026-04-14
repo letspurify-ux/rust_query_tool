@@ -290,14 +290,13 @@ impl SqlEditorWidget {
             guard.session_state()
         };
 
-        let mut names: Vec<String> = session
+        let names = session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .binds
             .keys()
             .cloned()
             .collect();
-        names.sort_by_key(|name| name.to_ascii_uppercase());
         names
     }
 
@@ -320,18 +319,35 @@ impl SqlEditorWidget {
             analysis.local_scopes.as_ref(),
             cursor_in_statement,
         );
-        for scope_id in Self::local_scope_chain(analysis.local_scopes.as_ref(), active_scope) {
-            for symbol in analysis.local_symbols.iter() {
-                if symbol.scope_id != scope_id || symbol.declared_at > cursor_in_statement {
-                    continue;
-                }
-                if !Self::local_symbol_matches_prefix(&symbol.name, &symbol.upper, &prefix_upper) {
-                    continue;
-                }
-                if seen.insert(symbol.upper.clone()) {
-                    suggestions.push(symbol.name.clone());
-                }
+        let scope_chain = Self::local_scope_chain(analysis.local_scopes.as_ref(), active_scope);
+        let mut scope_rank_by_id = vec![None; analysis.local_scopes.len()];
+        for (rank, scope_id) in scope_chain.iter().copied().enumerate() {
+            if let Some(slot) = scope_rank_by_id.get_mut(scope_id) {
+                *slot = Some(rank);
             }
+        }
+        let mut scoped_suggestions = vec![Vec::new(); scope_chain.len()];
+
+        for symbol in analysis.local_symbols.iter() {
+            if symbol.declared_at > cursor_in_statement {
+                continue;
+            }
+            let Some(scope_rank) = scope_rank_by_id
+                .get(symbol.scope_id)
+                .and_then(|rank| *rank)
+            else {
+                continue;
+            };
+            if !Self::local_symbol_matches_prefix(&symbol.name, &symbol.upper, &prefix_upper) {
+                continue;
+            }
+            if seen.insert(symbol.upper.clone()) {
+                scoped_suggestions[scope_rank].push(symbol.name.clone());
+            }
+        }
+
+        for bucket in scoped_suggestions {
+            suggestions.extend(bucket);
         }
 
         for name in analysis.text_bind_names.iter() {
@@ -389,9 +405,8 @@ impl SqlEditorWidget {
             if !Self::local_scope_contains(scope, cursor_byte) {
                 continue;
             }
-            let depth = Self::local_scope_depth(scopes, idx);
-            if depth >= best_depth {
-                best_depth = depth;
+            if scope.depth >= best_depth {
+                best_depth = scope.depth;
                 best_idx = idx;
             }
         }
@@ -409,15 +424,6 @@ impl SqlEditorWidget {
             scope_id = parent;
         }
         chain
-    }
-
-    fn local_scope_depth(scopes: &[LocalScope], mut scope_id: usize) -> usize {
-        let mut depth = 0usize;
-        while let Some(parent) = scopes.get(scope_id).and_then(|scope| scope.parent) {
-            depth = depth.saturating_add(1);
-            scope_id = parent;
-        }
-        depth
     }
 
     fn local_scope_contains(scope: &LocalScope, cursor_byte: usize) -> bool {
@@ -440,6 +446,7 @@ impl SqlEditorWidget {
                 parent: None,
                 start: 0,
                 end: statement_len,
+                depth: 0,
                 kind: LocalScopeKind::Statement,
             },
             token_start_idx: 0,
@@ -449,6 +456,7 @@ impl SqlEditorWidget {
             mysql_declare_statements: mysql_compatible && root_begins_with_begin,
         }];
         let mut symbols = Vec::new();
+        let mut seen_symbol_keys = HashSet::new();
         let mut block_stack = Vec::<LocalBlockFrame>::new();
         let mut root_decl_start_idx = None;
         let mut root_decl_end_idx = None;
@@ -492,6 +500,7 @@ impl SqlEditorWidget {
                     {
                         if let Some(parsed) = Self::parse_routine_header(token_spans, idx) {
                             let parent_scope = Self::current_local_parent_scope_id(&block_stack);
+                            let scope_depth = scopes[parent_scope].scope.depth.saturating_add(1);
                             let scope_id = scopes.len();
                             let scope_start = token_spans
                                 .get(parsed.body_keyword_idx)
@@ -502,6 +511,7 @@ impl SqlEditorWidget {
                                     parent: Some(parent_scope),
                                     start: scope_start,
                                     end: statement_len,
+                                    depth: scope_depth,
                                     kind: LocalScopeKind::Routine,
                                 },
                                 token_start_idx: idx,
@@ -515,7 +525,13 @@ impl SqlEditorWidget {
                                 mysql_declare_statements: parsed.body_starts_immediately,
                             });
                             for name in parsed.parameter_names {
-                                Self::push_local_symbol(&mut symbols, scope_id, name, scope_start);
+                                Self::push_local_symbol(
+                                    &mut symbols,
+                                    &mut seen_symbol_keys,
+                                    scope_id,
+                                    name,
+                                    scope_start,
+                                );
                             }
                             block_stack.push(LocalBlockFrame {
                                 kind: LocalBlockKind::Routine,
@@ -539,6 +555,7 @@ impl SqlEditorWidget {
                                 for name in Self::extract_mysql_declaration_symbols_from_item(item) {
                                     Self::push_local_symbol(
                                         &mut symbols,
+                                        &mut seen_symbol_keys,
                                         scope_id,
                                         name,
                                         declared_at,
@@ -549,12 +566,14 @@ impl SqlEditorWidget {
                             }
 
                             let parent_scope = Self::current_local_parent_scope_id(&block_stack);
+                            let scope_depth = scopes[parent_scope].scope.depth.saturating_add(1);
                             let scope_id = scopes.len();
                             scopes.push(LocalScopeBuilder {
                                 scope: LocalScope {
                                     parent: Some(parent_scope),
                                     start: token.start,
                                     end: statement_len,
+                                    depth: scope_depth,
                                     kind: LocalScopeKind::DeclareBlock,
                                 },
                                 token_start_idx: idx,
@@ -581,12 +600,15 @@ impl SqlEditorWidget {
                             let scope_id = pending_loop_var.take().map(|name| {
                                 let parent_scope =
                                     Self::current_local_parent_scope_id(&block_stack);
+                                let scope_depth =
+                                    scopes[parent_scope].scope.depth.saturating_add(1);
                                 let next_scope_id = scopes.len();
                                 scopes.push(LocalScopeBuilder {
                                     scope: LocalScope {
                                         parent: Some(parent_scope),
                                         start: token.end,
                                         end: statement_len,
+                                        depth: scope_depth,
                                         kind: LocalScopeKind::Loop,
                                     },
                                     token_start_idx: idx,
@@ -600,6 +622,7 @@ impl SqlEditorWidget {
                                 });
                                 Self::push_local_symbol(
                                     &mut symbols,
+                                    &mut seen_symbol_keys,
                                     next_scope_id,
                                     name,
                                     token.end,
@@ -661,12 +684,15 @@ impl SqlEditorWidget {
                                 ) {
                                     let parent_scope =
                                         Self::current_local_parent_scope_id(&block_stack);
+                                    let scope_depth =
+                                        scopes[parent_scope].scope.depth.saturating_add(1);
                                     let scope_id = scopes.len();
                                     scopes.push(LocalScopeBuilder {
                                         scope: LocalScope {
                                             parent: Some(parent_scope),
                                             start: token.end,
                                             end: statement_len,
+                                            depth: scope_depth,
                                             kind: LocalScopeKind::Block,
                                         },
                                         token_start_idx: idx,
@@ -776,6 +802,14 @@ impl SqlEditorWidget {
             }
         }
 
+        let mut child_ranges_by_scope = vec![Vec::new(); scopes.len()];
+        for scope in &scopes {
+            if let Some(parent_scope) = scope.scope.parent {
+                child_ranges_by_scope[parent_scope]
+                    .push((scope.token_start_idx, scope.token_end_idx));
+            }
+        }
+
         for scope_id in 0..scopes.len() {
             let Some(decl_start_idx) = scopes[scope_id].decl_start_idx else {
                 continue;
@@ -788,11 +822,15 @@ impl SqlEditorWidget {
             }
             Self::collect_scope_declaration_symbols(
                 scope_id,
-                &scopes,
                 token_spans,
                 decl_start_idx,
                 decl_end_idx.min(token_spans.len()),
+                child_ranges_by_scope
+                    .get(scope_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 &mut symbols,
+                &mut seen_symbol_keys,
             );
         }
 
@@ -802,25 +840,13 @@ impl SqlEditorWidget {
 
     fn collect_scope_declaration_symbols(
         scope_id: usize,
-        scopes: &[LocalScopeBuilder],
         token_spans: &[SqlTokenSpan],
         decl_start_idx: usize,
         decl_end_idx: usize,
+        child_ranges: &[(usize, usize)],
         symbols: &mut Vec<LocalSymbolEntry>,
+        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
     ) {
-        let mut child_ranges: Vec<(usize, usize)> = scopes
-            .iter()
-            .enumerate()
-            .filter(|(idx, scope)| {
-                *idx != scope_id
-                    && scope.scope.parent == Some(scope_id)
-                    && scope.token_start_idx < decl_end_idx
-                    && scope.token_end_idx > decl_start_idx
-            })
-            .map(|(_, scope)| (scope.token_start_idx, scope.token_end_idx))
-            .collect();
-        child_ranges.sort_by(|left, right| left.0.cmp(&right.0));
-
         let mut child_idx = 0usize;
         let mut idx = decl_start_idx;
         while idx < decl_end_idx {
@@ -857,7 +883,13 @@ impl SqlEditorWidget {
             let item = &token_spans[item_start..item_end];
             if let Some(name) = Self::extract_declaration_symbol_from_item(item) {
                 let declared_at = Self::declaration_item_declared_at(item);
-                Self::push_local_symbol(symbols, scope_id, name, declared_at);
+                Self::push_local_symbol(
+                    symbols,
+                    seen_symbol_keys,
+                    scope_id,
+                    name,
+                    declared_at,
+                );
             }
 
             idx = item_end;
@@ -1341,16 +1373,13 @@ impl SqlEditorWidget {
 
     fn push_local_symbol(
         symbols: &mut Vec<LocalSymbolEntry>,
+        seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
         scope_id: usize,
         name: String,
         declared_at: usize,
     ) {
         let upper = name.to_ascii_uppercase();
-        if symbols.iter().any(|symbol| {
-            symbol.scope_id == scope_id
-                && symbol.declared_at == declared_at
-                && symbol.upper == upper
-        }) {
+        if !seen_symbol_keys.insert((scope_id, declared_at, upper.clone())) {
             return;
         }
         symbols.push(LocalSymbolEntry {

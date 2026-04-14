@@ -567,7 +567,11 @@ impl SqlEditorWidget {
                     virtual_wildcard_dependencies.insert(cte.name.to_uppercase(), wildcard_tables);
                 }
                 if !columns.is_empty() {
-                    virtual_table_columns.insert(cte.name.clone(), columns);
+                    Self::insert_virtual_table_columns(
+                        &mut virtual_table_columns,
+                        &cte.name,
+                        columns,
+                    );
                 }
             }
 
@@ -589,7 +593,11 @@ impl SqlEditorWidget {
                         connection,
                     );
                     if !nested_columns.is_empty() {
-                        body_virtual_table_columns.insert(cte.name.clone(), nested_columns);
+                        Self::insert_virtual_table_columns(
+                            &mut body_virtual_table_columns,
+                            &cte.name,
+                            nested_columns,
+                        );
                     }
                 }
                 let body_local_tables =
@@ -609,7 +617,11 @@ impl SqlEditorWidget {
                         .insert(subq.alias.to_uppercase(), wildcard_tables);
                 }
                 if !columns.is_empty() {
-                    virtual_table_columns.insert(subq.alias.clone(), columns);
+                    Self::insert_virtual_table_columns(
+                        &mut virtual_table_columns,
+                        &subq.alias,
+                        columns,
+                    );
                 }
             }
             intellisense_data
@@ -840,14 +852,8 @@ impl SqlEditorWidget {
         virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
     ) -> Vec<String> {
-        for candidate in Self::table_lookup_key_candidates(table) {
-            if let Some(columns) = virtual_table_columns
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&candidate))
-                .map(|(_, columns)| columns.clone())
-            {
-                return columns;
-            }
+        if let Some(columns) = Self::virtual_table_columns_for_lookup(virtual_table_columns, table) {
+            return columns.to_vec();
         }
 
         let data = intellisense_data
@@ -1075,7 +1081,7 @@ impl SqlEditorWidget {
 
             for table in tables {
                 if let Some(virtual_cols) =
-                    Self::find_virtual_columns_case_insensitive(virtual_table_columns, &table)
+                    Self::virtual_table_columns_for_lookup(virtual_table_columns, &table)
                 {
                     columns.extend(virtual_cols.iter().cloned());
                     continue;
@@ -1129,7 +1135,7 @@ impl SqlEditorWidget {
                 connection,
             );
             if !columns.is_empty() {
-                virtual_table_columns.insert(cte.name.clone(), columns);
+                Self::insert_virtual_table_columns(&mut virtual_table_columns, &cte.name, columns);
             }
         }
 
@@ -1154,7 +1160,11 @@ impl SqlEditorWidget {
                     connection,
                 );
                 if !columns.is_empty() {
-                    relation_virtual_table_columns.insert(cte.name.clone(), columns);
+                    Self::insert_virtual_table_columns(
+                        &mut relation_virtual_table_columns,
+                        &cte.name,
+                        columns,
+                    );
                 }
             }
 
@@ -1170,7 +1180,7 @@ impl SqlEditorWidget {
                 connection,
             );
             if !columns.is_empty() {
-                virtual_table_columns.insert(subq.alias.clone(), columns);
+                Self::insert_virtual_table_columns(&mut virtual_table_columns, &subq.alias, columns);
             }
         }
 
@@ -1374,14 +1384,41 @@ impl SqlEditorWidget {
         false
     }
 
-    fn find_virtual_columns_case_insensitive<'a>(
+    fn virtual_table_columns_for_lookup<'a>(
         virtual_table_columns: &'a HashMap<String, Vec<String>>,
         table: &str,
     ) -> Option<&'a [String]> {
+        let candidates = Self::table_lookup_key_candidates(table);
+        for candidate in &candidates {
+            if let Some(columns) = virtual_table_columns.get(candidate.as_str()) {
+                return Some(columns.as_slice());
+            }
+
+            let normalized = candidate.to_ascii_uppercase();
+            if normalized != candidate.as_str() {
+                if let Some(columns) = virtual_table_columns.get(&normalized) {
+                    return Some(columns.as_slice());
+                }
+            }
+        }
+
         virtual_table_columns
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(table)
+                    || candidates
+                        .iter()
+                        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            })
             .map(|(_, cols)| cols.as_slice())
+    }
+
+    fn insert_virtual_table_columns(
+        virtual_table_columns: &mut HashMap<String, Vec<String>>,
+        relation_name: &str,
+        columns: Vec<String>,
+    ) {
+        virtual_table_columns.insert(relation_name.to_ascii_uppercase(), columns);
     }
 
     fn resolve_column_tables_for_context(

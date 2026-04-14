@@ -719,7 +719,6 @@ impl IntellisenseData {
                 &mut seen,
             );
             if column_only && !suggestions.is_empty() {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 suggestions.truncate(MAX_SUGGESTIONS);
                 return suggestions;
             }
@@ -733,7 +732,6 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
             if Self::push_entries(
@@ -742,11 +740,9 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
             if relation_only && !suggestions.is_empty() {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 suggestions.truncate(MAX_SUGGESTIONS);
                 return suggestions;
             }
@@ -811,7 +807,6 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
 
@@ -821,7 +816,6 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
         }
@@ -833,7 +827,6 @@ impl IntellisenseData {
             &mut suggestions,
             &mut seen,
         ) {
-            Self::dedup_suggestions_case_insensitive(&mut suggestions);
             return suggestions;
         }
 
@@ -844,7 +837,6 @@ impl IntellisenseData {
             &mut suggestions,
             &mut seen,
         ) {
-            Self::dedup_suggestions_case_insensitive(&mut suggestions);
             return suggestions;
         }
 
@@ -858,7 +850,6 @@ impl IntellisenseData {
             );
         }
 
-        Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -876,7 +867,6 @@ impl IntellisenseData {
             &mut suggestions,
             &mut seen,
         ) {
-            Self::dedup_suggestions_case_insensitive(&mut suggestions);
             return suggestions;
         }
 
@@ -887,7 +877,6 @@ impl IntellisenseData {
             &mut seen,
         );
 
-        Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -911,7 +900,6 @@ impl IntellisenseData {
             &mut seen,
         );
 
-        Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -1217,11 +1205,6 @@ impl IntellisenseData {
         }
         suggestions.len() >= MAX_SUGGESTIONS
     }
-
-    fn dedup_suggestions_case_insensitive(suggestions: &mut Vec<String>) {
-        let mut seen = HashSet::new();
-        suggestions.retain(|value| seen.insert(value.to_ascii_uppercase()));
-    }
 }
 
 impl Default for IntellisenseData {
@@ -1452,18 +1435,14 @@ impl IntellisensePopup {
         let selected_idx = selected_text
             .and_then(|selected| suggestions.iter().position(|item| item == selected))
             .unwrap_or(0);
-        let browser_lines: Vec<String> = suggestions
-            .iter()
-            .map(|suggestion| format!("@C255 {}", suggestion))
-            .collect();
         self.browser.clear();
+        for suggestion in &suggestions {
+            self.browser.add(&format!("@C255 {}", suggestion));
+        }
         *self
             .suggestions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions;
-        for line in &browser_lines {
-            self.browser.add(line);
-        }
 
         if suggestion_count > 0 {
             self.browser.select((selected_idx + 1) as i32);
