@@ -1510,6 +1510,7 @@ enum ScopedIndentKind {
     CursorSql,
     ForallBody,
     MySqlHandlerBody,
+    SplitControlBody,
 }
 
 impl ScopedIndentKind {
@@ -1519,11 +1520,12 @@ impl ScopedIndentKind {
             Self::CursorSql => 1,
             Self::ForallBody => 2,
             Self::MySqlHandlerBody => 3,
+            Self::SplitControlBody => 4,
         }
     }
 }
 
-const SCOPED_INDENT_KIND_COUNT: usize = 4;
+const SCOPED_INDENT_KIND_COUNT: usize = 5;
 
 #[derive(Clone, Copy)]
 struct ScopedIndentFrame {
@@ -3512,7 +3514,7 @@ impl FormatFrame {
             self,
             FormatFrame::Block(_)
                 | FormatFrame::ScopedIndent(ScopedIndentFrame {
-                    kind: ScopedIndentKind::MySqlHandlerBody,
+                    kind: ScopedIndentKind::MySqlHandlerBody | ScopedIndentKind::SplitControlBody,
                     ..
                 })
                 | FormatFrame::PlsqlContext(_)
@@ -6947,6 +6949,57 @@ impl SqlEditorWidget {
         first_is_key && second_is_duplicate && third_is_on
     }
 
+    /// Returns true when the current token starts MySQL's
+    /// `ON DUPLICATE KEY UPDATE` clause.
+    fn starts_mysql_on_duplicate_key_update_clause(
+        tokens: &[SqlToken],
+        idx: usize,
+        meaningful_links: Option<&MeaningfulTokenLinks>,
+    ) -> bool {
+        let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+            return false;
+        };
+        if !word.eq_ignore_ascii_case("ON") {
+            return false;
+        }
+
+        let next_meaningful_index = |from_idx: usize| {
+            if let Some(links) = meaningful_links {
+                return links.next_index(from_idx);
+            }
+
+            let mut probe_idx = from_idx.saturating_add(1);
+            while probe_idx < tokens.len() {
+                if !matches!(tokens.get(probe_idx), Some(SqlToken::Comment(_))) {
+                    return Some(probe_idx);
+                }
+                probe_idx = probe_idx.saturating_add(1);
+            }
+            None
+        };
+        let meaningful_word = |token_idx: usize| match tokens.get(token_idx) {
+            Some(SqlToken::Word(value)) => Some(value.as_str()),
+            _ => None,
+        };
+
+        let duplicate_idx = match next_meaningful_index(idx) {
+            Some(next_idx) => next_idx,
+            None => return false,
+        };
+        let key_idx = match next_meaningful_index(duplicate_idx) {
+            Some(next_idx) => next_idx,
+            None => return false,
+        };
+        let update_idx = match next_meaningful_index(key_idx) {
+            Some(next_idx) => next_idx,
+            None => return false,
+        };
+
+        meaningful_word(duplicate_idx).is_some_and(|value| value.eq_ignore_ascii_case("DUPLICATE"))
+            && meaningful_word(key_idx).is_some_and(|value| value.eq_ignore_ascii_case("KEY"))
+            && meaningful_word(update_idx).is_some_and(|value| value.eq_ignore_ascii_case("UPDATE"))
+    }
+
     fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
         statement
             .split_whitespace()
@@ -8123,6 +8176,21 @@ impl SqlEditorWidget {
                     let mysql_create_function_header_attribute = mysql_compatible
                         && matches!(construct_value_as_deref!(CreateObject), Some("FUNCTION"))
                         && matches!(upper, "RETURNS" | "DETERMINISTIC");
+                    let split_control_body_should_close = format_stack
+                        .last_scoped_indent(ScopedIndentKind::SplitControlBody)
+                        .is_some_and(|frame| frame.scope == current_scope)
+                        && ((matches!(upper, "ELSE" | "ELSIF" | "ELSEIF")
+                            && format_stack.last_block_kind_is("IF"))
+                            || (upper == "END"
+                                && format_stack
+                                    .last_block_kind()
+                                    .is_some_and(|kind| matches!(kind, BlockKind::If | BlockKind::While))));
+                    if split_control_body_should_close {
+                        let _ = format_stack.deactivate_scoped_indent(
+                            ScopedIndentKind::SplitControlBody,
+                            &mut indent_level,
+                        );
+                    }
                     if mysql_handler_block_begin {
                         format_stack.push_scoped_indent(
                             ScopedIndentKind::MySqlHandlerBody,
@@ -8715,6 +8783,11 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                             } else {
+                                let plsql_statement_body_indent = (in_plsql_block
+                                    && at_line_start
+                                    && format_stack.current_clause().is_none()
+                                    && format_stack.paren_is_empty())
+                                .then_some(line_indent);
                                 let select_clause_header_indent =
                                     matches!(format_stack.current_clause(), Some("SELECT"))
                                         .then_some(())
@@ -8739,8 +8812,7 @@ impl SqlEditorWidget {
                                                 )
                                                 .saturating_sub(1)
                                         });
-                                newline_with(
-                                    &mut out,
+                                let clause_header_indent =
                                     select_clause_header_indent.unwrap_or_else(|| {
                                         clause_indent!(
                                             indent_level,
@@ -8756,7 +8828,12 @@ impl SqlEditorWidget {
                                                 ScopedIndentKind::CursorSql,
                                             ),
                                         )
-                                    }),
+                                    });
+                                newline_with(
+                                    &mut out,
+                                    plsql_statement_body_indent
+                                        .map(|indent| indent.max(clause_header_indent))
+                                        .unwrap_or(clause_header_indent),
                                     insert_all_extra + mysql_handler_body_extra,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -9862,6 +9939,16 @@ impl SqlEditorWidget {
                             line_indent = split_end_indent;
                         }
                     }
+                    let mysql_on_duplicate_clause_line = mysql_compatible
+                        && at_line_start
+                        && Self::starts_mysql_on_duplicate_key_update_clause(
+                            tokens,
+                            idx,
+                            Some(token_cache.meaningful_links()),
+                        );
+                    if mysql_on_duplicate_clause_line {
+                        line_indent = base_indent!(indent_level);
+                    }
                     if at_line_start
                         && upper == "BEGIN"
                         && (format_stack.last_block_kind_is("PACKAGE_BODY")
@@ -10332,13 +10419,35 @@ impl SqlEditorWidget {
                         );
                         let control_condition_body_indent = matches!(upper, "THEN" | "LOOP" | "DO")
                             .then(|| {
-                                closed_control_header_body_indent.or_else(|| {
-                                    format_stack
-                                        .last_condition_owner(ConditionOwnerKind::ControlHeader)
-                                        .map(|frame| frame.indent.saturating_add(1))
-                                })
+                                let rendered_body_indent =
+                                    current_output_line_indent.saturating_add(1);
+                                let control_owner_body_indent = closed_control_header_body_indent
+                                    .or_else(|| {
+                                        matches!(upper, "THEN")
+                                            .then(|| {
+                                                format_stack
+                                                    .last_condition_owner(
+                                                        ConditionOwnerKind::ControlHeader,
+                                                    )
+                                                    .map(|frame| frame.indent.saturating_add(1))
+                                            })
+                                            .flatten()
+                                    })
+                                    .map(|indent| indent.max(rendered_body_indent));
+                                control_owner_body_indent
+                                    .or_else(|| matches!(upper, "LOOP" | "DO").then_some(rendered_body_indent))
                             })
                             .flatten();
+                        let control_body_extra_delta = control_condition_body_indent.and_then(
+                            |_| {
+                                let base_body_indent = base_indent!(indent_level);
+                                let rendered_body_indent =
+                                    current_output_line_indent.saturating_add(1);
+                                rendered_body_indent
+                                    .checked_sub(base_body_indent)
+                                    .filter(|delta| *delta > 0)
+                            },
+                        );
                         newline_with(
                             &mut out,
                             case_branch_body_indent
@@ -10352,6 +10461,14 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
+                        if let Some(delta) = control_body_extra_delta {
+                            format_stack.push_scoped_indent(
+                                ScopedIndentKind::SplitControlBody,
+                                current_scope,
+                                delta,
+                                &mut indent_level,
+                            );
+                        }
                     }
 
                     if upper == "BETWEEN" {
@@ -10370,6 +10487,8 @@ impl SqlEditorWidget {
 
                     // MySQL ON DUPLICATE KEY UPDATE: activate flag so that VALUES(col)
                     // inside the UPDATE assignment list is treated as a function call.
+                    // Treat the assignment list itself like SET so comma siblings
+                    // indent one body level deeper than the ON DUPLICATE owner.
                     if upper == "UPDATE"
                         && format_stack.paren_is_empty()
                         && Self::is_mysql_on_duplicate_key_update(
@@ -10379,7 +10498,7 @@ impl SqlEditorWidget {
                         )
                     {
                         on_duplicate_key_update_active = true;
-                        set_current_clause!(Some(upper.to_string()));
+                        set_current_clause!(Some("SET".to_string()));
                         clear_select_list_layout_state!();
                     }
                     if should_break_condition
@@ -25821,8 +25940,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[null_idx]),
-            indent(lines[if_idx]).saturating_add(4),
-            "THEN body should still open exactly one level deeper than IF"
+            indent(lines[close_and_idx]).saturating_add(4),
+            "THEN body should open one level deeper than the split continuation line"
         );
         assert_eq!(
             indent(lines[end_if_idx]),
@@ -25876,8 +25995,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[null_idx]),
-            indent(lines[if_idx]).saturating_add(4),
-            "THEN body should remain exactly one level deeper than IF, got:\n{}",
+            indent(lines[close_and_idx]).saturating_add(4),
+            "THEN body should remain one level deeper than the split continuation line, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -25937,8 +26056,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[null_idx]),
-            indent(lines[if_idx]).saturating_add(4),
-            "THEN body should remain exactly one level deeper than IF, got:\n{}",
+            indent(lines[close_and_idx]).saturating_add(4),
+            "THEN body should remain one level deeper than the split continuation line, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -32249,6 +32368,46 @@ sort_no = VALUES(sort_no);"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mysql_db_type_indents_on_duplicate_key_update_assignment_siblings() {
+        let source = r#"INSERT INTO dept (dept_id, dept_name, sort_no, updated_at)
+VALUES (20, 'SALES', 2, NOW())
+ON DUPLICATE KEY UPDATE dept_name = VALUES(dept_name),
+sort_no = VALUES(sort_no),
+updated_at = NOW();"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let on_duplicate_idx =
+            find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = VALUES(dept_name),")
+                .expect("ON DUPLICATE KEY UPDATE owner");
+        let sort_no_idx =
+            find_line_starting_with(&lines, "sort_no = VALUES(sort_no),").expect("sort_no sibling");
+        let updated_at_idx =
+            find_line_starting_with(&lines, "updated_at = NOW();").expect("updated_at sibling");
+
+        assert_eq!(
+            leading_spaces(lines[sort_no_idx]),
+            leading_spaces(lines[on_duplicate_idx]).saturating_add(4),
+            "ON DUPLICATE KEY UPDATE assignment siblings should indent one level deeper than the owner, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[updated_at_idx]),
+            leading_spaces(lines[sort_no_idx]),
+            "ON DUPLICATE KEY UPDATE sibling assignments should stay on the same list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_reapplies_frame_depth_after_nested_subquery_close_comma()
     {
         let source = r#"SELECT ROUND(
@@ -36215,6 +36374,44 @@ END$$"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_mysql_keeps_split_procedure_if_body_one_level_below_then_line() {
+        let source = r#"CREATE DEFINER = `root` @`localhost` PROCEDURE `sp_rebuild_monthly_stats`(IN p_from DATE, IN p_to DATE)
+BEGIN
+    DECLARE v_msg VARCHAR(255);
+    IF p_from IS NULL
+        OR p_to IS NULL
+        OR p_from > p_to THEN
+        SET v_msg = 'p_from / p_to is invalid';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+    END IF;
+END;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let then_idx = find_line_starting_with(&lines, "OR p_from > p_to THEN")
+            .expect("split procedure IF THEN line");
+        let set_idx = find_line_starting_with(&lines, "SET v_msg = 'p_from / p_to is invalid';")
+            .expect("split procedure IF SET body");
+        let signal_idx =
+            find_line_starting_with(&lines, "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;")
+                .expect("split procedure IF SIGNAL body");
+
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            leading_spaces(lines[then_idx]).saturating_add(4),
+            "auto-format IF body should keep SET one frame deeper than the THEN line, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[signal_idx]),
+            leading_spaces(lines[set_idx]),
+            "auto-format IF body siblings should stay on the same THEN body depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test6_split_if_or_condition_continuations_on_frame_depth(
     ) {
         let source = include_str!("../../../test_mariadb/test6.txt");
@@ -36265,6 +36462,45 @@ END$$"#;
             leading_spaces(lines[proc_or_order_idx]),
             leading_spaces(lines[proc_if_idx]).saturating_add(4),
             "test6 procedure split IF OR p_from > p_to line should stay on IF condition continuation frame depth, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_split_procedure_if_set_and_signal_on_then_body_depth(
+    ) {
+        let source = r#"CREATE PROCEDURE sp_rebuild_monthly_stats(IN p_from DATE, IN p_to DATE)
+BEGIN
+    DECLARE v_msg VARCHAR(255);
+    IF p_from IS NULL
+        OR p_to IS NULL
+        OR p_from > p_to THEN
+        SET v_msg = 'p_from / p_to is invalid';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+    END IF;
+END"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let then_idx = find_line_starting_with(&lines, "OR p_from > p_to THEN")
+            .expect("split procedure IF THEN line");
+        let set_idx = find_line_starting_with(&lines, "SET v_msg = 'p_from / p_to is invalid';")
+            .expect("split procedure IF SET body");
+        let signal_idx =
+            find_line_starting_with(&lines, "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;")
+                .expect("split procedure IF SIGNAL body");
+
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            leading_spaces(lines[then_idx]).saturating_add(4),
+            "split procedure IF body should keep SET one frame deeper than the THEN line, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[signal_idx]),
+            leading_spaces(lines[set_idx]),
+            "split procedure IF SET and SIGNAL should stay on the same THEN body depth, got:\n{formatted}"
         );
     }
 

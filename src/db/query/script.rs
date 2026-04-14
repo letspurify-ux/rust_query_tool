@@ -2453,8 +2453,6 @@ impl QueryExecutor {
             }
             let current_line_is_exact_else =
                 sql_text::identifier_words_exact(&line_words, &["ELSE"]);
-            let current_line_is_exact_then =
-                sql_text::identifier_words_exact(&line_words, &["THEN"]);
             let current_line_is_exact_exception =
                 sql_text::identifier_words_exact(&line_words, &["EXCEPTION"]);
             let current_line_is_plain_end =
@@ -3943,8 +3941,26 @@ impl QueryExecutor {
                 ));
             }
 
-            let opens_split_control_body =
-                current_line_is_exact_then && active_merge_branch_header.is_none();
+            let opens_split_control_body = context
+                .condition_header_terminator
+                .is_some_and(|terminator| match terminator {
+                    AutoFormatConditionTerminator::Then => {
+                        sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                            trimmed,
+                            &["THEN"],
+                        )
+                    }
+                    AutoFormatConditionTerminator::Loop => {
+                        sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                            trimmed,
+                            &["LOOP"],
+                        ) || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                            trimmed,
+                            &["DO"],
+                        )
+                    }
+                })
+                && active_merge_branch_header.is_none();
             pending_control_branch_body_frame =
                 (!sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
                     && (opens_split_control_body
@@ -18064,8 +18080,8 @@ END;"#;
         );
         assert_eq!(
             contexts[null_idx].auto_depth,
-            contexts[if_idx].auto_depth.saturating_add(1),
-            "the THEN body should still open exactly one level deeper than the IF owner"
+            contexts[close_and_idx].auto_depth.saturating_add(1),
+            "the THEN body should still open exactly one level deeper than the split THEN line"
         );
     }
 
