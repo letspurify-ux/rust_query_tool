@@ -19,9 +19,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
+use crate::db::{
+    ColumnInfo, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail,
+};
 use crate::ui::constants::*;
-use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
+use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
@@ -30,6 +32,7 @@ use crate::ui::syntax_highlight::{
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
+use crate::ui::ResultTabRequest;
 use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
 
@@ -337,6 +340,7 @@ pub struct SqlEditorWidget {
     style_buffer: TextBuffer,
     connection: SharedConnection,
     execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
+    result_tab_callback: Arc<Mutex<Option<Box<dyn FnMut(ResultTabRequest)>>>>,
     progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
     progress_sender: mpsc::Sender<QueryProgress>,
     column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -360,7 +364,6 @@ pub struct SqlEditorWidget {
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
-    last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
 }
 impl SqlEditorWidget {
@@ -569,6 +572,34 @@ impl SqlEditorWidget {
         }
     }
 
+    fn invoke_result_tab_callback(
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(ResultTabRequest)>>>>,
+        request: ResultTabRequest,
+    ) {
+        let callback = {
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.take()
+        };
+
+        if let Some(mut cb) = callback {
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(request)));
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("result tab callback", payload.as_ref());
+            }
+            return;
+        }
+
+        crate::utils::logging::log_error("sql_editor::callback", "result tab callback is not set");
+    }
+
     fn invoke_status_callback(
         callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
         message: &str,
@@ -640,6 +671,8 @@ impl SqlEditorWidget {
 
         let execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>> =
             Arc::new(Mutex::new(None));
+        let result_tab_callback: Arc<Mutex<Option<Box<dyn FnMut(ResultTabRequest)>>>> =
+            Arc::new(Mutex::new(None));
         let progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
             Arc::new(Mutex::new(None));
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
@@ -665,7 +698,6 @@ impl SqlEditorWidget {
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
-        let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
         let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
 
         let mut widget = Self {
@@ -675,6 +707,7 @@ impl SqlEditorWidget {
             style_buffer,
             connection,
             execute_callback,
+            result_tab_callback,
             progress_callback: progress_callback.clone(),
             progress_sender,
             column_sender,
@@ -698,7 +731,6 @@ impl SqlEditorWidget {
             history_navigation_entries,
             applying_history_navigation,
             undo_redo_state,
-            last_explain_plan,
             preferred_insert_position,
         };
 
@@ -911,28 +943,17 @@ impl SqlEditorWidget {
                         match action {
                             UiActionResult::ExplainPlan(result) => match result {
                                 Ok(plan_lines) => {
-                                    let previous_plan = {
-                                        let mut plan_slot = widget
-                                            .last_explain_plan
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        let previous = plan_slot.clone();
-                                        *plan_slot = Some(plan_lines.clone());
-                                        previous
-                                    };
-
                                     let plan_text =
                                         SqlEditorWidget::render_explain_plan(&plan_lines);
-                                    let comparison = previous_plan.as_ref().map(|previous| {
-                                        SqlEditorWidget::render_explain_plan_diff(
-                                            previous.as_slice(),
-                                            plan_lines.as_slice(),
-                                        )
-                                    });
-                                    SqlEditorWidget::show_plan_dialog(
-                                        &plan_text,
-                                        comparison.as_deref(),
+                                    let request =
+                                        SqlEditorWidget::build_explain_plan_result_request(
+                                            &plan_text,
+                                        );
+                                    SqlEditorWidget::invoke_result_tab_callback(
+                                        &widget.result_tab_callback,
+                                        request,
                                     );
+                                    widget.emit_status("Explain plan loaded");
                                 }
                                 Err(err) => {
                                     let _ =
@@ -954,16 +975,32 @@ impl SqlEditorWidget {
                                             object_name.to_uppercase()
                                         ));
                                     } else {
-                                        SqlEditorWidget::show_quick_describe_dialog(
-                                            &object_name,
-                                            &columns,
+                                        let request =
+                                            SqlEditorWidget::build_quick_describe_result_request(
+                                                &object_name,
+                                                &columns,
+                                            );
+                                        SqlEditorWidget::invoke_result_tab_callback(
+                                            &widget.result_tab_callback,
+                                            request,
                                         );
+                                        widget.emit_status(&format!(
+                                            "Describe loaded for {}",
+                                            object_name.to_uppercase()
+                                        ));
                                     }
                                 }
                                 Ok(QuickDescribeData::Text { title, content }) => {
-                                    SqlEditorWidget::show_quick_describe_text_dialog(
-                                        &title, &content,
+                                    let request = SqlEditorWidget::build_text_result_request(
+                                        &title,
+                                        &content,
+                                        "Describe loaded",
                                     );
+                                    SqlEditorWidget::invoke_result_tab_callback(
+                                        &widget.result_tab_callback,
+                                        request,
+                                    );
+                                    widget.emit_status("Describe loaded");
                                 }
                                 Err(err) => {
                                     if err.contains("Not connected") {
@@ -1162,147 +1199,99 @@ impl SqlEditorWidget {
         out.trim_end_matches('\n').to_string()
     }
 
-    fn render_explain_plan_diff(previous: &[String], current: &[String]) -> String {
-        let mut previous_used = vec![false; previous.len()];
-        let mut added: Vec<String> = Vec::new();
-
-        for current_line in current {
-            let mut matched_index = None;
-            for (idx, previous_line) in previous.iter().enumerate() {
-                if !previous_used[idx] && previous_line == current_line {
-                    matched_index = Some(idx);
-                    break;
-                }
-            }
-
-            if let Some(idx) = matched_index {
-                previous_used[idx] = true;
-            } else {
-                added.push(current_line.clone());
-            }
+    fn build_text_result_request(label: &str, content: &str, message: &str) -> ResultTabRequest {
+        let rows = if content.is_empty() {
+            Vec::new()
+        } else {
+            content
+                .lines()
+                .enumerate()
+                .map(|(idx, line)| vec![(idx + 1).to_string(), line.to_string()])
+                .collect()
+        };
+        let result = QueryResult {
+            sql: String::new(),
+            columns: vec![
+                ColumnInfo {
+                    name: "Line".to_string(),
+                    data_type: "NUMBER".to_string(),
+                },
+                ColumnInfo {
+                    name: "Text".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+            ],
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::from_secs(0),
+            message: message.to_string(),
+            is_select: true,
+            success: true,
+        };
+        ResultTabRequest {
+            label: label.to_string(),
+            result,
         }
-
-        let mut removed: Vec<String> = Vec::new();
-        for (idx, previous_line) in previous.iter().enumerate() {
-            if !previous_used[idx] {
-                removed.push(previous_line.clone());
-            }
-        }
-
-        const DIFF_PREVIEW_LIMIT: usize = 20;
-
-        let mut out = String::new();
-        out.push_str("=== Comparison Against Previous Explain Plan ===\n");
-        out.push_str(&format!(
-            "Previous lines: {}, Current lines: {}\n",
-            previous.len(),
-            current.len()
-        ));
-        out.push_str(&format!(
-            "Added lines: {}, Removed lines: {}\n",
-            added.len(),
-            removed.len()
-        ));
-
-        if added.is_empty() && removed.is_empty() {
-            out.push_str("No line-level differences detected.\n");
-            return out;
-        }
-
-        if !added.is_empty() {
-            out.push('\n');
-            out.push_str("Added:\n");
-            for line in added.iter().take(DIFF_PREVIEW_LIMIT) {
-                out.push_str("+ ");
-                out.push_str(line);
-                out.push('\n');
-            }
-            if added.len() > DIFF_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "... {} more added lines\n",
-                    added.len() - DIFF_PREVIEW_LIMIT
-                ));
-            }
-        }
-
-        if !removed.is_empty() {
-            out.push('\n');
-            out.push_str("Removed:\n");
-            for line in removed.iter().take(DIFF_PREVIEW_LIMIT) {
-                out.push_str("- ");
-                out.push_str(line);
-                out.push('\n');
-            }
-            if removed.len() > DIFF_PREVIEW_LIMIT {
-                out.push_str(&format!(
-                    "... {} more removed lines\n",
-                    removed.len() - DIFF_PREVIEW_LIMIT
-                ));
-            }
-        }
-
-        out
     }
 
-    fn show_plan_dialog(plan_text: &str, comparison_text: Option<&str>) {
-        use fltk::{prelude::*, text::TextDisplay, window::Window};
+    fn build_explain_plan_result_request(plan_text: &str) -> ResultTabRequest {
+        Self::build_text_result_request("Explain Plan", plan_text, "Explain plan loaded")
+    }
 
-        let current_group = fltk::group::Group::try_current();
-
-        fltk::group::Group::set_current(None::<&fltk::group::Group>);
-
-        let mut dialog = Window::default()
-            .with_size(800, 500)
-            .with_label("Explain Plan");
-        crate::ui::center_on_main(&mut dialog);
-        dialog.set_color(theme::panel_raised());
-        dialog.make_modal(true);
-        dialog.begin();
-
-        let mut display = TextDisplay::default().with_pos(10, 10).with_size(780, 440);
-        display.set_color(theme::editor_bg());
-        display.set_text_color(theme::text_primary());
-        display.set_text_font(configured_editor_profile().normal);
-        display.set_text_size(configured_ui_font_size());
-
-        let mut content = plan_text.to_string();
-        if let Some(comparison) = comparison_text {
-            content.push_str("\n\n");
-            content.push_str(comparison);
+    fn build_quick_describe_result_request(
+        object_name: &str,
+        columns: &[TableColumnDetail],
+    ) -> ResultTabRequest {
+        let rows = columns
+            .iter()
+            .map(|col| {
+                vec![
+                    col.name.clone(),
+                    col.get_type_display(),
+                    if col.nullable {
+                        "YES".to_string()
+                    } else {
+                        "NO".to_string()
+                    },
+                    if col.is_primary_key {
+                        "PK".to_string()
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let result = QueryResult {
+            sql: String::new(),
+            columns: vec![
+                ColumnInfo {
+                    name: "Column Name".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+                ColumnInfo {
+                    name: "Data Type".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+                ColumnInfo {
+                    name: "Nullable".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+                ColumnInfo {
+                    name: "PK".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+            ],
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::from_secs(0),
+            message: format!("Describe loaded for {}", object_name.to_uppercase()),
+            is_select: true,
+            success: true,
+        };
+        ResultTabRequest {
+            label: format!("Describe: {}", object_name.to_uppercase()),
+            result,
         }
-
-        let mut buffer = fltk::text::TextBuffer::default();
-        buffer.set_text(&content);
-        display.set_buffer(buffer);
-
-        let mut close_btn = fltk::button::Button::default()
-            .with_pos(690, 455)
-            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close");
-        close_btn.set_color(theme::button_secondary());
-        close_btn.set_label_color(theme::text_primary());
-
-        let (sender, receiver) = mpsc::channel::<()>();
-        close_btn.set_callback(move |_| {
-            let _ = sender.send(());
-            app::awake();
-        });
-
-        dialog.end();
-        dialog.show();
-        fltk::group::Group::set_current(current_group.as_ref());
-        let _ = dialog.take_focus();
-        let _ = close_btn.take_focus();
-
-        while dialog.shown() {
-            app::wait();
-            if receiver.try_recv().is_ok() {
-                dialog.hide();
-            }
-        }
-
-        // Explicitly destroy top-level dialog widgets to release native resources.
-        Window::delete(dialog);
     }
 
     fn emit_status(&self, message: &str) {
@@ -1644,6 +1633,16 @@ impl SqlEditorWidget {
     {
         *self
             .execute_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
+    pub fn set_result_tab_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(ResultTabRequest) + 'static,
+    {
+        *self
+            .result_tab_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
@@ -2314,24 +2313,6 @@ mod explain_plan_tests {
         let rendered = SqlEditorWidget::render_explain_plan(&plan);
         assert!(rendered.contains("  1: Plan hash value: 1"));
         assert!(rendered.contains("  2: TABLE ACCESS FULL"));
-    }
-
-    #[test]
-    fn render_explain_plan_diff_reports_added_and_removed() {
-        let previous = vec![
-            "SELECT STATEMENT".to_string(),
-            "TABLE ACCESS FULL T1".to_string(),
-        ];
-        let current = vec![
-            "SELECT STATEMENT".to_string(),
-            "INDEX RANGE SCAN IDX_T1".to_string(),
-        ];
-
-        let diff = SqlEditorWidget::render_explain_plan_diff(&previous, &current);
-        assert!(diff.contains("Added lines: 1"));
-        assert!(diff.contains("Removed lines: 1"));
-        assert!(diff.contains("+ INDEX RANGE SCAN IDX_T1"));
-        assert!(diff.contains("- TABLE ACCESS FULL T1"));
     }
 }
 

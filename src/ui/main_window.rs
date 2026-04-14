@@ -33,7 +33,7 @@ use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
     IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QueryHistoryDialog, QueryProgress,
-    QueryTabId, QueryTabsWidget, ResultTabsWidget, SqlAction, SqlEditorWidget,
+    QueryTabId, QueryTabsWidget, ResultTabRequest, ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -406,6 +406,17 @@ impl AppState {
             .clone();
         self.status_bar
             .set_label(&format_status(message, &conn_info));
+    }
+
+    fn append_result_tab_request(&mut self, request: ResultTabRequest) {
+        let mut result_tabs = self.result_tabs.clone();
+        let tab_index = result_tabs.tab_count();
+        let status_message = request.result.message.clone();
+        result_tabs.start_statement(tab_index, &request.label);
+        result_tabs.display_result(tab_index, &request.result);
+        self.result_tab_offset = result_tabs.tab_count();
+        self.refresh_result_edit_controls();
+        self.set_status_message(&status_message);
     }
 
     fn start_status_animation(&mut self, message: &str) {
@@ -2492,6 +2503,17 @@ impl MainWindow {
             s.set_status_message(&base_msg);
         });
 
+        let weak_state_for_result_tab = Arc::downgrade(state);
+        editor.set_result_tab_callback(move |request| {
+            let Some(state_for_result_tab) = weak_state_for_result_tab.upgrade() else {
+                return;
+            };
+            let mut s = state_for_result_tab
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.append_result_tab_request(request);
+        });
+
         let weak_state_for_status = Arc::downgrade(state);
         editor.set_status_callback(move |message| {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
@@ -3806,6 +3828,9 @@ impl MainWindow {
                     }
                     SqlAction::Execute(sql) => {
                         sql_to_execute = Some(sql);
+                    }
+                    SqlAction::DisplayResult(request) => {
+                        s.append_result_tab_request(request);
                     }
                 }
             }

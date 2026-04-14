@@ -17,9 +17,7 @@ use std::time::Duration;
 
 use oracle::Connection;
 
-use crate::db::{
-    ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection, TableColumnDetail,
-};
+use crate::db::{ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection};
 use crate::sql_text;
 use crate::ui::intellisense::{
     detect_sql_context, get_word_at_cursor, sql_context_for_phase, IntellisenseData,

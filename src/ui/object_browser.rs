@@ -1,7 +1,6 @@
 use fltk::{
     app,
-    enums::{Align, Event, Key},
-    frame::Frame,
+    enums::{Event, Key},
     group::{Flex, FlexType},
     input::Input,
     prelude::*,
@@ -13,23 +12,25 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
+use std::time::Duration;
 
 use crate::db::{
     format_connection_busy_message, lock_connection_with_activity,
-    try_lock_connection_with_activity, CompilationError, ConstraintInfo, IndexInfo, ObjectBrowser,
-    PackageRoutine, ProcedureArgument, SequenceInfo, SharedConnection, SynonymInfo,
-    TableColumnDetail,
+    try_lock_connection_with_activity, ColumnInfo, CompilationError, ConstraintInfo, IndexInfo,
+    ObjectBrowser, PackageRoutine, ProcedureArgument, QueryResult, SequenceInfo, SharedConnection,
+    SynonymInfo, TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
-use crate::ui::{configured_editor_profile, configured_ui_font_size};
+use crate::ui::ResultTabRequest;
 
 #[derive(Clone)]
 pub enum SqlAction {
     Insert(String),
     OpenInNewTab(String),
     Execute(String),
+    DisplayResult(ResultTabRequest),
 }
 
 /// Callback type for executing SQL from object browser
@@ -127,7 +128,6 @@ pub struct ObjectBrowserWidget {
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
     filter_input: Input,
-    filter_label: Frame,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
@@ -150,13 +150,6 @@ impl ObjectBrowserWidget {
         let mut filter_row = Flex::default();
         filter_row.set_type(FlexType::Row);
         filter_row.set_spacing(DIALOG_SPACING);
-
-        let mut filter_label = Frame::default().with_label("Filter");
-        filter_label.set_label_color(theme::text_secondary());
-        filter_label.set_label_font(configured_editor_profile().normal);
-        filter_label.set_label_size(configured_ui_font_size());
-        filter_label.set_align(Align::Inside | Align::Left);
-        filter_row.fixed(&filter_label, 44);
 
         // Filter input with modern styling
         let mut filter_input = Input::default();
@@ -207,7 +200,6 @@ impl ObjectBrowserWidget {
             tree,
             connection,
             filter_input,
-            filter_label,
             object_cache,
             current_db_type,
             pending_tree_refresh,
@@ -231,8 +223,6 @@ impl ObjectBrowserWidget {
     pub fn apply_font_settings(&mut self, profile: FontProfile, ui_size: i32) {
         self.filter_input.set_text_font(profile.normal);
         self.filter_input.set_text_size(ui_size);
-        self.filter_label.set_label_font(profile.normal);
-        self.filter_label.set_label_size(ui_size);
         self.tree.set_item_label_font(profile.normal);
         self.tree.set_item_label_size(ui_size);
         let canceled_pending_refresh = self.clear_pending_tree_refresh();
@@ -254,7 +244,6 @@ impl ObjectBrowserWidget {
         self.tree.resize(x, y, w, h);
         self.flex.layout();
         self.filter_input.redraw();
-        self.filter_label.redraw();
         self.tree.redraw();
         if canceled_pending_refresh {
             self.emit_status("Object browser metadata refresh completed");
@@ -496,25 +485,15 @@ impl ObjectBrowserWidget {
                     Ok(action) => match action {
                         ObjectActionResult::TableStructure { table_name, result } => match result {
                             Ok(columns) => {
-                                let mut info =
-                                    format!("=== Table Structure: {} ===\n\n", table_name);
-                                info.push_str(&format!(
-                                    "{:<30} {:<20} {:<10} {:<10}\n",
-                                    "Column Name", "Data Type", "Nullable", "PK"
-                                ));
-                                info.push_str(&format!("{}\n", "-".repeat(70)));
-
-                                for col in columns {
-                                    info.push_str(&format!(
-                                        "{:<30} {:<20} {:<10} {:<10}\n",
-                                        col.name,
-                                        col.get_type_display(),
-                                        if col.nullable { "YES" } else { "NO" },
-                                        if col.is_primary_key { "PK" } else { "" }
-                                    ));
-                                }
-
-                                ObjectBrowserWidget::show_info_dialog("Table Structure", &info);
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_table_structure_result_request(
+                                            &table_name,
+                                            &columns,
+                                        ),
+                                    ),
+                                );
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -525,23 +504,15 @@ impl ObjectBrowserWidget {
                         },
                         ObjectActionResult::TableIndexes { table_name, result } => match result {
                             Ok(indexes) => {
-                                let mut info = format!("=== Indexes: {} ===\n\n", table_name);
-                                info.push_str(&format!(
-                                    "{:<30} {:<10} {:<40}\n",
-                                    "Index Name", "Unique", "Columns"
-                                ));
-                                info.push_str(&format!("{}\n", "-".repeat(80)));
-
-                                for idx in indexes {
-                                    info.push_str(&format!(
-                                        "{:<30} {:<10} {:<40}\n",
-                                        idx.name,
-                                        if idx.is_unique { "YES" } else { "NO" },
-                                        idx.columns
-                                    ));
-                                }
-
-                                ObjectBrowserWidget::show_info_dialog("Table Indexes", &info);
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_table_indexes_result_request(
+                                            &table_name,
+                                            &indexes,
+                                        ),
+                                    ),
+                                );
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -553,24 +524,15 @@ impl ObjectBrowserWidget {
                         ObjectActionResult::TableConstraints { table_name, result } => match result
                         {
                             Ok(constraints) => {
-                                let mut info = format!("=== Constraints: {} ===\n\n", table_name);
-                                info.push_str(&format!(
-                                    "{:<30} {:<15} {:<25} {:<20}\n",
-                                    "Constraint Name", "Type", "Columns", "Ref Table"
-                                ));
-                                info.push_str(&format!("{}\n", "-".repeat(90)));
-
-                                for con in constraints {
-                                    info.push_str(&format!(
-                                        "{:<30} {:<15} {:<25} {:<20}\n",
-                                        con.name,
-                                        con.constraint_type,
-                                        con.columns,
-                                        con.ref_table.unwrap_or_default()
-                                    ));
-                                }
-
-                                ObjectBrowserWidget::show_info_dialog("Table Constraints", &info);
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_table_constraints_result_request(
+                                            &table_name,
+                                            &constraints,
+                                        ),
+                                    ),
+                                );
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -581,31 +543,14 @@ impl ObjectBrowserWidget {
                         },
                         ObjectActionResult::SequenceInfo(result) => match result {
                             Ok(info) => {
-                                let mut details =
-                                    format!("=== Sequence Info: {} ===\n\n", info.name);
-                                details
-                                    .push_str(&format!("{:<18} {}\n", "Min Value", info.min_value));
-                                details
-                                    .push_str(&format!("{:<18} {}\n", "Max Value", info.max_value));
-                                details.push_str(&format!(
-                                    "{:<18} {}\n",
-                                    "Increment By", info.increment_by
-                                ));
-                                details.push_str(&format!("{:<18} {}\n", "Cycle", info.cycle_flag));
-                                details.push_str(&format!("{:<18} {}\n", "Order", info.order_flag));
-                                details.push_str(&format!(
-                                    "{:<18} {}\n",
-                                    "Cache Size", info.cache_size
-                                ));
-                                details.push_str(&format!(
-                                    "{:<18} {}\n",
-                                    "Last Number", info.last_number
-                                ));
-                                details.push_str(
-                                    "\nNote: LAST_NUMBER is the next value to be generated.\n",
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_sequence_info_result_request(
+                                            &info,
+                                        ),
+                                    ),
                                 );
-
-                                ObjectBrowserWidget::show_info_dialog("Sequence Info", &details);
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -616,22 +561,14 @@ impl ObjectBrowserWidget {
                         },
                         ObjectActionResult::SynonymInfo(result) => match result {
                             Ok(info) => {
-                                let mut details =
-                                    format!("=== Synonym Info: {} ===\n\n", info.name);
-                                details.push_str(&format!(
-                                    "{:<18} {}\n",
-                                    "Table Owner", info.table_owner
-                                ));
-                                details.push_str(&format!(
-                                    "{:<18} {}\n",
-                                    "Table Name", info.table_name
-                                ));
-                                if !info.db_link.is_empty() {
-                                    details
-                                        .push_str(&format!("{:<18} {}\n", "DB Link", info.db_link));
-                                }
-
-                                ObjectBrowserWidget::show_info_dialog("Synonym Info", &details);
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_synonym_info_result_request(
+                                            &info,
+                                        ),
+                                    ),
+                                );
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -706,36 +643,17 @@ impl ObjectBrowserWidget {
                             result,
                         } => match result {
                             Ok(errors) => {
-                                let mut info = format!(
-                                    "=== Compilation Status: {} ({}) ===\n\n",
-                                    object_name, object_type
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::DisplayResult(
+                                        ObjectBrowserWidget::build_compilation_result_request(
+                                            &object_name,
+                                            &object_type,
+                                            &status,
+                                            &errors,
+                                        ),
+                                    ),
                                 );
-                                info.push_str(&format!("Status: {}\n\n", status));
-
-                                if errors.is_empty() {
-                                    info.push_str(
-                                        "No compilation errors found. Object is valid.\n",
-                                    );
-                                } else {
-                                    info.push_str(&format!(
-                                        "Found {} error(s)/warning(s):\n\n",
-                                        errors.len()
-                                    ));
-                                    info.push_str(&format!(
-                                        "{:<10} {:<10} {:<10} {}\n",
-                                        "Line", "Position", "Type", "Message"
-                                    ));
-                                    info.push_str(&format!("{}\n", "-".repeat(80)));
-
-                                    for err in &errors {
-                                        info.push_str(&format!(
-                                            "{:<10} {:<10} {:<10} {}\n",
-                                            err.line, err.position, err.attribute, err.text
-                                        ));
-                                    }
-                                }
-
-                                ObjectBrowserWidget::show_info_dialog("Compilation Status", &info);
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -2382,54 +2300,217 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn show_info_dialog(title: &str, content: &str) {
-        use fltk::{prelude::*, text::TextDisplay, window::Window};
+    fn result_column(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+        }
+    }
 
-        let current_group = fltk::group::Group::try_current();
-        fltk::group::Group::set_current(None::<&fltk::group::Group>);
+    fn build_result_tab_request(
+        label: String,
+        columns: Vec<ColumnInfo>,
+        rows: Vec<Vec<String>>,
+        message: String,
+    ) -> ResultTabRequest {
+        ResultTabRequest {
+            label,
+            result: QueryResult {
+                sql: String::new(),
+                columns,
+                row_count: rows.len(),
+                rows,
+                execution_time: Duration::from_secs(0),
+                message,
+                is_select: true,
+                success: true,
+            },
+        }
+    }
 
-        let mut dialog = Window::default().with_size(700, 500).with_label(title);
-        crate::ui::center_on_main(&mut dialog);
-        dialog.set_color(theme::panel_raised());
-        dialog.make_modal(true);
+    fn build_table_structure_result_request(
+        table_name: &str,
+        columns: &[TableColumnDetail],
+    ) -> ResultTabRequest {
+        let rows = columns
+            .iter()
+            .map(|column| {
+                vec![
+                    column.name.clone(),
+                    column.get_type_display(),
+                    if column.nullable {
+                        "YES".to_string()
+                    } else {
+                        "NO".to_string()
+                    },
+                    if column.is_primary_key {
+                        "PK".to_string()
+                    } else {
+                        String::new()
+                    },
+                ]
+            })
+            .collect();
+        Self::build_result_tab_request(
+            format!("Structure: {table_name}"),
+            vec![
+                Self::result_column("Column Name", "VARCHAR2"),
+                Self::result_column("Data Type", "VARCHAR2"),
+                Self::result_column("Nullable", "VARCHAR2"),
+                Self::result_column("PK", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded table structure for {table_name}"),
+        )
+    }
 
-        let mut display = TextDisplay::default().with_pos(10, 10).with_size(680, 440);
-        display.set_color(theme::editor_bg());
-        display.set_text_color(theme::text_primary());
-        display.set_text_font(configured_editor_profile().normal);
-        display.set_text_size(configured_ui_font_size());
+    fn build_table_indexes_result_request(
+        table_name: &str,
+        indexes: &[IndexInfo],
+    ) -> ResultTabRequest {
+        let rows = indexes
+            .iter()
+            .map(|index| {
+                vec![
+                    index.name.clone(),
+                    if index.is_unique {
+                        "YES".to_string()
+                    } else {
+                        "NO".to_string()
+                    },
+                    index.columns.clone(),
+                ]
+            })
+            .collect();
+        Self::build_result_tab_request(
+            format!("Indexes: {table_name}"),
+            vec![
+                Self::result_column("Index Name", "VARCHAR2"),
+                Self::result_column("Unique", "VARCHAR2"),
+                Self::result_column("Columns", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded table indexes for {table_name}"),
+        )
+    }
 
-        let mut buffer = fltk::text::TextBuffer::default();
-        buffer.set_text(content);
-        display.set_buffer(buffer);
+    fn build_table_constraints_result_request(
+        table_name: &str,
+        constraints: &[ConstraintInfo],
+    ) -> ResultTabRequest {
+        let rows = constraints
+            .iter()
+            .map(|constraint| {
+                vec![
+                    constraint.name.clone(),
+                    constraint.constraint_type.clone(),
+                    constraint.columns.clone(),
+                    constraint.ref_table.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        Self::build_result_tab_request(
+            format!("Constraints: {table_name}"),
+            vec![
+                Self::result_column("Constraint Name", "VARCHAR2"),
+                Self::result_column("Type", "VARCHAR2"),
+                Self::result_column("Columns", "VARCHAR2"),
+                Self::result_column("Ref Table", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded table constraints for {table_name}"),
+        )
+    }
 
-        let mut close_btn = fltk::button::Button::default()
-            .with_pos(300, 460)
-            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close");
-        close_btn.set_color(theme::button_secondary());
-        close_btn.set_label_color(theme::text_primary());
+    fn build_sequence_info_result_request(info: &SequenceInfo) -> ResultTabRequest {
+        let rows = vec![
+            vec!["Name".to_string(), info.name.clone()],
+            vec!["Min Value".to_string(), info.min_value.clone()],
+            vec!["Max Value".to_string(), info.max_value.clone()],
+            vec!["Increment By".to_string(), info.increment_by.clone()],
+            vec!["Cycle".to_string(), info.cycle_flag.clone()],
+            vec!["Order".to_string(), info.order_flag.clone()],
+            vec!["Cache Size".to_string(), info.cache_size.clone()],
+            vec!["Last Number".to_string(), info.last_number.clone()],
+            vec![
+                "Note".to_string(),
+                "LAST_NUMBER is the next value to be generated.".to_string(),
+            ],
+        ];
+        Self::build_result_tab_request(
+            format!("Sequence: {}", info.name),
+            vec![
+                Self::result_column("Property", "VARCHAR2"),
+                Self::result_column("Value", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded sequence info for {}", info.name),
+        )
+    }
 
-        let (sender, receiver) = std::sync::mpsc::channel::<()>();
-        close_btn.set_callback(move |_| {
-            let _ = sender.send(());
-            app::awake();
-        });
+    fn build_synonym_info_result_request(info: &SynonymInfo) -> ResultTabRequest {
+        let mut rows = vec![
+            vec!["Name".to_string(), info.name.clone()],
+            vec!["Table Owner".to_string(), info.table_owner.clone()],
+            vec!["Table Name".to_string(), info.table_name.clone()],
+        ];
+        if !info.db_link.is_empty() {
+            rows.push(vec!["DB Link".to_string(), info.db_link.clone()]);
+        }
+        Self::build_result_tab_request(
+            format!("Synonym: {}", info.name),
+            vec![
+                Self::result_column("Property", "VARCHAR2"),
+                Self::result_column("Value", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded synonym info for {}", info.name),
+        )
+    }
 
-        dialog.end();
-        dialog.show();
-        fltk::group::Group::set_current(current_group.as_ref());
-
-        while dialog.shown() {
-            fltk::app::wait();
-            if receiver.try_recv().is_ok() {
-                dialog.hide();
-            }
+    fn build_compilation_result_request(
+        object_name: &str,
+        object_type: &str,
+        status: &str,
+        errors: &[CompilationError],
+    ) -> ResultTabRequest {
+        if errors.is_empty() {
+            return Self::build_result_tab_request(
+                format!("Compile: {object_name}"),
+                vec![
+                    Self::result_column("Status", "VARCHAR2"),
+                    Self::result_column("Message", "VARCHAR2"),
+                ],
+                vec![vec![
+                    status.to_string(),
+                    format!("No compilation errors found for {object_type}."),
+                ]],
+                format!("Loaded compilation status for {object_name}"),
+            );
         }
 
-        // Top-level dialogs created without a parent should be explicitly deleted
-        // to avoid retaining native FLTK resources across repeated opens.
-        Window::delete(dialog);
+        let rows = errors
+            .iter()
+            .map(|error| {
+                vec![
+                    error.line.to_string(),
+                    error.position.to_string(),
+                    error.attribute.clone(),
+                    error.text.clone(),
+                ]
+            })
+            .collect();
+        Self::build_result_tab_request(
+            format!("Compile: {object_name}"),
+            vec![
+                Self::result_column("Line", "NUMBER"),
+                Self::result_column("Position", "NUMBER"),
+                Self::result_column("Type", "VARCHAR2"),
+                Self::result_column("Message", "VARCHAR2"),
+            ],
+            rows,
+            format!("Loaded compilation status for {object_name} ({status})"),
+        )
     }
 
     pub fn set_sql_callback<F>(&mut self, callback: F)

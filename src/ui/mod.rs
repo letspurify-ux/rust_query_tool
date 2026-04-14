@@ -38,6 +38,12 @@ pub use settings_dialog::*;
 pub use sql_editor::*;
 pub use syntax_highlight::*;
 
+#[derive(Clone)]
+pub struct ResultTabRequest {
+    pub label: String,
+    pub result: crate::db::QueryResult,
+}
+
 pub fn center_on_main(window: &mut Window) {
     // NOTE: fltk-rs의 center_of()는 참조 위젯이 Window 타입이면
     // wx/wy를 0으로 고정해 실제 화면 위치를 무시하는 버그가 있음.

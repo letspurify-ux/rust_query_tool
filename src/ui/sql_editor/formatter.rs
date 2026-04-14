@@ -212,9 +212,7 @@ fn rendered_line_indent(line: &str) -> usize {
     // Leading indentation is always plain ASCII spaces, so byte-iteration is
     // both byte-offset compliant (per CLAUDE.md) and avoids per-call UTF-8
     // decoding on a hot path that runs once per token rendering.
-    SqlEditorWidget::safe_indent_div(
-        line.bytes().take_while(|b| *b == b' ').count(),
-    )
+    SqlEditorWidget::safe_indent_div(line.bytes().take_while(|b| *b == b' ').count())
 }
 
 #[derive(Default)]
@@ -225,8 +223,10 @@ struct IndentCache {
 impl IndentCache {
     fn spaces(&mut self, count: usize) -> &str {
         if self.spaces.len() < count {
-            self.spaces
-                .extend(std::iter::repeat_n(' ', count.saturating_sub(self.spaces.len())));
+            self.spaces.extend(std::iter::repeat_n(
+                ' ',
+                count.saturating_sub(self.spaces.len()),
+            ));
         }
         &self.spaces[..count]
     }
@@ -5473,9 +5473,7 @@ impl SqlEditorWidget {
 
     fn split_inline_statement_separators(mut formatted: String) -> String {
         formatted.truncate(formatted.trim_end().len());
-        if formatted.is_empty()
-            || !Self::has_inline_statement_separator_candidate(&formatted)
-        {
+        if formatted.is_empty() || !Self::has_inline_statement_separator_candidate(&formatted) {
             return formatted;
         }
 
@@ -8067,8 +8065,7 @@ impl SqlEditorWidget {
                             || (upper == "INSTEAD" && next_word_is("OF")));
                     let is_create_index_on =
                         upper == "ON" && construct_flag_active!(CreateIndexPending);
-                    let follows_alias_keyword =
-                        matches!(prev_word_upper, Some("AS" | "IS"));
+                    let follows_alias_keyword = matches!(prev_word_upper, Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
                         format_stack.current_clause(),
                         Some("FROM" | "UPDATE" | "DELETE" | "INTO" | "MERGE" | "USING")
@@ -8171,10 +8168,8 @@ impl SqlEditorWidget {
                             || mysql_compound_declare
                             || treat_control_keyword_as_identifier
                             || follows_alias_control_keyword);
-                    let follows_type_method_modifier = matches!(
-                        prev_word_upper,
-                        Some("MEMBER" | "STATIC" | "CONSTRUCTOR")
-                    );
+                    let follows_type_method_modifier =
+                        matches!(prev_word_upper, Some("MEMBER" | "STATIC" | "CONSTRUCTOR"));
                     let at_package_body_member_depth =
                         is_package_body_statement && indent_level == 1;
                     if upper == "END" && !treat_control_keyword_as_identifier {
@@ -8303,11 +8298,6 @@ impl SqlEditorWidget {
                         let paren_extra =
                             Self::paren_extra_depth_within_current_query_frame(&format_stack);
                         let mut closed_block = None;
-                        // Tracks whether any block was popped. `indent_level`
-                        // restoration happens atomically inside `pop_block`, so
-                        // we only need to know *whether* a pop occurred to
-                        // decide on the fallback path below.
-                        let mut any_block_popped = false;
                         let mut closed_owner_depth = None;
                         let mut closed_mysql_handler_begin = false;
 
@@ -8343,7 +8333,6 @@ impl SqlEditorWidget {
                                             popped_block.mysql_handler_begin;
                                         closed_owner_depth =
                                             Some(popped_block.depth_frame.owner_depth);
-                                        any_block_popped = true;
                                     }
                                 }
                             }
@@ -8351,7 +8340,6 @@ impl SqlEditorWidget {
                             if let Some(popped_block) = format_stack.pop_block(&mut indent_level) {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
-                                any_block_popped = true;
                             }
                         } else {
                             // Plain END - closes BEGIN or DECLARE/PACKAGE_BODY block
@@ -8361,7 +8349,6 @@ impl SqlEditorWidget {
                                 closed_mysql_handler_begin |= popped_block.mysql_handler_begin;
                                 let top = popped_block.kind;
                                 closed_owner_depth = Some(popped_block.depth_frame.owner_depth);
-                                any_block_popped = true;
                                 let reached_package_body =
                                     format_stack.last_block_kind_is(BlockKind::PackageBody);
                                 if closes_active_package_member {
@@ -8397,7 +8384,7 @@ impl SqlEditorWidget {
                         // it alone.
                         #[cfg(debug_assertions)]
                         {
-                            if !any_block_popped {
+                            if closed_owner_depth.is_none() {
                                 debug_assert_eq!(
                                     indent_level,
                                     format_stack.statement_base_indent(),
@@ -10664,14 +10651,13 @@ impl SqlEditorWidget {
                         );
                         let next_word_upper = next_non_comment_idx
                             .and_then(|token_idx| token_cache.upper_word(token_idx));
-                        let next_is_condition_keyword =
-                            if let Some(upper) = next_word_upper {
-                                condition_keywords.contains(&upper)
-                                    && !(upper == "AND"
-                                        && format_stack.between_pending_matches(current_scope))
-                            } else {
-                                false
-                            };
+                        let next_is_condition_keyword = if let Some(upper) = next_word_upper {
+                            condition_keywords.contains(&upper)
+                                && !(upper == "AND"
+                                    && format_stack.between_pending_matches(current_scope))
+                        } else {
+                            false
+                        };
                         let next_is_else = matches!(
                             next_non_comment,
                             Some(SqlToken::Word(w))
@@ -12209,10 +12195,7 @@ impl SqlEditorWidget {
                                 &mut indent_cache,
                             );
                             let keeps_aggregate_call_tight = statement_has_apply
-                                && matches!(
-                                    prev_word_upper,
-                                    Some("AVG" | "COUNT" | "MAX" | "MIN")
-                                );
+                                && matches!(prev_word_upper, Some("AVG" | "COUNT" | "MAX" | "MIN"));
                             let keeps_count_star_call_tight =
                                 Self::count_star_call_should_stay_tight(
                                     tokens,
@@ -14092,9 +14075,7 @@ mod inline_statement_separator_tests {
     #[test]
     fn split_inline_statement_separators_keeps_same_line_comments_attached() {
         assert_eq!(
-            SqlEditorWidget::split_inline_statement_separators_for_test(
-                "SELECT 1; -- note"
-            ),
+            SqlEditorWidget::split_inline_statement_separators_for_test("SELECT 1; -- note"),
             "SELECT 1; -- note"
         );
     }
@@ -14102,9 +14083,7 @@ mod inline_statement_separator_tests {
     #[test]
     fn split_inline_statement_separators_breaks_same_line_statements() {
         assert_eq!(
-            SqlEditorWidget::split_inline_statement_separators_for_test(
-                "SELECT 1; SELECT 2;"
-            ),
+            SqlEditorWidget::split_inline_statement_separators_for_test("SELECT 1; SELECT 2;"),
             "SELECT 1;\n SELECT 2;"
         );
     }
