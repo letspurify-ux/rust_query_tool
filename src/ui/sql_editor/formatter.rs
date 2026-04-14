@@ -328,7 +328,24 @@ impl BlockKind {
             Self::Begin | Self::CompoundTrigger | Self::Declare | Self::PackageBody
         )
     }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Begin => 0,
+            Self::Case => 1,
+            Self::CompoundTrigger => 2,
+            Self::Declare => 3,
+            Self::Exception => 4,
+            Self::If => 5,
+            Self::Loop => 6,
+            Self::PackageBody => 7,
+            Self::Repeat => 8,
+            Self::While => 9,
+        }
+    }
 }
+
+const BLOCK_KIND_COUNT: usize = 10;
 
 trait BlockKindMatcher {
     fn matches(&self, kind: BlockKind) -> bool;
@@ -1297,6 +1314,19 @@ enum ConditionOwnerKind {
     ControlHeader,
 }
 
+impl ConditionOwnerKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::JoinOn => 0,
+            Self::Where => 1,
+            Self::Case => 2,
+            Self::ControlHeader => 3,
+        }
+    }
+}
+
+const CONDITION_OWNER_KIND_COUNT: usize = 4;
+
 #[derive(Clone, Copy)]
 struct ConditionOwnerFrame {
     kind: ConditionOwnerKind,
@@ -1336,6 +1366,19 @@ enum ScopedIndentKind {
     ForallBody,
     MySqlHandlerBody,
 }
+
+impl ScopedIndentKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::MergeWhenBranch => 0,
+            Self::CursorSql => 1,
+            Self::ForallBody => 2,
+            Self::MySqlHandlerBody => 3,
+        }
+    }
+}
+
+const SCOPED_INDENT_KIND_COUNT: usize = 4;
 
 #[derive(Clone, Copy)]
 struct ScopedIndentFrame {
@@ -1400,8 +1443,277 @@ struct FormatFrameTransitionEvent {
 }
 
 #[derive(Default)]
+struct ParenSemanticFlagCounts {
+    match_recognize: usize,
+    analytic_over: usize,
+    window_clause: usize,
+    keep: usize,
+}
+
+impl ParenSemanticFlagCounts {
+    fn push(&mut self, flags: ParenSemanticFlags) {
+        self.match_recognize = self
+            .match_recognize
+            .saturating_add(usize::from(flags.match_recognize));
+        self.analytic_over = self
+            .analytic_over
+            .saturating_add(usize::from(flags.analytic_over));
+        self.window_clause = self
+            .window_clause
+            .saturating_add(usize::from(flags.window_clause));
+        self.keep = self.keep.saturating_add(usize::from(flags.keep));
+    }
+
+    fn pop(&mut self, flags: ParenSemanticFlags) {
+        self.match_recognize = self
+            .match_recognize
+            .saturating_sub(usize::from(flags.match_recognize));
+        self.analytic_over = self
+            .analytic_over
+            .saturating_sub(usize::from(flags.analytic_over));
+        self.window_clause = self
+            .window_clause
+            .saturating_sub(usize::from(flags.window_clause));
+        self.keep = self.keep.saturating_sub(usize::from(flags.keep));
+    }
+}
+
+struct FrameIndexCache {
+    paren_indices: Vec<usize>,
+    block_indices: Vec<usize>,
+    block_kind_indices: [Vec<usize>; BLOCK_KIND_COUNT],
+    paren_semantic_counts: ParenSemanticFlagCounts,
+    condition_owner_indices: [Vec<usize>; CONDITION_OWNER_KIND_COUNT],
+    construct_flag_indices: [Vec<usize>; CONSTRUCT_FLAG_KIND_COUNT],
+    construct_value_indices: [Vec<usize>; CONSTRUCT_VALUE_KIND_COUNT],
+    scoped_indent_indices: [Vec<usize>; SCOPED_INDENT_KIND_COUNT],
+    pending_split_end_suffix_indices: Vec<usize>,
+    pending_plsql_label_indices: Vec<usize>,
+    mysql_handler_pending_body_indent_indices: Vec<usize>,
+    trigger_header_indices: Vec<usize>,
+    plsql_context_indices: Vec<usize>,
+    compound_trigger_indices: Vec<usize>,
+    with_cte_indices: Vec<usize>,
+}
+
+impl Default for FrameIndexCache {
+    fn default() -> Self {
+        Self {
+            paren_indices: Vec::new(),
+            block_indices: Vec::new(),
+            block_kind_indices: std::array::from_fn(|_| Vec::new()),
+            paren_semantic_counts: ParenSemanticFlagCounts::default(),
+            condition_owner_indices: std::array::from_fn(|_| Vec::new()),
+            construct_flag_indices: std::array::from_fn(|_| Vec::new()),
+            construct_value_indices: std::array::from_fn(|_| Vec::new()),
+            scoped_indent_indices: std::array::from_fn(|_| Vec::new()),
+            pending_split_end_suffix_indices: Vec::new(),
+            pending_plsql_label_indices: Vec::new(),
+            mysql_handler_pending_body_indent_indices: Vec::new(),
+            trigger_header_indices: Vec::new(),
+            plsql_context_indices: Vec::new(),
+            compound_trigger_indices: Vec::new(),
+            with_cte_indices: Vec::new(),
+        }
+    }
+}
+
+impl FrameIndexCache {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn push(&mut self, frame: &FormatFrame, idx: usize) {
+        match frame {
+            FormatFrame::Paren(frame) => {
+                self.paren_indices.push(idx);
+                self.paren_semantic_counts.push(frame.semantic_flags);
+            }
+            FormatFrame::Block(frame) => {
+                self.block_indices.push(idx);
+                self.block_kind_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::ScopedIndent(frame) => {
+                self.scoped_indent_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::ConstructFlag(frame) => {
+                self.construct_flag_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::ConstructValue(frame) => {
+                self.construct_value_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::ConditionOwner(frame) => {
+                self.condition_owner_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::BetweenPending(_) | FormatFrame::OpenCursorRestore(_) => {}
+            FormatFrame::PendingSplitEndSuffix(_) => {
+                self.pending_split_end_suffix_indices.push(idx);
+            }
+            FormatFrame::PendingPlsqlLabel(_) => {
+                self.pending_plsql_label_indices.push(idx);
+            }
+            FormatFrame::MySqlHandlerPendingBodyIndent(_) => {
+                self.mysql_handler_pending_body_indent_indices.push(idx);
+            }
+            FormatFrame::TriggerHeader(_) => {
+                self.trigger_header_indices.push(idx);
+            }
+            FormatFrame::PlsqlContext(_) => {
+                self.plsql_context_indices.push(idx);
+            }
+            FormatFrame::CompoundTrigger(_) => {
+                self.compound_trigger_indices.push(idx);
+            }
+            FormatFrame::WithCte(_) => {
+                self.with_cte_indices.push(idx);
+            }
+        }
+    }
+
+    fn pop(&mut self, frame: &FormatFrame) {
+        match frame {
+            FormatFrame::Paren(frame) => {
+                let _ = self.paren_indices.pop();
+                self.paren_semantic_counts.pop(frame.semantic_flags);
+            }
+            FormatFrame::Block(frame) => {
+                let _ = self.block_indices.pop();
+                let _ = self.block_kind_indices[frame.kind.index()].pop();
+            }
+            FormatFrame::ScopedIndent(frame) => {
+                let _ = self.scoped_indent_indices[frame.kind.index()].pop();
+            }
+            FormatFrame::ConstructFlag(frame) => {
+                let _ = self.construct_flag_indices[frame.kind.index()].pop();
+            }
+            FormatFrame::ConstructValue(frame) => {
+                let _ = self.construct_value_indices[frame.kind.index()].pop();
+            }
+            FormatFrame::ConditionOwner(frame) => {
+                let _ = self.condition_owner_indices[frame.kind.index()].pop();
+            }
+            FormatFrame::BetweenPending(_) | FormatFrame::OpenCursorRestore(_) => {}
+            FormatFrame::PendingSplitEndSuffix(_) => {
+                let _ = self.pending_split_end_suffix_indices.pop();
+            }
+            FormatFrame::PendingPlsqlLabel(_) => {
+                let _ = self.pending_plsql_label_indices.pop();
+            }
+            FormatFrame::MySqlHandlerPendingBodyIndent(_) => {
+                let _ = self.mysql_handler_pending_body_indent_indices.pop();
+            }
+            FormatFrame::TriggerHeader(_) => {
+                let _ = self.trigger_header_indices.pop();
+            }
+            FormatFrame::PlsqlContext(_) => {
+                let _ = self.plsql_context_indices.pop();
+            }
+            FormatFrame::CompoundTrigger(_) => {
+                let _ = self.compound_trigger_indices.pop();
+            }
+            FormatFrame::WithCte(_) => {
+                let _ = self.with_cte_indices.pop();
+            }
+        }
+    }
+
+    fn remove(&mut self, frame: &FormatFrame, idx: usize) {
+        match frame {
+            FormatFrame::Paren(frame) => {
+                Self::remove_index(&mut self.paren_indices, idx);
+                self.paren_semantic_counts.pop(frame.semantic_flags);
+            }
+            FormatFrame::Block(frame) => {
+                Self::remove_index(&mut self.block_indices, idx);
+                Self::remove_index(&mut self.block_kind_indices[frame.kind.index()], idx);
+            }
+            FormatFrame::ScopedIndent(frame) => {
+                Self::remove_index(&mut self.scoped_indent_indices[frame.kind.index()], idx);
+            }
+            FormatFrame::ConstructFlag(frame) => {
+                Self::remove_index(&mut self.construct_flag_indices[frame.kind.index()], idx);
+            }
+            FormatFrame::ConstructValue(frame) => {
+                Self::remove_index(&mut self.construct_value_indices[frame.kind.index()], idx);
+            }
+            FormatFrame::ConditionOwner(frame) => {
+                Self::remove_index(&mut self.condition_owner_indices[frame.kind.index()], idx);
+            }
+            FormatFrame::BetweenPending(_) | FormatFrame::OpenCursorRestore(_) => {}
+            FormatFrame::PendingSplitEndSuffix(_) => {
+                Self::remove_index(&mut self.pending_split_end_suffix_indices, idx);
+            }
+            FormatFrame::PendingPlsqlLabel(_) => {
+                Self::remove_index(&mut self.pending_plsql_label_indices, idx);
+            }
+            FormatFrame::MySqlHandlerPendingBodyIndent(_) => {
+                Self::remove_index(&mut self.mysql_handler_pending_body_indent_indices, idx);
+            }
+            FormatFrame::TriggerHeader(_) => {
+                Self::remove_index(&mut self.trigger_header_indices, idx);
+            }
+            FormatFrame::PlsqlContext(_) => {
+                Self::remove_index(&mut self.plsql_context_indices, idx);
+            }
+            FormatFrame::CompoundTrigger(_) => {
+                Self::remove_index(&mut self.compound_trigger_indices, idx);
+            }
+            FormatFrame::WithCte(_) => {
+                Self::remove_index(&mut self.with_cte_indices, idx);
+            }
+        }
+        self.shift_indices_after_removal(idx);
+    }
+
+    fn remove_index(indices: &mut Vec<usize>, idx: usize) {
+        if let Some(position) = indices.iter().rposition(|stored| *stored == idx) {
+            let _ = indices.remove(position);
+        }
+    }
+
+    fn shift_indices_after_removal(&mut self, removed_idx: usize) {
+        Self::shift_indices(&mut self.paren_indices, removed_idx);
+        Self::shift_indices(&mut self.block_indices, removed_idx);
+        for indices in &mut self.block_kind_indices {
+            Self::shift_indices(indices, removed_idx);
+        }
+        for indices in &mut self.condition_owner_indices {
+            Self::shift_indices(indices, removed_idx);
+        }
+        for indices in &mut self.construct_flag_indices {
+            Self::shift_indices(indices, removed_idx);
+        }
+        for indices in &mut self.construct_value_indices {
+            Self::shift_indices(indices, removed_idx);
+        }
+        for indices in &mut self.scoped_indent_indices {
+            Self::shift_indices(indices, removed_idx);
+        }
+        Self::shift_indices(&mut self.pending_split_end_suffix_indices, removed_idx);
+        Self::shift_indices(&mut self.pending_plsql_label_indices, removed_idx);
+        Self::shift_indices(
+            &mut self.mysql_handler_pending_body_indent_indices,
+            removed_idx,
+        );
+        Self::shift_indices(&mut self.trigger_header_indices, removed_idx);
+        Self::shift_indices(&mut self.plsql_context_indices, removed_idx);
+        Self::shift_indices(&mut self.compound_trigger_indices, removed_idx);
+        Self::shift_indices(&mut self.with_cte_indices, removed_idx);
+    }
+
+    fn shift_indices(indices: &mut Vec<usize>, removed_idx: usize) {
+        for stored in indices.iter_mut() {
+            if *stored > removed_idx {
+                *stored = stored.saturating_sub(1);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
 struct FormatFrameStack {
     frames: Vec<FormatFrame>,
+    frame_index_cache: FrameIndexCache,
     paren_depth: usize,
     block_depth: usize,
     current_paren_frame_id: Option<SqlFormatFrameId>,
@@ -1414,6 +1726,13 @@ struct FormatFrameStack {
 }
 
 impl FormatFrameStack {
+    fn rebuild_frame_index_cache(&mut self) {
+        self.frame_index_cache.clear();
+        for (idx, frame) in self.frames.iter().enumerate() {
+            self.frame_index_cache.push(frame, idx);
+        }
+    }
+
     #[cfg(test)]
     fn record_transition(
         &mut self,
@@ -1449,8 +1768,26 @@ impl FormatFrameStack {
         self.frame_id_allocator.next_id()
     }
 
+    fn push_frame(&mut self, frame: FormatFrame) {
+        self.frames.push(frame);
+        if let Some(frame) = self.frames.last() {
+            self.frame_index_cache
+                .push(frame, self.frames.len().saturating_sub(1));
+        }
+    }
+
+    fn remove_frame_at(&mut self, idx: usize) -> Option<FormatFrame> {
+        if idx >= self.frames.len() {
+            return None;
+        }
+        let frame = self.frames.remove(idx);
+        self.frame_index_cache.remove(&frame, idx);
+        Some(frame)
+    }
+
     fn pop_tail_frame(&mut self) -> Option<FormatFrame> {
         let frame = self.frames.pop()?;
+        self.frame_index_cache.pop(&frame);
         match &frame {
             FormatFrame::Paren(frame) => {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
@@ -1473,17 +1810,19 @@ impl FormatFrameStack {
         next_scope: FormatScope,
         indent_level: &mut usize,
     ) {
-        let mut retained_frames = Vec::with_capacity(self.frames.len());
-        for frame in self.frames.drain(..) {
-            if frame.expires_for_scope(next_scope) {
-                if let FormatFrame::ScopedIndent(frame) = &frame {
+        while self
+            .frames
+            .last()
+            .is_some_and(|frame| frame.expires_for_scope(next_scope))
+        {
+            if let Some(frame) = self.pop_tail_frame() {
+                if let FormatFrame::ScopedIndent(frame) = frame {
                     *indent_level = indent_level.saturating_sub(frame.delta);
                 }
-                continue;
+            } else {
+                break;
             }
-            retained_frames.push(frame);
         }
-        self.frames = retained_frames;
     }
 
     fn current_scope(&self) -> FormatScope {
@@ -1593,21 +1932,23 @@ impl FormatFrameStack {
         if self.last_construct_flag_scope(kind) == Some(scope) {
             return;
         }
-        self.frames
-            .push(FormatFrame::ConstructFlag(ConstructFlagFrame {
-                kind,
-                scope,
-            }));
+        self.push_frame(FormatFrame::ConstructFlag(ConstructFlagFrame {
+            kind,
+            scope,
+        }));
     }
 
     fn deactivate_construct_flag(&mut self, kind: ConstructFlagKind) -> bool {
-        let Some(idx) = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::ConstructFlag(frame) if frame.kind == kind),
-        ) else {
+        let Some(idx) = self
+            .frame_index_cache
+            .construct_flag_indices
+            .get(kind.index())
+            .and_then(|indices| indices.last())
+            .copied()
+        else {
             return false;
         };
-        self.frames.remove(idx);
-        true
+        self.remove_frame_at(idx).is_some()
     }
 
     fn deactivate_construct_flag_at_or_above_paren_depth(
@@ -1622,13 +1963,13 @@ impl FormatFrameStack {
                     if frame.kind == kind && frame.scope.paren_depth >= paren_depth
             )
         });
+        self.rebuild_frame_index_cache();
     }
 
     fn construct_flag_is_active(&self, kind: ConstructFlagKind) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .any(|frame| matches!(frame, FormatFrame::ConstructFlag(frame) if frame.kind == kind))
+        self.frame_index_cache.construct_flag_indices[kind.index()]
+            .last()
+            .is_some()
     }
 
     fn construct_flag_is_active_at_paren_depth(
@@ -1636,19 +1977,18 @@ impl FormatFrameStack {
         kind: ConstructFlagKind,
         paren_depth: usize,
     ) -> bool {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ConstructFlag(frame) if frame.kind == kind => {
-                Some(frame.scope.paren_depth)
-            }
-            _ => None,
-        }) == Some(paren_depth)
+        self.last_construct_flag_scope(kind)
+            .is_some_and(|scope| scope.paren_depth == paren_depth)
     }
 
     fn last_construct_flag_scope(&self, kind: ConstructFlagKind) -> Option<FormatScope> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ConstructFlag(frame) if frame.kind == kind => Some(frame.scope),
-            _ => None,
-        })
+        self.frame_index_cache.construct_flag_indices[kind.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::ConstructFlag(frame) => Some(frame.scope),
+                _ => None,
+            })
     }
 
     fn replace_construct_value(
@@ -1657,9 +1997,9 @@ impl FormatFrameStack {
         scope: FormatScope,
         value: String,
     ) {
-        let existing_idx = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
-        );
+        let existing_idx = self.frame_index_cache.construct_value_indices[kind.index()]
+            .last()
+            .copied();
         if let Some(idx) = existing_idx {
             match self.frames.get_mut(idx) {
                 Some(FormatFrame::ConstructValue(frame)) if frame.scope == scope => {
@@ -1669,32 +2009,34 @@ impl FormatFrameStack {
                 _ => {}
             }
         }
-        self.frames
-            .push(FormatFrame::ConstructValue(ConstructValueFrame {
-                kind,
-                scope,
-                value,
-            }));
+        self.push_frame(FormatFrame::ConstructValue(ConstructValueFrame {
+            kind,
+            scope,
+            value,
+        }));
     }
 
     fn clear_construct_value(&mut self, kind: ConstructValueKind) {
         self.frames.retain(
             |frame| !matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
         );
+        self.rebuild_frame_index_cache();
     }
 
     fn construct_value_is_some(&self, kind: ConstructValueKind) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .any(|frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind))
+        self.frame_index_cache.construct_value_indices[kind.index()]
+            .last()
+            .is_some()
     }
 
     fn construct_value_as_deref(&self, kind: ConstructValueKind) -> Option<&str> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ConstructValue(frame) if frame.kind == kind => Some(frame.value.as_str()),
-            _ => None,
-        })
+        self.frame_index_cache.construct_value_indices[kind.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::ConstructValue(frame) => Some(frame.value.as_str()),
+                _ => None,
+            })
     }
 
     /// Push a paren frame and atomically apply its indent delta to
@@ -1722,7 +2064,7 @@ impl FormatFrameStack {
         if frame.opens_indented() {
             *indent_level = indent_level.saturating_add(frame.indent_level_delta());
         }
-        self.frames.push(FormatFrame::Paren(ParenStackFrame {
+        self.push_frame(FormatFrame::Paren(ParenStackFrame {
             id: frame_id,
             frame,
             semantic_flags,
@@ -1808,17 +2150,18 @@ impl FormatFrameStack {
     }
 
     fn last_paren(&self) -> Option<&ParenFormatFrame> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => Some(&frame.frame),
-            _ => None,
-        })
+        self.frame_index_cache
+            .paren_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Paren(frame) => Some(&frame.frame),
+                _ => None,
+            })
     }
 
     fn last_paren_mut(&mut self) -> Option<&mut ParenFormatFrame> {
-        let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::Paren(_)))?;
+        let idx = self.frame_index_cache.paren_indices.last().copied()?;
         match self.frames.get_mut(idx) {
             Some(FormatFrame::Paren(frame)) => Some(&mut frame.frame),
             _ => None,
@@ -1826,19 +2169,25 @@ impl FormatFrameStack {
     }
 
     fn last_paren_wrapped_owner_kind(&self) -> Option<FormatIndentedParenOwnerKind> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => frame.wrapped_owner_kind,
-            _ => None,
-        })
+        self.frame_index_cache
+            .paren_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Paren(frame) => frame.wrapped_owner_kind,
+                _ => None,
+            })
     }
 
     fn paren_semantic_flag_is_active(
         &self,
         matches_flag: impl Fn(ParenSemanticFlags) -> bool,
     ) -> bool {
-        self.frames.iter().rev().any(|frame| match frame {
-            FormatFrame::Paren(frame) => matches_flag(frame.semantic_flags),
-            _ => false,
+        matches_flag(ParenSemanticFlags {
+            match_recognize: self.frame_index_cache.paren_semantic_counts.match_recognize > 0,
+            analytic_over: self.frame_index_cache.paren_semantic_counts.analytic_over > 0,
+            window_clause: self.frame_index_cache.paren_semantic_counts.window_clause > 0,
+            keep: self.frame_index_cache.paren_semantic_counts.keep > 0,
         })
     }
 
@@ -1890,7 +2239,7 @@ impl FormatFrameStack {
         let indent_before = *indent_level;
         let frame_id = self.next_frame_id();
         *indent_level = new_indent_level;
-        self.frames.push(FormatFrame::Block(BlockStackFrame {
+        self.push_frame(FormatFrame::Block(BlockStackFrame {
             id: frame_id,
             kind,
             depth_frame: FormatBlockDepthFrame {
@@ -1970,10 +2319,14 @@ impl FormatFrameStack {
     }
 
     fn last_block_kind(&self) -> Option<BlockKind> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.kind),
-            _ => None,
-        })
+        self.frame_index_cache
+            .block_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Block(frame) => Some(frame.kind),
+                _ => None,
+            })
     }
 
     fn last_block_kind_is(&self, kind: impl BlockKindMatcher) -> bool {
@@ -1982,16 +2335,23 @@ impl FormatFrameStack {
     }
 
     fn set_last_block_kind(&mut self, kind: BlockKind) -> bool {
-        let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::Block(_)));
-        let Some(idx) = idx else {
+        let Some(idx) = self.frame_index_cache.block_indices.last().copied() else {
             return false;
+        };
+        let previous_kind = match self.frames.get(idx) {
+            Some(FormatFrame::Block(frame)) => frame.kind,
+            _ => return false,
         };
         match self.frames.get_mut(idx) {
             Some(FormatFrame::Block(frame)) => {
                 frame.kind = kind;
+                if previous_kind != kind {
+                    FrameIndexCache::remove_index(
+                        &mut self.frame_index_cache.block_kind_indices[previous_kind.index()],
+                        idx,
+                    );
+                    self.frame_index_cache.block_kind_indices[kind.index()].push(idx);
+                }
                 true
             }
             _ => false,
@@ -1999,11 +2359,7 @@ impl FormatFrameStack {
     }
 
     fn mark_last_block_mysql_handler_begin(&mut self) -> bool {
-        let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::Block(_)));
-        let Some(idx) = idx else {
+        let Some(idx) = self.frame_index_cache.block_indices.last().copied() else {
             return false;
         };
         match self.frames.get_mut(idx) {
@@ -2016,10 +2372,10 @@ impl FormatFrameStack {
     }
 
     fn set_last_case_branch_started(&mut self, started: bool) -> bool {
-        let idx = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::Block(frame) if frame.kind == BlockKind::Case),
-        );
-        let Some(idx) = idx else {
+        let Some(idx) = self.frame_index_cache.block_kind_indices[BlockKind::Case.index()]
+            .last()
+            .copied()
+        else {
             return false;
         };
         match self.frames.get_mut(idx) {
@@ -2032,25 +2388,21 @@ impl FormatFrameStack {
     }
 
     fn last_case_branch_started(&self) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| match frame {
-                FormatFrame::Block(frame) if frame.kind == BlockKind::Case => {
-                    Some(frame.case_branch_started)
-                }
+        self.frame_index_cache.block_kind_indices[BlockKind::Case.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Block(frame) => Some(frame.case_branch_started),
                 _ => None,
             })
             .unwrap_or(false)
     }
 
     fn set_last_exception_branch_started(&mut self, started: bool) -> bool {
-        let idx = self.frames.iter().rposition(
-            |frame| {
-                matches!(frame, FormatFrame::Block(frame) if frame.kind == BlockKind::Exception)
-            },
-        );
-        let Some(idx) = idx else {
+        let Some(idx) = self.frame_index_cache.block_kind_indices[BlockKind::Exception.index()]
+            .last()
+            .copied()
+        else {
             return false;
         };
         match self.frames.get_mut(idx) {
@@ -2063,23 +2415,25 @@ impl FormatFrameStack {
     }
 
     fn last_exception_branch_started(&self) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| match frame {
-                FormatFrame::Block(frame) if frame.kind == BlockKind::Exception => {
-                    Some(frame.exception_branch_started)
-                }
+        self.frame_index_cache.block_kind_indices[BlockKind::Exception.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Block(frame) => Some(frame.exception_branch_started),
                 _ => None,
             })
             .unwrap_or(false)
     }
 
     fn last_block_depth_frame(&self) -> Option<FormatBlockDepthFrame> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.depth_frame),
-            _ => None,
-        })
+        self.frame_index_cache
+            .block_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::Block(frame) => Some(frame.depth_frame),
+                _ => None,
+            })
     }
 
     fn last_block_owner_depth(&self) -> Option<usize> {
@@ -2155,13 +2509,12 @@ impl FormatFrameStack {
         indent: usize,
         parenthesized: bool,
     ) {
-        self.frames
-            .push(FormatFrame::ConditionOwner(ConditionOwnerFrame {
-                kind,
-                scope,
-                indent,
-                parenthesized,
-            }));
+        self.push_frame(FormatFrame::ConditionOwner(ConditionOwnerFrame {
+            kind,
+            scope,
+            indent,
+            parenthesized,
+        }));
     }
 
     fn pop_condition_owners_for_push(&mut self, kind: ConditionOwnerKind, scope: FormatScope) {
@@ -2196,15 +2549,17 @@ impl FormatFrameStack {
     }
 
     fn last_condition_owner(&self, kind: ConditionOwnerKind) -> Option<ConditionOwnerFrame> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ConditionOwner(owner) if owner.kind == kind => Some(*owner),
-            _ => None,
-        })
+        self.frame_index_cache.condition_owner_indices[kind.index()]
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::ConditionOwner(owner) => Some(*owner),
+                _ => None,
+            })
     }
 
     fn push_between_pending(&mut self, scope: FormatScope) {
-        self.frames
-            .push(FormatFrame::BetweenPending(BetweenPendingFrame { scope }));
+        self.push_frame(FormatFrame::BetweenPending(BetweenPendingFrame { scope }));
     }
 
     fn between_pending_matches(&self, scope: FormatScope) -> bool {
@@ -2230,18 +2585,26 @@ impl FormatFrameStack {
     }
 
     fn pending_split_end_suffix_indent(&self) -> Option<usize> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::PendingSplitEndSuffix(frame) => Some(frame.indent),
-            _ => None,
-        })
+        self.frame_index_cache
+            .pending_split_end_suffix_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::PendingSplitEndSuffix(frame) => Some(frame.indent),
+                _ => None,
+            })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn pending_split_end_suffix_kind(&self) -> Option<PendingSplitEndSuffixKind> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::PendingSplitEndSuffix(frame) => Some(frame.kind),
-            _ => None,
-        })
+        self.frame_index_cache
+            .pending_split_end_suffix_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::PendingSplitEndSuffix(frame) => Some(frame.kind),
+                _ => None,
+            })
     }
 
     fn set_pending_split_end_suffix(
@@ -2251,7 +2614,7 @@ impl FormatFrameStack {
         kind: PendingSplitEndSuffixKind,
     ) {
         let _ = self.clear_pending_split_end_suffix();
-        self.frames.push(FormatFrame::PendingSplitEndSuffix(
+        self.push_frame(FormatFrame::PendingSplitEndSuffix(
             PendingSplitEndSuffixFrame {
                 scope,
                 indent,
@@ -2262,21 +2625,22 @@ impl FormatFrameStack {
 
     fn clear_pending_split_end_suffix(&mut self) -> bool {
         let Some(idx) = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::PendingSplitEndSuffix(_)))
+            .frame_index_cache
+            .pending_split_end_suffix_indices
+            .last()
+            .copied()
         else {
             return false;
         };
-        self.frames.remove(idx);
-        true
+        self.remove_frame_at(idx).is_some()
     }
 
     fn advance_pending_split_end_suffix(&mut self, word_upper: &str) {
         let Some(idx) = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::PendingSplitEndSuffix(_)))
+            .frame_index_cache
+            .pending_split_end_suffix_indices
+            .last()
+            .copied()
         else {
             return;
         };
@@ -2291,63 +2655,70 @@ impl FormatFrameStack {
                 }
             }
             None => {
-                self.frames.remove(idx);
+                let _ = self.remove_frame_at(idx);
             }
         }
     }
 
     fn pending_plsql_label_body_indent(&self) -> Option<usize> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::PendingPlsqlLabel(frame) => Some(frame.body_indent),
-            _ => None,
-        })
+        self.frame_index_cache
+            .pending_plsql_label_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::PendingPlsqlLabel(frame) => Some(frame.body_indent),
+                _ => None,
+            })
     }
 
     fn set_pending_plsql_label_body_indent(&mut self, scope: FormatScope, body_indent: usize) {
         let _ = self.clear_pending_plsql_label_body_indent();
-        self.frames
-            .push(FormatFrame::PendingPlsqlLabel(PendingPlsqlLabelFrame {
-                scope,
-                body_indent,
-            }));
+        self.push_frame(FormatFrame::PendingPlsqlLabel(PendingPlsqlLabelFrame {
+            scope,
+            body_indent,
+        }));
     }
 
     fn clear_pending_plsql_label_body_indent(&mut self) -> bool {
         let Some(idx) = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::PendingPlsqlLabel(_)))
+            .frame_index_cache
+            .pending_plsql_label_indices
+            .last()
+            .copied()
         else {
             return false;
         };
-        self.frames.remove(idx);
-        true
+        self.remove_frame_at(idx).is_some()
     }
 
     fn mysql_handler_pending_body_indent(&self) -> Option<usize> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::MySqlHandlerPendingBodyIndent(frame) => Some(frame.indent),
-            _ => None,
-        })
+        self.frame_index_cache
+            .mysql_handler_pending_body_indent_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::MySqlHandlerPendingBodyIndent(frame) => Some(frame.indent),
+                _ => None,
+            })
     }
 
     fn set_mysql_handler_pending_body_indent(&mut self, scope: FormatScope, indent: usize) {
         let _ = self.clear_mysql_handler_pending_body_indent();
-        self.frames.push(FormatFrame::MySqlHandlerPendingBodyIndent(
+        self.push_frame(FormatFrame::MySqlHandlerPendingBodyIndent(
             MySqlHandlerPendingBodyIndentFrame { scope, indent },
         ));
     }
 
     fn clear_mysql_handler_pending_body_indent(&mut self) -> bool {
         let Some(idx) = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::MySqlHandlerPendingBodyIndent(_)))
+            .frame_index_cache
+            .mysql_handler_pending_body_indent_indices
+            .last()
+            .copied()
         else {
             return false;
         };
-        self.frames.remove(idx);
-        true
+        self.remove_frame_at(idx).is_some()
     }
 
     fn push_scoped_indent(
@@ -2367,12 +2738,11 @@ impl FormatFrameStack {
             return;
         }
         *indent_level = indent_level.saturating_add(delta);
-        self.frames
-            .push(FormatFrame::ScopedIndent(ScopedIndentFrame {
-                kind,
-                scope,
-                delta,
-            }));
+        self.push_frame(FormatFrame::ScopedIndent(ScopedIndentFrame {
+            kind,
+            scope,
+            delta,
+        }));
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity();
@@ -2381,10 +2751,9 @@ impl FormatFrameStack {
     }
 
     fn scoped_indent_is_active(&self, kind: ScopedIndentKind) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .any(|frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind))
+        self.frame_index_cache.scoped_indent_indices[kind.index()]
+            .last()
+            .is_some()
     }
 
     fn deactivate_scoped_indent(
@@ -2392,9 +2761,10 @@ impl FormatFrameStack {
         kind: ScopedIndentKind,
         indent_level: &mut usize,
     ) -> bool {
-        let Some(idx) = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
-        ) else {
+        let Some(idx) = self.frame_index_cache.scoped_indent_indices[kind.index()]
+            .last()
+            .copied()
+        else {
             return false;
         };
         let delta = match self.frames.get(idx) {
@@ -2402,7 +2772,7 @@ impl FormatFrameStack {
             _ => return false,
         };
         *indent_level = indent_level.saturating_sub(delta);
-        self.frames.remove(idx);
+        let _ = self.remove_frame_at(idx);
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity();
@@ -2413,15 +2783,16 @@ impl FormatFrameStack {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn clear_scoped_indent(&mut self, kind: ScopedIndentKind, indent_level: &mut usize) {
-        while let Some(idx) = self.frames.iter().rposition(
-            |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
-        ) {
+        while let Some(idx) = self.frame_index_cache.scoped_indent_indices[kind.index()]
+            .last()
+            .copied()
+        {
             let delta = match self.frames.get(idx) {
                 Some(FormatFrame::ScopedIndent(frame)) => frame.delta,
                 _ => break,
             };
             *indent_level = indent_level.saturating_sub(delta);
-            self.frames.remove(idx);
+            let _ = self.remove_frame_at(idx);
         }
         #[cfg(debug_assertions)]
         {
@@ -2434,14 +2805,18 @@ impl FormatFrameStack {
         if self.last_trigger_header_scope() == Some(scope) {
             return;
         }
-        self.frames.push(FormatFrame::TriggerHeader(scope));
+        self.push_frame(FormatFrame::TriggerHeader(scope));
     }
 
     fn last_trigger_header_scope(&self) -> Option<FormatScope> {
-        match self.frames.last() {
-            Some(FormatFrame::TriggerHeader(scope)) => Some(*scope),
-            _ => None,
-        }
+        self.frame_index_cache
+            .trigger_header_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::TriggerHeader(scope) => Some(*scope),
+                _ => None,
+            })
     }
 
     fn trigger_header_is_active(&self) -> bool {
@@ -2458,14 +2833,18 @@ impl FormatFrameStack {
         if self.plsql_context_scope() == Some(scope) {
             return;
         }
-        self.frames.push(FormatFrame::PlsqlContext(scope));
+        self.push_frame(FormatFrame::PlsqlContext(scope));
     }
 
     fn plsql_context_scope(&self) -> Option<FormatScope> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::PlsqlContext(scope) => Some(*scope),
-            _ => None,
-        })
+        self.frame_index_cache
+            .plsql_context_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::PlsqlContext(scope) => Some(*scope),
+                _ => None,
+            })
     }
 
     fn plsql_context_is_active(&self) -> bool {
@@ -2473,18 +2852,18 @@ impl FormatFrameStack {
     }
 
     fn push_compound_trigger(&mut self, scope: FormatScope) {
-        self.frames
-            .push(FormatFrame::CompoundTrigger(CompoundTriggerFrame {
-                scope,
-                phase: CompoundTriggerPhase::AwaitingOuterBodyStart,
-            }));
+        self.push_frame(FormatFrame::CompoundTrigger(CompoundTriggerFrame {
+            scope,
+            phase: CompoundTriggerPhase::AwaitingOuterBodyStart,
+        }));
     }
 
     fn last_compound_trigger_mut(&mut self) -> Option<&mut CompoundTriggerFrame> {
         let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::CompoundTrigger(_)))?;
+            .frame_index_cache
+            .compound_trigger_indices
+            .last()
+            .copied()?;
         match self.frames.get_mut(idx) {
             Some(FormatFrame::CompoundTrigger(frame)) => Some(frame),
             _ => None,
@@ -2492,10 +2871,14 @@ impl FormatFrameStack {
     }
 
     fn last_compound_trigger(&self) -> Option<&CompoundTriggerFrame> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::CompoundTrigger(frame) => Some(frame),
-            _ => None,
-        })
+        self.frame_index_cache
+            .compound_trigger_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::CompoundTrigger(frame) => Some(frame),
+                _ => None,
+            })
     }
 
     fn compound_trigger_awaiting_outer_body_start(&self) -> bool {
@@ -2544,7 +2927,7 @@ impl FormatFrameStack {
     }
 
     fn push_with_cte_frame(&mut self, scope: FormatScope) {
-        self.frames.push(FormatFrame::WithCte(WithCteFrame {
+        self.push_frame(FormatFrame::WithCte(WithCteFrame {
             scope,
             paren_depth: 0,
             owner_depth: None,
@@ -2553,10 +2936,7 @@ impl FormatFrameStack {
     }
 
     fn last_with_cte_mut(&mut self) -> Option<&mut WithCteFrame> {
-        let idx = self
-            .frames
-            .iter()
-            .rposition(|frame| matches!(frame, FormatFrame::WithCte(_)))?;
+        let idx = self.frame_index_cache.with_cte_indices.last().copied()?;
         match self.frames.get_mut(idx) {
             Some(FormatFrame::WithCte(frame)) => Some(frame),
             _ => None,
@@ -2564,10 +2944,14 @@ impl FormatFrameStack {
     }
 
     fn last_with_cte(&self) -> Option<&WithCteFrame> {
-        self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::WithCte(frame) => Some(frame),
-            _ => None,
-        })
+        self.frame_index_cache
+            .with_cte_indices
+            .last()
+            .and_then(|idx| self.frames.get(*idx))
+            .and_then(|frame| match frame {
+                FormatFrame::WithCte(frame) => Some(frame),
+                _ => None,
+            })
     }
 
     fn pop_last_with_cte(&mut self) -> bool {
@@ -2587,7 +2971,7 @@ impl FormatFrameStack {
     }
 
     fn push_open_cursor_restore(&mut self, state: OpenCursorFormatState) {
-        self.frames.push(FormatFrame::OpenCursorRestore(state));
+        self.push_frame(FormatFrame::OpenCursorRestore(state));
     }
 
     fn pop_open_cursor_restore(&mut self) -> Option<OpenCursorFormatState> {
@@ -2628,6 +3012,7 @@ impl FormatFrameStack {
             FormatFrame::Block(frame) => Some(frame.id),
             _ => None,
         });
+        self.rebuild_frame_index_cache();
         self.current_query_base_depth = None;
         *indent_level = self.statement_base_indent();
         #[cfg(debug_assertions)]
@@ -2937,10 +3322,50 @@ enum ConstructFlagKind {
     SearchCycleClauseActive,
 }
 
+impl ConstructFlagKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::BulkCollectActive => 0,
+            Self::CommentOnActive => 1,
+            Self::CreateIndexPending => 2,
+            Self::CreatePending => 3,
+            Self::CreateSequenceActive => 4,
+            Self::CreateSynonymActive => 5,
+            Self::CreateTableParenExpected => 6,
+            Self::CursorDeclPending => 7,
+            Self::ExecuteImmediateActive => 8,
+            Self::FetchActive => 9,
+            Self::ForallPending => 10,
+            Self::GrantRevokeActive => 11,
+            Self::InsertAllActive => 12,
+            Self::MergeActive => 13,
+            Self::ModelActive => 14,
+            Self::ModelReferencePending => 15,
+            Self::ReferentialActionPending => 16,
+            Self::ReferentialOnActive => 17,
+            Self::ReturningActive => 18,
+            Self::RoutineDeclPending => 19,
+            Self::SearchCycleClauseActive => 20,
+        }
+    }
+}
+
+const CONSTRUCT_FLAG_KIND_COUNT: usize = 21;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConstructValueKind {
     CreateObject,
 }
+
+impl ConstructValueKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::CreateObject => 0,
+        }
+    }
+}
+
+const CONSTRUCT_VALUE_KIND_COUNT: usize = 1;
 
 #[derive(Clone, Copy)]
 struct ConstructFlagFrame {
@@ -6525,12 +6950,12 @@ impl SqlEditorWidget {
     }
 
     fn classify_comment_attachment(
-        out: &str,
+        has_rendered_content: bool,
         at_line_start: bool,
         has_leading_newline: bool,
         is_multiline_block_comment: bool,
     ) -> CommentAttachment {
-        if out.trim().is_empty() {
+        if !has_rendered_content {
             return CommentAttachment::FileHeader;
         }
 
@@ -6886,7 +7311,7 @@ impl SqlEditorWidget {
             return statement.to_string();
         }
 
-        if let Some(formatted) = Self::format_create_table(statement, mysql_compatible) {
+        if let Some(formatted) = Self::format_create_table(tokens, mysql_compatible) {
             return formatted;
         }
 
@@ -6907,6 +7332,7 @@ impl SqlEditorWidget {
         let mut format_stack = FormatFrameStack::default();
         let mut at_line_start = true;
         let mut needs_space = false;
+        let mut has_rendered_content = false;
         let mut line_indent = 0usize;
         let mut line_start_token_paren_depth = 0usize;
         let mut line_start_delimiter_snapshot = DelimiterLineStartSnapshot::default();
@@ -7152,6 +7578,7 @@ impl SqlEditorWidget {
         let mut idx = 0;
         let mut line_start_token_idx = 0usize;
         while idx < tokens.len() {
+            let rendered_token_idx = idx;
             let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = format_stack.sync_for_token_entry(&mut indent_level);
             let prev_word_upper =
@@ -9895,7 +10322,7 @@ impl SqlEditorWidget {
                         || continuation_keyword
                         || comment_header_continuation_kind.is_some();
                     let attachment = Self::classify_comment_attachment(
-                        &out,
+                        has_rendered_content,
                         at_line_start,
                         has_leading_newline,
                         is_multiline_block_comment,
@@ -11941,6 +12368,13 @@ impl SqlEditorWidget {
                 }
             }
 
+            has_rendered_content = has_rendered_content
+                || tokens
+                    .get(rendered_token_idx)
+                    .is_some_and(|token| match token {
+                        SqlToken::Comment(comment) => !comment.trim().is_empty(),
+                        _ => true,
+                    });
             idx += 1;
         }
 
@@ -12830,13 +13264,7 @@ impl SqlEditorWidget {
         QueryExecutor::parse_ddl_object_type(&upper)
     }
 
-    fn format_create_table(statement: &str, mysql_compatible: bool) -> Option<String> {
-        let trimmed = statement.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let tokens = Self::tokenize_sql(trimmed);
+    fn format_create_table(tokens: &[SqlToken], mysql_compatible: bool) -> Option<String> {
         if tokens.is_empty() {
             return None;
         }
@@ -12844,23 +13272,24 @@ impl SqlEditorWidget {
         // Guard: only apply CREATE TABLE formatting when TABLE is the actual
         // object keyword in the CREATE header. This avoids false matches like
         // CREATE PACKAGE BODY ... TYPE ... IS TABLE OF ...
-        let mut word_positions: Vec<(usize, String)> = Vec::new();
+        let mut word_positions: Vec<(usize, &str)> = Vec::new();
         for (idx, token) in tokens.iter().enumerate() {
             if let SqlToken::Word(word) = token {
-                word_positions.push((idx, word.to_uppercase()));
+                word_positions.push((idx, word.as_str()));
             }
         }
 
         let create_word_idx = word_positions
             .iter()
-            .position(|(_, word)| word == "CREATE")?;
+            .position(|(_, word)| word.eq_ignore_ascii_case("CREATE"))?;
 
         let mut header_idx = create_word_idx + 1;
         while let Some((_, word)) = word_positions.get(header_idx) {
-            if matches!(
-                word.as_str(),
-                "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE"
-            ) {
+            if word.eq_ignore_ascii_case("OR")
+                || word.eq_ignore_ascii_case("REPLACE")
+                || word.eq_ignore_ascii_case("EDITIONABLE")
+                || word.eq_ignore_ascii_case("NONEDITIONABLE")
+            {
                 header_idx += 1;
                 continue;
             }
@@ -12869,19 +13298,19 @@ impl SqlEditorWidget {
 
         if (word_positions
             .get(header_idx)
-            .is_some_and(|(_, word)| word == "GLOBAL")
+            .is_some_and(|(_, word)| word.eq_ignore_ascii_case("GLOBAL"))
             || word_positions
                 .get(header_idx)
-                .is_some_and(|(_, word)| word == "PRIVATE"))
+                .is_some_and(|(_, word)| word.eq_ignore_ascii_case("PRIVATE")))
             && word_positions
                 .get(header_idx + 1)
-                .is_some_and(|(_, word)| word == "TEMPORARY")
+                .is_some_and(|(_, word)| word.eq_ignore_ascii_case("TEMPORARY"))
         {
             header_idx += 2;
         }
 
         let (_, create_object) = word_positions.get(header_idx)?;
-        if create_object != "TABLE" {
+        if !create_object.eq_ignore_ascii_case("TABLE") {
             return None;
         }
 
@@ -12889,28 +13318,28 @@ impl SqlEditorWidget {
         let mut ctas = false;
         let mut open_idx: Option<usize> = None;
         let mut close_idx: Option<usize> = None;
-        let token_depths = paren_depths(&tokens);
+        let token_depths = paren_depths(tokens);
         let mut idx = 0usize;
+        let mut word_position_idx = 0usize;
 
         while idx < tokens.len() {
             let token = &tokens[idx];
             match token {
                 SqlToken::Word(word) => {
-                    let upper = word.to_uppercase();
-                    if !seen_table && upper == "TABLE" {
+                    let next_word = word_positions
+                        .get(word_position_idx.saturating_add(1))
+                        .map(|(_, value)| *value);
+                    if !seen_table && word.eq_ignore_ascii_case("TABLE") {
                         seen_table = true;
                     } else if seen_table
-                        && upper == "AS"
-                        && tokens[idx + 1..]
-                            .iter()
-                            .find_map(|t| match t {
-                                SqlToken::Word(w) => Some(w.to_uppercase()),
-                                _ => None,
-                            })
-                            .is_some_and(|w| w == "SELECT" || w == "WITH")
+                        && word.eq_ignore_ascii_case("AS")
+                        && next_word.is_some_and(|next| {
+                            next.eq_ignore_ascii_case("SELECT") || next.eq_ignore_ascii_case("WITH")
+                        })
                     {
                         ctas = true;
                     }
+                    word_position_idx = word_position_idx.saturating_add(1);
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     if is_top_level_depth(&token_depths, idx)
@@ -12962,10 +13391,11 @@ impl SqlEditorWidget {
             let first = iter.next();
             let is_constraint = match first {
                 Some(SqlToken::Word(word)) => {
-                    matches!(
-                        word.to_uppercase().as_str(),
-                        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK"
-                    )
+                    word.eq_ignore_ascii_case("CONSTRAINT")
+                        || word.eq_ignore_ascii_case("PRIMARY")
+                        || word.eq_ignore_ascii_case("UNIQUE")
+                        || word.eq_ignore_ascii_case("FOREIGN")
+                        || word.eq_ignore_ascii_case("CHECK")
                 }
                 _ => false,
             };
