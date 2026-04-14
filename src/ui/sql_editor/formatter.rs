@@ -9690,6 +9690,39 @@ impl SqlEditorWidget {
                                         &mut needs_space,
                                         &mut line_indent,
                                     );
+                                } else if matches!(format_stack.current_clause(), Some("SELECT")) {
+                                    let mut select_case_indent = active_list_indent!(
+                                        indent_level,
+                                        open_cursor_state!(),
+                                        select_list_layout_state!(),
+                                        format_stack.current_clause(),
+                                        construct_flag_active!(MergeActive),
+                                        false,
+                                    );
+                                    if format_stack.paren_is_empty() {
+                                        if let Some(base_depth) = query_body_clause_base_depth!() {
+                                            select_case_indent =
+                                                select_case_indent.max(base_depth.saturating_add(1));
+                                        }
+                                    }
+                                    if select_list_layout_state!().has_active_indent()
+                                        && !select_list_layout_state!().is_multiline()
+                                    {
+                                        set_select_list_layout_state!(
+                                            SelectListLayoutState::Multiline {
+                                                indent: select_case_indent,
+                                                hanging_indent_spaces: None,
+                                            }
+                                        );
+                                    }
+                                    newline_with(
+                                        &mut out,
+                                        select_case_indent,
+                                        0,
+                                        &mut at_line_start,
+                                        &mut needs_space,
+                                        &mut line_indent,
+                                    );
                                 } else {
                                     newline_with(
                                         &mut out,
@@ -37355,6 +37388,136 @@ GROUP BY c.customer_id,
                 crate::db::connection::DatabaseType::MySQL,
             ),
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_test8_view_case_on_select_item_depth() {
+        let source = include_str!("../../../test_mariadb/test8.txt");
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_idx =
+            find_line_starting_with(&lines, "SELECT u.user_id,").expect("test8 view SELECT");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("test8 view CASE");
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start()
+                    == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test8 view first WHEN");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END AS spend_band")
+            .map(|(idx, _)| idx)
+            .expect("test8 view CASE END");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM cfb_user u").expect("test8 view FROM");
+
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "test8 CREATE VIEW CASE select item should stay one level deeper than the query-body SELECT header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[when_idx]),
+            leading_spaces(lines[case_idx]).saturating_add(4),
+            "test8 CREATE VIEW CASE WHEN should stay one level deeper than CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "test8 CREATE VIEW CASE END should realign with CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "test8 CREATE VIEW FROM should return to the query-body SELECT depth after CASE, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mysql_keeps_test8_view_case_on_select_item_depth() {
+        let source = include_str!("../../../test_mariadb/test8.txt");
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_idx = find_line_starting_with(&lines, "SELECT u.user_id,")
+            .expect("test8 auto-format view SELECT");
+        let case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(select_idx + 1)
+            .find(|(_, line)| line.trim_start() == "CASE")
+            .map(|(idx, _)| idx)
+            .expect("test8 auto-format view CASE");
+        let when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| {
+                line.trim_start()
+                    == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+            })
+            .map(|(idx, _)| idx)
+            .expect("test8 auto-format view first WHEN");
+        let end_idx = lines
+            .iter()
+            .enumerate()
+            .skip(when_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END AS spend_band")
+            .map(|(idx, _)| idx)
+            .expect("test8 auto-format view CASE END");
+        let from_idx =
+            find_line_starting_with(&lines, "FROM cfb_user u").expect("test8 auto-format view FROM");
+
+        assert_eq!(
+            leading_spaces(lines[case_idx]),
+            leading_spaces(lines[select_idx]).saturating_add(4),
+            "test8 auto-format CREATE VIEW CASE select item should stay one level deeper than the query-body SELECT header, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[when_idx]),
+            leading_spaces(lines[case_idx]).saturating_add(4),
+            "test8 auto-format CREATE VIEW CASE WHEN should stay one level deeper than CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[end_idx]),
+            leading_spaces(lines[case_idx]),
+            "test8 auto-format CREATE VIEW CASE END should realign with CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            leading_spaces(lines[select_idx]),
+            "test8 auto-format CREATE VIEW FROM should return to the query-body SELECT depth after CASE, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted,
+            "test8 auto-format CREATE VIEW CASE result should stay stable after reformatting"
         );
     }
 
