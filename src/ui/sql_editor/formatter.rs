@@ -809,9 +809,8 @@ impl FormatFrameStack {
         let mut retained_frames = Vec::with_capacity(self.frames.len());
         for frame in self.frames.drain(..) {
             if frame.expires_for_scope(next_scope) {
-                if let FormatFrame::ScopedIndent(frame) = &frame {
-                    *indent_level = indent_level.saturating_sub(frame.delta);
-                }
+                *indent_level =
+                    indent_level.saturating_sub(frame.indent_delta_on_expire());
                 continue;
             }
             retained_frames.push(frame);
@@ -1741,15 +1740,7 @@ impl FormatFrameStack {
                 retained_frames.push(frame);
                 continue;
             }
-            match &frame {
-                FormatFrame::Paren(paren) if paren.frame.closes_indented() => {
-                    *indent_level = indent_level.saturating_sub(paren.frame.indent_level_delta());
-                }
-                FormatFrame::ScopedIndent(frame) => {
-                    *indent_level = indent_level.saturating_sub(frame.delta);
-                }
-                _ => {}
-            }
+            *indent_level = indent_level.saturating_sub(frame.indent_delta_on_expire());
         }
         self.frames = retained_frames;
         self.paren_depth = 0;
@@ -1990,6 +1981,35 @@ impl FormatScope {
 }
 
 impl FormatFrame {
+    /// Indent delta contributed by this frame, to be reversed when the frame
+    /// is dropped outside of its own explicit pop path (e.g. scope expiry or
+    /// statement-boundary cleanup). Keeping this in one place prevents the
+    /// auxiliary-expiry and statement-cleanup loops from drifting apart if
+    /// new frame kinds with indent deltas are introduced.
+    fn indent_delta_on_expire(&self) -> usize {
+        match self {
+            FormatFrame::Paren(frame) if frame.frame.closes_indented() => {
+                frame.frame.indent_level_delta()
+            }
+            FormatFrame::ScopedIndent(frame) => frame.delta,
+            // Block frames never expire implicitly — they only leave the
+            // stack via `pop_block`, which restores `indent_level` from the
+            // surviving frame stack. A non-zero delta here would double-count
+            // during any future generalized expiry path.
+            FormatFrame::Paren(_)
+            | FormatFrame::Block(_)
+            | FormatFrame::ConstructFlag(_)
+            | FormatFrame::ConstructValue(_)
+            | FormatFrame::ConditionOwner(_)
+            | FormatFrame::BetweenPending(_)
+            | FormatFrame::TriggerHeader(_)
+            | FormatFrame::PlsqlContext(_)
+            | FormatFrame::CompoundTrigger(_)
+            | FormatFrame::WithCte(_)
+            | FormatFrame::OpenCursorRestore(_) => 0,
+        }
+    }
+
     fn expires_for_scope(&self, next_scope: FormatScope) -> bool {
         match self {
             FormatFrame::ConditionOwner(owner) => match owner.kind {
@@ -6113,6 +6133,11 @@ impl SqlEditorWidget {
         let mut idx = 0;
         let mut line_start_token_idx = 0usize;
         while idx < tokens.len() {
+            // Per-iteration invariant gate: catch any drift introduced by the
+            // previous iteration's tail before auxiliary frames are expired
+            // by `sync_to_scope`, so the offending token is easier to locate.
+            #[cfg(debug_assertions)]
+            format_stack.debug_assert_indent_level(indent_level);
             let current_token_paren_depth = token_paren_depths.get(idx).copied().unwrap_or(0);
             let current_scope = format_stack.current_scope();
             format_stack.pop_between_pending_at_or_above(FormatScope::with_frame_ids(
@@ -8436,14 +8461,30 @@ impl SqlEditorWidget {
                                 {
                                     let _ = pop_format_block(&mut format_stack, &mut indent_level);
                                 }
-                                indent_level = format_stack.statement_base_indent();
+                                // `pop_format_block` restores `indent_level` via
+                                // `expected_indent_level()` on every iteration, so by
+                                // the time the loop exits we are already at the
+                                // package body's base indent. No re-assignment needed.
+                                debug_assert_eq!(
+                                    indent_level,
+                                    format_stack.statement_base_indent(),
+                                    "indent_level drifted from statement base after popping to PACKAGE_BODY"
+                                );
                                 pending_package_member_separator = false;
                             } else if format_stack.last_block_kind_is(BlockKind::Declare) {
                                 format_stack.set_last_block_kind(BlockKind::Begin);
                             } else if format_stack.package_body_member_indent().is_some() {
                                 // Package initializer body always starts one level under
-                                // the package owner, regardless of prior member-body depth.
-                                indent_level = format_stack.statement_base_indent();
+                                // the package owner. Under the FormatFrameStack
+                                // single-source-of-truth invariant, `indent_level`
+                                // already equals `statement_base_indent()` whenever
+                                // the PACKAGE_BODY block frame is on top — verify
+                                // rather than re-assign.
+                                debug_assert_eq!(
+                                    indent_level,
+                                    format_stack.statement_base_indent(),
+                                    "indent_level drifted from PACKAGE_BODY base at initializer BEGIN"
+                                );
                             }
                             // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
                         } else {
@@ -37309,6 +37350,47 @@ mod format_frame_stack_tests {
         assert_eq!(popped_case.kind, BlockKind::Case);
         assert_eq!(stack.block_depth(), 0);
         assert_eq!(indent_level, 0);
+    }
+
+    #[test]
+    fn format_frame_stack_scope_expiry_preserves_block_indent_symmetry() {
+        // Drive a Paren → ScopedIndent → Block nesting, then pop the paren
+        // (which implicitly expires the sibling ScopedIndent via
+        // `pop_tail_auxiliary_frames_for_scope`) and finally pop the block.
+        // The terminal `indent_level` must match the pre-push baseline,
+        // proving that the generalized expire-delta path keeps every frame
+        // kind's push/pop accounting in lock-step.
+        let mut stack = FormatFrameStack::default();
+        let mut indent_level = 0usize;
+
+        stack.push_paren(
+            ParenFormatFrame::new(ParenFormatFrameKind::Compact, 0, true, 0, None),
+            ParenSemanticFlags::default(),
+            false,
+            None,
+            None,
+            None,
+            &mut indent_level,
+        );
+        let paren_indent = indent_level;
+        let inner_scope = stack.current_scope();
+        stack.push_scoped_indent(
+            ScopedIndentKind::CursorSql,
+            inner_scope,
+            1,
+            &mut indent_level,
+        );
+        assert!(indent_level > paren_indent);
+
+        // Pop the paren: this must expire the sibling ScopedIndent frame
+        // AND reverse its delta — all routed through the same
+        // `indent_delta_on_expire` path that `clear_statement_frames` uses.
+        let _ = stack.pop_paren(&mut indent_level).expect("paren frame");
+        assert_eq!(
+            indent_level, 0,
+            "paren pop must reverse both its own delta and the expired scoped-indent delta"
+        );
+        assert!(!stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
     }
 
     #[test]
