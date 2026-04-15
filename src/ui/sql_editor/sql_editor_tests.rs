@@ -1023,6 +1023,29 @@ fn format_sql_basic_no_cache_is_idempotent_for_mariadb_test2_and_test3() {
 }
 
 #[test]
+fn format_sql_cache_and_no_cache_match_for_mariadb_final_boss_v3() {
+    let input = load_mariadb_test_file("test6.txt");
+    assert!(
+        !input.is_empty(),
+        "test_mariadb/test6.txt should not be empty"
+    );
+
+    let cached = SqlEditorWidget::format_sql_basic_for_db_type(
+        &input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+    let uncached = SqlEditorWidget::format_sql_basic_no_cache_for_db_type(
+        &input,
+        crate::db::connection::DatabaseType::MySQL,
+    );
+
+    assert_eq!(
+        cached, uncached,
+        "cache and no-cache formatting should match for test_mariadb/test6.txt"
+    );
+}
+
+#[test]
 fn format_sql_preserves_mariadb_final_boss_v2_script() {
     let input = load_mariadb_test_file("test4.txt");
     assert!(
@@ -8014,6 +8037,23 @@ fn format_sql_oracle_ultimate_boss_idempotent() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for oracle_format_ultimate_boss.sql"
+    );
+}
+
+#[test]
+fn format_sql_cache_and_no_cache_match_for_oracle_ultimate_boss() {
+    let input = load_test_file("oracle_format_ultimate_boss.sql");
+    assert!(
+        !input.is_empty(),
+        "Test file oracle_format_ultimate_boss.sql should not be empty"
+    );
+
+    let cached = SqlEditorWidget::format_sql_basic(&input);
+    let uncached = SqlEditorWidget::format_sql_basic_no_cache(&input);
+
+    assert_eq!(
+        cached, uncached,
+        "cache and no-cache formatting should match for oracle_format_ultimate_boss.sql"
     );
 }
 
