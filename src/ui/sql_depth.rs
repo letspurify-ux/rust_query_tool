@@ -75,6 +75,7 @@ pub(crate) fn is_top_level_depth(depths: &[usize], idx: usize) -> bool {
 
 /// Returns true when a token is at a specific depth.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn is_depth(depths: &[usize], idx: usize, depth: usize) -> bool {
     depth_at(depths, idx) == depth
 }

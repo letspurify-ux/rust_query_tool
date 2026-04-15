@@ -5771,6 +5771,57 @@ fn line_trailing_identifiers_before_inline_comment(
     max_identifiers: usize,
 ) -> (Option<u8>, Vec<&str>) {
     let bytes = line.as_bytes();
+    let fast_path_safe = !bytes
+        .iter()
+        .any(|byte| matches!(*byte, b'\'' | b'"' | b'`' | b'#' | b'-' | b'/'));
+    if fast_path_safe {
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return (None, Vec::new());
+        }
+
+        let last_significant_byte = Some(bytes[end - 1]);
+        let mut trailing_identifiers = Vec::with_capacity(max_identifiers);
+        let mut idx = end;
+
+        while idx > 0 {
+            while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
+                idx -= 1;
+            }
+            if idx == 0 {
+                break;
+            }
+
+            if is_identifier_byte(bytes[idx - 1]) {
+                let token_end = idx;
+                while idx > 0 && is_identifier_byte(bytes[idx - 1]) {
+                    idx -= 1;
+                }
+                if !is_identifier_start_byte(bytes[idx]) {
+                    continue;
+                }
+
+                if max_identifiers > 0 {
+                    if let Some(token) = line.get(idx..token_end) {
+                        trailing_identifiers.push(token);
+                    }
+                    if trailing_identifiers.len() == max_identifiers {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            idx -= 1;
+        }
+
+        trailing_identifiers.reverse();
+        return (last_significant_byte, trailing_identifiers);
+    }
+
     let mut idx = 0usize;
     let mut in_single_quote = false;
     let mut in_double_quote = false;

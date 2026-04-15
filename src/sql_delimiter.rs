@@ -43,11 +43,12 @@ impl DelimiterLineStartSnapshot {
         self.baseline_depth
     }
 
-    fn into_state(self) -> DelimiterFrameState {
+    pub(crate) fn frame_state(&self) -> DelimiterFrameState {
         DelimiterFrameState {
-            stack: self.visible_frames,
+            stack: self.visible_frames.clone(),
         }
     }
+
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -67,6 +68,18 @@ impl DelimiterFrameState {
         };
 
         self.apply_symbol_strict(symbol);
+    }
+
+    pub(crate) fn apply_token_with_close_detection(
+        &mut self,
+        token: &SqlToken,
+        baseline_depth: usize,
+    ) -> bool {
+        let SqlToken::Symbol(symbol) = token else {
+            return false;
+        };
+
+        self.apply_symbol_with_close_detection(symbol, baseline_depth)
     }
 
     pub(crate) fn line_start_snapshot(&self, baseline_depth: usize) -> DelimiterLineStartSnapshot {
@@ -152,18 +165,14 @@ pub(crate) fn line_closes_delimiter_frame_below_snapshot_before_token(
         return false;
     }
 
-    let mut frame_state = line_start_snapshot.clone().into_state();
+    let mut frame_state = line_start_snapshot.frame_state();
     for token in tokens
         .iter()
         .skip(line_start_idx)
         .take(token_idx.saturating_sub(line_start_idx))
     {
-        let SqlToken::Symbol(symbol) = token else {
-            continue;
-        };
-
         if frame_state
-            .apply_symbol_with_close_detection(symbol, line_start_snapshot.baseline_depth())
+            .apply_token_with_close_detection(token, line_start_snapshot.baseline_depth())
         {
             return true;
         }
