@@ -5665,6 +5665,186 @@ impl SqlEditorWidget {
         None
     }
 
+    fn build_statement_token_metadata(
+        tokens: &[SqlToken],
+    ) -> (
+        MeaningfulTokenLinks,
+        StatementWordLinks,
+        Vec<Option<usize>>,
+        Vec<usize>,
+        Vec<Option<ParenBodyAnalysis>>,
+        Vec<bool>,
+    ) {
+        #[derive(Clone, Copy, Default)]
+        struct ParenBodyScanState {
+            nested_depth: usize,
+            has_top_level_comma: bool,
+            contains_query_like_child: bool,
+            contains_analytic_clause_owner_child: bool,
+            saw_within: bool,
+        }
+
+        let mut prev_meaningful = vec![None; tokens.len()];
+        let mut next_meaningful = vec![None; tokens.len()];
+        let mut prev_word = vec![None; tokens.len()];
+        let mut last_meaningful_idx: Option<usize> = None;
+        let mut last_word_idx: Option<usize> = None;
+        let mut matching_paren_close_indices = vec![None; tokens.len()];
+        let mut token_depths = Vec::with_capacity(tokens.len());
+        let mut paren_body_analyses: Vec<Option<ParenBodyAnalysis>> = vec![None; tokens.len()];
+        let mut open_paren_stack: Vec<(usize, ParenBodyScanState)> = Vec::new();
+        let mut token_paren_depth = 0usize;
+        let mut latest_into_at_depth: Vec<Option<usize>> = Vec::new();
+        let mut fetch_into_has_multiple_targets = vec![false; tokens.len()];
+
+        for (idx, token) in tokens.iter().enumerate() {
+            prev_meaningful[idx] = last_meaningful_idx;
+            prev_word[idx] = last_word_idx;
+
+            let is_meaningful = !matches!(token, SqlToken::Comment(_));
+            if is_meaningful {
+                if let Some(last_idx) = last_meaningful_idx {
+                    next_meaningful[last_idx] = Some(idx);
+                }
+                last_meaningful_idx = Some(idx);
+
+                if matches!(token, SqlToken::Word(_)) {
+                    last_word_idx = Some(idx);
+                }
+            }
+
+            token_depths.push(token_paren_depth);
+
+            if latest_into_at_depth.len() <= token_paren_depth {
+                latest_into_at_depth.resize_with(token_paren_depth + 1, || None);
+            }
+
+            match token {
+                SqlToken::Word(word) => {
+                    if word.eq_ignore_ascii_case("INTO") {
+                        latest_into_at_depth[token_paren_depth] = Some(idx);
+                    } else if word.eq_ignore_ascii_case("LIMIT")
+                        || word.eq_ignore_ascii_case("BULK")
+                        || word.eq_ignore_ascii_case("FROM")
+                        || word.eq_ignore_ascii_case("WHERE")
+                    {
+                        latest_into_at_depth[token_paren_depth] = None;
+                    }
+
+                    for (_, state) in &mut open_paren_stack {
+                        if word.eq_ignore_ascii_case("CASE")
+                            || crate::sql_text::is_subquery_head_keyword(word)
+                        {
+                            state.contains_query_like_child = true;
+                        }
+                        if word.eq_ignore_ascii_case("OVER") || word.eq_ignore_ascii_case("KEEP") {
+                            state.contains_analytic_clause_owner_child = true;
+                        }
+
+                        if word.eq_ignore_ascii_case("WITHIN") {
+                            state.saw_within = true;
+                        } else if state.saw_within && word.eq_ignore_ascii_case("GROUP") {
+                            state.contains_analytic_clause_owner_child = true;
+                            state.saw_within = false;
+                        } else {
+                            state.saw_within = false;
+                        }
+                    }
+                }
+                SqlToken::Symbol(symbol) if symbol == "(" => {
+                    for (_, state) in &mut open_paren_stack {
+                        state.nested_depth = state.nested_depth.saturating_add(1);
+                        state.saw_within = false;
+                    }
+
+                    open_paren_stack.push((idx, ParenBodyScanState::default()));
+                    token_paren_depth = token_paren_depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    if let Some((open_idx, state)) = open_paren_stack.pop() {
+                        matching_paren_close_indices[open_idx] = Some(idx);
+                        paren_body_analyses[open_idx] = Some(ParenBodyAnalysis {
+                            contains_query_like_child: state.contains_query_like_child,
+                            contains_analytic_clause_owner_child:
+                                state.contains_analytic_clause_owner_child,
+                            has_top_level_comma: state.has_top_level_comma,
+                        });
+                    }
+
+                    for (_, state) in &mut open_paren_stack {
+                        state.nested_depth = state.nested_depth.saturating_sub(1);
+                        state.saw_within = false;
+                    }
+
+                    if token_paren_depth < latest_into_at_depth.len() {
+                        latest_into_at_depth[token_paren_depth] = None;
+                    }
+                    token_paren_depth = token_paren_depth.saturating_sub(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == "," => {
+                    if let Some(into_idx) = latest_into_at_depth[token_paren_depth] {
+                        if into_idx < fetch_into_has_multiple_targets.len() {
+                            fetch_into_has_multiple_targets[into_idx] = true;
+                        }
+                    }
+
+                    for (_, state) in &mut open_paren_stack {
+                        if state.nested_depth == 0 {
+                            state.has_top_level_comma = true;
+                            state.saw_within = false;
+                        }
+                    }
+                }
+                SqlToken::Symbol(symbol) if symbol == ";" => {
+                    latest_into_at_depth[token_paren_depth] = None;
+                }
+                SqlToken::Comment(_) => {}
+                _ => {
+                    for (_, state) in &mut open_paren_stack {
+                        state.saw_within = false;
+                    }
+                }
+            }
+        }
+
+        (
+            MeaningfulTokenLinks {
+                prev: prev_meaningful,
+                next: next_meaningful,
+            },
+            StatementWordLinks {
+                prev_word_in_statement: prev_word,
+            },
+            matching_paren_close_indices,
+            token_depths,
+            paren_body_analyses,
+            fetch_into_has_multiple_targets,
+        )
+    }
+
+    fn build_meaningful_token_links(tokens: &[SqlToken]) -> MeaningfulTokenLinks {
+        Self::build_statement_token_metadata(tokens).0
+    }
+
+    fn build_statement_word_links(tokens: &[SqlToken]) -> StatementWordLinks {
+        Self::build_statement_token_metadata(tokens).1
+    }
+
+    fn build_matching_paren_close_indices_and_depths_and_body_analysis(
+        tokens: &[SqlToken],
+    ) -> (
+        Vec<Option<usize>>,
+        Vec<usize>,
+        Vec<Option<ParenBodyAnalysis>>,
+    ) {
+        let metadata = Self::build_statement_token_metadata(tokens);
+        (metadata.2, metadata.3, metadata.4)
+    }
+
+    fn build_fetch_into_has_multiple_targets(tokens: &[SqlToken]) -> Vec<bool> {
+        Self::build_statement_token_metadata(tokens).5
+    }
+
     fn mysql_identifier_left_boundary_symbol(sym: &str) -> bool {
         matches!(
             sym,
@@ -6007,23 +6187,48 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         idx: usize,
         current_clause: Option<&str>,
-        _meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
     ) -> bool {
         let Some(SqlToken::Word(word)) = tokens.get(idx) else {
             return false;
         };
         let upper = word.to_ascii_uppercase();
-        let mut token_lookahead = FormatterTokenLookahead::new(tokens);
-        let mut token_context = FormatterTokenContext::default();
-        for current_idx in 0..=idx {
-            token_context = token_lookahead.context(current_idx);
-            token_lookahead.advance(current_idx);
+        let prev_token = meaningful_token_links
+            .and_then(|links| links.prev_index(idx))
+            .and_then(|token_idx| tokens.get(token_idx))
+            .or_else(|| {
+                tokens[..idx]
+                    .iter()
+                    .rev()
+                    .find(|token| !matches!(token, SqlToken::Comment(_)))
+            });
+        let next_token = meaningful_token_links
+            .and_then(|links| links.next_index(idx))
+            .and_then(|token_idx| tokens.get(token_idx))
+            .or_else(|| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .skip(idx.saturating_add(1))
+                    .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+                    .and_then(|(_, token)| Some(token))
+            });
+        let mut next_words = [None; 3];
+        let mut word_slot = 0usize;
+        let mut word_idx = idx;
+        while word_slot < 3 {
+            let Some(next_meaningful_idx) = meaningful_token_links
+                .and_then(|links| links.next_index(word_idx))
+                .or_else(|| Self::next_meaningful_token_index(tokens, word_idx))
+            else {
+                break;
+            };
+            if let Some(SqlToken::Word(word)) = tokens.get(next_meaningful_idx) {
+                next_words[word_slot] = Some(word.as_str());
+                word_slot += 1;
+            }
+            word_idx = next_meaningful_idx.saturating_add(1);
         }
-        let prev_token = token_context
-            .prev_non_comment_idx()
-            .and_then(|token_idx| tokens.get(token_idx));
-        let next_token = token_context.next_non_comment_token();
-        let next_words = token_context.next_words(tokens);
 
         Self::formatter_keyword_should_render_as_identifier_from_context(
             upper.as_str(),
@@ -6039,23 +6244,48 @@ impl SqlEditorWidget {
         idx: usize,
         current_clause: Option<&str>,
         on_duplicate_key_update_active: bool,
-        _meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
     ) -> bool {
         let Some(SqlToken::Word(word)) = tokens.get(idx) else {
             return false;
         };
         let upper = word.to_ascii_uppercase();
-        let mut token_lookahead = FormatterTokenLookahead::new(tokens);
-        let mut token_context = FormatterTokenContext::default();
-        for current_idx in 0..=idx {
-            token_context = token_lookahead.context(current_idx);
-            token_lookahead.advance(current_idx);
+        let prev_token = meaningful_token_links
+            .and_then(|links| links.prev_index(idx))
+            .and_then(|token_idx| tokens.get(token_idx))
+            .or_else(|| {
+                tokens[..idx]
+                    .iter()
+                    .rev()
+                    .find(|token| !matches!(token, SqlToken::Comment(_)))
+            });
+        let next_token = meaningful_token_links
+            .and_then(|links| links.next_index(idx))
+            .and_then(|token_idx| tokens.get(token_idx))
+            .or_else(|| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .skip(idx.saturating_add(1))
+                    .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+                    .and_then(|(_, token)| Some(token))
+            });
+        let mut next_words = [None; 3];
+        let mut word_slot = 0usize;
+        let mut word_idx = idx;
+        while word_slot < 3 {
+            let Some(next_meaningful_idx) = meaningful_token_links
+                .and_then(|links| links.next_index(word_idx))
+                .or_else(|| Self::next_meaningful_token_index(tokens, word_idx))
+            else {
+                break;
+            };
+            if let Some(SqlToken::Word(word)) = tokens.get(next_meaningful_idx) {
+                next_words[word_slot] = Some(word.as_str());
+                word_slot += 1;
+            }
+            word_idx = next_meaningful_idx.saturating_add(1);
         }
-        let prev_token = token_context
-            .prev_non_comment_idx()
-            .and_then(|token_idx| tokens.get(token_idx));
-        let next_token = token_context.next_non_comment_token();
-        let next_words = token_context.next_words(tokens);
 
         Self::mysql_keyword_should_render_as_identifier_from_context(
             word,
@@ -7563,6 +7793,14 @@ impl SqlEditorWidget {
                                                             // LOOP is handled separately for FOR ... LOOP on same line
         let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
         let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
+        let (
+            meaningful_token_links,
+            _statement_word_links,
+            matching_paren_close_indices,
+            _token_depths,
+            paren_body_analyses,
+            fetch_into_has_multiple_targets,
+        ) = Self::build_statement_token_metadata(tokens);
 
         let mut out = String::with_capacity(
             statement
@@ -8027,7 +8265,12 @@ impl SqlEditorWidget {
                         );
                     let is_analytic_within_group = upper == "GROUP"
                         && matches!(prev_word_upper, Some("WITHIN"))
-                        && Self::within_group_is_analytic(tokens, idx);
+                        && Self::within_group_is_analytic(
+                            tokens,
+                            idx,
+                            Some(&meaningful_token_links),
+                            Some(&matching_paren_close_indices),
+                        );
                     let is_within_group = upper == "GROUP"
                         && matches!(prev_word_upper, Some("WITHIN"))
                         && !is_analytic_within_group;
@@ -8591,7 +8834,7 @@ impl SqlEditorWidget {
                             current_scope,
                             format_stack.trigger_header_is_active(),
                             is_analytic_within_group,
-                            !Self::fetch_into_has_multiple_targets(tokens, idx),
+                            !fetch_into_has_multiple_targets[idx],
                             format_stack.in_analytic_over_paren(),
                             format_stack.in_keep_paren(),
                             &recent_statement_word_indices,
@@ -11847,8 +12090,12 @@ impl SqlEditorWidget {
                                         && matches!(prev_word_upper, Some("AS")))
                                     .then_some(FormatIndentedParenOwnerKind::Window)
                                 });
-                            let paren_body_analysis =
-                                Self::analyze_paren_body(tokens, idx, None);
+                            let paren_body_analysis = Self::analyze_paren_body(
+                                tokens,
+                                idx,
+                                Some(&matching_paren_close_indices),
+                                Some(&paren_body_analyses),
+                            );
                             let body_contains_query_like_child = direct_wraps_subquery_or_case_head
                                 || paren_body_analysis.contains_query_like_child;
                             let wraps_subquery_or_case_head =
@@ -12939,7 +13186,15 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         open_idx: usize,
         matching_paren_close_indices: Option<&[Option<usize>]>,
+        paren_body_analysis: Option<&[Option<ParenBodyAnalysis>]>,
     ) -> ParenBodyAnalysis {
+        if let Some(cached) = paren_body_analysis
+            .and_then(|cache| cache.get(open_idx))
+            .and_then(Option::as_ref)
+        {
+            return *cached;
+        }
+
         if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
             return ParenBodyAnalysis::default();
         }
@@ -13689,7 +13944,7 @@ impl SqlEditorWidget {
         open_idx: usize,
         matching_paren_close_indices: Option<&[Option<usize>]>,
     ) -> bool {
-        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices)
+        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices, None)
             .contains_query_like_child
     }
 
@@ -13698,7 +13953,7 @@ impl SqlEditorWidget {
         open_idx: usize,
         matching_paren_close_indices: Option<&[Option<usize>]>,
     ) -> bool {
-        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices)
+        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices, None)
             .contains_analytic_clause_owner_child
     }
 
@@ -13707,22 +13962,35 @@ impl SqlEditorWidget {
         open_idx: usize,
         matching_paren_close_indices: Option<&[Option<usize>]>,
     ) -> bool {
-        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices)
+        Self::analyze_paren_body(tokens, open_idx, matching_paren_close_indices, None)
             .has_top_level_comma
     }
 
-    fn within_group_is_analytic(tokens: &[SqlToken], group_idx: usize) -> bool {
-        let Some(open_idx) = Self::next_meaningful_token_index(tokens, group_idx) else {
+    fn within_group_is_analytic(
+        tokens: &[SqlToken],
+        group_idx: usize,
+        meaningful_token_links: Option<&MeaningfulTokenLinks>,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+    ) -> bool {
+        let Some(open_idx) = meaningful_token_links
+            .and_then(|links| links.next_index(group_idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, group_idx))
+        else {
             return false;
         };
         if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
             return false;
         }
-        let Some(close_idx) = Self::matching_close_paren_index(tokens, open_idx, None) else {
+        let Some(close_idx) = Self::matching_close_paren_index(
+            tokens,
+            open_idx,
+            matching_paren_close_indices,
+        ) else {
             return false;
         };
         matches!(
-            Self::next_meaningful_token_index(tokens, close_idx).and_then(|idx| tokens.get(idx)),
+            Self::next_meaningful_token_index_with_links(tokens, close_idx, meaningful_token_links)
+                .and_then(|idx| tokens.get(idx)),
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OVER")
         )
     }
