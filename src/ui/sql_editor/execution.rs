@@ -336,20 +336,9 @@ impl SqlEditorWidget {
                 let deleted_len = end.saturating_sub(start) as usize;
                 let mut editor = self.editor.clone();
                 let original_pos = editor.insert_position().clamp(0, buffer_len) as usize;
-                let original_within_selection = (original_pos as isize - start_usize as isize)
-                    .clamp(0, source.len() as isize)
-                    as i32;
-                let mapped_within_selection = Self::map_cursor_after_format_with_policy_for_db_type(
-                    &source,
-                    &formatted,
-                    original_within_selection,
-                    true,
-                    preferred_db_type,
-                );
                 let selection_end =
                     start_usize + Self::clamp_to_char_boundary(&formatted, formatted.len());
-                let mapped_cursor = start_usize
-                    + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
+                let mapped_cursor = selection_end;
 
                 let _suppress_callbacks = self.suppress_buffer_callbacks();
                 buffer.replace(start, end, &formatted);
@@ -386,13 +375,7 @@ impl SqlEditorWidget {
 
         let mut editor = self.editor.clone();
         let original_pos = Self::normalize_index(&full_text, editor.insert_position());
-        let mapped_cursor = Self::map_cursor_after_format_with_policy_for_db_type(
-            &full_text,
-            &formatted,
-            original_pos as i32,
-            false,
-            preferred_db_type,
-        ) as usize;
+        let mapped_cursor = Self::clamp_to_char_boundary(&formatted, formatted.len());
 
         let _suppress_callbacks = self.suppress_buffer_callbacks();
         buffer.set_text(&formatted);
