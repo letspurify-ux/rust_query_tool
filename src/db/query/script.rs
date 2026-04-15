@@ -3941,26 +3941,27 @@ impl QueryExecutor {
                 ));
             }
 
-            let opens_split_control_body = context
-                .condition_header_terminator
-                .is_some_and(|terminator| match terminator {
-                    AutoFormatConditionTerminator::Then => {
-                        sql_text::line_ends_with_identifier_sequence_before_inline_comment(
-                            trimmed,
-                            &["THEN"],
-                        )
-                    }
-                    AutoFormatConditionTerminator::Loop => {
-                        sql_text::line_ends_with_identifier_sequence_before_inline_comment(
-                            trimmed,
-                            &["LOOP"],
-                        ) || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
-                            trimmed,
-                            &["DO"],
-                        )
-                    }
-                })
-                && active_merge_branch_header.is_none();
+            let opens_split_control_body =
+                context
+                    .condition_header_terminator
+                    .is_some_and(|terminator| match terminator {
+                        AutoFormatConditionTerminator::Then => {
+                            sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                                trimmed,
+                                &["THEN"],
+                            )
+                        }
+                        AutoFormatConditionTerminator::Loop => {
+                            sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                                trimmed,
+                                &["LOOP"],
+                            ) || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                                trimmed,
+                                &["DO"],
+                            )
+                        }
+                    })
+                    && active_merge_branch_header.is_none();
             pending_control_branch_body_frame =
                 (!sql_text::line_ends_with_semicolon_before_inline_comment(trimmed)
                     && (opens_split_control_body

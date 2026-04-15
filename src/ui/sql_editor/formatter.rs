@@ -1405,11 +1405,18 @@ impl ActiveParenMetrics {
 
 #[derive(Clone, Default)]
 struct FormatRuntimeState {
+    query_base_depth: Option<usize>,
     current_clause: Option<String>,
     select_list_layout_state: SelectListLayoutState,
     statement_has_with_clause: bool,
     query_body_clause_base_depth: Option<usize>,
     open_cursor_state: OpenCursorFormatState,
+}
+
+#[derive(Clone)]
+struct QueryRuntimeFrame {
+    scope: FormatScope,
+    state: FormatRuntimeState,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1425,11 +1432,8 @@ struct ParenStackFrame {
     id: SqlFormatFrameId,
     frame: ParenFormatFrame,
     semantic_flags: ParenSemanticFlags,
-    runtime_state_snapshot: Option<FormatRuntimeState>,
-    applied_query_base_depth: Option<usize>,
     previous_active_paren_metrics: ActiveParenMetrics,
     previous_paren_frame_id: Option<SqlFormatFrameId>,
-    previous_query_base_depth: Option<Option<usize>>,
     wrapped_owner_kind: Option<FormatIndentedParenOwnerKind>,
     open_cursor_restore_state: Option<OpenCursorFormatState>,
 }
@@ -1538,6 +1542,7 @@ struct ScopedIndentFrame {
 enum FormatFrame {
     Paren(Box<ParenStackFrame>),
     Block(BlockStackFrame),
+    QueryRuntime(QueryRuntimeFrame),
     ScopedIndent(ScopedIndentFrame),
     ConstructFlag(ConstructFlagFrame),
     ConstructValue(ConstructValueFrame),
@@ -1628,6 +1633,7 @@ impl ParenSemanticFlagCounts {
 struct FrameIndexCache {
     paren_indices: Vec<usize>,
     block_indices: Vec<usize>,
+    query_runtime_indices: Vec<usize>,
     block_kind_indices: [Vec<usize>; BLOCK_KIND_COUNT],
     paren_semantic_counts: ParenSemanticFlagCounts,
     condition_owner_indices: [Vec<usize>; CONDITION_OWNER_KIND_COUNT],
@@ -1648,6 +1654,7 @@ impl Default for FrameIndexCache {
         Self {
             paren_indices: Vec::new(),
             block_indices: Vec::new(),
+            query_runtime_indices: Vec::new(),
             block_kind_indices: std::array::from_fn(|_| Vec::new()),
             paren_semantic_counts: ParenSemanticFlagCounts::default(),
             condition_owner_indices: std::array::from_fn(|_| Vec::new()),
@@ -1666,10 +1673,6 @@ impl Default for FrameIndexCache {
 }
 
 impl FrameIndexCache {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
     fn push(&mut self, frame: &FormatFrame, idx: usize) {
         match frame {
             FormatFrame::Paren(frame) => {
@@ -1679,6 +1682,9 @@ impl FrameIndexCache {
             FormatFrame::Block(frame) => {
                 self.block_indices.push(idx);
                 self.block_kind_indices[frame.kind.index()].push(idx);
+            }
+            FormatFrame::QueryRuntime(_) => {
+                self.query_runtime_indices.push(idx);
             }
             FormatFrame::ScopedIndent(frame) => {
                 self.scoped_indent_indices[frame.kind.index()].push(idx);
@@ -1727,6 +1733,9 @@ impl FrameIndexCache {
                 let _ = self.block_indices.pop();
                 let _ = self.block_kind_indices[frame.kind.index()].pop();
             }
+            FormatFrame::QueryRuntime(_) => {
+                let _ = self.query_runtime_indices.pop();
+            }
             FormatFrame::ScopedIndent(frame) => {
                 let _ = self.scoped_indent_indices[frame.kind.index()].pop();
             }
@@ -1764,95 +1773,9 @@ impl FrameIndexCache {
         }
     }
 
-    fn remove(&mut self, frame: &FormatFrame, idx: usize) {
-        match frame {
-            FormatFrame::Paren(frame) => {
-                Self::remove_index(&mut self.paren_indices, idx);
-                self.paren_semantic_counts.pop(frame.semantic_flags);
-            }
-            FormatFrame::Block(frame) => {
-                Self::remove_index(&mut self.block_indices, idx);
-                Self::remove_index(&mut self.block_kind_indices[frame.kind.index()], idx);
-            }
-            FormatFrame::ScopedIndent(frame) => {
-                Self::remove_index(&mut self.scoped_indent_indices[frame.kind.index()], idx);
-            }
-            FormatFrame::ConstructFlag(frame) => {
-                Self::remove_index(&mut self.construct_flag_indices[frame.kind.index()], idx);
-            }
-            FormatFrame::ConstructValue(frame) => {
-                Self::remove_index(&mut self.construct_value_indices[frame.kind.index()], idx);
-            }
-            FormatFrame::ConditionOwner(frame) => {
-                Self::remove_index(&mut self.condition_owner_indices[frame.kind.index()], idx);
-            }
-            FormatFrame::BetweenPending(_) | FormatFrame::OpenCursorRestore(_) => {}
-            FormatFrame::PendingSplitEndSuffix(_) => {
-                Self::remove_index(&mut self.pending_split_end_suffix_indices, idx);
-            }
-            FormatFrame::PendingPlsqlLabel(_) => {
-                Self::remove_index(&mut self.pending_plsql_label_indices, idx);
-            }
-            FormatFrame::MySqlHandlerPendingBodyIndent(_) => {
-                Self::remove_index(&mut self.mysql_handler_pending_body_indent_indices, idx);
-            }
-            FormatFrame::TriggerHeader(_) => {
-                Self::remove_index(&mut self.trigger_header_indices, idx);
-            }
-            FormatFrame::PlsqlContext(_) => {
-                Self::remove_index(&mut self.plsql_context_indices, idx);
-            }
-            FormatFrame::CompoundTrigger(_) => {
-                Self::remove_index(&mut self.compound_trigger_indices, idx);
-            }
-            FormatFrame::WithCte(_) => {
-                Self::remove_index(&mut self.with_cte_indices, idx);
-            }
-        }
-        self.shift_indices_after_removal(idx);
-    }
-
     fn remove_index(indices: &mut Vec<usize>, idx: usize) {
         if let Some(position) = indices.iter().rposition(|stored| *stored == idx) {
             let _ = indices.remove(position);
-        }
-    }
-
-    fn shift_indices_after_removal(&mut self, removed_idx: usize) {
-        Self::shift_indices(&mut self.paren_indices, removed_idx);
-        Self::shift_indices(&mut self.block_indices, removed_idx);
-        for indices in &mut self.block_kind_indices {
-            Self::shift_indices(indices, removed_idx);
-        }
-        for indices in &mut self.condition_owner_indices {
-            Self::shift_indices(indices, removed_idx);
-        }
-        for indices in &mut self.construct_flag_indices {
-            Self::shift_indices(indices, removed_idx);
-        }
-        for indices in &mut self.construct_value_indices {
-            Self::shift_indices(indices, removed_idx);
-        }
-        for indices in &mut self.scoped_indent_indices {
-            Self::shift_indices(indices, removed_idx);
-        }
-        Self::shift_indices(&mut self.pending_split_end_suffix_indices, removed_idx);
-        Self::shift_indices(&mut self.pending_plsql_label_indices, removed_idx);
-        Self::shift_indices(
-            &mut self.mysql_handler_pending_body_indent_indices,
-            removed_idx,
-        );
-        Self::shift_indices(&mut self.trigger_header_indices, removed_idx);
-        Self::shift_indices(&mut self.plsql_context_indices, removed_idx);
-        Self::shift_indices(&mut self.compound_trigger_indices, removed_idx);
-        Self::shift_indices(&mut self.with_cte_indices, removed_idx);
-    }
-
-    fn shift_indices(indices: &mut [usize], removed_idx: usize) {
-        for stored in indices.iter_mut() {
-            if *stored > removed_idx {
-                *stored = stored.saturating_sub(1);
-            }
         }
     }
 }
@@ -1866,21 +1789,12 @@ struct FormatFrameStack {
     active_paren_metrics: ActiveParenMetrics,
     current_paren_frame_id: Option<SqlFormatFrameId>,
     current_block_frame_id: Option<SqlFormatFrameId>,
-    current_query_base_depth: Option<usize>,
-    runtime_state: FormatRuntimeState,
     frame_id_allocator: SqlFormatFrameIdAllocator,
     #[cfg(test)]
     transition_trace: Vec<FormatFrameTransitionEvent>,
 }
 
 impl FormatFrameStack {
-    fn rebuild_frame_index_cache(&mut self) {
-        self.frame_index_cache.clear();
-        for (idx, frame) in self.frames.iter().enumerate() {
-            self.frame_index_cache.push(frame, idx);
-        }
-    }
-
     #[cfg(test)]
     fn record_transition(
         &mut self,
@@ -1924,98 +1838,33 @@ impl FormatFrameStack {
         }
     }
 
-    fn remove_frame_at_unchecked(&mut self, idx: usize) -> Option<FormatFrame> {
-        if idx >= self.frames.len() {
-            return None;
-        }
-        let frame = self.frames.remove(idx);
-        self.frame_index_cache.remove(&frame, idx);
-        Some(frame)
-    }
-
-    fn remove_indexed_auxiliary_frame_at(&mut self, idx: usize) -> Option<FormatFrame> {
-        let frame = self.frames.get(idx)?;
-        debug_assert!(
-            matches!(
-                frame,
-                FormatFrame::ConstructFlag(_)
-                    | FormatFrame::ConstructValue(_)
-                    | FormatFrame::PendingSplitEndSuffix(_)
-                    | FormatFrame::PendingPlsqlLabel(_)
-                    | FormatFrame::MySqlHandlerPendingBodyIndent(_)
-            ),
-            "indexed auxiliary removal must not be used for structural or indent-bearing frames"
-        );
-        self.remove_frame_at_unchecked(idx)
-    }
-
-    fn remove_scoped_indent_frame_at(&mut self, idx: usize) -> Option<ScopedIndentFrame> {
-        let frame = self.frames.get(idx)?;
-        debug_assert!(
-            matches!(frame, FormatFrame::ScopedIndent(_)),
-            "scoped-indent removal must only target scoped-indent frames"
-        );
-        match self.remove_frame_at_unchecked(idx) {
-            Some(FormatFrame::ScopedIndent(frame)) => Some(frame),
-            _ => None,
-        }
-    }
-
-    fn remove_auxiliary_frames_matching(
-        &mut self,
-        mut should_remove: impl FnMut(&FormatFrame) -> bool,
-    ) -> usize {
-        let indices: Vec<usize> = self
-            .frames
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, frame)| should_remove(frame).then_some(idx))
-            .collect();
-        let mut removed = 0usize;
-        for idx in indices.into_iter().rev() {
-            if self.remove_indexed_auxiliary_frame_at(idx).is_some() {
-                removed = removed.saturating_add(1);
+    fn push_existing_frame(&mut self, frame: FormatFrame) {
+        match &frame {
+            FormatFrame::Paren(frame) => {
+                self.active_paren_metrics = self.active_paren_metrics.after_push(frame.frame);
+                self.paren_depth = self.paren_depth.saturating_add(1);
+                self.current_paren_frame_id = Some(frame.id);
             }
+            FormatFrame::Block(frame) => {
+                self.block_depth = self.block_depth.saturating_add(1);
+                self.current_block_frame_id = Some(frame.id);
+            }
+            FormatFrame::QueryRuntime(_)
+            | FormatFrame::ScopedIndent(_)
+            | FormatFrame::ConstructFlag(_)
+            | FormatFrame::ConstructValue(_)
+            | FormatFrame::ConditionOwner(_)
+            | FormatFrame::BetweenPending(_)
+            | FormatFrame::PendingSplitEndSuffix(_)
+            | FormatFrame::PendingPlsqlLabel(_)
+            | FormatFrame::MySqlHandlerPendingBodyIndent(_)
+            | FormatFrame::TriggerHeader(_)
+            | FormatFrame::PlsqlContext(_)
+            | FormatFrame::CompoundTrigger(_)
+            | FormatFrame::WithCte(_)
+            | FormatFrame::OpenCursorRestore(_) => {}
         }
-        removed
-    }
-
-    fn rebuild_structural_state_from_frames(&mut self) {
-        self.paren_depth = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Paren(_)))
-            .count();
-        self.block_depth = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Block(_)))
-            .count();
-        self.active_paren_metrics = self.frames.iter().fold(
-            ActiveParenMetrics::default(),
-            |metrics, frame| match frame {
-                FormatFrame::Paren(frame) => metrics.after_push(frame.frame),
-                _ => metrics,
-            },
-        );
-        self.current_paren_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => Some(frame.id),
-            _ => None,
-        });
-        self.current_block_frame_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.id),
-            _ => None,
-        });
-        self.current_query_base_depth = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => frame.applied_query_base_depth,
-            _ => None,
-        });
-        self.rebuild_frame_index_cache();
-    }
-
-    fn retain_frames_matching(&mut self, mut should_keep: impl FnMut(&FormatFrame) -> bool) {
-        self.frames.retain(|frame| should_keep(frame));
-        self.rebuild_structural_state_from_frames();
+        self.push_frame(frame);
     }
 
     fn pop_tail_frame(&mut self) -> Option<FormatFrame> {
@@ -2026,9 +1875,6 @@ impl FormatFrameStack {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
                 self.active_paren_metrics = frame.previous_active_paren_metrics;
                 self.current_paren_frame_id = frame.previous_paren_frame_id;
-                if let Some(previous_query_base_depth) = frame.previous_query_base_depth {
-                    self.current_query_base_depth = previous_query_base_depth;
-                }
             }
             FormatFrame::Block(frame) => {
                 self.block_depth = self.block_depth.saturating_sub(1);
@@ -2037,6 +1883,111 @@ impl FormatFrameStack {
             _ => {}
         }
         Some(frame)
+    }
+
+    fn pop_tail_frame_adjust_indent(&mut self, indent_level: &mut usize) -> Option<FormatFrame> {
+        let frame = self.pop_tail_frame()?;
+        match &frame {
+            FormatFrame::Paren(frame) => {
+                if frame.frame.closes_indented() {
+                    *indent_level = indent_level.saturating_sub(frame.frame.indent_level_delta());
+                }
+            }
+            FormatFrame::Block(_) => {
+                *indent_level = self.expected_indent_level();
+            }
+            FormatFrame::ScopedIndent(frame) => {
+                *indent_level = indent_level.saturating_sub(frame.delta);
+            }
+            FormatFrame::QueryRuntime(_)
+            | FormatFrame::ConstructFlag(_)
+            | FormatFrame::ConstructValue(_)
+            | FormatFrame::ConditionOwner(_)
+            | FormatFrame::BetweenPending(_)
+            | FormatFrame::PendingSplitEndSuffix(_)
+            | FormatFrame::PendingPlsqlLabel(_)
+            | FormatFrame::MySqlHandlerPendingBodyIndent(_)
+            | FormatFrame::TriggerHeader(_)
+            | FormatFrame::PlsqlContext(_)
+            | FormatFrame::CompoundTrigger(_)
+            | FormatFrame::WithCte(_)
+            | FormatFrame::OpenCursorRestore(_) => {}
+        }
+        Some(frame)
+    }
+
+    fn restore_tail_frame_with_indent(&mut self, frame: FormatFrame, indent_level: &mut usize) {
+        match &frame {
+            FormatFrame::Paren(frame) => {
+                if frame.frame.opens_indented() {
+                    *indent_level = indent_level.saturating_add(frame.frame.indent_level_delta());
+                }
+            }
+            FormatFrame::Block(frame) => {
+                *indent_level = frame.depth_frame.body_indent_level;
+            }
+            FormatFrame::ScopedIndent(frame) => {
+                *indent_level = indent_level.saturating_add(frame.delta);
+            }
+            FormatFrame::QueryRuntime(_)
+            | FormatFrame::ConstructFlag(_)
+            | FormatFrame::ConstructValue(_)
+            | FormatFrame::ConditionOwner(_)
+            | FormatFrame::BetweenPending(_)
+            | FormatFrame::PendingSplitEndSuffix(_)
+            | FormatFrame::PendingPlsqlLabel(_)
+            | FormatFrame::MySqlHandlerPendingBodyIndent(_)
+            | FormatFrame::TriggerHeader(_)
+            | FormatFrame::PlsqlContext(_)
+            | FormatFrame::CompoundTrigger(_)
+            | FormatFrame::WithCte(_)
+            | FormatFrame::OpenCursorRestore(_) => {}
+        }
+        self.push_existing_frame(frame);
+    }
+
+    fn remove_last_frame_matching_via_tail_pop(
+        &mut self,
+        indent_level: &mut usize,
+        mut should_remove: impl FnMut(&FormatFrame) -> bool,
+    ) -> bool {
+        self.take_last_frame_matching_via_tail_pop(indent_level, |frame| should_remove(frame))
+            .is_some()
+    }
+
+    fn take_last_frame_matching_via_tail_pop(
+        &mut self,
+        indent_level: &mut usize,
+        mut should_take: impl FnMut(&FormatFrame) -> bool,
+    ) -> Option<FormatFrame> {
+        let mut frames_to_restore = Vec::new();
+
+        while let Some(frame) = self.pop_tail_frame_adjust_indent(indent_level) {
+            if should_take(&frame) {
+                for frame in frames_to_restore.into_iter().rev() {
+                    self.restore_tail_frame_with_indent(frame, indent_level);
+                }
+                self.realign_indent_level_to_base(indent_level);
+                #[cfg(debug_assertions)]
+                {
+                    self.debug_assert_integrity();
+                    self.debug_assert_indent_level(*indent_level);
+                }
+                return Some(frame);
+            }
+            frames_to_restore.push(frame);
+        }
+
+        for frame in frames_to_restore.into_iter().rev() {
+            self.restore_tail_frame_with_indent(frame, indent_level);
+        }
+        self.realign_indent_level_to_base(indent_level);
+        #[cfg(debug_assertions)]
+        {
+            self.debug_assert_integrity();
+            self.debug_assert_indent_level(*indent_level);
+        }
+        None
     }
 
     fn pop_tail_auxiliary_frames_for_scope(
@@ -2120,62 +2071,137 @@ impl FormatFrameStack {
         self.paren_depth == 0
     }
 
+    fn current_query_runtime_frame(&self) -> Option<&QueryRuntimeFrame> {
+        let current_scope = self.current_scope();
+        self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::QueryRuntime(frame) if frame.scope.contains(current_scope) => Some(frame),
+            _ => None,
+        })
+    }
+
+    fn current_query_runtime_frame_mut(&mut self) -> Option<&mut QueryRuntimeFrame> {
+        let current_scope = self.current_scope();
+        let idx = self.frames.iter().enumerate().rev().find_map(|(idx, frame)| {
+            matches!(frame, FormatFrame::QueryRuntime(frame) if frame.scope.contains(current_scope))
+                .then_some(idx)
+        })?;
+        match self.frames.get_mut(idx) {
+            Some(FormatFrame::QueryRuntime(frame)) => Some(frame),
+            _ => None,
+        }
+    }
+
+    fn query_runtime_state_or_default(&self) -> FormatRuntimeState {
+        self.current_query_runtime_frame()
+            .map(|frame| frame.state.clone())
+            .unwrap_or_default()
+    }
+
+    fn current_query_runtime_scope(&self) -> Option<FormatScope> {
+        self.current_query_runtime_frame().map(|frame| frame.scope)
+    }
+
+    fn runtime_frame_mut_for_update(
+        &mut self,
+        should_create: bool,
+    ) -> Option<&mut QueryRuntimeFrame> {
+        let current_scope = self.current_scope();
+        let has_matching_frame = self
+            .current_query_runtime_frame()
+            .is_some_and(|frame| frame.scope.contains(current_scope));
+        if has_matching_frame {
+            return self.current_query_runtime_frame_mut();
+        }
+        if !should_create {
+            return None;
+        }
+        self.push_frame(FormatFrame::QueryRuntime(QueryRuntimeFrame {
+            scope: current_scope,
+            state: FormatRuntimeState::default(),
+        }));
+        self.current_query_runtime_frame_mut()
+    }
+
+    fn push_query_runtime_frame(&mut self, scope: FormatScope, state: FormatRuntimeState) {
+        self.push_frame(FormatFrame::QueryRuntime(QueryRuntimeFrame {
+            scope,
+            state,
+        }));
+    }
+
     fn current_query_base_depth(&self) -> Option<usize> {
-        self.current_query_base_depth
+        self.current_query_runtime_frame()
+            .and_then(|frame| frame.state.query_base_depth)
     }
 
     fn set_current_query_base_depth(&mut self, depth: Option<usize>) {
-        self.current_query_base_depth = depth;
+        if let Some(frame) = self.runtime_frame_mut_for_update(depth.is_some()) {
+            frame.state.query_base_depth = depth;
+        }
     }
 
     fn current_clause(&self) -> Option<&str> {
-        self.runtime_state.current_clause.as_deref()
+        self.current_query_runtime_frame()
+            .and_then(|frame| frame.state.current_clause.as_deref())
     }
 
     fn set_current_clause(&mut self, current_clause: Option<String>) {
-        self.runtime_state.current_clause = current_clause;
+        if let Some(frame) = self.runtime_frame_mut_for_update(current_clause.is_some()) {
+            frame.state.current_clause = current_clause;
+        }
     }
 
     fn select_list_layout_state(&self) -> SelectListLayoutState {
-        self.runtime_state.select_list_layout_state
+        self.current_query_runtime_frame()
+            .map(|frame| frame.state.select_list_layout_state)
+            .unwrap_or_default()
     }
 
     fn set_select_list_layout_state(&mut self, select_list_layout_state: SelectListLayoutState) {
-        self.runtime_state.select_list_layout_state = select_list_layout_state;
+        if let Some(frame) = self.runtime_frame_mut_for_update(
+            select_list_layout_state != SelectListLayoutState::Inactive,
+        ) {
+            frame.state.select_list_layout_state = select_list_layout_state;
+        }
     }
 
     fn statement_has_with_clause(&self) -> bool {
-        self.runtime_state.statement_has_with_clause
+        self.current_query_runtime_frame()
+            .is_some_and(|frame| frame.state.statement_has_with_clause)
+            || self.with_cte_in_definitions()
     }
 
     fn set_statement_has_with_clause(&mut self, statement_has_with_clause: bool) {
-        self.runtime_state.statement_has_with_clause = statement_has_with_clause;
+        if let Some(frame) = self.runtime_frame_mut_for_update(statement_has_with_clause) {
+            frame.state.statement_has_with_clause = statement_has_with_clause;
+        }
     }
 
     fn query_body_clause_base_depth(&self) -> Option<usize> {
-        self.runtime_state.query_body_clause_base_depth
+        self.current_query_runtime_frame()
+            .and_then(|frame| frame.state.query_body_clause_base_depth)
     }
 
     fn set_query_body_clause_base_depth(&mut self, query_body_clause_base_depth: Option<usize>) {
-        self.runtime_state.query_body_clause_base_depth = query_body_clause_base_depth;
+        if let Some(frame) =
+            self.runtime_frame_mut_for_update(query_body_clause_base_depth.is_some())
+        {
+            frame.state.query_body_clause_base_depth = query_body_clause_base_depth;
+        }
     }
 
     fn open_cursor_state(&self) -> OpenCursorFormatState {
-        self.runtime_state.open_cursor_state
+        self.current_query_runtime_frame()
+            .map(|frame| frame.state.open_cursor_state)
+            .unwrap_or_default()
     }
 
     fn set_open_cursor_state(&mut self, open_cursor_state: OpenCursorFormatState) {
-        self.runtime_state.open_cursor_state = open_cursor_state;
-    }
-
-    fn reset_runtime_state_for_statement_boundary(&mut self, preserve_with_clause: bool) {
-        self.set_current_clause(None);
-        self.set_select_list_layout_state(SelectListLayoutState::Inactive);
-        if !preserve_with_clause {
-            self.set_statement_has_with_clause(false);
+        if let Some(frame) =
+            self.runtime_frame_mut_for_update(open_cursor_state != OpenCursorFormatState::None)
+        {
+            frame.state.open_cursor_state = open_cursor_state;
         }
-        self.set_query_body_clause_base_depth(None);
-        self.set_open_cursor_state(OpenCursorFormatState::None);
     }
 
     fn activate_construct_flag(&mut self, kind: ConstructFlagKind, scope: FormatScope) {
@@ -2189,16 +2215,11 @@ impl FormatFrameStack {
     }
 
     fn deactivate_construct_flag(&mut self, kind: ConstructFlagKind) -> bool {
-        let Some(idx) = self
-            .frame_index_cache
-            .construct_flag_indices
-            .get(kind.index())
-            .and_then(|indices| indices.last())
-            .copied()
-        else {
-            return false;
-        };
-        self.remove_indexed_auxiliary_frame_at(idx).is_some()
+        let mut indent_level = self.statement_base_indent();
+        self.remove_last_frame_matching_via_tail_pop(
+            &mut indent_level,
+            |frame| matches!(frame, FormatFrame::ConstructFlag(frame) if frame.kind == kind),
+        )
     }
 
     fn deactivate_construct_flag_at_or_above_paren_depth(
@@ -2206,13 +2227,14 @@ impl FormatFrameStack {
         kind: ConstructFlagKind,
         paren_depth: usize,
     ) {
-        let _ = self.remove_auxiliary_frames_matching(|frame| {
+        let mut indent_level = self.statement_base_indent();
+        while self.remove_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
             matches!(
                 frame,
                 FormatFrame::ConstructFlag(frame)
                     if frame.kind == kind && frame.scope.paren_depth >= paren_depth
             )
-        });
+        }) {}
     }
 
     fn construct_flag_is_active(&self, kind: ConstructFlagKind) -> bool {
@@ -2266,9 +2288,11 @@ impl FormatFrameStack {
     }
 
     fn clear_construct_value(&mut self, kind: ConstructValueKind) {
-        let _ = self.remove_auxiliary_frames_matching(
+        let mut indent_level = self.statement_base_indent();
+        while self.remove_last_frame_matching_via_tail_pop(
+            &mut indent_level,
             |frame| matches!(frame, FormatFrame::ConstructValue(frame) if frame.kind == kind),
-        );
+        ) {}
     }
 
     fn construct_value_is_some(&self, kind: ConstructValueKind) -> bool {
@@ -2305,10 +2329,10 @@ impl FormatFrameStack {
         #[cfg(test)]
         let indent_before = *indent_level;
         let frame_id = self.next_frame_id();
-        let previous_query_base_depth = new_query_base_depth.map(|_| self.current_query_base_depth);
         let previous_active_paren_metrics = self.active_paren_metrics;
+        let mut next_runtime_state = self.query_runtime_state_or_default();
         if let Some(depth) = new_query_base_depth {
-            self.current_query_base_depth = Some(depth);
+            next_runtime_state.query_base_depth = Some(depth);
         }
         if frame.opens_indented() {
             *indent_level = indent_level.saturating_add(frame.indent_level_delta());
@@ -2318,16 +2342,16 @@ impl FormatFrameStack {
             id: frame_id,
             frame,
             semantic_flags,
-            runtime_state_snapshot: capture_runtime_state.then(|| self.runtime_state.clone()),
-            applied_query_base_depth: new_query_base_depth,
             previous_active_paren_metrics,
             previous_paren_frame_id: self.current_paren_frame_id,
-            previous_query_base_depth,
             wrapped_owner_kind,
             open_cursor_restore_state,
         })));
         self.paren_depth = self.paren_depth.saturating_add(1);
         self.current_paren_frame_id = Some(frame_id);
+        if capture_runtime_state || new_query_base_depth.is_some() {
+            self.push_query_runtime_frame(self.current_scope(), next_runtime_state);
+        }
         #[cfg(debug_assertions)]
         {
             self.debug_assert_integrity();
@@ -2345,10 +2369,12 @@ impl FormatFrameStack {
     /// Pop a paren frame and atomically undo the indent delta applied at push
     /// time when the frame closes indented.
     fn pop_paren(&mut self, indent_level: &mut usize) -> Option<PoppedParenFrame> {
+        let current_scope = self.current_scope();
         #[cfg(test)]
-        let scope_before = self.current_scope();
+        let scope_before = current_scope;
         #[cfg(test)]
         let indent_before = *indent_level;
+        let restored_runtime_state = self.current_query_runtime_scope() == Some(current_scope);
         let next_scope = self
             .frames
             .iter()
@@ -2373,12 +2399,6 @@ impl FormatFrameStack {
         if frame.frame.closes_indented() {
             *indent_level = indent_level.saturating_sub(frame.frame.indent_level_delta());
         }
-        let restored_runtime_state = if let Some(runtime_state) = frame.runtime_state_snapshot {
-            self.runtime_state = runtime_state;
-            true
-        } else {
-            false
-        };
         let popped = Some(PoppedParenFrame {
             frame: frame.frame,
             restored_runtime_state,
@@ -2700,7 +2720,8 @@ impl FormatFrameStack {
                 }
                 FormatFrame::Block(frame) => frame.depth_frame.body_indent_level,
                 FormatFrame::ScopedIndent(frame) => indent_level.saturating_add(frame.delta),
-                FormatFrame::ConstructFlag(_)
+                FormatFrame::QueryRuntime(_)
+                | FormatFrame::ConstructFlag(_)
                 | FormatFrame::ConstructValue(_)
                 | FormatFrame::ConditionOwner(_)
                 | FormatFrame::BetweenPending(_)
@@ -2779,13 +2800,10 @@ impl FormatFrameStack {
         &mut self,
         kind: ConditionOwnerKind,
     ) -> Option<ConditionOwnerFrame> {
-        let Some(FormatFrame::ConditionOwner(frame)) = self.frames.last() else {
-            return None;
-        };
-        if frame.kind != kind {
-            return None;
-        }
-        match self.pop_tail_frame() {
+        let mut indent_level = self.statement_base_indent();
+        match self.take_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+            matches!(frame, FormatFrame::ConditionOwner(frame) if frame.kind == kind)
+        }) {
             Some(FormatFrame::ConditionOwner(frame)) => Some(frame),
             _ => None,
         }
@@ -2867,15 +2885,10 @@ impl FormatFrameStack {
     }
 
     fn clear_pending_split_end_suffix(&mut self) -> bool {
-        let Some(idx) = self
-            .frame_index_cache
-            .pending_split_end_suffix_indices
-            .last()
-            .copied()
-        else {
-            return false;
-        };
-        self.remove_indexed_auxiliary_frame_at(idx).is_some()
+        let mut indent_level = self.statement_base_indent();
+        self.remove_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+            matches!(frame, FormatFrame::PendingSplitEndSuffix(_))
+        })
     }
 
     fn advance_pending_split_end_suffix(&mut self, word_upper: &str) {
@@ -2898,7 +2911,7 @@ impl FormatFrameStack {
                 }
             }
             None => {
-                let _ = self.remove_indexed_auxiliary_frame_at(idx);
+                let _ = self.clear_pending_split_end_suffix();
             }
         }
     }
@@ -2923,15 +2936,10 @@ impl FormatFrameStack {
     }
 
     fn clear_pending_plsql_label_body_indent(&mut self) -> bool {
-        let Some(idx) = self
-            .frame_index_cache
-            .pending_plsql_label_indices
-            .last()
-            .copied()
-        else {
-            return false;
-        };
-        self.remove_indexed_auxiliary_frame_at(idx).is_some()
+        let mut indent_level = self.statement_base_indent();
+        self.remove_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+            matches!(frame, FormatFrame::PendingPlsqlLabel(_))
+        })
     }
 
     fn mysql_handler_pending_body_indent(&self) -> Option<usize> {
@@ -2953,15 +2961,10 @@ impl FormatFrameStack {
     }
 
     fn clear_mysql_handler_pending_body_indent(&mut self) -> bool {
-        let Some(idx) = self
-            .frame_index_cache
-            .mysql_handler_pending_body_indent_indices
-            .last()
-            .copied()
-        else {
-            return false;
-        };
-        self.remove_indexed_auxiliary_frame_at(idx).is_some()
+        let mut indent_level = self.statement_base_indent();
+        self.remove_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+            matches!(frame, FormatFrame::MySqlHandlerPendingBodyIndent(_))
+        })
     }
 
     fn push_scoped_indent(
@@ -3011,13 +3014,11 @@ impl FormatFrameStack {
         kind: ScopedIndentKind,
         indent_level: &mut usize,
     ) -> bool {
-        let Some(idx) = self.frame_index_cache.scoped_indent_indices[kind.index()]
-            .last()
-            .copied()
-        else {
-            return false;
-        };
-        if self.remove_scoped_indent_frame_at(idx).is_none() {
+        let removed = self.remove_last_frame_matching_via_tail_pop(
+            indent_level,
+            |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
+        );
+        if !removed {
             return false;
         }
         self.realign_indent_level_to_base(indent_level);
@@ -3031,14 +3032,10 @@ impl FormatFrameStack {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn clear_scoped_indent(&mut self, kind: ScopedIndentKind, indent_level: &mut usize) {
-        while let Some(idx) = self.frame_index_cache.scoped_indent_indices[kind.index()]
-            .last()
-            .copied()
-        {
-            if self.remove_scoped_indent_frame_at(idx).is_none() {
-                break;
-            }
-        }
+        while self.remove_last_frame_matching_via_tail_pop(
+            indent_level,
+            |frame| matches!(frame, FormatFrame::ScopedIndent(frame) if frame.kind == kind),
+        ) {}
         self.realign_indent_level_to_base(indent_level);
         #[cfg(debug_assertions)]
         {
@@ -3070,9 +3067,13 @@ impl FormatFrameStack {
     }
 
     fn clear_trigger_header(&mut self) {
-        while matches!(self.frames.last(), Some(FormatFrame::TriggerHeader(_))) {
-            let _ = self.pop_tail_frame();
-        }
+        let mut indent_level = self.statement_base_indent();
+        while self
+            .take_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+                matches!(frame, FormatFrame::TriggerHeader(_))
+            })
+            .is_some()
+        {}
     }
 
     fn push_plsql_context(&mut self, scope: FormatScope) {
@@ -3167,9 +3168,13 @@ impl FormatFrameStack {
     }
 
     fn clear_compound_trigger(&mut self) {
-        while matches!(self.frames.last(), Some(FormatFrame::CompoundTrigger(_))) {
-            let _ = self.pop_tail_frame();
-        }
+        let mut indent_level = self.statement_base_indent();
+        while self
+            .take_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+                matches!(frame, FormatFrame::CompoundTrigger(_))
+            })
+            .is_some()
+        {}
     }
 
     fn push_with_cte_frame(&mut self, scope: FormatScope) {
@@ -3201,10 +3206,11 @@ impl FormatFrameStack {
     }
 
     fn pop_last_with_cte(&mut self) -> bool {
-        if !matches!(self.frames.last(), Some(FormatFrame::WithCte(_))) {
-            return false;
-        }
-        self.pop_tail_frame().is_some()
+        let mut indent_level = self.statement_base_indent();
+        self.take_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
+            matches!(frame, FormatFrame::WithCte(_))
+        })
+        .is_some()
     }
 
     fn sync_to_scope(&mut self, current_scope: FormatScope, indent_level: &mut usize) {
@@ -3234,14 +3240,19 @@ impl FormatFrameStack {
     /// `indent_level` from the surviving frame stack via
     /// `statement_base_indent()`. Surviving frames (`Block`, MySQL handler
     /// scoped indent, `PlsqlContext`, `CompoundTrigger`, `WithCte`) remain the
-    /// single source of truth for the base indent, so we simply discard the
-    /// rest and let `statement_base_indent()` recompute. Counters are
-    /// recounted from the retained frames to stay structurally consistent
-    /// even if a caller accidentally forgets to pop a nested frame.
+    /// single source of truth for the base indent, so cleanup happens by
+    /// tail-pop and replay instead of middle-frame retention.
     fn clear_statement_frames(&mut self, indent_level: &mut usize) {
-        self.retain_frames_matching(|frame| frame.survives_statement_boundary());
-        self.current_query_base_depth = None;
-        *indent_level = self.statement_base_indent();
+        let mut frames_to_restore = Vec::new();
+        while let Some(frame) = self.pop_tail_frame_adjust_indent(indent_level) {
+            if frame.survives_statement_boundary() {
+                frames_to_restore.push(frame);
+            }
+        }
+        for frame in frames_to_restore.into_iter().rev() {
+            self.restore_tail_frame_with_indent(frame, indent_level);
+        }
+        self.realign_indent_level_to_base(indent_level);
         #[cfg(debug_assertions)]
         {
             self.debug_assert_statement_boundary_integrity();
@@ -3254,9 +3265,7 @@ impl FormatFrameStack {
         let scope_before = self.current_scope();
         #[cfg(test)]
         let indent_before = *indent_level;
-        let preserve_with_clause = self.with_cte_in_definitions();
         self.pop_between_pending_at_or_above(FormatScope::new(0, 0));
-        self.reset_runtime_state_for_statement_boundary(preserve_with_clause);
         self.clear_statement_frames(indent_level);
         #[cfg(test)]
         self.record_transition(
@@ -3350,6 +3359,10 @@ impl FormatFrameStack {
                 FormatFrame::MySqlHandlerPendingBodyIndent(frame) => debug_assert!(
                     frame.scope.contains(current_scope),
                     "MySQL handler pending body-indent frame survived outside its scope"
+                ),
+                FormatFrame::QueryRuntime(frame) => debug_assert!(
+                    frame.scope.contains(current_scope),
+                    "query runtime frame survived outside its scope"
                 ),
                 FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
                     debug_assert!(
@@ -3496,6 +3509,7 @@ impl FormatFrame {
             FormatFrame::PendingPlsqlLabel(frame) => !frame.scope.contains(next_scope),
             FormatFrame::MySqlHandlerPendingBodyIndent(frame) => !frame.scope.contains(next_scope),
             FormatFrame::ScopedIndent(frame) => !frame.scope.contains(next_scope),
+            FormatFrame::QueryRuntime(frame) => !frame.scope.contains(next_scope),
             FormatFrame::ConstructFlag(frame) => !frame.scope.contains(next_scope),
             FormatFrame::ConstructValue(frame) => !frame.scope.contains(next_scope),
             FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
@@ -8182,9 +8196,9 @@ impl SqlEditorWidget {
                         && ((matches!(upper, "ELSE" | "ELSIF" | "ELSEIF")
                             && format_stack.last_block_kind_is("IF"))
                             || (upper == "END"
-                                && format_stack
-                                    .last_block_kind()
-                                    .is_some_and(|kind| matches!(kind, BlockKind::If | BlockKind::While))));
+                                && format_stack.last_block_kind().is_some_and(|kind| {
+                                    matches!(kind, BlockKind::If | BlockKind::While)
+                                })));
                     if split_control_body_should_close {
                         let _ = format_stack.deactivate_scoped_indent(
                             ScopedIndentKind::SplitControlBody,
@@ -8823,8 +8837,8 @@ impl SqlEditorWidget {
                                                 )
                                                 .saturating_sub(1)
                                         });
-                                let clause_header_indent =
-                                    select_clause_header_indent.unwrap_or_else(|| {
+                                let clause_header_indent = select_clause_header_indent
+                                    .unwrap_or_else(|| {
                                         clause_indent!(
                                             indent_level,
                                             open_cursor_state!(),
@@ -9712,8 +9726,8 @@ impl SqlEditorWidget {
                                     );
                                     if format_stack.paren_is_empty() {
                                         if let Some(base_depth) = query_body_clause_base_depth!() {
-                                            select_case_indent =
-                                                select_case_indent.max(base_depth.saturating_add(1));
+                                            select_case_indent = select_case_indent
+                                                .max(base_depth.saturating_add(1));
                                         }
                                     }
                                     if select_list_layout_state!().has_active_indent()
@@ -10492,19 +10506,21 @@ impl SqlEditorWidget {
                                             })
                                             .flatten()
                                     })
-                                    .or_else(|| matches!(upper, "LOOP" | "DO").then_some(rendered_body_indent))
+                                    .or_else(|| {
+                                        matches!(upper, "LOOP" | "DO")
+                                            .then_some(rendered_body_indent)
+                                    })
                             })
                             .flatten();
-                        let control_body_extra_delta = control_condition_body_indent.and_then(
-                            |_| {
+                        let control_body_extra_delta =
+                            control_condition_body_indent.and_then(|_| {
                                 let base_body_indent = base_indent!(indent_level);
                                 let rendered_body_indent =
                                     current_output_line_indent.saturating_add(1);
                                 rendered_body_indent
                                     .checked_sub(base_body_indent)
                                     .filter(|delta| *delta > 0)
-                            },
-                        );
+                            });
                         newline_with(
                             &mut out,
                             case_branch_body_indent
@@ -32437,9 +32453,11 @@ updated_at = NOW();"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         let lines: Vec<&str> = formatted.lines().collect();
-        let on_duplicate_idx =
-            find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE dept_name = VALUES(dept_name),")
-                .expect("ON DUPLICATE KEY UPDATE owner");
+        let on_duplicate_idx = find_line_starting_with(
+            &lines,
+            "ON DUPLICATE KEY UPDATE dept_name = VALUES(dept_name),",
+        )
+        .expect("ON DUPLICATE KEY UPDATE owner");
         let sort_no_idx =
             find_line_starting_with(&lines, "sort_no = VALUES(sort_no),").expect("sort_no sibling");
         let updated_at_idx =
@@ -37438,8 +37456,7 @@ GROUP BY c.customer_id,
             .enumerate()
             .skip(case_idx + 1)
             .find(|(_, line)| {
-                line.trim_start()
-                    == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+                line.trim_start() == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
             })
             .map(|(idx, _)| idx)
             .expect("test8 view first WHEN");
@@ -37450,8 +37467,7 @@ GROUP BY c.customer_id,
             .find(|(_, line)| line.trim_start() == "END AS spend_band")
             .map(|(idx, _)| idx)
             .expect("test8 view CASE END");
-        let from_idx =
-            find_line_starting_with(&lines, "FROM cfb_user u").expect("test8 view FROM");
+        let from_idx = find_line_starting_with(&lines, "FROM cfb_user u").expect("test8 view FROM");
 
         assert_eq!(
             leading_spaces(lines[case_idx]),
@@ -37499,8 +37515,7 @@ GROUP BY c.customer_id,
             .enumerate()
             .skip(case_idx + 1)
             .find(|(_, line)| {
-                line.trim_start()
-                    == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+                line.trim_start() == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
             })
             .map(|(idx, _)| idx)
             .expect("test8 auto-format view first WHEN");
@@ -37511,8 +37526,8 @@ GROUP BY c.customer_id,
             .find(|(_, line)| line.trim_start() == "END AS spend_band")
             .map(|(idx, _)| idx)
             .expect("test8 auto-format view CASE END");
-        let from_idx =
-            find_line_starting_with(&lines, "FROM cfb_user u").expect("test8 auto-format view FROM");
+        let from_idx = find_line_starting_with(&lines, "FROM cfb_user u")
+            .expect("test8 auto-format view FROM");
 
         assert_eq!(
             leading_spaces(lines[case_idx]),
@@ -39383,6 +39398,7 @@ mod format_frame_stack_tests {
     fn format_frame_stack_restores_query_base_and_runtime_state_from_same_paren_frame() {
         let mut stack = FormatFrameStack::default();
         let runtime_state = FormatRuntimeState {
+            query_base_depth: Some(2),
             current_clause: Some("SELECT".to_string()),
             select_list_layout_state: SelectListLayoutState::Multiline {
                 indent: 6,
@@ -39537,7 +39553,7 @@ mod format_frame_stack_tests {
     }
 
     #[test]
-    fn format_frame_stack_rebuild_restores_query_base_depth_from_nearest_active_paren_payload() {
+    fn format_frame_stack_uses_nearest_active_query_runtime_frame_for_query_base_depth() {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
@@ -39559,9 +39575,6 @@ mod format_frame_stack_tests {
             None,
             &mut indent_level,
         );
-
-        stack.current_query_base_depth = None;
-        stack.rebuild_structural_state_from_frames();
 
         assert_eq!(stack.current_query_base_depth(), Some(1));
     }
@@ -39589,7 +39602,7 @@ mod format_frame_stack_tests {
     }
 
     #[test]
-    fn format_frame_stack_rebuild_prefers_innermost_active_query_base_depth_payload() {
+    fn format_frame_stack_prefers_innermost_active_query_runtime_frame_for_query_base_depth() {
         let mut stack = FormatFrameStack::default();
         let mut indent_level = 0usize;
 
@@ -39612,11 +39625,11 @@ mod format_frame_stack_tests {
             &mut indent_level,
         );
 
-        stack.current_query_base_depth = None;
-
-        stack.rebuild_structural_state_from_frames();
-
         assert_eq!(stack.current_query_base_depth(), Some(6));
+
+        let _ = stack.pop_paren(&mut indent_level);
+
+        assert_eq!(stack.current_query_base_depth(), Some(2));
     }
 
     #[test]
