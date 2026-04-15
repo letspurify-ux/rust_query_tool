@@ -1712,6 +1712,135 @@ fn mysql_lock_in_share_mode_is_not_classified_as_lock_table_context() {
 }
 
 #[test]
+fn mysql_straight_join_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+SELECT 1 FROM dual;
+
+SELECT d.__CODEX_CURSOR__deptno
+FROM emp e
+STRAIGHT_JOIN dept d ON e.deptno = d.deptno
+WHERE d.loc = 'SEOUL';
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("STRAIGHT_JOIN dept d"),
+        "current statement should stay inside STRAIGHT_JOIN query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("d"), &deep_ctx);
+    assert_eq!(tables, vec!["dept".to_string()]);
+}
+
+#[test]
+fn mysql_use_index_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+SELECT 'warmup';
+
+SELECT o.order_id
+FROM orders USE INDEX (idx_orders_date) o
+JOIN customers c ON c.id = o.customer_id
+WHERE c.__CODEX_CURSOR__status = 'A';
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("USE INDEX (idx_orders_date) o"),
+        "current statement should stay inside USE INDEX query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::WhereClause);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("c"), &deep_ctx);
+    assert_eq!(tables, vec!["customers".to_string()]);
+}
+
+#[test]
+fn mysql_force_index_for_order_by_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+SELECT 'warmup';
+
+SELECT o.__CODEX_CURSOR__order_id
+FROM orders FORCE INDEX FOR ORDER BY (idx_orders_date) o
+WHERE o.created_at >= CURRENT_DATE - INTERVAL '1' DAY;
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("FORCE INDEX FOR ORDER BY"),
+        "current statement should stay inside FORCE INDEX query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("o"), &deep_ctx);
+    assert_eq!(tables, vec!["orders".to_string()]);
+}
+
+#[test]
+fn oracle_partition_clause_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+PROMPT partition check
+
+SELECT s.__CODEX_CURSOR__amount
+FROM sales PARTITION (p202401) s
+WHERE s.region_id = 1;
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("PARTITION (p202401) s"),
+        "current statement should stay inside PARTITION query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("s"), &deep_ctx);
+    assert_eq!(tables, vec!["sales".to_string()]);
+}
+
+#[test]
+fn oracle_tablesample_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+PROMPT tablesample check
+
+SELECT s.__CODEX_CURSOR__amount
+FROM sales TABLESAMPLE BERNOULLI (10) REPEATABLE (7) s
+WHERE s.region_id = 1;
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("TABLESAMPLE BERNOULLI (10) REPEATABLE (7) s"),
+        "current statement should stay inside TABLESAMPLE query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("s"), &deep_ctx);
+    assert_eq!(tables, vec!["sales".to_string()]);
+}
+
+#[test]
+fn oracle_partitioned_outer_join_alias_resolution_survives_full_script_statement_slicing() {
+    let script = "\
+SELECT 'warmup' FROM dual;
+
+SELECT t.__CODEX_CURSOR__region_id
+FROM sales s PARTITION BY (s.region_id)
+RIGHT OUTER JOIN targets t ON s.region_id = t.region_id
+WHERE t.region_id IS NOT NULL;
+";
+
+    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(script);
+    assert!(
+        statement.contains("PARTITION BY (s.region_id)"),
+        "current statement should stay inside partitioned outer join query, got:\n{statement}"
+    );
+    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+
+    let tables = SqlEditorWidget::resolve_column_tables_for_context(Some("t"), &deep_ctx);
+    assert_eq!(tables, vec!["targets".to_string()]);
+}
+
+#[test]
 fn statement_bounds_slash_terminates_create_plsql_block() {
     // After 'CREATE FUNCTION ... IS BEGIN ... END;\n/\n', a subsequent
     // SELECT should be recognised as a separate statement.
