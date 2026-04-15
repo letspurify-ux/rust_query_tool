@@ -465,6 +465,13 @@ impl SqlEditorWidget {
         let expected_previous_len = text_len
             .saturating_add(del.max(0) as usize)
             .saturating_sub(ins.max(0) as usize);
+        let full_buffer_replaced = pos <= 0
+            && del.max(0) as usize == expected_previous_len
+            && ins.max(0) as usize == text_len;
+        if full_buffer_replaced {
+            self.rehighlight_full_buffer_from_text(inserted_text);
+            return;
+        }
         let mut style_buffer = self.style_buffer.clone();
         Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, &inserted_text, del);
         if style_buffer.length().max(0) as usize != text_len {
@@ -625,22 +632,25 @@ impl SqlEditorWidget {
     }
 
     fn rehighlight_full_buffer(&self) {
-        let text = self.buffer.text();
+        self.rehighlight_full_buffer_from_text(&self.buffer.text());
+    }
+
+    fn rehighlight_full_buffer_from_text(&self, text: &str) {
         let (styles, line_exit_states) = {
             let highlighter = self
                 .highlighter
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            build_logical_styles_and_line_states(&highlighter, &text)
+            build_logical_styles_and_line_states(&highlighter, text)
         };
         let mut style_buffer = self.style_buffer.clone();
-        if !Self::set_style_buffer_for_text(&mut style_buffer, &text, &styles) {
+        if !Self::set_style_buffer_for_text(&mut style_buffer, text, &styles) {
             return;
         }
         self.highlight_shadow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .rebuild(text, &styles, line_exit_states);
+            .rebuild(text.to_string(), &styles, line_exit_states);
         let mut editor = self.editor.clone();
         editor.redraw();
     }

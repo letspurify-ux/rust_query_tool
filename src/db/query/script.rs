@@ -7954,6 +7954,9 @@ impl QueryExecutor {
             Some(ScriptItem::Statement(statement)) => statement,
             _ => return None,
         };
+        if !Self::starts_new_top_level_create_statement(statement) {
+            return None;
+        }
 
         let routine_name = Self::extract_standalone_routine_name(statement)?;
         if Self::statement_has_matching_end_label(statement, routine_name.as_str()) {
@@ -8293,7 +8296,7 @@ impl QueryExecutor {
                             return true;
                         }
 
-                        if let Some(command) = Self::parse_tool_command(trailing_line) {
+                        if let Some(command) = Self::parse_tool_command_if_candidate(trailing_line) {
                             return !matches!(command, ToolCommand::Unsupported { .. });
                         }
 
@@ -8523,7 +8526,7 @@ impl QueryExecutor {
         I: Iterator<Item = &'a str> + Clone,
     {
         let trimmed = first_line.trim();
-        let parsed = Self::parse_tool_command(trimmed)?;
+        let parsed = Self::parse_tool_command_if_candidate(trimmed)?;
         if !Self::tool_command_can_continue(trimmed, &parsed) {
             return None;
         }
@@ -8541,7 +8544,7 @@ impl QueryExecutor {
             candidate.push_str(next_line.trim());
             consumed = consumed.saturating_add(1);
 
-            let Some(parsed_candidate) = Self::parse_tool_command(&candidate) else {
+            let Some(parsed_candidate) = Self::parse_tool_command_if_candidate(&candidate) else {
                 break;
             };
 
@@ -8619,7 +8622,7 @@ impl QueryExecutor {
         mysql_delimiter: Option<&str>,
     ) -> bool {
         mysql_delimiter.is_some_and(|delimiter| delimiter != ";")
-            || Self::parse_mysql_tool_command(trimmed).is_some()
+            || Self::parse_mysql_tool_command_if_candidate(trimmed).is_some()
             || Self::statement_ends_with_mysql_vertical_terminator(trimmed)
             || sql_text::mysql_compatibility_for_sql(line, preferred_db_type)
     }
@@ -8673,6 +8676,9 @@ impl QueryExecutor {
             Some(FormatItem::Statement(statement)) => statement,
             _ => return None,
         };
+        if !Self::starts_new_top_level_create_statement(statement) {
+            return None;
+        }
 
         let routine_name = Self::extract_standalone_routine_name(statement)?;
         if Self::statement_has_matching_end_label(statement, routine_name.as_str()) {
@@ -8929,7 +8935,7 @@ impl QueryExecutor {
             && builder.can_terminate_on_slash()
             && !is_sql_set_clause_context
             && !is_order_by_modifier_line
-            && Self::parse_tool_command(trimmed).is_some()
+            && Self::parse_tool_command_if_candidate(trimmed).is_some()
         {
             for stmt in builder.force_terminate_and_take_statements() {
                 add_statement(stmt, items);
@@ -8945,7 +8951,7 @@ impl QueryExecutor {
             is_sql_set_clause_context,
         ) && !is_order_by_modifier_line
         {
-            if let Some(command) = Self::parse_tool_command(trimmed) {
+            if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, items);
                 }
@@ -8964,7 +8970,7 @@ impl QueryExecutor {
             parser_is_top_level,
         ) && !is_sql_set_statement
         {
-            if let Some(command) = Self::parse_tool_command(trimmed) {
+            if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
                 if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                     *sqlblanklines_enabled = *enabled;
                 }
@@ -9513,6 +9519,14 @@ impl QueryExecutor {
         None
     }
 
+    pub(crate) fn parse_tool_command_if_candidate(line: &str) -> Option<ToolCommand> {
+        if !Self::looks_like_tool_command_candidate(line) {
+            return None;
+        }
+
+        Self::parse_tool_command(line)
+    }
+
     fn parse_var_command(raw: &str) -> ToolCommand {
         let mut parts = raw.split_whitespace();
         let _ = parts.next(); // VAR or VARIABLE
@@ -9689,6 +9703,14 @@ impl QueryExecutor {
             "SHOW" => Self::parse_mysql_show_command(raw),
             _ => None,
         }
+    }
+
+    fn parse_mysql_tool_command_if_candidate(raw: &str) -> Option<ToolCommand> {
+        if !Self::looks_like_mysql_tool_command_candidate(raw) {
+            return None;
+        }
+
+        Self::parse_mysql_tool_command(raw)
     }
 
     pub(crate) fn parse_mysql_delimiter_command(raw: &str) -> Option<ToolCommand> {
@@ -10945,6 +10967,94 @@ impl QueryExecutor {
             .and_then(|tail| tail.chars().next())
             .map(|ch| ch.is_whitespace())
             .unwrap_or(false)
+    }
+
+    fn looks_like_tool_command_candidate(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with("@@")
+            || trimmed.starts_with('@')
+            || trimmed.starts_with('!')
+            || trimmed.starts_with("\\.")
+        {
+            return true;
+        }
+
+        let Some(first_word) = sql_text::first_meaningful_word(trimmed) else {
+            return false;
+        };
+
+        first_word.eq_ignore_ascii_case("ACCEPT")
+            || first_word.eq_ignore_ascii_case("ARCHIVE")
+            || first_word.eq_ignore_ascii_case("BREAK")
+            || first_word.eq_ignore_ascii_case("BTITLE")
+            || first_word.eq_ignore_ascii_case("CLEAR")
+            || first_word.eq_ignore_ascii_case("COLUMN")
+            || first_word.eq_ignore_ascii_case("COMPUTE")
+            || first_word.eq_ignore_ascii_case("CONN")
+            || first_word.eq_ignore_ascii_case("CONNECT")
+            || first_word.eq_ignore_ascii_case("DEFINE")
+            || first_word.eq_ignore_ascii_case("DELIMITER")
+            || first_word.eq_ignore_ascii_case("DESC")
+            || first_word.eq_ignore_ascii_case("DESCRIBE")
+            || first_word.eq_ignore_ascii_case("DISC")
+            || first_word.eq_ignore_ascii_case("DISCONNECT")
+            || first_word.eq_ignore_ascii_case("EXEC")
+            || first_word.eq_ignore_ascii_case("EXECUTE")
+            || first_word.eq_ignore_ascii_case("EXIT")
+            || first_word.eq_ignore_ascii_case("GET")
+            || first_word.eq_ignore_ascii_case("HOST")
+            || first_word.eq_ignore_ascii_case("PASSW")
+            || first_word.eq_ignore_ascii_case("PASSWORD")
+            || first_word.eq_ignore_ascii_case("PAUSE")
+            || first_word.eq_ignore_ascii_case("PRINT")
+            || first_word.eq_ignore_ascii_case("PROMPT")
+            || first_word.eq_ignore_ascii_case("QUIT")
+            || first_word.eq_ignore_ascii_case("R")
+            || first_word.eq_ignore_ascii_case("RECOVER")
+            || first_word.eq_ignore_ascii_case("REM")
+            || first_word.eq_ignore_ascii_case("REMARK")
+            || first_word.eq_ignore_ascii_case("REPFOOTER")
+            || first_word.eq_ignore_ascii_case("REPHEADER")
+            || first_word.eq_ignore_ascii_case("RUN")
+            || first_word.eq_ignore_ascii_case("SAVE")
+            || first_word.eq_ignore_ascii_case("SET")
+            || first_word.eq_ignore_ascii_case("SHOW")
+            || first_word.eq_ignore_ascii_case("SHUTDOWN")
+            || first_word.eq_ignore_ascii_case("SOURCE")
+            || first_word.eq_ignore_ascii_case("SPOOL")
+            || first_word.eq_ignore_ascii_case("START")
+            || first_word.eq_ignore_ascii_case("STARTUP")
+            || first_word.eq_ignore_ascii_case("TIMING")
+            || first_word.eq_ignore_ascii_case("TTITLE")
+            || first_word.eq_ignore_ascii_case("UNDEFINE")
+            || first_word.eq_ignore_ascii_case("USE")
+            || first_word.eq_ignore_ascii_case("VAR")
+            || first_word.eq_ignore_ascii_case("VARIABLE")
+            || first_word.eq_ignore_ascii_case("WHENEVER")
+    }
+
+    fn looks_like_mysql_tool_command_candidate(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with("\\.") {
+            return true;
+        }
+
+        let Some(first_word) = sql_text::first_meaningful_word(trimmed) else {
+            return false;
+        };
+
+        first_word.eq_ignore_ascii_case("DELIMITER")
+            || first_word.eq_ignore_ascii_case("SHOW")
+            || first_word.eq_ignore_ascii_case("SOURCE")
+            || first_word.eq_ignore_ascii_case("USE")
     }
 
     fn parse_bind_type(type_str: &str) -> Result<BindDataType, String> {

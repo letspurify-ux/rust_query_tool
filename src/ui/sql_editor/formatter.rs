@@ -140,7 +140,7 @@ impl FormatItemStaticAnalysis {
                 ..Self::default()
             },
             FormatItem::Verbatim(text) => Self {
-                is_prompt: QueryExecutor::parse_tool_command(text)
+                is_prompt: QueryExecutor::parse_tool_command_if_candidate(text)
                     .is_some_and(|cmd| matches!(cmd, ToolCommand::Prompt { .. })),
                 ..Self::default()
             },
@@ -5061,7 +5061,7 @@ impl SqlEditorWidget {
             trimmed.starts_with("--")
                 || trimmed.starts_with('#')
                 || Self::is_sqlplus_remark_comment_statement(trimmed)
-                || QueryExecutor::parse_tool_command(trimmed)
+                || QueryExecutor::parse_tool_command_if_candidate(trimmed)
                     .is_some_and(|command| !matches!(command, ToolCommand::Unsupported { .. }))
         };
         let mut current_line_is_non_sql = line_is_non_sql(0);
@@ -5240,6 +5240,10 @@ impl SqlEditorWidget {
     }
 
     fn statement_has_unterminated_plsql_label(statement: &str) -> bool {
+        if !statement.contains("<<") && !statement.contains(">>") {
+            return false;
+        }
+
         let tokens = Self::tokenize_sql(statement);
         let mut idx = 0usize;
         let mut open_label_count = 0usize;
@@ -6960,7 +6964,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        QueryExecutor::parse_tool_command(line)
+        QueryExecutor::parse_tool_command_if_candidate(line)
             .is_some_and(|command| !matches!(command, ToolCommand::Unsupported { .. }))
     }
 
