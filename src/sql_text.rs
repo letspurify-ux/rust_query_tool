@@ -3204,7 +3204,10 @@ fn next_identifier_sequence_segment<'a>(
 }
 
 fn identifier_sequence_segment_count(sequence: &[&str]) -> usize {
-    sequence.iter().map(|word| identifier_segment_count(word)).sum()
+    sequence
+        .iter()
+        .map(|word| identifier_segment_count(word))
+        .sum()
 }
 
 fn identifier_word_matches_keyword_sequence(words: &[&str], sequence: &[&str]) -> bool {
@@ -3332,7 +3335,8 @@ fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
         };
 
         let mut actual_segment_idx = 0usize;
-        while let Some(segment) = next_identifier_word_segment(identifier, &mut actual_segment_idx) {
+        while let Some(segment) = next_identifier_word_segment(identifier, &mut actual_segment_idx)
+        {
             let Some(expected) = next_identifier_sequence_segment(
                 sequence,
                 &mut expected_word_idx,
@@ -5706,9 +5710,11 @@ pub(crate) fn format_indented_paren_owner_kind_from_words(
         Some(FormatIndentedParenOwnerKind::WithinGroup)
     } else if identifier_words_end_with_sequence(words, &["KEEP"]) {
         Some(FormatIndentedParenOwnerKind::Keep)
-    } else if FormatIndentedParenOwnerKind::ModelSubclause
-        .starts_body_header_words(first_word, second_word, third_word)
-    {
+    } else if FormatIndentedParenOwnerKind::ModelSubclause.starts_body_header_words(
+        first_word,
+        second_word,
+        third_word,
+    ) {
         Some(FormatIndentedParenOwnerKind::ModelSubclause)
     } else if identifier_words_start_with_sequence(words, &["WINDOW"])
         && identifier_words_end_with_sequence(words, &["AS"])

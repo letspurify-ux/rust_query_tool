@@ -436,8 +436,27 @@ impl SqlEditorWidget {
         del: i32,
         deleted_text: &str,
     ) {
-        let text_len = buf.length().max(0) as usize;
         let inserted_text = inserted_text(buf, &self.highlight_shadow, pos, ins);
+        self.handle_buffer_highlight_update_with_known_inserted_text(
+            buf,
+            pos,
+            ins,
+            del,
+            &inserted_text,
+            deleted_text,
+        );
+    }
+
+    fn handle_buffer_highlight_update_with_known_inserted_text(
+        &self,
+        buf: &TextBuffer,
+        pos: i32,
+        ins: i32,
+        del: i32,
+        inserted_text: &str,
+        deleted_text: &str,
+    ) {
+        let text_len = buf.length().max(0) as usize;
         if ins > 0 && inserted_text.len() != ins.max(0) as usize {
             self.rehighlight_full_buffer();
             return;
@@ -487,7 +506,7 @@ impl SqlEditorWidget {
                 shadow_pos,
                 inserted_text.len(),
                 del.max(0) as usize,
-                &inserted_text,
+                inserted_text,
                 deleted_text,
             )
         };

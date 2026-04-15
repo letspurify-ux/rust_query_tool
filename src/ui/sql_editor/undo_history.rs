@@ -444,6 +444,51 @@ impl WordUndoRedoState {
         self.trim_history_if_needed();
     }
 
+    fn record_full_buffer_programmatic_replace(
+        &mut self,
+        deleted_text: String,
+        inserted_text: String,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) {
+        self.normalize_index();
+        self.truncate_redo_history();
+
+        let before_cursor =
+            Self::clamp_to_char_boundary(&self.current.text, before_cursor.min(self.current.text.len()));
+        let group_id = self.next_group_id();
+
+        self.current.text = inserted_text.clone();
+        let after_cursor =
+            Self::clamp_to_char_boundary(&self.current.text, after_cursor.min(self.current.text.len()));
+        self.current.cursor_pos = after_cursor;
+
+        let delta = UndoDelta {
+            start: 0,
+            deleted_text,
+            inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = Some((
+            EditGroup {
+                granularity: EditGranularity::Other,
+                operation: EditOperation::Replace,
+            },
+            group_id,
+        ));
+        self.trim_history_if_needed();
+    }
+
     #[cfg(test)]
     fn record_snapshot(&mut self, current_text: String, edit_group: EditGroup) {
         self.normalize_index();
@@ -636,6 +681,25 @@ impl SqlEditorWidget {
                 inserted_text: inserted_text.to_string(),
                 deleted_text: deleted_text.to_string(),
             },
+            before_cursor,
+            after_cursor,
+        );
+    }
+
+    fn record_full_buffer_programmatic_replace(
+        &self,
+        deleted_text: String,
+        inserted_text: String,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) {
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_full_buffer_programmatic_replace(
+            deleted_text,
+            inserted_text,
             before_cursor,
             after_cursor,
         );

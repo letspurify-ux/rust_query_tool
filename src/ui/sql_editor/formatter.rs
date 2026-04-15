@@ -16,7 +16,7 @@ use crate::ui::sql_depth::{
 };
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use super::SqlEditorWidget;
 use super::SqlToken;
@@ -31,8 +31,8 @@ struct MeaningfulTokenLinks {
 struct FormatResultCacheEntry {
     preferred_db_type: Option<DatabaseType>,
     append_missing_terminator: bool,
-    input: String,
-    output: String,
+    input: Arc<str>,
+    output: Arc<str>,
 }
 
 const FORMAT_RESULT_CACHE_CAPACITY: usize = 8;
@@ -67,7 +67,8 @@ impl MeaningfulTokenLinks {
     }
 
     fn second_prev_index(&self, idx: usize) -> Option<usize> {
-        self.prev_index(idx).and_then(|prev_idx| self.prev_index(prev_idx))
+        self.prev_index(idx)
+            .and_then(|prev_idx| self.prev_index(prev_idx))
     }
 
     fn next_index(&self, idx: usize) -> Option<usize> {
@@ -85,6 +86,74 @@ fn format_result_cache_guard() -> MutexGuard<'static, VecDeque<FormatResultCache
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn is_statement_prefix_word_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_statement_prefix_word_continue_byte(byte: u8) -> bool {
+    is_statement_prefix_word_start_byte(byte)
+        || byte.is_ascii_digit()
+        || matches!(byte, b'$' | b'#')
+}
+
+fn leading_statement_words_upper(statement: &str, max_words: usize) -> Vec<String> {
+    let bytes = statement.as_bytes();
+    let mut words = Vec::with_capacity(max_words);
+    let mut idx = 0usize;
+
+    while idx < bytes.len() && words.len() < max_words {
+        match bytes[idx] {
+            byte if byte.is_ascii_whitespace() => {
+                idx += 1;
+            }
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                idx += 2;
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
+            }
+            b'#' => {
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                idx += 2;
+                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                    idx += 1;
+                }
+                idx = idx.saturating_add(2).min(bytes.len());
+            }
+            byte if is_statement_prefix_word_start_byte(byte) => {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && is_statement_prefix_word_continue_byte(bytes[idx]) {
+                    idx += 1;
+                }
+                if let Some(word) = statement.get(start..idx) {
+                    words.push(word.to_ascii_uppercase());
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    words
+}
+
+fn statement_starts_with_create_trigger_prefix(statement: &str) -> bool {
+    let words = leading_statement_words_upper(statement, 8);
+    words.first().is_some_and(|word| word == "CREATE")
+        && words.iter().skip(1).any(|word| word == "TRIGGER")
+}
+
+fn statement_starts_with_alter_trigger_prefix(statement: &str) -> bool {
+    let words = leading_statement_words_upper(statement, 2);
+    matches!(words.as_slice(), [first, second] if first == "ALTER" && second == "TRIGGER")
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,14 +176,13 @@ impl FormatItemStaticAnalysis {
                     };
                 }
 
-                let tokens = SqlEditorWidget::tokenize_sql(statement);
                 Self {
                     is_sqlplus_comment_line,
-                    is_create_trigger_statement: SqlEditorWidget::is_create_trigger_statement_tokens(
-                        &tokens,
+                    is_create_trigger_statement: statement_starts_with_create_trigger_prefix(
+                        statement,
                     ),
-                    is_alter_trigger_statement: SqlEditorWidget::is_alter_trigger_statement_tokens(
-                        &tokens,
+                    is_alter_trigger_statement: statement_starts_with_alter_trigger_prefix(
+                        statement,
                     ),
                     ..Self::default()
                 }
@@ -336,7 +404,6 @@ impl RenderedLineTracker {
         let previous_line_end = current_line_start.saturating_sub(1);
         self.line_ending_at(out, previous_line_end)
     }
-
 }
 
 #[derive(Clone, Copy)]
@@ -372,13 +439,11 @@ impl RenderedLineInfo {
                 &["VALUE"],
             ),
             ends_with_join_or_apply:
-                sql_text::line_ends_with_identifier_sequence_before_inline_comment(
-                    line,
-                    &["JOIN"],
-                ) || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
-                    line,
-                    &["APPLY"],
-                ),
+                sql_text::line_ends_with_identifier_sequence_before_inline_comment(line, &["JOIN"])
+                    || sql_text::line_ends_with_identifier_sequence_before_inline_comment(
+                        line,
+                        &["APPLY"],
+                    ),
         }
     }
 }
@@ -636,6 +701,7 @@ impl FormatterTokenCache {
         let mut next_word_indices = vec![None; tokens.len()];
         let mut second_next_word_indices = vec![None; tokens.len()];
         let matching_paren_close_indices = Self::build_matching_paren_close_indices(tokens);
+        let newline_counts = Self::build_token_newline_counts(statement, token_spans);
         let open_paren_query_owner_kinds = Self::build_open_paren_query_owner_kinds(
             tokens,
             &meaningful_links,
@@ -643,8 +709,7 @@ impl FormatterTokenCache {
         );
         let newline_before_next_meaningful = Self::build_newline_before_next_meaningful(
             tokens,
-            token_spans,
-            statement,
+            newline_counts.as_ref(),
             &meaningful_links,
         );
         let mut upper_words = vec![None; tokens.len()];
@@ -663,8 +728,7 @@ impl FormatterTokenCache {
         let wrapped_layout_heads = Self::build_wrapped_layout_heads(tokens, &meaningful_links);
         let paren_body_metrics = Self::build_paren_body_metrics(
             tokens,
-            token_spans,
-            statement,
+            newline_counts.as_ref(),
             &meaningful_links,
             &statement_word_links,
             &wrapped_layout_heads,
@@ -846,14 +910,12 @@ impl FormatterTokenCache {
 
     fn build_paren_body_metrics(
         tokens: &[SqlToken],
-        token_spans: &[SqlTokenSpan],
-        statement: &str,
+        newline_counts: Option<&(Vec<usize>, Vec<usize>)>,
         meaningful_links: &MeaningfulTokenLinks,
         statement_word_links: &StatementWordLinks,
         wrapped_layout_heads: &[bool],
     ) -> ParenBodyMetrics {
         let mut metrics = ParenBodyMetrics::new(tokens.len());
-        let newline_counts = Self::build_token_newline_counts(statement, token_spans);
         let mut stack: Vec<OpenParenBodyFrame> = Vec::new();
 
         for (idx, token) in tokens.iter().enumerate() {
@@ -1131,17 +1193,15 @@ impl FormatterTokenCache {
     }
 
     fn build_gap_has_newline_before_token(
-        statement: &str,
-        token_spans: &[SqlTokenSpan],
+        newline_counts: Option<&(Vec<usize>, Vec<usize>)>,
+        token_count: usize,
     ) -> Vec<bool> {
-        let Some((start_counts, end_counts)) =
-            Self::build_token_newline_counts(statement, token_spans)
-        else {
-            return vec![false; token_spans.len()];
+        let Some((start_counts, end_counts)) = newline_counts else {
+            return vec![false; token_count];
         };
 
-        let mut flags = vec![false; token_spans.len()];
-        for idx in 0..token_spans.len() {
+        let mut flags = vec![false; token_count];
+        for idx in 0..token_count {
             let previous_end_count = idx
                 .checked_sub(1)
                 .and_then(|previous_idx| end_counts.get(previous_idx))
@@ -1160,12 +1220,11 @@ impl FormatterTokenCache {
 
     fn build_newline_before_next_meaningful(
         tokens: &[SqlToken],
-        token_spans: &[SqlTokenSpan],
-        statement: &str,
+        newline_counts: Option<&(Vec<usize>, Vec<usize>)>,
         meaningful_links: &MeaningfulTokenLinks,
     ) -> Vec<bool> {
         let gap_has_newline_before_token =
-            Self::build_gap_has_newline_before_token(statement, token_spans);
+            Self::build_gap_has_newline_before_token(newline_counts, tokens.len());
         let mut flags = vec![false; tokens.len()];
 
         for idx in (0..tokens.len()).rev() {
@@ -1386,7 +1445,10 @@ struct CommentPrefixCache {
 
 impl CommentPrefixCache {
     fn build(tokens: &[SqlToken]) -> Self {
-        if !tokens.iter().any(|token| matches!(token, SqlToken::Comment(_))) {
+        if !tokens
+            .iter()
+            .any(|token| matches!(token, SqlToken::Comment(_)))
+        {
             return Self {
                 prefix_text: String::new(),
                 prefix_len_before_token: Vec::new(),
@@ -3054,9 +3116,10 @@ impl FormatFrameStack {
         kind: ConditionOwnerKind,
     ) -> Option<ConditionOwnerFrame> {
         let mut indent_level = self.statement_base_indent();
-        match self.take_last_frame_matching_via_tail_pop(&mut indent_level, |frame| {
-            matches!(frame, FormatFrame::ConditionOwner(frame) if frame.kind == kind)
-        }) {
+        match self.take_last_frame_matching_via_tail_pop(
+            &mut indent_level,
+            |frame| matches!(frame, FormatFrame::ConditionOwner(frame) if frame.kind == kind),
+        ) {
             Some(FormatFrame::ConditionOwner(frame)) => Some(frame),
             _ => None,
         }
@@ -4651,7 +4714,10 @@ impl SqlEditorWidget {
                 None
             }
             Some(SqlToken::Symbol(symbol))
-                if matches!(symbol.as_str(), "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "<=>") =>
+                if matches!(
+                    symbol.as_str(),
+                    "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "<=>"
+                ) =>
             {
                 Some(sql_text::FormatQueryOwnerKind::Operator)
             }
@@ -5868,7 +5934,10 @@ impl SqlEditorWidget {
     }
 
     #[cfg(test)]
-    pub(crate) fn format_sql_basic_no_cache_for_db_type(sql: &str, db_type: DatabaseType) -> String {
+    pub(crate) fn format_sql_basic_no_cache_for_db_type(
+        sql: &str,
+        db_type: DatabaseType,
+    ) -> String {
         Self::format_sql_basic_no_cache_inner(sql, true, Some(db_type))
     }
 
@@ -6126,10 +6195,10 @@ impl SqlEditorWidget {
         let entry_idx = cache.iter().position(|entry| {
             entry.append_missing_terminator == append_missing_terminator
                 && entry.preferred_db_type == preferred_db_type
-                && entry.input == sql
+                && entry.input.as_ref() == sql
         })?;
         let entry = cache.remove(entry_idx)?;
-        let output = entry.output.clone();
+        let output = entry.output.to_string();
         cache.push_front(entry);
         Some(output)
     }
@@ -6141,27 +6210,29 @@ impl SqlEditorWidget {
         preferred_db_type: Option<DatabaseType>,
     ) {
         let mut cache = format_result_cache_guard();
-        let mut push_entry = |input: &str, output: &str| {
+        let mut push_entry = |input: Arc<str>, output: Arc<str>| {
             if let Some(existing_idx) = cache.iter().position(|entry| {
                 entry.append_missing_terminator == append_missing_terminator
                     && entry.preferred_db_type == preferred_db_type
-                    && entry.input == input
+                    && entry.input.as_ref() == input.as_ref()
             }) {
                 let _ = cache.remove(existing_idx);
             }
             cache.push_front(FormatResultCacheEntry {
                 preferred_db_type,
                 append_missing_terminator,
-                input: input.to_string(),
-                output: output.to_string(),
+                input,
+                output,
             });
             while cache.len() > FORMAT_RESULT_CACHE_CAPACITY {
                 let _ = cache.pop_back();
             }
         };
 
-        push_entry(sql, formatted);
-        push_entry(formatted, formatted);
+        let sql_arc: Arc<str> = Arc::from(sql);
+        let formatted_arc: Arc<str> = Arc::from(formatted);
+        push_entry(sql_arc, formatted_arc.clone());
+        push_entry(formatted_arc.clone(), formatted_arc);
     }
 
     fn format_sql_basic_for_preferred_db_type(
@@ -6219,8 +6290,10 @@ impl SqlEditorWidget {
         if items.is_empty() {
             return String::new();
         }
-        let item_static_analyses: Vec<FormatItemStaticAnalysis> =
-            items.iter().map(FormatItemStaticAnalysis::analyze).collect();
+        let item_static_analyses: Vec<FormatItemStaticAnalysis> = items
+            .iter()
+            .map(FormatItemStaticAnalysis::analyze)
+            .collect();
 
         let mut select_list_break_state = SelectListBreakState::None;
         let mut active_mysql_delimiter: Option<String> = None;
@@ -6325,12 +6398,13 @@ impl SqlEditorWidget {
     ) -> bool {
         match (current, next) {
             (FormatItem::Statement(_), FormatItem::Statement(_)) => {
-                (current_analysis.is_sqlplus_comment_line
-                    && next_analysis.is_sqlplus_comment_line)
+                (current_analysis.is_sqlplus_comment_line && next_analysis.is_sqlplus_comment_line)
                     || (current_analysis.is_create_trigger_statement
                         && next_analysis.is_alter_trigger_statement)
             }
-            (FormatItem::Slash, FormatItem::Statement(_)) => next_analysis.is_alter_trigger_statement,
+            (FormatItem::Slash, FormatItem::Statement(_)) => {
+                next_analysis.is_alter_trigger_statement
+            }
             _ if current_analysis.is_prompt && next_analysis.is_prompt => true,
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
@@ -6369,20 +6443,6 @@ impl SqlEditorWidget {
 
     fn is_mysql_executable_comment_token(comment: &str) -> bool {
         crate::sql_text::is_mysql_executable_comment_start(comment.trim_start().as_bytes(), 0)
-    }
-
-    fn is_alter_trigger_statement_tokens(tokens: &[SqlToken]) -> bool {
-        let mut meaningful_words = tokens.iter().filter_map(|token| match token {
-            SqlToken::Word(word) => Some(word.as_str()),
-            _ => None,
-        });
-
-        matches!(
-            (meaningful_words.next(), meaningful_words.next()),
-            (Some(first), Some(second))
-                if first.eq_ignore_ascii_case("ALTER")
-                    && second.eq_ignore_ascii_case("TRIGGER")
-        )
     }
 
     fn statement_has_code(statement: &str, tokens: &[SqlToken]) -> bool {
@@ -9030,9 +9090,7 @@ impl SqlEditorWidget {
                                         .active_query_owner_line_info(&out, at_line_start)
                                 })
                                 .filter(|owner_line| owner_line.is_create_query_body_header)
-                                .map(|owner_line| {
-                                    owner_line.indent.saturating_add(1)
-                                });
+                                .map(|owner_line| owner_line.indent.saturating_add(1));
                             if let Some(base_depth) = create_query_body_base_depth {
                                 set_query_body_clause_base_depth!(Some(base_depth));
                             }
@@ -10799,8 +10857,7 @@ impl SqlEditorWidget {
 
                     if newline_after_keyword {
                         let current_output_line = rendered_line_tracker.current_line(&out);
-                        let current_output_line_indent =
-                            rendered_line_indent(current_output_line);
+                        let current_output_line_indent = rendered_line_indent(current_output_line);
                         let previous_output_line = rendered_line_tracker.previous_line(&out);
                         let case_branch_body_indent = (in_plsql_block
                             && format_stack.last_block_kind_is("CASE")
@@ -12658,8 +12715,7 @@ impl SqlEditorWidget {
                                             owner_info.indent
                                         }
                                     } else if paren_frame_kind.is_query_like() {
-                                        if let Some(clause_owner_depth) =
-                                            inline_clause_owner_depth
+                                        if let Some(clause_owner_depth) = inline_clause_owner_depth
                                         {
                                             clause_owner_depth
                                         } else if owner_info.ends_with_value {
@@ -12668,9 +12724,7 @@ impl SqlEditorWidget {
                                                 .map(|frame| frame.open_line_indent)
                                                 .unwrap_or(semantic_open_line_indent)
                                         } else {
-                                            owner_info
-                                                .indent
-                                                .saturating_add(owner_line_open_depth)
+                                            owner_info.indent.saturating_add(owner_line_open_depth)
                                         }
                                     } else {
                                         semantic_open_line_indent
@@ -12725,9 +12779,8 @@ impl SqlEditorWidget {
                                 out.push(' ');
                             }
                             out.push('(');
-                            current_rendered_line_paren_depth.set(
-                                current_rendered_line_paren_depth.get().saturating_add(1),
-                            );
+                            current_rendered_line_paren_depth
+                                .set(current_rendered_line_paren_depth.get().saturating_add(1));
                             deactivate_construct_flag!(CreateTableParenExpected);
                             let paren_indent_level_delta = query_like_layout
                                 .map(|layout| layout.child_head_depth.saturating_sub(indent_level))
@@ -13045,9 +13098,8 @@ impl SqlEditorWidget {
                                 &mut indent_cache,
                             );
                             out.push(')');
-                            current_rendered_line_paren_depth.set(
-                                current_rendered_line_paren_depth.get().saturating_sub(1),
-                            );
+                            current_rendered_line_paren_depth
+                                .set(current_rendered_line_paren_depth.get().saturating_sub(1));
                             if let Some(parent_frame) = format_stack.last_paren_mut() {
                                 if paren_frame_kind.contributes_multiline_close()
                                     && !close_compact_before_parent_close

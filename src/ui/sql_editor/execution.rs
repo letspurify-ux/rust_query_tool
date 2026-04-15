@@ -308,47 +308,37 @@ impl SqlEditorWidget {
 
     pub fn format_selected_sql(&self) {
         let mut buffer = self.buffer.clone();
-        let full_text = buffer.text();
         let selection = buffer.selection_position();
-        let (start, end, source, select_formatted) = match selection {
-            Some((start, end)) if start != end => {
+        let preferred_db_type = Some(self.current_db_type());
+        if let Some((start, end)) = selection {
+            if start != end {
+                let buffer_len = buffer.length().max(0);
                 let (start, end) = if start <= end {
                     (start, end)
                 } else {
                     (end, start)
                 };
-                (
-                    Self::normalize_index(&full_text, start),
-                    Self::normalize_index(&full_text, end),
-                    buffer.selection_text(),
-                    true,
-                )
-            }
-            _ => {
-                let text = buffer.text();
-                let end = Self::normalize_index(&full_text, buffer.length());
-                (0, end, text, false)
-            }
-        };
+                let start = start.clamp(0, buffer_len);
+                let end = end.clamp(start, buffer_len);
+                let source = text_buffer_access::text_range(
+                    &buffer,
+                    Some(&self.highlight_shadow),
+                    start,
+                    end,
+                );
+                let formatted =
+                    Self::format_for_auto_formatting_with_db_type(&source, true, preferred_db_type);
+                if formatted == source {
+                    return;
+                }
 
-        let preferred_db_type = Some(self.current_db_type());
-        let formatted = Self::format_for_auto_formatting_with_db_type(
-            &source,
-            select_formatted,
-            preferred_db_type,
-        );
-        if formatted == source {
-            return;
-        }
-
-        let mut editor = self.editor.clone();
-        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
-        let full_range_replace = start == 0 && end == full_text.len();
-
-        if full_range_replace {
-            let mapped_cursor = if select_formatted {
-                let original_within_selection =
-                    (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
+                let start_usize = start as usize;
+                let deleted_len = end.saturating_sub(start) as usize;
+                let mut editor = self.editor.clone();
+                let original_pos = editor.insert_position().clamp(0, buffer_len) as usize;
+                let original_within_selection = (original_pos as isize - start_usize as isize)
+                    .clamp(0, source.len() as isize)
+                    as i32;
                 let mapped_within_selection = Self::map_cursor_after_format_with_policy_for_db_type(
                     &source,
                     &formatted,
@@ -356,65 +346,72 @@ impl SqlEditorWidget {
                     true,
                     preferred_db_type,
                 );
-                start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize)
-            } else {
-                Self::map_cursor_after_format_with_policy_for_db_type(
+                let selection_end =
+                    start_usize + Self::clamp_to_char_boundary(&formatted, formatted.len());
+                let mapped_cursor = start_usize
+                    + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
+
+                let _suppress_callbacks = self.suppress_buffer_callbacks();
+                buffer.replace(start, end, &formatted);
+                self.invalidate_intellisense_after_buffer_edit();
+                self.handle_buffer_highlight_update_with_known_inserted_text(
+                    &buffer,
+                    start,
+                    formatted.len().min(i32::MAX as usize) as i32,
+                    deleted_len.min(i32::MAX as usize) as i32,
+                    &formatted,
+                    &source,
+                );
+                self.record_programmatic_buffer_edit(
+                    start_usize,
                     &source,
                     &formatted,
-                    original_pos as i32,
-                    false,
-                    preferred_db_type,
-                ) as usize
-            };
+                    original_pos,
+                    mapped_cursor,
+                );
 
-            let _suppress_callbacks = self.suppress_buffer_callbacks();
-            buffer.set_text(&formatted);
-            self.invalidate_intellisense_after_buffer_edit();
-            self.rehighlight_full_buffer();
-            self.record_programmatic_buffer_edit(
-                start,
-                &source,
-                &formatted,
-                original_pos,
-                mapped_cursor,
-            );
-
-            if select_formatted {
-                let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
-                buffer.select(start as i32, selection_end as i32);
+                buffer.select(start, selection_end.min(i32::MAX as usize) as i32);
+                editor.set_insert_position(mapped_cursor.min(i32::MAX as usize) as i32);
+                editor.show_insert_position();
+                return;
             }
-            editor.set_insert_position(mapped_cursor.min(i32::MAX as usize) as i32);
-            editor.show_insert_position();
+        }
+
+        let full_text = buffer.text();
+        let formatted =
+            Self::format_for_auto_formatting_with_db_type(&full_text, false, preferred_db_type);
+        if formatted == full_text {
             return;
         }
 
-        buffer.replace(start as i32, end as i32, &formatted);
+        let mut editor = self.editor.clone();
+        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
+        let mapped_cursor = Self::map_cursor_after_format_with_policy_for_db_type(
+            &full_text,
+            &formatted,
+            original_pos as i32,
+            false,
+            preferred_db_type,
+        ) as usize;
 
-        if select_formatted {
-            let original_within_selection =
-                (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
-            let mapped_within_selection = Self::map_cursor_after_format_with_policy_for_db_type(
-                &source,
-                &formatted,
-                original_within_selection,
-                true,
-                preferred_db_type,
-            );
-            let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
-            let mapped_cursor =
-                start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
-            buffer.select(start as i32, selection_end as i32);
-            editor.set_insert_position(mapped_cursor as i32);
-        } else {
-            let new_pos = Self::map_cursor_after_format_with_policy_for_db_type(
-                &source,
-                &formatted,
-                original_pos as i32,
-                false,
-                preferred_db_type,
-            );
-            editor.set_insert_position(new_pos);
-        }
+        let _suppress_callbacks = self.suppress_buffer_callbacks();
+        buffer.set_text(&formatted);
+        self.invalidate_intellisense_after_buffer_edit();
+        self.handle_buffer_highlight_update_with_known_inserted_text(
+            &buffer,
+            0,
+            formatted.len().min(i32::MAX as usize) as i32,
+            full_text.len().min(i32::MAX as usize) as i32,
+            &formatted,
+            &full_text,
+        );
+        self.record_full_buffer_programmatic_replace(
+            full_text,
+            formatted,
+            original_pos,
+            mapped_cursor,
+        );
+        editor.set_insert_position(mapped_cursor.min(i32::MAX as usize) as i32);
         editor.show_insert_position();
     }
 
