@@ -3141,6 +3141,19 @@ fn encode_fltk_style_bytes_zeroes_utf8_continuations() {
 }
 
 #[test]
+fn encode_fltk_style_bytes_ascii_fast_path_preserves_bytes() {
+    let text = "SELECT col FROM dual";
+    let logical = std::iter::repeat_n(STYLE_KEYWORD, text.len()).collect::<String>();
+    let encoded = encode_fltk_style_bytes(text, &logical).unwrap_or_default();
+
+    assert_eq!(encoded, logical.into_bytes());
+    assert_eq!(
+        encode_repeated_fltk_style_bytes(text, STYLE_COMMENT),
+        vec![STYLE_COMMENT as u8; text.len()]
+    );
+}
+
+#[test]
 fn encoded_style_bytes_preserve_utf8_byte_length_after_multibyte_edit() {
     let original = "SELECT '가'";
     let insert_pos = original.find('가').unwrap_or(0);

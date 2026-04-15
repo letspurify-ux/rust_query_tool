@@ -1913,6 +1913,9 @@ pub(crate) fn encode_fltk_style_bytes(text: &str, logical_styles: &str) -> Optio
     if text.len() != logical_styles.len() {
         return None;
     }
+    if text.is_ascii() {
+        return Some(logical_styles.as_bytes().to_vec());
+    }
 
     let logical_bytes = logical_styles.as_bytes();
     let mut encoded = Vec::with_capacity(text.len());
@@ -1926,6 +1929,10 @@ pub(crate) fn encode_fltk_style_bytes(text: &str, logical_styles: &str) -> Optio
 }
 
 pub(crate) fn encode_repeated_fltk_style_bytes(text: &str, style: char) -> Vec<u8> {
+    if text.is_ascii() {
+        return vec![style as u8; text.len()];
+    }
+
     let mut encoded = Vec::with_capacity(text.len());
     for (_, ch) in text.char_indices() {
         encoded.push(style as u8);

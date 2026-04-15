@@ -3146,35 +3146,133 @@ fn leading_identifier_words(line: &str, max_identifiers: usize) -> Vec<&str> {
     identifiers
 }
 
+fn next_identifier_word_segment<'a>(word: &'a str, idx: &mut usize) -> Option<&'a str> {
+    let bytes = word.as_bytes();
+
+    while *idx < bytes.len() && bytes[*idx] == b'_' {
+        *idx = idx.saturating_add(1);
+    }
+    if *idx >= bytes.len() {
+        return None;
+    }
+
+    let start = *idx;
+    while *idx < bytes.len() && bytes[*idx] != b'_' {
+        *idx = idx.saturating_add(1);
+    }
+
+    word.get(start..*idx)
+}
+
+fn identifier_segment_count(word: &str) -> usize {
+    let bytes = word.as_bytes();
+    let mut idx = 0usize;
+    let mut count = 0usize;
+
+    while idx < bytes.len() {
+        while idx < bytes.len() && bytes[idx] == b'_' {
+            idx = idx.saturating_add(1);
+        }
+        if idx >= bytes.len() {
+            break;
+        }
+
+        count = count.saturating_add(1);
+        while idx < bytes.len() && bytes[idx] != b'_' {
+            idx = idx.saturating_add(1);
+        }
+    }
+
+    count
+}
+
+fn next_identifier_sequence_segment<'a>(
+    sequence: &'a [&'a str],
+    word_idx: &mut usize,
+    segment_idx: &mut usize,
+) -> Option<&'a str> {
+    while *word_idx < sequence.len() {
+        if let Some(segment) = next_identifier_word_segment(sequence[*word_idx], segment_idx) {
+            return Some(segment);
+        }
+
+        *word_idx = word_idx.saturating_add(1);
+        *segment_idx = 0;
+    }
+
+    None
+}
+
 fn identifier_sequence_segment_count(sequence: &[&str]) -> usize {
-    sequence
-        .iter()
-        .map(|word| {
-            word.split('_')
-                .filter(|segment| !segment.is_empty())
-                .count()
-        })
-        .sum()
+    sequence.iter().map(|word| identifier_segment_count(word)).sum()
 }
 
 fn identifier_word_matches_keyword_sequence(words: &[&str], sequence: &[&str]) -> bool {
-    let mut expected_segments = sequence
-        .iter()
-        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()));
+    let mut expected_word_idx = 0usize;
+    let mut expected_segment_idx = 0usize;
 
-    for segment in words
-        .iter()
-        .flat_map(|word| word.split('_').filter(|segment| !segment.is_empty()))
-    {
-        let Some(expected) = expected_segments.next() else {
+    for word in words {
+        let mut actual_segment_idx = 0usize;
+        while let Some(segment) = next_identifier_word_segment(word, &mut actual_segment_idx) {
+            let Some(expected) = next_identifier_sequence_segment(
+                sequence,
+                &mut expected_word_idx,
+                &mut expected_segment_idx,
+            ) else {
+                return false;
+            };
+            if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+                return false;
+            }
+        }
+    }
+
+    next_identifier_sequence_segment(sequence, &mut expected_word_idx, &mut expected_segment_idx)
+        .is_none()
+}
+
+fn identifier_words_start_with_sequence(words: &[&str], sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return true;
+    }
+
+    let expected_segment_count = identifier_sequence_segment_count(sequence);
+    let mut end_idx = 0usize;
+    let mut consumed_segments = 0usize;
+
+    while end_idx < words.len() && consumed_segments < expected_segment_count {
+        let identifier_segment_count = identifier_segment_count(words[end_idx]);
+        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
+        if consumed_segments > expected_segment_count {
             return false;
-        };
-        if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+        }
+        end_idx = end_idx.saturating_add(1);
+    }
+
+    consumed_segments == expected_segment_count
+        && identifier_word_matches_keyword_sequence(&words[..end_idx], sequence)
+}
+
+fn identifier_words_end_with_sequence(words: &[&str], sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return true;
+    }
+
+    let expected_segment_count = identifier_sequence_segment_count(sequence);
+    let mut start_idx = words.len();
+    let mut consumed_segments = 0usize;
+
+    while start_idx > 0 && consumed_segments < expected_segment_count {
+        start_idx = start_idx.saturating_sub(1);
+        let identifier_segment_count = identifier_segment_count(words[start_idx]);
+        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
+        if consumed_segments > expected_segment_count {
             return false;
         }
     }
 
-    expected_segments.next().is_none()
+    consumed_segments == expected_segment_count
+        && identifier_word_matches_keyword_sequence(&words[start_idx..], sequence)
 }
 
 fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
@@ -3183,24 +3281,73 @@ fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     }
 
     let expected_segment_count = identifier_sequence_segment_count(sequence);
-    let identifiers = leading_identifier_words(line, expected_segment_count);
-    let mut consumed_identifiers = 0usize;
-    let mut consumed_segments = 0usize;
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut matched_segments = 0usize;
+    let mut expected_word_idx = 0usize;
+    let mut expected_segment_idx = 0usize;
 
-    while consumed_identifiers < identifiers.len() && consumed_segments < expected_segment_count {
-        let identifier_segment_count = identifiers[consumed_identifiers]
-            .split('_')
-            .filter(|segment| !segment.is_empty())
-            .count();
-        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
-        if consumed_segments > expected_segment_count {
+    while idx < bytes.len() && matched_segments < expected_segment_count {
+        while idx < bytes.len() {
+            let current = bytes[idx];
+            let next = bytes.get(idx.saturating_add(1)).copied();
+            if current.is_ascii_whitespace() {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if sql_line_comment_prefix_len(bytes, idx).is_some() {
+                return false;
+            }
+            if current == b'/' && next == Some(b'*') {
+                idx = idx.saturating_add(2);
+                let mut closed_comment = false;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        idx = idx.saturating_add(2);
+                        closed_comment = true;
+                        break;
+                    }
+                    idx = idx.saturating_add(1);
+                }
+                if !closed_comment {
+                    return false;
+                }
+                continue;
+            }
+            break;
+        }
+
+        if idx >= bytes.len() || !is_identifier_start_byte(bytes[idx]) {
             return false;
         }
-        consumed_identifiers = consumed_identifiers.saturating_add(1);
+
+        let start = idx;
+        idx = idx.saturating_add(1);
+        while idx < bytes.len() && is_identifier_byte(bytes[idx]) {
+            idx = idx.saturating_add(1);
+        }
+
+        let Some(identifier) = line.get(start..idx) else {
+            return false;
+        };
+
+        let mut actual_segment_idx = 0usize;
+        while let Some(segment) = next_identifier_word_segment(identifier, &mut actual_segment_idx) {
+            let Some(expected) = next_identifier_sequence_segment(
+                sequence,
+                &mut expected_word_idx,
+                &mut expected_segment_idx,
+            ) else {
+                return false;
+            };
+            if !segment.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
+                return false;
+            }
+            matched_segments = matched_segments.saturating_add(1);
+        }
     }
 
-    consumed_segments == expected_segment_count
-        && identifier_word_matches_keyword_sequence(&identifiers[..consumed_identifiers], sequence)
+    matched_segments == expected_segment_count
 }
 
 fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
@@ -3255,7 +3402,8 @@ fn line_has_exact_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
             return false;
         };
 
-        for segment in identifier.split('_').filter(|segment| !segment.is_empty()) {
+        let mut segment_idx = 0usize;
+        while let Some(segment) = next_identifier_word_segment(identifier, &mut segment_idx) {
             let Some(expected) = expected_segments.get(matched_segments) else {
                 return false;
             };
@@ -3362,7 +3510,8 @@ fn line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(
             return false;
         };
 
-        for segment in identifier.split('_').filter(|segment| !segment.is_empty()) {
+        let mut segment_idx = 0usize;
+        while let Some(segment) = next_identifier_word_segment(identifier, &mut segment_idx) {
             let Some(expected) = expected_segments.get(matched_segments) else {
                 return false;
             };
@@ -4779,10 +4928,7 @@ fn leading_words_match_keyword_prefix(words: &[&str], sequence: &[&str]) -> usiz
         let mut consumed_segments = 0usize;
 
         while candidate_end < words.len() && consumed_segments < expected_segment_count {
-            let identifier_segment_count = words[candidate_end]
-                .split('_')
-                .filter(|segment| !segment.is_empty())
-                .count();
+            let identifier_segment_count = identifier_segment_count(words[candidate_end]);
             consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
             if consumed_segments > expected_segment_count {
                 return matched_sequence_words;
@@ -4871,11 +5017,7 @@ impl FormatIndentedParenOwnerKind {
         let line_word_count = words.len();
         let line_segment_count = words
             .iter()
-            .map(|word| {
-                word.split('_')
-                    .filter(|segment| !segment.is_empty())
-                    .count()
-            })
+            .map(|word| identifier_segment_count(word))
             .sum::<usize>();
         let mut best_match = None;
         let mut best_matched_words = 0usize;
@@ -5540,6 +5682,51 @@ pub(crate) fn starts_with_format_match_recognize_subclause(text_upper: &str) -> 
     FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header(text_upper)
 }
 
+fn identifier_words_end_with_pivot_owner(words: &[&str]) -> bool {
+    identifier_words_end_with_sequence(words, &["PIVOT"])
+        || identifier_words_end_with_sequence(words, &["PIVOT", "XML"])
+}
+
+fn identifier_words_end_with_unpivot_owner(words: &[&str]) -> bool {
+    identifier_words_end_with_sequence(words, &["UNPIVOT"])
+        || identifier_words_end_with_sequence(words, &["UNPIVOT", "INCLUDE", "NULLS"])
+        || identifier_words_end_with_sequence(words, &["UNPIVOT", "EXCLUDE", "NULLS"])
+}
+
+pub(crate) fn format_indented_paren_owner_kind_from_words(
+    words: &[&str],
+) -> Option<FormatIndentedParenOwnerKind> {
+    let first_word = words.first().copied()?;
+    let second_word = words.get(1).copied();
+    let third_word = words.get(2).copied();
+
+    if identifier_words_end_with_sequence(words, &["OVER"]) {
+        Some(FormatIndentedParenOwnerKind::AnalyticOver)
+    } else if identifier_words_end_with_sequence(words, &["WITHIN", "GROUP"]) {
+        Some(FormatIndentedParenOwnerKind::WithinGroup)
+    } else if identifier_words_end_with_sequence(words, &["KEEP"]) {
+        Some(FormatIndentedParenOwnerKind::Keep)
+    } else if FormatIndentedParenOwnerKind::ModelSubclause
+        .starts_body_header_words(first_word, second_word, third_word)
+    {
+        Some(FormatIndentedParenOwnerKind::ModelSubclause)
+    } else if identifier_words_start_with_sequence(words, &["WINDOW"])
+        && identifier_words_end_with_sequence(words, &["AS"])
+    {
+        Some(FormatIndentedParenOwnerKind::Window)
+    } else if identifier_words_end_with_sequence(words, &["MATCH_RECOGNIZE"]) {
+        Some(FormatIndentedParenOwnerKind::MatchRecognize)
+    } else if identifier_words_end_with_pivot_owner(words) {
+        Some(FormatIndentedParenOwnerKind::Pivot)
+    } else if identifier_words_end_with_unpivot_owner(words) {
+        Some(FormatIndentedParenOwnerKind::Unpivot)
+    } else if identifier_words_end_with_sequence(words, &["COLUMNS"]) {
+        Some(FormatIndentedParenOwnerKind::StructuredColumns)
+    } else {
+        None
+    }
+}
+
 /// Returns the structured formatter owner kind when `line` ends on the owner
 /// header token itself and the parenthesized body starts on a later line.
 pub(crate) fn format_indented_paren_owner_header_kind(
@@ -5849,10 +6036,7 @@ fn line_ends_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
 
     while start_idx > 0 && consumed_segments < expected_segment_count {
         start_idx = start_idx.saturating_sub(1);
-        let identifier_segment_count = trailing_identifiers[start_idx]
-            .split('_')
-            .filter(|segment| !segment.is_empty())
-            .count();
+        let identifier_segment_count = identifier_segment_count(trailing_identifiers[start_idx]);
         consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
         if consumed_segments > expected_segment_count {
             return false;
@@ -9770,6 +9954,46 @@ mod tests {
             format_indented_paren_owner_header_kind(
                 "SELECT LISTAGG (xr.flag_txt, ', ') WITHIN GROUP (ORDER BY xr.flag_txt)"
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn format_indented_paren_owner_kind_from_words_covers_hot_path_owner_heads() {
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["SUM", "OVER"]),
+            Some(FormatIndentedParenOwnerKind::AnalyticOver)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["WITHIN", "GROUP"]),
+            Some(FormatIndentedParenOwnerKind::WithinGroup)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["KEEP"]),
+            Some(FormatIndentedParenOwnerKind::Keep)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["WINDOW", "w_dept", "AS"]),
+            Some(FormatIndentedParenOwnerKind::Window)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["MATCH_RECOGNIZE"]),
+            Some(FormatIndentedParenOwnerKind::MatchRecognize)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["FROM", "src", "PIVOT"]),
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["RULES", "UPDATE"]),
+            Some(FormatIndentedParenOwnerKind::ModelSubclause)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["NESTED", "PATH", "COLUMNS"]),
+            Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        );
+        assert_eq!(
+            format_indented_paren_owner_kind_from_words(&["deptno"]),
             None
         );
     }

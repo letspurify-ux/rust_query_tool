@@ -343,6 +343,51 @@ impl SqlEditorWidget {
 
         let mut editor = self.editor.clone();
         let original_pos = Self::normalize_index(&full_text, editor.insert_position());
+        let full_range_replace = start == 0 && end == full_text.len();
+
+        if full_range_replace {
+            let mapped_cursor = if select_formatted {
+                let original_within_selection =
+                    (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
+                let mapped_within_selection = Self::map_cursor_after_format_with_policy_for_db_type(
+                    &source,
+                    &formatted,
+                    original_within_selection,
+                    true,
+                    preferred_db_type,
+                );
+                start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize)
+            } else {
+                Self::map_cursor_after_format_with_policy_for_db_type(
+                    &source,
+                    &formatted,
+                    original_pos as i32,
+                    false,
+                    preferred_db_type,
+                ) as usize
+            };
+
+            let _suppress_callbacks = self.suppress_buffer_callbacks();
+            buffer.set_text(&formatted);
+            self.invalidate_intellisense_after_buffer_edit();
+            self.rehighlight_full_buffer();
+            self.record_programmatic_buffer_edit(
+                start,
+                &source,
+                &formatted,
+                original_pos,
+                mapped_cursor,
+            );
+
+            if select_formatted {
+                let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
+                buffer.select(start as i32, selection_end as i32);
+            }
+            editor.set_insert_position(mapped_cursor.min(i32::MAX as usize) as i32);
+            editor.show_insert_position();
+            return;
+        }
+
         buffer.replace(start as i32, end as i32, &formatted);
 
         if select_formatted {

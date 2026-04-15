@@ -141,6 +141,16 @@ fn store_mutex_bool(flag: &Arc<Mutex<bool>>, value: bool) {
     }
 }
 
+struct BufferCallbackSuppressionGuard {
+    flag: Arc<Mutex<bool>>,
+}
+
+impl Drop for BufferCallbackSuppressionGuard {
+    fn drop(&mut self) {
+        store_mutex_bool(&self.flag, false);
+    }
+}
+
 fn load_mutex_i32_option(slot: &Arc<Mutex<Option<i32>>>) -> Option<i32> {
     match slot.lock() {
         Ok(guard) => *guard,
@@ -363,6 +373,7 @@ pub struct SqlEditorWidget {
     history_original: Arc<Mutex<Option<String>>>,
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Arc<Mutex<bool>>,
+    suppress_buffer_callbacks: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
 }
@@ -377,6 +388,21 @@ impl SqlEditorWidget {
         static STATE: OnceLock<Arc<Mutex<PendingAlertState>>> = OnceLock::new();
         STATE.get_or_init(|| Arc::new(Mutex::new(PendingAlertState::default())))
     }
+
+    fn suppress_buffer_callbacks(&self) -> BufferCallbackSuppressionGuard {
+        store_mutex_bool(&self.suppress_buffer_callbacks, true);
+        BufferCallbackSuppressionGuard {
+            flag: self.suppress_buffer_callbacks.clone(),
+        }
+    }
+
+    fn invalidate_intellisense_after_buffer_edit(&self) {
+        self.intellisense_runtime.next_buffer_revision();
+        self.intellisense_runtime.next_parse_generation();
+        self.intellisense_runtime.clear_parse_cache();
+        self.intellisense_runtime.clear_routine_symbol_cache();
+    }
+
     fn schedule_alert_pump(delay_seconds: f64) {
         app::add_timeout3(delay_seconds, move |_| {
             SqlEditorWidget::drain_pending_alerts();
@@ -697,6 +723,7 @@ impl SqlEditorWidget {
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Arc::new(Mutex::new(false));
+        let suppress_buffer_callbacks = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
 
@@ -730,6 +757,7 @@ impl SqlEditorWidget {
             history_original,
             history_navigation_entries,
             applying_history_navigation,
+            suppress_buffer_callbacks,
             undo_redo_state,
             preferred_insert_position,
         };
@@ -2297,6 +2325,26 @@ mod execution_state_tests {
             ]
         );
         assert_eq!(state.index, 2);
+    }
+
+    #[test]
+    fn record_programmatic_edit_preserves_explicit_cursor_mapping() {
+        let mut state = WordUndoRedoState::new("select  1".to_string());
+
+        state.record_programmatic_edit(&build_edit(0, "select  1", "SELECT 1"), 8, 7);
+
+        assert_eq!(
+            state.history_texts(),
+            vec!["select  1".to_string(), "SELECT 1".to_string()]
+        );
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[0].cursor_pos, 9);
+        assert_eq!(snapshots[1].cursor_pos, 7);
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 1);
+        assert_eq!(undo_group[0].before_cursor, 8);
+        assert_eq!(undo_group[0].after_cursor, 7);
     }
 }
 

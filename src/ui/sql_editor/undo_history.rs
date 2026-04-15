@@ -385,6 +385,65 @@ impl WordUndoRedoState {
         self.trim_history_if_needed();
     }
 
+    fn record_programmatic_edit(
+        &mut self,
+        edit: &BufferEdit,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) {
+        self.normalize_index();
+        self.truncate_redo_history();
+
+        let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
+        let deleted_text = self
+            .current
+            .text
+            .get(replace_start..replace_end)
+            .map(|text| text.to_string())
+            .unwrap_or_else(String::new);
+        let normalized_edit = BufferEdit {
+            start: replace_start,
+            deleted_len: replace_end.saturating_sub(replace_start),
+            inserted_text: edit.inserted_text.clone(),
+            deleted_text,
+        };
+        let before_cursor = Self::clamp_to_char_boundary(
+            &self.current.text,
+            before_cursor.min(self.current.text.len()),
+        );
+        let group_id = self.next_group_id();
+
+        Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
+        let after_cursor =
+            Self::clamp_to_char_boundary(&self.current.text, after_cursor.min(self.current.text.len()));
+        self.current.cursor_pos = after_cursor;
+
+        let delta = UndoDelta {
+            start: replace_start,
+            deleted_text: normalized_edit.deleted_text.clone(),
+            inserted_text: normalized_edit.inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = Some((
+            EditGroup {
+                granularity: EditGranularity::Other,
+                operation: EditOperation::Replace,
+            },
+            group_id,
+        ));
+        self.trim_history_if_needed();
+    }
+
     #[cfg(test)]
     fn record_snapshot(&mut self, current_text: String, edit_group: EditGroup) {
         self.normalize_index();
@@ -520,10 +579,14 @@ impl SqlEditorWidget {
     fn setup_word_undo_redo(&self) {
         let undo_state = self.undo_redo_state.clone();
         let applying_history_navigation = self.applying_history_navigation.clone();
+        let suppress_buffer_callbacks = self.suppress_buffer_callbacks.clone();
         let text_shadow = self.highlight_shadow.clone();
         let mut buffer = self.buffer.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             if ins <= 0 && del <= 0 {
+                return;
+            }
+            if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }
 
@@ -552,6 +615,30 @@ impl SqlEditorWidget {
             };
             state.record_edit(&edit, edit_group);
         });
+    }
+
+    fn record_programmatic_buffer_edit(
+        &self,
+        start: usize,
+        deleted_text: &str,
+        inserted_text: &str,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) {
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_programmatic_edit(
+            &BufferEdit {
+                start,
+                deleted_len: deleted_text.len(),
+                inserted_text: inserted_text.to_string(),
+                deleted_text: deleted_text.to_string(),
+            },
+            before_cursor,
+            after_cursor,
+        );
     }
 
     fn reset_word_undo_state(undo_redo_state: &Arc<Mutex<WordUndoRedoState>>) {

@@ -233,8 +233,12 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let widget = self.clone();
         let intellisense_runtime = self.intellisense_runtime.clone();
+        let suppress_buffer_callbacks = self.suppress_buffer_callbacks.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             if ins <= 0 && del <= 0 {
+                return;
+            }
+            if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }
             intellisense_runtime.next_buffer_revision();

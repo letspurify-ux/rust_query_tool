@@ -12945,9 +12945,7 @@ impl SqlEditorWidget {
         }
 
         preceding_words.reverse();
-        let mut candidate = preceding_words.join(" ");
-        candidate.push_str(" (");
-        crate::sql_text::format_indented_paren_owner_kind(&candidate)
+        crate::sql_text::format_indented_paren_owner_kind_from_words(&preceding_words)
     }
 
     fn matching_close_paren_index(
