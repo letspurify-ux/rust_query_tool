@@ -473,7 +473,7 @@ impl SqlEditorWidget {
             return;
         }
         let mut style_buffer = self.style_buffer.clone();
-        Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, &inserted_text, del);
+        Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, inserted_text, del);
         if style_buffer.length().max(0) as usize != text_len {
             self.rehighlight_full_buffer();
             return;
@@ -501,7 +501,7 @@ impl SqlEditorWidget {
             }
 
             let shadow_pos = pos.max(0) as usize;
-            if !shadow.apply_edit(shadow_pos, &inserted_text, del.max(0) as usize) {
+            if !shadow.apply_edit(shadow_pos, inserted_text, del.max(0) as usize) {
                 drop(shadow);
                 self.rehighlight_full_buffer();
                 return;
