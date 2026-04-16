@@ -2179,14 +2179,14 @@ impl FormatFrameStack {
                     self.block_depth = self.block_depth.saturating_sub(1);
                     self.last_block_frame_id_cache = frame.previous_block_frame_id;
                     self.last_block_frame_idx = frame.previous_block_frame_idx;
-                    debug_assert_eq!(
-                        self.block_kind_frame_indices[frame.kind.index()].pop(),
-                        Some(popped_idx)
-                    );
+                    let popped_block_kind_idx =
+                        self.block_kind_frame_indices[frame.kind.index()].pop();
+                    debug_assert_eq!(popped_block_kind_idx, Some(popped_idx));
                     self.base_indent_level = frame.previous_base_indent_level;
                 }
                 FormatFrame::QueryRuntime(_) => {
-                    debug_assert_eq!(self.query_runtime_frame_indices.pop(), Some(popped_idx));
+                    let popped_query_runtime_idx = self.query_runtime_frame_indices.pop();
+                    debug_assert_eq!(popped_query_runtime_idx, Some(popped_idx));
                     self.current_runtime_state = self
                         .query_runtime_frame_indices
                         .last()
@@ -2197,31 +2197,30 @@ impl FormatFrameStack {
                         .unwrap_or_default();
                 }
                 FormatFrame::ScopedIndent(frame) => {
-                    debug_assert_eq!(
-                        self.scoped_indent_frame_indices[frame.kind.index()].pop(),
-                        Some(popped_idx)
-                    );
+                    let popped_scoped_indent_idx =
+                        self.scoped_indent_frame_indices[frame.kind.index()].pop();
+                    debug_assert_eq!(popped_scoped_indent_idx, Some(popped_idx));
                     self.base_indent_level = self.base_indent_level.saturating_sub(frame.delta);
                 }
                 FormatFrame::ConstructFlag(frame) => {
                     if frame.active {
                         let scopes = &mut self.construct_flag_scopes[frame.kind.index()];
-                        debug_assert_eq!(scopes.pop(), Some(frame.scope));
+                        let popped_scope = scopes.pop();
+                        debug_assert_eq!(popped_scope, Some(frame.scope));
                         let frame_indices = &mut self.construct_flag_frame_indices[frame.kind.index()];
-                        debug_assert_eq!(frame_indices.pop(), Some(popped_idx));
+                        let popped_frame_idx = frame_indices.pop();
+                        debug_assert_eq!(popped_frame_idx, Some(popped_idx));
                     }
                 }
                 FormatFrame::ConstructValue(frame) => {
-                    debug_assert_eq!(
-                        self.construct_value_frame_indices[frame.kind.index()].pop(),
-                        Some(popped_idx)
-                    );
+                    let popped_construct_value_idx =
+                        self.construct_value_frame_indices[frame.kind.index()].pop();
+                    debug_assert_eq!(popped_construct_value_idx, Some(popped_idx));
                 }
                 FormatFrame::ConditionOwner(frame) => {
-                    debug_assert_eq!(
-                        self.condition_owner_frame_indices[frame.kind.index()].pop(),
-                        Some(popped_idx)
-                    );
+                    let popped_condition_owner_idx =
+                        self.condition_owner_frame_indices[frame.kind.index()].pop();
+                    debug_assert_eq!(popped_condition_owner_idx, Some(popped_idx));
                 }
                 FormatFrame::PendingSplitEndSuffix(_) => {
                     debug_assert_eq!(self.pending_split_end_suffix_frame_idx, Some(popped_idx));
@@ -2239,16 +2238,20 @@ impl FormatFrameStack {
                     self.mysql_handler_pending_body_indent_frame_idx = None;
                 }
                 FormatFrame::TriggerHeader(_) => {
-                    debug_assert_eq!(self.trigger_header_frame_indices.pop(), Some(popped_idx));
+                    let popped_trigger_header_idx = self.trigger_header_frame_indices.pop();
+                    debug_assert_eq!(popped_trigger_header_idx, Some(popped_idx));
                 }
                 FormatFrame::PlsqlContext(_) => {
-                    debug_assert_eq!(self.plsql_context_frame_indices.pop(), Some(popped_idx));
+                    let popped_plsql_context_idx = self.plsql_context_frame_indices.pop();
+                    debug_assert_eq!(popped_plsql_context_idx, Some(popped_idx));
                 }
                 FormatFrame::CompoundTrigger(_) => {
-                    debug_assert_eq!(self.compound_trigger_frame_indices.pop(), Some(popped_idx));
+                    let popped_compound_trigger_idx = self.compound_trigger_frame_indices.pop();
+                    debug_assert_eq!(popped_compound_trigger_idx, Some(popped_idx));
                 }
                 FormatFrame::WithCte(_) => {
-                    debug_assert_eq!(self.with_cte_frame_indices.pop(), Some(popped_idx));
+                    let popped_with_cte_idx = self.with_cte_frame_indices.pop();
+                    debug_assert_eq!(popped_with_cte_idx, Some(popped_idx));
                 }
                 FormatFrame::BetweenPending(_)
                 | FormatFrame::OpenCursorRestore(_) => {}
@@ -2945,10 +2948,8 @@ impl FormatFrameStack {
         if current_kind == kind {
             return true;
         }
-        debug_assert_eq!(
-            self.block_kind_frame_indices[current_kind.index()].pop(),
-            Some(idx)
-        );
+        let popped_block_kind_idx = self.block_kind_frame_indices[current_kind.index()].pop();
+        debug_assert_eq!(popped_block_kind_idx, Some(idx));
         self.block_kind_frame_indices[kind.index()].push(idx);
         match self.frames.get_mut(idx) {
             Some(FormatFrame::Block(frame)) => {
