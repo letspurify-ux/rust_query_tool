@@ -177,6 +177,7 @@ pub(crate) fn line_starts_with_consumed_slash_terminator(line: &str) -> bool {
 pub(crate) struct SqlParserEngine {
     pub(crate) state: SplitState,
     current: String,
+    current_has_non_whitespace: bool,
     statements: Vec<String>,
     scratch_chars: Vec<char>,
     preview_identifier_upper_buf: String,
@@ -187,6 +188,7 @@ impl SqlParserEngine {
         Self {
             state: SplitState::default(),
             current: String::new(),
+            current_has_non_whitespace: false,
             statements: Vec::new(),
             scratch_chars: Vec::new(),
             preview_identifier_upper_buf: String::new(),
@@ -206,7 +208,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn current_is_empty(&self) -> bool {
-        self.current.trim().is_empty()
+        !self.current_has_non_whitespace
     }
 
     /// Returns `true` when the accumulated statement text contains an
@@ -241,12 +243,34 @@ impl SqlParserEngine {
         self.state.prepare_splitter_line_boundary(line);
     }
 
+    #[inline]
+    fn append_current_char(&mut self, ch: char) {
+        if !ch.is_whitespace() {
+            self.current_has_non_whitespace = true;
+        }
+        self.current.push(ch);
+    }
+
+    #[inline]
+    fn append_current_str(&mut self, text: &str) {
+        if !self.current_has_non_whitespace && text.chars().any(|ch| !ch.is_whitespace()) {
+            self.current_has_non_whitespace = true;
+        }
+        self.current.push_str(text);
+    }
+
+    #[inline]
+    fn clear_current(&mut self) {
+        self.current.clear();
+        self.current_has_non_whitespace = false;
+    }
+
     fn push_current_statement(&mut self) {
         let trimmed = self.current.trim();
         if !trimmed.is_empty() {
             self.statements.push(trimmed.to_string());
         }
-        self.current.clear();
+        self.clear_current();
     }
 
     fn finish_current_statement(&mut self) {
@@ -257,7 +281,7 @@ impl SqlParserEngine {
     fn apply_semicolon_action(&mut self, action: SemicolonAction, semicolon: char) {
         match action {
             SemicolonAction::AppendToCurrent => {
-                self.current.push(semicolon);
+                self.append_current_char(semicolon);
             }
             SemicolonAction::SplitTopLevel => {
                 self.finish_current_statement();
@@ -267,7 +291,7 @@ impl SqlParserEngine {
                 self.state.block_stack.clear();
             }
             SemicolonAction::CloseRoutineBlock => {
-                self.current.push(semicolon);
+                self.append_current_char(semicolon);
                 self.state.close_external_routine_on_semicolon();
             }
         }
@@ -464,7 +488,7 @@ impl SqlParserEngine {
             // ---- Dispatch on LexMode (replaces 6 if-chains) ----
             match &self.state.lex_mode {
                 LexMode::LineComment => {
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if c == '\n' {
                         self.state.lex_mode = LexMode::Idle;
                     }
@@ -472,9 +496,9 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::BlockComment => {
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if c == '*' && next == Some('/') {
-                        self.current.push('/');
+                        self.append_current_char('/');
                         self.state.lex_mode = LexMode::Idle;
                         i += 2;
                         continue;
@@ -490,7 +514,7 @@ impl SqlParserEngine {
                         {
                             if nested_end_char == end_char {
                                 for k in 0..prefix_len {
-                                    self.current.push(chars[i + k]);
+                                    self.append_current_char(chars[i + k]);
                                 }
                                 self.state.lex_mode = LexMode::QQuote {
                                     end_char,
@@ -502,9 +526,9 @@ impl SqlParserEngine {
                         }
                     }
 
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if c == end_char && next == Some('\'') {
-                        self.current.push('\'');
+                        self.append_current_char('\'');
                         self.state.lex_mode = if depth == 1 {
                             LexMode::Idle
                         } else {
@@ -523,28 +547,28 @@ impl SqlParserEngine {
                     if c == '$' && chars_starts_with(chars, i, tag) {
                         let tag_len = tag.len();
                         for k in 0..tag_len {
-                            self.current.push(chars[i + k]);
+                            self.append_current_char(chars[i + k]);
                         }
                         self.state.lex_mode = LexMode::Idle;
                         i += tag_len;
                     } else {
-                        self.current.push(c);
+                        self.append_current_char(c);
                         i += 1;
                     }
                     continue;
                 }
                 LexMode::SingleQuote => {
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if self.state.mysql_mode {
                         if let Some(escaped) = next.filter(|_| c == '\\') {
-                            self.current.push(escaped);
+                            self.append_current_char(escaped);
                             i += 2;
                             continue;
                         }
                     }
                     if c == '\'' {
                         if next == Some('\'') {
-                            self.current.push('\'');
+                            self.append_current_char('\'');
                             i += 2;
                             continue;
                         }
@@ -554,17 +578,17 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::DoubleQuote => {
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if self.state.mysql_mode {
                         if let Some(escaped) = next.filter(|_| c == '\\') {
-                            self.current.push(escaped);
+                            self.append_current_char(escaped);
                             i += 2;
                             continue;
                         }
                     }
                     if c == '"' {
                         if next == Some('"') {
-                            self.current.push('"');
+                            self.append_current_char('"');
                             self.state.push_quoted_identifier_char('"');
                             i += 2;
                             continue;
@@ -584,10 +608,10 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::BacktickQuote => {
-                    self.current.push(c);
+                    self.append_current_char(c);
                     if c == '`' {
                         if next == Some('`') {
-                            self.current.push('`');
+                            self.append_current_char('`');
                             i += 2;
                             continue;
                         }
@@ -624,8 +648,8 @@ impl SqlParserEngine {
                     self.split_current_statement();
                 }
                 self.state.lex_mode = LexMode::LineComment;
-                self.current.push('-');
-                self.current.push('-');
+                self.append_current_char('-');
+                self.append_current_char('-');
                 i += 2;
                 continue;
             }
@@ -634,7 +658,7 @@ impl SqlParserEngine {
             if c == '#' && self.state.mysql_mode {
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::LineComment;
-                self.current.push('#');
+                self.append_current_char('#');
                 i += 1;
                 continue;
             }
@@ -649,8 +673,8 @@ impl SqlParserEngine {
                     self.split_current_statement();
                 }
                 self.state.lex_mode = LexMode::BlockComment;
-                self.current.push('/');
-                self.current.push('*');
+                self.append_current_char('/');
+                self.append_current_char('*');
                 i += 2;
                 continue;
             }
@@ -668,7 +692,7 @@ impl SqlParserEngine {
                             .observe_external_clause_literal_target(allow_implicit_target);
                         self.state.start_q_quote(delimiter);
                         for k in 0..q_prefix_len {
-                            self.current.push(chars[i + k]);
+                            self.append_current_char(chars[i + k]);
                         }
                         i += q_prefix_len;
                         continue;
@@ -697,7 +721,7 @@ impl SqlParserEngine {
                         .observe_external_clause_literal_target(allow_implicit_target);
                     self.state.lex_mode = LexMode::SingleQuote;
                     for k in 0..prefix_len {
-                        self.current.push(chars[i + k]);
+                        self.append_current_char(chars[i + k]);
                     }
                     i += prefix_len;
                     continue;
@@ -718,7 +742,7 @@ impl SqlParserEngine {
                         .observe_external_clause_literal_target(allow_implicit_target);
                     // Push tag chars to current before moving tag into lex_mode.
                     for k in 0..tag_len {
-                        self.current.push(chars[i + k]);
+                        self.append_current_char(chars[i + k]);
                     }
                     self.state.lex_mode = LexMode::DollarQuote { tag };
                     i += tag_len;
@@ -732,7 +756,7 @@ impl SqlParserEngine {
                 self.state
                     .observe_external_clause_literal_target(allow_implicit_target);
                 self.state.lex_mode = LexMode::SingleQuote;
-                self.current.push(c);
+                self.append_current_char(c);
                 i += 1;
                 continue;
             }
@@ -743,7 +767,7 @@ impl SqlParserEngine {
                     .consume_trigger_alias_subject_on_quoted_identifier();
                 self.state.begin_quoted_identifier();
                 self.state.lex_mode = LexMode::DoubleQuote;
-                self.current.push(c);
+                self.append_current_char(c);
                 i += 1;
                 continue;
             }
@@ -751,7 +775,7 @@ impl SqlParserEngine {
             if c == '`' {
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::BacktickQuote;
-                self.current.push(c);
+                self.append_current_char(c);
                 i += 1;
                 continue;
             }
@@ -762,7 +786,7 @@ impl SqlParserEngine {
                     self.state.token_prefixed_with_dollar = i > 0 && chars[i - 1] == '$';
                 }
                 self.state.token.push(c);
-                self.current.push(c);
+                self.append_current_char(c);
                 i += 1;
                 continue;
             }
@@ -862,7 +886,7 @@ impl SqlParserEngine {
                 continue;
             }
 
-            self.current.push(c);
+            self.append_current_char(c);
             i += 1;
         }
     }
@@ -917,7 +941,7 @@ impl SqlParserEngine {
         F: FnMut(&[char], usize, char, Option<char>),
         G: FnMut(&[char], usize),
     {
-        let line_started_with_empty_current = self.current.trim().is_empty();
+        let line_started_with_empty_current = self.current_is_empty();
         let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
             && self.state.with_clause_waiting_main_query()
             && self.state.block_depth() == 0
@@ -941,10 +965,10 @@ impl SqlParserEngine {
             && self.state.block_depth() == 0
             && self.state.paren_depth() == 0
             && !self.state.in_with_plsql_declaration()
-            && self.current.trim().is_empty();
+            && self.current_is_empty();
         if line_starts_at_statement_boundary && sql_text::is_auto_terminated_tool_command(line) {
-            self.current.push_str(line);
-            self.current.push('\n');
+            self.append_current_str(line);
+            self.append_current_char('\n');
             self.finish_current_statement();
             self.scratch_chars = scratch_chars;
             return;

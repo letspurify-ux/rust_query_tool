@@ -3234,50 +3234,6 @@ fn identifier_word_matches_keyword_sequence(words: &[&str], sequence: &[&str]) -
         .is_none()
 }
 
-fn identifier_words_start_with_sequence(words: &[&str], sequence: &[&str]) -> bool {
-    if sequence.is_empty() {
-        return true;
-    }
-
-    let expected_segment_count = identifier_sequence_segment_count(sequence);
-    let mut end_idx = 0usize;
-    let mut consumed_segments = 0usize;
-
-    while end_idx < words.len() && consumed_segments < expected_segment_count {
-        let identifier_segment_count = identifier_segment_count(words[end_idx]);
-        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
-        if consumed_segments > expected_segment_count {
-            return false;
-        }
-        end_idx = end_idx.saturating_add(1);
-    }
-
-    consumed_segments == expected_segment_count
-        && identifier_word_matches_keyword_sequence(&words[..end_idx], sequence)
-}
-
-fn identifier_words_end_with_sequence(words: &[&str], sequence: &[&str]) -> bool {
-    if sequence.is_empty() {
-        return true;
-    }
-
-    let expected_segment_count = identifier_sequence_segment_count(sequence);
-    let mut start_idx = words.len();
-    let mut consumed_segments = 0usize;
-
-    while start_idx > 0 && consumed_segments < expected_segment_count {
-        start_idx = start_idx.saturating_sub(1);
-        let identifier_segment_count = identifier_segment_count(words[start_idx]);
-        consumed_segments = consumed_segments.saturating_add(identifier_segment_count);
-        if consumed_segments > expected_segment_count {
-            return false;
-        }
-    }
-
-    consumed_segments == expected_segment_count
-        && identifier_word_matches_keyword_sequence(&words[start_idx..], sequence)
-}
-
 fn line_starts_with_identifier_sequence(line: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return true;
@@ -5686,17 +5642,6 @@ pub(crate) fn starts_with_format_match_recognize_subclause(text_upper: &str) -> 
     FormatIndentedParenOwnerKind::MatchRecognize.starts_body_header(text_upper)
 }
 
-fn identifier_words_end_with_pivot_owner(words: &[&str]) -> bool {
-    identifier_words_end_with_sequence(words, &["PIVOT"])
-        || identifier_words_end_with_sequence(words, &["PIVOT", "XML"])
-}
-
-fn identifier_words_end_with_unpivot_owner(words: &[&str]) -> bool {
-    identifier_words_end_with_sequence(words, &["UNPIVOT"])
-        || identifier_words_end_with_sequence(words, &["UNPIVOT", "INCLUDE", "NULLS"])
-        || identifier_words_end_with_sequence(words, &["UNPIVOT", "EXCLUDE", "NULLS"])
-}
-
 pub(crate) fn format_indented_paren_owner_kind_from_words(
     words: &[&str],
 ) -> Option<FormatIndentedParenOwnerKind> {
@@ -5704,11 +5649,17 @@ pub(crate) fn format_indented_paren_owner_kind_from_words(
     let second_word = words.get(1).copied();
     let third_word = words.get(2).copied();
 
-    if identifier_words_end_with_sequence(words, &["OVER"]) {
+    let last_word = words.last().copied()?;
+    let penultimate_word = words.iter().rev().nth(1).copied();
+    let third_from_end_word = words.iter().rev().nth(2).copied();
+
+    if last_word.eq_ignore_ascii_case("OVER") {
         Some(FormatIndentedParenOwnerKind::AnalyticOver)
-    } else if identifier_words_end_with_sequence(words, &["WITHIN", "GROUP"]) {
+    } else if last_word.eq_ignore_ascii_case("GROUP")
+        && penultimate_word.is_some_and(|word| word.eq_ignore_ascii_case("WITHIN"))
+    {
         Some(FormatIndentedParenOwnerKind::WithinGroup)
-    } else if identifier_words_end_with_sequence(words, &["KEEP"]) {
+    } else if last_word.eq_ignore_ascii_case("KEEP") {
         Some(FormatIndentedParenOwnerKind::Keep)
     } else if FormatIndentedParenOwnerKind::ModelSubclause.starts_body_header_words(
         first_word,
@@ -5716,17 +5667,25 @@ pub(crate) fn format_indented_paren_owner_kind_from_words(
         third_word,
     ) {
         Some(FormatIndentedParenOwnerKind::ModelSubclause)
-    } else if identifier_words_start_with_sequence(words, &["WINDOW"])
-        && identifier_words_end_with_sequence(words, &["AS"])
-    {
+    } else if first_word.eq_ignore_ascii_case("WINDOW") && last_word.eq_ignore_ascii_case("AS") {
         Some(FormatIndentedParenOwnerKind::Window)
-    } else if identifier_words_end_with_sequence(words, &["MATCH_RECOGNIZE"]) {
+    } else if last_word.eq_ignore_ascii_case("MATCH_RECOGNIZE") {
         Some(FormatIndentedParenOwnerKind::MatchRecognize)
-    } else if identifier_words_end_with_pivot_owner(words) {
+    } else if last_word.eq_ignore_ascii_case("PIVOT")
+        || (last_word.eq_ignore_ascii_case("XML")
+            && penultimate_word.is_some_and(|word| word.eq_ignore_ascii_case("PIVOT")))
+    {
         Some(FormatIndentedParenOwnerKind::Pivot)
-    } else if identifier_words_end_with_unpivot_owner(words) {
+    } else if last_word.eq_ignore_ascii_case("UNPIVOT")
+        || (last_word.eq_ignore_ascii_case("NULLS")
+            && penultimate_word
+                .is_some_and(|word| {
+                    word.eq_ignore_ascii_case("INCLUDE") || word.eq_ignore_ascii_case("EXCLUDE")
+                })
+            && third_from_end_word.is_some_and(|word| word.eq_ignore_ascii_case("UNPIVOT")))
+    {
         Some(FormatIndentedParenOwnerKind::Unpivot)
-    } else if identifier_words_end_with_sequence(words, &["COLUMNS"]) {
+    } else if last_word.eq_ignore_ascii_case("COLUMNS") {
         Some(FormatIndentedParenOwnerKind::StructuredColumns)
     } else {
         None

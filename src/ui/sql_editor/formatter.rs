@@ -14,6 +14,7 @@ use crate::ui::sql_depth::{
     apply_paren_token, split_top_level_keyword_groups, split_top_level_symbol_groups,
     ParenDepthState,
 };
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
 
@@ -104,6 +105,14 @@ fn statement_starts_with_alter_trigger_prefix(statement: &str) -> bool {
     matches!(words.as_slice(), [first, second] if first == "ALTER" && second == "TRIGGER")
 }
 
+fn ascii_uppercase_cow(text: &str) -> Cow<'_, str> {
+    if text.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        Cow::Owned(text.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct FormatItemStaticAnalysis {
     is_sqlplus_comment_line: bool,
@@ -165,59 +174,10 @@ struct FormatterTokenContext<'a> {
     immediate_next: Option<&'a SqlToken>,
     immediate_next_next: Option<&'a SqlToken>,
     next_non_comment_indices: [Option<usize>; 3],
-    next_non_comment_tokens: [Option<&'a SqlToken>; 3],
     next_word_indices: [Option<usize>; 3],
-    next_words: [Option<&'a str>; 3],
 }
 
 impl<'a> FormatterTokenContext<'a> {
-    fn from_statement_links(
-        tokens: &'a [SqlToken],
-        idx: usize,
-        meaningful_token_links: &MeaningfulTokenLinks,
-        statement_word_links: &StatementWordLinks,
-    ) -> Self {
-        let prev_non_comment_idx = meaningful_token_links.prev_index(idx);
-        let second_prev_non_comment_idx =
-            prev_non_comment_idx.and_then(|prev_idx| meaningful_token_links.prev_index(prev_idx));
-        let next_non_comment_indices = {
-            let first = meaningful_token_links.next_index(idx);
-            let second = first.and_then(|next_idx| meaningful_token_links.next_index(next_idx));
-            let third = second.and_then(|next_idx| meaningful_token_links.next_index(next_idx));
-            [first, second, third]
-        };
-        let next_non_comment_tokens = next_non_comment_indices
-            .map(|token_idx| token_idx.and_then(|next_idx| tokens.get(next_idx)));
-        let next_word_indices = {
-            let first = statement_word_links.next_word_index(idx);
-            let second = first.and_then(|next_idx| statement_word_links.next_word_index(next_idx));
-            let third = second.and_then(|next_idx| statement_word_links.next_word_index(next_idx));
-            [first, second, third]
-        };
-        let next_words = next_word_indices.map(|token_idx| {
-            token_idx
-                .and_then(|next_idx| tokens.get(next_idx))
-                .and_then(|token| match token {
-                    SqlToken::Word(word) => Some(word.as_str()),
-                    _ => None,
-                })
-        });
-
-        Self {
-            gap_from_prev_has_newline: false,
-            prev_non_comment_idx,
-            second_prev_non_comment_idx,
-            immediate_prev_prev: idx.checked_sub(2).and_then(|prev_idx| tokens.get(prev_idx)),
-            immediate_prev: idx.checked_sub(1).and_then(|prev_idx| tokens.get(prev_idx)),
-            immediate_next: tokens.get(idx.saturating_add(1)),
-            immediate_next_next: tokens.get(idx.saturating_add(2)),
-            next_non_comment_indices,
-            next_non_comment_tokens,
-            next_word_indices,
-            next_words,
-        }
-    }
-
     fn prev_non_comment_idx(self) -> Option<usize> {
         self.prev_non_comment_idx
     }
@@ -268,20 +228,147 @@ impl<'a> FormatterTokenContext<'a> {
         self.next_non_comment_indices[2]
     }
 
-    fn next_non_comment_token(self) -> Option<&'a SqlToken> {
-        self.next_non_comment_tokens[0]
+    fn next_non_comment_token(self, tokens: &'a [SqlToken]) -> Option<&'a SqlToken> {
+        self.next_non_comment_idx()
+            .and_then(|token_idx| tokens.get(token_idx))
     }
 
-    fn second_next_non_comment_token(self) -> Option<&'a SqlToken> {
-        self.next_non_comment_tokens[1]
+    fn second_next_non_comment_token(self, tokens: &'a [SqlToken]) -> Option<&'a SqlToken> {
+        self.second_next_non_comment_idx()
+            .and_then(|token_idx| tokens.get(token_idx))
     }
 
-    fn third_next_non_comment_token(self) -> Option<&'a SqlToken> {
-        self.next_non_comment_tokens[2]
+    fn third_next_non_comment_token(self, tokens: &'a [SqlToken]) -> Option<&'a SqlToken> {
+        self.third_next_non_comment_idx()
+            .and_then(|token_idx| tokens.get(token_idx))
     }
 
-    fn next_words(self, _tokens: &'a [SqlToken]) -> [Option<&'a str>; 3] {
-        self.next_words
+    fn next_words(self, tokens: &'a [SqlToken]) -> [Option<&'a str>; 3] {
+        [
+            self.next_word_indices[0]
+                .and_then(|token_idx| tokens.get(token_idx))
+                .and_then(|token| match token {
+                    SqlToken::Word(word) => Some(word.as_str()),
+                    _ => None,
+                }),
+            self.next_word_indices[1]
+                .and_then(|token_idx| tokens.get(token_idx))
+                .and_then(|token| match token {
+                    SqlToken::Word(word) => Some(word.as_str()),
+                    _ => None,
+                }),
+            self.next_word_indices[2]
+                .and_then(|token_idx| tokens.get(token_idx))
+                .and_then(|token| match token {
+                    SqlToken::Word(word) => Some(word.as_str()),
+                    _ => None,
+                }),
+        ]
+    }
+}
+
+struct FormatterTokenContextCursor<'a> {
+    tokens: &'a [SqlToken],
+    current_idx: usize,
+    prev_non_comment_idx: Option<usize>,
+    second_prev_non_comment_idx: Option<usize>,
+    next_non_comment_scan_idx: usize,
+    next_word_scan_idx: usize,
+    upcoming_non_comment_indices: [Option<usize>; 3],
+    upcoming_word_indices: [Option<usize>; 3],
+}
+
+impl<'a> FormatterTokenContextCursor<'a> {
+    fn new(tokens: &'a [SqlToken]) -> Self {
+        let mut cursor = Self {
+            tokens,
+            current_idx: 0,
+            prev_non_comment_idx: None,
+            second_prev_non_comment_idx: None,
+            next_non_comment_scan_idx: 1,
+            next_word_scan_idx: 1,
+            upcoming_non_comment_indices: [None; 3],
+            upcoming_word_indices: [None; 3],
+        };
+        cursor.fill_upcoming_non_comment_indices();
+        cursor.fill_upcoming_word_indices();
+        cursor
+    }
+
+    #[inline]
+    fn push_upcoming_index(slots: &mut [Option<usize>; 3], idx: usize) {
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(idx);
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    fn discard_consumed_indices(slots: &mut [Option<usize>; 3], current_idx: usize) {
+        while slots[0].is_some_and(|queued_idx| queued_idx <= current_idx) {
+            slots[0] = slots[1];
+            slots[1] = slots[2];
+            slots[2] = None;
+        }
+    }
+
+    fn fill_upcoming_non_comment_indices(&mut self) {
+        while self.upcoming_non_comment_indices[2].is_none() && self.next_non_comment_scan_idx < self.tokens.len() {
+            let idx = self.next_non_comment_scan_idx;
+            self.next_non_comment_scan_idx = self.next_non_comment_scan_idx.saturating_add(1);
+            if !matches!(self.tokens.get(idx), Some(SqlToken::Comment(_))) {
+                Self::push_upcoming_index(&mut self.upcoming_non_comment_indices, idx);
+            }
+        }
+    }
+
+    fn fill_upcoming_word_indices(&mut self) {
+        while self.upcoming_word_indices[2].is_none() && self.next_word_scan_idx < self.tokens.len() {
+            let idx = self.next_word_scan_idx;
+            self.next_word_scan_idx = self.next_word_scan_idx.saturating_add(1);
+            if matches!(self.tokens.get(idx), Some(SqlToken::Word(_))) {
+                Self::push_upcoming_index(&mut self.upcoming_word_indices, idx);
+            }
+        }
+    }
+
+    fn advance_to(&mut self, idx: usize) -> FormatterTokenContext<'a> {
+        debug_assert!(idx < self.tokens.len());
+        debug_assert!(idx >= self.current_idx);
+
+        while self.current_idx < idx {
+            if !matches!(self.tokens.get(self.current_idx), Some(SqlToken::Comment(_))) {
+                self.second_prev_non_comment_idx = self.prev_non_comment_idx;
+                self.prev_non_comment_idx = Some(self.current_idx);
+            }
+            self.current_idx = self.current_idx.saturating_add(1);
+
+            Self::discard_consumed_indices(
+                &mut self.upcoming_non_comment_indices,
+                self.current_idx,
+            );
+            Self::discard_consumed_indices(&mut self.upcoming_word_indices, self.current_idx);
+
+            self.fill_upcoming_non_comment_indices();
+            self.fill_upcoming_word_indices();
+        }
+
+        let next_non_comment_indices = self.upcoming_non_comment_indices;
+        let next_word_indices = self.upcoming_word_indices;
+
+        FormatterTokenContext {
+            gap_from_prev_has_newline: false,
+            prev_non_comment_idx: self.prev_non_comment_idx,
+            second_prev_non_comment_idx: self.second_prev_non_comment_idx,
+            immediate_prev_prev: idx.checked_sub(2).and_then(|prev_idx| self.tokens.get(prev_idx)),
+            immediate_prev: idx.checked_sub(1).and_then(|prev_idx| self.tokens.get(prev_idx)),
+            immediate_next: self.tokens.get(idx.saturating_add(1)),
+            immediate_next_next: self.tokens.get(idx.saturating_add(2)),
+            next_non_comment_indices,
+            next_word_indices,
+        }
     }
 }
 
@@ -296,6 +383,7 @@ struct FormatterStatementInput<'a> {
     mysql_compatible: bool,
     tokens: Vec<SqlToken>,
     token_spans: Vec<FormatterTokenSpanRange>,
+    metadata: Option<FormatterStatementMetadata>,
     is_package_body_statement: bool,
     is_create_trigger_statement: bool,
     statement_has_apply: bool,
@@ -307,10 +395,14 @@ impl<'a> FormatterStatementInput<'a> {
             super::query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible);
         let mut tokens = Vec::with_capacity(token_spans.len());
         let mut token_ranges = Vec::with_capacity(token_spans.len());
+        let mut metadata_builder = Some(FormatterStatementMetadataBuilder::new(
+            token_spans.len(),
+            false,
+        ));
         let mut leading_words_upper: Vec<String> = Vec::with_capacity(8);
         let mut statement_has_apply = false;
 
-        for span in &mut token_spans {
+        for (idx, span) in token_spans.iter_mut().enumerate() {
             let token = std::mem::replace(&mut span.token, SqlToken::Symbol(String::new()));
             if let SqlToken::Word(word) = &token {
                 if leading_words_upper.len() < 8 {
@@ -320,10 +412,22 @@ impl<'a> FormatterStatementInput<'a> {
                     statement_has_apply = true;
                 }
             }
+
+            if metadata_builder.is_some()
+                && FormatterStatementStructure::leading_words_start_create_table(
+                    leading_words_upper.as_slice(),
+                )
+            {
+                metadata_builder = None;
+            }
+
             token_ranges.push(FormatterTokenSpanRange {
                 start: span.start,
                 end: span.end,
             });
+            if let Some(builder) = metadata_builder.as_mut() {
+                builder.observe(idx, &token);
+            }
             tokens.push(token);
         }
 
@@ -332,6 +436,7 @@ impl<'a> FormatterStatementInput<'a> {
             mysql_compatible,
             tokens,
             token_spans: token_ranges,
+            metadata: metadata_builder.map(FormatterStatementMetadataBuilder::finish),
             is_package_body_statement: FormatterStatementStructure::leading_words_start_package_body(
                 leading_words_upper.as_slice(),
             ),
@@ -586,16 +691,11 @@ impl LiveQueryApplyTracker {
 
 struct StatementWordLinks {
     prev_word_in_statement: Vec<Option<usize>>,
-    next_word_in_statement: Vec<Option<usize>>,
 }
 
 impl StatementWordLinks {
     fn prev_word_index(&self, idx: usize) -> Option<usize> {
         self.prev_word_in_statement.get(idx).copied().flatten()
-    }
-
-    fn next_word_index(&self, idx: usize) -> Option<usize> {
-        self.next_word_in_statement.get(idx).copied().flatten()
     }
 }
 
@@ -946,19 +1046,115 @@ impl FormatterStatementStructure {
         tokens: &[SqlToken],
         recent_statement_word_indices: &VecDeque<usize>,
     ) -> Option<FormatIndentedParenOwnerKind> {
-        let mut preceding_words =
-            Self::recent_statement_words_before(tokens, recent_statement_word_indices, 8);
-        if preceding_words.is_empty() {
+        let mut recent_words = [None; 8];
+        let mut recent_word_count = 0usize;
+
+        for word_idx in recent_statement_word_indices.iter().rev().take(8) {
+            let Some(SqlToken::Word(word)) = tokens.get(*word_idx) else {
+                continue;
+            };
+            recent_words[recent_word_count] = Some(word.as_str());
+            recent_word_count = recent_word_count.saturating_add(1);
+            if recent_word_count == recent_words.len() {
+                break;
+            }
+        }
+
+        if recent_word_count == 0 {
             return None;
         }
 
-        preceding_words.reverse();
-        crate::sql_text::format_indented_paren_owner_kind_from_words(&preceding_words)
+        let last_word = recent_words[0]?;
+        let penultimate_word = if recent_word_count > 1 {
+            recent_words[1]
+        } else {
+            None
+        };
+        let third_from_end_word = if recent_word_count > 2 {
+            recent_words[2]
+        } else {
+            None
+        };
+        let first_word = recent_words[recent_word_count - 1]?;
+        let second_word = if recent_word_count > 1 {
+            recent_words[recent_word_count - 2]
+        } else {
+            None
+        };
+        let third_word = if recent_word_count > 2 {
+            recent_words[recent_word_count - 3]
+        } else {
+            None
+        };
+
+        if last_word.eq_ignore_ascii_case("OVER") {
+            Some(FormatIndentedParenOwnerKind::AnalyticOver)
+        } else if last_word.eq_ignore_ascii_case("GROUP")
+            && penultimate_word.is_some_and(|word| word.eq_ignore_ascii_case("WITHIN"))
+        {
+            Some(FormatIndentedParenOwnerKind::WithinGroup)
+        } else if last_word.eq_ignore_ascii_case("KEEP") {
+            Some(FormatIndentedParenOwnerKind::Keep)
+        } else if FormatIndentedParenOwnerKind::ModelSubclause.starts_body_header_words(
+            first_word,
+            second_word,
+            third_word,
+        ) {
+            Some(FormatIndentedParenOwnerKind::ModelSubclause)
+        } else if first_word.eq_ignore_ascii_case("WINDOW") && last_word.eq_ignore_ascii_case("AS")
+        {
+            Some(FormatIndentedParenOwnerKind::Window)
+        } else if last_word.eq_ignore_ascii_case("MATCH_RECOGNIZE") {
+            Some(FormatIndentedParenOwnerKind::MatchRecognize)
+        } else if last_word.eq_ignore_ascii_case("PIVOT")
+            || (last_word.eq_ignore_ascii_case("XML")
+                && penultimate_word.is_some_and(|word| word.eq_ignore_ascii_case("PIVOT")))
+        {
+            Some(FormatIndentedParenOwnerKind::Pivot)
+        } else if last_word.eq_ignore_ascii_case("UNPIVOT")
+            || (last_word.eq_ignore_ascii_case("NULLS")
+                && penultimate_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("INCLUDE") || word.eq_ignore_ascii_case("EXCLUDE")
+                })
+                && third_from_end_word.is_some_and(|word| word.eq_ignore_ascii_case("UNPIVOT")))
+        {
+            Some(FormatIndentedParenOwnerKind::Unpivot)
+        } else if last_word.eq_ignore_ascii_case("COLUMNS") {
+            Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        } else {
+            None
+        }
     }
 
     fn leading_words_start_create_trigger(words: &[String]) -> bool {
         words.first().is_some_and(|word| word == "CREATE")
             && words.iter().skip(1).any(|word| word == "TRIGGER")
+    }
+
+    fn leading_words_start_create_table(words: &[String]) -> bool {
+        let mut idx = 0usize;
+        if words.get(idx).map(String::as_str) != Some("CREATE") {
+            return false;
+        }
+        idx = idx.saturating_add(1);
+
+        if words.get(idx).map(String::as_str) == Some("OR") {
+            idx = idx.saturating_add(1);
+            if words.get(idx).map(String::as_str) != Some("REPLACE") {
+                return false;
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        if matches!(words.get(idx).map(String::as_str), Some("GLOBAL" | "PRIVATE")) {
+            idx = idx.saturating_add(1);
+            if words.get(idx).map(String::as_str) != Some("TEMPORARY") {
+                return false;
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        words.get(idx).map(String::as_str) == Some("TABLE")
     }
 
     fn leading_words_start_package_body(words: &[String]) -> bool {
@@ -1205,6 +1401,204 @@ struct ParenBodyAnalysis {
     has_top_level_comma: bool,
 }
 
+struct FormatterStatementMetadata {
+    meaningful_token_links: MeaningfulTokenLinks,
+    statement_word_links: StatementWordLinks,
+    matching_paren_close_indices: Vec<Option<usize>>,
+    token_depths: Vec<usize>,
+    paren_body_analyses: Vec<Option<ParenBodyAnalysis>>,
+    fetch_into_has_multiple_targets: Vec<bool>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ParenBodyScanState {
+    nested_depth: usize,
+    has_top_level_comma: bool,
+    contains_query_like_child: bool,
+    contains_analytic_clause_owner_child: bool,
+    saw_within: bool,
+}
+
+struct FormatterStatementMetadataBuilder {
+    include_navigation_links: bool,
+    prev_meaningful: Vec<Option<usize>>,
+    next_meaningful: Vec<Option<usize>>,
+    prev_word: Vec<Option<usize>>,
+    last_meaningful_idx: Option<usize>,
+    last_word_idx: Option<usize>,
+    next_meaningful_fill_start: usize,
+    matching_paren_close_indices: Vec<Option<usize>>,
+    token_depths: Vec<usize>,
+    paren_body_analyses: Vec<Option<ParenBodyAnalysis>>,
+    open_paren_stack: Vec<(usize, ParenBodyScanState)>,
+    token_paren_depth: usize,
+    latest_into_at_depth: Vec<Option<usize>>,
+    fetch_into_has_multiple_targets: Vec<bool>,
+}
+
+impl FormatterStatementMetadataBuilder {
+    fn new(token_len: usize, include_navigation_links: bool) -> Self {
+        Self {
+            include_navigation_links,
+            prev_meaningful: if include_navigation_links {
+                vec![None; token_len]
+            } else {
+                Vec::new()
+            },
+            next_meaningful: if include_navigation_links {
+                vec![None; token_len]
+            } else {
+                Vec::new()
+            },
+            prev_word: if include_navigation_links {
+                vec![None; token_len]
+            } else {
+                Vec::new()
+            },
+            last_meaningful_idx: None,
+            last_word_idx: None,
+            next_meaningful_fill_start: 0,
+            matching_paren_close_indices: vec![None; token_len],
+            token_depths: Vec::with_capacity(token_len),
+            paren_body_analyses: vec![None; token_len],
+            open_paren_stack: Vec::new(),
+            token_paren_depth: 0,
+            latest_into_at_depth: Vec::new(),
+            fetch_into_has_multiple_targets: vec![false; token_len],
+        }
+    }
+
+    fn observe(&mut self, idx: usize, token: &SqlToken) {
+        if self.include_navigation_links {
+            self.prev_meaningful[idx] = self.last_meaningful_idx;
+            self.prev_word[idx] = self.last_word_idx;
+        }
+
+        let is_meaningful = !matches!(token, SqlToken::Comment(_));
+        if is_meaningful {
+            if self.include_navigation_links {
+                for unresolved_idx in self.next_meaningful_fill_start..idx {
+                    self.next_meaningful[unresolved_idx] = Some(idx);
+                }
+                self.next_meaningful_fill_start = idx;
+            }
+            self.last_meaningful_idx = Some(idx);
+            if matches!(token, SqlToken::Word(_)) {
+                self.last_word_idx = Some(idx);
+            }
+        }
+
+        self.token_depths.push(self.token_paren_depth);
+
+        if self.latest_into_at_depth.len() <= self.token_paren_depth {
+            self.latest_into_at_depth
+                .resize_with(self.token_paren_depth + 1, || None);
+        }
+
+        match token {
+            SqlToken::Word(word) => {
+                if word.eq_ignore_ascii_case("INTO") {
+                    self.latest_into_at_depth[self.token_paren_depth] = Some(idx);
+                } else if word.eq_ignore_ascii_case("LIMIT")
+                    || word.eq_ignore_ascii_case("BULK")
+                    || word.eq_ignore_ascii_case("FROM")
+                    || word.eq_ignore_ascii_case("WHERE")
+                {
+                    self.latest_into_at_depth[self.token_paren_depth] = None;
+                }
+
+                for (_, state) in &mut self.open_paren_stack {
+                    if word.eq_ignore_ascii_case("CASE")
+                        || crate::sql_text::is_subquery_head_keyword(word)
+                    {
+                        state.contains_query_like_child = true;
+                    }
+                    if word.eq_ignore_ascii_case("OVER") || word.eq_ignore_ascii_case("KEEP") {
+                        state.contains_analytic_clause_owner_child = true;
+                    }
+
+                    if word.eq_ignore_ascii_case("WITHIN") {
+                        state.saw_within = true;
+                    } else if state.saw_within && word.eq_ignore_ascii_case("GROUP") {
+                        state.contains_analytic_clause_owner_child = true;
+                        state.saw_within = false;
+                    } else {
+                        state.saw_within = false;
+                    }
+                }
+            }
+            SqlToken::Symbol(symbol) if symbol == "(" => {
+                for (_, state) in &mut self.open_paren_stack {
+                    state.nested_depth = state.nested_depth.saturating_add(1);
+                    state.saw_within = false;
+                }
+
+                self.open_paren_stack
+                    .push((idx, ParenBodyScanState::default()));
+                self.token_paren_depth = self.token_paren_depth.saturating_add(1);
+            }
+            SqlToken::Symbol(symbol) if symbol == ")" => {
+                if let Some((open_idx, state)) = self.open_paren_stack.pop() {
+                    self.matching_paren_close_indices[open_idx] = Some(idx);
+                    self.paren_body_analyses[open_idx] = Some(ParenBodyAnalysis {
+                        contains_query_like_child: state.contains_query_like_child,
+                        contains_analytic_clause_owner_child:
+                            state.contains_analytic_clause_owner_child,
+                        has_top_level_comma: state.has_top_level_comma,
+                    });
+                }
+
+                for (_, state) in &mut self.open_paren_stack {
+                    state.nested_depth = state.nested_depth.saturating_sub(1);
+                    state.saw_within = false;
+                }
+
+                if self.token_paren_depth < self.latest_into_at_depth.len() {
+                    self.latest_into_at_depth[self.token_paren_depth] = None;
+                }
+                self.token_paren_depth = self.token_paren_depth.saturating_sub(1);
+            }
+            SqlToken::Symbol(symbol) if symbol == "," => {
+                if let Some(into_idx) = self.latest_into_at_depth[self.token_paren_depth] {
+                    self.fetch_into_has_multiple_targets[into_idx] = true;
+                }
+
+                for (_, state) in &mut self.open_paren_stack {
+                    if state.nested_depth == 0 {
+                        state.has_top_level_comma = true;
+                        state.saw_within = false;
+                    }
+                }
+            }
+            SqlToken::Symbol(symbol) if symbol == ";" => {
+                self.latest_into_at_depth[self.token_paren_depth] = None;
+            }
+            SqlToken::Comment(_) => {}
+            _ => {
+                for (_, state) in &mut self.open_paren_stack {
+                    state.saw_within = false;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> FormatterStatementMetadata {
+        FormatterStatementMetadata {
+            meaningful_token_links: MeaningfulTokenLinks {
+                prev: self.prev_meaningful,
+                next: self.next_meaningful,
+            },
+            statement_word_links: StatementWordLinks {
+                prev_word_in_statement: self.prev_word,
+            },
+            matching_paren_close_indices: self.matching_paren_close_indices,
+            token_depths: self.token_depths,
+            paren_body_analyses: self.paren_body_analyses,
+            fetch_into_has_multiple_targets: self.fetch_into_has_multiple_targets,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct ActiveParenMetrics {
     query_like_count: usize,
@@ -1430,13 +1824,27 @@ impl FormatFrameStack {
         indent_before: usize,
         indent_after: usize,
     ) {
-        self.transition_trace.push(FormatFrameTransitionEvent {
+        let next_event = FormatFrameTransitionEvent {
             kind,
             scope_before,
             scope_after: self.current_scope(),
             indent_before,
             indent_after,
-        });
+        };
+
+        if matches!(next_event.kind, FormatFrameTransitionKind::TokenEntrySync)
+            && self
+                .transition_trace
+                .last()
+                .is_some_and(|event| matches!(event.kind, FormatFrameTransitionKind::TokenEntrySync))
+        {
+            if let Some(last_event) = self.transition_trace.last_mut() {
+                *last_event = next_event;
+            }
+            return;
+        }
+
+        self.transition_trace.push(next_event);
     }
 
     #[cfg(test)]
@@ -2847,12 +3255,25 @@ impl FormatFrameStack {
     }
 
     fn sync_to_scope(&mut self, current_scope: FormatScope, indent_level: &mut usize) {
+        #[cfg(debug_assertions)]
+        let frames_len_before = self.frames.len();
+        #[cfg(debug_assertions)]
+        let base_indent_before = self.base_indent_level;
+        #[cfg(debug_assertions)]
+        let indent_before = *indent_level;
+
         self.pop_tail_auxiliary_frames_for_scope(current_scope, indent_level);
         self.realign_indent_level_to_base(indent_level);
+
         #[cfg(debug_assertions)]
         {
-            self.debug_assert_integrity_for_scope(current_scope);
-            self.debug_assert_indent_level(*indent_level);
+            let structural_state_changed = self.frames.len() != frames_len_before
+                || self.base_indent_level != base_indent_before
+                || *indent_level != indent_before;
+            if structural_state_changed {
+                self.debug_assert_integrity_for_scope(current_scope);
+                self.debug_assert_indent_level(*indent_level);
+            }
         }
     }
 
@@ -2911,32 +3332,54 @@ impl FormatFrameStack {
 
     #[cfg(debug_assertions)]
     fn debug_assert_integrity(&self) {
-        let paren_count = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Paren(_)))
-            .count();
-        let block_count = self
-            .frames
-            .iter()
-            .filter(|frame| matches!(frame, FormatFrame::Block(_)))
-            .count();
+        debug_assert!(
+            self.paren_depth <= self.frames.len(),
+            "paren depth exceeds frame count"
+        );
+        debug_assert!(
+            self.block_depth <= self.frames.len(),
+            "block depth exceeds frame count"
+        );
+
+        let last_paren_id = self
+            .last_paren_frame_idx
+            .and_then(|idx| match self.frames.get(idx) {
+                Some(FormatFrame::Paren(frame)) => Some(frame.id),
+                _ => None,
+            })
+            .or_else(|| {
+                self.last_paren_frame_id_cache.and_then(|_| {
+                    self.frames.iter().rev().find_map(|frame| match frame {
+                        FormatFrame::Paren(frame) => Some(frame.id),
+                        _ => None,
+                    })
+                })
+            });
+        let last_block_id = self
+            .last_block_frame_idx
+            .and_then(|idx| match self.frames.get(idx) {
+                Some(FormatFrame::Block(frame)) => Some(frame.id),
+                _ => None,
+            })
+            .or_else(|| {
+                self.last_block_frame_id_cache.and_then(|_| {
+                    self.frames.iter().rev().find_map(|frame| match frame {
+                        FormatFrame::Block(frame) => Some(frame.id),
+                        _ => None,
+                    })
+                })
+            });
+
         debug_assert_eq!(
-            self.paren_depth, paren_count,
-            "paren depth/frame count drift"
+            self.paren_depth == 0,
+            self.last_paren_frame_id_cache.is_none(),
+            "paren depth/index drift"
         );
         debug_assert_eq!(
-            self.block_depth, block_count,
-            "block depth/frame count drift"
+            self.block_depth == 0,
+            self.last_block_frame_id_cache.is_none(),
+            "block depth/index drift"
         );
-        let last_paren_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Paren(frame) => Some(frame.id),
-            _ => None,
-        });
-        let last_block_id = self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::Block(frame) => Some(frame.id),
-            _ => None,
-        });
         debug_assert_eq!(
             self.last_paren_frame_id(),
             last_paren_id,
@@ -4440,6 +4883,15 @@ impl SqlEditorWidget {
         crate::sql_text::line_ends_with_semicolon_before_inline_comment(line)
     }
 
+    fn resolve_format_preferred_db_type(
+        source: &str,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> Option<DatabaseType> {
+        preferred_db_type.or_else(|| {
+            (!sql_text::sql_uses_mysql_compatible_syntax(source)).then_some(DatabaseType::Oracle)
+        })
+    }
+
     fn paren_opens_analytic_layout(
         current_clause: Option<&str>,
         prev_word_upper: Option<&str>,
@@ -4458,6 +4910,7 @@ impl SqlEditorWidget {
         selected_only: bool,
         preferred_db_type: Option<DatabaseType>,
     ) -> String {
+        let preferred_db_type = Self::resolve_format_preferred_db_type(source, preferred_db_type);
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(source, preferred_db_type),
         );
@@ -5360,6 +5813,7 @@ impl SqlEditorWidget {
         append_missing_terminator: bool,
         preferred_db_type: Option<DatabaseType>,
     ) -> String {
+        let preferred_db_type = Self::resolve_format_preferred_db_type(sql, preferred_db_type);
         let normalized_items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(sql, preferred_db_type),
         );
@@ -5600,6 +6054,14 @@ impl SqlEditorWidget {
         None
     }
 
+    fn build_statement_metadata(tokens: &[SqlToken]) -> FormatterStatementMetadata {
+        let mut metadata_builder = FormatterStatementMetadataBuilder::new(tokens.len(), true);
+        for (idx, token) in tokens.iter().enumerate() {
+            metadata_builder.observe(idx, token);
+        }
+        metadata_builder.finish()
+    }
+
     fn build_statement_token_metadata(
         tokens: &[SqlToken],
     ) -> (
@@ -5610,159 +6072,14 @@ impl SqlEditorWidget {
         Vec<Option<ParenBodyAnalysis>>,
         Vec<bool>,
     ) {
-        #[derive(Clone, Copy, Default)]
-        struct ParenBodyScanState {
-            nested_depth: usize,
-            has_top_level_comma: bool,
-            contains_query_like_child: bool,
-            contains_analytic_clause_owner_child: bool,
-            saw_within: bool,
-        }
-
-        let mut prev_meaningful = vec![None; tokens.len()];
-        let mut next_meaningful = vec![None; tokens.len()];
-        let mut prev_word = vec![None; tokens.len()];
-        let mut next_word = vec![None; tokens.len()];
-        let mut last_meaningful_idx: Option<usize> = None;
-        let mut last_word_idx: Option<usize> = None;
-        let mut next_meaningful_fill_start = 0usize;
-        let mut next_word_fill_start = 0usize;
-        let mut matching_paren_close_indices = vec![None; tokens.len()];
-        let mut token_depths = Vec::with_capacity(tokens.len());
-        let mut paren_body_analyses: Vec<Option<ParenBodyAnalysis>> = vec![None; tokens.len()];
-        let mut open_paren_stack: Vec<(usize, ParenBodyScanState)> = Vec::new();
-        let mut token_paren_depth = 0usize;
-        let mut latest_into_at_depth: Vec<Option<usize>> = Vec::new();
-        let mut fetch_into_has_multiple_targets = vec![false; tokens.len()];
-
-        for (idx, token) in tokens.iter().enumerate() {
-            prev_meaningful[idx] = last_meaningful_idx;
-            prev_word[idx] = last_word_idx;
-
-            let is_meaningful = !matches!(token, SqlToken::Comment(_));
-            if is_meaningful {
-                for unresolved_idx in next_meaningful_fill_start..idx {
-                    next_meaningful[unresolved_idx] = Some(idx);
-                }
-                next_meaningful_fill_start = idx;
-                last_meaningful_idx = Some(idx);
-
-                if matches!(token, SqlToken::Word(_)) {
-                    for unresolved_idx in next_word_fill_start..idx {
-                        next_word[unresolved_idx] = Some(idx);
-                    }
-                    next_word_fill_start = idx;
-                    last_word_idx = Some(idx);
-                }
-            }
-
-            token_depths.push(token_paren_depth);
-
-            if latest_into_at_depth.len() <= token_paren_depth {
-                latest_into_at_depth.resize_with(token_paren_depth + 1, || None);
-            }
-
-            match token {
-                SqlToken::Word(word) => {
-                    if word.eq_ignore_ascii_case("INTO") {
-                        latest_into_at_depth[token_paren_depth] = Some(idx);
-                    } else if word.eq_ignore_ascii_case("LIMIT")
-                        || word.eq_ignore_ascii_case("BULK")
-                        || word.eq_ignore_ascii_case("FROM")
-                        || word.eq_ignore_ascii_case("WHERE")
-                    {
-                        latest_into_at_depth[token_paren_depth] = None;
-                    }
-
-                    for (_, state) in &mut open_paren_stack {
-                        if word.eq_ignore_ascii_case("CASE")
-                            || crate::sql_text::is_subquery_head_keyword(word)
-                        {
-                            state.contains_query_like_child = true;
-                        }
-                        if word.eq_ignore_ascii_case("OVER") || word.eq_ignore_ascii_case("KEEP") {
-                            state.contains_analytic_clause_owner_child = true;
-                        }
-
-                        if word.eq_ignore_ascii_case("WITHIN") {
-                            state.saw_within = true;
-                        } else if state.saw_within && word.eq_ignore_ascii_case("GROUP") {
-                            state.contains_analytic_clause_owner_child = true;
-                            state.saw_within = false;
-                        } else {
-                            state.saw_within = false;
-                        }
-                    }
-                }
-                SqlToken::Symbol(symbol) if symbol == "(" => {
-                    for (_, state) in &mut open_paren_stack {
-                        state.nested_depth = state.nested_depth.saturating_add(1);
-                        state.saw_within = false;
-                    }
-
-                    open_paren_stack.push((idx, ParenBodyScanState::default()));
-                    token_paren_depth = token_paren_depth.saturating_add(1);
-                }
-                SqlToken::Symbol(symbol) if symbol == ")" => {
-                    if let Some((open_idx, state)) = open_paren_stack.pop() {
-                        matching_paren_close_indices[open_idx] = Some(idx);
-                        paren_body_analyses[open_idx] = Some(ParenBodyAnalysis {
-                            contains_query_like_child: state.contains_query_like_child,
-                            contains_analytic_clause_owner_child:
-                                state.contains_analytic_clause_owner_child,
-                            has_top_level_comma: state.has_top_level_comma,
-                        });
-                    }
-
-                    for (_, state) in &mut open_paren_stack {
-                        state.nested_depth = state.nested_depth.saturating_sub(1);
-                        state.saw_within = false;
-                    }
-
-                    if token_paren_depth < latest_into_at_depth.len() {
-                        latest_into_at_depth[token_paren_depth] = None;
-                    }
-                    token_paren_depth = token_paren_depth.saturating_sub(1);
-                }
-                SqlToken::Symbol(symbol) if symbol == "," => {
-                    if let Some(into_idx) = latest_into_at_depth[token_paren_depth] {
-                        if into_idx < fetch_into_has_multiple_targets.len() {
-                            fetch_into_has_multiple_targets[into_idx] = true;
-                        }
-                    }
-
-                    for (_, state) in &mut open_paren_stack {
-                        if state.nested_depth == 0 {
-                            state.has_top_level_comma = true;
-                            state.saw_within = false;
-                        }
-                    }
-                }
-                SqlToken::Symbol(symbol) if symbol == ";" => {
-                    latest_into_at_depth[token_paren_depth] = None;
-                }
-                SqlToken::Comment(_) => {}
-                _ => {
-                    for (_, state) in &mut open_paren_stack {
-                        state.saw_within = false;
-                    }
-                }
-            }
-        }
-
+        let metadata = Self::build_statement_metadata(tokens);
         (
-            MeaningfulTokenLinks {
-                prev: prev_meaningful,
-                next: next_meaningful,
-            },
-            StatementWordLinks {
-                prev_word_in_statement: prev_word,
-                next_word_in_statement: next_word,
-            },
-            matching_paren_close_indices,
-            token_depths,
-            paren_body_analyses,
-            fetch_into_has_multiple_targets,
+            metadata.meaningful_token_links,
+            metadata.statement_word_links,
+            metadata.matching_paren_close_indices,
+            metadata.token_depths,
+            metadata.paren_body_analyses,
+            metadata.fetch_into_has_multiple_targets,
         )
     }
 
@@ -7737,14 +8054,18 @@ impl SqlEditorWidget {
                                                             // LOOP is handled separately for FOR ... LOOP on same line
         let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
         let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
-        let (
-            meaningful_token_links,
-            statement_word_links,
-            matching_paren_close_indices,
-            _token_depths,
-            paren_body_analyses,
-            fetch_into_has_multiple_targets,
-        ) = Self::build_statement_token_metadata(tokens);
+        let owned_metadata;
+        let metadata = if let Some(metadata) = input.metadata.as_ref() {
+            metadata
+        } else {
+            owned_metadata = Self::build_statement_metadata(tokens);
+            &owned_metadata
+        };
+        let meaningful_token_links = &metadata.meaningful_token_links;
+        let _statement_word_links = &metadata.statement_word_links;
+        let matching_paren_close_indices = &metadata.matching_paren_close_indices;
+        let paren_body_analyses = &metadata.paren_body_analyses;
+        let fetch_into_has_multiple_targets = &metadata.fetch_into_has_multiple_targets;
 
         let mut out = String::with_capacity(
             statement
@@ -7783,6 +8104,7 @@ impl SqlEditorWidget {
         let mut query_apply_context_tracker = LiveQueryApplyTracker::default();
         let mut statement_tail_state = FormatterTailState::new();
         let mut token_line_cursor = FormatterTokenLineCursor::new(statement.as_bytes(), token_spans);
+        let mut token_context_cursor = FormatterTokenContextCursor::new(tokens);
         let mut rendered_line_tracker = RenderedLineTracker::default();
         let mut comment_prefix_text = String::new();
         let newline_with = |out: &mut String,
@@ -8026,7 +8348,7 @@ impl SqlEditorWidget {
             let current_scope = format_stack.sync_for_token_entry(&mut indent_level);
             let prev_word_upper_owned =
                 prev_word_idx.and_then(|prev_idx| match tokens.get(prev_idx) {
-                    Some(SqlToken::Word(word)) => Some(word.to_ascii_uppercase()),
+                    Some(SqlToken::Word(word)) => Some(ascii_uppercase_cow(word)),
                     _ => None,
                 });
             let prev_word_upper = prev_word_upper_owned.as_deref();
@@ -8039,9 +8361,9 @@ impl SqlEditorWidget {
                 };
                 let token_keeps_clause_structural = match tokens.get(idx) {
                     Some(SqlToken::Word(word)) => {
-                        let upper = word.to_ascii_uppercase();
-                        Self::is_dml_clause_starter(upper.as_str())
-                            || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
+                        let upper = ascii_uppercase_cow(word);
+                        Self::is_dml_clause_starter(upper.as_ref())
+                            || crate::sql_text::is_format_set_operator_keyword(upper.as_ref())
                     }
                     _ => false,
                 };
@@ -8074,12 +8396,7 @@ impl SqlEditorWidget {
                     inline_comment_continuation_state = InlineCommentContinuationState::None;
                 }
             }
-            let mut token_context = FormatterTokenContext::from_statement_links(
-                tokens,
-                idx,
-                &meaningful_token_links,
-                &statement_word_links,
-            );
+            let mut token_context = token_context_cursor.advance_to(idx);
             let current_token_profile = token_line_cursor.profile(idx);
             token_context.gap_from_prev_has_newline =
                 current_token_profile.start_newline_count > previous_token_end_newline_count;
@@ -8094,8 +8411,9 @@ impl SqlEditorWidget {
             let next_words = token_context.next_words(tokens);
             let next_word = next_words[0];
             let third_word = next_words[1];
-            let next_non_comment = token_context.next_non_comment_token();
-            let second_next_non_comment_token = token_context.second_next_non_comment_token();
+            let next_non_comment = token_context.next_non_comment_token(tokens);
+            let second_next_non_comment_token =
+                token_context.second_next_non_comment_token(tokens);
             let loop_previous_non_comment_token = token_context.prev_non_comment_token(tokens);
             let loop_second_previous_non_comment_token =
                 token_context.second_prev_non_comment_token(tokens);
@@ -8125,8 +8443,8 @@ impl SqlEditorWidget {
 
             match &tokens[idx] {
                 SqlToken::Word(word) => {
-                    let upper_owned = word.to_ascii_uppercase();
-                    let upper = upper_owned.as_str();
+                    let upper_owned = ascii_uppercase_cow(word);
+                    let upper = upper_owned.as_ref();
                     let opens_unterminated_plsql_label =
                         word.starts_with("<<") && !word.ends_with(">>");
                     if opens_unterminated_plsql_label {
@@ -8216,8 +8534,8 @@ impl SqlEditorWidget {
                         && Self::within_group_is_analytic(
                             tokens,
                             idx,
-                            Some(&meaningful_token_links),
-                            Some(&matching_paren_close_indices),
+                            Some(meaningful_token_links),
+                            Some(matching_paren_close_indices),
                         );
                     let is_within_group = upper == "GROUP"
                         && matches!(prev_word_upper, Some("WITHIN"))
@@ -12040,8 +12358,8 @@ impl SqlEditorWidget {
                             let paren_body_analysis = Self::analyze_paren_body(
                                 tokens,
                                 idx,
-                                Some(&matching_paren_close_indices),
-                                Some(&paren_body_analyses),
+                                Some(matching_paren_close_indices),
+                                Some(paren_body_analyses),
                             );
                             let body_contains_query_like_child = direct_wraps_subquery_or_case_head
                                 || paren_body_analysis.contains_query_like_child;
@@ -12957,7 +13275,32 @@ impl SqlEditorWidget {
     }
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
-        crate::sql_text::starts_with_format_layout_clause(trimmed_upper)
+        matches!(
+            trimmed_upper,
+            "SELECT"
+                | "WITH"
+                | "FROM"
+                | "WHERE"
+                | "GROUP"
+                | "HAVING"
+                | "ORDER"
+                | "VALUES"
+                | "SET"
+                | "CONNECT"
+                | "START"
+                | "UNION"
+                | "INTERSECT"
+                | "MINUS"
+                | "EXCEPT"
+                | "RETURNING"
+                | "MODEL"
+                | "WINDOW"
+                | "MATCH_RECOGNIZE"
+                | "PIVOT"
+                | "UNPIVOT"
+                | "QUALIFY"
+                | "OFFSET"
+        )
     }
 
     #[allow(dead_code)]
@@ -13488,7 +13831,7 @@ impl SqlEditorWidget {
 
     fn block_comment_keeps_inline_terminal_close_alias_tail(
         current_line: &str,
-        _tokens: &[SqlToken],
+        tokens: &[SqlToken],
         token_context: FormatterTokenContext<'_>,
         current_clause: Option<&str>,
     ) -> bool {
@@ -13496,7 +13839,7 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let Some(next_token) = token_context.next_non_comment_token() else {
+        let Some(next_token) = token_context.next_non_comment_token(tokens) else {
             return false;
         };
         let Some(next_text) = Self::close_alias_tail_token_text(next_token) else {
@@ -13505,7 +13848,7 @@ impl SqlEditorWidget {
 
         let (alias_tail_suffix, boundary_token) =
             if next_text.eq_ignore_ascii_case("AS") || next_text.eq_ignore_ascii_case("IS") {
-                let Some(alias_token) = token_context.second_next_non_comment_token() else {
+                let Some(alias_token) = token_context.second_next_non_comment_token(tokens) else {
                     return false;
                 };
                 let Some(alias_text) = Self::close_alias_tail_token_text(alias_token) else {
@@ -13513,12 +13856,12 @@ impl SqlEditorWidget {
                 };
                 (
                     format!("{next_text} {alias_text}"),
-                    token_context.third_next_non_comment_token(),
+                    token_context.third_next_non_comment_token(tokens),
                 )
             } else {
                 (
                     next_text.to_string(),
-                    token_context.second_next_non_comment_token(),
+                    token_context.second_next_non_comment_token(tokens),
                 )
             };
 
@@ -14237,20 +14580,14 @@ impl SqlEditorWidget {
         let mut out = String::new();
         let mut needs_space = false;
         let mut recent_statement_word_indices: VecDeque<usize> = VecDeque::with_capacity(8);
-        let (meaningful_token_links, statement_word_links, _, _, _, _) =
-            Self::build_statement_token_metadata(tokens);
+        let mut token_context_cursor = FormatterTokenContextCursor::new(tokens);
 
         for (idx, token) in tokens.iter().enumerate() {
-            let token_context = FormatterTokenContext::from_statement_links(
-                tokens,
-                idx,
-                &meaningful_token_links,
-                &statement_word_links,
-            );
+            let token_context = token_context_cursor.advance_to(idx);
             let previous_non_comment_token = token_context.prev_non_comment_token(tokens);
             let second_previous_non_comment_token =
                 token_context.second_prev_non_comment_token(tokens);
-            let next_non_comment_token = token_context.next_non_comment_token();
+            let next_non_comment_token = token_context.next_non_comment_token(tokens);
             let next_words = token_context.next_words(tokens);
             let prev_word_upper_owned = recent_statement_word_indices
                 .back()
@@ -14334,20 +14671,14 @@ impl SqlEditorWidget {
         let indent = " ".repeat(indent_level * 4);
         let mut at_line_start = true;
         let mut recent_statement_word_indices: VecDeque<usize> = VecDeque::with_capacity(8);
-        let (meaningful_token_links, statement_word_links, _, _, _, _) =
-            Self::build_statement_token_metadata(tokens);
+        let mut token_context_cursor = FormatterTokenContextCursor::new(tokens);
 
         for (idx, token) in tokens.iter().enumerate() {
-            let token_context = FormatterTokenContext::from_statement_links(
-                tokens,
-                idx,
-                &meaningful_token_links,
-                &statement_word_links,
-            );
+            let token_context = token_context_cursor.advance_to(idx);
             let previous_non_comment_token = token_context.prev_non_comment_token(tokens);
             let second_previous_non_comment_token =
                 token_context.second_prev_non_comment_token(tokens);
-            let next_non_comment_token = token_context.next_non_comment_token();
+            let next_non_comment_token = token_context.next_non_comment_token(tokens);
             let next_words = token_context.next_words(tokens);
             let prev_word_upper_owned = recent_statement_word_indices
                 .back()
@@ -14890,6 +15221,8 @@ mod formatter_scope_state_tests {
         );
     }
 }
+
+
 
 #[cfg(test)]
 mod formatter_regression_tests {
@@ -40371,4 +40704,5 @@ mod format_frame_stack_tests {
         assert!(stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
         assert_eq!(stack.block_depth(), 1);
     }
+
 }
