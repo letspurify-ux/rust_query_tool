@@ -22099,6 +22099,47 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_no_cache_keeps_package_body_named_end_before_final_end_stable() {
+        let source = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;"#;
+        let expected = r#"CREATE PACKAGE BODY a IS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                INSERT INTO d (e)
+                VALUES (1);
+            END;
+        END IF;
+        OPEN v FOR
+            SELECT 1
+            FROM DUAL;
+    END b;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_no_cache(source);
+
+        assert_eq!(
+            formatted.trim(),
+            expected.trim(),
+            "no-cache formatting should keep package member END and final END aligned after OPEN ... FOR, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_for_auto_formatting_keeps_package_body_unlabeled_final_end_attached_before_trailing_statement(
     ) {
         let source = r#"create package body a is

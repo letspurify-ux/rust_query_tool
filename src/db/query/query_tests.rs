@@ -16701,6 +16701,32 @@ END pkg_mix;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_open_for_query_then_named_end_returns_to_owner_depth() {
+    let sql = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 2, 3, 4, 4, 3, 2, 2, 2, 2, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "package body OPEN ... FOR should not leak query depth into END b; / END; lines: {depths:?}"
+    );
+}
+
+#[test]
 fn test_package_body_keyword_name_with_nested_exception_and_split_schema_end_label() {
     // Stress case: package name is keyword(IF), nested BEGIN/IF/EXCEPTION,
     // and package init END label is schema-qualified/split across lines.

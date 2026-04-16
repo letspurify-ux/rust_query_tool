@@ -21238,6 +21238,62 @@ end a;"#;
     }
 
     #[test]
+    fn auto_format_line_contexts_reset_open_for_query_depth_before_package_body_named_end() {
+        let sql = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;"#;
+
+        let contexts = QueryExecutor::auto_format_line_contexts(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let find_line = |needle: &str| -> usize {
+            lines
+                .iter()
+                .position(|line| line.trim() == needle)
+                .unwrap_or(0)
+        };
+
+        let package_idx = find_line("create package body a is");
+        let procedure_idx = find_line("procedure b (c in varchar2) is");
+        let open_idx = find_line("open v for");
+        let select_idx = find_line("select 1");
+        let from_idx = find_line("from dual;");
+        let named_end_idx = find_line("end b;");
+        let final_end_idx = lines
+            .iter()
+            .rposition(|line| line.trim() == "end;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            contexts[select_idx].auto_depth,
+            contexts[open_idx].auto_depth.saturating_add(1),
+            "SELECT after OPEN ... FOR should stay exactly one level deeper than OPEN"
+        );
+        assert_eq!(
+            contexts[from_idx].auto_depth, contexts[select_idx].auto_depth,
+            "FROM under OPEN ... FOR should stay on the SELECT query base depth"
+        );
+        assert_eq!(
+            contexts[named_end_idx].auto_depth, contexts[procedure_idx].auto_depth,
+            "procedure named END should realign with the procedure owner depth instead of leaking the OPEN ... FOR query depth"
+        );
+        assert_eq!(
+            contexts[final_end_idx].auto_depth, contexts[package_idx].auto_depth,
+            "final package END should return to the package body depth after OPEN ... FOR"
+        );
+    }
+
+    #[test]
     fn auto_format_line_contexts_keep_inline_view_body_on_nested_scalar_query_base() {
         let sql = r#"WITH t AS (
     SELECT
