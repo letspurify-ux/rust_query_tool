@@ -1672,21 +1672,15 @@ impl QueryExecutor {
                     .unwrap_or_else(|| line.len())
             }
 
-            fn current_ends_with_mysql_delimiter(&self, sql: &str) -> bool {
+            fn line_ends_with_mysql_delimiter(&self, line: &str) -> bool {
                 if self.mysql_delimiter == ";" {
                     return false;
                 }
 
-                let Some(start) = self.current_start else {
-                    return false;
-                };
-                let end = self.current_end.max(start).min(sql.len());
-                sql.get(start..end).is_some_and(|statement| {
-                    QueryExecutor::statement_ends_with_mysql_delimiter(
-                        statement,
-                        self.mysql_delimiter.as_str(),
-                    )
-                })
+                QueryExecutor::statement_ends_with_mysql_delimiter(
+                    line,
+                    self.mysql_delimiter.as_str(),
+                )
             }
 
             fn trim_span_for_bounds(
@@ -1880,7 +1874,7 @@ impl QueryExecutor {
                 }
                 collector.current_end = next_line_start;
 
-                if collector.current_ends_with_mysql_delimiter(sql)
+                if collector.line_ends_with_mysql_delimiter(line)
                     && !collector.emit_current_span(sql, &mut on_span)
                 {
                     return;

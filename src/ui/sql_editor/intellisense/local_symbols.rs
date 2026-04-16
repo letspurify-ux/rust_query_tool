@@ -1463,14 +1463,15 @@ impl SqlEditorWidget {
     }
 
     #[cfg(test)]
-    fn build_routine_symbol_cache_entry_for_test(
+    fn build_routine_symbol_cache_bundle_for_test(
         full_text: &str,
         cursor_pos: usize,
-    ) -> RoutineSymbolCacheEntry {
+    ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
         let expanded = Self::expanded_statement_window_in_text(full_text, cursor_pos);
         let text_bind_names =
             Self::collect_text_var_bind_names_before_statement(full_text, expanded.statement_start);
-        Self::build_routine_symbol_cache_entry(0, &expanded, text_bind_names)
+        let routine_cache = Self::build_routine_symbol_cache_entry(0, &expanded, text_bind_names);
+        (routine_cache, expanded)
     }
 
     #[cfg(test)]
@@ -1484,8 +1485,8 @@ impl SqlEditorWidget {
             return Vec::new();
         };
         let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
-        let routine_cache = Self::build_routine_symbol_cache_entry_for_test(&sql, cursor);
-        let expanded = Self::expanded_statement_window_in_text(&sql, cursor);
+        let (routine_cache, expanded) =
+            Self::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
         let analysis = Self::build_intellisense_analysis_from_routine_cache(
             &routine_cache,
             expanded.cursor_in_statement,

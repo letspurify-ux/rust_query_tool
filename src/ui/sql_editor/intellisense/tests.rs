@@ -4495,8 +4495,8 @@ fn large_routine_cache_analysis_keeps_far_declarations_visible() {
         .find("__CODEX_CURSOR__")
         .expect("cursor marker should exist");
     let sql = sql.replacen("__CODEX_CURSOR__", "", 1);
-    let routine_cache = SqlEditorWidget::build_routine_symbol_cache_entry_for_test(&sql, cursor);
-    let expanded = SqlEditorWidget::expanded_statement_window_in_text(&sql, cursor);
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
     let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
         &routine_cache,
         expanded.cursor_in_statement,
