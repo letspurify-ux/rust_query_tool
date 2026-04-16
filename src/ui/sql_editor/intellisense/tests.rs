@@ -21,18 +21,70 @@ fn runtime_state_for_test(
     runtime
 }
 
-fn load_intellisense_test_file(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("test");
-    path.push(name);
-    std::fs::read_to_string(path).unwrap_or_default()
+fn load_intellisense_test_file(name: &str) -> &'static str {
+    match name {
+        "test7.txt" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/test/test7.txt")),
+        "test8.txt" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/test/test8.txt")),
+        "test10.txt" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/test/test10.txt")),
+        "test11.txt" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/test/test11.txt")),
+        _ => {
+            static EXTRA_FILES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+            let cache = EXTRA_FILES.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(script) = lock_or_recover(cache).get(name).copied() {
+                return script;
+            }
+
+            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.push("test");
+            path.push(name);
+            let script = Box::leak(
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .into_boxed_str(),
+            );
+            lock_or_recover(cache).insert(name.to_string(), script);
+            script
+        }
+    }
 }
 
-fn load_mariadb_intellisense_test_file(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("test_mariadb");
-    path.push(name);
-    std::fs::read_to_string(path).unwrap_or_default()
+fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
+    match name {
+        "test1.txt" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_mariadb/test1.txt"
+        )),
+        "test2.txt" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_mariadb/test2.txt"
+        )),
+        "test3.txt" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_mariadb/test3.txt"
+        )),
+        "test4.txt" => include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_mariadb/test4.txt"
+        )),
+        _ => {
+            static EXTRA_FILES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+            let cache = EXTRA_FILES.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(script) = lock_or_recover(cache).get(name).copied() {
+                return script;
+            }
+
+            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.push("test_mariadb");
+            path.push(name);
+            let script = Box::leak(
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .into_boxed_str(),
+            );
+            lock_or_recover(cache).insert(name.to_string(), script);
+            script
+        }
+    }
 }
 
 fn analyze_full_script_marker(
@@ -68,7 +120,9 @@ fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::Cur
     intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
 }
 
-fn mysql_context_and_suggestions_for_inline_sql(sql_with_cursor: &str) -> (SqlContext, Vec<String>) {
+fn mysql_context_and_suggestions_for_inline_sql(
+    sql_with_cursor: &str,
+) -> (SqlContext, Vec<String>) {
     let cursor = sql_with_cursor
         .find('|')
         .expect("cursor marker should exist");
@@ -418,7 +472,7 @@ fn test8_log_query_order_by_statement_isolated_from_previous_summary_query() {
             marked.push_str(&script[insert_at..]);
             marked
         })
-        .unwrap_or_else(|| script.clone());
+        .unwrap_or_else(|| script.to_string());
     assert_ne!(
         marked, script,
         "expected log query ORDER BY target in test8.txt"
@@ -782,11 +836,7 @@ fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_c
 #[test]
 fn mariadb_final_boss_ranked_cte_completion_context_survives_full_script_split() {
     let script = load_mariadb_intellisense_test_file("test1.txt");
-    let marked = script.replacen(
-        "ORDER BY order_id",
-        "ORDER BY __CODEX_CURSOR__order_id",
-        1,
-    );
+    let marked = script.replacen("ORDER BY order_id", "ORDER BY __CODEX_CURSOR__order_id", 1);
     assert_ne!(marked, script, "expected ORDER BY target in test1.txt");
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
@@ -907,7 +957,10 @@ fn mariadb_final_boss_window_named_window_definition_is_column_context() {
         "PARTITION BY ob.__CODEX_CURSOR__emp_id\n                ORDER BY ob.created_at, ob.order_id\n            ),",
         1,
     );
-    assert_ne!(marked, script, "expected WINDOW w_emp PARTITION BY target in test1.txt");
+    assert_ne!(
+        marked, script,
+        "expected WINDOW w_emp PARTITION BY target in test1.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -923,7 +976,12 @@ fn mariadb_final_boss_window_named_window_definition_is_column_context() {
     let table_names: Vec<String> = deep_ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "OB"),
@@ -941,7 +999,10 @@ fn mariadb_final_boss_recursive_cte_union_all_member_select_is_select_list() {
         "CONCAT(p.path_txt, ' > ', c.__CODEX_CURSOR__dept_code) AS path_txt,",
         1,
     );
-    assert_ne!(marked, script, "expected recursive CTE CONCAT target in test1.txt");
+    assert_ne!(
+        marked, script,
+        "expected recursive CTE CONCAT target in test1.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -999,7 +1060,10 @@ fn mariadb_parser_killer_while_loop_body_select_is_where_clause() {
         "FROM agg_result\n     WHERE result_key = '__CODEX_CURSOR__TEMP_ROLLBACK'",
         1,
     );
-    assert_ne!(marked, script, "expected agg_result WHERE target in test2.txt");
+    assert_ne!(
+        marked, script,
+        "expected agg_result WHERE target in test2.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1032,7 +1096,10 @@ fn mariadb_ultra_final_boss_window_named_window_definition_is_column_context() {
         "PARTITION BY s.__CODEX_CURSOR__owner_name\n                ORDER BY s.created_at, s.run_id\n            ),\n            w_owner_running AS (",
         1,
     );
-    assert_ne!(marked, script, "expected WINDOW w_owner PARTITION BY target in test3.txt");
+    assert_ne!(
+        marked, script,
+        "expected WINDOW w_owner PARTITION BY target in test3.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1063,7 +1130,10 @@ fn mariadb_ultra_final_boss_recursive_cte_second_member_where_clause() {
         "ON c.parent_node_id = p.__CODEX_CURSOR__node_id",
         1,
     );
-    assert_ne!(marked, script, "expected recursive CTE ON target in test3.txt");
+    assert_ne!(
+        marked, script,
+        "expected recursive CTE ON target in test3.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1097,7 +1167,10 @@ fn mariadb_ultra_final_boss_insert_column_list_with_backtick_column() {
         "INSERT INTO qa_summary (\n        summary_key,\n        `group`,\n        `rank`,\n        summary_num,\n        summary_text,\n        __CODEX_CURSOR__summary_json\n    )\n    VALUES\n        (\n            'TOP_OWNER_WEIGHTED'",
         1,
     );
-    assert_ne!(marked, script, "expected INSERT INTO qa_summary column list target in test3.txt");
+    assert_ne!(
+        marked, script,
+        "expected INSERT INTO qa_summary column list target in test3.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1121,7 +1194,10 @@ fn mariadb_ultra_final_boss_on_duplicate_key_update_backtick_column_is_dml_set()
         "ON DUPLICATE KEY UPDATE\n        `group` = VALUES(`group`),\n        `rank` = VALUES(`rank`),\n        __CODEX_CURSOR__summary_num = VALUES(summary_num),",
         1,
     );
-    assert_ne!(marked, script, "expected ON DUPLICATE KEY UPDATE target in test3.txt");
+    assert_ne!(
+        marked, script,
+        "expected ON DUPLICATE KEY UPDATE target in test3.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1184,12 +1260,11 @@ fn mariadb_final_boss_create_or_replace_view_select_list_is_column_context() {
     // `SELECT e.employee_id, e.emp_code, CONCAT(e.last_name, ...`
     // REPLACE in `CREATE OR REPLACE VIEW` must NOT be treated as a DML REPLACE.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
-        "e.employee_id,",
-        "e.__CODEX_CURSOR__employee_id,",
-        1,
+    let marked = script.replacen("e.employee_id,", "e.__CODEX_CURSOR__employee_id,", 1);
+    assert_ne!(
+        marked, script,
+        "expected CREATE OR REPLACE VIEW SELECT target in test4.txt"
     );
-    assert_ne!(marked, script, "expected CREATE OR REPLACE VIEW SELECT target in test4.txt");
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1204,7 +1279,12 @@ fn mariadb_final_boss_create_or_replace_view_select_list_is_column_context() {
     let table_names: Vec<String> = deep_ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "E"),
@@ -1232,7 +1312,10 @@ fn mariadb_final_boss_create_or_replace_view_join_on_is_join_condition() {
         "ON d.dept_id = e.__CODEX_CURSOR__dept_id",
         1,
     );
-    assert_ne!(marked, script, "expected ON condition cursor target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected ON condition cursor target in test4.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1247,7 +1330,12 @@ fn mariadb_final_boss_create_or_replace_view_join_on_is_join_condition() {
     let table_names: Vec<String> = deep_ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "E"),
@@ -1269,7 +1357,10 @@ fn mariadb_final_boss_insert_on_duplicate_key_update_values_fn_is_dml_set() {
         "role_name = VALUES(role_name),\n        __CODEX_CURSOR__",
         1,
     );
-    assert_ne!(marked, script, "expected ON DUPLICATE KEY UPDATE target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected ON DUPLICATE KEY UPDATE target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1291,7 +1382,10 @@ fn mariadb_final_boss_monster_query_window_function_order_by_is_order_by_clause(
         "ORDER BY d.__CODEX_CURSOR__day_hours DESC,\n                d.work_date",
         1,
     );
-    assert_ne!(marked, script, "expected ROW_NUMBER ORDER BY target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected ROW_NUMBER ORDER BY target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1315,7 +1409,10 @@ fn mariadb_final_boss_recursive_cte_dept_tree_second_member_where() {
         "ON t.dept_id = c.__CODEX_CURSOR__parent_dept_id",
         1,
     );
-    assert_ne!(marked, script, "expected recursive CTE ON target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected recursive CTE ON target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1335,7 +1432,10 @@ fn mariadb_final_boss_trigger_body_insert_column_list_is_insert_column_list() {
         "INSERT INTO audit_events (event_type, entity_name, entity_id, __CODEX_CURSOR__detail)",
         1,
     );
-    assert_ne!(marked, script, "expected INSERT INTO audit_events column list target in test4.txt trigger");
+    assert_ne!(
+        marked, script,
+        "expected INSERT INTO audit_events column list target in test4.txt trigger"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1368,7 +1468,10 @@ fn mariadb_final_boss_procedure_insert_inside_while_loop_is_insert_column_list()
         "INSERT INTO task_log (project_id, __CODEX_CURSOR__employee_id, work_date, hours, note, payload)",
         1,
     );
-    assert_ne!(marked, script, "expected INSERT INTO task_log column list target in sp_seed_monster_data");
+    assert_ne!(
+        marked, script,
+        "expected INSERT INTO task_log column list target in sp_seed_monster_data"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1401,7 +1504,10 @@ fn mariadb_final_boss_procedure_update_join_set_is_dml_set() {
         "SET p.__CODEX_CURSOR__last_rollup_at = CURRENT_TIMESTAMP(6);",
         1,
     );
-    assert_ne!(marked, script, "expected UPDATE...SET target in sp_build_monthly_rollup");
+    assert_ne!(
+        marked, script,
+        "expected UPDATE...SET target in sp_build_monthly_rollup"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1418,8 +1524,12 @@ fn mariadb_final_boss_procedure_update_join_set_is_dml_set() {
         "DmlSetTargetList must be a column context"
     );
     assert!(
-        deep_ctx.focused_tables.iter().any(|t| t.eq_ignore_ascii_case("projects")),
-        "focused table for UPDATE...SET should include projects, got: {:?}", deep_ctx.focused_tables
+        deep_ctx
+            .focused_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("projects")),
+        "focused table for UPDATE...SET should include projects, got: {:?}",
+        deep_ctx.focused_tables
     );
 }
 
@@ -1434,7 +1544,10 @@ fn mariadb_final_boss_standalone_monster_query1_recursive_cte_select_list() {
         "SELECT\n    __CODEX_CURSOR__dept_id,\n    dept_code,\n    dept_name,\n    lvl,\n    path_text\nFROM dept_tree",
         1,
     );
-    assert_ne!(marked, script, "expected standalone monster query #1 SELECT target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected standalone monster query #1 SELECT target in test4.txt"
+    );
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
@@ -1446,7 +1559,11 @@ fn mariadb_final_boss_standalone_monster_query1_recursive_cte_select_list() {
         intellisense_context::SqlPhase::SelectList,
         "outer SELECT of WITH RECURSIVE should be SelectList phase"
     );
-    let cte_names: Vec<String> = deep_ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect();
+    let cte_names: Vec<String> = deep_ctx
+        .ctes
+        .iter()
+        .map(|c| c.name.to_uppercase())
+        .collect();
     assert!(
         cte_names.iter().any(|n| n == "DEPT_TREE"),
         "DEPT_TREE CTE must be visible in outer SELECT, got: {cte_names:?}"
@@ -1466,7 +1583,10 @@ fn mariadb_final_boss_monster_query2_owner_chain_cte_dept_tree_visible() {
         "ON dt.__CODEX_CURSOR__dept_id = e.dept_id",
         1,
     );
-    assert_ne!(marked, script, "expected owner_chain ON clause target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected owner_chain ON clause target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1474,7 +1594,11 @@ fn mariadb_final_boss_monster_query2_owner_chain_cte_dept_tree_visible() {
         intellisense_context::SqlPhase::JoinCondition,
         "ON clause inside owner_chain CTE body should be JoinCondition phase"
     );
-    let cte_names: Vec<String> = deep_ctx.ctes.iter().map(|c| c.name.to_uppercase()).collect();
+    let cte_names: Vec<String> = deep_ctx
+        .ctes
+        .iter()
+        .map(|c| c.name.to_uppercase())
+        .collect();
     assert!(
         cte_names.iter().any(|n| n == "DEPT_TREE"),
         "DEPT_TREE CTE must be visible inside owner_chain body, got: {cte_names:?}"
@@ -1482,7 +1606,12 @@ fn mariadb_final_boss_monster_query2_owner_chain_cte_dept_tree_visible() {
     let table_names: Vec<String> = deep_ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_names.iter().any(|n| n == "DT"),
@@ -1506,7 +1635,10 @@ fn mariadb_final_boss_monster_query3_json_table_group_by_is_column_context() {
         "GROUP BY p.project_code,\n        jt.__CODEX_CURSOR__tag",
         1,
     );
-    assert_ne!(marked, script, "expected JSON_TABLE GROUP BY target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected JSON_TABLE GROUP BY target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1519,10 +1651,8 @@ fn mariadb_final_boss_monster_query3_json_table_group_by_is_column_context() {
         "GroupByClause must be a column context"
     );
     // jt (JSON_TABLE virtual relation alias) must be visible
-    let qualifier_tables = crate::ui::intellisense_context::resolve_qualifier_tables(
-        "JT",
-        &deep_ctx.tables_in_scope,
-    );
+    let qualifier_tables =
+        crate::ui::intellisense_context::resolve_qualifier_tables("JT", &deep_ctx.tables_in_scope);
     assert!(
         !qualifier_tables.is_empty(),
         "qualifier `jt` (JSON_TABLE alias) must resolve in GROUP BY context, got empty"
@@ -1540,7 +1670,10 @@ fn mariadb_final_boss_final_inspection_select_from_clause_tables_in_scope() {
         "ORDER BY mr.__CODEX_CURSOR__ym,\n    p.project_code,\n    e.emp_code;",
         1,
     );
-    assert_ne!(marked, script, "expected final SELECT ORDER BY target in test4.txt");
+    assert_ne!(
+        marked, script,
+        "expected final SELECT ORDER BY target in test4.txt"
+    );
     let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
@@ -1551,7 +1684,12 @@ fn mariadb_final_boss_final_inspection_select_from_clause_tables_in_scope() {
     let table_aliases: Vec<String> = deep_ctx
         .tables_in_scope
         .iter()
-        .map(|t| t.alias.clone().unwrap_or_else(|| t.name.clone()).to_uppercase())
+        .map(|t| {
+            t.alias
+                .clone()
+                .unwrap_or_else(|| t.name.clone())
+                .to_uppercase()
+        })
         .collect();
     assert!(
         table_aliases.iter().any(|n| n == "MR"),
@@ -1593,7 +1731,10 @@ fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
         let marked = script.replacen(target, replacement, 1);
-        assert_ne!(marked, script, "expected CREATE TABLE target in {file_name}");
+        assert_ne!(
+            marked, script,
+            "expected CREATE TABLE target in {file_name}"
+        );
         let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -1698,7 +1839,10 @@ fn mysql_create_table_option_keywords_include_engine_default_and_collate() {
 #[test]
 fn mysql_lock_in_share_mode_is_not_classified_as_lock_table_context() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM emp LOCK IN SHARE MODE |");
-    assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
+    assert_eq!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::OrderByClause
+    );
 
     let context = SqlEditorWidget::classify_intellisense_context(
         &deep_ctx,
@@ -3152,6 +3296,29 @@ fn request_table_columns_handles_quoted_schema_and_table_names() {
     assert_eq!(update.table, "SCHEMA.TABLE.NAME");
     assert!(!update.cache_columns);
 }
+
+#[test]
+fn request_table_columns_handles_backtick_quoted_schema_and_table_names() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["SCHEMA.TABLE.NAME".to_string()];
+        guard.rebuild_indices();
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("`SCHEMA`.`TABLE.NAME`", &data, &sender, &connection);
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("backtick-quoted schema/table names should normalize before relation lookup");
+    assert_eq!(update.table, "SCHEMA.TABLE.NAME");
+    assert!(!update.cache_columns);
+}
+
 #[test]
 fn request_table_columns_keeps_exact_dotted_relation_name() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
@@ -3239,10 +3406,32 @@ fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier(
 
     SqlEditorWidget::request_table_columns("\"A.B\"", &data, &sender, &connection);
 
-    let update = receiver.recv_timeout(Duration::from_millis(200));
+    let update = receiver.try_recv();
     assert!(
         update.is_err(),
         "quoted identifier with embedded dot should not fall back to unqualified key"
+    );
+}
+
+#[test]
+fn request_table_columns_does_not_fallback_when_dot_is_inside_backtick_quoted_identifier() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["B".to_string()];
+        guard.rebuild_indices();
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("`A.B`", &data, &sender, &connection);
+
+    let update = receiver.try_recv();
+    assert!(
+        update.is_err(),
+        "backtick-quoted identifier with embedded dot should not fall back to unqualified key"
     );
 }
 
@@ -3261,7 +3450,7 @@ fn request_table_columns_does_not_fallback_for_invalid_qualified_identifier() {
 
     SqlEditorWidget::request_table_columns("HR.", &data, &sender, &connection);
 
-    let update = receiver.recv_timeout(Duration::from_millis(200));
+    let update = receiver.try_recv();
     assert!(
         update.is_err(),
         "invalid qualified identifier should not fall back to unrelated relation key"
@@ -3283,7 +3472,7 @@ fn request_table_columns_ignores_unbalanced_quoted_identifier() {
 
     SqlEditorWidget::request_table_columns("\"HR\".\"EMP", &data, &sender, &connection);
 
-    let update = receiver.recv_timeout(Duration::from_millis(200));
+    let update = receiver.try_recv();
     assert!(
         update.is_err(),
         "unbalanced quoted identifier should not trigger fallback column loading"
@@ -3294,7 +3483,7 @@ fn request_table_columns_ignores_unbalanced_quoted_identifier() {
 fn intellisense_data_clears_stale_column_loading_entries() {
     let mut data = IntellisenseData::new();
     assert!(data.mark_columns_loading("EMP"));
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(2));
 
     let cleared = data.clear_stale_columns_loading(Duration::from_millis(1));
     assert_eq!(cleared, 1);
@@ -3556,14 +3745,8 @@ fn qualified_condition_comparison_suggestions_quote_column_identifiers_when_need
     let mut data = IntellisenseData::new();
     data.tables = vec!["tb1".to_string(), "tb2".to_string()];
     data.rebuild_indices();
-    data.set_columns_for_table(
-        "tb1",
-        vec!["Order Id".to_string(), "Only A".to_string()],
-    );
-    data.set_columns_for_table(
-        "tb2",
-        vec!["Order Id".to_string(), "Only B".to_string()],
-    );
+    data.set_columns_for_table("tb1", vec!["Order Id".to_string(), "Only A".to_string()]);
+    data.set_columns_for_table("tb2", vec!["Order Id".to_string(), "Only B".to_string()]);
 
     let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
         &data, "Or", "a", &deep_ctx,
@@ -3690,8 +3873,7 @@ fn qualified_condition_comparison_suggestions_show_for_partial_prefix_after_qual
 fn qualified_condition_comparison_lookup_tables_include_join_peers_before_equals() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.a|");
 
-    let lookup_tables =
-        SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
 
     assert!(
         lookup_tables
@@ -3716,8 +3898,7 @@ fn qualified_condition_comparison_suggestions_are_suppressed_on_rhs_of_existing_
         .find('|')
         .expect("cursor marker should exist");
     let sql = sql_with_cursor.replace('|', "");
-    let (prefix, word_start, _word_end) =
-        crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let (prefix, word_start, _word_end) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
     let deep_ctx = analyze_inline_cursor_sql(sql_with_cursor);
 
@@ -3748,8 +3929,7 @@ fn qualified_condition_comparison_suggestions_are_suppressed_on_rhs_of_existing_
 fn qualified_condition_comparison_lookup_tables_are_empty_on_rhs_of_existing_equals() {
     let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.abc = b.ab|");
 
-    let lookup_tables =
-        SqlEditorWidget::comparison_lookup_tables_for_context(Some("b"), &deep_ctx);
+    let lookup_tables = SqlEditorWidget::comparison_lookup_tables_for_context(Some("b"), &deep_ctx);
 
     assert!(
         lookup_tables.is_empty(),
@@ -4035,8 +4215,14 @@ END;"#,
         .iter()
         .position(|name| name.eq_ignore_ascii_case("v_outer"));
 
-    assert!(inner_idx.is_some(), "inner scope symbol should be suggested");
-    assert!(outer_idx.is_some(), "outer scope symbol should be suggested");
+    assert!(
+        inner_idx.is_some(),
+        "inner scope symbol should be suggested"
+    );
+    assert!(
+        outer_idx.is_some(),
+        "outer scope symbol should be suggested"
+    );
     assert!(
         inner_idx < outer_idx,
         "inner scope symbol should rank before outer scope symbol: {:?}",
@@ -4221,7 +4407,8 @@ END;"#,
     assert!(
         !suggestions
             .iter()
-            .any(|name| name.eq_ignore_ascii_case("continue") || name.eq_ignore_ascii_case("handler")),
+            .any(|name| name.eq_ignore_ascii_case("continue")
+                || name.eq_ignore_ascii_case("handler")),
         "handler keywords must not leak into local suggestions: {:?}",
         suggestions
     );

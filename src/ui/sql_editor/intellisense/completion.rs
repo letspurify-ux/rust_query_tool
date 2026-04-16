@@ -1996,24 +1996,24 @@ impl SqlEditorWidget {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut chars = value.trim().chars().peekable();
-        let mut in_quotes = false;
+        let mut active_quote: Option<char> = None;
 
         while let Some(ch) = chars.next() {
             match ch {
-                '"' => {
+                '"' | '`' => {
                     current.push(ch);
-                    if in_quotes {
-                        if chars.peek().copied() == Some('"') {
-                            current.push('"');
+                    if active_quote == Some(ch) {
+                        if chars.peek().copied() == Some(ch) {
+                            current.push(ch);
                             chars.next();
                         } else {
-                            in_quotes = false;
+                            active_quote = None;
                         }
-                    } else {
-                        in_quotes = true;
+                    } else if active_quote.is_none() {
+                        active_quote = Some(ch);
                     }
                 }
-                '.' if !in_quotes => {
+                '.' if active_quote.is_none() => {
                     let segment = Self::strip_identifier_quotes(current.trim());
                     if !segment.is_empty() {
                         parts.push(segment);
@@ -2026,7 +2026,7 @@ impl SqlEditorWidget {
             }
         }
 
-        if in_quotes {
+        if active_quote.is_some() {
             return None;
         }
 
@@ -2042,21 +2042,21 @@ impl SqlEditorWidget {
 
     fn has_unquoted_dot(value: &str) -> bool {
         let mut chars = value.trim().chars().peekable();
-        let mut in_quotes = false;
+        let mut active_quote: Option<char> = None;
         while let Some(ch) = chars.next() {
             match ch {
-                '"' => {
-                    if in_quotes {
-                        if chars.peek().copied() == Some('"') {
+                '"' | '`' => {
+                    if active_quote == Some(ch) {
+                        if chars.peek().copied() == Some(ch) {
                             chars.next();
                         } else {
-                            in_quotes = false;
+                            active_quote = None;
                         }
-                    } else {
-                        in_quotes = true;
+                    } else if active_quote.is_none() {
+                        active_quote = Some(ch);
                     }
                 }
-                '.' if !in_quotes => return true,
+                '.' if active_quote.is_none() => return true,
                 _ => {}
             }
         }

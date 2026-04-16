@@ -139,7 +139,13 @@ impl ColumnLoadWorkerPool {
 static COLUMN_LOAD_WORKER_POOL: OnceLock<ColumnLoadWorkerPool> = OnceLock::new();
 
 impl SqlEditorWidget {
+    #[cfg(test)]
+    const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 1;
+    #[cfg(not(test))]
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
+    #[cfg(test)]
+    const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 1;
+    #[cfg(not(test))]
     const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
     const INTELLISENSE_POPUP_WIDTH: i32 = 320;
     const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
