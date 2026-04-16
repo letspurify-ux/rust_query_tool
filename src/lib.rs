@@ -15,3 +15,4 @@ pub mod sql_parser_engine;
 pub mod sql_text;
 pub mod ui;
 pub mod utils;
+pub mod version;

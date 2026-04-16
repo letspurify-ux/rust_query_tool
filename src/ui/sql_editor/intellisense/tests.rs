@@ -682,7 +682,7 @@ fn test11_with_function_statement_isolated_after_package_execution_block() {
     let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
-        statement.contains("WITH FUNCTION score_fn"),
+        statement.trim_start().starts_with("WITH") && statement.contains("FUNCTION score_fn"),
         "WITH FUNCTION statement should remain isolated, got:\n{statement}"
     );
     assert!(

@@ -1,6 +1,10 @@
 use std::env;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+use syn::punctuated::Punctuated;
+use syn::{Expr, ExprLit, Item, Lit, Meta, Token};
 
 fn has_system_lib_via_pkg_config(name: &str) -> bool {
     Command::new("pkg-config")
@@ -21,7 +25,219 @@ fn build_empty_stub(out_dir: &Path, lib_name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, files)?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+struct CfgContext {
+    target_os: String,
+    debug_assertions: bool,
+    no_splash_enabled: bool,
+}
+
+fn parse_cfg_items(list: &syn::MetaList) -> syn::Result<Punctuated<Meta, Token![,]>> {
+    list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+}
+
+fn meta_string_value(meta: &syn::MetaNameValue) -> Option<String> {
+    match &meta.value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) => Some(value.value()),
+        _ => None,
+    }
+}
+
+fn eval_cfg(meta: &Meta, ctx: &CfgContext) -> syn::Result<bool> {
+    match meta {
+        Meta::Path(path) if path.is_ident("test") => Ok(true),
+        Meta::Path(path) if path.is_ident("debug_assertions") => Ok(ctx.debug_assertions),
+        Meta::Path(path) if path.is_ident("unix") => Ok(ctx.target_os != "windows"),
+        Meta::Path(path) if path.is_ident("windows") => Ok(ctx.target_os == "windows"),
+        Meta::List(list) if list.path.is_ident("all") => {
+            for item in parse_cfg_items(list)? {
+                if !eval_cfg(&item, ctx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Meta::List(list) if list.path.is_ident("any") => {
+            for item in parse_cfg_items(list)? {
+                if eval_cfg(&item, ctx)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Meta::List(list) if list.path.is_ident("not") => {
+            let items = parse_cfg_items(list)?;
+            let item = items.first().ok_or_else(|| {
+                syn::Error::new_spanned(list, "cfg(not()) requires one predicate")
+            })?;
+            Ok(!eval_cfg(item, ctx)?)
+        }
+        Meta::NameValue(meta) if meta.path.is_ident("feature") => {
+            Ok(meta_string_value(meta).as_deref() == Some("no-splash") && ctx.no_splash_enabled)
+        }
+        Meta::NameValue(meta) if meta.path.is_ident("target_os") => {
+            Ok(meta_string_value(meta).as_deref() == Some(ctx.target_os.as_str()))
+        }
+        Meta::NameValue(meta) if meta.path.is_ident("target_family") => {
+            Ok(match meta_string_value(meta).as_deref() {
+                Some("unix") => ctx.target_os != "windows",
+                Some("windows") => ctx.target_os == "windows",
+                _ => false,
+            })
+        }
+        _ => Err(syn::Error::new_spanned(
+            meta,
+            "unsupported cfg predicate in test counter",
+        )),
+    }
+}
+
+fn item_is_enabled(attrs: &[syn::Attribute], ctx: &CfgContext) -> syn::Result<bool> {
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+
+        let Meta::List(list) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[cfg(...)] attribute",
+            ));
+        };
+
+        for predicate in parse_cfg_items(list)? {
+            if !eval_cfg(&predicate, ctx)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn count_test_items(items: &[Item], ctx: &CfgContext) -> syn::Result<usize> {
+    let mut count = 0;
+
+    for item in items {
+        let attrs = match item {
+            Item::Const(item) => &item.attrs,
+            Item::Enum(item) => &item.attrs,
+            Item::ExternCrate(item) => &item.attrs,
+            Item::Fn(item) => &item.attrs,
+            Item::ForeignMod(item) => &item.attrs,
+            Item::Impl(item) => &item.attrs,
+            Item::Macro(item) => &item.attrs,
+            Item::Mod(item) => &item.attrs,
+            Item::Static(item) => &item.attrs,
+            Item::Struct(item) => &item.attrs,
+            Item::Trait(item) => &item.attrs,
+            Item::TraitAlias(item) => &item.attrs,
+            Item::Type(item) => &item.attrs,
+            Item::Union(item) => &item.attrs,
+            Item::Use(item) => &item.attrs,
+            _ => continue,
+        };
+
+        if !item_is_enabled(attrs, ctx)? {
+            continue;
+        }
+
+        match item {
+            Item::Fn(item_fn) => {
+                if item_fn.attrs.iter().any(|attr| {
+                    attr.path()
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "test")
+                }) {
+                    count += 1;
+                }
+            }
+            Item::Mod(item_mod) => {
+                if let Some((_, nested_items)) = &item_mod.content {
+                    count += count_test_items(nested_items, ctx)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(count)
+}
+
+fn count_rust_tests_in_dir(
+    dir: &Path,
+    ctx: &CfgContext,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    collect_rust_files(dir, &mut files)?;
+
+    let mut count = 0;
+    for path in files {
+        if ctx.no_splash_enabled && path.starts_with(Path::new("src/splash")) {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path)?;
+        let parsed = syn::parse_file(&source)?;
+        count += count_test_items(&parsed.items, ctx)?;
+    }
+
+    Ok(count)
+}
+
+fn replace_patch_version(base_version: &str, patch: usize) -> String {
+    let mut parts = base_version.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(_), None) => format!("{major}.{minor}.{patch}"),
+        _ => base_version.to_string(),
+    }
+}
+
+fn configure_display_version() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=tests");
+
+    let cfg = CfgContext {
+        target_os: env::var("CARGO_CFG_TARGET_OS")?,
+        debug_assertions: env::var("DEBUG")
+            .map(|value| value == "true")
+            .unwrap_or(cfg!(debug_assertions)),
+        no_splash_enabled: env::var_os("CARGO_FEATURE_NO_SPLASH").is_some(),
+    };
+    let base_version = env::var("CARGO_PKG_VERSION")?;
+    let test_count = count_rust_tests_in_dir(Path::new("src"), &cfg)?
+        + count_rust_tests_in_dir(Path::new("tests"), &cfg)?;
+    let display_version = replace_patch_version(&base_version, test_count);
+
+    println!("cargo:rustc-env=SPACE_QUERY_DISPLAY_VERSION={display_version}");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    configure_display_version()?;
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if target_os == "linux" {

@@ -53,6 +53,7 @@ strip = true
 
 [build-dependencies]
 cc = "1.2"
+syn = { version = "2", features = ["full"] }
 winres = "0.1"
 
 [dev-dependencies]

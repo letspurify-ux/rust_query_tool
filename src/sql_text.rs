@@ -2132,8 +2132,6 @@ pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
 
 const MYSQL_COMPAT_CACHE_MAX_ENTRIES: usize = 64;
 const MYSQL_COMPAT_CACHE_MAX_SQL_BYTES: usize = 2 * 1024 * 1024;
-#[cfg(test)]
-const MYSQL_COMPAT_CACHE_MIN_SQL_LEN: usize = 0;
 #[cfg(not(test))]
 const MYSQL_COMPAT_CACHE_MIN_SQL_LEN: usize = 256;
 
@@ -2152,8 +2150,18 @@ struct MysqlCompatCache {
 static MYSQL_COMPAT_CACHE: Lazy<Mutex<MysqlCompatCache>> =
     Lazy::new(|| Mutex::new(MysqlCompatCache::default()));
 
+#[cfg(test)]
 fn should_cache_mysql_compatibility(sql: &str) -> bool {
-    sql.len() >= MYSQL_COMPAT_CACHE_MIN_SQL_LEN && sql.len() <= MYSQL_COMPAT_CACHE_MAX_SQL_BYTES
+    sql.len() <= MYSQL_COMPAT_CACHE_MAX_SQL_BYTES
+}
+
+#[cfg(not(test))]
+fn should_cache_mysql_compatibility(sql: &str) -> bool {
+    let sql_len = sql.len();
+    if sql_len > MYSQL_COMPAT_CACHE_MAX_SQL_BYTES {
+        return false;
+    }
+    sql_len >= MYSQL_COMPAT_CACHE_MIN_SQL_LEN
 }
 
 pub(crate) fn mysql_compatibility_for_sql(

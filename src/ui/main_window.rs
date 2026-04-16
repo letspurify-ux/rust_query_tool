@@ -177,6 +177,10 @@ fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, 
 }
 
 impl AppState {
+    fn app_window_title() -> String {
+        format!("SPACE Query {}", crate::version::display_version())
+    }
+
     fn next_spinner_frame(current_frame: usize, frame_count: usize) -> Option<usize> {
         if frame_count == 0 {
             return None;
@@ -204,12 +208,13 @@ impl AppState {
     }
 
     fn refresh_window_title(&mut self) {
+        let base_title = Self::app_window_title();
         if let Some(index) = self.find_tab_index(self.active_editor_tab_id) {
             let label = Self::tab_display_label(&self.editor_tabs[index]);
-            self.window.set_label(&format!("SPACE Query - {}", label));
+            self.window.set_label(&format!("{base_title} - {label}"));
             return;
         }
-        self.window.set_label("SPACE Query");
+        self.window.set_label(&base_title);
     }
 
     fn find_tab_index(&self, tab_id: QueryTabId) -> Option<usize> {
@@ -992,7 +997,7 @@ impl MainWindow {
 
         let mut window = Window::default()
             .with_size(1200, 800)
-            .with_label("SPACE Query")
+            .with_label(&AppState::app_window_title())
             .center_screen();
         window.set_id("main_window");
         window.set_color(theme::window_bg());

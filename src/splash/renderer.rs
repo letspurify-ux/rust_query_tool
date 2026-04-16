@@ -9,7 +9,6 @@ const TITLE_TEXTURE_WIDTH: u16 = 1280;
 const TITLE_TEXTURE_HEIGHT: u16 = 256;
 const TITLE_TEXT: &str = "SPACE QUERY";
 const SUBTITLE_TEXT: &str = "BUILT WITH RUST";
-const VERSION_TEXT: &str = concat!("V", env!("CARGO_PKG_VERSION"));
 
 #[repr(C)]
 struct Uniforms {
@@ -743,8 +742,9 @@ fn build_title_texture() -> Vec<u8> {
     );
 
     // Version text — small, below subtitle, right-aligned
+    let version_text = format!("V{}", crate::version::display_version());
     let subtitle_height = GLYPH_ROWS.saturating_mul(subtitle_scale);
-    let version_columns = text_columns(VERSION_TEXT);
+    let version_columns = text_columns(&version_text);
     let version_scale = subtitle_scale.saturating_sub(1).max(1);
     let version_width = version_columns.saturating_mul(version_scale);
     let version_origin_x = title_right.saturating_sub(version_width);
@@ -759,7 +759,7 @@ fn build_title_texture() -> Vec<u8> {
         &mut version_hi,
         sw,
         sh,
-        VERSION_TEXT,
+        &version_text,
         version_scale,
         version_origin_x,
         version_origin_y,

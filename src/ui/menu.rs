@@ -73,7 +73,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
 }
 
 fn build_about_dialog_content() -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = crate::version::display_version();
     let build_profile = if cfg!(debug_assertions) {
         "Debug"
     } else {
