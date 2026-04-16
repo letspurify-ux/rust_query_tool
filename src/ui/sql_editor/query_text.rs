@@ -752,6 +752,14 @@ pub(crate) fn statement_bounds_in_text_for_db_type_with_mysql_delimiter(
     .unwrap_or((0, sql.len()))
 }
 
+#[cfg(test)]
+pub(crate) fn statement_spans_in_text_for_db_type(
+    sql: &str,
+    preferred_db_type: Option<crate::db::connection::DatabaseType>,
+) -> Vec<(usize, usize)> {
+    QueryExecutor::statement_spans_for_db_type_with_mysql_delimiter(sql, preferred_db_type, None)
+}
+
 /// SQL 텍스트를 실행 단위(`ScriptItem`)로 분해합니다.
 ///
 /// 실행/스크립트 include/연결 가능 여부 판정 등에서 동일한 분해 규칙을 재사용하기 위한

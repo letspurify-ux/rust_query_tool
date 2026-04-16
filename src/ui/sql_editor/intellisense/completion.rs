@@ -139,13 +139,35 @@ impl SqlEditorWidget {
         statement_text: &str,
         cursor_in_statement: usize,
     ) -> intellisense_context::CursorContext {
-        let full_token_spans = super::query_text::tokenize_sql_spanned(statement_text);
-        let split_idx = full_token_spans.partition_point(|span| span.end <= cursor_in_statement);
-        let full_tokens: Vec<SqlToken> = full_token_spans
-            .into_iter()
-            .map(|span| span.token)
-            .collect();
-        intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
+        type CachedStatementTokens = (Arc<[usize]>, Arc<[SqlToken]>);
+
+        static TOKENIZED_STATEMENT_CACHE: OnceLock<Mutex<HashMap<String, CachedStatementTokens>>> =
+            OnceLock::new();
+
+        let cache = TOKENIZED_STATEMENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let (token_ends, statement_tokens) = {
+            let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = guard.get(statement_text) {
+                entry.clone()
+            } else {
+                let full_token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+                let token_ends: Arc<[usize]> = full_token_spans
+                    .iter()
+                    .map(|span| span.end)
+                    .collect::<Vec<_>>()
+                    .into();
+                let statement_tokens: Arc<[SqlToken]> = full_token_spans
+                    .into_iter()
+                    .map(|span| span.token)
+                    .collect::<Vec<_>>()
+                    .into();
+                let entry = (token_ends, statement_tokens);
+                guard.insert(statement_text.to_string(), entry.clone());
+                entry
+            }
+        };
+        let split_idx = token_ends.partition_point(|end| *end <= cursor_in_statement);
+        intellisense_context::analyze_cursor_context_arc(statement_tokens, split_idx)
     }
 
     fn is_intellisense_snapshot_current(

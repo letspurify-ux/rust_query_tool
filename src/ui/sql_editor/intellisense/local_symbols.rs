@@ -243,8 +243,8 @@ impl SqlEditorWidget {
         let split_idx = routine_cache
             .token_spans
             .partition_point(|span| span.end <= cursor_in_statement);
-        let context = intellisense_context::analyze_cursor_context(
-            routine_cache.statement_tokens.as_ref(),
+        let context = intellisense_context::analyze_cursor_context_arc(
+            routine_cache.statement_tokens.clone(),
             split_idx,
         );
 

@@ -24,7 +24,7 @@ fn split_at_cursor(sql: &str) -> (Vec<SqlToken>, usize) {
 
 fn analyze(sql: &str) -> CursorContext {
     let (full, cursor_token_len) = split_at_cursor(sql);
-    analyze_cursor_context(&full, cursor_token_len)
+    analyze_cursor_context_owned(full, cursor_token_len)
 }
 
 fn table_names(ctx: &CursorContext) -> Vec<String> {

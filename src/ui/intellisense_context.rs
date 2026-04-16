@@ -311,8 +311,21 @@ pub(crate) fn analyze_cursor_context(
     full_statement: &[SqlToken],
     cursor_token_len: usize,
 ) -> CursorContext {
-    let clamped_cursor_token_len = cursor_token_len.min(full_statement.len());
-    let statement_tokens: Arc<[SqlToken]> = full_statement.to_vec().into();
+    analyze_cursor_context_arc(full_statement.to_vec().into(), cursor_token_len)
+}
+
+pub(crate) fn analyze_cursor_context_owned(
+    full_statement: Vec<SqlToken>,
+    cursor_token_len: usize,
+) -> CursorContext {
+    analyze_cursor_context_arc(full_statement.into(), cursor_token_len)
+}
+
+pub(crate) fn analyze_cursor_context_arc(
+    statement_tokens: Arc<[SqlToken]>,
+    cursor_token_len: usize,
+) -> CursorContext {
+    let clamped_cursor_token_len = cursor_token_len.min(statement_tokens.len());
     let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
     let active_query_range = find_active_query_range(
         &parse_result.parsed_ctes,

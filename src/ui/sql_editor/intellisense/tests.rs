@@ -87,6 +87,43 @@ fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
     }
 }
 
+fn cached_statement_spans_for_test_script(sql: &str) -> Vec<(usize, usize)> {
+    static SPANS: OnceLock<Mutex<HashMap<String, Vec<(usize, usize)>>>> = OnceLock::new();
+    let cache = SPANS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(spans) = lock_or_recover(cache).get(sql).cloned() {
+        return spans;
+    }
+
+    let spans = super::query_text::statement_spans_in_text_for_db_type(sql, None);
+    lock_or_recover(cache).insert(sql.to_string(), spans.clone());
+    spans
+}
+
+fn simple_single_statement_bounds(sql: &str) -> Option<(usize, usize)> {
+    if sql.contains(';') {
+        return None;
+    }
+
+    if sql.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "/"
+            || super::query_text::is_sqlplus_command_line(trimmed)
+            || trimmed.starts_with('@')
+            || trimmed.starts_with("START ")
+            || trimmed.starts_with("start ")
+            || trimmed.starts_with("DELIMITER ")
+            || trimmed.starts_with("delimiter ")
+    }) {
+        return None;
+    }
+
+    let start = sql
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+        .unwrap_or(0);
+    Some((start, sql.len()))
+}
+
 fn analyze_full_script_marker(
     script_with_cursor: &str,
 ) -> (String, usize, intellisense_context::CursorContext) {
@@ -96,8 +133,45 @@ fn analyze_full_script_marker(
         .find(CURSOR_MARKER)
         .expect("cursor marker should exist");
     let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
-    let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+    let (stmt_start, stmt_end) = simple_single_statement_bounds(&sql).unwrap_or_else(|| {
+        cached_statement_spans_for_test_script(&sql)
+            .into_iter()
+            .find(|(start, end)| cursor >= *start && cursor < *end)
+            .unwrap_or_else(|| SqlEditorWidget::statement_bounds_in_text(&sql, cursor))
+    });
     let statement = sql.get(stmt_start..stmt_end).unwrap_or("").to_string();
+    let cursor_in_statement = cursor.saturating_sub(stmt_start).min(statement.len());
+    let (normalized_statement, normalized_cursor) =
+        SqlEditorWidget::normalize_intellisense_context_with_cursor(
+            &statement,
+            cursor_in_statement,
+        );
+    let deep_ctx =
+        SqlEditorWidget::analyze_statement_context(&normalized_statement, normalized_cursor);
+    (normalized_statement, normalized_cursor, deep_ctx)
+}
+
+fn analyze_full_script_target_replacement(
+    script: &str,
+    target: &str,
+    replacement: &str,
+) -> (String, usize, intellisense_context::CursorContext) {
+    const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+
+    let cursor_in_replacement = replacement
+        .find(CURSOR_MARKER)
+        .expect("replacement must include cursor marker");
+    let target_start = script
+        .find(target)
+        .unwrap_or_else(|| panic!("expected target to exist in script: {target}"));
+    let cursor = target_start.saturating_add(cursor_in_replacement);
+    let (stmt_start, stmt_end) = simple_single_statement_bounds(script).unwrap_or_else(|| {
+        cached_statement_spans_for_test_script(script)
+            .into_iter()
+            .find(|(start, end)| cursor >= *start && cursor < *end)
+            .unwrap_or_else(|| SqlEditorWidget::statement_bounds_in_text(script, cursor))
+    });
+    let statement = script.get(stmt_start..stmt_end).unwrap_or("").to_string();
     let cursor_in_statement = cursor.saturating_sub(stmt_start).min(statement.len());
     let (normalized_statement, normalized_cursor) =
         SqlEditorWidget::normalize_intellisense_context_with_cursor(
@@ -117,7 +191,7 @@ fn analyze_inline_cursor_sql(sql_with_cursor: &str) -> intellisense_context::Cur
     let token_spans = super::query_text::tokenize_sql_spanned(&sql);
     let split_idx = token_spans.partition_point(|span| span.end <= cursor);
     let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
-    intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
+    intellisense_context::analyze_cursor_context_owned(full_tokens, split_idx)
 }
 
 fn mysql_context_and_suggestions_for_inline_sql(
@@ -130,7 +204,7 @@ fn mysql_context_and_suggestions_for_inline_sql(
     let token_spans = super::query_text::tokenize_sql_spanned(&sql);
     let split_idx = token_spans.partition_point(|span| span.end <= cursor);
     let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
-    let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+    let deep_ctx = intellisense_context::analyze_cursor_context_owned(full_tokens, split_idx);
     let context = SqlEditorWidget::classify_intellisense_context(
         &deep_ctx,
         deep_ctx.statement_tokens.as_ref(),
@@ -836,9 +910,11 @@ fn expanded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_c
 #[test]
 fn mariadb_final_boss_ranked_cte_completion_context_survives_full_script_split() {
     let script = load_mariadb_intellisense_test_file("test1.txt");
-    let marked = script.replacen("ORDER BY order_id", "ORDER BY __CODEX_CURSOR__order_id", 1);
-    assert_ne!(marked, script, "expected ORDER BY target in test1.txt");
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
+        "ORDER BY order_id",
+        "ORDER BY __CODEX_CURSOR__order_id",
+    );
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_final_boss ()"),
@@ -873,13 +949,11 @@ fn mariadb_final_boss_ranked_cte_completion_context_survives_full_script_split()
 #[test]
 fn mariadb_parser_killer_ranked_cte_completion_context_survives_full_script_split() {
     let script = load_mariadb_intellisense_test_file("test2.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "SELECT\n        owner_name,\n        weight_sum\n    INTO",
         "SELECT\n        __CODEX_CURSOR__owner_name,\n        weight_sum\n    INTO",
-        1,
     );
-    assert_ne!(marked, script, "expected ranked SELECT target in test2.txt");
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_parser_killer ()"),
@@ -905,13 +979,11 @@ fn mariadb_parser_killer_ranked_cte_completion_context_survives_full_script_spli
 #[test]
 fn mariadb_ultra_final_boss_ranked_cte_completion_context_survives_full_script_split() {
     let script = load_mariadb_intellisense_test_file("test3.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "WHERE owner_name = 'alice';",
         "WHERE __CODEX_CURSOR__owner_name = 'alice';",
-        1,
     );
-    assert_ne!(marked, script, "expected ranked WHERE target in test3.txt");
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
@@ -952,16 +1024,11 @@ fn mariadb_final_boss_window_named_window_definition_is_column_context() {
     // After `WINDOW w_emp AS (PARTITION BY ob.|emp_id ...)`, the phase must
     // be OrderByClause and table alias `ob` must be visible.
     let script = load_mariadb_intellisense_test_file("test1.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "PARTITION BY ob.emp_id\n                ORDER BY ob.created_at, ob.order_id\n            ),",
         "PARTITION BY ob.__CODEX_CURSOR__emp_id\n                ORDER BY ob.created_at, ob.order_id\n            ),",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected WINDOW w_emp PARTITION BY target in test1.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_final_boss ()"),
@@ -994,16 +1061,11 @@ fn mariadb_final_boss_recursive_cte_union_all_member_select_is_select_list() {
     // test1.txt: cursor inside the recursive UNION ALL member SELECT of dept_tree.
     // `SELECT c.dept_id, c.parent_dept_id, c.dept_code, CONCAT(p.path_txt, ' > ', c.dept_code) ...`
     let script = load_mariadb_intellisense_test_file("test1.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "CONCAT(p.path_txt, ' > ', c.dept_code) AS path_txt,",
         "CONCAT(p.path_txt, ' > ', c.__CODEX_CURSOR__dept_code) AS path_txt,",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected recursive CTE CONCAT target in test1.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1027,13 +1089,11 @@ fn mariadb_parser_killer_exists_subquery_where_is_where_clause() {
     // test2.txt: cursor inside WHERE clause of an EXISTS subquery.
     // `SELECT 1 FROM task AS t WHERE t.node_id = n.|node_id`
     let script = load_mariadb_intellisense_test_file("test2.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "WHERE t.node_id = n.node_id",
         "WHERE t.node_id = n.__CODEX_CURSOR__node_id",
-        1,
     );
-    assert_ne!(marked, script, "expected EXISTS WHERE target in test2.txt");
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1055,16 +1115,11 @@ fn mariadb_parser_killer_while_loop_body_select_is_where_clause() {
     // statement after several control-flow blocks.  Cursor at the WHERE clause
     // of the scalar SELECT inside the procedure body.
     let script = load_mariadb_intellisense_test_file("test2.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "FROM agg_result\n     WHERE result_key = 'TEMP_ROLLBACK'",
         "FROM agg_result\n     WHERE result_key = '__CODEX_CURSOR__TEMP_ROLLBACK'",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected agg_result WHERE target in test2.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_parser_killer ()"),
@@ -1091,16 +1146,11 @@ fn mariadb_ultra_final_boss_window_named_window_definition_is_column_context() {
     // test3.txt: cursor inside WINDOW w_owner definition in the ranked CTE body.
     // `WINDOW w_owner AS (PARTITION BY s.|owner_name ORDER BY ...)`
     let script = load_mariadb_intellisense_test_file("test3.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "PARTITION BY s.owner_name\n                ORDER BY s.created_at, s.run_id\n            ),\n            w_owner_running AS (",
         "PARTITION BY s.__CODEX_CURSOR__owner_name\n                ORDER BY s.created_at, s.run_id\n            ),\n            w_owner_running AS (",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected WINDOW w_owner PARTITION BY target in test3.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
@@ -1125,16 +1175,11 @@ fn mariadb_ultra_final_boss_recursive_cte_second_member_where_clause() {
     // test3.txt: cursor in WHERE of the recursive CTE join condition
     // `JOIN node_tree AS p ON c.parent_node_id = p.|node_id`
     let script = load_mariadb_intellisense_test_file("test3.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ON c.parent_node_id = p.node_id",
         "ON c.parent_node_id = p.__CODEX_CURSOR__node_id",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected recursive CTE ON target in test3.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1162,16 +1207,11 @@ fn mariadb_ultra_final_boss_insert_column_list_with_backtick_column() {
     // The backtick-quoted column should not break InsertColumnList phase detection.
     let script = load_mariadb_intellisense_test_file("test3.txt");
     // Target the last INSERT INTO qa_summary column list (uses `group`, `rank`)
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "INSERT INTO qa_summary (\n        summary_key,\n        `group`,\n        `rank`,\n        summary_num,\n        summary_text,\n        summary_json\n    )\n    VALUES\n        (\n            'TOP_OWNER_WEIGHTED'",
         "INSERT INTO qa_summary (\n        summary_key,\n        `group`,\n        `rank`,\n        summary_num,\n        summary_text,\n        __CODEX_CURSOR__summary_json\n    )\n    VALUES\n        (\n            'TOP_OWNER_WEIGHTED'",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected INSERT INTO qa_summary column list target in test3.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
@@ -1189,16 +1229,11 @@ fn mariadb_ultra_final_boss_on_duplicate_key_update_backtick_column_is_dml_set()
     // test3.txt: cursor inside ON DUPLICATE KEY UPDATE after backtick column.
     // `ON DUPLICATE KEY UPDATE `group` = VALUES(`group`), `rank` = VALUES(`rank`), ...|`
     let script = load_mariadb_intellisense_test_file("test3.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ON DUPLICATE KEY UPDATE\n        `group` = VALUES(`group`),\n        `rank` = VALUES(`rank`),\n        summary_num = VALUES(summary_num),",
         "ON DUPLICATE KEY UPDATE\n        `group` = VALUES(`group`),\n        `rank` = VALUES(`rank`),\n        __CODEX_CURSOR__summary_num = VALUES(summary_num),",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected ON DUPLICATE KEY UPDATE target in test3.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
@@ -1225,13 +1260,11 @@ fn mariadb_ultra_final_boss_nested_labeled_block_select_into_is_select_list() {
     let script = load_mariadb_intellisense_test_file("test3.txt");
     // SELECT MAX(running_owner_weighted) INTO v_alice_running_weighted FROM ranked WHERE owner_name = 'alice'
     // The first occurrence of "MAX(running_owner_weighted)" is in the procedure
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "SELECT MAX(running_owner_weighted)",
         "SELECT __CODEX_CURSOR__MAX(running_owner_weighted)",
-        1,
     );
-    assert_ne!(marked, script, "expected SELECT MAX target in test3.txt");
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_run_ultra_final_boss ()"),
@@ -1260,12 +1293,11 @@ fn mariadb_final_boss_create_or_replace_view_select_list_is_column_context() {
     // `SELECT e.employee_id, e.emp_code, CONCAT(e.last_name, ...`
     // REPLACE in `CREATE OR REPLACE VIEW` must NOT be treated as a DML REPLACE.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen("e.employee_id,", "e.__CODEX_CURSOR__employee_id,", 1);
-    assert_ne!(
-        marked, script,
-        "expected CREATE OR REPLACE VIEW SELECT target in test4.txt"
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
+        "e.employee_id,",
+        "e.__CODEX_CURSOR__employee_id,",
     );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE OR REPLACE VIEW"),
@@ -1307,16 +1339,11 @@ fn mariadb_final_boss_create_or_replace_view_join_on_is_join_condition() {
     // test4.txt: cursor inside an ON condition of a JOIN inside the CREATE OR REPLACE VIEW body.
     // `JOIN departments d ON d.dept_id = e.|dept_id`
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ON d.dept_id = e.dept_id",
         "ON d.dept_id = e.__CODEX_CURSOR__dept_id",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected ON condition cursor target in test4.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE OR REPLACE VIEW"),
@@ -1352,16 +1379,11 @@ fn mariadb_final_boss_insert_on_duplicate_key_update_values_fn_is_dml_set() {
     // test4.txt: ON DUPLICATE KEY UPDATE with VALUES() references.
     // `ON DUPLICATE KEY UPDATE role_name = VALUES(role_name), ...`
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "role_name = VALUES(role_name),",
         "role_name = VALUES(role_name),\n        __CODEX_CURSOR__",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected ON DUPLICATE KEY UPDATE target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1377,16 +1399,11 @@ fn mariadb_final_boss_monster_query_window_function_order_by_is_order_by_clause(
     // `ROW_NUMBER() OVER (PARTITION BY d.project_id ORDER BY d.|day_hours DESC, d.work_date)`
     // The ORDER BY inside an inline OVER clause sets OrderByClause phase.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ORDER BY d.day_hours DESC,\n                d.work_date",
         "ORDER BY d.__CODEX_CURSOR__day_hours DESC,\n                d.work_date",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected ROW_NUMBER ORDER BY target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1404,16 +1421,11 @@ fn mariadb_final_boss_recursive_cte_dept_tree_second_member_where() {
     // test4.txt Monster query #2: cursor inside the recursive UNION ALL second member.
     // `FROM departments c JOIN dept_tree t ON t.dept_id = c.|parent_dept_id`
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ON t.dept_id = c.parent_dept_id",
         "ON t.dept_id = c.__CODEX_CURSOR__parent_dept_id",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected recursive CTE ON target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1427,16 +1439,11 @@ fn mariadb_final_boss_trigger_body_insert_column_list_is_insert_column_list() {
     // test4.txt: cursor inside INSERT INTO audit_events (...) column list
     // inside the ai_task_log AFTER INSERT trigger body.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "INSERT INTO audit_events (event_type, entity_name, entity_id, detail)",
         "INSERT INTO audit_events (event_type, entity_name, entity_id, __CODEX_CURSOR__detail)",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected INSERT INTO audit_events column list target in test4.txt trigger"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE TRIGGER ai_task_log"),
@@ -1463,16 +1470,11 @@ fn mariadb_final_boss_procedure_insert_inside_while_loop_is_insert_column_list()
     // test4.txt: cursor inside INSERT INTO task_log (...) column list
     // inside the nested WHILE loop of sp_seed_monster_data procedure.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "INSERT INTO task_log (project_id, employee_id, work_date, hours, note, payload)",
         "INSERT INTO task_log (project_id, __CODEX_CURSOR__employee_id, work_date, hours, note, payload)",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected INSERT INTO task_log column list target in sp_seed_monster_data"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_seed_monster_data"),
@@ -1499,16 +1501,11 @@ fn mariadb_final_boss_procedure_update_join_set_is_dml_set() {
     // test4.txt: cursor inside SET clause of UPDATE projects p JOIN (...) x ON ... SET p.last_rollup_at
     // in sp_build_monthly_rollup procedure.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "SET p.last_rollup_at = CURRENT_TIMESTAMP(6);",
         "SET p.__CODEX_CURSOR__last_rollup_at = CURRENT_TIMESTAMP(6);",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected UPDATE...SET target in sp_build_monthly_rollup"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("CREATE PROCEDURE sp_build_monthly_rollup"),
@@ -1539,16 +1536,11 @@ fn mariadb_final_boss_standalone_monster_query1_recursive_cte_select_list() {
     // Cursor inside the SELECT list of the outer query referencing dept_tree CTE.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     // The outer SELECT references columns from dept_tree CTE
-    let marked = script.replacen(
+    let (statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "SELECT\n    dept_id,\n    dept_code,\n    dept_name,\n    lvl,\n    path_text\nFROM dept_tree",
         "SELECT\n    __CODEX_CURSOR__dept_id,\n    dept_code,\n    dept_name,\n    lvl,\n    path_text\nFROM dept_tree",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected standalone monster query #1 SELECT target in test4.txt"
-    );
-    let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert!(
         statement.starts_with("WITH RECURSIVE dept_tree AS"),
@@ -1578,16 +1570,11 @@ fn mariadb_final_boss_monster_query2_owner_chain_cte_dept_tree_visible() {
     let script = load_mariadb_intellisense_test_file("test4.txt");
     // This is the 2nd occurrence of `ON t.dept_id = c.parent_dept_id` - but that's different.
     // owner_chain has `ON dt.dept_id = e.dept_id`
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ON dt.dept_id = e.dept_id",
         "ON dt.__CODEX_CURSOR__dept_id = e.dept_id",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected owner_chain ON clause target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1630,16 +1617,11 @@ fn mariadb_final_boss_monster_query3_json_table_group_by_is_column_context() {
     // Cursor inside the GROUP BY clause, verifying it's GroupByClause phase
     // and that jt (JSON_TABLE alias) is in scope.
     let script = load_mariadb_intellisense_test_file("test4.txt");
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "GROUP BY p.project_code,\n        jt.tag",
         "GROUP BY p.project_code,\n        jt.__CODEX_CURSOR__tag",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected JSON_TABLE GROUP BY target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1665,16 +1647,11 @@ fn mariadb_final_boss_final_inspection_select_from_clause_tables_in_scope() {
     // Cursor inside WHERE/ORDER BY of the multi-join SELECT to verify all tables visible.
     let script = load_mariadb_intellisense_test_file("test4.txt");
     // Target the ORDER BY clause of the final SELECT
-    let marked = script.replacen(
+    let (_statement, _cursor, deep_ctx) = analyze_full_script_target_replacement(
+        script,
         "ORDER BY mr.ym,\n    p.project_code,\n    e.emp_code;",
         "ORDER BY mr.__CODEX_CURSOR__ym,\n    p.project_code,\n    e.emp_code;",
-        1,
     );
-    assert_ne!(
-        marked, script,
-        "expected final SELECT ORDER BY target in test4.txt"
-    );
-    let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
 
     assert_eq!(
         deep_ctx.phase,
@@ -1730,12 +1707,8 @@ fn mariadb_scripts_create_table_definition_contexts_do_not_regress_to_table_name
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
-        let marked = script.replacen(target, replacement, 1);
-        assert_ne!(
-            marked, script,
-            "expected CREATE TABLE target in {file_name}"
-        );
-        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+        let (statement, _cursor, deep_ctx) =
+            analyze_full_script_target_replacement(script, target, replacement);
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),
@@ -1778,9 +1751,8 @@ fn mariadb_scripts_create_table_option_contexts_do_not_regress_to_table_name() {
         ),
     ] {
         let script = load_mariadb_intellisense_test_file(file_name);
-        let marked = script.replacen(target, replacement, 1);
-        assert_ne!(marked, script, "expected ENGINE target in {file_name}");
-        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+        let (statement, _cursor, deep_ctx) =
+            analyze_full_script_target_replacement(script, target, replacement);
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
             deep_ctx.statement_tokens.as_ref(),

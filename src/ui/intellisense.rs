@@ -1775,7 +1775,7 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         .into_iter()
         .map(|span| span.token)
         .collect::<Vec<_>>();
-    let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+    let ctx = intellisense_context::analyze_cursor_context_owned(full_tokens, split_idx);
 
     sql_context_for_phase(ctx.phase)
 }

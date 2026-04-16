@@ -1515,6 +1515,24 @@ impl QueryExecutor {
         )
     }
 
+    pub(crate) fn statement_spans_for_db_type_with_mysql_delimiter(
+        sql: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        Self::walk_statement_spans_for_bounds(
+            sql,
+            preferred_db_type,
+            initial_mysql_delimiter,
+            |span, _| {
+                spans.push(span);
+                true
+            },
+        );
+        spans
+    }
+
     fn find_statement_bounds_for_cursor(
         sql: &str,
         cursor_pos: usize,
