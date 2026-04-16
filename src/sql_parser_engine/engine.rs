@@ -454,9 +454,13 @@ impl SqlParserEngine {
         second.eq_ignore_ascii_case(keyword)
     }
 
-
+    #[allow(dead_code)]
     pub(crate) fn process_line(&mut self, line: &str) {
         self.process_line_with_boundary_observer(line, |_, _| {});
+    }
+
+    pub(crate) fn process_splitter_line(&mut self, line: &str) {
+        self.process_line_with_observers_after_boundary(line, |_, _, _, _| {}, |_, _| {});
     }
 
     fn process_chars_with_observer<F, G>(
@@ -932,6 +936,31 @@ impl SqlParserEngine {
         );
     }
 
+    fn process_line_with_observers_after_boundary<F, G>(
+        &mut self,
+        line: &str,
+        on_symbol: F,
+        on_statement_boundary: G,
+    ) where
+        F: FnMut(&[char], usize, char, Option<char>),
+        G: FnMut(&[char], usize),
+    {
+        let mut on_symbol = on_symbol;
+        let mut on_statement_boundary = on_statement_boundary;
+        let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
+        scratch_chars.clear();
+        scratch_chars.extend(line.chars());
+        scratch_chars.push('\n');
+
+        self.process_chars_with_observer(
+            &scratch_chars,
+            &mut on_symbol,
+            &mut on_statement_boundary,
+        );
+        self.state.clear_skip_next_end_label_token();
+        self.scratch_chars = scratch_chars;
+    }
+
     fn process_line_with_observers<F, G>(
         &mut self,
         line: &str,
@@ -1030,8 +1059,14 @@ impl SqlParserEngine {
         self.take_statements()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn process_line_and_take_statements(&mut self, line: &str) -> Vec<String> {
         self.process_line(line);
+        self.take_statements()
+    }
+
+    pub(crate) fn process_splitter_line_and_take_statements(&mut self, line: &str) -> Vec<String> {
+        self.process_splitter_line(line);
         self.take_statements()
     }
 }

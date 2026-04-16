@@ -80,6 +80,21 @@ impl AutoFormatLineSemantic {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum MysqlDelimitedLexMode {
+    #[default]
+    Normal,
+    SingleQuote,
+    DoubleQuote,
+    Backtick,
+    BlockComment,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MysqlDelimitedStatementState {
+    lex_mode: MysqlDelimitedLexMode,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AutoFormatLineContext {
     pub(crate) parser_depth: usize,
@@ -8179,6 +8194,7 @@ impl QueryExecutor {
         let mut sqlblanklines_enabled = true;
         let mut mysql_delimiter = ";".to_string();
         let mut mysql_raw_statement = String::new();
+        let mut mysql_delimited_state = MysqlDelimitedStatementState::default();
 
         let mut add_statement = |stmt: String, items: &mut Vec<FormatItem>| {
             let cleaned = stmt.trim();
@@ -8220,6 +8236,7 @@ impl QueryExecutor {
                 {
                     let command = ToolCommand::MysqlDelimiter { delimiter };
                     Self::sync_mysql_delimiter_from_tool_command(&command, &mut mysql_delimiter);
+                    mysql_delimited_state = MysqlDelimitedStatementState::default();
                     items.push(FormatItem::ToolCommand(command));
                     continue;
                 }
@@ -8233,18 +8250,24 @@ impl QueryExecutor {
                 if !mysql_raw_statement.is_empty() {
                     mysql_raw_statement.push('\n');
                 }
+                let line_start = mysql_raw_statement.len();
                 mysql_raw_statement.push_str(line);
 
-                if Self::statement_ends_with_mysql_delimiter(
-                    mysql_raw_statement.as_str(),
-                    mysql_delimiter.as_str(),
-                ) {
-                    let statement = Self::strip_trailing_mysql_delimiter(
-                        mysql_raw_statement.as_str(),
+                if let Some((delimiter_start, delimiter_end)) =
+                    Self::mysql_line_trailing_delimiter_range_with_state(
+                        line,
                         mysql_delimiter.as_str(),
+                        &mut mysql_delimited_state,
+                    )
+                {
+                    let statement = Self::strip_mysql_delimiter_range(
+                        mysql_raw_statement.as_str(),
+                        line_start.saturating_add(delimiter_start),
+                        line_start.saturating_add(delimiter_end),
                     );
                     add_statement(statement, &mut items);
                     mysql_raw_statement.clear();
+                    mysql_delimited_state = MysqlDelimitedStatementState::default();
                 }
                 continue;
             }
@@ -8756,6 +8779,7 @@ impl QueryExecutor {
             .unwrap_or(";")
             .to_string();
         let mut mysql_raw_statement = String::new();
+        let mut mysql_delimited_state = MysqlDelimitedStatementState::default();
 
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
@@ -8790,6 +8814,7 @@ impl QueryExecutor {
                 {
                     let command = ToolCommand::MysqlDelimiter { delimiter };
                     Self::sync_mysql_delimiter_from_tool_command(&command, &mut mysql_delimiter);
+                    mysql_delimited_state = MysqlDelimitedStatementState::default();
                     on_tool_command(command, line, items);
                     continue;
                 }
@@ -8803,18 +8828,24 @@ impl QueryExecutor {
                 if !mysql_raw_statement.is_empty() {
                     mysql_raw_statement.push('\n');
                 }
+                let line_start = mysql_raw_statement.len();
                 mysql_raw_statement.push_str(line);
 
-                if Self::statement_ends_with_mysql_delimiter(
-                    mysql_raw_statement.as_str(),
-                    mysql_delimiter.as_str(),
-                ) {
-                    let statement = Self::strip_trailing_mysql_delimiter(
-                        mysql_raw_statement.as_str(),
+                if let Some((delimiter_start, delimiter_end)) =
+                    Self::mysql_line_trailing_delimiter_range_with_state(
+                        line,
                         mysql_delimiter.as_str(),
+                        &mut mysql_delimited_state,
+                    )
+                {
+                    let statement = Self::strip_mysql_delimiter_range(
+                        mysql_raw_statement.as_str(),
+                        line_start.saturating_add(delimiter_start),
+                        line_start.saturating_add(delimiter_end),
                     );
                     add_statement(statement, items);
                     mysql_raw_statement.clear();
+                    mysql_delimited_state = MysqlDelimitedStatementState::default();
                 }
                 continue;
             }
@@ -8980,7 +9011,7 @@ impl QueryExecutor {
         }
 
         // Feed line to the parser engine
-        for stmt in builder.process_line_and_take_statements(line) {
+        for stmt in builder.process_splitter_line_and_take_statements(line) {
             add_statement(stmt, items);
         }
     }
@@ -9011,6 +9042,139 @@ impl QueryExecutor {
             index += 1;
         }
         bytes.len()
+    }
+
+    fn mysql_line_trailing_delimiter_range_with_state(
+        line: &str,
+        delimiter: &str,
+        state: &mut MysqlDelimitedStatementState,
+    ) -> Option<(usize, usize)> {
+        let delimiter_bytes = delimiter.as_bytes();
+        if delimiter_bytes.is_empty() {
+            return None;
+        }
+
+        let bytes = line.as_bytes();
+        let mut index = 0usize;
+        let mut candidate_range: Option<(usize, usize)> = None;
+
+        while index < bytes.len() {
+            match state.lex_mode {
+                MysqlDelimitedLexMode::Normal => {
+                    if bytes[index].is_ascii_whitespace() {
+                        index += 1;
+                        continue;
+                    }
+
+                    if bytes[index] == b'#' || Self::is_mysql_dash_comment_start(bytes, index) {
+                        break;
+                    }
+
+                    if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+                        state.lex_mode = MysqlDelimitedLexMode::BlockComment;
+                        index += 2;
+                        continue;
+                    }
+
+                    let delimiter_end = index.saturating_add(delimiter_bytes.len());
+                    if bytes
+                        .get(index..delimiter_end)
+                        .is_some_and(|segment| segment == delimiter_bytes)
+                    {
+                        candidate_range = Some((index, delimiter_end));
+                        index = delimiter_end;
+                        continue;
+                    }
+
+                    candidate_range = None;
+                    state.lex_mode = match bytes[index] {
+                        b'\'' => MysqlDelimitedLexMode::SingleQuote,
+                        b'"' => MysqlDelimitedLexMode::DoubleQuote,
+                        b'`' => MysqlDelimitedLexMode::Backtick,
+                        _ => {
+                            index += 1;
+                            continue;
+                        }
+                    };
+                    index += 1;
+                }
+                MysqlDelimitedLexMode::SingleQuote => {
+                    while index < bytes.len() {
+                        if bytes[index] == b'\\' {
+                            index = index.saturating_add(2);
+                            continue;
+                        }
+                        if bytes[index] == b'\'' {
+                            if bytes.get(index + 1) == Some(&b'\'') {
+                                index += 2;
+                                continue;
+                            }
+                            state.lex_mode = MysqlDelimitedLexMode::Normal;
+                            index += 1;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                MysqlDelimitedLexMode::DoubleQuote => {
+                    while index < bytes.len() {
+                        if bytes[index] == b'\\' {
+                            index = index.saturating_add(2);
+                            continue;
+                        }
+                        if bytes[index] == b'"' {
+                            if bytes.get(index + 1) == Some(&b'"') {
+                                index += 2;
+                                continue;
+                            }
+                            state.lex_mode = MysqlDelimitedLexMode::Normal;
+                            index += 1;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                MysqlDelimitedLexMode::Backtick => {
+                    while index < bytes.len() {
+                        if bytes[index] == b'`' {
+                            if bytes.get(index + 1) == Some(&b'`') {
+                                index += 2;
+                                continue;
+                            }
+                            state.lex_mode = MysqlDelimitedLexMode::Normal;
+                            index += 1;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                MysqlDelimitedLexMode::BlockComment => {
+                    while index + 1 < bytes.len() {
+                        if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                            state.lex_mode = MysqlDelimitedLexMode::Normal;
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    if index >= bytes.len().saturating_sub(1)
+                        && !matches!(state.lex_mode, MysqlDelimitedLexMode::Normal)
+                    {
+                        index = bytes.len();
+                    }
+                }
+            }
+        }
+
+        candidate_range
+    }
+
+    fn strip_mysql_delimiter_range(statement: &str, start: usize, end: usize) -> String {
+        let mut stripped =
+            String::with_capacity(statement.len().saturating_sub(end.saturating_sub(start)));
+        stripped.push_str(statement.get(..start).unwrap_or_default());
+        stripped.push_str(statement.get(end..).unwrap_or_default());
+        stripped.trim_end().to_string()
     }
 
     fn skip_mysql_quoted_literal(
