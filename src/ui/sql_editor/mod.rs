@@ -294,7 +294,7 @@ pub(crate) struct RoutineSymbolCacheEntry {
     statement_start: usize,
     statement_end: usize,
     statement_tokens: Arc<[SqlToken]>,
-    token_spans: Arc<[SqlTokenSpan]>,
+    token_ends: Arc<[usize]>,
     local_scopes: Arc<[LocalScope]>,
     local_symbols: Arc<[LocalSymbolEntry]>,
     text_bind_names: Arc<[String]>,

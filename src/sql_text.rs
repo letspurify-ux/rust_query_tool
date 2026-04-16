@@ -3,7 +3,8 @@
 
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Mutex;
 
 /// Shared Oracle SQL keywords used by parser, IntelliSense, and formatter.
 pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
@@ -2129,6 +2130,32 @@ pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
         })
 }
 
+const MYSQL_COMPAT_CACHE_MAX_ENTRIES: usize = 64;
+const MYSQL_COMPAT_CACHE_MAX_SQL_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(test)]
+const MYSQL_COMPAT_CACHE_MIN_SQL_LEN: usize = 0;
+#[cfg(not(test))]
+const MYSQL_COMPAT_CACHE_MIN_SQL_LEN: usize = 256;
+
+#[derive(Clone)]
+struct MysqlCompatCacheEntry {
+    sql: String,
+    mysql_compatible: bool,
+}
+
+#[derive(Default)]
+struct MysqlCompatCache {
+    entries: VecDeque<MysqlCompatCacheEntry>,
+    total_sql_bytes: usize,
+}
+
+static MYSQL_COMPAT_CACHE: Lazy<Mutex<MysqlCompatCache>> =
+    Lazy::new(|| Mutex::new(MysqlCompatCache::default()));
+
+fn should_cache_mysql_compatibility(sql: &str) -> bool {
+    sql.len() >= MYSQL_COMPAT_CACHE_MIN_SQL_LEN && sql.len() <= MYSQL_COMPAT_CACHE_MAX_SQL_BYTES
+}
+
 pub(crate) fn mysql_compatibility_for_sql(
     sql: &str,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
@@ -2136,7 +2163,49 @@ pub(crate) fn mysql_compatibility_for_sql(
     match preferred_db_type {
         Some(crate::db::connection::DatabaseType::MySQL) => true,
         Some(crate::db::connection::DatabaseType::Oracle) => false,
-        None => sql_uses_mysql_compatible_syntax(sql),
+        None => {
+            if !should_cache_mysql_compatibility(sql) {
+                return sql_uses_mysql_compatible_syntax(sql);
+            }
+
+            let cache = &*MYSQL_COMPAT_CACHE;
+            {
+                let mut guard = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(hit_idx) = guard.entries.iter().position(|entry| entry.sql == sql) {
+                    let Some(entry) = guard.entries.remove(hit_idx) else {
+                        return sql_uses_mysql_compatible_syntax(sql);
+                    };
+                    let mysql_compatible = entry.mysql_compatible;
+                    guard.entries.push_front(entry);
+                    return mysql_compatible;
+                }
+            }
+
+            let mysql_compatible = sql_uses_mysql_compatible_syntax(sql);
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing_idx) = guard.entries.iter().position(|entry| entry.sql == sql) {
+                let _ = guard.entries.remove(existing_idx);
+            } else {
+                guard.total_sql_bytes = guard.total_sql_bytes.saturating_add(sql.len());
+            }
+            guard.entries.push_front(MysqlCompatCacheEntry {
+                sql: sql.to_string(),
+                mysql_compatible,
+            });
+            while guard.entries.len() > MYSQL_COMPAT_CACHE_MAX_ENTRIES
+                || guard.total_sql_bytes > MYSQL_COMPAT_CACHE_MAX_SQL_BYTES
+            {
+                let Some(removed) = guard.entries.pop_back() else {
+                    break;
+                };
+                guard.total_sql_bytes = guard.total_sql_bytes.saturating_sub(removed.sql.len());
+            }
+            mysql_compatible
+        }
     }
 }
 

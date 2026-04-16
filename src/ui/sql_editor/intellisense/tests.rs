@@ -100,28 +100,7 @@ fn cached_statement_spans_for_test_script(sql: &str) -> Vec<(usize, usize)> {
 }
 
 fn simple_single_statement_bounds(sql: &str) -> Option<(usize, usize)> {
-    if sql.contains(';') {
-        return None;
-    }
-
-    if sql.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed == "/"
-            || super::query_text::is_sqlplus_command_line(trimmed)
-            || trimmed.starts_with('@')
-            || trimmed.starts_with("START ")
-            || trimmed.starts_with("start ")
-            || trimmed.starts_with("DELIMITER ")
-            || trimmed.starts_with("delimiter ")
-    }) {
-        return None;
-    }
-
-    let start = sql
-        .char_indices()
-        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
-        .unwrap_or(0);
-    Some((start, sql.len()))
+    super::query_text::simple_single_statement_bounds(sql)
 }
 
 fn analyze_full_script_marker(

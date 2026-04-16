@@ -11546,8 +11546,7 @@ impl SqlEditorWidget {
                             next_non_comment,
                             Some(SqlToken::Symbol(s)) if s == ")"
                         );
-                        let next_word_upper_ref =
-                            next_non_comment_idx.and_then(&word_upper_at);
+                        let next_word_upper_ref = next_non_comment_idx.and_then(&word_upper_at);
                         let next_word_upper = next_word_upper_ref.as_deref();
                         let next_is_condition_keyword = if let Some(upper) = next_word_upper {
                             condition_keywords.contains(&upper)

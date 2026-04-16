@@ -52,6 +52,8 @@ struct ParsedPackageBodyHeader {
 }
 
 impl SqlEditorWidget {
+    const EXPANDED_STATEMENT_FIRST_WORD_SCAN_BYTES: usize = 1024;
+
     #[cfg(test)]
     fn expanded_statement_window_in_text(text: &str, cursor_pos: usize) -> ExpandedStatementWindow {
         Self::expanded_statement_window_in_text_for_db_type(text, cursor_pos, None)
@@ -89,6 +91,14 @@ impl SqlEditorWidget {
                 Self::statement_bounds_in_text_for_db_type(window, rel_cursor, preferred_db_type);
             let touches_left = stmt_start == 0 && start > 0;
             let touches_right = stmt_end == window.len() && end < text_len;
+
+            if (touches_left && end == text_len) || (touches_right && start == 0) {
+                return Self::exact_statement_window_in_text_for_db_type(
+                    text,
+                    cursor_pos,
+                    preferred_db_type,
+                );
+            }
 
             if (!touches_left && !touches_right) || (start == 0 && end == text_len) {
                 let expanded = Self::statement_window_from_bounds(
@@ -174,7 +184,16 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let first_word = super::query_text::tokenize_sql_spanned(&expanded.text)
+        let first_word_scan_end = Self::clamp_to_char_boundary_local(
+            &expanded.text,
+            expanded
+                .text
+                .len()
+                .min(Self::EXPANDED_STATEMENT_FIRST_WORD_SCAN_BYTES),
+        );
+        let first_word = super::query_text::tokenize_sql_spanned(
+            expanded.text.get(..first_word_scan_end).unwrap_or(&expanded.text),
+        )
             .into_iter()
             .find_map(|span| match span.token {
                 SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
@@ -188,8 +207,13 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let upper = expanded.text.to_ascii_uppercase();
-        if upper.contains("BEGIN") || upper.contains("DECLARE") || upper.contains("PACKAGE BODY") {
+        if Self::expanded_statement_contains_ascii_case_insensitive(&expanded.text, "BEGIN")
+            || Self::expanded_statement_contains_ascii_case_insensitive(&expanded.text, "DECLARE")
+            || Self::expanded_statement_contains_ascii_case_insensitive(
+                &expanded.text,
+                "PACKAGE BODY",
+            )
+        {
             return true;
         }
 
@@ -219,6 +243,24 @@ impl SqlEditorWidget {
         )
     }
 
+    fn expanded_statement_contains_ascii_case_insensitive(
+        haystack: &str,
+        needle: &str,
+    ) -> bool {
+        let haystack_bytes = haystack.as_bytes();
+        let needle_bytes = needle.as_bytes();
+        if needle_bytes.is_empty() {
+            return true;
+        }
+        if haystack_bytes.len() < needle_bytes.len() {
+            return false;
+        }
+
+        haystack_bytes
+            .windows(needle_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(needle_bytes))
+    }
+
     fn expanded_statement_window_and_text_binds_from_shadow(
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: usize,
@@ -241,8 +283,8 @@ impl SqlEditorWidget {
         cursor_in_statement: usize,
     ) -> IntellisenseAnalysis {
         let split_idx = routine_cache
-            .token_spans
-            .partition_point(|span| span.end <= cursor_in_statement);
+            .token_ends
+            .partition_point(|end| *end <= cursor_in_statement);
         let context = intellisense_context::analyze_cursor_context_arc(
             routine_cache.statement_tokens.clone(),
             split_idx,
@@ -263,19 +305,30 @@ impl SqlEditorWidget {
         expanded_statement: &ExpandedStatementWindow,
         text_bind_names: Vec<String>,
     ) -> RoutineSymbolCacheEntry {
-        let token_spans: Vec<SqlTokenSpan> =
-            super::query_text::tokenize_sql_spanned(&expanded_statement.text);
-        let statement_tokens: Vec<SqlToken> =
-            token_spans.iter().map(|span| span.token.clone()).collect();
-        let (local_scopes, local_symbols) =
-            Self::analyze_local_scopes_and_symbols(&expanded_statement.text, &token_spans);
+        let mysql_compatible =
+            sql_text::mysql_compatibility_for_sql(&expanded_statement.text, None);
+        let token_spans: Vec<SqlTokenSpan> = super::query_text::tokenize_sql_spanned_with_mysql_compat(
+            &expanded_statement.text,
+            mysql_compatible,
+        );
+        let (local_scopes, local_symbols) = Self::analyze_local_scopes_and_symbols(
+            &expanded_statement.text,
+            &token_spans,
+            mysql_compatible,
+        );
+        let mut statement_tokens = Vec::with_capacity(token_spans.len());
+        let mut token_ends = Vec::with_capacity(token_spans.len());
+        for span in token_spans {
+            token_ends.push(span.end);
+            statement_tokens.push(span.token);
+        }
 
         RoutineSymbolCacheEntry {
             buffer_revision,
             statement_start: expanded_statement.statement_start,
             statement_end: expanded_statement.statement_end,
             statement_tokens: statement_tokens.into(),
-            token_spans: token_spans.into(),
+            token_ends: token_ends.into(),
             local_scopes: local_scopes.into(),
             local_symbols: local_symbols.into(),
             text_bind_names: text_bind_names.into(),
@@ -313,7 +366,8 @@ impl SqlEditorWidget {
                 .saturating_sub(analysis.statement_start),
         );
         let mut suggestions = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen_local_symbols = HashSet::new();
+        let mut seen_dynamic_symbols = HashSet::new();
 
         let active_scope = Self::deepest_local_scope_at_cursor(
             analysis.local_scopes.as_ref(),
@@ -341,7 +395,7 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(&symbol.name, &symbol.upper, &prefix_upper) {
                 continue;
             }
-            if seen.insert(symbol.upper.clone()) {
+            if seen_local_symbols.insert(symbol.upper.as_str()) {
                 scoped_suggestions[scope_rank].push(symbol.name.clone());
             }
         }
@@ -355,7 +409,7 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(name, &upper, &prefix_upper) {
                 continue;
             }
-            if seen.insert(upper) {
+            if !seen_local_symbols.contains(upper.as_str()) && seen_dynamic_symbols.insert(upper) {
                 suggestions.push(name.clone());
             }
         }
@@ -365,7 +419,7 @@ impl SqlEditorWidget {
             if !Self::local_symbol_matches_prefix(name, &upper, &prefix_upper) {
                 continue;
             }
-            if seen.insert(upper) {
+            if !seen_local_symbols.contains(upper.as_str()) && seen_dynamic_symbols.insert(upper) {
                 suggestions.push(name.clone());
             }
         }
@@ -433,9 +487,9 @@ impl SqlEditorWidget {
     fn analyze_local_scopes_and_symbols(
         statement_text: &str,
         token_spans: &[SqlTokenSpan],
+        mysql_compatible: bool,
     ) -> (Vec<LocalScope>, Vec<LocalSymbolEntry>) {
         let statement_len = statement_text.len();
-        let mysql_compatible = sql_text::mysql_compatibility_for_sql(statement_text, None);
         let root_begins_with_begin = token_spans.iter().find_map(|span| match &span.token {
             SqlToken::Word(word) => Some(word.eq_ignore_ascii_case("BEGIN")),
             SqlToken::Comment(_) => None,
@@ -464,6 +518,8 @@ impl SqlEditorWidget {
         let mut pending_loop_var = None::<String>;
         let mut skip_token_idx = None::<usize>;
         let mut idx = 0usize;
+        let previous_meaningful_word_is_end =
+            Self::previous_meaningful_word_is_end(token_spans);
 
         while idx < token_spans.len() {
             if skip_token_idx == Some(idx) {
@@ -472,7 +528,10 @@ impl SqlEditorWidget {
             }
 
             let token = &token_spans[idx];
-            let prev_upper = Self::previous_meaningful_word_upper(token_spans, idx);
+            let prev_is_end = previous_meaningful_word_is_end
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
 
             match &token.token {
                 SqlToken::Comment(_) | SqlToken::String(_) => {}
@@ -484,7 +543,7 @@ impl SqlEditorWidget {
 
                     if upper == "PACKAGE"
                         && root_decl_start_idx.is_none()
-                        && !matches!(prev_upper.as_deref(), Some("END"))
+                        && !prev_is_end
                     {
                         if let Some(parsed) = Self::parse_package_body_header(token_spans, idx) {
                             scopes[0].scope.kind = LocalScopeKind::PackageBody;
@@ -496,7 +555,7 @@ impl SqlEditorWidget {
                     }
 
                     if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
-                        && !matches!(prev_upper.as_deref(), Some("END"))
+                        && !prev_is_end
                     {
                         if let Some(parsed) = Self::parse_routine_header(token_spans, idx) {
                             let parent_scope = Self::current_local_parent_scope_id(&block_stack);
@@ -592,7 +651,7 @@ impl SqlEditorWidget {
                             pending_loop_var = Self::parse_for_loop_variable(token_spans, idx);
                         }
                         "LOOP" => {
-                            if matches!(prev_upper.as_deref(), Some("END")) {
+                            if prev_is_end {
                                 idx += 1;
                                 continue;
                             }
@@ -636,7 +695,7 @@ impl SqlEditorWidget {
                             });
                         }
                         "IF" => {
-                            if !matches!(prev_upper.as_deref(), Some("END")) {
+                            if !prev_is_end {
                                 block_stack.push(LocalBlockFrame {
                                     kind: LocalBlockKind::If,
                                     scope_id: None,
@@ -645,7 +704,7 @@ impl SqlEditorWidget {
                             }
                         }
                         "CASE" => {
-                            if !matches!(prev_upper.as_deref(), Some("END")) {
+                            if !prev_is_end {
                                 block_stack.push(LocalBlockFrame {
                                     kind: LocalBlockKind::Case,
                                     scope_id: None,
@@ -836,6 +895,22 @@ impl SqlEditorWidget {
 
         let scopes: Vec<LocalScope> = scopes.into_iter().map(|builder| builder.scope).collect();
         (scopes, symbols)
+    }
+
+    fn previous_meaningful_word_is_end(token_spans: &[SqlTokenSpan]) -> Vec<bool> {
+        let mut previous_word_is_end = Vec::with_capacity(token_spans.len());
+        let mut is_end = false;
+
+        for token in token_spans {
+            previous_word_is_end.push(is_end);
+            match &token.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => is_end = word.eq_ignore_ascii_case("END"),
+                _ => is_end = false,
+            }
+        }
+
+        previous_word_is_end
     }
 
     fn collect_scope_declaration_symbols(
@@ -1390,11 +1465,6 @@ impl SqlEditorWidget {
         });
     }
 
-    fn previous_meaningful_word_upper(tokens: &[SqlTokenSpan], idx: usize) -> Option<String> {
-        let prev_idx = Self::previous_meaningful_token_idx(tokens, idx)?;
-        Self::token_word(&tokens[prev_idx].token).map(|word| word.to_ascii_uppercase())
-    }
-
     fn next_meaningful_token_idx(tokens: &[SqlTokenSpan], start_idx: usize) -> Option<usize> {
         let mut idx = start_idx;
         while idx < tokens.len() {
@@ -1402,20 +1472,6 @@ impl SqlEditorWidget {
                 return Some(idx);
             }
             idx += 1;
-        }
-        None
-    }
-
-    fn previous_meaningful_token_idx(tokens: &[SqlTokenSpan], start_idx: usize) -> Option<usize> {
-        if start_idx == 0 {
-            return None;
-        }
-        let mut idx = start_idx;
-        while idx > 0 {
-            idx -= 1;
-            if !matches!(tokens[idx].token, SqlToken::Comment(_)) {
-                return Some(idx);
-            }
         }
         None
     }

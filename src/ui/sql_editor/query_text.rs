@@ -714,6 +714,31 @@ pub(crate) fn statement_at_cursor_for_db_type_with_mysql_delimiter(
     )
 }
 
+pub(crate) fn simple_single_statement_bounds(sql: &str) -> Option<(usize, usize)> {
+    if sql.contains(';') {
+        return None;
+    }
+
+    if sql.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "/"
+            || is_sqlplus_command_line(trimmed)
+            || trimmed.starts_with('@')
+            || trimmed.starts_with("START ")
+            || trimmed.starts_with("start ")
+            || trimmed.starts_with("DELIMITER ")
+            || trimmed.starts_with("delimiter ")
+    }) {
+        return None;
+    }
+
+    let start = sql
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+        .unwrap_or(0);
+    Some((start, sql.len()))
+}
+
 /// 현재 커서 위치가 속한 문장의 바이트 범위를 반환합니다.
 ///
 /// SQL*Plus 스타일 단독 `/` 구분자, tool command 문맥까지 포함한 경계 판정은

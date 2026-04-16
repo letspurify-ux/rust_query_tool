@@ -477,6 +477,10 @@ impl SqlEditorWidget {
         }
         let rel_cursor = Self::clamp_to_char_boundary_local(&window, rel_cursor);
         let before_cursor = window.get(..rel_cursor).unwrap_or("");
+        if let Some((stmt_start, _)) = super::query_text::simple_single_statement_bounds(before_cursor)
+        {
+            return before_cursor.get(stmt_start..).unwrap_or("").to_string();
+        }
         let (stmt_start, _) = Self::statement_bounds_in_text_for_db_type(
             before_cursor,
             before_cursor.len(),
@@ -549,6 +553,10 @@ impl SqlEditorWidget {
             .map(|idx| end_candidate + idx)
             .unwrap_or(text.len());
         let window = text.get(start..end).unwrap_or("");
+        if let Some((stmt_start, stmt_end)) = super::query_text::simple_single_statement_bounds(window)
+        {
+            return window.get(stmt_start..stmt_end).unwrap_or("").to_string();
+        }
         let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
         let (stmt_start, stmt_end) =
             Self::statement_bounds_in_text_for_db_type(window, rel_cursor, preferred_db_type);
