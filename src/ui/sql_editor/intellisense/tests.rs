@@ -3687,6 +3687,78 @@ fn qualified_condition_comparison_suggestions_show_for_partial_prefix_after_qual
 }
 
 #[test]
+fn qualified_condition_comparison_lookup_tables_include_join_peers_before_equals() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.a|");
+
+    let lookup_tables =
+        SqlEditorWidget::comparison_lookup_tables_for_context(Some("a"), &deep_ctx);
+
+    assert!(
+        lookup_tables
+            .iter()
+            .any(|table| table.eq_ignore_ascii_case("tb1")),
+        "expected current table lookup in {:?}",
+        lookup_tables
+    );
+    assert!(
+        lookup_tables
+            .iter()
+            .any(|table| table.eq_ignore_ascii_case("tb2")),
+        "expected peer join table lookup in {:?}",
+        lookup_tables
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_are_suppressed_on_rhs_of_existing_equals() {
+    let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.abc = b.ab|";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (prefix, word_start, _word_end) =
+        crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+    let deep_ctx = analyze_inline_cursor_sql(sql_with_cursor);
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string(), "deptno".to_string()]);
+    data.set_columns_for_table("tb2", vec!["abc".to_string(), "deptno".to_string()]);
+
+    assert_eq!(prefix, "ab");
+    assert_eq!(qualifier.as_deref(), Some("b"));
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        &prefix,
+        qualifier.as_deref().expect("expected qualifier"),
+        &deep_ctx,
+    );
+
+    assert!(
+        suggestions.is_empty(),
+        "comparison suggestions should be suppressed on RHS after existing '=': {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_lookup_tables_are_empty_on_rhs_of_existing_equals() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.abc = b.ab|");
+
+    let lookup_tables =
+        SqlEditorWidget::comparison_lookup_tables_for_context(Some("b"), &deep_ctx);
+
+    assert!(
+        lookup_tables.is_empty(),
+        "comparison lookup tables should be empty on RHS after existing '=': {:?}",
+        lookup_tables
+    );
+}
+
+#[test]
 fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["CONFIG".to_string()];

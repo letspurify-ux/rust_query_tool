@@ -1560,6 +1560,71 @@ impl SqlEditorWidget {
         resolved
     }
 
+    fn token_is_qualified_identifier_segment(token: &SqlToken) -> bool {
+        matches!(token, SqlToken::Word(_) | SqlToken::String(_))
+    }
+
+    fn current_qualified_identifier_chain_start(
+        tokens: &[SqlToken],
+        cursor_token_len: usize,
+    ) -> Option<usize> {
+        if cursor_token_len == 0 || cursor_token_len > tokens.len() {
+            return None;
+        }
+
+        let mut start = cursor_token_len;
+        if start >= 2
+            && matches!(tokens.get(start - 1), Some(SqlToken::Symbol(symbol)) if symbol == ".")
+            && tokens
+                .get(start - 2)
+                .is_some_and(Self::token_is_qualified_identifier_segment)
+        {
+            start -= 2;
+        } else if tokens
+            .get(start - 1)
+            .is_some_and(Self::token_is_qualified_identifier_segment)
+        {
+            start -= 1;
+            while start >= 2
+                && matches!(tokens.get(start - 1), Some(SqlToken::Symbol(symbol)) if symbol == ".")
+                && tokens
+                    .get(start - 2)
+                    .is_some_and(Self::token_is_qualified_identifier_segment)
+            {
+                start -= 2;
+            }
+        } else {
+            return None;
+        }
+
+        Some(start)
+    }
+
+    fn previous_non_comment_token(tokens: &[SqlToken], end: usize) -> Option<&SqlToken> {
+        tokens
+            .get(..end)?
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+    }
+
+    fn cursor_has_existing_equals_before_qualified_identifier(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let Some(chain_start) =
+            Self::current_qualified_identifier_chain_start(tokens, cursor_token_len)
+        else {
+            return false;
+        };
+
+        matches!(
+            Self::previous_non_comment_token(tokens, chain_start),
+            Some(SqlToken::Symbol(symbol)) if symbol == "="
+        )
+    }
+
     fn supports_qualified_condition_comparison_suggestions(
         phase: intellisense_context::SqlPhase,
     ) -> bool {
@@ -1620,6 +1685,9 @@ impl SqlEditorWidget {
         if !Self::supports_qualified_condition_comparison_suggestions(deep_ctx.phase) {
             return Vec::new();
         }
+        if Self::cursor_has_existing_equals_before_qualified_identifier(deep_ctx) {
+            return Vec::new();
+        }
 
         let comparison_tables = Self::comparison_scope_tables_for_context(deep_ctx);
         if comparison_tables.is_empty() {
@@ -1645,6 +1713,9 @@ impl SqlEditorWidget {
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
         if !Self::supports_qualified_condition_comparison_suggestions(deep_ctx.phase) {
+            return Vec::new();
+        }
+        if Self::cursor_has_existing_equals_before_qualified_identifier(deep_ctx) {
             return Vec::new();
         }
 
