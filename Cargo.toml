@@ -12,9 +12,10 @@ path = "src/main.rs"
 test = false
 
 [features]
-# Build without the OpenGL splash screen (useful for CI, headless environments,
-# or users who prefer a faster startup).
-# Usage: cargo build --features no-splash
+# Disable the OpenGL splash screen by default for faster startup and better
+# compatibility in headless environments.
+# To re-enable the splash screen, build with: cargo build --no-default-features
+default = ["no-splash"]
 no-splash = []
 
 [dependencies]
