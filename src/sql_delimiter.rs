@@ -48,7 +48,6 @@ impl DelimiterLineStartSnapshot {
             stack: self.visible_frames.clone(),
         }
     }
-
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -171,8 +170,7 @@ pub(crate) fn line_closes_delimiter_frame_below_snapshot_before_token(
         .skip(line_start_idx)
         .take(token_idx.saturating_sub(line_start_idx))
     {
-        if frame_state
-            .apply_token_with_close_detection(token, line_start_snapshot.baseline_depth())
+        if frame_state.apply_token_with_close_detection(token, line_start_snapshot.baseline_depth())
         {
             return true;
         }

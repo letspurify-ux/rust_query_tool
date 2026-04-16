@@ -8422,6 +8422,12 @@ impl QueryExecutor {
             }
 
             // Delegate to the shared termination-check sequence
+            let restore_plain_end_semicolon = mysql_delimiter == ";"
+                && builder.state.package_body_init_end_context()
+                && sql_text::line_ends_with_semicolon_before_inline_comment(line.trim_start())
+                && sql_text::starts_with_format_plain_end(
+                    line.trim_start().to_ascii_uppercase().as_str(),
+                );
             Self::process_split_line(
                 parser_line,
                 parser_trimmed,
@@ -8439,6 +8445,9 @@ impl QueryExecutor {
                 },
                 &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
             );
+            if restore_plain_end_semicolon {
+                Self::maybe_restore_plain_end_semicolon_in_last_format_item(&mut items);
+            }
         }
 
         if !mysql_raw_statement.trim().is_empty() {
@@ -8689,6 +8698,20 @@ impl QueryExecutor {
         }
 
         merged
+    }
+
+    fn maybe_restore_plain_end_semicolon_in_last_format_item(items: &mut [FormatItem]) {
+        let Some(FormatItem::Statement(statement)) = items.last_mut() else {
+            return;
+        };
+
+        if statement.trim_end().ends_with(';')
+            || sql_text::line_ends_with_semicolon_before_inline_comment(statement)
+        {
+            return;
+        }
+
+        statement.push(';');
     }
 
     fn combine_fragmented_standalone_routine_format_statement(

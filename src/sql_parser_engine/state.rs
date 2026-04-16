@@ -418,7 +418,7 @@ impl SplitState {
         false
     }
 
-    fn package_body_init_end_context(&self) -> bool {
+    pub(crate) fn package_body_init_end_context(&self) -> bool {
         if self.create_plsql_kind != CreatePlsqlKind::PackageBody || self.pending_subprogram_begins != 0 {
             return false;
         }

@@ -22053,6 +22053,145 @@ END calc_depth;"#;
     }
 
     #[test]
+    fn format_for_auto_formatting_keeps_package_body_named_end_before_final_end_stable() {
+        let source = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;"#;
+        let expected = r#"CREATE PACKAGE BODY a IS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                INSERT INTO d (e)
+                VALUES (1);
+            END;
+        END IF;
+        OPEN v FOR
+            SELECT 1
+            FROM DUAL;
+    END b;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted.trim(),
+            expected.trim(),
+            "auto-formatting should keep package member END and final END aligned, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "package body auto-formatting should remain idempotent for named END before final END"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_package_body_unlabeled_final_end_attached_before_trailing_statement(
+    ) {
+        let source = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;
+select 1 from dual;"#;
+        let expected = r#"CREATE PACKAGE BODY a IS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                INSERT INTO d (e)
+                VALUES (1);
+            END;
+        END IF;
+        OPEN v FOR
+            SELECT 1
+            FROM DUAL;
+    END b;
+END;
+
+SELECT 1
+FROM DUAL;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+
+        assert_eq!(
+            formatted.trim(),
+            expected.trim(),
+            "auto-formatting should keep the final package END attached before the next statement, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn split_format_items_keeps_package_body_unlabeled_final_end_with_preceding_statement() {
+        let source = r#"create package body a is
+    procedure b (c in varchar2) is
+    begin
+        if (1 = 1) then
+            begin
+                insert into d (e)
+                values (1);
+            end;
+        end if;
+        open v for
+            select 1
+            from dual;
+    end b;
+end;
+select 1 from dual;"#;
+
+        let items = crate::db::QueryExecutor::split_format_items(source);
+        let statements: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::db::query::FormatItem::Statement(statement) => Some(statement.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "format splitter should keep package body + trailing SELECT as two statements, got: {statements:?}"
+        );
+        assert!(
+            statements[0]
+                .trim_end()
+                .to_ascii_uppercase()
+                .ends_with("END;"),
+            "package body format item should keep the final END terminator attached, got:\n{}",
+            statements[0]
+        );
+        assert!(
+            statements[1].trim_start().starts_with("select 1 from dual"),
+            "second format item should stay on the trailing SELECT, got:\n{}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn format_for_auto_formatting_keeps_trailing_with_function_sibling_cte_on_with_depth() {
         let source = r#"WITH
     FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS

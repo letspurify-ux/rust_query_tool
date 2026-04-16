@@ -12308,6 +12308,95 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_named_member_end_followed_by_unlabeled_package_end() {
+    let sql = r#"CREATE PACKAGE BODY a IS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                INSERT INTO d (e)
+                VALUES (1);
+            END;
+        END IF;
+        OPEN v FOR
+            SELECT 1
+            FROM dual;
+    END b;
+END;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let procedure_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE b"))
+        .expect("expected PROCEDURE line");
+    let end_proc_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END b;")
+        .expect("expected END b line");
+    let end_pkg_idx = lines
+        .iter()
+        .rposition(|line| line.trim_start() == "END;")
+        .expect("expected final END line");
+    let select_idx = lines
+        .iter()
+        .rposition(|line| line.trim_start() == "SELECT 1 FROM dual;")
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[end_proc_idx], depths[procedure_idx],
+        "named subprogram END should close back to the package member depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "final unlabeled package END should return to top-level depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "trailing SELECT should start at top-level after package body closure (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_named_member_end_before_unlabeled_package_end_stays_single_statement(
+) {
+    let sql = r#"CREATE PACKAGE BODY a IS
+    PROCEDURE b (c IN VARCHAR2) IS
+    BEGIN
+        IF (1 = 1) THEN
+            BEGIN
+                INSERT INTO d (e)
+                VALUES (1);
+            END;
+        END IF;
+        OPEN v FOR
+            SELECT 1
+            FROM dual;
+    END b;
+END;
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "package body should split only at the final unlabeled END: {stmts:?}"
+    );
+    assert!(stmts[0].contains("END IF;"));
+    assert!(stmts[0].contains("END b;"));
+    assert!(
+        stmts[0].trim_end().ends_with("END"),
+        "first statement should keep the final package END line, got: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_package_body_split_end_name_with_exception_and_if_suffix() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split2 AS
   PROCEDURE p1 IS

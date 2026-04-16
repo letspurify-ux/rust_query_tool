@@ -5678,10 +5678,9 @@ pub(crate) fn format_indented_paren_owner_kind_from_words(
         Some(FormatIndentedParenOwnerKind::Pivot)
     } else if last_word.eq_ignore_ascii_case("UNPIVOT")
         || (last_word.eq_ignore_ascii_case("NULLS")
-            && penultimate_word
-                .is_some_and(|word| {
-                    word.eq_ignore_ascii_case("INCLUDE") || word.eq_ignore_ascii_case("EXCLUDE")
-                })
+            && penultimate_word.is_some_and(|word| {
+                word.eq_ignore_ascii_case("INCLUDE") || word.eq_ignore_ascii_case("EXCLUDE")
+            })
             && third_from_end_word.is_some_and(|word| word.eq_ignore_ascii_case("UNPIVOT")))
     {
         Some(FormatIndentedParenOwnerKind::Unpivot)
