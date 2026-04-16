@@ -3428,6 +3428,265 @@ fn collect_clause_wildcard_suggestions_outside_select_list_are_empty() {
 }
 
 #[test]
+fn qualified_condition_comparison_suggestions_cover_supported_predicate_clauses() {
+    let cases = [
+        (
+            "SELECT * FROM tb1 a JOIN tb2 b ON a.|",
+            intellisense_context::SqlPhase::JoinCondition,
+        ),
+        (
+            "SELECT * FROM tb1 a JOIN tb2 b ON a.id = b.id WHERE a.|",
+            intellisense_context::SqlPhase::WhereClause,
+        ),
+        (
+            "SELECT a.id FROM tb1 a JOIN tb2 b ON a.id = b.id GROUP BY a.id HAVING a.|",
+            intellisense_context::SqlPhase::HavingClause,
+        ),
+        (
+            "SELECT * FROM tb1 a START WITH a.| CONNECT BY PRIOR a.id = a.parent_id",
+            intellisense_context::SqlPhase::StartWithClause,
+        ),
+        (
+            "SELECT * FROM tb1 a CONNECT BY a.| = PRIOR a.parent_id",
+            intellisense_context::SqlPhase::ConnectByClause,
+        ),
+        (
+            "SELECT * FROM oqt_t_emp MATCH_RECOGNIZE ( PATTERN (a b+) DEFINE b AS b.| > PREV(b.sal) )",
+            intellisense_context::SqlPhase::MatchRecognizeClause,
+        ),
+    ];
+
+    for (sql_with_cursor, expected_phase) in cases {
+        let deep_ctx = analyze_inline_cursor_sql(sql_with_cursor);
+        assert_eq!(deep_ctx.phase, expected_phase, "sql: {sql_with_cursor}");
+        assert!(
+            SqlEditorWidget::supports_qualified_condition_comparison_suggestions(deep_ctx.phase),
+            "phase should support comparison suggestions: {:?}",
+            deep_ctx.phase
+        );
+    }
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_match_same_named_columns_from_other_scopes() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string(), "only_a".to_string()]);
+    data.set_columns_for_table("tb2", vec!["abc".to_string(), "only_b".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "", "a", &deep_ctx,
+    );
+
+    assert_has_case_insensitive(&suggestions, "a.abc = b.abc");
+    assert!(
+        !suggestions
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case("a.only_a = b.only_a")),
+        "unexpected unmatched comparison suggestion: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_prefer_aliases_for_other_side() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.de|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["deptno".to_string(), "abc".to_string()]);
+    data.set_columns_for_table("tb2", vec!["deptno".to_string(), "abc".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "de", "a", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["a.deptno = b.deptno".to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_are_empty_without_other_scope() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a WHERE a.|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string(), "deptno".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "", "a", &deep_ctx,
+    );
+
+    assert!(
+        suggestions.is_empty(),
+        "single-scope condition should not suggest self-comparisons: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_are_empty_outside_predicate_clause() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT a.| FROM tb1 a JOIN tb2 b ON a.id = b.id");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string()]);
+    data.set_columns_for_table("tb2", vec!["abc".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "", "a", &deep_ctx,
+    );
+
+    assert!(
+        suggestions.is_empty(),
+        "non-predicate clause should not get comparison suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_quote_column_identifiers_when_needed() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM tb1 a JOIN tb2 b ON a.Or|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table(
+        "tb1",
+        vec!["Order Id".to_string(), "Only A".to_string()],
+    );
+    data.set_columns_for_table(
+        "tb2",
+        vec!["Order Id".to_string(), "Only B".to_string()],
+    );
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "Or", "a", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_include_correlated_outer_aliases() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE e.de|)",
+    );
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["emp".to_string(), "dept".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("emp", vec!["deptno".to_string(), "empno".to_string()]);
+    data.set_columns_for_table("dept", vec!["deptno".to_string(), "dname".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "de", "e", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["e.deptno = d.deptno".to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_use_pattern_variables_in_match_recognize() {
+    let deep_ctx = analyze_inline_cursor_sql(
+        "SELECT * FROM oqt_t_emp \
+         MATCH_RECOGNIZE ( \
+           PATTERN (a b+) \
+           DEFINE b AS b.sa| > PREV(b.sal) \
+         )",
+    );
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["oqt_t_emp".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("oqt_t_emp", vec!["sal".to_string(), "deptno".to_string()]);
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data, "sa", "b", &deep_ctx,
+    );
+
+    assert_eq!(
+        suggestions,
+        vec!["b.sal = a.sal".to_string()],
+        "suggestions: {:?}",
+        suggestions
+    );
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_show_when_cursor_is_before_prefix_char() {
+    let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.|a";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (prefix, word_start, _word_end) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+    let deep_ctx = analyze_inline_cursor_sql(sql_with_cursor);
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string(), "deptno".to_string()]);
+    data.set_columns_for_table("tb2", vec!["abc".to_string(), "deptno".to_string()]);
+
+    assert_eq!(prefix, "");
+    assert_eq!(qualifier.as_deref(), Some("a"));
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        &prefix,
+        qualifier.as_deref().expect("expected qualifier"),
+        &deep_ctx,
+    );
+
+    assert_has_case_insensitive(&suggestions, "a.abc = b.abc");
+}
+
+#[test]
+fn qualified_condition_comparison_suggestions_show_for_partial_prefix_after_qualifier() {
+    let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.a|";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (prefix, word_start, _word_end) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+    let deep_ctx = analyze_inline_cursor_sql(sql_with_cursor);
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["tb1".to_string(), "tb2".to_string()];
+    data.rebuild_indices();
+    data.set_columns_for_table("tb1", vec!["abc".to_string(), "deptno".to_string()]);
+    data.set_columns_for_table("tb2", vec!["abc".to_string(), "deptno".to_string()]);
+
+    assert_eq!(prefix, "a");
+    assert_eq!(qualifier.as_deref(), Some("a"));
+
+    let suggestions = SqlEditorWidget::collect_qualified_condition_comparison_suggestions(
+        &data,
+        &prefix,
+        qualifier.as_deref().expect("expected qualifier"),
+        &deep_ctx,
+    );
+
+    assert_has_case_insensitive(&suggestions, "a.abc = b.abc");
+}
+
+#[test]
 fn base_suggestions_for_table_context_with_prefix_stay_relation_only() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["CONFIG".to_string()];
@@ -6570,4 +6829,42 @@ fn finalize_completion_after_selection_clears_pending_and_invalidates_generation
     assert!(runtime.pending_intellisense().is_none());
     assert_eq!(runtime.current_keyup_generation(), 4);
     assert_eq!(runtime.current_parse_generation(), 10);
+}
+
+#[test]
+fn completion_insert_text_keeps_existing_left_qualifier_for_condition_comparison() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text("a.abc = b.abc"),
+        "abc = b.abc"
+    );
+}
+
+#[test]
+fn completion_insert_text_handles_quoted_multi_part_left_qualifier() {
+    assert_eq!(
+        SqlEditorWidget::completion_insert_text(
+            "\"sales\".\"Order Header\".\"Order Id\" = b.\"Order Id\""
+        ),
+        "\"Order Id\" = b.\"Order Id\""
+    );
+}
+
+#[test]
+fn completion_replacement_range_extends_zero_length_range_over_forward_identifier() {
+    let sql_with_cursor = "SELECT * FROM tb1 a JOIN tb2 b ON a.|a";
+    let cursor = sql_with_cursor
+        .find('|')
+        .expect("cursor marker should exist");
+    let sql = sql_with_cursor.replace('|', "");
+    let (word, word_start, word_end) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+
+    let range = SqlEditorWidget::completion_replacement_range_from_word_bounds(
+        &word,
+        word_start,
+        word_end,
+        cursor,
+        Some((cursor, cursor)),
+    );
+
+    assert_eq!(range, (cursor, cursor + 1));
 }

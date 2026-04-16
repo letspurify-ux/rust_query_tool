@@ -327,6 +327,88 @@ impl SqlEditorWidget {
         line_text.get(..indent_len).unwrap_or("")
     }
 
+    fn completion_insert_text(selected: &str) -> String {
+        Self::condition_comparison_completion_suffix(selected)
+            .unwrap_or_else(|| selected.to_string())
+    }
+
+    fn completion_replacement_range(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+        range: Option<IntellisenseCompletionRange>,
+    ) -> (usize, usize) {
+        let cursor_pos_usize = cursor_pos.max(0) as usize;
+        let (word, word_start, word_end) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
+        Self::completion_replacement_range_from_word_bounds(
+            &word,
+            word_start,
+            word_end,
+            cursor_pos_usize,
+            range.map(|value| (value.start(), value.end())),
+        )
+    }
+
+    fn completion_replacement_range_from_word_bounds(
+        word: &str,
+        word_start: usize,
+        word_end: usize,
+        cursor_pos: usize,
+        range: Option<(usize, usize)>,
+    ) -> (usize, usize) {
+        if let Some((start, end)) = range {
+            if start != end {
+                return (start, end);
+            }
+            if word_start == cursor_pos && word_end > cursor_pos {
+                return (start, word_end);
+            }
+            return (start, end);
+        }
+
+        if word.is_empty() {
+            if word_start == cursor_pos && word_end > cursor_pos {
+                return (cursor_pos, word_end);
+            }
+            return (cursor_pos, cursor_pos);
+        }
+
+        (word_start, cursor_pos)
+    }
+
+    fn condition_comparison_completion_suffix(selected: &str) -> Option<String> {
+        let eq_idx = selected.find(" = ")?;
+        let left_expr = selected.get(..eq_idx)?;
+        let dot_idx = Self::last_unquoted_dot(left_expr)?;
+        selected.get(dot_idx + 1..).map(ToString::to_string)
+    }
+
+    fn last_unquoted_dot(text: &str) -> Option<usize> {
+        let mut last_dot = None;
+        let mut chars = text.char_indices().peekable();
+        let mut in_quotes = false;
+
+        while let Some((idx, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                    }
+                }
+                '.' if !in_quotes => last_dot = Some(idx),
+                _ => {}
+            }
+        }
+
+        (!in_quotes).then_some(last_dot).flatten()
+    }
+
     #[cfg(test)]
     pub(super) fn take_keyup_debounce_timeout_handle(
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,

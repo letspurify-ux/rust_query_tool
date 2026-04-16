@@ -80,7 +80,9 @@ fn span_snippet(source: &str, line_starts: &[usize], span: proc_macro2::Span) ->
     let end = span.end();
     let start_offset = byte_offset_for_line_column(line_starts, start.line, start.column)?;
     let end_offset = byte_offset_for_line_column(line_starts, end.line, end.column)?;
-    source.get(start_offset..end_offset).map(|snippet| snippet.to_string())
+    source
+        .get(start_offset..end_offset)
+        .map(|snippet| snippet.to_string())
 }
 
 fn is_debug_assert_macro(mac: &Macro) -> Option<String> {

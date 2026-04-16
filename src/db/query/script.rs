@@ -8319,7 +8319,8 @@ impl QueryExecutor {
                             return true;
                         }
 
-                        if let Some(command) = Self::parse_tool_command_if_candidate(trailing_line) {
+                        if let Some(command) = Self::parse_tool_command_if_candidate(trailing_line)
+                        {
                             return !matches!(command, ToolCommand::Unsupported { .. });
                         }
 

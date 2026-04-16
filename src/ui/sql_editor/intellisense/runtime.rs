@@ -56,28 +56,21 @@ impl SqlEditorWidget {
                     }
                 }
                 let range = intellisense_runtime_for_insert.completion_range();
-                let (start, end) = if let Some(range) = range {
-                    (range.start(), range.end())
-                } else {
-                    let (word, start, _end) = Self::word_at_cursor(
-                        &buffer_for_insert,
-                        &text_shadow_for_insert,
-                        cursor_pos,
-                    );
-                    if word.is_empty() {
-                        (cursor_pos_usize, cursor_pos_usize)
-                    } else {
-                        (start, cursor_pos_usize)
-                    }
-                };
+                let (start, end) = Self::completion_replacement_range(
+                    &buffer_for_insert,
+                    &text_shadow_for_insert,
+                    cursor_pos,
+                    range,
+                );
 
+                let inserted = Self::completion_insert_text(&selected);
                 if start != end {
-                    buffer_for_insert.replace(start as i32, end as i32, &selected);
-                    editor_for_insert.set_insert_position((start + selected.len()) as i32);
+                    buffer_for_insert.replace(start as i32, end as i32, &inserted);
+                    editor_for_insert.set_insert_position((start + inserted.len()) as i32);
                 } else {
-                    buffer_for_insert.insert(cursor_pos, &selected);
+                    buffer_for_insert.insert(cursor_pos, &inserted);
                     editor_for_insert
-                        .set_insert_position((cursor_pos_usize + selected.len()) as i32);
+                        .set_insert_position((cursor_pos_usize + inserted.len()) as i32);
                 }
                 Self::sync_preferred_insert_position_from_editor(
                     &preferred_insert_position_for_insert,
@@ -328,32 +321,25 @@ impl SqlEditorWidget {
                                     let (cursor_pos, cursor_pos_usize) =
                                         Self::editor_cursor_position(ed, &buffer_for_handle);
                                     let range = intellisense_runtime_for_handle.completion_range();
-                                    let (start, end) = if let Some(range) = range {
-                                        (range.start(), range.end())
-                                    } else {
-                                        let (word, start, _end) = Self::word_at_cursor(
-                                            &buffer_for_handle,
-                                            &text_shadow_for_handle,
-                                            cursor_pos,
-                                        );
-                                        if word.is_empty() {
-                                            (cursor_pos_usize, cursor_pos_usize)
-                                        } else {
-                                            (start, cursor_pos_usize)
-                                        }
-                                    };
+                                    let (start, end) = Self::completion_replacement_range(
+                                        &buffer_for_handle,
+                                        &text_shadow_for_handle,
+                                        cursor_pos,
+                                        range,
+                                    );
 
+                                    let inserted = Self::completion_insert_text(&selected);
                                     if start != end {
                                         buffer_for_handle.replace(
                                             start as i32,
                                             end as i32,
-                                            &selected,
+                                            &inserted,
                                         );
-                                        ed.set_insert_position((start + selected.len()) as i32);
+                                        ed.set_insert_position((start + inserted.len()) as i32);
                                     } else {
-                                        buffer_for_handle.insert(cursor_pos, &selected);
+                                        buffer_for_handle.insert(cursor_pos, &inserted);
                                         ed.set_insert_position(
-                                            (cursor_pos_usize + selected.len()) as i32,
+                                            (cursor_pos_usize + inserted.len()) as i32,
                                         );
                                     }
                                     Self::finalize_completion_after_selection(

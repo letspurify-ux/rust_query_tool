@@ -539,6 +539,8 @@ impl SqlEditorWidget {
         let column_tables = Self::resolve_column_tables_for_context(qualifier, deep_ctx);
         let include_columns = qualifier.is_some()
             || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
+        let comparison_lookup_tables =
+            Self::comparison_lookup_tables_for_context(qualifier, deep_ctx);
 
         let allow_empty_prefix = qualifier.is_some()
             || include_columns
@@ -647,15 +649,33 @@ impl SqlEditorWidget {
                     );
                 }
             }
+
+            for table in &comparison_lookup_tables {
+                Self::request_table_columns(table, intellisense_data, column_sender, connection);
+            }
         }
 
         let columns_loading = if include_columns {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let loading_tables = if comparison_lookup_tables.is_empty() {
+                column_tables.clone()
+            } else {
+                let mut merged_tables = column_tables.clone();
+                for table in &comparison_lookup_tables {
+                    if merged_tables
+                        .iter()
+                        .all(|existing| !existing.eq_ignore_ascii_case(table))
+                    {
+                        merged_tables.push(table.clone());
+                    }
+                }
+                merged_tables
+            };
             Self::has_column_loading_for_scope(
                 include_columns,
-                &column_tables,
+                &loading_tables,
                 &virtual_wildcard_dependencies,
                 &data,
             )
@@ -692,6 +712,28 @@ impl SqlEditorWidget {
                 )
             }
         };
+        let comparison_suggestions = {
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            qualifier
+                .map(|qualifier| {
+                    Self::collect_qualified_condition_comparison_suggestions(
+                        &data,
+                        &snapshot.prefix,
+                        qualifier,
+                        deep_ctx,
+                    )
+                })
+                .unwrap_or_default()
+        };
+        if !comparison_suggestions.is_empty() {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                comparison_suggestions,
+                true,
+            );
+        }
         let wildcard_suggestions =
             Self::collect_clause_wildcard_suggestions(&snapshot.prefix, qualifier, deep_ctx);
         if !wildcard_suggestions.is_empty() {
@@ -1516,6 +1558,223 @@ impl SqlEditorWidget {
         let mut resolved = resolved;
         prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
         resolved
+    }
+
+    fn supports_qualified_condition_comparison_suggestions(
+        phase: intellisense_context::SqlPhase,
+    ) -> bool {
+        matches!(
+            phase,
+            intellisense_context::SqlPhase::JoinCondition
+                | intellisense_context::SqlPhase::WhereClause
+                | intellisense_context::SqlPhase::HavingClause
+                | intellisense_context::SqlPhase::ConnectByClause
+                | intellisense_context::SqlPhase::StartWithClause
+                | intellisense_context::SqlPhase::MatchRecognizeClause
+        )
+    }
+
+    fn current_query_tables_for_condition_completion(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<intellisense_context::ScopedTableRef> {
+        let current_query_tables =
+            intellisense_context::collect_tables_in_statement(Self::current_query_tokens(deep_ctx));
+        if current_query_tables.is_empty() {
+            deep_ctx.tables_in_scope.clone()
+        } else {
+            current_query_tables
+        }
+    }
+
+    fn comparison_scope_tables_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<intellisense_context::ScopedTableRef> {
+        let mut tables = Self::current_query_tables_for_condition_completion(deep_ctx);
+
+        for table in &deep_ctx.tables_in_scope {
+            let already_present = tables.iter().any(|existing| {
+                existing.depth == table.depth
+                    && existing.is_cte == table.is_cte
+                    && existing.name.eq_ignore_ascii_case(&table.name)
+                    && match (&existing.alias, &table.alias) {
+                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+            if !already_present {
+                tables.push(table.clone());
+            }
+        }
+
+        tables
+    }
+
+    fn comparison_lookup_tables_for_context(
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let Some(qualifier) = qualifier else {
+            return Vec::new();
+        };
+        if !Self::supports_qualified_condition_comparison_suggestions(deep_ctx.phase) {
+            return Vec::new();
+        }
+
+        let comparison_tables = Self::comparison_scope_tables_for_context(deep_ctx);
+        if comparison_tables.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lookup_tables = Self::resolve_column_tables_for_context(Some(qualifier), deep_ctx);
+        for table_ref in comparison_tables {
+            if lookup_tables
+                .iter()
+                .all(|existing| !existing.eq_ignore_ascii_case(&table_ref.name))
+            {
+                lookup_tables.push(table_ref.name);
+            }
+        }
+        lookup_tables
+    }
+
+    fn collect_qualified_condition_comparison_suggestions(
+        data: &IntellisenseData,
+        prefix: &str,
+        qualifier: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        if !Self::supports_qualified_condition_comparison_suggestions(deep_ctx.phase) {
+            return Vec::new();
+        }
+
+        let comparison_tables = Self::comparison_scope_tables_for_context(deep_ctx);
+        if comparison_tables.is_empty() {
+            return Vec::new();
+        }
+
+        let target_tables = Self::resolve_column_tables_for_context(Some(qualifier), deep_ctx);
+        if target_tables.is_empty() {
+            return Vec::new();
+        }
+
+        let left_scope = Self::render_select_list_wildcard_scope(qualifier);
+        if left_scope.is_empty() {
+            return Vec::new();
+        }
+
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut target_columns = Vec::new();
+        let mut seen_target_columns = HashSet::new();
+        for table in &target_tables {
+            for column in data.get_columns_for_table(table) {
+                let upper = column.to_ascii_uppercase();
+                if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
+                    continue;
+                }
+                if seen_target_columns.insert(upper.clone()) {
+                    target_columns.push((upper, column));
+                }
+            }
+        }
+        if target_columns.is_empty() {
+            return Vec::new();
+        }
+
+        let pattern_variables = matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::MatchRecognizeClause
+        )
+        .then(|| intellisense_context::extract_match_recognize_pattern_variables(
+            Self::current_query_tokens(deep_ctx),
+        ))
+        .filter(|variables| {
+            variables
+                .iter()
+                .any(|variable| variable.eq_ignore_ascii_case(qualifier))
+        });
+        if let Some(pattern_variables) = pattern_variables {
+            let mut suggestions = Vec::new();
+            let mut seen_suggestions = HashSet::new();
+
+            for other_pattern in pattern_variables {
+                if other_pattern.eq_ignore_ascii_case(qualifier) {
+                    continue;
+                }
+
+                let rendered_other_scope =
+                    Self::render_select_list_wildcard_scope(other_pattern.as_str());
+                if rendered_other_scope.is_empty() {
+                    continue;
+                }
+
+                for (_, target_column) in &target_columns {
+                    let suggestion = format!(
+                        "{}.{} = {}.{}",
+                        left_scope,
+                        Self::quote_identifier_segment_for_completion(target_column),
+                        rendered_other_scope,
+                        Self::quote_identifier_segment_for_completion(target_column),
+                    );
+                    if seen_suggestions.insert(suggestion.to_ascii_uppercase()) {
+                        suggestions.push(suggestion);
+                        if suggestions.len() >= MAX_MERGED_SUGGESTIONS {
+                            return suggestions;
+                        }
+                    }
+                }
+            }
+
+            return suggestions;
+        }
+
+        let mut suggestions = Vec::new();
+        let mut seen_suggestions = HashSet::new();
+        for table_ref in &comparison_tables {
+            let other_scope_name = table_ref
+                .alias
+                .as_deref()
+                .unwrap_or(table_ref.name.as_str());
+            if other_scope_name.eq_ignore_ascii_case(qualifier) {
+                continue;
+            }
+
+            let rendered_other_scope = Self::render_select_list_wildcard_scope(other_scope_name);
+            if rendered_other_scope.is_empty() {
+                continue;
+            }
+
+            let mut other_columns_by_upper = HashMap::new();
+            for column in data.get_columns_for_table(&table_ref.name) {
+                other_columns_by_upper
+                    .entry(column.to_ascii_uppercase())
+                    .or_insert(column);
+            }
+            if other_columns_by_upper.is_empty() {
+                continue;
+            }
+
+            for (upper, target_column) in &target_columns {
+                let Some(other_column) = other_columns_by_upper.get(upper) else {
+                    continue;
+                };
+                let suggestion = format!(
+                    "{}.{} = {}.{}",
+                    left_scope,
+                    Self::quote_identifier_segment_for_completion(target_column),
+                    rendered_other_scope,
+                    Self::quote_identifier_segment_for_completion(other_column),
+                );
+                if seen_suggestions.insert(suggestion.to_ascii_uppercase()) {
+                    suggestions.push(suggestion);
+                    if suggestions.len() >= MAX_MERGED_SUGGESTIONS {
+                        return suggestions;
+                    }
+                }
+            }
+        }
+
+        suggestions
     }
 
     fn merge_suggestions_with_derived_columns(
