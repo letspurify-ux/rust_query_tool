@@ -32,8 +32,9 @@ use crate::ui::result_table::ResultGridSqlExecuteCallback;
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
-    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QueryHistoryDialog, QueryProgress,
-    QueryTabId, QueryTabsWidget, ResultTabRequest, ResultTabsWidget, SqlAction, SqlEditorWidget,
+    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QualifiedMemberKind, QueryHistoryDialog,
+    QueryProgress, QueryTabId, QueryTabsWidget, ResultTabRequest, ResultTabsWidget, SqlAction,
+    SqlEditorWidget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -2359,7 +2360,19 @@ impl MainWindow {
     ) -> Option<SchemaUpdate> {
         let mut conn_guard = lock_connection_with_activity(connection, "Loading schema metadata");
         let connection_generation = conn_guard.connection_generation();
-        let (tables, views, procedures, functions) = match conn_guard.db_type() {
+        let (
+            tables,
+            views,
+            procedures,
+            functions,
+            packages,
+            sequences,
+            synonyms,
+            public_synonyms,
+            users,
+            qualifier_members,
+            relation_members,
+        ) = match conn_guard.db_type() {
             crate::db::DatabaseType::Oracle => {
                 let Ok(conn) = conn_guard.require_live_connection() else {
                     return None;
@@ -2389,7 +2402,43 @@ impl MainWindow {
 
                 let procedures = ObjectBrowser::get_procedures(conn.as_ref()).unwrap_or_default();
                 let functions = ObjectBrowser::get_functions(conn.as_ref()).unwrap_or_default();
-                (tables, views, procedures, functions)
+                let packages = ObjectBrowser::get_packages(conn.as_ref()).unwrap_or_default();
+                let sequences = ObjectBrowser::get_sequences(conn.as_ref()).unwrap_or_default();
+                let synonyms = ObjectBrowser::get_synonyms(conn.as_ref()).unwrap_or_default();
+                let public_synonyms =
+                    ObjectBrowser::get_public_synonyms(conn.as_ref()).unwrap_or_default();
+                let users = ObjectBrowser::get_users(conn.as_ref()).unwrap_or_default();
+                let package_routines =
+                    ObjectBrowser::get_all_package_routines(conn.as_ref()).unwrap_or_default();
+                let schema_objects =
+                    ObjectBrowser::get_schema_objects_by_owner(conn.as_ref()).unwrap_or_default();
+                let schema_relations =
+                    ObjectBrowser::get_schema_relation_members_by_owner(conn.as_ref())
+                        .unwrap_or_default();
+
+                let mut qualifier_members = schema_objects;
+                let relation_members = schema_relations;
+                for (package_name, routines) in package_routines {
+                    let members: Vec<(String, String)> = routines
+                        .into_iter()
+                        .map(|routine| (routine.name, routine.routine_type))
+                        .collect();
+                    qualifier_members.insert(package_name, members);
+                }
+
+                (
+                    tables,
+                    views,
+                    procedures,
+                    functions,
+                    packages,
+                    sequences,
+                    synonyms,
+                    public_synonyms,
+                    users,
+                    qualifier_members,
+                    relation_members,
+                )
             }
             crate::db::DatabaseType::MySQL => {
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
@@ -2420,7 +2469,35 @@ impl MainWindow {
                 let functions =
                     crate::db::query::mysql_executor::MysqlObjectBrowser::get_functions(mysql_conn)
                         .unwrap_or_default();
-                (tables, views, procedures, functions)
+                let sequences =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_sequences(mysql_conn)
+                        .unwrap_or_default();
+                let users =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_schemas(mysql_conn)
+                        .unwrap_or_default();
+                let qualifier_members =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_schema_objects_by_schema(
+                        mysql_conn,
+                    )
+                    .unwrap_or_default();
+                let relation_members =
+                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_schema_relation_members_by_schema(
+                        mysql_conn,
+                    )
+                    .unwrap_or_default();
+                (
+                    tables,
+                    views,
+                    procedures,
+                    functions,
+                    Vec::new(),
+                    sequences,
+                    Vec::new(),
+                    Vec::new(),
+                    users,
+                    qualifier_members,
+                    relation_members,
+                )
             }
         };
 
@@ -2432,7 +2509,27 @@ impl MainWindow {
         data.views = views;
         data.procedures = procedures;
         data.functions = functions;
+        data.packages = packages;
+        data.sequences = sequences;
+        data.synonyms = synonyms;
+        data.public_synonyms = public_synonyms;
+        data.users = users;
         data.rebuild_indices();
+        for (qualifier, members) in qualifier_members {
+            let typed_members = members
+                .into_iter()
+                .map(|(name, object_type)| {
+                    (
+                        name,
+                        QualifiedMemberKind::from_object_type_name(&object_type),
+                    )
+                })
+                .collect();
+            data.set_members_for_qualifier_with_kinds(&qualifier, typed_members);
+        }
+        for (qualifier, members) in relation_members {
+            data.set_relation_members_for_qualifier(&qualifier, members);
+        }
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);
 
         Some(SchemaUpdate {

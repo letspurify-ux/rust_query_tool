@@ -1,5 +1,6 @@
 use mysql::prelude::*;
 use mysql::{Conn, Error as MysqlError, Row, Value as MysqlValue};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::db::connection::ConnectionInfo;
@@ -1501,6 +1502,61 @@ impl MysqlObjectBrowser {
              ORDER BY ROUTINE_NAME",
         )?;
         Ok(rows)
+    }
+
+    pub fn get_schemas(conn: &mut Conn) -> Result<Vec<String>, MysqlError> {
+        let rows: Vec<String> = conn.query(
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA \
+             WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+             ORDER BY SCHEMA_NAME",
+        )?;
+        Ok(rows)
+    }
+
+    pub fn get_schema_objects_by_schema(
+        conn: &mut Conn,
+    ) -> Result<HashMap<String, Vec<(String, String)>>, MysqlError> {
+        let rows: Vec<(String, String, String)> = conn.query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, \
+                    CASE TABLE_TYPE \
+                        WHEN 'BASE TABLE' THEN 'TABLE' \
+                        ELSE TABLE_TYPE \
+                    END AS OBJECT_TYPE \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+               AND TABLE_TYPE IN ('BASE TABLE', 'VIEW', 'SEQUENCE') \
+             UNION ALL \
+             SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE \
+             FROM INFORMATION_SCHEMA.ROUTINES \
+             WHERE ROUTINE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+             ORDER BY 1, 2, 3",
+        )?;
+
+        let mut grouped = HashMap::new();
+        for (schema, name, object_type) in rows {
+            grouped
+                .entry(schema)
+                .or_insert_with(Vec::new)
+                .push((name, object_type));
+        }
+        Ok(grouped)
+    }
+
+    pub fn get_schema_relation_members_by_schema(
+        conn: &mut Conn,
+    ) -> Result<HashMap<String, Vec<String>>, MysqlError> {
+        let rows: Vec<(String, String)> = conn.query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+               AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
+             ORDER BY 1, 2",
+        )?;
+
+        let mut grouped = HashMap::new();
+        for (schema, name) in rows {
+            grouped.entry(schema).or_insert_with(Vec::new).push(name);
+        }
+        Ok(grouped)
     }
 
     pub fn get_triggers(conn: &mut Conn) -> Result<Vec<String>, MysqlError> {

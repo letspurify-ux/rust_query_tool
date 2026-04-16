@@ -21,7 +21,7 @@ use crate::db::{ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection
 use crate::sql_text;
 use crate::ui::intellisense::{
     detect_sql_context, get_word_at_cursor, sql_context_for_phase, IntellisenseData,
-    IntellisensePopup, SqlContext,
+    IntellisensePopup, QualifiedMemberKind, SqlContext,
 };
 use crate::ui::intellisense_context;
 use crate::ui::text_buffer_access;

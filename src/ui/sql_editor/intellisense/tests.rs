@@ -7025,6 +7025,227 @@ fn extract_select_list_columns_supports_literal_implicit_alias_in_cte() {
 }
 
 #[test]
+fn resolve_qualified_completion_mode_prefers_relation_columns_for_visible_alias() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT e.| FROM emp e");
+    let data = IntellisenseData::new();
+
+    let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        "e",
+        SqlContext::ColumnOrAll,
+        &deep_ctx,
+        &data,
+    );
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::RelationColumns));
+}
+
+#[test]
+fn resolve_qualified_completion_mode_uses_schema_relation_members_in_table_context() {
+    let deep_ctx = analyze_inline_cursor_sql("SELECT * FROM scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec!["EMP".to_string(), "DEPT".to_string()],
+    );
+
+    let mode =
+        SqlEditorWidget::resolve_qualified_completion_mode("scott", SqlContext::TableName, &deep_ctx, &data);
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::RelationMembers));
+}
+
+#[test]
+fn resolve_qualified_completion_mode_uses_package_members_in_general_context() {
+    let deep_ctx = analyze_inline_cursor_sql("BEGIN demo_pkg.|; END;");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier(
+        "DEMO_PKG",
+        vec!["RUN_JOB".to_string(), "CALC_BONUS".to_string()],
+    );
+
+    let mode = SqlEditorWidget::resolve_qualified_completion_mode(
+        "demo_pkg",
+        SqlContext::General,
+        &deep_ctx,
+        &data,
+    );
+
+    assert_eq!(mode, Some(QualifiedCompletionMode::ObjectMembers));
+}
+
+#[test]
+fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
+    let order_ctx = analyze_inline_cursor_sql("SELECT * FROM emp ORDER |");
+    let when_ctx = analyze_inline_cursor_sql(
+        "MERGE INTO target t USING src s ON (t.id = s.id) WHEN |",
+    );
+
+    let order_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &order_ctx);
+    let when_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &when_ctx);
+
+    assert_eq!(order_suggestions, vec!["BY".to_string()]);
+    assert!(when_suggestions.iter().any(|value| value == "MATCHED"));
+    assert!(when_suggestions.iter().any(|value| value == "NOT"));
+}
+
+#[test]
+fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
+    let create_or_replace_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE |");
+    let drop_public_ctx = analyze_inline_cursor_sql("DROP PUBLIC |");
+
+    let create_or_replace_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_ctx);
+    let drop_public_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx);
+
+    assert!(create_or_replace_suggestions.iter().any(|value| value == "PACKAGE"));
+    assert!(create_or_replace_suggestions.iter().any(|value| value == "USER"));
+    assert_eq!(drop_public_suggestions, vec!["SYNONYM".to_string()]);
+}
+
+#[test]
+fn collect_expected_object_suggestions_prefer_routines_for_call_context() {
+    let call_ctx = analyze_inline_cursor_sql("CALL |");
+    let describe_ctx = analyze_inline_cursor_sql("DESC |");
+    let mut data = IntellisenseData::new();
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.packages = vec!["UTIL_PKG".to_string()];
+    data.tables = vec!["EMP".to_string()];
+    data.rebuild_indices();
+
+    let call_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &call_ctx);
+    let describe_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &describe_ctx);
+
+    assert!(call_suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(call_suggestions.iter().any(|value| value == "UTIL_PKG"));
+    assert!(!call_suggestions.iter().any(|value| value == "EMP"));
+    assert!(describe_suggestions.iter().any(|value| value == "EMP"));
+}
+
+#[test]
+fn collect_expected_object_suggestions_filter_by_object_type_and_include_users() {
+    let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE |");
+    let prefixed_drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE sc|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.packages = vec!["UTIL_PKG".to_string()];
+    data.sequences = vec!["SEQ_ORDER".to_string()];
+    data.users = vec!["SCOTT".to_string()];
+    data.rebuild_indices();
+
+    let package_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_package_ctx);
+    let prefixed_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "sc", &prefixed_drop_package_ctx);
+
+    assert_eq!(package_suggestions, vec!["UTIL_PKG".to_string()]);
+    assert_eq!(prefixed_suggestions, vec!["SCOTT".to_string()]);
+}
+
+#[test]
+fn expected_member_suggestions_for_qualifier_filter_schema_members_by_context() {
+    let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
+    let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["EMP".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
+    data.packages = vec!["UTIL_PKG".to_string()];
+    data.sequences = vec!["SEQ_ORDER".to_string()];
+    data.rebuild_indices();
+    data.set_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string(),
+            "SEQ_ORDER".to_string(),
+        ],
+    );
+
+    let call_suggestions =
+        SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &call_ctx);
+    let drop_package_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_package_ctx,
+    );
+
+    assert!(call_suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(call_suggestions.iter().any(|value| value == "UTIL_PKG"));
+    assert!(!call_suggestions.iter().any(|value| value == "EMP"));
+    assert!(!call_suggestions.iter().any(|value| value == "SEQ_ORDER"));
+    assert_eq!(drop_package_suggestions, vec!["UTIL_PKG".to_string()]);
+}
+
+#[test]
+fn expected_schema_routine_suggestions_do_not_require_top_level_type_lists() {
+    let call_ctx = analyze_inline_cursor_sql("CALL scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure))],
+    );
+
+    let call_suggestions =
+        SqlEditorWidget::expected_member_suggestions_for_qualifier(&mut data, "scott", "", &call_ctx);
+
+    assert!(
+        call_suggestions.iter().any(|value| value == "RUN_JOB"),
+        "schema-qualified routine suggestions should not depend on current-user type caches: {:?}",
+        call_suggestions
+    );
+}
+
+#[test]
+fn expected_schema_package_suggestions_do_not_require_top_level_type_lists() {
+    let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package))],
+    );
+
+    let drop_package_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_package_ctx,
+    );
+
+    assert_eq!(
+        drop_package_suggestions,
+        vec!["UTIL_PKG".to_string()],
+        "schema-qualified package suggestions should not depend on current-user package caches"
+    );
+}
+
+#[test]
+fn expected_package_member_routine_suggestions_do_not_require_top_level_type_lists() {
+    let call_ctx = analyze_inline_cursor_sql("CALL demo_pkg.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "DEMO_PKG",
+        vec![
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("CALC_BONUS".to_string(), Some(QualifiedMemberKind::Function)),
+        ],
+    );
+
+    let call_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "demo_pkg",
+        "",
+        &call_ctx,
+    );
+
+    assert!(call_suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(call_suggestions.iter().any(|value| value == "CALC_BONUS"));
+}
+
+#[test]
 fn finalize_completion_after_selection_clears_pending_and_invalidates_generation() {
     let runtime = runtime_state_for_test(
         Some((5, 10)),

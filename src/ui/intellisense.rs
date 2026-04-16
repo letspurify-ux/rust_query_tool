@@ -629,6 +629,36 @@ impl NameEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QualifiedMemberKind {
+    Table,
+    View,
+    Procedure,
+    Function,
+    Package,
+    Sequence,
+    Synonym,
+    PublicSynonym,
+    User,
+}
+
+impl QualifiedMemberKind {
+    pub fn from_object_type_name(object_type: &str) -> Option<Self> {
+        match object_type.trim().to_ascii_uppercase().as_str() {
+            "TABLE" | "BASE TABLE" => Some(Self::Table),
+            "VIEW" => Some(Self::View),
+            "PROCEDURE" => Some(Self::Procedure),
+            "FUNCTION" => Some(Self::Function),
+            "PACKAGE" => Some(Self::Package),
+            "SEQUENCE" => Some(Self::Sequence),
+            "SYNONYM" => Some(Self::Synonym),
+            "PUBLIC SYNONYM" => Some(Self::PublicSynonym),
+            "USER" | "SCHEMA" => Some(Self::User),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct IntellisenseData {
     pub tables: Vec<String>,
@@ -638,12 +668,25 @@ pub struct IntellisenseData {
     pub views: Vec<String>,
     pub procedures: Vec<String>,
     pub functions: Vec<String>,
+    pub packages: Vec<String>,
+    pub sequences: Vec<String>,
+    pub synonyms: Vec<String>,
+    pub public_synonyms: Vec<String>,
+    pub users: Vec<String>,
     table_entries: Vec<NameEntry>,
     view_entries: Vec<NameEntry>,
     procedure_entries: Vec<NameEntry>,
     function_entries: Vec<NameEntry>,
+    package_entries: Vec<NameEntry>,
+    sequence_entries: Vec<NameEntry>,
+    synonym_entries: Vec<NameEntry>,
+    public_synonym_entries: Vec<NameEntry>,
+    user_entries: Vec<NameEntry>,
     column_entries_by_table: HashMap<String, Vec<NameEntry>>,
     virtual_column_entries_by_table: HashMap<String, Vec<NameEntry>>,
+    member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
+    member_kinds_by_qualifier: HashMap<String, HashMap<String, HashSet<QualifiedMemberKind>>>,
+    relation_member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
     all_columns_entries: Vec<NameEntry>,
     all_columns_dirty: bool,
     relations_upper: HashSet<String>,
@@ -662,12 +705,25 @@ impl IntellisenseData {
             views: Vec::new(),
             procedures: Vec::new(),
             functions: Vec::new(),
+            packages: Vec::new(),
+            sequences: Vec::new(),
+            synonyms: Vec::new(),
+            public_synonyms: Vec::new(),
+            users: Vec::new(),
             table_entries: Vec::new(),
             view_entries: Vec::new(),
             procedure_entries: Vec::new(),
             function_entries: Vec::new(),
+            package_entries: Vec::new(),
+            sequence_entries: Vec::new(),
+            synonym_entries: Vec::new(),
+            public_synonym_entries: Vec::new(),
+            user_entries: Vec::new(),
             column_entries_by_table: HashMap::new(),
             virtual_column_entries_by_table: HashMap::new(),
+            member_entries_by_qualifier: HashMap::new(),
+            member_kinds_by_qualifier: HashMap::new(),
+            relation_member_entries_by_qualifier: HashMap::new(),
             all_columns_entries: Vec::new(),
             all_columns_dirty: false,
             relations_upper: HashSet::new(),
@@ -736,6 +792,22 @@ impl IntellisenseData {
             }
             if Self::push_entries(
                 &self.view_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+            if Self::push_entries(
+                &self.synonym_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+            if Self::push_entries(
+                &self.public_synonym_entries,
                 &prefix_upper,
                 &mut suggestions,
                 &mut seen,
@@ -818,11 +890,39 @@ impl IntellisenseData {
             ) {
                 return suggestions;
             }
+
+            if Self::push_entries(
+                &self.synonym_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+
+            if Self::push_entries(
+                &self.public_synonym_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
         }
 
         // Add procedures
         if Self::push_entries(
             &self.procedure_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        ) {
+            return suggestions;
+        }
+
+        // Add packages
+        if Self::push_entries(
+            &self.package_entries,
             &prefix_upper,
             &mut suggestions,
             &mut seen,
@@ -840,6 +940,22 @@ impl IntellisenseData {
             return suggestions;
         }
 
+        if Self::push_entries(
+            &self.sequence_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        ) {
+            return suggestions;
+        }
+
+        let _ = Self::push_entries(
+            &self.user_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        );
+
         if include_columns && !prefer_columns {
             self.append_column_suggestions(
                 &prefix_upper,
@@ -856,29 +972,91 @@ impl IntellisenseData {
 
     pub fn get_relation_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.table_entries,
+                &self.view_entries,
+                &self.synonym_entries,
+                &self.public_synonym_entries,
+                &self.user_entries,
+            ],
+        )
+    }
 
-        let prefix_upper = prefix.to_uppercase();
-        let mut suggestions = Vec::new();
-        let mut seen = HashSet::new();
+    pub fn get_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.table_entries,
+                &self.view_entries,
+                &self.synonym_entries,
+                &self.public_synonym_entries,
+                &self.procedure_entries,
+                &self.package_entries,
+                &self.function_entries,
+                &self.sequence_entries,
+                &self.user_entries,
+            ],
+        )
+    }
 
-        if Self::push_entries(
-            &self.table_entries,
-            &prefix_upper,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            return suggestions;
-        }
+    pub fn get_routine_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.procedure_entries,
+                &self.package_entries,
+                &self.function_entries,
+            ],
+        )
+    }
 
-        let _ = Self::push_entries(
-            &self.view_entries,
-            &prefix_upper,
-            &mut suggestions,
-            &mut seen,
-        );
+    pub fn get_table_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.table_entries])
+    }
 
-        suggestions.truncate(MAX_SUGGESTIONS);
-        suggestions
+    pub fn get_view_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.view_entries])
+    }
+
+    pub fn get_procedure_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.procedure_entries])
+    }
+
+    pub fn get_function_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.function_entries])
+    }
+
+    pub fn get_package_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.package_entries])
+    }
+
+    pub fn get_sequence_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.sequence_entries])
+    }
+
+    pub fn get_synonym_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.synonym_entries])
+    }
+
+    pub fn get_public_synonym_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.public_synonym_entries])
+    }
+
+    pub fn get_user_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.user_entries])
     }
 
     pub fn get_column_suggestions(
@@ -902,6 +1080,106 @@ impl IntellisenseData {
 
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
+    }
+
+    pub fn set_members_for_qualifier(&mut self, qualifier: &str, members: Vec<String>) {
+        let key = Self::normalize_qualifier_lookup_key(qualifier);
+        if key.is_empty() {
+            return;
+        }
+        self.member_entries_by_qualifier
+            .insert(key, Self::build_entries(&members));
+        self.member_kinds_by_qualifier
+            .remove(&Self::normalize_qualifier_lookup_key(qualifier));
+    }
+
+    pub fn set_members_for_qualifier_with_kinds(
+        &mut self,
+        qualifier: &str,
+        members: Vec<(String, Option<QualifiedMemberKind>)>,
+    ) {
+        let key = Self::normalize_qualifier_lookup_key(qualifier);
+        if key.is_empty() {
+            return;
+        }
+
+        let mut names = Vec::with_capacity(members.len());
+        let mut member_kinds: HashMap<String, HashSet<QualifiedMemberKind>> = HashMap::new();
+        for (name, kind) in members {
+            names.push(name.clone());
+            if let Some(kind) = kind {
+                member_kinds
+                    .entry(name.to_uppercase())
+                    .or_default()
+                    .insert(kind);
+            }
+        }
+
+        self.member_entries_by_qualifier
+            .insert(key.clone(), Self::build_entries(&names));
+        if member_kinds.is_empty() {
+            self.member_kinds_by_qualifier.remove(&key);
+        } else {
+            self.member_kinds_by_qualifier.insert(key, member_kinds);
+        }
+    }
+
+    pub fn set_relation_members_for_qualifier(&mut self, qualifier: &str, members: Vec<String>) {
+        let key = Self::normalize_qualifier_lookup_key(qualifier);
+        if key.is_empty() {
+            return;
+        }
+        self.relation_member_entries_by_qualifier
+            .insert(key, Self::build_entries(&members));
+    }
+
+    pub fn has_members_for_qualifier(&self, qualifier: &str, relation_only: bool) -> bool {
+        self.member_entries_for_qualifier(qualifier, relation_only)
+            .is_some_and(|entries| !entries.is_empty())
+    }
+
+    pub fn get_member_suggestions(
+        &mut self,
+        qualifier: &str,
+        prefix: &str,
+        relation_only: bool,
+    ) -> Vec<String> {
+        self.ensure_base_indices();
+
+        let prefix_upper = prefix.to_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(entries) = self.member_entries_for_qualifier(qualifier, relation_only) {
+            let _ = Self::push_entries(entries, &prefix_upper, &mut suggestions, &mut seen);
+        }
+
+        suggestions.truncate(MAX_SUGGESTIONS);
+        suggestions
+    }
+
+    pub fn qualifier_member_matches_kinds(
+        &self,
+        qualifier: &str,
+        candidate: &str,
+        expected_kinds: &[QualifiedMemberKind],
+    ) -> Option<bool> {
+        if expected_kinds.is_empty() {
+            return Some(true);
+        }
+
+        let candidate_upper = candidate.to_uppercase();
+        for key in Self::qualifier_lookup_keys(qualifier) {
+            let Some(member_kinds) = self.member_kinds_by_qualifier.get(&key) else {
+                continue;
+            };
+            let matches = member_kinds
+                .get(&candidate_upper)
+                .is_some_and(|kinds| expected_kinds.iter().any(|kind| kinds.contains(kind)));
+            return Some(matches);
+        }
+
+        None
     }
 
     fn column_entries_for_scope_table(&self, table: &str) -> Option<&[NameEntry]> {
@@ -1058,6 +1336,11 @@ impl IntellisenseData {
         }
         self.tables.iter().any(|t| t.eq_ignore_ascii_case(&upper))
             || self.views.iter().any(|v| v.eq_ignore_ascii_case(&upper))
+            || self.synonyms.iter().any(|v| v.eq_ignore_ascii_case(&upper))
+            || self
+                .public_synonyms
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&upper))
     }
 
     pub fn rebuild_indices(&mut self) {
@@ -1065,10 +1348,17 @@ impl IntellisenseData {
         self.view_entries = Self::build_entries(&self.views);
         self.procedure_entries = Self::build_entries(&self.procedures);
         self.function_entries = Self::build_entries(&self.functions);
+        self.package_entries = Self::build_entries(&self.packages);
+        self.sequence_entries = Self::build_entries(&self.sequences);
+        self.synonym_entries = Self::build_entries(&self.synonyms);
+        self.public_synonym_entries = Self::build_entries(&self.public_synonyms);
+        self.user_entries = Self::build_entries(&self.users);
         self.relations_upper = self
             .tables
             .iter()
             .chain(self.views.iter())
+            .chain(self.synonyms.iter())
+            .chain(self.public_synonyms.iter())
             .map(|name| name.to_uppercase())
             .collect();
         self.column_entries_by_table.clear();
@@ -1152,9 +1442,58 @@ impl IntellisenseData {
             || self.view_entries.len() != self.views.len()
             || self.procedure_entries.len() != self.procedures.len()
             || self.function_entries.len() != self.functions.len()
+            || self.package_entries.len() != self.packages.len()
+            || self.sequence_entries.len() != self.sequences.len()
+            || self.synonym_entries.len() != self.synonyms.len()
+            || self.public_synonym_entries.len() != self.public_synonyms.len()
+            || self.user_entries.len() != self.users.len()
         {
             self.rebuild_indices();
         }
+    }
+
+    fn member_entries_for_qualifier(
+        &self,
+        qualifier: &str,
+        relation_only: bool,
+    ) -> Option<&[NameEntry]> {
+        let keys = Self::qualifier_lookup_keys(qualifier);
+        let source = if relation_only {
+            &self.relation_member_entries_by_qualifier
+        } else {
+            &self.member_entries_by_qualifier
+        };
+
+        for key in &keys {
+            if let Some(entries) = source.get(key) {
+                return Some(entries.as_slice());
+            }
+        }
+
+        if relation_only {
+            for key in &keys {
+                if let Some(entries) = self.member_entries_by_qualifier.get(key) {
+                    return Some(entries.as_slice());
+                }
+            }
+        }
+
+        None
+    }
+
+    fn suggestions_from_entry_groups(prefix: &str, groups: &[&[NameEntry]]) -> Vec<String> {
+        let prefix_upper = prefix.to_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        for group in groups {
+            if Self::push_entries(group, &prefix_upper, &mut suggestions, &mut seen) {
+                break;
+            }
+        }
+
+        suggestions.truncate(MAX_SUGGESTIONS);
+        suggestions
     }
 
     fn ensure_all_columns_entries(&mut self) {
@@ -1180,6 +1519,31 @@ impl IntellisenseData {
         let mut entries: Vec<NameEntry> = names.iter().cloned().map(NameEntry::new).collect();
         entries.sort_by(|a, b| a.upper.cmp(&b.upper).then_with(|| a.name.cmp(&b.name)));
         entries
+    }
+
+    fn normalize_qualifier_lookup_key(qualifier: &str) -> String {
+        qualifier
+            .split('.')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join(".")
+            .to_ascii_uppercase()
+    }
+
+    fn qualifier_lookup_keys(qualifier: &str) -> Vec<String> {
+        let normalized = Self::normalize_qualifier_lookup_key(qualifier);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+
+        let mut keys = vec![normalized.clone()];
+        if let Some(last) = normalized.rsplit('.').next() {
+            if last != normalized {
+                keys.push(last.to_string());
+            }
+        }
+        keys
     }
 
     fn push_entries(
@@ -2670,6 +3034,89 @@ mod intellisense_tests {
             "expected schema-qualified scope to reuse unqualified cached columns, got: {:?}",
             suggestions
         );
+    }
+
+    #[test]
+    fn get_relation_suggestions_include_synonyms() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["EMP".to_string()];
+        data.synonyms = vec!["EMP_SYN".to_string()];
+        data.public_synonyms = vec!["PUBLIC_EMP".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_relation_suggestions("P");
+
+        assert!(suggestions.iter().any(|name| name == "PUBLIC_EMP"));
+        assert!(!suggestions.iter().any(|name| name == "PACKAGE"));
+    }
+
+    #[test]
+    fn get_relation_suggestions_include_users_for_schema_qualification() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SCOTT".to_string(), "SYS".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_relation_suggestions("SC");
+
+        assert_eq!(suggestions, vec!["SCOTT".to_string()]);
+    }
+
+    #[test]
+    fn get_object_suggestions_include_packages_sequences_and_synonyms() {
+        let mut data = IntellisenseData::new();
+        data.procedures = vec!["RUN_JOB".to_string()];
+        data.packages = vec!["UTIL_PKG".to_string()];
+        data.sequences = vec!["SEQ_ORDER".to_string()];
+        data.synonyms = vec!["JOB_SYN".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_object_suggestions("");
+
+        assert!(suggestions.iter().any(|name| name == "RUN_JOB"));
+        assert!(suggestions.iter().any(|name| name == "UTIL_PKG"));
+        assert!(suggestions.iter().any(|name| name == "SEQ_ORDER"));
+        assert!(suggestions.iter().any(|name| name == "JOB_SYN"));
+    }
+
+    #[test]
+    fn get_object_suggestions_include_users_for_schema_qualification() {
+        let mut data = IntellisenseData::new();
+        data.users = vec!["SCOTT".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_object_suggestions("SC");
+
+        assert_eq!(suggestions, vec!["SCOTT".to_string()]);
+    }
+
+    #[test]
+    fn get_member_suggestions_use_package_and_schema_qualifiers() {
+        let mut data = IntellisenseData::new();
+        data.set_members_for_qualifier(
+            "DEMO_PKG",
+            vec!["RUN_JOB".to_string(), "CALC_BONUS".to_string()],
+        );
+        data.set_members_for_qualifier(
+            "SCOTT",
+            vec![
+                "EMP".to_string(),
+                "EMP_API".to_string(),
+                "SEQ_EMP".to_string(),
+            ],
+        );
+        data.set_relation_members_for_qualifier(
+            "SCOTT",
+            vec!["EMP".to_string(), "EMP_VIEW".to_string()],
+        );
+
+        let package_members = data.get_member_suggestions("demo_pkg", "R", false);
+        let schema_members = data.get_member_suggestions("scott", "EMP", false);
+        let schema_relations = data.get_member_suggestions("scott", "EMP", true);
+
+        assert_eq!(package_members, vec!["RUN_JOB".to_string()]);
+        assert!(schema_members.iter().any(|name| name == "EMP_API"));
+        assert!(schema_relations.iter().any(|name| name == "EMP_VIEW"));
+        assert!(!schema_relations.iter().any(|name| name == "EMP_API"));
     }
 
     #[test]

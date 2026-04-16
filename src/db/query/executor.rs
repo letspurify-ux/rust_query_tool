@@ -7834,6 +7834,53 @@ impl ObjectBrowser {
         Self::get_object_list(conn, sql)
     }
 
+    pub fn get_public_synonyms(conn: &Connection) -> Result<Vec<String>, OracleError> {
+        let sql =
+            "SELECT synonym_name FROM all_synonyms WHERE owner = 'PUBLIC' ORDER BY synonym_name";
+        Self::get_object_list(conn, sql)
+    }
+
+    pub fn get_users(conn: &Connection) -> Result<Vec<String>, OracleError> {
+        let sql = "SELECT username FROM all_users ORDER BY username";
+        Self::get_object_list(conn, sql)
+    }
+
+    pub fn get_schema_objects_by_owner(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<(String, String)>>, OracleError> {
+        let sql = r#"
+            SELECT owner, object_name, object_type
+            FROM all_objects
+            WHERE object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'SEQUENCE')
+            UNION ALL
+            SELECT
+                owner,
+                synonym_name,
+                CASE
+                    WHEN owner = 'PUBLIC' THEN 'PUBLIC SYNONYM'
+                    ELSE 'SYNONYM'
+                END AS object_type
+            FROM all_synonyms
+            ORDER BY 1, 2, 3
+        "#;
+        Self::get_grouped_typed_object_list(conn, sql)
+    }
+
+    pub fn get_schema_relation_members_by_owner(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>, OracleError> {
+        let sql = r#"
+            SELECT owner, object_name
+            FROM all_objects
+            WHERE object_type IN ('TABLE', 'VIEW')
+            UNION ALL
+            SELECT owner, synonym_name
+            FROM all_synonyms
+            ORDER BY 1, 2
+        "#;
+        Self::get_grouped_object_list(conn, sql)
+    }
+
     pub fn get_synonym_info(conn: &Connection, syn_name: &str) -> Result<SynonymInfo, OracleError> {
         let sql = r#"
             SELECT
@@ -8503,6 +8550,109 @@ impl ObjectBrowser {
         }
 
         Ok(objects)
+    }
+
+    fn get_grouped_object_list(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<HashMap<String, Vec<String>>, OracleError> {
+        let mut stmt = match conn.statement(sql).build() {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+        let rows = match stmt.query(&[]) {
+            Ok(rows) => rows,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for row_result in rows {
+            let row: Row = match row_result {
+                Ok(row) => row,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let owner: String = match row.get(0) {
+                Ok(owner) => owner,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let name: String = match row.get(1) {
+                Ok(name) => name,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            grouped.entry(owner).or_default().push(name);
+        }
+
+        Ok(grouped)
+    }
+
+    fn get_grouped_typed_object_list(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<HashMap<String, Vec<(String, String)>>, OracleError> {
+        let mut stmt = match conn.statement(sql).build() {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+        let rows = match stmt.query(&[]) {
+            Ok(rows) => rows,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+
+        let mut grouped: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for row_result in rows {
+            let row: Row = match row_result {
+                Ok(row) => row,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let owner: String = match row.get(0) {
+                Ok(owner) => owner,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let name: String = match row.get(1) {
+                Ok(name) => name,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let object_type: String = match row.get(2) {
+                Ok(object_type) => object_type,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            grouped.entry(owner).or_default().push((name, object_type));
+        }
+
+        Ok(grouped)
     }
 
     pub fn get_object_types(

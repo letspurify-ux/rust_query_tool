@@ -12,6 +12,28 @@ enum SelectListWildcardMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualifiedCompletionMode {
+    RelationColumns,
+    RelationMembers,
+    ObjectMembers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedObjectSuggestionKind {
+    Any,
+    Routine,
+    Table,
+    View,
+    Procedure,
+    Function,
+    Package,
+    Sequence,
+    Synonym,
+    PublicSynonym,
+    User,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClauseCompletionPolicy {
     restrict_to_relation_columns: bool,
     select_list_wildcard_mode: SelectListWildcardMode,
@@ -557,17 +579,87 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-
-        let column_tables = Self::resolve_column_tables_for_context(qualifier, deep_ctx);
-        let include_columns = qualifier.is_some()
-            || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
-        let comparison_lookup_tables =
-            Self::comparison_lookup_tables_for_context(qualifier, deep_ctx);
+        let qualified_completion_mode = qualifier.and_then(|qualifier| {
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::resolve_qualified_completion_mode(qualifier, context, deep_ctx, &data)
+        });
+        let column_tables = if matches!(
+            qualified_completion_mode,
+            Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
+        ) {
+            Vec::new()
+        } else {
+            Self::resolve_column_tables_for_context(qualifier, deep_ctx)
+        };
+        let include_columns = matches!(
+            qualified_completion_mode,
+            Some(QualifiedCompletionMode::RelationColumns)
+        ) || (qualified_completion_mode.is_none()
+            && (qualifier.is_some()
+                || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll)));
+        let comparison_lookup_tables = if matches!(
+            qualified_completion_mode,
+            Some(QualifiedCompletionMode::RelationMembers | QualifiedCompletionMode::ObjectMembers)
+        ) {
+            Vec::new()
+        } else {
+            Self::comparison_lookup_tables_for_context(qualifier, deep_ctx)
+        };
+        let qualified_member_suggestions = match (qualifier, qualified_completion_mode) {
+            (Some(qualifier), Some(QualifiedCompletionMode::RelationMembers)) => {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                data.get_member_suggestions(qualifier, &snapshot.prefix, true)
+            }
+            (Some(qualifier), Some(QualifiedCompletionMode::ObjectMembers)) => {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::expected_member_suggestions_for_qualifier(
+                    &mut data,
+                    qualifier,
+                    &snapshot.prefix,
+                    deep_ctx,
+                )
+            }
+            _ => Vec::new(),
+        };
+        let expected_keyword_suggestions = if qualifier.is_none()
+            && !restrict_to_relation_columns
+            && !matches!(context, SqlContext::VariableName | SqlContext::BindValue)
+        {
+            Self::collect_expected_keyword_suggestions(&snapshot.prefix, deep_ctx)
+        } else {
+            Vec::new()
+        };
+        let expected_object_suggestions = if qualifier.is_none()
+            && !restrict_to_relation_columns
+            && !matches!(
+                context,
+                SqlContext::VariableName
+                    | SqlContext::BindValue
+                    | SqlContext::ColumnName
+                    | SqlContext::ColumnOrAll
+                    | SqlContext::TableName
+            ) {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::collect_expected_object_suggestions(&mut data, &snapshot.prefix, deep_ctx)
+        } else {
+            Vec::new()
+        };
 
         let allow_empty_prefix = qualifier.is_some()
             || include_columns
             || matches!(context, SqlContext::TableName)
-            || !local_suggestions.is_empty();
+            || !local_suggestions.is_empty()
+            || !qualified_member_suggestions.is_empty()
+            || !expected_keyword_suggestions.is_empty()
+            || !expected_object_suggestions.is_empty();
         if snapshot.prefix.is_empty() && !allow_empty_prefix {
             // Context no longer allows completion for empty prefix, so hide
             // stale popup state immediately.
@@ -705,7 +797,9 @@ impl SqlEditorWidget {
             false
         };
 
-        let mut suggestions = {
+        let mut suggestions = if !qualified_member_suggestions.is_empty() {
+            qualified_member_suggestions
+        } else {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -734,6 +828,20 @@ impl SqlEditorWidget {
                 )
             }
         };
+        if !expected_object_suggestions.is_empty() {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_object_suggestions,
+                true,
+            );
+        }
+        if !expected_keyword_suggestions.is_empty() {
+            suggestions = Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                expected_keyword_suggestions,
+                true,
+            );
+        }
         let comparison_suggestions = {
             let data = intellisense_data
                 .lock()
@@ -879,6 +987,430 @@ impl SqlEditorWidget {
             matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll),
             db_type,
         )
+    }
+
+    fn qualifier_matches_visible_relation_scope(
+        qualifier: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> bool {
+        deep_ctx.tables_in_scope.iter().any(|table_ref| {
+            table_ref.name.eq_ignore_ascii_case(qualifier)
+                || table_ref
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+        }) || deep_ctx
+            .ctes
+            .iter()
+            .any(|cte| cte.name.eq_ignore_ascii_case(qualifier))
+            || deep_ctx
+                .subqueries
+                .iter()
+                .any(|subq| subq.alias.eq_ignore_ascii_case(qualifier))
+    }
+
+    fn resolve_qualified_completion_mode(
+        qualifier: &str,
+        context: SqlContext,
+        deep_ctx: &intellisense_context::CursorContext,
+        data: &IntellisenseData,
+    ) -> Option<QualifiedCompletionMode> {
+        if matches!(context, SqlContext::TableName)
+            && data.has_members_for_qualifier(qualifier, true)
+        {
+            return Some(QualifiedCompletionMode::RelationMembers);
+        }
+
+        if Self::qualifier_matches_visible_relation_scope(qualifier, deep_ctx)
+            || data.is_known_relation(qualifier)
+        {
+            return Some(QualifiedCompletionMode::RelationColumns);
+        }
+
+        let resolved_tables = Self::resolve_column_tables_for_context(Some(qualifier), deep_ctx);
+        if resolved_tables
+            .iter()
+            .any(|table| data.is_known_relation(table))
+        {
+            return Some(QualifiedCompletionMode::RelationColumns);
+        }
+
+        if data.has_members_for_qualifier(qualifier, false) {
+            return Some(QualifiedCompletionMode::ObjectMembers);
+        }
+
+        None
+    }
+
+    fn previous_meaningful_words_upper(
+        tokens: &[SqlToken],
+        end: usize,
+        max_words: usize,
+    ) -> Vec<String> {
+        if max_words == 0 {
+            return Vec::new();
+        }
+
+        let mut words_rev = Vec::new();
+        for token in tokens.get(..end).unwrap_or(tokens).iter().rev() {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => {
+                    words_rev.push(word.to_ascii_uppercase());
+                    if words_rev.len() >= max_words {
+                        break;
+                    }
+                }
+                SqlToken::Symbol(_) => {}
+                _ => break,
+            }
+        }
+        words_rev.reverse();
+        words_rev
+    }
+
+    fn filter_expected_candidates(prefix: &str, candidates: &[&str]) -> Vec<String> {
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut seen = HashSet::new();
+        let mut suggestions = Vec::new();
+
+        for candidate in candidates {
+            let upper = candidate.to_ascii_uppercase();
+            if !prefix_upper.is_empty() && !upper.starts_with(prefix_upper.as_str()) {
+                continue;
+            }
+            if seen.insert(upper) {
+                suggestions.push((*candidate).to_string());
+                if suggestions.len() >= MAX_MERGED_SUGGESTIONS {
+                    break;
+                }
+            }
+        }
+
+        suggestions
+    }
+
+    fn collect_expected_keyword_suggestions(
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        const TOP_LEVEL_KEYWORDS: &[&str] = &[
+            "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP",
+            "BEGIN", "DECLARE", "CALL", "VALUES",
+        ];
+        const OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "USER",
+            "PUBLIC",
+        ];
+
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let words = Self::previous_meaningful_words_upper(
+            tokens,
+            Self::expected_suggestion_context_end(tokens, cursor_token_len, !prefix.is_empty()),
+            4,
+        );
+
+        let candidates: &[&str] = match words.as_slice() {
+            [] => TOP_LEVEL_KEYWORDS,
+            [.., last] if *last == "ORDER" || *last == "GROUP" || *last == "CONNECT" => &["BY"],
+            [.., last] if *last == "START" => &["WITH"],
+            [.., last] if *last == "DELETE" => &["FROM"],
+            [.., last] if *last == "INSERT" || *last == "MERGE" => &["INTO"],
+            [.., last]
+                if matches!(
+                    last.as_str(),
+                    "LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "NATURAL"
+                ) =>
+            {
+                &["JOIN"]
+            }
+            [.., last] if matches!(last.as_str(), "UNION" | "INTERSECT" | "EXCEPT" | "MINUS") => {
+                &["SELECT", "ALL"]
+            }
+            [.., last] if *last == "CREATE" || *last == "DROP" || *last == "ALTER" => {
+                OBJECT_TYPE_KEYWORDS
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "PUBLIC" => &["SYNONYM"],
+            [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => &["SYNONYM"],
+            [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
+                OBJECT_TYPE_KEYWORDS
+            }
+            [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
+                &["TABLE"]
+            }
+            [.., last] if *last == "COMMENT" => &["ON"],
+            [.., last] if *last == "EXECUTE" => &["IMMEDIATE"],
+            [.., last] if *last == "WHEN" => &["MATCHED", "NOT"],
+            [.., prev, last] if *prev == "WHEN" && *last == "NOT" => &["MATCHED"],
+            [.., prev, last] if *prev == "CREATE" && *last == "OR" => &["REPLACE"],
+            _ => {
+                if deep_ctx.cursor_token_len == 0 {
+                    TOP_LEVEL_KEYWORDS
+                } else {
+                    &[]
+                }
+            }
+        };
+
+        Self::filter_expected_candidates(prefix, candidates)
+    }
+
+    fn expected_object_suggestion_kind(
+        prefix: &str,
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let words = Self::previous_meaningful_words_upper(
+            tokens,
+            Self::expected_suggestion_context_end(
+                tokens,
+                cursor_token_len,
+                !prefix.is_empty() || qualifier.is_some(),
+            ),
+            4,
+        );
+
+        match words.as_slice() {
+            [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
+                Some(ExpectedObjectSuggestionKind::Routine)
+            }
+            [.., last] if matches!(last.as_str(), "DESC" | "DESCRIBE") => {
+                Some(ExpectedObjectSuggestionKind::Any)
+            }
+            [.., prev, last]
+                if matches!(
+                    prev.as_str(),
+                    "ALTER" | "DROP" | "TRUNCATE" | "FLASHBACK" | "LOCK"
+                ) && *last == "TABLE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "VIEW" => {
+                Some(ExpectedObjectSuggestionKind::View)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PROCEDURE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Procedure)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "FUNCTION" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Function)
+            }
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PACKAGE" => {
+                Some(ExpectedObjectSuggestionKind::Package)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "SEQUENCE" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Sequence)
+            }
+            [.., prev, last] if *prev == "DROP" && *last == "SYNONYM" => {
+                Some(ExpectedObjectSuggestionKind::Synonym)
+            }
+            [.., a, b, c] if *a == "DROP" && *b == "PUBLIC" && *c == "SYNONYM" => {
+                Some(ExpectedObjectSuggestionKind::PublicSynonym)
+            }
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "USER" => {
+                Some(ExpectedObjectSuggestionKind::User)
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_suggestion_context_end(
+        tokens: &[SqlToken],
+        cursor_token_len: usize,
+        exclude_current_identifier_chain: bool,
+    ) -> usize {
+        if !exclude_current_identifier_chain {
+            return cursor_token_len.min(tokens.len());
+        }
+
+        Self::current_qualified_identifier_chain_start(tokens, cursor_token_len)
+            .unwrap_or(cursor_token_len)
+            .min(tokens.len())
+    }
+
+    fn collect_expected_object_suggestions_for_kind(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        kind: ExpectedObjectSuggestionKind,
+    ) -> Vec<String> {
+        let suggestions = match kind {
+            ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Routine => data.get_routine_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Table => data.get_table_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::View => data.get_view_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Procedure => {
+                data.get_procedure_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::Function => data.get_function_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Package => data.get_package_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Sequence => data.get_sequence_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Synonym => data.get_synonym_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::PublicSynonym => {
+                data.get_public_synonym_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::User => data.get_user_suggestions(prefix),
+        };
+
+        if prefix.is_empty() || matches!(kind, ExpectedObjectSuggestionKind::User) {
+            return suggestions;
+        }
+
+        Self::merge_suggestions_with_context_aliases(
+            suggestions,
+            data.get_user_suggestions(prefix),
+            false,
+        )
+    }
+
+    fn matches_string_list_case_insensitive(values: &[String], candidate: &str) -> bool {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(candidate))
+    }
+
+    fn suggestion_matches_expected_object_kind(
+        data: &IntellisenseData,
+        candidate: &str,
+        kind: ExpectedObjectSuggestionKind,
+    ) -> bool {
+        match kind {
+            ExpectedObjectSuggestionKind::Any => true,
+            ExpectedObjectSuggestionKind::Routine => {
+                Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.functions, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.packages, candidate)
+            }
+            ExpectedObjectSuggestionKind::Table => {
+                Self::matches_string_list_case_insensitive(&data.tables, candidate)
+            }
+            ExpectedObjectSuggestionKind::View => {
+                Self::matches_string_list_case_insensitive(&data.views, candidate)
+            }
+            ExpectedObjectSuggestionKind::Procedure => {
+                Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+            }
+            ExpectedObjectSuggestionKind::Function => {
+                Self::matches_string_list_case_insensitive(&data.functions, candidate)
+            }
+            ExpectedObjectSuggestionKind::Package => {
+                Self::matches_string_list_case_insensitive(&data.packages, candidate)
+            }
+            ExpectedObjectSuggestionKind::Sequence => {
+                Self::matches_string_list_case_insensitive(&data.sequences, candidate)
+            }
+            ExpectedObjectSuggestionKind::Synonym => {
+                Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
+            }
+            ExpectedObjectSuggestionKind::PublicSynonym => {
+                Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
+            }
+            ExpectedObjectSuggestionKind::User => {
+                Self::matches_string_list_case_insensitive(&data.users, candidate)
+            }
+        }
+    }
+
+    fn expected_qualifier_member_kinds(
+        kind: ExpectedObjectSuggestionKind,
+    ) -> Option<&'static [QualifiedMemberKind]> {
+        match kind {
+            ExpectedObjectSuggestionKind::Any => None,
+            ExpectedObjectSuggestionKind::Routine => Some(&[
+                QualifiedMemberKind::Procedure,
+                QualifiedMemberKind::Function,
+                QualifiedMemberKind::Package,
+            ]),
+            ExpectedObjectSuggestionKind::Table => Some(&[QualifiedMemberKind::Table]),
+            ExpectedObjectSuggestionKind::View => Some(&[QualifiedMemberKind::View]),
+            ExpectedObjectSuggestionKind::Procedure => Some(&[QualifiedMemberKind::Procedure]),
+            ExpectedObjectSuggestionKind::Function => Some(&[QualifiedMemberKind::Function]),
+            ExpectedObjectSuggestionKind::Package => Some(&[QualifiedMemberKind::Package]),
+            ExpectedObjectSuggestionKind::Sequence => Some(&[QualifiedMemberKind::Sequence]),
+            ExpectedObjectSuggestionKind::Synonym => Some(&[QualifiedMemberKind::Synonym]),
+            ExpectedObjectSuggestionKind::PublicSynonym => {
+                Some(&[QualifiedMemberKind::PublicSynonym])
+            }
+            ExpectedObjectSuggestionKind::User => Some(&[QualifiedMemberKind::User]),
+        }
+    }
+
+    fn suggestion_matches_expected_object_kind_for_qualifier(
+        data: &IntellisenseData,
+        qualifier: &str,
+        candidate: &str,
+        kind: ExpectedObjectSuggestionKind,
+    ) -> bool {
+        if let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) {
+            if let Some(matches) =
+                data.qualifier_member_matches_kinds(qualifier, candidate, expected_kinds)
+            {
+                return matches;
+            }
+        }
+
+        Self::suggestion_matches_expected_object_kind(data, candidate, kind)
+    }
+
+    fn expected_member_suggestions_for_qualifier(
+        data: &mut IntellisenseData,
+        qualifier: &str,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let suggestions = data.get_member_suggestions(qualifier, prefix, false);
+        let Some(kind) = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
+        else {
+            return suggestions;
+        };
+        if matches!(kind, ExpectedObjectSuggestionKind::Any) {
+            return suggestions;
+        }
+
+        let mut filtered = Vec::new();
+        let mut seen = HashSet::new();
+        for suggestion in suggestions {
+            if !Self::suggestion_matches_expected_object_kind_for_qualifier(
+                data,
+                qualifier,
+                &suggestion,
+                kind,
+            ) {
+                continue;
+            }
+            if seen.insert(suggestion.to_ascii_uppercase()) {
+                filtered.push(suggestion);
+            }
+            if filtered.len() >= MAX_MERGED_SUGGESTIONS {
+                break;
+            }
+        }
+        filtered
+    }
+
+    fn collect_expected_object_suggestions(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        match Self::expected_object_suggestion_kind(prefix, None, deep_ctx) {
+            Some(kind) => Self::collect_expected_object_suggestions_for_kind(data, prefix, kind),
+            None => Vec::new(),
+        }
     }
 
     fn expand_virtual_table_wildcards(
