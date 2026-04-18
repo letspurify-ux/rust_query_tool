@@ -23,17 +23,18 @@ use crate::utils::AppConfig;
 pub struct ConnectionDialog;
 
 fn db_type_from_choice_index(idx: i32) -> DatabaseType {
-    if idx <= 0 {
-        DatabaseType::Oracle
-    } else {
-        DatabaseType::MySQL
+    match idx {
+        i if i <= 0 => DatabaseType::Oracle,
+        1 => DatabaseType::OracleThin,
+        _ => DatabaseType::MySQL,
     }
 }
 
 fn choice_index_from_db_type(db_type: DatabaseType) -> i32 {
     match db_type {
         DatabaseType::Oracle => 0,
-        DatabaseType::MySQL => 1,
+        DatabaseType::OracleThin => 1,
+        DatabaseType::MySQL => 2,
     }
 }
 
@@ -93,10 +94,10 @@ fn build_connection_info(
         return Err("Host contains invalid characters".to_string());
     }
     let svc_label = match db_type {
-        DatabaseType::Oracle => "Service name",
+        DatabaseType::Oracle | DatabaseType::OracleThin => "Service name",
         DatabaseType::MySQL => "Database name",
     };
-    let requires_service_name = matches!(db_type, DatabaseType::Oracle);
+    let requires_service_name = matches!(db_type, DatabaseType::Oracle | DatabaseType::OracleThin);
     if requires_service_name && service_name.is_empty() {
         return Err(format!("{} is required", svc_label));
     }
@@ -226,7 +227,7 @@ impl ConnectionDialog {
         dbtype_label.set_label_color(theme::text_primary());
         dbtype_flex.fixed(&dbtype_label, FORM_LABEL_WIDTH);
         let mut dbtype_choice = Choice::default();
-        dbtype_choice.add_choice("Oracle|MySQL or MariaDB");
+        dbtype_choice.add_choice("Oracle (OCI)|Oracle (thin)|MySQL or MariaDB (thin)");
         dbtype_choice.set_value(0); // Oracle by default
         dbtype_choice.set_color(theme::input_bg());
         dbtype_choice.set_text_color(theme::text_primary());
@@ -915,10 +916,30 @@ mod tests {
     }
 
     #[test]
-    fn db_type_choice_indexes_treat_any_non_oracle_item_as_mysql() {
+    fn db_type_choice_indexes_cover_oracle_thin_and_mysql() {
         assert_eq!(super::db_type_from_choice_index(0), DatabaseType::Oracle);
-        assert_eq!(super::db_type_from_choice_index(1), DatabaseType::MySQL);
+        assert_eq!(
+            super::db_type_from_choice_index(1),
+            DatabaseType::OracleThin
+        );
         assert_eq!(super::db_type_from_choice_index(2), DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn build_connection_info_accepts_oracle_thin_service_name() {
+        let info = build_connection_info(
+            "thin",
+            "system",
+            "password",
+            "localhost",
+            "1521",
+            "FREE",
+            DatabaseType::OracleThin,
+        )
+        .expect("oracle thin connection info should be valid");
+
+        assert_eq!(info.db_type, DatabaseType::OracleThin);
+        assert_eq!(info.service_name, "FREE");
     }
 
     #[test]

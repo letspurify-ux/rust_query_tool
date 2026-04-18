@@ -6209,6 +6209,23 @@ impl QueryExecutor {
         loop {
             let trimmed = remaining.trim_start();
 
+            let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
+            let first_line = &trimmed[..first_line_end];
+            if let Some(after_slash) = trimmed.strip_prefix('/') {
+                let slash_rest = after_slash.trim_start();
+                if slash_rest.starts_with("/*") {
+                    remaining = slash_rest;
+                    continue;
+                }
+            }
+            if crate::sql_parser_engine::classify_line_leading_slash_marker(first_line).is_some() {
+                if first_line_end < trimmed.len() {
+                    remaining = &trimmed[first_line_end + 1..];
+                    continue;
+                }
+                return String::new();
+            }
+
             if sql_text::is_sqlplus_comment_line(trimmed)
                 || sql_text::is_mysql_hash_comment_line(trimmed)
             {
@@ -6365,6 +6382,58 @@ impl QueryExecutor {
             .is_some_and(|token| token.eq_ignore_ascii_case("END"))
     }
 
+    fn strip_trailing_plain_end_semicolon_for_split(sql: &str) -> String {
+        let trimmed = sql.trim_end();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        let last_line_start = trimmed.rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let last_line = &trimmed[last_line_start..];
+        let last_trimmed = last_line.trim_start();
+
+        let ends_with_semicolon =
+            sql_text::line_ends_with_semicolon_before_inline_comment(last_trimmed);
+        let last_upper = last_trimmed.to_ascii_uppercase();
+
+        if ends_with_semicolon && sql_text::starts_with_format_bare_end(&last_upper) {
+            let Some(semicolon_index) = last_trimmed.rfind(';') else {
+                return trimmed.to_string();
+            };
+            let indent = &last_line[..last_line.len() - last_trimmed.len()];
+            let mut normalized = String::with_capacity(trimmed.len().saturating_sub(1));
+            normalized.push_str(&trimmed[..last_line_start]);
+            normalized.push_str(indent);
+            normalized.push_str(&last_trimmed[..semicolon_index]);
+            normalized.push_str(&last_trimmed[semicolon_index + 1..]);
+            return normalized;
+        }
+
+        if ends_with_semicolon || !sql_text::starts_with_format_named_plain_end(&last_upper) {
+            return trimmed.to_string();
+        }
+
+        let indent = &last_line[..last_line.len() - last_trimmed.len()];
+        let mut normalized = String::with_capacity(trimmed.len().saturating_add(1));
+        normalized.push_str(&trimmed[..last_line_start]);
+        normalized.push_str(indent);
+
+        if let Some(prefix) = sql_text::trailing_inline_comment_prefix(last_trimmed) {
+            let comment = &last_trimmed[prefix.len()..];
+            normalized.push_str(prefix.trim_end());
+            normalized.push(';');
+            if !prefix.chars().last().is_some_and(char::is_whitespace) {
+                normalized.push(' ');
+            }
+            normalized.push_str(comment);
+        } else {
+            normalized.push_str(last_trimmed);
+            normalized.push(';');
+        }
+
+        normalized
+    }
+
     pub fn leading_keyword(sql: &str) -> Option<String> {
         let cleaned = Self::strip_leading_comments(sql);
         cleaned
@@ -6418,6 +6487,17 @@ impl QueryExecutor {
             return sql.to_string();
         }
 
+        if leading == Some("WITH")
+            && Self::with_main_select_reads_cte_source(
+                sql,
+                with_prefix_len,
+                effective_sql,
+                from_idx_in_effective,
+            )
+        {
+            return sql.to_string();
+        }
+
         let Some(rowid_expr) =
             Self::single_table_rowid_expression(effective_sql, from_idx_in_effective)
         else {
@@ -6461,6 +6541,52 @@ impl QueryExecutor {
             rewritten.push_str(select_body);
         }
         rewritten
+    }
+
+    pub(crate) fn rowid_edit_target_source_name(sql: &str) -> Option<String> {
+        if !Self::is_select_statement(sql) {
+            return None;
+        }
+
+        let leading_kw = Self::leading_keyword(sql);
+        let leading = leading_kw.as_deref();
+
+        let effective_sql: &str;
+        let with_prefix_len: usize;
+        if leading == Some("WITH") {
+            if let Some(main_select_idx) = Self::find_main_select_after_with(sql) {
+                if Self::is_parenthesized_select_start(sql, main_select_idx) {
+                    return None;
+                }
+                effective_sql = &sql[main_select_idx..];
+                with_prefix_len = main_select_idx;
+            } else {
+                return None;
+            }
+        } else if leading == Some("SELECT") {
+            effective_sql = sql;
+            with_prefix_len = 0;
+        } else {
+            return None;
+        }
+
+        let from_idx_in_effective = Self::find_top_level_keyword(effective_sql, "FROM")?;
+        if !Self::is_rowid_edit_eligible_query(effective_sql) {
+            return None;
+        }
+
+        if leading == Some("WITH")
+            && Self::with_main_select_reads_cte_source(
+                sql,
+                with_prefix_len,
+                effective_sql,
+                from_idx_in_effective,
+            )
+        {
+            return None;
+        }
+
+        Self::single_table_source_name(effective_sql, from_idx_in_effective)
     }
 
     pub(crate) fn rowid_safe_execution_sql(_original_sql: &str, rewritten_sql: &str) -> String {
@@ -6933,6 +7059,286 @@ impl QueryExecutor {
         Self::find_top_level_keyword(sql, keyword).is_some()
     }
 
+    fn with_main_select_reads_cte_source(
+        sql: &str,
+        with_prefix_len: usize,
+        effective_sql: &str,
+        from_idx: usize,
+    ) -> bool {
+        let Some(source_name) = Self::single_table_source_name(effective_sql, from_idx) else {
+            return false;
+        };
+        let Some(with_prefix) = sql.get(..with_prefix_len) else {
+            return false;
+        };
+
+        Self::collect_top_level_cte_names(with_prefix)
+            .into_iter()
+            .any(|cte_name| cte_name.eq_ignore_ascii_case(&source_name))
+    }
+
+    fn collect_top_level_cte_names(sql: &str) -> Vec<String> {
+        let bytes = sql.as_bytes();
+        let mut names = Vec::new();
+        let mut pos = 0usize;
+        let mut depth = 0usize;
+
+        while pos < bytes.len() {
+            if let Some(next) = Self::skip_q_quoted_literal(sql, pos) {
+                pos = next;
+                continue;
+            }
+
+            if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(bytes, pos) {
+                pos += prefix_len;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < bytes.len() {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos] == b'\'' {
+                pos = Self::skip_single_quoted_literal(sql, pos);
+                continue;
+            }
+
+            if bytes[pos] == b'(' {
+                depth += 1;
+                pos += 1;
+                continue;
+            }
+
+            if bytes[pos] == b')' {
+                depth = depth.saturating_sub(1);
+                pos += 1;
+                continue;
+            }
+
+            if depth != 0 {
+                pos += 1;
+                continue;
+            }
+
+            let Some((name, next_pos)) = Self::parse_sql_identifier(sql, pos) else {
+                pos += 1;
+                continue;
+            };
+
+            let mut lookahead = Self::skip_sql_trivia(sql, next_pos);
+            if lookahead < bytes.len() && bytes[lookahead] == b'(' {
+                let Some(after_column_list) = Self::skip_balanced_sql_parens(sql, lookahead) else {
+                    break;
+                };
+                lookahead = Self::skip_sql_trivia(sql, after_column_list);
+            }
+
+            if Self::starts_with_keyword_at(sql, lookahead, "AS") {
+                let after_as = Self::skip_sql_trivia(sql, lookahead.saturating_add(2));
+                if after_as < bytes.len() && bytes[after_as] == b'(' {
+                    names.push(name);
+                }
+            }
+
+            pos = next_pos;
+        }
+
+        names
+    }
+
+    fn skip_sql_trivia(sql: &str, mut pos: usize) -> usize {
+        let bytes = sql.as_bytes();
+        while pos < bytes.len() {
+            if let Some(next) = Self::skip_q_quoted_literal(sql, pos) {
+                pos = next;
+                continue;
+            }
+
+            if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(bytes, pos) {
+                pos += prefix_len;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < bytes.len() {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        pos
+    }
+
+    fn skip_balanced_sql_parens(sql: &str, mut pos: usize) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        if bytes.get(pos) != Some(&b'(') {
+            return Some(pos);
+        }
+
+        let mut depth = 0usize;
+        while pos < bytes.len() {
+            if let Some(next) = Self::skip_q_quoted_literal(sql, pos) {
+                pos = next;
+                continue;
+            }
+
+            if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(bytes, pos) {
+                pos += prefix_len;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < bytes.len() {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+
+            if bytes[pos] == b'\'' {
+                pos = Self::skip_single_quoted_literal(sql, pos);
+                continue;
+            }
+
+            if bytes[pos] == b'(' {
+                depth += 1;
+                pos += 1;
+                continue;
+            }
+
+            if bytes[pos] == b')' {
+                depth = depth.saturating_sub(1);
+                pos += 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+                continue;
+            }
+
+            pos += 1;
+        }
+
+        None
+    }
+
+    fn skip_q_quoted_literal(sql: &str, pos: usize) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        let (delimiter, prefix_len) = if (bytes.get(pos) == Some(&b'n')
+            || bytes.get(pos) == Some(&b'N'))
+            && bytes
+                .get(pos + 1)
+                .is_some_and(|next_b| *next_b == b'q' || *next_b == b'Q')
+            && bytes.get(pos + 2) == Some(&b'\'')
+        {
+            (bytes.get(pos + 3).copied()?, 4usize)
+        } else if (bytes.get(pos) == Some(&b'q') || bytes.get(pos) == Some(&b'Q'))
+            && bytes.get(pos + 1) == Some(&b'\'')
+        {
+            (bytes.get(pos + 2).copied()?, 3usize)
+        } else {
+            return None;
+        };
+
+        if !sql_text::is_valid_q_quote_delimiter_byte(delimiter) {
+            return None;
+        }
+
+        let end_delimiter = sql_text::q_quote_closing_byte(delimiter);
+        let mut scan = pos.saturating_add(prefix_len);
+        while scan + 1 < bytes.len() {
+            if bytes[scan] == end_delimiter && bytes[scan + 1] == b'\'' {
+                return Some(scan + 2);
+            }
+            scan += 1;
+        }
+
+        Some(bytes.len())
+    }
+
+    fn skip_single_quoted_literal(sql: &str, mut pos: usize) -> usize {
+        let bytes = sql.as_bytes();
+        pos += 1;
+        while pos < bytes.len() {
+            if bytes[pos] == b'\'' {
+                pos += 1;
+                if pos < bytes.len() && bytes[pos] == b'\'' {
+                    pos += 1;
+                    continue;
+                }
+                break;
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    fn parse_sql_identifier(sql: &str, pos: usize) -> Option<(String, usize)> {
+        let bytes = sql.as_bytes();
+        let start = pos;
+        let byte = *bytes.get(pos)?;
+
+        if byte == b'"' {
+            let mut scan = pos + 1;
+            while scan < bytes.len() {
+                if bytes[scan] == b'"' {
+                    if scan + 1 < bytes.len() && bytes[scan + 1] == b'"' {
+                        scan += 2;
+                        continue;
+                    }
+                    scan += 1;
+                    return Some((sql.get(start..scan)?.to_string(), scan));
+                }
+                scan += 1;
+            }
+            return Some((sql.get(start..)?.to_string(), bytes.len()));
+        }
+
+        if !sql_text::is_identifier_start_byte(byte) {
+            return None;
+        }
+
+        let mut scan = pos + 1;
+        while scan < bytes.len() && sql_text::is_identifier_byte(bytes[scan]) {
+            scan += 1;
+        }
+
+        Some((sql.get(start..scan)?.to_string(), scan))
+    }
+
     /// Extract the ROWID expression for the first real (non-subquery) table
     /// in the FROM clause. Works for single tables, JOINs, and comma-joins.
     /// Returns `Some("alias.ROWID")` or `Some("TABLE_NAME.ROWID")` or `None`.
@@ -7316,6 +7722,92 @@ impl QueryExecutor {
     }
 
     fn single_table_rowid_expression(sql: &str, from_idx: usize) -> Option<String> {
+        let table_name = Self::single_table_source_name(sql, from_idx)?;
+        let from_body_start = from_idx.saturating_add("FROM".len());
+        let from_body_end = Self::find_top_level_keyword(sql, "WHERE")
+            .or_else(|| Self::find_top_level_keyword(sql, "ORDER"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FETCH"))
+            .or_else(|| Self::find_top_level_keyword(sql, "OFFSET"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FOR"))
+            .unwrap_or(sql.len());
+        if from_body_end <= from_body_start || !sql.is_char_boundary(from_body_end) {
+            return None;
+        }
+
+        let from_clause = &sql[from_body_start..from_body_end];
+        let table_ref = Self::strip_leading_relation_modifiers(from_clause);
+        if table_ref.is_empty() {
+            return None;
+        }
+        if Self::starts_with_relation_invocation(table_ref) {
+            return None;
+        }
+
+        let upper = table_ref.to_ascii_uppercase();
+        if upper.starts_with("(") {
+            return None;
+        }
+
+        let alias_start = if upper.starts_with('"') {
+            let bytes = table_ref.as_bytes();
+            let mut idx = 1usize;
+            while idx < bytes.len() {
+                if bytes[idx] == b'"' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'"' {
+                        idx += 2;
+                        continue;
+                    }
+                    idx += 1;
+                    break;
+                }
+                idx += 1;
+            }
+            idx
+        } else {
+            table_ref
+                .char_indices()
+                .find_map(|(idx, ch)| {
+                    if ch.is_whitespace() || ch == ';' {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(table_ref.len())
+        };
+
+        let mut alias_source = table_ref.get(alias_start..).unwrap_or("").trim_start();
+        if alias_source.is_empty() {
+            return Some(format!("{table_name}.ROWID"));
+        }
+
+        if alias_source
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
+        {
+            alias_source = alias_source.get(2..).unwrap_or("").trim_start();
+        }
+
+        let alias_len = alias_source
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                if ch.is_whitespace() || ch == ';' {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(alias_source.len());
+        let alias = alias_source.get(..alias_len).unwrap_or("").trim();
+
+        if alias.is_empty() {
+            Some(format!("{table_name}.ROWID"))
+        } else {
+            Some(format!("{alias}.ROWID"))
+        }
+    }
+
+    fn single_table_source_name(sql: &str, from_idx: usize) -> Option<String> {
         let from_body_start = from_idx.saturating_add("FROM".len());
         if from_body_start >= sql.len() || !sql.is_char_boundary(from_body_start) {
             return None;
@@ -7380,36 +7872,7 @@ impl QueryExecutor {
         if table_name.is_empty() {
             return None;
         }
-
-        let mut alias_source = table_ref.get(alias_start..).unwrap_or("").trim_start();
-        if alias_source.is_empty() {
-            return Some(format!("{table_name}.ROWID"));
-        }
-
-        if alias_source
-            .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
-        {
-            alias_source = alias_source.get(2..).unwrap_or("").trim_start();
-        }
-
-        let alias_len = alias_source
-            .char_indices()
-            .find_map(|(idx, ch)| {
-                if ch.is_whitespace() || ch == ';' {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(alias_source.len());
-        let alias = alias_source.get(..alias_len).unwrap_or("").trim();
-
-        if alias.is_empty() {
-            Some(format!("{table_name}.ROWID"))
-        } else {
-            Some(format!("{alias}.ROWID"))
-        }
+        Some(table_name.to_string())
     }
 
     fn is_single_table_from_clause(sql: &str, from_idx: usize) -> bool {
@@ -7836,7 +8299,9 @@ impl QueryExecutor {
         let mut items: Vec<ScriptItem> = Vec::new();
         let add_statement = |stmt: String, items: &mut Vec<ScriptItem>| {
             let stripped = Self::strip_comments(&stmt);
-            let cleaned = Self::strip_extra_trailing_semicolons(&stripped);
+            let cleaned = Self::strip_trailing_plain_end_semicolon_for_split(
+                Self::strip_extra_trailing_semicolons(&stripped).as_str(),
+            );
             if !cleaned.is_empty() {
                 items.push(ScriptItem::Statement(cleaned));
             }
@@ -8023,7 +8488,9 @@ impl QueryExecutor {
         }
 
         let stripped = Self::strip_comments(combined.as_str());
-        let cleaned = Self::strip_extra_trailing_semicolons(stripped.as_str());
+        let cleaned = Self::strip_trailing_plain_end_semicolon_for_split(
+            Self::strip_extra_trailing_semicolons(stripped.as_str()).as_str(),
+        );
         if cleaned.is_empty() {
             None
         } else {
@@ -11322,7 +11789,7 @@ mod tests {
     use super::{
         AutoFormatClauseKind, AutoFormatConditionRole, AutoFormatFrameContext,
         AutoFormatLineSemantic, AutoFormatQueryRole, FormatItem, InlineCommentContinuationKind,
-        LineCarrySnapshot, PendingQueryBaseFrame, QueryExecutor,
+        LineCarrySnapshot, PendingQueryBaseFrame, QueryExecutor, ScriptItem,
     };
 
     #[test]
@@ -11342,6 +11809,32 @@ mod tests {
         assert_eq!(
             QueryExecutor::strip_extra_trailing_semicolons("SELECT 'WEEKEND REPORT' FROM dual;;"),
             "SELECT 'WEEKEND REPORT' FROM dual"
+        );
+    }
+
+    #[test]
+    fn split_script_items_preserves_package_body_end_label_semicolon_for_test1() {
+        let sql = include_str!("../../../test/test1.txt");
+        let items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::OracleThin),
+        );
+
+        let package_body = items
+            .iter()
+            .find_map(|item| match item {
+                ScriptItem::Statement(statement)
+                    if statement.starts_with("CREATE OR REPLACE PACKAGE BODY oqt_demo_pkg AS") =>
+                {
+                    Some(statement.as_str())
+                }
+                _ => None,
+            })
+            .expect("test1 package body statement must be present");
+
+        assert!(
+            package_body.trim_end().ends_with("END oqt_demo_pkg;"),
+            "package body should preserve its labeled END semicolon, got:\n{package_body}"
         );
     }
 

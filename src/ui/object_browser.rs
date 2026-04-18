@@ -809,14 +809,30 @@ impl ObjectBrowserWidget {
                                                 return;
                                             };
 
-                                            let result = match conn_guard.require_live_connection()
-                                            {
-                                                Ok(db_conn) => ObjectBrowser::get_package_routines(
-                                                    db_conn.as_ref(),
-                                                    &package_name,
-                                                )
-                                                .map_err(|err| err.to_string()),
-                                                Err(message) => Err(message),
+                                            let result = match conn_guard.db_type() {
+                                                crate::db::DatabaseType::Oracle => {
+                                                    match conn_guard.require_live_connection() {
+                                                        Ok(db_conn) => ObjectBrowser::get_package_routines(
+                                                            db_conn.as_ref(),
+                                                            &package_name,
+                                                        )
+                                                        .map_err(|err| err.to_string()),
+                                                        Err(message) => Err(message),
+                                                    }
+                                                }
+                                                crate::db::DatabaseType::OracleThin => {
+                                                    match conn_guard.require_live_oracle_thin_connection() {
+                                                        Ok(db_conn) => crate::db::oracle_thin::get_package_routines(
+                                                            db_conn.as_ref(),
+                                                            &package_name,
+                                                        ),
+                                                        Err(message) => Err(message),
+                                                    }
+                                                }
+                                                crate::db::DatabaseType::MySQL => Err(
+                                                    "Package members are only supported for Oracle connections."
+                                                        .to_string(),
+                                                ),
                                             };
 
                                             let _ =
@@ -996,7 +1012,7 @@ impl ObjectBrowserWidget {
 
     fn preview_select_sql(db_type: crate::db::DatabaseType, object_name: &str) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => {
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
                 format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name)
             }
             crate::db::DatabaseType::MySQL => format!(
@@ -1030,7 +1046,9 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_procedure_script(qualified_name),
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
+                Self::build_simple_procedure_script(qualified_name)
+            }
             crate::db::DatabaseType::MySQL => {
                 format!(
                     "CALL {}();\n",
@@ -1045,7 +1063,9 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_function_script(qualified_name),
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
+                Self::build_simple_function_script(qualified_name)
+            }
             crate::db::DatabaseType::MySQL => format!(
                 "SELECT {} AS result;\n",
                 if qualified_name.contains('(') {
@@ -1216,7 +1236,7 @@ impl ObjectBrowserWidget {
         arguments: &[ProcedureArgument],
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => {
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
                 Self::build_procedure_script(qualified_name, arguments)
             }
             crate::db::DatabaseType::MySQL => {
@@ -1743,6 +1763,22 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
+                                    crate::db::DatabaseType::OracleThin => conn_guard
+                                        .require_live_oracle_thin_connection()
+                                        .and_then(|db_conn| {
+                                            crate::db::oracle_thin::get_procedure_arguments(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            )
+                                            .map(|arguments| {
+                                                ObjectBrowserWidget::build_routine_script_for_db(
+                                                    db_type,
+                                                    &object_name,
+                                                    &routine_type,
+                                                    &arguments,
+                                                )
+                                            })
+                                        }),
                                     crate::db::DatabaseType::MySQL => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
@@ -1811,28 +1847,54 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
-                                        db_conn.as_ref(),
-                                        &package_name,
-                                        &routine_name,
-                                    )
-                                    .map(|arguments| {
-                                        ObjectBrowserWidget::build_routine_script_for_db(
-                                            crate::db::DatabaseType::Oracle,
-                                            &qualified_name,
-                                            &routine_type,
-                                            &arguments,
-                                        )
-                                    })
-                                    .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message),
+                                let db_type = conn_guard.db_type();
+                                let result = match db_type {
+                                    crate::db::DatabaseType::Oracle => {
+                                        match conn_guard.require_live_connection() {
+                                            Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
+                                                db_conn.as_ref(),
+                                                &package_name,
+                                                &routine_name,
+                                            )
+                                            .map(|arguments| {
+                                                ObjectBrowserWidget::build_routine_script_for_db(
+                                                    db_type,
+                                                    &qualified_name,
+                                                    &routine_type,
+                                                    &arguments,
+                                                )
+                                            })
+                                            .map_err(|err| err.to_string()),
+                                            Err(message) => Err(message),
+                                        }
+                                    }
+                                    crate::db::DatabaseType::OracleThin => conn_guard
+                                        .require_live_oracle_thin_connection()
+                                        .and_then(|db_conn| {
+                                            crate::db::oracle_thin::get_package_procedure_arguments(
+                                                db_conn.as_ref(),
+                                                &package_name,
+                                                &routine_name,
+                                            )
+                                            .map(|arguments| {
+                                                ObjectBrowserWidget::build_routine_script_for_db(
+                                                    db_type,
+                                                    &qualified_name,
+                                                    &routine_type,
+                                                    &arguments,
+                                                )
+                                            })
+                                        }),
+                                    crate::db::DatabaseType::MySQL => Err(
+                                        "Package routines are only supported for Oracle connections."
+                                            .to_string(),
+                                    ),
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
                                     qualified_name,
                                     routine_type,
-                                    db_type: crate::db::DatabaseType::Oracle,
+                                    db_type,
                                     result,
                                 });
                                 app::awake();
@@ -1881,66 +1943,126 @@ impl ObjectBrowserWidget {
                                         result: Err("Compilation status is only supported for Oracle objects.".to_string()),
                                     });
                                     app::awake();
-                                } else if let Ok(db_conn) = conn_guard.require_live_connection() {
-                                    let status = ObjectBrowser::get_object_status(
-                                        db_conn.as_ref(),
-                                        &object_name,
-                                        &object_type,
-                                    )
-                                    .unwrap_or_else(|_| "UNKNOWN".to_string());
+                                } else {
+                                    let result = match conn_guard.db_type() {
+                                        crate::db::DatabaseType::Oracle => conn_guard
+                                            .require_live_connection()
+                                            .map_err(|_| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                            .map(|db_conn| {
+                                                let status = ObjectBrowser::get_object_status(
+                                                    db_conn.as_ref(),
+                                                    &object_name,
+                                                    &object_type,
+                                                )
+                                                .unwrap_or_else(|_| "UNKNOWN".to_string());
 
-                                    // Also check PACKAGE BODY status for packages
-                                    let body_status = if object_type == "PACKAGE" {
-                                        ObjectBrowser::get_object_status(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                            "PACKAGE BODY",
-                                        )
-                                        .ok()
-                                    } else {
-                                        None
+                                                let body_status = if object_type == "PACKAGE" {
+                                                    ObjectBrowser::get_object_status(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                        "PACKAGE BODY",
+                                                    )
+                                                    .ok()
+                                                } else {
+                                                    None
+                                                };
+
+                                                let mut errors = ObjectBrowser::get_compilation_errors(
+                                                    db_conn.as_ref(),
+                                                    &object_name,
+                                                    &object_type,
+                                                )
+                                                .unwrap_or_default();
+
+                                                if object_type == "PACKAGE" {
+                                                    if let Ok(body_errors) =
+                                                        ObjectBrowser::get_compilation_errors(
+                                                            db_conn.as_ref(),
+                                                            &object_name,
+                                                            "PACKAGE BODY",
+                                                        )
+                                                    {
+                                                        errors.extend(body_errors);
+                                                    }
+                                                }
+
+                                                (status, body_status, errors)
+                                            }),
+                                        crate::db::DatabaseType::OracleThin => conn_guard
+                                            .require_live_oracle_thin_connection()
+                                            .map_err(|_| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                                            .map(|db_conn| {
+                                                let status = crate::db::oracle_thin::get_object_status(
+                                                    db_conn.as_ref(),
+                                                    &object_name,
+                                                    &object_type,
+                                                )
+                                                .unwrap_or_else(|_| "UNKNOWN".to_string());
+
+                                                let body_status = if object_type == "PACKAGE" {
+                                                    crate::db::oracle_thin::get_object_status(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                        "PACKAGE BODY",
+                                                    )
+                                                    .ok()
+                                                } else {
+                                                    None
+                                                };
+
+                                                let mut errors =
+                                                    crate::db::oracle_thin::get_compilation_errors(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                        &object_type,
+                                                    )
+                                                    .unwrap_or_default();
+
+                                                if object_type == "PACKAGE" {
+                                                    if let Ok(body_errors) =
+                                                        crate::db::oracle_thin::get_compilation_errors(
+                                                            db_conn.as_ref(),
+                                                            &object_name,
+                                                            "PACKAGE BODY",
+                                                        )
+                                                    {
+                                                        errors.extend(body_errors);
+                                                    }
+                                                }
+
+                                                (status, body_status, errors)
+                                            }),
+                                        crate::db::DatabaseType::MySQL => unreachable!(),
                                     };
 
-                                    let mut errors = ObjectBrowser::get_compilation_errors(
-                                        db_conn.as_ref(),
-                                        &object_name,
-                                        &object_type,
-                                    )
-                                    .unwrap_or_default();
+                                    match result {
+                                        Ok((status, body_status, errors)) => {
+                                            let combined_status = if let Some(bs) = body_status {
+                                                format!("Spec: {} / Body: {}", status, bs)
+                                            } else {
+                                                status
+                                            };
 
-                                    // For packages, also get PACKAGE BODY errors
-                                    if object_type == "PACKAGE" {
-                                        if let Ok(body_errors) =
-                                            ObjectBrowser::get_compilation_errors(
-                                                db_conn.as_ref(),
-                                                &object_name,
-                                                "PACKAGE BODY",
-                                            )
-                                        {
-                                            errors.extend(body_errors);
+                                            let _ = sender.send(
+                                                ObjectActionResult::CompilationErrors {
+                                                    object_name,
+                                                    object_type,
+                                                    status: combined_status,
+                                                    result: Ok(errors),
+                                                },
+                                            );
+                                        }
+                                        Err(message) => {
+                                            let _ = sender.send(
+                                                ObjectActionResult::CompilationErrors {
+                                                    object_name,
+                                                    object_type,
+                                                    status: String::new(),
+                                                    result: Err(message),
+                                                },
+                                            );
                                         }
                                     }
-
-                                    let combined_status = if let Some(bs) = body_status {
-                                        format!("Spec: {} / Body: {}", status, bs)
-                                    } else {
-                                        status
-                                    };
-
-                                    let _ = sender.send(ObjectActionResult::CompilationErrors {
-                                        object_name,
-                                        object_type,
-                                        status: combined_status,
-                                        result: Ok(errors),
-                                    });
-                                    app::awake();
-                                } else {
-                                    let _ = sender.send(ObjectActionResult::CompilationErrors {
-                                        object_name,
-                                        object_type,
-                                        status: String::new(),
-                                        result: Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-                                    });
                                     app::awake();
                                 }
 
@@ -1978,6 +2100,14 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
+                                    crate::db::DatabaseType::OracleThin => conn_guard
+                                        .require_live_oracle_thin_connection()
+                                        .and_then(|db_conn| {
+                                            crate::db::oracle_thin::get_table_structure(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                        }),
                                     crate::db::DatabaseType::MySQL => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
@@ -2028,6 +2158,14 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
+                                    crate::db::DatabaseType::OracleThin => conn_guard
+                                        .require_live_oracle_thin_connection()
+                                        .and_then(|db_conn| {
+                                            crate::db::oracle_thin::get_table_indexes(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                        }),
                                     crate::db::DatabaseType::MySQL => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
@@ -2076,6 +2214,14 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
+                                    crate::db::DatabaseType::OracleThin => conn_guard
+                                        .require_live_oracle_thin_connection()
+                                        .and_then(|db_conn| {
+                                            crate::db::oracle_thin::get_table_constraints(
+                                                db_conn.as_ref(),
+                                                &table_name,
+                                            )
+                                        }),
                                     crate::db::DatabaseType::MySQL => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
@@ -2147,29 +2293,80 @@ impl ObjectBrowserWidget {
                                         }
                                     };
 
-                                if let Ok(db_conn) = conn_guard.require_live_connection() {
-                                    match obj_type.as_str() {
-                                        "SYNONYMS" => {
-                                            let result = ObjectBrowser::get_synonym_info(
-                                                db_conn.as_ref(),
-                                                &name,
-                                            )
-                                            .map_err(|err| err.to_string());
-                                            let _ = sender
-                                                .send(ObjectActionResult::SynonymInfo(result));
-                                        }
-                                        _ => {
-                                            let result = ObjectBrowser::get_sequence_info(
-                                                db_conn.as_ref(),
-                                                &name,
-                                            )
-                                            .map_err(|err| err.to_string());
-                                            let _ = sender
-                                                .send(ObjectActionResult::SequenceInfo(result));
+                                match conn_guard.db_type() {
+                                    crate::db::DatabaseType::Oracle => {
+                                        if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                            match obj_type.as_str() {
+                                                "SYNONYMS" => {
+                                                    let result = ObjectBrowser::get_synonym_info(
+                                                        db_conn.as_ref(),
+                                                        &name,
+                                                    )
+                                                    .map_err(|err| err.to_string());
+                                                    let _ = sender.send(
+                                                        ObjectActionResult::SynonymInfo(result),
+                                                    );
+                                                }
+                                                _ => {
+                                                    let result = ObjectBrowser::get_sequence_info(
+                                                        db_conn.as_ref(),
+                                                        &name,
+                                                    )
+                                                    .map_err(|err| err.to_string());
+                                                    let _ = sender.send(
+                                                        ObjectActionResult::SequenceInfo(result),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            send_err(
+                                                &sender,
+                                                &obj_type,
+                                                crate::db::NOT_CONNECTED_MESSAGE,
+                                            );
                                         }
                                     }
-                                } else {
-                                    send_err(&sender, &obj_type, crate::db::NOT_CONNECTED_MESSAGE);
+                                    crate::db::DatabaseType::OracleThin => {
+                                        if let Ok(db_conn) =
+                                            conn_guard.require_live_oracle_thin_connection()
+                                        {
+                                            match obj_type.as_str() {
+                                                "SYNONYMS" => {
+                                                    let result =
+                                                        crate::db::oracle_thin::get_synonym_info(
+                                                            db_conn.as_ref(),
+                                                            &name,
+                                                        );
+                                                    let _ = sender.send(
+                                                        ObjectActionResult::SynonymInfo(result),
+                                                    );
+                                                }
+                                                _ => {
+                                                    let result =
+                                                        crate::db::oracle_thin::get_sequence_info(
+                                                            db_conn.as_ref(),
+                                                            &name,
+                                                        );
+                                                    let _ = sender.send(
+                                                        ObjectActionResult::SequenceInfo(result),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            send_err(
+                                                &sender,
+                                                &obj_type,
+                                                crate::db::NOT_CONNECTED_MESSAGE,
+                                            );
+                                        }
+                                    }
+                                    crate::db::DatabaseType::MySQL => {
+                                        send_err(
+                                            &sender,
+                                            &obj_type,
+                                            crate::db::NOT_CONNECTED_MESSAGE,
+                                        );
+                                    }
                                 }
                                 app::awake();
                                 // conn_guard drops here, releasing the lock
@@ -2259,6 +2456,47 @@ impl ObjectBrowserWidget {
                                                     _ => return,
                                                 }
                                                 .map_err(|err| err.to_string()),
+                                                Err(message) => Err(message),
+                                            }
+                                        }
+                                        crate::db::DatabaseType::OracleThin => {
+                                            match conn_guard.require_live_oracle_thin_connection() {
+                                                Ok(db_conn) => match object_type.as_str() {
+                                                    "TABLE" => crate::db::oracle_thin::get_table_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "VIEW" => crate::db::oracle_thin::get_view_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "PROCEDURE" => crate::db::oracle_thin::get_procedure_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "FUNCTION" => crate::db::oracle_thin::get_function_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "SEQUENCE" => crate::db::oracle_thin::get_sequence_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "TRIGGER" => crate::db::oracle_thin::get_object_ddl(
+                                                        db_conn.as_ref(),
+                                                        "TRIGGER",
+                                                        &object_name,
+                                                    ),
+                                                    "SYNONYM" => crate::db::oracle_thin::get_synonym_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    "PACKAGE" => crate::db::oracle_thin::get_package_spec_ddl(
+                                                        db_conn.as_ref(),
+                                                        &object_name,
+                                                    ),
+                                                    _ => return,
+                                                },
                                                 Err(message) => Err(message),
                                             }
                                         }
@@ -2708,6 +2946,40 @@ impl ObjectBrowserWidget {
 
                 Some((db_type, cache))
             }
+            DatabaseType::OracleThin => {
+                let Ok(db_conn) = conn_guard.require_live_oracle_thin_connection() else {
+                    return None;
+                };
+
+                let mut cache = ObjectCache::default();
+
+                if let Ok(tables) = crate::db::oracle_thin::get_tables(db_conn.as_ref()) {
+                    cache.tables = tables;
+                }
+                if let Ok(views) = crate::db::oracle_thin::get_views(db_conn.as_ref()) {
+                    cache.views = views;
+                }
+                if let Ok(procedures) = crate::db::oracle_thin::get_procedures(db_conn.as_ref()) {
+                    cache.procedures = procedures;
+                }
+                if let Ok(functions) = crate::db::oracle_thin::get_functions(db_conn.as_ref()) {
+                    cache.functions = functions;
+                }
+                if let Ok(sequences) = crate::db::oracle_thin::get_sequences(db_conn.as_ref()) {
+                    cache.sequences = sequences;
+                }
+                if let Ok(triggers) = crate::db::oracle_thin::get_triggers(db_conn.as_ref()) {
+                    cache.triggers = triggers;
+                }
+                if let Ok(synonyms) = crate::db::oracle_thin::get_synonyms(db_conn.as_ref()) {
+                    cache.synonyms = synonyms;
+                }
+                if let Ok(packages) = crate::db::oracle_thin::get_packages(db_conn.as_ref()) {
+                    cache.packages = packages;
+                }
+
+                Some((db_type, cache))
+            }
             DatabaseType::MySQL => {
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 
@@ -2788,7 +3060,7 @@ impl ObjectBrowserWidget {
         cache: &ObjectCache,
     ) -> Vec<&'static str> {
         match db_type {
-            crate::db::DatabaseType::Oracle => vec![
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => vec![
                 "Tables",
                 "Views",
                 "Procedures",

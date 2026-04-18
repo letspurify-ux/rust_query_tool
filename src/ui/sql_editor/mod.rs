@@ -19,6 +19,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use crate::db::oracle_thin::ThinConnection;
 use crate::db::{
     ColumnInfo, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail,
 };
@@ -357,6 +358,7 @@ pub struct SqlEditorWidget {
     ui_action_sender: mpsc::Sender<UiActionResult>,
     query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
@@ -706,6 +708,7 @@ impl SqlEditorWidget {
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
+        let current_oracle_thin_connection = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
@@ -741,6 +744,7 @@ impl SqlEditorWidget {
             ui_action_sender,
             query_running: query_running.clone(),
             current_query_connection,
+            current_oracle_thin_connection,
             current_mysql_cancel_context,
             cancel_flag,
             intellisense_data,
@@ -1142,6 +1146,7 @@ impl SqlEditorWidget {
         let sender = self.ui_action_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_oracle_thin_connection = self.current_oracle_thin_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
 
@@ -1175,6 +1180,21 @@ impl SqlEditorWidget {
                         }
                         Err(message) => Err(message),
                     },
+                    crate::db::DatabaseType::OracleThin => {
+                        match conn_guard.require_live_oracle_thin_connection() {
+                            Ok(db_conn) => {
+                                SqlEditorWidget::set_current_oracle_thin_connection(
+                                    &current_oracle_thin_connection,
+                                    Some(Arc::clone(&db_conn)),
+                                );
+                                if load_mutex_bool(&cancel_flag) {
+                                    let _ = crate::db::oracle_thin::interrupt(db_conn.as_ref());
+                                }
+                                crate::db::oracle_thin::explain_plan(db_conn.as_ref(), &sql)
+                            }
+                            Err(message) => Err(message),
+                        }
+                    }
                     crate::db::DatabaseType::MySQL => {
                         SqlEditorWidget::run_mysql_action_with_timeout(
                             &mut conn_guard,
@@ -1196,6 +1216,10 @@ impl SqlEditorWidget {
             }));
 
             SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::set_current_oracle_thin_connection(
+                &current_oracle_thin_connection,
+                None,
+            );
             SqlEditorWidget::set_current_mysql_cancel_context(&current_mysql_cancel_context, None);
             SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
@@ -1332,6 +1356,7 @@ impl SqlEditorWidget {
         panic_context: &'static str,
         make_ui_result: fn(Result<(), String>) -> UiActionResult,
         oracle_action: F,
+        oracle_thin_action: fn(Arc<ThinConnection>) -> Result<(), String>,
         mysql_sql: &'static str,
         query_timeout: Option<Duration>,
     ) where
@@ -1351,6 +1376,7 @@ impl SqlEditorWidget {
         let sender = self.ui_action_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_oracle_thin_connection = self.current_oracle_thin_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
 
@@ -1382,6 +1408,21 @@ impl SqlEditorWidget {
                         }
                         Err(message) => Err(message),
                     },
+                    crate::db::DatabaseType::OracleThin => {
+                        match conn_guard.require_live_oracle_thin_connection() {
+                            Ok(db_conn) => {
+                                SqlEditorWidget::set_current_oracle_thin_connection(
+                                    &current_oracle_thin_connection,
+                                    Some(Arc::clone(&db_conn)),
+                                );
+                                if load_mutex_bool(&cancel_flag) {
+                                    let _ = crate::db::oracle_thin::interrupt(db_conn.as_ref());
+                                }
+                                oracle_thin_action(db_conn)
+                            }
+                            Err(message) => Err(message),
+                        }
+                    }
                     crate::db::DatabaseType::MySQL => {
                         SqlEditorWidget::run_mysql_action_with_timeout(
                             &mut conn_guard,
@@ -1399,6 +1440,10 @@ impl SqlEditorWidget {
             }));
 
             SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::set_current_oracle_thin_connection(
+                &current_oracle_thin_connection,
+                None,
+            );
             SqlEditorWidget::set_current_mysql_cancel_context(&current_mysql_cancel_context, None);
             SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
@@ -1436,6 +1481,7 @@ impl SqlEditorWidget {
             "sql_editor::commit",
             UiActionResult::Commit,
             |db_conn| db_conn.commit().map_err(|err| err.to_string()),
+            |db_conn| crate::db::oracle_thin::commit(db_conn.as_ref()),
             "COMMIT",
             query_timeout,
         );
@@ -1448,6 +1494,7 @@ impl SqlEditorWidget {
             "sql_editor::rollback",
             UiActionResult::Rollback,
             |db_conn| db_conn.rollback().map_err(|err| err.to_string()),
+            |db_conn| crate::db::oracle_thin::rollback(db_conn.as_ref()),
             "ROLLBACK",
             query_timeout,
         );
@@ -1458,6 +1505,7 @@ impl SqlEditorWidget {
         store_mutex_bool(&self.cancel_flag, true);
 
         let current_query_connection = self.current_query_connection.clone();
+        let current_oracle_thin_connection = self.current_oracle_thin_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
@@ -1465,11 +1513,15 @@ impl SqlEditorWidget {
         thread::spawn(move || {
             let mut conn =
                 SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+            let mut thin_conn = SqlEditorWidget::clone_current_oracle_thin_connection(
+                &current_oracle_thin_connection,
+            );
             let mut mysql_cancel_context =
                 SqlEditorWidget::clone_current_mysql_cancel_context(&current_mysql_cancel_context);
 
             if !SqlEditorWidget::is_query_running_flag(&query_running)
                 && conn.is_none()
+                && thin_conn.is_none()
                 && mysql_cancel_context.is_none()
             {
                 // Execution can still be transitioning into "running" and may not
@@ -1485,10 +1537,13 @@ impl SqlEditorWidget {
                     thread::sleep(Duration::from_millis(25));
                     conn =
                         SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+                    thin_conn = SqlEditorWidget::clone_current_oracle_thin_connection(
+                        &current_oracle_thin_connection,
+                    );
                     mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
                         &current_mysql_cancel_context,
                     );
-                    if conn.is_some() || mysql_cancel_context.is_some() {
+                    if conn.is_some() || thin_conn.is_some() || mysql_cancel_context.is_some() {
                         break;
                     }
                 }
@@ -1496,6 +1551,7 @@ impl SqlEditorWidget {
 
             if !SqlEditorWidget::is_query_running_flag(&query_running)
                 && conn.is_none()
+                && thin_conn.is_none()
                 && mysql_cancel_context.is_none()
             {
                 // This editor is idle. Do not attempt to cancel through the
@@ -1507,7 +1563,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() && mysql_cancel_context.is_none() {
+            if conn.is_none() && thin_conn.is_none() && mysql_cancel_context.is_none() {
                 // Execution may still be initializing the DB connection.
                 // Wait briefly so a single cancel click can still interrupt reliably.
                 for _ in 0..40 {
@@ -1517,10 +1573,13 @@ impl SqlEditorWidget {
                     thread::sleep(Duration::from_millis(25));
                     conn =
                         SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+                    thin_conn = SqlEditorWidget::clone_current_oracle_thin_connection(
+                        &current_oracle_thin_connection,
+                    );
                     mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
                         &current_mysql_cancel_context,
                     );
-                    if conn.is_some() || mysql_cancel_context.is_some() {
+                    if conn.is_some() || thin_conn.is_some() || mysql_cancel_context.is_some() {
                         break;
                     }
                 }
@@ -1535,7 +1594,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() && mysql_cancel_context.is_none() {
+            if conn.is_none() && thin_conn.is_none() && mysql_cancel_context.is_none() {
                 // The worker has not published a break-able connection yet.
                 // Keep cancel requested so execution stops at the first safe
                 // cancellation point, and surface a status update instead of
@@ -1547,6 +1606,8 @@ impl SqlEditorWidget {
 
             let result = if conn.is_some() {
                 SqlEditorWidget::break_current_query_connection(conn)
+            } else if thin_conn.is_some() {
+                SqlEditorWidget::break_current_oracle_thin_connection(thin_conn)
             } else {
                 SqlEditorWidget::break_current_mysql_query(mysql_cancel_context, &cancel_flag)
             };
@@ -1584,12 +1645,34 @@ impl SqlEditorWidget {
         }
     }
 
+    fn clone_current_oracle_thin_connection(
+        current_oracle_thin_connection: &Arc<Mutex<Option<Arc<ThinConnection>>>>,
+    ) -> Option<Arc<ThinConnection>> {
+        match current_oracle_thin_connection.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: Oracle thin connection lock was poisoned; recovering.");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
     fn break_current_query_connection(connection: Option<Arc<Connection>>) -> Result<(), String> {
         if let Some(db_conn) = connection {
             db_conn.break_execution().map_err(|err| err.to_string())
         } else {
             // No published connection yet. Keep cancel_flag set and let execution
             // stop at the first safe cancellation point.
+            Ok(())
+        }
+    }
+
+    fn break_current_oracle_thin_connection(
+        connection: Option<Arc<ThinConnection>>,
+    ) -> Result<(), String> {
+        if let Some(db_conn) = connection {
+            crate::db::oracle_thin::interrupt(db_conn.as_ref())
+        } else {
             Ok(())
         }
     }
@@ -1628,6 +1711,19 @@ impl SqlEditorWidget {
             }
             Err(poisoned) => {
                 eprintln!("Warning: current query connection lock was poisoned; recovering.");
+                *poisoned.into_inner() = value;
+            }
+        }
+    }
+
+    fn set_current_oracle_thin_connection(
+        current_oracle_thin_connection: &Arc<Mutex<Option<Arc<ThinConnection>>>>,
+        value: Option<Arc<ThinConnection>>,
+    ) {
+        match current_oracle_thin_connection.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => {
+                eprintln!("Warning: Oracle thin connection lock was poisoned; recovering.");
                 *poisoned.into_inner() = value;
             }
         }

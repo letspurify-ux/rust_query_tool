@@ -2006,10 +2006,7 @@ fn test_maybe_inject_rowid_for_editing_skips_with_clause_only_cte_ref() {
     // When the main SELECT FROM only references a CTE (not a base table), skip.
     let sql = "WITH e AS (SELECT ENAME FROM EMP) SELECT ENAME FROM e";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(
-        rewritten,
-        "WITH e AS (SELECT ENAME FROM EMP) SELECT e.ROWID, ENAME FROM e"
-    );
+    assert_eq!(rewritten, sql);
 }
 
 #[test]
@@ -2436,11 +2433,23 @@ fn test_maybe_inject_rowid_for_editing_with_recursive_cte() {
     // Recursive CTE with base table in main SELECT
     let sql = "WITH RECURSIVE mgr_chain AS (SELECT EMPNO, ENAME, MGR FROM EMP WHERE EMPNO = 7369 UNION ALL SELECT e.EMPNO, e.ENAME, e.MGR FROM EMP e JOIN mgr_chain m ON e.EMPNO = m.MGR) SELECT ENAME FROM mgr_chain";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    // Main SELECT is from CTE only, UNION inside CTE is inside parens (not top-level)
-    assert_eq!(
-        rewritten,
-        "WITH RECURSIVE mgr_chain AS (SELECT EMPNO, ENAME, MGR FROM EMP WHERE EMPNO = 7369 UNION ALL SELECT e.EMPNO, e.ENAME, e.MGR FROM EMP e JOIN mgr_chain m ON e.EMPNO = m.MGR) SELECT mgr_chain.ROWID, ENAME FROM mgr_chain"
-    );
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_with_function_trailing_cte_ref() {
+    let sql = r#"WITH
+FUNCTION calc_depth RETURN NUMBER IS
+BEGIN
+    RETURN 1;
+END calc_depth;
+tree_cte (node_id) AS (
+    SELECT 1 AS node_id FROM dual
+)
+SELECT node_id
+FROM tree_cte"#;
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
 }
 
 #[test]
@@ -4502,6 +4511,37 @@ SELECT 1 FROM DUAL;"#;
         "slash terminator with REM comment should split, got: {:?}",
         stmts
     );
+}
+
+#[test]
+fn test_slash_block_comment_line_does_not_become_statement() {
+    let sql = r#"BEGIN
+  NULL;
+END;
+/ /* separator */
+SELECT 1 FROM DUAL;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "slash+block-comment line must be consumed as a terminator, got: {:?}",
+        stmts
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|stmt| stmt.trim_start().starts_with("/ /*")),
+        "slash comment line leaked into executable statements: {:?}",
+        stmts
+    );
+}
+
+#[test]
+fn test_strip_leading_comments_consumes_slash_before_multiline_block_comment() {
+    let sql = "/ /* header\n   body */\nSELECT 1 FROM DUAL;";
+    let stripped = QueryExecutor::strip_leading_comments(sql);
+    assert_eq!(stripped, "SELECT 1 FROM DUAL;");
 }
 
 #[test]

@@ -192,6 +192,14 @@ impl SqlEditorWidget {
                 Ok(db_conn) => Self::describe_object(db_conn.as_ref(), object_name, qualifier),
                 Err(message) => Err(message),
             },
+            crate::db::DatabaseType::OracleThin => {
+                match conn_guard.require_live_oracle_thin_connection() {
+                    Ok(db_conn) => {
+                        Self::describe_thin_object(db_conn.as_ref(), object_name, qualifier)
+                    }
+                    Err(message) => Err(message),
+                }
+            }
             crate::db::DatabaseType::MySQL => conn_guard
                 .get_mysql_connection_mut()
                 .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
@@ -199,6 +207,126 @@ impl SqlEditorWidget {
                     Self::describe_mysql_object(mysql_conn, object_name, qualifier)
                 }),
         }
+    }
+
+    fn describe_thin_object(
+        conn: &crate::db::oracle_thin::ThinConnection,
+        object_name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<QuickDescribeData, String> {
+        let object_name_upper = object_name.to_uppercase();
+
+        if let Some(package_name) = qualifier {
+            let package_name_upper = package_name.to_uppercase();
+            if let Ok(routines) =
+                crate::db::oracle_thin::get_package_routines(conn, &package_name_upper)
+            {
+                if let Some(routine) = routines
+                    .iter()
+                    .find(|routine| routine.name.eq_ignore_ascii_case(&object_name_upper))
+                {
+                    let args = crate::db::oracle_thin::get_package_procedure_arguments(
+                        conn,
+                        &package_name_upper,
+                        &object_name_upper,
+                    )?;
+                    let qualified_name = format!("{}.{}", package_name_upper, object_name_upper);
+                    let content =
+                        Self::format_routine_details(&qualified_name, &routine.routine_type, &args);
+                    return Ok(QuickDescribeData::Text {
+                        title: format!(
+                            "Describe: {} ({})",
+                            qualified_name,
+                            routine.routine_type.to_uppercase()
+                        ),
+                        content,
+                    });
+                }
+            }
+        }
+
+        if let Ok(columns) = crate::db::oracle_thin::get_table_structure(conn, &object_name_upper)
+        {
+            if !columns.is_empty() {
+                return Ok(QuickDescribeData::TableColumns(columns));
+            }
+        }
+
+        let mut object_types = crate::db::oracle_thin::get_object_types(conn, &object_name_upper)?;
+        if object_types.is_empty() {
+            return Err(format!(
+                "Object not found or not accessible: {}",
+                object_name_upper
+            ));
+        }
+
+        object_types.sort_by_key(|object_type| Self::quick_describe_type_priority(object_type));
+
+        for object_type in object_types {
+            let object_type_upper = object_type.to_uppercase();
+            match object_type_upper.as_str() {
+                "TABLE" | "VIEW" => {
+                    if let Ok(columns) =
+                        crate::db::oracle_thin::get_table_structure(conn, &object_name_upper)
+                    {
+                        if !columns.is_empty() {
+                            return Ok(QuickDescribeData::TableColumns(columns));
+                        }
+                    }
+                }
+                "FUNCTION" | "PROCEDURE" => {
+                    let args =
+                        crate::db::oracle_thin::get_procedure_arguments(conn, &object_name_upper)
+                            .unwrap_or_default();
+                    let content =
+                        Self::format_routine_details(&object_name_upper, &object_type_upper, &args);
+                    return Ok(QuickDescribeData::Text {
+                        title: format!("Describe: {} ({})", object_name_upper, object_type_upper),
+                        content,
+                    });
+                }
+                "SEQUENCE" => {
+                    if let Ok(info) =
+                        crate::db::oracle_thin::get_sequence_info(conn, &object_name_upper)
+                    {
+                        return Ok(QuickDescribeData::Text {
+                            title: format!("Describe: {} (SEQUENCE)", object_name_upper),
+                            content: Self::format_sequence_details(&info),
+                        });
+                    }
+                }
+                "PACKAGE" => {
+                    if let Ok(ddl) =
+                        crate::db::oracle_thin::get_package_spec_ddl(conn, &object_name_upper)
+                    {
+                        return Ok(QuickDescribeData::Text {
+                            title: format!("Describe: {} (PACKAGE)", object_name_upper),
+                            content: ddl,
+                        });
+                    }
+                }
+                _ => {
+                    if let Ok(ddl) = crate::db::oracle_thin::get_object_ddl(
+                        conn,
+                        &object_type_upper,
+                        &object_name_upper,
+                    ) {
+                        return Ok(QuickDescribeData::Text {
+                            title: format!(
+                                "Describe: {} ({})",
+                                object_name_upper, object_type_upper
+                            ),
+                            content: ddl,
+                        });
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "Object not found or not accessible: {}",
+            object_name_upper
+        ))
     }
 
     fn describe_mysql_object(

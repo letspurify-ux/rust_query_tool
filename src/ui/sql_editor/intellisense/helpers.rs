@@ -191,6 +191,17 @@ impl SqlEditorWidget {
                 },
                 Err(_) => (Vec::new(), false),
             },
+            crate::db::DatabaseType::OracleThin => match conn_guard
+                .require_live_oracle_thin_connection()
+            {
+                Ok(conn) => {
+                    match crate::db::oracle_thin::get_table_columns(conn.as_ref(), &table_key) {
+                        Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                        Err(_) => (Vec::new(), false),
+                    }
+                }
+                Err(_) => (Vec::new(), false),
+            },
             crate::db::DatabaseType::MySQL => conn_guard
                 .get_mysql_connection_mut()
                 .map(|mysql_conn| {

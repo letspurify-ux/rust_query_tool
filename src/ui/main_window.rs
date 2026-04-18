@@ -2405,6 +2405,35 @@ impl MainWindow {
 
                     (tables, views, procedures, functions, packages)
                 }
+                crate::db::DatabaseType::OracleThin => {
+                    let Ok(conn) = conn_guard.require_live_oracle_thin_connection() else {
+                        return None;
+                    };
+
+                    let tables = match crate::db::oracle_thin::get_tables(conn.as_ref()) {
+                        Ok(tables) => tables,
+                        Err(err) => {
+                            crate::utils::logging::log_error(
+                                "schema",
+                                &format!(
+                                    "failed to load tables for thin intellisense schema update: {err}"
+                                ),
+                            );
+                            return None;
+                        }
+                    };
+
+                    let views =
+                        crate::db::oracle_thin::get_views(conn.as_ref()).unwrap_or_default();
+                    let procedures =
+                        crate::db::oracle_thin::get_procedures(conn.as_ref()).unwrap_or_default();
+                    let functions =
+                        crate::db::oracle_thin::get_functions(conn.as_ref()).unwrap_or_default();
+                    let packages =
+                        crate::db::oracle_thin::get_packages(conn.as_ref()).unwrap_or_default();
+
+                    (tables, views, procedures, functions, packages)
+                }
                 crate::db::DatabaseType::MySQL => {
                     let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 

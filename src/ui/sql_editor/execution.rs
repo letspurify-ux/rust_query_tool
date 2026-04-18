@@ -16,10 +16,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::db::oracle_thin::ThinConnection;
 use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, QueryExecutor,
     QueryResult, ScriptItem, SessionState, ToolCommand,
@@ -85,6 +87,7 @@ struct ExecutionStartupPolicy {
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
@@ -96,6 +99,7 @@ impl QueryExecutionCleanupGuard {
     fn new(
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>>,
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
@@ -103,6 +107,7 @@ impl QueryExecutionCleanupGuard {
         Self {
             sender,
             current_query_connection,
+            current_oracle_thin_connection,
             current_mysql_cancel_context,
             cancel_flag,
             query_running,
@@ -125,6 +130,10 @@ impl QueryExecutionCleanupGuard {
 impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
+        SqlEditorWidget::set_current_oracle_thin_connection(
+            &self.current_oracle_thin_connection,
+            None,
+        );
         SqlEditorWidget::set_current_mysql_cancel_context(&self.current_mysql_cancel_context, None);
         store_mutex_bool(&self.cancel_flag, false);
         // Keep execution state fail-safe even if the UI progress poller has
@@ -1772,6 +1781,2449 @@ impl SqlEditorWidget {
         self.execute_sql_with_mysql_delimiter(sql, script_mode, None);
     }
 
+    fn execute_oracle_thin_batch(
+        shared_connection: &crate::db::SharedConnection,
+        sender: &mpsc::Sender<QueryProgress>,
+        sql_text: &str,
+        conn_name: &str,
+        session: &Arc<Mutex<SessionState>>,
+        thin_conn: Option<Arc<ThinConnection>>,
+        current_oracle_thin_connection: &Arc<Mutex<Option<Arc<ThinConnection>>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        script_mode: bool,
+        query_timeout: Option<Duration>,
+        initial_auto_commit: bool,
+        db_activity: &str,
+    ) {
+        let items = super::query_text::split_script_items_for_db_type(
+            sql_text,
+            Some(crate::db::connection::DatabaseType::OracleThin),
+        );
+        if items.is_empty() {
+            return;
+        }
+
+        let _ = sender.send(QueryProgress::BatchStart);
+        app::awake();
+
+        let mut result_index = 0usize;
+        let mut auto_commit = initial_auto_commit;
+        let mut continue_on_error = match session.lock() {
+            Ok(guard) => guard.continue_on_error,
+            Err(poisoned) => poisoned.into_inner().continue_on_error,
+        };
+        let mut stop_execution = false;
+        let mut conn_name = conn_name.to_string();
+        let mut conn = thin_conn;
+        let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let requires_transaction_first_statement =
+            SqlEditorWidget::requires_transaction_first_statement(&items);
+        if !requires_transaction_first_statement {
+            if let Some(conn) = conn.as_ref() {
+                if let Err(err) = SqlEditorWidget::sync_oracle_thin_serveroutput_with_session(
+                    conn.as_ref(),
+                    session,
+                ) {
+                    eprintln!(
+                        "Failed to apply Oracle thin SERVEROUTPUT setting on session start: {err}"
+                    );
+                }
+            }
+        }
+        let mut frames = vec![ScriptExecutionFrame {
+            items,
+            index: 0,
+            base_dir: working_dir.clone(),
+            source_path: None,
+        }];
+
+        while !frames.is_empty() {
+            if stop_execution || load_mutex_bool(cancel_flag) {
+                break;
+            }
+
+            let Some((item, current_frame_base_dir)) = ({
+                let frame = match frames.last_mut() {
+                    Some(frame) => frame,
+                    None => break,
+                };
+
+                if frame.index >= frame.items.len() {
+                    None
+                } else {
+                    let item = frame.items[frame.index].clone();
+                    frame.index += 1;
+                    Some((item, frame.base_dir.clone()))
+                }
+            }) else {
+                frames.pop();
+                continue;
+            };
+
+            let echo_enabled = match session.lock() {
+                Ok(guard) => guard.echo_enabled,
+                Err(poisoned) => poisoned.into_inner().echo_enabled,
+            };
+            if echo_enabled {
+                let echo_line = match &item {
+                    ScriptItem::Statement(statement) => statement.trim().to_string(),
+                    ScriptItem::ToolCommand(command) => {
+                        SqlEditorWidget::format_tool_command(command)
+                    }
+                };
+                if !echo_line.trim().is_empty() {
+                    SqlEditorWidget::emit_script_output(sender, session, vec![echo_line]);
+                }
+            }
+
+            match item {
+                ScriptItem::ToolCommand(command) => {
+                    let mut command_error = false;
+                    match command {
+                        ToolCommand::Var { name, data_type } => {
+                            let normalized = SessionState::normalize_name(&name);
+                            {
+                                let mut guard = match session.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard
+                                    .binds
+                                    .insert(normalized.clone(), BindVar::new(data_type.clone()));
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("VAR {} {}", normalized, data_type.display()),
+                                &format!(
+                                    "Variable :{} declared as {}",
+                                    normalized,
+                                    data_type.display()
+                                ),
+                            );
+                        }
+                        ToolCommand::Print { name } => {
+                            let (heading_enabled, feedback_enabled) =
+                                SqlEditorWidget::current_output_settings(session);
+                            let (_colsep, null_text, _trimspool_enabled) =
+                                SqlEditorWidget::current_text_output_settings(session);
+
+                            if let Some(name) = name {
+                                let key = SessionState::normalize_name(&name);
+                                let named_data = {
+                                    let guard = match session.lock() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    SqlEditorWidget::clone_print_named_data(&guard, &key)
+                                };
+
+                                match named_data {
+                                    PrintNamedData::Scalar(value) => {
+                                        let headers = SqlEditorWidget::apply_heading_setting(
+                                            vec!["NAME".to_string(), "VALUE".to_string()],
+                                            heading_enabled,
+                                        );
+                                        SqlEditorWidget::emit_select_result(
+                                            sender,
+                                            session,
+                                            &conn_name,
+                                            result_index,
+                                            &format!("PRINT {}", key),
+                                            headers,
+                                            vec![vec![
+                                                key.clone(),
+                                                value.unwrap_or_else(|| null_text.clone()),
+                                            ]],
+                                            true,
+                                            feedback_enabled,
+                                        );
+                                        result_index += 1;
+                                    }
+                                    PrintNamedData::Cursor(cursor) => {
+                                        let headers = SqlEditorWidget::apply_heading_setting(
+                                            cursor.columns,
+                                            heading_enabled,
+                                        );
+                                        SqlEditorWidget::emit_select_result(
+                                            sender,
+                                            session,
+                                            &conn_name,
+                                            result_index,
+                                            &format!("PRINT {}", key),
+                                            headers,
+                                            cursor.rows,
+                                            true,
+                                            feedback_enabled,
+                                        );
+                                        result_index += 1;
+                                    }
+                                    PrintNamedData::CursorEmpty => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            &format!("PRINT {}", key),
+                                            &format!(
+                                                "Error: Cursor :{} has no data to print.",
+                                                key
+                                            ),
+                                        );
+                                        if !continue_on_error {
+                                            break;
+                                        }
+                                    }
+                                    PrintNamedData::Missing => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            &format!("PRINT {}", key),
+                                            &format!(
+                                                "Error: Bind variable :{} is not defined.",
+                                                key
+                                            ),
+                                        );
+                                        if !continue_on_error {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let (summary_rows, cursor_results) = {
+                                    let guard = match session.lock() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+
+                                    if guard.binds.is_empty() {
+                                        (Vec::new(), Vec::new())
+                                    } else {
+                                        SqlEditorWidget::collect_print_all_data(&guard, &null_text)
+                                    }
+                                };
+
+                                if summary_rows.is_empty() {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "PRINT",
+                                        "No bind variables declared.",
+                                    );
+                                } else {
+                                    let headers = SqlEditorWidget::apply_heading_setting(
+                                        vec![
+                                            "NAME".to_string(),
+                                            "TYPE".to_string(),
+                                            "VALUE".to_string(),
+                                        ],
+                                        heading_enabled,
+                                    );
+                                    SqlEditorWidget::emit_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        "PRINT",
+                                        headers,
+                                        summary_rows,
+                                        true,
+                                        feedback_enabled,
+                                    );
+                                    result_index += 1;
+
+                                    for (cursor_name, cursor) in cursor_results {
+                                        let headers = SqlEditorWidget::apply_heading_setting(
+                                            cursor.columns,
+                                            heading_enabled,
+                                        );
+                                        SqlEditorWidget::emit_select_result(
+                                            sender,
+                                            session,
+                                            &conn_name,
+                                            result_index,
+                                            &format!("PRINT {}", cursor_name),
+                                            headers,
+                                            cursor.rows,
+                                            true,
+                                            feedback_enabled,
+                                        );
+                                        result_index += 1;
+                                    }
+                                }
+                            }
+                        }
+                        ToolCommand::Prompt { text } => {
+                            let mut output_text = text;
+                            let (define_enabled, scan_enabled) = match session.lock() {
+                                Ok(guard) => (guard.define_enabled, guard.scan_enabled),
+                                Err(poisoned) => {
+                                    let guard = poisoned.into_inner();
+                                    (guard.define_enabled, guard.scan_enabled)
+                                }
+                            };
+                            if define_enabled && scan_enabled && !output_text.is_empty() {
+                                match SqlEditorWidget::apply_define_substitution(
+                                    &output_text,
+                                    session,
+                                    sender,
+                                ) {
+                                    Ok(updated) => output_text = updated,
+                                    Err(message) => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            "PROMPT",
+                                            &format!("Error: {}", message),
+                                        );
+                                        command_error = true;
+                                        output_text.clear();
+                                    }
+                                }
+                            }
+                            if !output_text.is_empty() {
+                                SqlEditorWidget::emit_script_output(
+                                    sender,
+                                    session,
+                                    vec![output_text],
+                                );
+                            }
+                        }
+                        ToolCommand::Pause { message } => {
+                            let prompt_text = message
+                                .filter(|text| !text.trim().is_empty())
+                                .unwrap_or_else(|| "Press ENTER to continue.".to_string());
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "PAUSE",
+                                &prompt_text,
+                            );
+                            if SqlEditorWidget::prompt_for_input_with_sender(sender, &prompt_text)
+                                .is_err()
+                            {
+                                let emitted = SqlEditorWidget::emit_non_select_result(
+                                    sender,
+                                    session,
+                                    &conn_name,
+                                    result_index,
+                                    "PAUSE",
+                                    "Error: PAUSE cancelled.".to_string(),
+                                    false,
+                                    false,
+                                    script_mode,
+                                );
+                                if emitted {
+                                    result_index += 1;
+                                }
+                                if !continue_on_error {
+                                    break;
+                                }
+                            }
+                        }
+                        ToolCommand::Accept { name, prompt } => {
+                            let prompt_text =
+                                prompt.unwrap_or_else(|| format!("Enter value for {}:", name));
+                            match SqlEditorWidget::prompt_for_input_with_sender(
+                                sender,
+                                &prompt_text,
+                            ) {
+                                Ok(value) => {
+                                    let key = SessionState::normalize_name(&name);
+                                    match session.lock() {
+                                        Ok(mut guard) => {
+                                            guard.define_vars.insert(key.clone(), value);
+                                        }
+                                        Err(poisoned) => {
+                                            poisoned
+                                                .into_inner()
+                                                .define_vars
+                                                .insert(key.clone(), value);
+                                        }
+                                    }
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("ACCEPT {}", key),
+                                        &format!("Value assigned to {}", key),
+                                    );
+                                }
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        &format!("ACCEPT {}", name),
+                                        &format!("Error: {}", message),
+                                    );
+                                    if !continue_on_error {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ToolCommand::Define { name, value } => {
+                            let key = SessionState::normalize_name(&name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.define_vars.insert(key.clone(), value.clone());
+                                }
+                                Err(poisoned) => {
+                                    poisoned
+                                        .into_inner()
+                                        .define_vars
+                                        .insert(key.clone(), value.clone());
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("DEFINE {}", key),
+                                &format!("Defined {} = {}", key, value),
+                            );
+                        }
+                        ToolCommand::Undefine { name } => {
+                            let key = SessionState::normalize_name(&name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.define_vars.remove(&key);
+                                }
+                                Err(poisoned) => {
+                                    poisoned.into_inner().define_vars.remove(&key);
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("UNDEFINE {}", key),
+                                &format!("Undefined {}", key),
+                            );
+                        }
+                        ToolCommand::ColumnNewValue {
+                            column_name,
+                            variable_name,
+                        } => {
+                            let column_key = SessionState::normalize_name(&column_name);
+                            let variable_key = SessionState::normalize_name(&variable_name);
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard
+                                        .column_new_values
+                                        .insert(column_key.clone(), variable_key.clone());
+                                }
+                                Err(poisoned) => {
+                                    poisoned
+                                        .into_inner()
+                                        .column_new_values
+                                        .insert(column_key.clone(), variable_key.clone());
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &format!("COLUMN {} NEW_VALUE {}", column_key, variable_key),
+                                &format!(
+                                    "Registered NEW_VALUE mapping: {} -> {}",
+                                    column_key, variable_key
+                                ),
+                            );
+                        }
+                        ToolCommand::BreakOn { column_name } => {
+                            let key = SessionState::normalize_name(&column_name);
+                            match session.lock() {
+                                Ok(mut guard) => guard.break_column = Some(key.clone()),
+                                Err(poisoned) => {
+                                    poisoned.into_inner().break_column = Some(key.clone())
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "BREAK",
+                                &format!("BREAK ON {}", key),
+                            );
+                        }
+                        ToolCommand::BreakOff => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.break_column = None,
+                                Err(poisoned) => poisoned.into_inner().break_column = None,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "BREAK",
+                                "BREAK OFF",
+                            );
+                        }
+                        ToolCommand::ClearBreaks => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.break_column = None,
+                                Err(poisoned) => poisoned.into_inner().break_column = None,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "CLEAR",
+                                "BREAKS cleared",
+                            );
+                        }
+                        ToolCommand::Compute {
+                            mode,
+                            of_column,
+                            on_column,
+                        } => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.compute = Some(crate::db::ComputeConfig {
+                                        mode,
+                                        of_column: of_column.clone(),
+                                        on_column: on_column.clone(),
+                                    });
+                                }
+                                Err(poisoned) => {
+                                    poisoned.into_inner().compute =
+                                        Some(crate::db::ComputeConfig {
+                                            mode,
+                                            of_column: of_column.clone(),
+                                            on_column: on_column.clone(),
+                                        });
+                                }
+                            }
+                            let mode_text = match mode {
+                                crate::db::ComputeMode::Sum => "COMPUTE SUM",
+                                crate::db::ComputeMode::Count => "COMPUTE COUNT",
+                            };
+                            let label = match (of_column.as_deref(), on_column.as_deref()) {
+                                (Some(of_col), Some(on_col)) => {
+                                    format!("{} OF {} ON {}", mode_text, of_col, on_col)
+                                }
+                                _ => mode_text.to_string(),
+                            };
+                            SqlEditorWidget::emit_script_message(
+                                sender, session, "COMPUTE", &label,
+                            );
+                        }
+                        ToolCommand::ComputeOff => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.compute = None,
+                                Err(poisoned) => poisoned.into_inner().compute = None,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "COMPUTE",
+                                "COMPUTE OFF",
+                            );
+                        }
+                        ToolCommand::ClearComputes => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.compute = None,
+                                Err(poisoned) => poisoned.into_inner().compute = None,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "CLEAR",
+                                "COMPUTES cleared",
+                            );
+                        }
+                        ToolCommand::ClearBreaksComputes => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.break_column = None;
+                                    guard.compute = None;
+                                }
+                                Err(poisoned) => {
+                                    let mut guard = poisoned.into_inner();
+                                    guard.break_column = None;
+                                    guard.compute = None;
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "CLEAR",
+                                "BREAKS and COMPUTES cleared",
+                            );
+                        }
+                        ToolCommand::SetServerOutput {
+                            enabled,
+                            size,
+                            unlimited,
+                        } => {
+                            let Some(conn) = conn.as_ref() else {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SET SERVEROUTPUT",
+                                    "Error: Not connected to database",
+                                );
+                                if !continue_on_error {
+                                    break;
+                                }
+                                continue;
+                            };
+
+                            let default_size = 1_000_000u32;
+                            let current_size = match session.lock() {
+                                Ok(guard) => guard.server_output.size,
+                                Err(poisoned) => poisoned.into_inner().server_output.size,
+                            };
+                            let mut message = String::new();
+                            let mut success = true;
+
+                            if enabled {
+                                if unlimited {
+                                    match crate::db::oracle_thin::enable_dbms_output(
+                                        conn.as_ref(),
+                                        None,
+                                    ) {
+                                        Ok(()) => {
+                                            let mut guard = match session.lock() {
+                                                Ok(guard) => guard,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.server_output.enabled = true;
+                                            guard.server_output.size = 0;
+                                            message =
+                                                "SERVEROUTPUT enabled (size UNLIMITED)".to_string();
+                                        }
+                                        Err(err) => {
+                                            success = false;
+                                            message =
+                                                format!("SERVEROUTPUT enable failed: {}", err);
+                                        }
+                                    }
+                                } else {
+                                    let desired_size = Self::resolve_serveroutput_enable_size(
+                                        size,
+                                        current_size,
+                                        default_size,
+                                    );
+                                    let mut applied_size = desired_size;
+                                    let mut enable_result =
+                                        crate::db::oracle_thin::enable_dbms_output(
+                                            conn.as_ref(),
+                                            Some(desired_size),
+                                        );
+
+                                    if enable_result.is_err()
+                                        && size.is_some()
+                                        && desired_size != default_size
+                                        && crate::db::oracle_thin::enable_dbms_output(
+                                            conn.as_ref(),
+                                            Some(default_size),
+                                        )
+                                        .is_ok()
+                                    {
+                                        applied_size = default_size;
+                                        message = format!(
+                                        "SERVEROUTPUT enabled with size {} (requested {} not supported)",
+                                        applied_size, desired_size
+                                    );
+                                        enable_result = Ok(());
+                                    }
+
+                                    match enable_result {
+                                        Ok(()) => {
+                                            let mut guard = match session.lock() {
+                                                Ok(guard) => guard,
+                                                Err(poisoned) => poisoned.into_inner(),
+                                            };
+                                            guard.server_output.enabled = true;
+                                            guard.server_output.size = applied_size;
+                                            if message.is_empty() {
+                                                message = format!(
+                                                    "SERVEROUTPUT enabled (size {})",
+                                                    applied_size
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            success = false;
+                                            message =
+                                                format!("SERVEROUTPUT enable failed: {}", err);
+                                        }
+                                    }
+                                }
+                            } else {
+                                match crate::db::oracle_thin::disable_dbms_output(conn.as_ref()) {
+                                    Ok(()) => {
+                                        let mut guard = match session.lock() {
+                                            Ok(guard) => guard,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        guard.server_output.enabled = false;
+                                        message = "SERVEROUTPUT disabled".to_string();
+                                    }
+                                    Err(err) => {
+                                        success = false;
+                                        message = format!("SERVEROUTPUT disable failed: {}", err);
+                                    }
+                                }
+                            }
+
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET SERVEROUTPUT",
+                                &message,
+                            );
+                            if !success && !continue_on_error {
+                                break;
+                            }
+                        }
+                        command @ (ToolCommand::ShowErrors { .. }
+                        | ToolCommand::MysqlShowErrors) => {
+                            let (object_type, object_name) = match command {
+                                ToolCommand::ShowErrors {
+                                    object_type,
+                                    object_name,
+                                } => (object_type, object_name),
+                                ToolCommand::MysqlShowErrors => (None, None),
+                                _ => unreachable!(),
+                            };
+                            let Some(conn) = conn.as_ref() else {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SHOW ERRORS",
+                                    "Error: Not connected to database",
+                                );
+                                if !continue_on_error {
+                                    break;
+                                }
+                                continue;
+                            };
+
+                            let mut target = None;
+                            if object_type.is_none() {
+                                target = match session.lock() {
+                                    Ok(guard) => guard.last_compiled.clone(),
+                                    Err(poisoned) => poisoned.into_inner().last_compiled.clone(),
+                                };
+                            } else if let (Some(obj_type), Some(obj_name)) =
+                                (object_type.clone(), object_name.clone())
+                            {
+                                let (owner, name) = if let Some(dot) = obj_name.find('.') {
+                                    let (owner_raw, name_raw) = obj_name.split_at(dot);
+                                    (
+                                        Some(SqlEditorWidget::normalize_object_name(owner_raw)),
+                                        SqlEditorWidget::normalize_object_name(
+                                            name_raw.trim_start_matches('.'),
+                                        ),
+                                    )
+                                } else {
+                                    (None, SqlEditorWidget::normalize_object_name(&obj_name))
+                                };
+
+                                target = Some(crate::db::CompiledObject {
+                                    owner,
+                                    object_type: obj_type.to_uppercase(),
+                                    name,
+                                });
+                            }
+
+                            if let Some(object) = target {
+                                match crate::db::oracle_thin::fetch_compilation_errors(
+                                    conn.as_ref(),
+                                    &object,
+                                ) {
+                                    Ok(rows) => {
+                                        if rows.is_empty() {
+                                            SqlEditorWidget::emit_script_message(
+                                                sender,
+                                                session,
+                                                "SHOW ERRORS",
+                                                "No errors found.",
+                                            );
+                                        } else {
+                                            let (heading_enabled, feedback_enabled) =
+                                                SqlEditorWidget::current_output_settings(session);
+                                            let headers = SqlEditorWidget::apply_heading_setting(
+                                                vec![
+                                                    "LINE".to_string(),
+                                                    "POSITION".to_string(),
+                                                    "TEXT".to_string(),
+                                                ],
+                                                heading_enabled,
+                                            );
+                                            SqlEditorWidget::emit_select_result(
+                                                sender,
+                                                session,
+                                                &conn_name,
+                                                result_index,
+                                                "SHOW ERRORS",
+                                                headers,
+                                                rows,
+                                                true,
+                                                feedback_enabled,
+                                            );
+                                            result_index += 1;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            "SHOW ERRORS",
+                                            &format!("Error: {}", err),
+                                        );
+                                        if !continue_on_error {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SHOW ERRORS",
+                                    "Error: No compiled object found to show errors.",
+                                );
+                                if !continue_on_error {
+                                    break;
+                                }
+                            }
+                        }
+                        ToolCommand::ShowUser => {
+                            let Some(conn) = conn.as_ref() else {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SHOW USER",
+                                    "Error: Not connected to database",
+                                );
+                                if !continue_on_error {
+                                    break;
+                                }
+                                continue;
+                            };
+
+                            match crate::db::oracle_thin::show_user(conn.as_ref()) {
+                                Ok(user) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SHOW USER",
+                                        &format!("USER: {}", user),
+                                    );
+                                }
+                                Err(err) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SHOW USER",
+                                        &format!("Error: {}", err),
+                                    );
+                                    if !continue_on_error {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ToolCommand::ShowAll => {
+                            let (
+                                server_output,
+                                define_enabled,
+                                define_char,
+                                scan_enabled,
+                                verify_enabled,
+                                echo_enabled,
+                                timing_enabled,
+                                feedback_enabled,
+                                heading_enabled,
+                                pagesize,
+                                linesize,
+                                trimspool_enabled,
+                                trimout_enabled,
+                                sqlblanklines_enabled,
+                                tab_enabled,
+                                colsep,
+                                null_text,
+                                break_column,
+                                compute_config,
+                                continue_on_error_state,
+                                spool_path,
+                            ) = match session.lock() {
+                                Ok(guard) => (
+                                    guard.server_output.clone(),
+                                    guard.define_enabled,
+                                    guard.define_char,
+                                    guard.scan_enabled,
+                                    guard.verify_enabled,
+                                    guard.echo_enabled,
+                                    guard.timing_enabled,
+                                    guard.feedback_enabled,
+                                    guard.heading_enabled,
+                                    guard.pagesize,
+                                    guard.linesize,
+                                    guard.trimspool_enabled,
+                                    guard.trimout_enabled,
+                                    guard.sqlblanklines_enabled,
+                                    guard.tab_enabled,
+                                    guard.colsep.clone(),
+                                    guard.null_text.clone(),
+                                    guard.break_column.clone(),
+                                    guard.compute.clone(),
+                                    guard.continue_on_error,
+                                    guard.spool_path.clone(),
+                                ),
+                                Err(poisoned) => {
+                                    let guard = poisoned.into_inner();
+                                    (
+                                        guard.server_output.clone(),
+                                        guard.define_enabled,
+                                        guard.define_char,
+                                        guard.scan_enabled,
+                                        guard.verify_enabled,
+                                        guard.echo_enabled,
+                                        guard.timing_enabled,
+                                        guard.feedback_enabled,
+                                        guard.heading_enabled,
+                                        guard.pagesize,
+                                        guard.linesize,
+                                        guard.trimspool_enabled,
+                                        guard.trimout_enabled,
+                                        guard.sqlblanklines_enabled,
+                                        guard.tab_enabled,
+                                        guard.colsep.clone(),
+                                        guard.null_text.clone(),
+                                        guard.break_column.clone(),
+                                        guard.compute.clone(),
+                                        guard.continue_on_error,
+                                        guard.spool_path.clone(),
+                                    )
+                                }
+                            };
+
+                            let serveroutput_line = if server_output.enabled {
+                                if server_output.size == 0 {
+                                    "SERVEROUTPUT ON SIZE UNLIMITED".to_string()
+                                } else {
+                                    format!("SERVEROUTPUT ON SIZE {}", server_output.size)
+                                }
+                            } else {
+                                "SERVEROUTPUT OFF".to_string()
+                            };
+
+                            let spool_line = match spool_path {
+                                Some(path) => format!("SPOOL {}", path.display()),
+                                None => "SPOOL OFF".to_string(),
+                            };
+
+                            let lines = vec![
+                                format!("AUTOCOMMIT {}", if auto_commit { "ON" } else { "OFF" }),
+                                serveroutput_line,
+                                if define_enabled {
+                                    format!("DEFINE '{}'", define_char)
+                                } else {
+                                    "DEFINE OFF".to_string()
+                                },
+                                format!("SCAN {}", if scan_enabled { "ON" } else { "OFF" }),
+                                format!("VERIFY {}", if verify_enabled { "ON" } else { "OFF" }),
+                                format!("ECHO {}", if echo_enabled { "ON" } else { "OFF" }),
+                                format!("TIMING {}", if timing_enabled { "ON" } else { "OFF" }),
+                                format!("FEEDBACK {}", if feedback_enabled { "ON" } else { "OFF" }),
+                                format!("HEADING {}", if heading_enabled { "ON" } else { "OFF" }),
+                                format!("PAGESIZE {}", pagesize),
+                                format!("LINESIZE {}", linesize),
+                                format!(
+                                    "TRIMSPOOL {}",
+                                    if trimspool_enabled { "ON" } else { "OFF" }
+                                ),
+                                format!("TRIMOUT {}", if trimout_enabled { "ON" } else { "OFF" }),
+                                format!(
+                                    "SQLBLANKLINES {}",
+                                    if sqlblanklines_enabled { "ON" } else { "OFF" }
+                                ),
+                                format!("TAB {}", if tab_enabled { "ON" } else { "OFF" }),
+                                format!("COLSEP {}", colsep),
+                                format!("NULL {}", null_text),
+                                match break_column {
+                                    Some(column) => format!("BREAK ON {}", column),
+                                    None => "BREAK OFF".to_string(),
+                                },
+                                match compute_config {
+                                    Some(config) => {
+                                        let mode_text = match config.mode {
+                                            crate::db::ComputeMode::Sum => "SUM",
+                                            crate::db::ComputeMode::Count => "COUNT",
+                                        };
+                                        match (
+                                            config.of_column.as_deref(),
+                                            config.on_column.as_deref(),
+                                        ) {
+                                            (Some(of_col), Some(on_col)) => {
+                                                format!(
+                                                    "COMPUTE {} OF {} ON {}",
+                                                    mode_text, of_col, on_col
+                                                )
+                                            }
+                                            _ => format!("COMPUTE {}", mode_text),
+                                        }
+                                    }
+                                    None => "COMPUTE OFF".to_string(),
+                                },
+                                format!(
+                                    "ERRORCONTINUE {}",
+                                    if continue_on_error_state { "ON" } else { "OFF" }
+                                ),
+                                spool_line,
+                            ];
+
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SHOW ALL",
+                                &lines.join("\n"),
+                            );
+                        }
+                        ToolCommand::Describe { name } => {
+                            let Some(conn) = conn.as_ref() else {
+                                let emitted = SqlEditorWidget::emit_non_select_result(
+                                    sender,
+                                    session,
+                                    &conn_name,
+                                    result_index,
+                                    &format!("DESCRIBE {}", name),
+                                    "Error: Not connected to database".to_string(),
+                                    false,
+                                    false,
+                                    false,
+                                );
+                                if emitted {
+                                    result_index += 1;
+                                }
+                                if !continue_on_error {
+                                    break;
+                                }
+                                continue;
+                            };
+
+                            let title = format!("DESCRIBE {}", name);
+                            match crate::db::oracle_thin::get_table_structure(
+                                conn.as_ref(),
+                                &SqlEditorWidget::normalize_object_name(&name),
+                            ) {
+                                Ok(columns) if !columns.is_empty() => {
+                                    let rows = columns
+                                        .into_iter()
+                                        .map(|col| {
+                                            let type_display = col.get_type_display();
+                                            let TableColumnDetail {
+                                                name,
+                                                nullable,
+                                                is_primary_key,
+                                                ..
+                                            } = col;
+                                            vec![
+                                                name,
+                                                type_display,
+                                                if nullable {
+                                                    "YES".to_string()
+                                                } else {
+                                                    "NO".to_string()
+                                                },
+                                                if is_primary_key {
+                                                    "PK".to_string()
+                                                } else {
+                                                    String::new()
+                                                },
+                                            ]
+                                        })
+                                        .collect::<Vec<Vec<String>>>();
+                                    let (heading_enabled, feedback_enabled) =
+                                        SqlEditorWidget::current_output_settings(session);
+                                    let headers = SqlEditorWidget::apply_heading_setting(
+                                        vec![
+                                            "COLUMN".to_string(),
+                                            "TYPE".to_string(),
+                                            "NULLABLE".to_string(),
+                                            "PK".to_string(),
+                                        ],
+                                        heading_enabled,
+                                    );
+                                    SqlEditorWidget::emit_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        &title,
+                                        headers,
+                                        rows,
+                                        true,
+                                        feedback_enabled,
+                                    );
+                                    result_index += 1;
+                                }
+                                Ok(_) => {
+                                    let emitted = SqlEditorWidget::emit_non_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        &title,
+                                        "Error: Object not found.".to_string(),
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                                    if emitted {
+                                        result_index += 1;
+                                    }
+                                    if !continue_on_error {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    let emitted = SqlEditorWidget::emit_non_select_result(
+                                        sender,
+                                        session,
+                                        &conn_name,
+                                        result_index,
+                                        &title,
+                                        format!("Error: {}", err),
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                                    if emitted {
+                                        result_index += 1;
+                                    }
+                                    if !continue_on_error {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        ToolCommand::SetDefine {
+                            enabled,
+                            define_char,
+                        } => {
+                            match session.lock() {
+                                Ok(mut guard) => {
+                                    guard.define_enabled = enabled;
+                                    if let Some(ch) = define_char {
+                                        guard.define_char = ch;
+                                    }
+                                }
+                                Err(poisoned) => {
+                                    let mut guard = poisoned.into_inner();
+                                    guard.define_enabled = enabled;
+                                    if let Some(ch) = define_char {
+                                        guard.define_char = ch;
+                                    }
+                                }
+                            }
+                            let msg = if let Some(ch) = define_char {
+                                format!("DEFINE '{}'", ch)
+                            } else {
+                                format!("DEFINE {}", if enabled { "ON" } else { "OFF" })
+                            };
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET DEFINE",
+                                &msg,
+                            );
+                        }
+                        ToolCommand::SetScan { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.scan_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().scan_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET SCAN",
+                                &format!("SCAN {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetVerify { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.verify_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().verify_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET VERIFY",
+                                &format!("VERIFY {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetEcho { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.echo_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().echo_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET ECHO",
+                                &format!("ECHO {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetTiming { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.timing_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().timing_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET TIMING",
+                                &format!("TIMING {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetFeedback { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.feedback_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().feedback_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET FEEDBACK",
+                                &format!("FEEDBACK {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetHeading { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.heading_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().heading_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET HEADING",
+                                &format!("HEADING {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetPageSize { size } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.pagesize = size,
+                                Err(poisoned) => poisoned.into_inner().pagesize = size,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET PAGESIZE",
+                                &format!("PAGESIZE {}", size),
+                            );
+                        }
+                        ToolCommand::SetLineSize { size } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.linesize = size,
+                                Err(poisoned) => poisoned.into_inner().linesize = size,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET LINESIZE",
+                                &format!("LINESIZE {}", size),
+                            );
+                        }
+                        ToolCommand::SetTrimSpool { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.trimspool_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().trimspool_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET TRIMSPOOL",
+                                &format!("TRIMSPOOL {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetTrimOut { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.trimout_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().trimout_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET TRIMOUT",
+                                &format!("TRIMOUT {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetSqlBlankLines { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.sqlblanklines_enabled = enabled,
+                                Err(poisoned) => {
+                                    poisoned.into_inner().sqlblanklines_enabled = enabled
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET SQLBLANKLINES",
+                                &format!("SQLBLANKLINES {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetTab { enabled } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.tab_enabled = enabled,
+                                Err(poisoned) => poisoned.into_inner().tab_enabled = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET TAB",
+                                &format!("TAB {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::SetColSep { separator } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.colsep = separator.clone(),
+                                Err(poisoned) => poisoned.into_inner().colsep = separator.clone(),
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET COLSEP",
+                                &format!("COLSEP {}", separator),
+                            );
+                        }
+                        ToolCommand::SetNull { null_text } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.null_text = null_text.clone(),
+                                Err(poisoned) => {
+                                    poisoned.into_inner().null_text = null_text.clone()
+                                }
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET NULL",
+                                &format!("NULL {}", null_text),
+                            );
+                        }
+                        ToolCommand::SetAutoCommit { enabled } => {
+                            {
+                                let mut conn_guard = lock_connection_with_activity(
+                                    shared_connection,
+                                    db_activity.to_string(),
+                                );
+                                conn_guard.set_auto_commit(enabled);
+                            }
+                            auto_commit = enabled;
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET AUTOCOMMIT",
+                                if enabled {
+                                    "Auto-commit enabled"
+                                } else {
+                                    "Auto-commit disabled"
+                                },
+                            );
+                            let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
+                            app::awake();
+                        }
+                        ToolCommand::SetErrorContinue { enabled } => {
+                            continue_on_error = enabled;
+                            match session.lock() {
+                                Ok(mut guard) => guard.continue_on_error = enabled,
+                                Err(poisoned) => poisoned.into_inner().continue_on_error = enabled,
+                            }
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "SET ERRORCONTINUE",
+                                &format!("ERRORCONTINUE {}", if enabled { "ON" } else { "OFF" }),
+                            );
+                        }
+                        ToolCommand::Spool { path, append } => match path {
+                            Some(path) => {
+                                let target_path = if Path::new(&path).is_absolute() {
+                                    PathBuf::from(&path)
+                                } else {
+                                    working_dir.join(&path)
+                                };
+                                match session.lock() {
+                                    Ok(mut guard) => {
+                                        guard.spool_path = Some(target_path.clone());
+                                        guard.spool_truncate = !append;
+                                    }
+                                    Err(poisoned) => {
+                                        let mut guard = poisoned.into_inner();
+                                        guard.spool_path = Some(target_path.clone());
+                                        guard.spool_truncate = !append;
+                                    }
+                                }
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SPOOL",
+                                    &format!(
+                                        "Spooling output to {} ({})",
+                                        target_path.display(),
+                                        if append { "append" } else { "replace" }
+                                    ),
+                                );
+                            }
+                            None if append => {
+                                if SqlEditorWidget::has_spool_target(session) {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SPOOL",
+                                        "Spool switched to append mode",
+                                    );
+                                } else {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SPOOL",
+                                        "Error: SPOOL APPEND requires an active spool target.",
+                                    );
+                                    if !continue_on_error {
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                match session.lock() {
+                                    Ok(mut guard) => {
+                                        guard.spool_path = None;
+                                        guard.spool_truncate = false;
+                                    }
+                                    Err(poisoned) => {
+                                        let mut guard = poisoned.into_inner();
+                                        guard.spool_path = None;
+                                        guard.spool_truncate = false;
+                                    }
+                                }
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "SPOOL",
+                                    "Spooling disabled",
+                                );
+                            }
+                        },
+                        ToolCommand::WheneverSqlError { exit, action } => {
+                            if exit
+                                && action
+                                    .as_deref()
+                                    .map(|value| value.trim().eq_ignore_ascii_case("SQL.SQLCODE"))
+                                    .unwrap_or(false)
+                                && !script_mode
+                            {
+                                SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "WHENEVER SQLERROR",
+                                "Error: EXIT SQL.SQLCODE is supported only in batch(script) execution.",
+                            );
+                                command_error = true;
+                            } else {
+                                match session.lock() {
+                                    Ok(mut guard) => guard.continue_on_error = !exit,
+                                    Err(poisoned) => {
+                                        poisoned.into_inner().continue_on_error = !exit
+                                    }
+                                }
+                                continue_on_error = !exit;
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    "WHENEVER SQLERROR",
+                                    if exit { "Mode EXIT" } else { "Mode CONTINUE" },
+                                );
+                            }
+                        }
+                        ToolCommand::WheneverOsError { exit } => {
+                            match session.lock() {
+                                Ok(mut guard) => guard.continue_on_error = !exit,
+                                Err(poisoned) => poisoned.into_inner().continue_on_error = !exit,
+                            }
+                            continue_on_error = !exit;
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "WHENEVER OSERROR",
+                                if exit { "Mode EXIT" } else { "Mode CONTINUE" },
+                            );
+                        }
+                        ToolCommand::Exit => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "EXIT",
+                                "Execution stopped.",
+                            );
+                            stop_execution = true;
+                        }
+                        ToolCommand::Quit => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "QUIT",
+                                "Execution stopped.",
+                            );
+                            stop_execution = true;
+                        }
+                        ToolCommand::Connect {
+                            username,
+                            password,
+                            host,
+                            port,
+                            service_name,
+                        } => {
+                            let conn_info = ConnectionInfo {
+                                name: format!("{}@{}", username, host),
+                                username,
+                                password,
+                                host,
+                                port,
+                                service_name,
+                                db_type: crate::db::DatabaseType::OracleThin,
+                            };
+
+                            let connect_result = {
+                                let mut conn_guard = lock_connection_with_activity(
+                                    shared_connection,
+                                    db_activity.to_string(),
+                                );
+                                match conn_guard.connect(conn_info.clone()) {
+                                    Ok(_) => {
+                                        conn_guard.refresh_tracked_connection();
+                                        let next_conn =
+                                            conn_guard.require_live_oracle_thin_connection().ok();
+                                        let sanitized = SqlEditorWidget::connection_info_for_ui(
+                                            conn_guard.get_info(),
+                                        );
+                                        let next_name = if conn_guard.is_connected() {
+                                            conn_guard.get_info().name.clone()
+                                        } else {
+                                            String::new()
+                                        };
+                                        Ok((next_conn, sanitized, next_name))
+                                    }
+                                    Err(err) => Err(err),
+                                }
+                            };
+
+                            match connect_result {
+                                Ok((next_conn, sanitized_conn_info, next_conn_name)) => {
+                                    conn = next_conn;
+                                    conn_name = next_conn_name;
+                                    SqlEditorWidget::set_current_oracle_thin_connection(
+                                        current_oracle_thin_connection,
+                                        conn.clone(),
+                                    );
+                                    match session.lock() {
+                                        Ok(mut guard) => guard.reset(),
+                                        Err(poisoned) => poisoned.into_inner().reset(),
+                                    }
+                                    if let Some(conn) = conn.as_ref() {
+                                        if let Err(err) =
+                                        SqlEditorWidget::sync_oracle_thin_serveroutput_with_session(
+                                            conn.as_ref(),
+                                            session,
+                                        )
+                                    {
+                                        eprintln!(
+                                            "Failed to apply Oracle thin SERVEROUTPUT after CONNECT: {err}"
+                                        );
+                                    }
+                                        if load_mutex_bool(cancel_flag) {
+                                            let _ =
+                                                crate::db::oracle_thin::interrupt(conn.as_ref());
+                                        }
+                                    }
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "CONNECT",
+                                        &format!("Connected to {}", conn_info.name),
+                                    );
+                                    let _ = sender.send(QueryProgress::ConnectionChanged {
+                                        info: Some(sanitized_conn_info),
+                                    });
+                                    app::awake();
+                                }
+                                Err(err) => {
+                                    conn = None;
+                                    conn_name.clear();
+                                    SqlEditorWidget::set_current_oracle_thin_connection(
+                                        current_oracle_thin_connection,
+                                        None,
+                                    );
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "CONNECT",
+                                        &format!("Connection failed: {}", err),
+                                    );
+                                    let _ = sender
+                                        .send(QueryProgress::ConnectionChanged { info: None });
+                                    app::awake();
+                                    command_error = true;
+                                }
+                            }
+                        }
+                        ToolCommand::Disconnect => {
+                            let had_connection = {
+                                let mut conn_guard = lock_connection_with_activity(
+                                    shared_connection,
+                                    db_activity.to_string(),
+                                );
+                                let had_connection =
+                                    conn_guard.is_connected() || conn_guard.has_connection_handle();
+                                conn_guard.disconnect();
+                                had_connection
+                            };
+                            SqlEditorWidget::set_current_oracle_thin_connection(
+                                current_oracle_thin_connection,
+                                None,
+                            );
+                            conn = None;
+                            conn_name.clear();
+                            match session.lock() {
+                                Ok(mut guard) => guard.reset(),
+                                Err(poisoned) => poisoned.into_inner().reset(),
+                            }
+                            let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                            app::awake();
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                "DISCONNECT",
+                                if had_connection {
+                                    "Disconnected from database"
+                                } else {
+                                    "Not connected to any database"
+                                },
+                            );
+                        }
+                        ToolCommand::RunScript {
+                            path,
+                            relative_to_caller,
+                        } => {
+                            let include_base_dir = if relative_to_caller {
+                                current_frame_base_dir.as_path()
+                            } else {
+                                working_dir.as_path()
+                            };
+                            let (target_path, normalized_target_path) =
+                                SqlEditorWidget::resolve_script_include_path(
+                                    &path,
+                                    relative_to_caller,
+                                    current_frame_base_dir.as_path(),
+                                    working_dir.as_path(),
+                                );
+                            if let Err(message) = SqlEditorWidget::validate_script_include_target(
+                                &frames,
+                                normalized_target_path.as_path(),
+                            ) {
+                                SqlEditorWidget::emit_script_message(
+                                    sender,
+                                    session,
+                                    if relative_to_caller { "@@" } else { "@" },
+                                    &format!("Error: {}", message),
+                                );
+                                command_error = true;
+                            } else {
+                                match SqlEditorWidget::load_script_include(
+                                    target_path.as_path(),
+                                    normalized_target_path.as_path(),
+                                    include_base_dir,
+                                    Some(crate::db::connection::DatabaseType::OracleThin),
+                                    None,
+                                ) {
+                                    Ok(resolved_include) => {
+                                        frames.push(ScriptExecutionFrame {
+                                            items: resolved_include.items,
+                                            index: 0,
+                                            base_dir: resolved_include.script_dir,
+                                            source_path: Some(resolved_include.source_path),
+                                        });
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            if relative_to_caller { "@@" } else { "@" },
+                                            &format!("Running script {}", target_path.display()),
+                                        );
+                                    }
+                                    Err(message) => {
+                                        SqlEditorWidget::emit_script_message(
+                                            sender,
+                                            session,
+                                            if relative_to_caller { "@@" } else { "@" },
+                                            &format!("Error: {}", message),
+                                        );
+                                        command_error = true;
+                                    }
+                                }
+                            }
+                        }
+                        ToolCommand::Unsupported {
+                            raw,
+                            message,
+                            is_error,
+                        } => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &raw,
+                                &format!(
+                                    "{}: {}",
+                                    if is_error { "Error" } else { "Warning" },
+                                    message
+                                ),
+                            );
+                            command_error = is_error;
+                        }
+                        unsupported => {
+                            SqlEditorWidget::emit_script_message(
+                                sender,
+                                session,
+                                &SqlEditorWidget::format_tool_command(&unsupported),
+                                &format!(
+                                    "Error: {} is not supported in Oracle thin mode yet.",
+                                    SqlEditorWidget::format_tool_command(&unsupported)
+                                ),
+                            );
+                            command_error = true;
+                        }
+                    }
+
+                    if command_error && !continue_on_error {
+                        stop_execution = true;
+                    }
+                }
+                ScriptItem::Statement(statement) => {
+                    let trimmed = statement.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let mut sql_text = trimmed.to_string();
+                    let (define_enabled, scan_enabled, verify_enabled) = match session.lock() {
+                        Ok(guard) => (
+                            guard.define_enabled,
+                            guard.scan_enabled,
+                            guard.verify_enabled,
+                        ),
+                        Err(poisoned) => {
+                            let guard = poisoned.into_inner();
+                            (
+                                guard.define_enabled,
+                                guard.scan_enabled,
+                                guard.verify_enabled,
+                            )
+                        }
+                    };
+                    if define_enabled && scan_enabled {
+                        let sql_before = sql_text.clone();
+                        match SqlEditorWidget::apply_define_substitution(&sql_text, session, sender)
+                        {
+                            Ok(updated) => {
+                                if verify_enabled && updated != sql_before {
+                                    SqlEditorWidget::emit_script_output(
+                                        sender,
+                                        session,
+                                        vec![
+                                            format!("old: {}", sql_before),
+                                            format!("new: {}", updated),
+                                        ],
+                                    );
+                                }
+                                sql_text = updated;
+                            }
+                            Err(message) => {
+                                let emitted = SqlEditorWidget::emit_non_select_result(
+                                    sender,
+                                    session,
+                                    &conn_name,
+                                    result_index,
+                                    trimmed,
+                                    format!("Error: {}", message),
+                                    false,
+                                    false,
+                                    script_mode,
+                                );
+                                if emitted {
+                                    result_index += 1;
+                                }
+                                if !continue_on_error {
+                                    stop_execution = true;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    let Some(conn) = conn.as_ref() else {
+                        let emitted = SqlEditorWidget::emit_non_select_result(
+                            sender,
+                            session,
+                            &conn_name,
+                            result_index,
+                            &sql_text,
+                            crate::db::NOT_CONNECTED_MESSAGE.to_string(),
+                            false,
+                            false,
+                            script_mode,
+                        );
+                        let _ = emitted;
+                        break;
+                    };
+
+                    let sql_text = QueryExecutor::strip_leading_comments(&sql_text);
+                    if sql_text.is_empty() {
+                        continue;
+                    }
+
+                    let binds = match session.lock() {
+                        Ok(guard) => QueryExecutor::resolve_binds(&sql_text, &guard),
+                        Err(poisoned) => {
+                            QueryExecutor::resolve_binds(&sql_text, &poisoned.into_inner())
+                        }
+                    };
+
+                    let binds = match binds {
+                        Ok(binds) => binds,
+                        Err(message) => {
+                            let emitted = SqlEditorWidget::emit_non_select_result(
+                                sender,
+                                session,
+                                &conn_name,
+                                result_index,
+                                &sql_text,
+                                format!("Error: {}", message),
+                                false,
+                                false,
+                                script_mode,
+                            );
+                            if emitted {
+                                result_index += 1;
+                            }
+                            if !continue_on_error {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    if QueryExecutor::is_select_statement(&sql_text) {
+                        let sql_to_execute = sql_text.trim_end_matches(';').trim().to_string();
+                        let index = result_index;
+                        let _ = sender.send(QueryProgress::StatementStart { index });
+                        app::awake();
+
+                        let (heading_enabled, feedback_enabled) =
+                            SqlEditorWidget::current_output_settings(session);
+                        let (colsep, null_text, _trimspool_enabled) =
+                            SqlEditorWidget::current_text_output_settings(session);
+                        let mut buffered_rows: Vec<Vec<String>> = Vec::new();
+                        let mut select_column_names: Vec<String> = Vec::new();
+                        let select_column_count = std::cell::Cell::new(0usize);
+                        let mut last_select_row: Option<Vec<String>> = None;
+                        let mut last_flush = Instant::now();
+                        let mut has_flushed_rows = false;
+                        let statement_start = Instant::now();
+                        let mut statement_interrupted = false;
+                        let (break_column, compute_config) = match session.lock() {
+                            Ok(guard) => (guard.break_column.clone(), guard.compute.clone()),
+                            Err(poisoned) => {
+                                let guard = poisoned.into_inner();
+                                (guard.break_column.clone(), guard.compute.clone())
+                            }
+                        };
+                        let transform_state =
+                            std::sync::Mutex::new(SelectTransformState::default());
+                        let timeout_watch =
+                            SqlEditorWidget::start_oracle_thin_timeout_watch(conn, query_timeout);
+
+                        let result = crate::db::oracle_thin::execute_select_streaming_with_binds(
+                            conn.as_ref(),
+                            &sql_to_execute,
+                            &binds,
+                            &mut |columns| {
+                                let names = columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect::<Vec<String>>();
+                                select_column_names = names.clone();
+                                select_column_count.set(names.len());
+                                {
+                                    let mut state = transform_state
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    state.break_index = break_column.as_ref().and_then(|target| {
+                                        let target_key = SessionState::normalize_name(target);
+                                        names.iter().position(|column_name| {
+                                            SessionState::normalize_name(column_name) == target_key
+                                        })
+                                    });
+                                    state.compute_of_index =
+                                        compute_config.as_ref().and_then(|config| {
+                                            config.of_column.as_ref().and_then(|target| {
+                                                let target_key =
+                                                    SessionState::normalize_name(target);
+                                                names.iter().position(|column_name| {
+                                                    SessionState::normalize_name(column_name)
+                                                        == target_key
+                                                })
+                                            })
+                                        });
+                                    state.compute_on_index =
+                                        compute_config.as_ref().and_then(|config| {
+                                            config.on_column.as_ref().and_then(|target| {
+                                                let target_key =
+                                                    SessionState::normalize_name(target);
+                                                names.iter().position(|column_name| {
+                                                    SessionState::normalize_name(column_name)
+                                                        == target_key
+                                                })
+                                            })
+                                        });
+                                    if compute_config
+                                        .as_ref()
+                                        .map(|config| {
+                                            config.mode == crate::db::ComputeMode::Sum
+                                                && config.of_column.is_none()
+                                        })
+                                        .unwrap_or(false)
+                                    {
+                                        state.compute_sums = vec![0.0; names.len()];
+                                        state.compute_seen_numeric = vec![false; names.len()];
+                                    }
+                                }
+                                let display_columns =
+                                    SqlEditorWidget::apply_heading_setting(names, heading_enabled);
+                                let _ = sender.send(QueryProgress::SelectStart {
+                                    index,
+                                    columns: display_columns.clone(),
+                                    null_text: null_text.clone(),
+                                });
+                                app::awake();
+                                if !display_columns.is_empty() {
+                                    SqlEditorWidget::append_spool_output(
+                                        session,
+                                        &[display_columns.join(&colsep)],
+                                    );
+                                }
+                            },
+                            &mut |row| {
+                                if load_mutex_bool(cancel_flag) {
+                                    return false;
+                                }
+
+                                let mut row = row;
+                                last_select_row = Some(row.clone());
+                                {
+                                    let mut state = transform_state
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    if let Some(config) = compute_config.as_ref() {
+                                        let grouped_compute = config.of_column.is_some()
+                                            && config.on_column.is_some()
+                                            && state.compute_of_index.is_some()
+                                            && state.compute_on_index.is_some();
+                                        if grouped_compute {
+                                            if let Some(on_idx) = state.compute_on_index {
+                                                if let Some(current_group_value) =
+                                                    row.get(on_idx).cloned()
+                                                {
+                                                    if let Some(previous_group_value) =
+                                                        state.compute_group_value.clone()
+                                                    {
+                                                        if previous_group_value
+                                                            != current_group_value
+                                                        {
+                                                            if let Some(summary_row) =
+                                                                SqlEditorWidget::build_compute_summary_row(
+                                                                    select_column_count.get(),
+                                                                    Some(config),
+                                                                    &state,
+                                                                )
+                                                            {
+                                                                let mut display_summary = summary_row;
+                                                                SqlEditorWidget::apply_null_text_to_row(
+                                                                    &mut display_summary,
+                                                                    &null_text,
+                                                                );
+                                                                buffered_rows.push(display_summary);
+                                                            }
+                                                            state.compute_count = 0;
+                                                            state.compute_sum = 0.0;
+                                                            state.compute_sum_seen = false;
+                                                        }
+                                                    }
+                                                    state.compute_group_value =
+                                                        Some(current_group_value);
+                                                }
+                                            }
+                                        }
+                                        SqlEditorWidget::accumulate_compute(
+                                            config, &row, &mut state,
+                                        );
+                                    }
+                                    if let Some(idx) = state.break_index {
+                                        if let Some(current_break_value) = row.get(idx).cloned() {
+                                            if state
+                                                .previous_break_value
+                                                .as_ref()
+                                                .map(|prev| prev == &current_break_value)
+                                                .unwrap_or(false)
+                                            {
+                                                if let Some(cell) = row.get_mut(idx) {
+                                                    *cell = String::new();
+                                                }
+                                            } else {
+                                                state.previous_break_value =
+                                                    Some(current_break_value);
+                                            }
+                                        }
+                                    }
+                                }
+                                SqlEditorWidget::apply_null_text_to_row(&mut row, &null_text);
+                                buffered_rows.push(row);
+                                if SqlEditorWidget::should_flush_progress_rows(
+                                    last_flush,
+                                    buffered_rows.len(),
+                                    has_flushed_rows,
+                                ) {
+                                    let rows = std::mem::take(&mut buffered_rows);
+                                    SqlEditorWidget::append_spool_rows(session, &rows);
+                                    let _ = sender.send(QueryProgress::Rows { index, rows });
+                                    app::awake();
+                                    last_flush = Instant::now();
+                                    has_flushed_rows = true;
+                                }
+                                true
+                            },
+                        );
+
+                        let timed_out =
+                            SqlEditorWidget::stop_oracle_thin_timeout_watch(timeout_watch);
+                        let mut result = match result {
+                            Ok((mut result, was_cancelled)) => {
+                                SqlEditorWidget::apply_heading_to_result(
+                                    &mut result,
+                                    heading_enabled,
+                                );
+                                if timed_out {
+                                    result.message =
+                                        SqlEditorWidget::timeout_message(query_timeout);
+                                    result.success = false;
+                                    statement_interrupted = true;
+                                } else if was_cancelled {
+                                    result.message = SqlEditorWidget::cancel_message();
+                                    result.success = false;
+                                    statement_interrupted = true;
+                                }
+                                if !feedback_enabled {
+                                    result.message.clear();
+                                }
+                                result
+                            }
+                            Err(err) => {
+                                statement_interrupted = timed_out
+                                    || SqlEditorWidget::is_oracle_thin_cancel_message(&err);
+                                let message = SqlEditorWidget::oracle_thin_error_message(
+                                    &err,
+                                    timed_out,
+                                    query_timeout,
+                                );
+                                let mut error_result = QueryResult::new_error(&sql_text, &message);
+                                error_result.is_select = true;
+                                error_result
+                            }
+                        };
+                        let transform_state = match transform_state.into_inner() {
+                            Ok(state) => state,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+
+                        let interrupted = timed_out
+                            || statement_interrupted
+                            || !result.success
+                                && SqlEditorWidget::is_oracle_thin_cancel_message(&result.message)
+                            || result.message == SqlEditorWidget::cancel_message();
+                        SqlEditorWidget::flush_buffered_rows(
+                            sender,
+                            session,
+                            index,
+                            &mut buffered_rows,
+                            interrupted,
+                        );
+
+                        let timing_duration = if result.execution_time.is_zero() {
+                            statement_start.elapsed()
+                        } else {
+                            result.execution_time
+                        };
+                        result.execution_time = timing_duration;
+                        let result_success = result.success;
+                        if result.success {
+                            let grouped_compute = compute_config
+                                .as_ref()
+                                .map(|config| {
+                                    config.of_column.is_some()
+                                        && config.on_column.is_some()
+                                        && transform_state.compute_of_index.is_some()
+                                        && transform_state.compute_on_index.is_some()
+                                })
+                                .unwrap_or(false);
+                            if grouped_compute {
+                                if transform_state.compute_group_value.is_some() {
+                                    if let Some(summary_row) =
+                                        SqlEditorWidget::build_compute_summary_row(
+                                            select_column_names.len(),
+                                            compute_config.as_ref(),
+                                            &transform_state,
+                                        )
+                                    {
+                                        let rows = vec![summary_row];
+                                        SqlEditorWidget::append_spool_rows(session, &rows);
+                                        let _ = sender.send(QueryProgress::Rows { index, rows });
+                                        app::awake();
+                                    }
+                                }
+                            } else if let Some(summary_row) =
+                                SqlEditorWidget::build_compute_summary_row(
+                                    select_column_names.len(),
+                                    compute_config.as_ref(),
+                                    &transform_state,
+                                )
+                            {
+                                let rows = vec![summary_row];
+                                SqlEditorWidget::append_spool_rows(session, &rows);
+                                let _ = sender.send(QueryProgress::Rows { index, rows });
+                                app::awake();
+                            }
+                            SqlEditorWidget::apply_column_new_value_from_row(
+                                session,
+                                &select_column_names,
+                                last_select_row.as_deref(),
+                            );
+                        }
+
+                        if !result.message.trim().is_empty() {
+                            SqlEditorWidget::append_spool_output(
+                                session,
+                                std::slice::from_ref(&result.message),
+                            );
+                        }
+                        let _ = sender.send(QueryProgress::StatementFinished {
+                            index,
+                            result,
+                            connection_name: conn_name.clone(),
+                            timed_out,
+                        });
+                        app::awake();
+                        result_index += 1;
+                        SqlEditorWidget::emit_timing_if_enabled(sender, session, timing_duration);
+                        let cancel_requested = load_mutex_bool(cancel_flag);
+                        let should_stop_after_statement = cancel_requested
+                            || timed_out
+                            || (!result_success && !continue_on_error);
+                        let skip_post_execution_output =
+                            should_stop_after_statement || statement_interrupted;
+                        if SqlEditorWidget::should_capture_post_execution_output(
+                            cancel_requested,
+                            timed_out,
+                            skip_post_execution_output,
+                        )
+                            && SqlEditorWidget::should_fetch_oracle_thin_dbms_output_after_statement(
+                                &sql_text,
+                            )
+                        {
+                            let _ = SqlEditorWidget::emit_oracle_thin_dbms_output(
+                                sender,
+                                conn.as_ref(),
+                                session,
+                            );
+                        }
+                        if should_stop_after_statement {
+                            stop_execution = true;
+                        }
+                    } else {
+                        let compiled_object = QueryExecutor::parse_compiled_object(&sql_text);
+                        if let Some(object) = compiled_object {
+                            match session.lock() {
+                                Ok(mut guard) => guard.last_compiled = Some(object),
+                                Err(poisoned) => poisoned.into_inner().last_compiled = Some(object),
+                            }
+                        }
+                        let statement_start = Instant::now();
+                        let timeout_watch =
+                            SqlEditorWidget::start_oracle_thin_timeout_watch(conn, query_timeout);
+                        let execution = crate::db::oracle_thin::execute_statement_with_binds(
+                            conn.as_ref(),
+                            &sql_text,
+                            &binds,
+                        );
+                        let timed_out =
+                            SqlEditorWidget::stop_oracle_thin_timeout_watch(timeout_watch);
+
+                        let mut follow_up_results: Vec<(String, QueryResult)> = Vec::new();
+                        let result = match execution {
+                            Ok(execution) => {
+                                let elapsed = statement_start.elapsed();
+                                let normalized =
+                                    QueryExecutor::normalize_sql_for_execute(&sql_text);
+                                let upper = normalized.to_ascii_uppercase();
+                                let dml_type = if upper.starts_with("INSERT") {
+                                    Some("INSERT")
+                                } else if upper.starts_with("UPDATE") {
+                                    Some("UPDATE")
+                                } else if upper.starts_with("DELETE") {
+                                    Some("DELETE")
+                                } else if upper.starts_with("MERGE") {
+                                    Some("MERGE")
+                                } else {
+                                    None
+                                };
+
+                                let mut result = if let Some(statement_type) = dml_type {
+                                    QueryResult::new_dml(
+                                        &sql_text,
+                                        execution.rows_affected,
+                                        elapsed,
+                                        statement_type,
+                                    )
+                                } else {
+                                    QueryResult {
+                                        sql: sql_text.to_string(),
+                                        columns: vec![],
+                                        rows: vec![],
+                                        row_count: 0,
+                                        execution_time: elapsed,
+                                        message: if upper.starts_with("CREATE")
+                                            || upper.starts_with("ALTER")
+                                            || upper.starts_with("DROP")
+                                            || upper.starts_with("TRUNCATE")
+                                            || upper.starts_with("RENAME")
+                                            || upper.starts_with("GRANT")
+                                            || upper.starts_with("REVOKE")
+                                            || upper.starts_with("COMMENT")
+                                        {
+                                            SqlEditorWidget::ddl_message(&upper)
+                                        } else if QueryExecutor::is_plain_commit(&sql_text) {
+                                            "Commit complete".to_string()
+                                        } else if QueryExecutor::is_plain_rollback(&sql_text) {
+                                            "Rollback complete".to_string()
+                                        } else if upper.starts_with("BEGIN")
+                                            || upper.starts_with("DECLARE")
+                                            || upper.starts_with("CALL")
+                                        {
+                                            "PL/SQL block executed successfully".to_string()
+                                        } else {
+                                            "Statement executed successfully".to_string()
+                                        },
+                                        is_select: false,
+                                        success: true,
+                                    }
+                                };
+
+                                let mut out_messages = Vec::new();
+                                let (_colsep, null_text, _trimspool_enabled) =
+                                    SqlEditorWidget::current_text_output_settings(session);
+
+                                if !execution.scalar_updates.is_empty()
+                                    || !execution.ref_cursors.is_empty()
+                                {
+                                    let mut guard = match session.lock() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => {
+                                            eprintln!(
+                                                "Warning: session state lock was poisoned; recovering."
+                                            );
+                                            poisoned.into_inner()
+                                        }
+                                    };
+
+                                    for (name, value) in execution.scalar_updates {
+                                        if let Some(bind) = guard.binds.get_mut(&name) {
+                                            bind.value = value.clone();
+                                        }
+                                        if let BindValue::Scalar(value) = value {
+                                            out_messages.push(format!(
+                                                ":{} = {}",
+                                                name,
+                                                value.unwrap_or_else(|| null_text.clone())
+                                            ));
+                                        }
+                                    }
+
+                                    for (name, cursor_result) in execution.ref_cursors {
+                                        if let Some(bind) = guard.binds.get_mut(&name) {
+                                            bind.value =
+                                                BindValue::Cursor(Some(cursor_result.clone()));
+                                        }
+                                        let cursor_query = QueryResult::new_select(
+                                            &format!("REFCURSOR :{name}"),
+                                            cursor_result
+                                                .columns
+                                                .iter()
+                                                .map(|column| ColumnInfo {
+                                                    name: column.clone(),
+                                                    data_type: String::new(),
+                                                })
+                                                .collect(),
+                                            cursor_result.rows.clone(),
+                                            elapsed,
+                                        );
+                                        follow_up_results
+                                            .push((format!("REFCURSOR :{name}"), cursor_query));
+                                    }
+                                }
+
+                                for (idx, implicit_result) in
+                                    execution.implicit_results.into_iter().enumerate()
+                                {
+                                    follow_up_results.push((
+                                        format!("IMPLICIT RESULT {}", idx + 1),
+                                        implicit_result,
+                                    ));
+                                }
+
+                                if !out_messages.is_empty() {
+                                    result.message = format!(
+                                        "{} | OUT: {}",
+                                        result.message,
+                                        out_messages.join(", ")
+                                    );
+                                }
+
+                                if dml_type.is_some() && !auto_commit && result.success {
+                                    result.message =
+                                        format!("{} | Commit required", result.message);
+                                }
+
+                                if dml_type.is_some() && auto_commit && result.success {
+                                    if let Err(err) = crate::db::oracle_thin::commit(conn.as_ref())
+                                    {
+                                        result = QueryResult::new_error(
+                                            &sql_text,
+                                            &format!("Auto-commit failed: {err}"),
+                                        );
+                                    } else {
+                                        result.message =
+                                            format!("{} | Auto-commit applied", result.message);
+                                    }
+                                }
+
+                                result
+                            }
+                            Err(err) => QueryResult::new_error(
+                                &sql_text,
+                                &SqlEditorWidget::oracle_thin_error_message(
+                                    &err,
+                                    timed_out,
+                                    query_timeout,
+                                ),
+                            ),
+                        };
+
+                        let result_success = result.success;
+                        if script_mode {
+                            if result_success {
+                                SqlEditorWidget::emit_script_lines(
+                                    sender,
+                                    session,
+                                    &result.message,
+                                );
+                            }
+                            SqlEditorWidget::emit_script_result(
+                                sender,
+                                &conn_name,
+                                result_index,
+                                result,
+                                timed_out,
+                            );
+                        } else {
+                            let index = result_index;
+                            let _ = sender.send(QueryProgress::StatementStart { index });
+                            app::awake();
+                            if !result.message.trim().is_empty() {
+                                SqlEditorWidget::append_spool_output(
+                                    session,
+                                    std::slice::from_ref(&result.message),
+                                );
+                            }
+                            let _ = sender.send(QueryProgress::StatementFinished {
+                                index,
+                                result,
+                                connection_name: conn_name.clone(),
+                                timed_out,
+                            });
+                            app::awake();
+                            result_index += 1;
+                        }
+
+                        let (heading_enabled, feedback_enabled) =
+                            SqlEditorWidget::current_output_settings(session);
+                        for (label, mut follow_up_result) in follow_up_results {
+                            let index = result_index;
+                            let _ = sender.send(QueryProgress::StatementStart { index });
+                            app::awake();
+                            SqlEditorWidget::apply_heading_to_result(
+                                &mut follow_up_result,
+                                heading_enabled,
+                            );
+                            if !feedback_enabled {
+                                follow_up_result.message.clear();
+                            }
+                            if !follow_up_result.message.trim().is_empty() {
+                                SqlEditorWidget::append_spool_output(
+                                    session,
+                                    std::slice::from_ref(&follow_up_result.message),
+                                );
+                            }
+                            let _ = sender.send(QueryProgress::StatementFinished {
+                                index,
+                                result: follow_up_result,
+                                connection_name: conn_name.clone(),
+                                timed_out: false,
+                            });
+                            app::awake();
+                            let _ = label;
+                            result_index += 1;
+                        }
+
+                        SqlEditorWidget::emit_timing_if_enabled(
+                            sender,
+                            session,
+                            statement_start.elapsed(),
+                        );
+                        let cancel_requested = load_mutex_bool(cancel_flag);
+                        let should_stop_after_statement = cancel_requested
+                            || timed_out
+                            || (!result_success && !continue_on_error);
+                        if SqlEditorWidget::should_capture_post_execution_output(
+                            cancel_requested,
+                            timed_out,
+                            should_stop_after_statement,
+                        )
+                            && SqlEditorWidget::should_fetch_oracle_thin_dbms_output_after_statement(
+                                &sql_text,
+                            )
+                        {
+                            let _ = SqlEditorWidget::emit_oracle_thin_dbms_output(
+                                sender,
+                                conn.as_ref(),
+                                session,
+                            );
+                        }
+                        if should_stop_after_statement {
+                            stop_execution = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(conn) = conn.as_ref() {
+            let _ = SqlEditorWidget::emit_oracle_thin_dbms_output(sender, conn.as_ref(), session);
+        }
+    }
+
     fn execute_sql_with_mysql_delimiter(
         &self,
         sql: &str,
@@ -1827,6 +4279,7 @@ impl SqlEditorWidget {
         let sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let current_oracle_thin_connection = self.current_oracle_thin_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
@@ -1842,6 +4295,7 @@ impl SqlEditorWidget {
                 let mut cleanup = QueryExecutionCleanupGuard::new(
                     sender.clone(),
                     current_query_connection.clone(),
+                    current_oracle_thin_connection.clone(),
                     current_mysql_cancel_context.clone(),
                     cancel_flag.clone(),
                     query_running.clone(),
@@ -1896,6 +4350,96 @@ impl SqlEditorWidget {
                         &cancel_flag,
                         script_mode,
                         initial_mysql_delimiter_for_worker.clone(),
+                        query_timeout,
+                        auto_commit,
+                        &db_activity,
+                    );
+                    return;
+                }
+
+                if db_type == crate::db::DatabaseType::OracleThin {
+                    if startup_policy.requires_connected_session
+                        && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
+                    {
+                        let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &message,
+                            None,
+                        );
+                        return;
+                    }
+
+                    if conn_guard.is_connected() {
+                        conn_name = conn_guard.get_info().name.clone();
+                    } else {
+                        conn_name.clear();
+                    }
+
+                    let thin_conn = match if startup_policy.has_connect_command {
+                        if conn_guard.is_connected() {
+                            conn_guard.require_live_oracle_thin_connection().map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    } else {
+                        conn_guard.require_live_oracle_thin_connection().map(Some)
+                    } {
+                        Ok(conn) => conn,
+                        Err(message) => {
+                            SqlEditorWidget::emit_execution_startup_error(
+                                &sender,
+                                script_mode,
+                                &sql_text,
+                                &conn_name,
+                                &message,
+                                None,
+                            );
+                            return;
+                        }
+                    };
+
+                    if startup_policy.requires_connected_session && thin_conn.is_none() {
+                        let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &message,
+                            None,
+                        );
+                        return;
+                    }
+
+                    if let Some(ref conn) = thin_conn {
+                        SqlEditorWidget::set_current_oracle_thin_connection(
+                            &current_oracle_thin_connection,
+                            Some(Arc::clone(conn)),
+                        );
+                        if load_mutex_bool(&cancel_flag) {
+                            let _ = crate::db::oracle_thin::interrupt(conn.as_ref());
+                        }
+                    }
+
+                    drop(conn_guard);
+                    SqlEditorWidget::execute_oracle_thin_batch(
+                        &shared_connection,
+                        &sender,
+                        &sql_text,
+                        &conn_name,
+                        &session,
+                        thin_conn,
+                        &current_oracle_thin_connection,
+                        &cancel_flag,
+                        script_mode,
                         query_timeout,
                         auto_commit,
                         &db_activity,
@@ -7209,6 +9753,26 @@ impl SqlEditorWidget {
         }
     }
 
+    fn sync_oracle_thin_serveroutput_with_session(
+        conn: &ThinConnection,
+        session: &Arc<Mutex<SessionState>>,
+    ) -> Result<(), String> {
+        let (enabled, size) = match session.lock() {
+            Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                (guard.server_output.enabled, guard.server_output.size)
+            }
+        };
+
+        if enabled {
+            let buffer_size = if size == 0 { None } else { Some(size) };
+            crate::db::oracle_thin::enable_dbms_output(conn, buffer_size)
+        } else {
+            crate::db::oracle_thin::disable_dbms_output(conn)
+        }
+    }
+
     pub(crate) fn resolve_serveroutput_enable_size(
         requested_size: Option<u32>,
         current_size: u32,
@@ -7258,6 +9822,50 @@ impl SqlEditorWidget {
         Ok(())
     }
 
+    fn emit_oracle_thin_dbms_output(
+        sender: &mpsc::Sender<QueryProgress>,
+        conn: &ThinConnection,
+        session: &Arc<Mutex<SessionState>>,
+    ) -> Result<(), String> {
+        let (enabled, size) = match session.lock() {
+            Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                (guard.server_output.enabled, guard.server_output.size)
+            }
+        };
+
+        if !enabled {
+            return Ok(());
+        }
+
+        let max_lines = if size == 0 {
+            10_000
+        } else {
+            safe_div(size, 80).clamp(1, 10_000)
+        };
+        let lines = crate::db::oracle_thin::get_dbms_output(conn, max_lines)?;
+        if lines.is_empty() {
+            return Ok(());
+        }
+
+        let mut output_lines = Vec::with_capacity(lines.len() + 1);
+        output_lines.push("DBMS_OUTPUT".to_string());
+        output_lines.extend(lines);
+        SqlEditorWidget::emit_script_output(sender, session, output_lines);
+        Ok(())
+    }
+
+    fn should_fetch_oracle_thin_dbms_output_after_statement(sql: &str) -> bool {
+        let normalized = QueryExecutor::normalize_sql_for_execute(sql);
+        let upper = normalized.to_ascii_uppercase();
+        let is_plsql_like = upper.starts_with("BEGIN")
+            || upper.starts_with("DECLARE")
+            || upper.starts_with("CALL")
+            || QueryExecutor::normalize_exec_call(sql).is_some();
+        is_plsql_like && upper.contains("DBMS_OUTPUT")
+    }
+
     fn ensure_plsql_terminator(sql: &str) -> String {
         let trimmed = sql.trim_end();
         if trimmed.ends_with(';') {
@@ -7268,41 +9876,7 @@ impl SqlEditorWidget {
     }
 
     fn strip_leading_comments(sql: &str) -> String {
-        let mut remaining = sql;
-
-        loop {
-            let trimmed = remaining.trim_start();
-
-            if trimmed.starts_with("--") {
-                if let Some(line_end) = trimmed.find('\n') {
-                    remaining = &trimmed[line_end + 1..];
-                    continue;
-                }
-                return String::new();
-            }
-
-            if trimmed.starts_with("/*") {
-                if let Some(block_end) = trimmed.find("*/") {
-                    remaining = &trimmed[block_end + 2..];
-                    continue;
-                }
-                return String::new();
-            }
-
-            if matches!(
-                trimmed.split_whitespace().next(),
-                Some(first) if first.eq_ignore_ascii_case("REM")
-                    || first.eq_ignore_ascii_case("REMARK")
-            ) {
-                if let Some(line_end) = trimmed.find('\n') {
-                    remaining = &trimmed[line_end + 1..];
-                    continue;
-                }
-                return String::new();
-            }
-
-            return trimmed.to_string();
-        }
+        QueryExecutor::strip_leading_comments(sql)
     }
 
     fn normalize_object_name(value: &str) -> String {
@@ -7346,6 +9920,56 @@ impl SqlEditorWidget {
 
     fn cancel_message() -> String {
         "Query cancelled".to_string()
+    }
+
+    fn is_oracle_thin_cancel_message(message: &str) -> bool {
+        let upper = message.to_ascii_uppercase();
+        upper.contains("ORA-01013")
+            || upper.contains("EARLY EOF")
+            || upper.contains("CONNECTION CLOSED")
+    }
+
+    fn start_oracle_thin_timeout_watch(
+        conn: &Arc<ThinConnection>,
+        query_timeout: Option<Duration>,
+    ) -> Option<(mpsc::Sender<()>, Arc<AtomicBool>, thread::JoinHandle<()>)> {
+        let timeout = query_timeout?;
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let watch_timed_out = Arc::clone(&timed_out);
+        let watch_conn = Arc::clone(conn);
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("oracle-thin-timeout-watch".to_string())
+            .spawn(move || match stop_receiver.recv_timeout(timeout) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    watch_timed_out.store(true, Ordering::Relaxed);
+                    let _ = crate::db::oracle_thin::interrupt(watch_conn.as_ref());
+                }
+            })
+            .ok()?;
+
+        Some((stop_sender, timed_out, handle))
+    }
+
+    fn stop_oracle_thin_timeout_watch(
+        watch: Option<(mpsc::Sender<()>, Arc<AtomicBool>, thread::JoinHandle<()>)>,
+    ) -> bool {
+        let Some((stop_sender, timed_out, handle)) = watch else {
+            return false;
+        };
+        let _ = stop_sender.send(());
+        let _ = handle.join();
+        timed_out.load(Ordering::Relaxed)
+    }
+
+    fn oracle_thin_error_message(
+        message: &str,
+        timed_out: bool,
+        timeout: Option<Duration>,
+    ) -> String {
+        let cancelled = Self::is_oracle_thin_cancel_message(message);
+        Self::choose_execution_error_message(cancelled, timed_out, timeout, message.to_string())
     }
 
     pub(super) fn abort_if_cancelled(cancel_flag: &Arc<Mutex<bool>>) -> Result<(), String> {
@@ -7496,6 +10120,7 @@ mod query_execution_cleanup_tests {
     use super::{
         MySqlQueryCancelContext, QueryExecutionCleanupGuard, QueryProgress, SqlEditorWidget,
     };
+    use crate::db::oracle_thin::ThinConnection;
     use mysql::{Error as MysqlError, MySqlError};
     use oracle::Connection;
     use std::panic::{self, AssertUnwindSafe};
@@ -7509,6 +10134,8 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(None));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
 
@@ -7516,6 +10143,7 @@ mod query_execution_cleanup_tests {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection.clone(),
+                current_oracle_thin_connection.clone(),
                 current_mysql_cancel_context.clone(),
                 cancel_flag.clone(),
                 query_running.clone(),
@@ -7551,18 +10179,22 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(None));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
 
         let unwind_result = panic::catch_unwind(AssertUnwindSafe({
             let cancel_flag = cancel_flag.clone();
             let current_query_connection = current_query_connection;
+            let current_oracle_thin_connection = current_oracle_thin_connection;
             let current_mysql_cancel_context = current_mysql_cancel_context;
             let query_running = query_running.clone();
             move || {
                 let _guard = QueryExecutionCleanupGuard::new(
                     sender,
                     current_query_connection,
+                    current_oracle_thin_connection,
                     current_mysql_cancel_context,
                     cancel_flag,
                     query_running,
@@ -7595,6 +10227,8 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(None));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
 
@@ -7602,6 +10236,7 @@ mod query_execution_cleanup_tests {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection,
+                current_oracle_thin_connection,
                 current_mysql_cancel_context,
                 cancel_flag.clone(),
                 query_running.clone(),
@@ -7626,6 +10261,8 @@ mod query_execution_cleanup_tests {
         let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(None));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
 
@@ -7641,6 +10278,7 @@ mod query_execution_cleanup_tests {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
                 current_query_connection,
+                current_oracle_thin_connection,
                 current_mysql_cancel_context,
                 cancel_flag.clone(),
                 query_running.clone(),
@@ -7949,6 +10587,1909 @@ mod execution_startup_error_tests {
             }
             _ => panic!("expected StatementFinished progress event"),
         }
+    }
+}
+
+#[cfg(test)]
+mod oracle_thin_script_regression_tests {
+    use super::{QueryProgress, SqlEditorWidget};
+    use crate::db::connection::DatabaseType;
+    use crate::db::oracle_thin::{
+        close as close_oracle_thin, connect as connect_oracle_thin, execute_select_all_with_binds,
+        execute_select_streaming_with_binds, execute_statement_with_binds, get_compilation_errors,
+        get_object_status, ThinConnection,
+    };
+    use crate::db::session::BindDataType;
+    use crate::db::{
+        create_shared_connection, lock_connection, ConnectionInfo, QueryExecutor, ResolvedBind,
+        ScriptItem, ToolCommand,
+    };
+    use std::collections::VecDeque;
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    fn test_connection_info() -> ConnectionInfo {
+        ConnectionInfo {
+            name: "oracle-thin-script-test".to_string(),
+            username: env::var("ORACLE_TEST_USER").unwrap_or_else(|_| "system".to_string()),
+            password: env::var("ORACLE_TEST_PASSWORD").unwrap_or_else(|_| "password".to_string()),
+            host: env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            port: env::var("ORACLE_TEST_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1521),
+            service_name: env::var("ORACLE_TEST_SERVICE").unwrap_or_else(|_| "FREE".to_string()),
+            db_type: DatabaseType::OracleThin,
+        }
+    }
+
+    fn cleanup_stale_local_oracle_test_sessions() {
+        let conn = connect_oracle_thin(&test_connection_info())
+            .expect("oracle thin cleanup connection must succeed");
+        let sessions = execute_select_all_with_binds(
+            conn.as_ref(),
+            r#"
+            SELECT sid, serial#
+            FROM sys.v_$session
+            WHERE username = USER
+              AND sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
+              AND machine = SYS_CONTEXT('USERENV', 'HOST')
+            "#,
+            &[],
+        )
+        .expect("stale session lookup must succeed");
+
+        for row in sessions.rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let sid = row[0].trim();
+            let serial = row[1].trim();
+            if sid.is_empty() || serial.is_empty() {
+                continue;
+            }
+            let _ = execute_statement_with_binds(
+                conn.as_ref(),
+                &format!("ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE"),
+                &[],
+            );
+        }
+
+        let _ = close_oracle_thin(conn.as_ref());
+    }
+
+    fn flatten_oracle_thin_batch_items(sql_text: &str) -> Vec<ScriptItem> {
+        let items = crate::db::query::QueryExecutor::split_script_items_for_db_type(
+            sql_text,
+            Some(DatabaseType::OracleThin),
+        );
+        let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut frames = vec![super::ScriptExecutionFrame {
+            items,
+            index: 0,
+            base_dir: working_dir.clone(),
+            source_path: None,
+        }];
+        let mut flattened = Vec::new();
+
+        while !frames.is_empty() {
+            let Some((item, current_frame_base_dir)) = ({
+                let frame = match frames.last_mut() {
+                    Some(frame) => frame,
+                    None => break,
+                };
+
+                if frame.index >= frame.items.len() {
+                    None
+                } else {
+                    let item = frame.items[frame.index].clone();
+                    frame.index += 1;
+                    Some((item, frame.base_dir.clone()))
+                }
+            }) else {
+                frames.pop();
+                continue;
+            };
+
+            match item {
+                ScriptItem::ToolCommand(ToolCommand::RunScript {
+                    path,
+                    relative_to_caller,
+                }) => {
+                    let include_base_dir = if relative_to_caller {
+                        current_frame_base_dir.as_path()
+                    } else {
+                        working_dir.as_path()
+                    };
+                    let (target_path, normalized_target_path) =
+                        SqlEditorWidget::resolve_script_include_path(
+                            &path,
+                            relative_to_caller,
+                            current_frame_base_dir.as_path(),
+                            working_dir.as_path(),
+                        );
+                    let resolved_include = SqlEditorWidget::load_script_include(
+                        target_path.as_path(),
+                        normalized_target_path.as_path(),
+                        include_base_dir,
+                        Some(DatabaseType::OracleThin),
+                        None,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "oracle thin include load must succeed for {}: {}",
+                            target_path.display(),
+                            err
+                        )
+                    });
+                    frames.push(super::ScriptExecutionFrame {
+                        items: resolved_include.items,
+                        index: 0,
+                        base_dir: resolved_include.script_dir,
+                        source_path: Some(resolved_include.source_path),
+                    });
+                }
+                other => flattened.push(other),
+            }
+        }
+
+        flattened
+    }
+
+    #[test]
+    #[ignore = "debug helper for statement index mapping"]
+    fn debug_oracle_thin_test9_to_test11_statement_indexes() {
+        let flattened = flatten_oracle_thin_batch_items(
+            "@test/test9.txt;\n@test/test10.txt;\n@test/test11.txt;\n",
+        );
+        let mut statement_index = 0usize;
+        for item in &flattened {
+            if let ScriptItem::Statement(statement) = item {
+                if (5360..=5405).contains(&statement_index)
+                    || statement.contains("CREATE TABLE qt_employees")
+                    || statement.contains("DROP TABLE qt_employees PURGE")
+                {
+                    eprintln!("statement #{statement_index}:\n{}\n---", statement);
+                }
+                statement_index += 1;
+            }
+        }
+
+        panic!("debug complete");
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test4_script_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test4.txt;\n",
+            "oracle-thin-test4-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test4.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if (5370..=5410).contains(&index) {
+                    eprintln!(
+                        "observed statement #{index} (success={}, timed_out={}):\n{}\n---",
+                        result.success, timed_out, result.sql
+                    );
+                }
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test4.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test6_script_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test6.txt;\n",
+            "oracle-thin-test6-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test6.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test6.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test7_script_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test7.txt;\n",
+            "oracle-thin-test7-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test7.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test7.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test8_script_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test8.txt;\n",
+            "oracle-thin-test8-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test8.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test8.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test6_then_test7_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test6.txt;\n@test/test7.txt;\n",
+            "oracle-thin-test6-test7-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test6.txt and test/test7.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test6.txt then test/test7.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test1_to_test5_then_test7_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test1.txt;\n@test/test2.txt;\n@test/test3.txt;\n@test/test4.txt;\n@test/test5.txt;\n@test/test7.txt;\n",
+            "oracle-thin-test1-test5-test7-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test1-5.txt and test/test7.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test1-5.txt then test/test7.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test3_then_test4_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test3.txt;\n@test/test4.txt;\n",
+            "oracle-thin-test3-test4-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test3.txt and test/test4.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test3.txt then test/test4.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test1_then_test4_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test1.txt;\n@test/test4.txt;\n",
+            "oracle-thin-test1-test4-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test1.txt and test/test4.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test1.txt then test/test4.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test2_then_test4_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test2.txt;\n@test/test4.txt;\n",
+            "oracle-thin-test2-test4-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test2.txt and test/test4.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test2.txt then test/test4.txt cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test_all_script_without_errors() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            include_str!("../../../test/test_all.sql"),
+            "oracle-thin-script-test",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test_all.sql via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        let mut recent_output = VecDeque::with_capacity(20);
+        let mut saw_batch_start = false;
+        let mut statement_count = 0usize;
+        let info = test_connection_info();
+
+        while let Ok(progress) = receiver.recv() {
+            match progress {
+                QueryProgress::BatchStart => saw_batch_start = true,
+                QueryProgress::ScriptOutput { lines } => {
+                    for line in lines {
+                        if recent_output.len() == 20 {
+                            recent_output.pop_front();
+                        }
+                        recent_output.push_back(line);
+                    }
+                }
+                QueryProgress::StatementFinished {
+                    index,
+                    result,
+                    timed_out,
+                    ..
+                } => {
+                    statement_count += 1;
+                    if timed_out || !result.success {
+                        let mut details = format!(
+                            "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                            result.sql, result.message
+                        );
+                        if result
+                            .sql
+                            .contains("oqt_demo_pkg.proc_in_only('HELLO_TOAD')")
+                        {
+                            match connect_oracle_thin(&info) {
+                                Ok(reconnect) => {
+                                    match get_object_status(
+                                        reconnect.as_ref(),
+                                        "OQT_DEMO_PKG",
+                                        "PACKAGE BODY",
+                                    ) {
+                                        Ok(status) => {
+                                            details.push_str(&format!(
+                                                "\nOQT_DEMO_PKG PACKAGE BODY status: {status}"
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            details.push_str(&format!(
+                                                "\nOQT_DEMO_PKG PACKAGE BODY status lookup failed: {err}"
+                                            ));
+                                        }
+                                    }
+                                    match get_compilation_errors(
+                                        reconnect.as_ref(),
+                                        "OQT_DEMO_PKG",
+                                        "PACKAGE BODY",
+                                    ) {
+                                        Ok(errors) => {
+                                            details.push_str(&format!(
+                                                "\nOQT_DEMO_PKG PACKAGE BODY errors: {errors:?}"
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            details.push_str(&format!(
+                                                "\nOQT_DEMO_PKG PACKAGE BODY error lookup failed: {err}"
+                                            ));
+                                        }
+                                    }
+                                    let retry = execute_statement_with_binds(
+                                        reconnect.as_ref(),
+                                        "BEGIN oqt_demo_pkg.proc_in_only('HELLO_TOAD_RETRY'); END;",
+                                        &[],
+                                    );
+                                    match retry {
+                                        Ok(_) => {
+                                            details.push_str(
+                                                "\nRetry on fresh thin connection: success",
+                                            );
+                                            match execute_select_all_with_binds(
+                                                reconnect.as_ref(),
+                                                "SELECT MSG FROM oqt_run_log ORDER BY run_ts DESC FETCH FIRST 2 ROWS ONLY",
+                                                &[],
+                                            ) {
+                                                Ok(rows) => {
+                                                    details.push_str("\nRecent oqt_run_log rows:");
+                                                    for row in rows.rows {
+                                                        details.push('\n');
+                                                        details.push_str(&row.join(" | "));
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    details.push_str(&format!(
+                                                        "\nRecent oqt_run_log lookup failed: {err}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            details.push_str(&format!(
+                                                "\nRetry on fresh thin connection failed: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    details
+                                        .push_str(&format!("\nFresh thin reconnect failed: {err}"));
+                                }
+                            }
+                        }
+                        if timed_out {
+                            details.push_str("\nTimed out: true");
+                        }
+                        if !recent_output.is_empty() {
+                            details.push_str("\nRecent script output:");
+                            for line in &recent_output {
+                                details.push('\n');
+                                details.push_str(line);
+                            }
+                        }
+                        failures.push(details);
+                    }
+                }
+                QueryProgress::WorkerPanicked { message } => {
+                    failures.push(format!("worker panicked: {message}"));
+                }
+                _ => {}
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(saw_batch_start, "batch execution did not start");
+        assert!(
+            !failures.is_empty() || statement_count > 0,
+            "script produced no statement results"
+        );
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test_all.sql cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test9_to_test23_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test9.txt;\n@test/test10.txt;\n@test/test11.txt;\n@test/test18.sql;\n@test/test22.sql;\n@test/test23.sql;\n",
+            "oracle-thin-test9-test23-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test9-test23 via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test9-test23 cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test9_to_test11_without_errors() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test9.txt;\n@test/test10.txt;\n@test/test11.txt;\n",
+            "oracle-thin-test9-test11-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test9-test11 via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test9-test11 cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic helper for repeated original test11 wrapper block"]
+    fn oracle_thin_executes_repeated_test11_first_block_without_errors() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let block_statements = QueryExecutor::split_script_items_for_db_type(
+            include_str!("../../../test/test11.txt"),
+            Some(DatabaseType::OracleThin),
+        )
+        .into_iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(statement) => Some(statement),
+            ScriptItem::ToolCommand(ToolCommand::ShowErrors { .. })
+            | ScriptItem::ToolCommand(ToolCommand::MysqlShowErrors)
+            | ScriptItem::ToolCommand(ToolCommand::Prompt { .. }) => None,
+            ScriptItem::ToolCommand(other) => {
+                panic!("unexpected test11 tool command in repeated block: {other:?}")
+            }
+        })
+        .take(120)
+        .collect::<Vec<_>>();
+
+        let block = block_statements
+            .iter()
+            .map(|statement| {
+                let trimmed = statement.trim();
+                let normalized = QueryExecutor::normalize_sql_for_execute(trimmed);
+                let upper = normalized.to_ascii_uppercase();
+                let needs_slash = upper.starts_with("BEGIN")
+                    || upper.starts_with("DECLARE")
+                    || QueryExecutor::parse_compiled_object(trimmed).is_some();
+                if needs_slash {
+                    format!("{trimmed}\n/")
+                } else if trimmed.ends_with(';') {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed};")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let script = std::iter::repeat(block.as_str())
+            .take(60)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            &script,
+            "oracle-thin-repeated-test11-first-block",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing repeated test11 first block via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute repeated test11 first block cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic helper for test9/test10 wrapper state before low-level test11"]
+    fn oracle_thin_test9_test10_wrapper_then_low_level_test11_front_block() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test9.txt;\n@test/test10.txt;\n",
+            "oracle-thin-test9-test10-script",
+            &session,
+            Some(Arc::clone(&active_thin_conn)),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test9/test10 via Oracle thin before low-level test11",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test9/test10 cleanly before low-level check.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+
+        let block_statements = QueryExecutor::split_script_items_for_db_type(
+            include_str!("../../../test/test11.txt"),
+            Some(DatabaseType::OracleThin),
+        )
+        .into_iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(statement) => Some(statement),
+            ScriptItem::ToolCommand(ToolCommand::ShowErrors { .. })
+            | ScriptItem::ToolCommand(ToolCommand::MysqlShowErrors)
+            | ScriptItem::ToolCommand(ToolCommand::Prompt { .. }) => None,
+            ScriptItem::ToolCommand(other) => {
+                panic!("unexpected test11 tool command in low-level diagnostic: {other:?}")
+            }
+        })
+        .take(120)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            block_statements.len(),
+            120,
+            "test11 low-level diagnostic block must contain 120 statements"
+        );
+
+        for (statement_offset, statement) in block_statements.iter().enumerate() {
+            let cleaned = QueryExecutor::strip_leading_comments(statement);
+            if QueryExecutor::is_select_statement(&cleaned) {
+                let (_result, cancelled) = execute_select_streaming_with_binds(
+                    active_thin_conn.as_ref(),
+                    &cleaned,
+                    &[],
+                    &mut |_columns| {},
+                    &mut |_row| true,
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "low-level test11 select must succeed after test9/test10 at statement {}.\nSQL:\n{}\n\n{}",
+                        statement_offset + 1,
+                        cleaned,
+                        err
+                    )
+                });
+                assert!(
+                    !cancelled,
+                    "low-level test11 select must not be cancelled after test9/test10 at statement {}",
+                    statement_offset + 1
+                );
+            } else {
+                execute_statement_with_binds(active_thin_conn.as_ref(), &cleaned, &[])
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "low-level test11 statement must succeed after test9/test10 at statement {}.\nSQL:\n{}\n\n{}",
+                            statement_offset + 1,
+                            cleaned,
+                            err
+                        )
+                    });
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic helper for open cursor source during test9/test11 wrapper run"]
+    fn oracle_thin_diagnostic_test9_to_test11_open_cursor_source() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let probe_conn =
+            connect_oracle_thin(&test_connection_info()).expect("probe connection must succeed");
+        let candidate_sessions = execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            r#"
+                SELECT
+                    s.sid,
+                    s.serial#,
+                    s.status,
+                    NVL(s.event, '-') AS event_name,
+                    (
+                        SELECT COUNT(*)
+                        FROM sys.v_$open_cursor oc
+                        WHERE oc.sid = s.sid
+                    ) AS open_cursor_count
+                FROM sys.v_$session s
+                WHERE s.username = USER
+                  AND s.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
+                  AND s.machine = SYS_CONTEXT('USERENV', 'HOST')
+                  AND s.module LIKE 'space_query%'
+                ORDER BY open_cursor_count DESC, s.logon_time DESC
+            "#,
+            &[],
+        )
+        .expect("candidate execution session lookup from probe connection must succeed");
+        eprintln!(
+            "diagnostic candidate sessions: {:?}",
+            candidate_sessions.rows
+        );
+
+        let exec_sid = candidate_sessions
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .expect("execution SID row from probe connection must be present");
+        let exec_sid_bind = vec![ResolvedBind {
+            name: "1".to_string(),
+            data_type: BindDataType::Varchar2(40),
+            value: Some(exec_sid.clone()),
+        }];
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test9.txt;\n@test/test10.txt;\n@test/test11.txt;\n",
+            "oracle-thin-test9-test11-diagnostic",
+            &session,
+            Some(Arc::clone(&active_thin_conn)),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test9/test11 diagnostic via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        let candidate_sessions_after = execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            r#"
+                SELECT
+                    s.sid,
+                    s.serial#,
+                    s.status,
+                    NVL(s.event, '-') AS event_name,
+                    (
+                        SELECT COUNT(*)
+                        FROM sys.v_$open_cursor oc
+                        WHERE oc.sid = s.sid
+                    ) AS open_cursor_count
+                FROM sys.v_$session s
+                WHERE s.username = USER
+                  AND s.sid <> TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))
+                  AND s.machine = SYS_CONTEXT('USERENV', 'HOST')
+                  AND s.module LIKE 'space_query%'
+                ORDER BY open_cursor_count DESC, s.logon_time DESC
+            "#,
+            &[],
+        )
+        .expect("post-failure candidate execution session lookup must succeed");
+
+        let open_cursor_count = execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            "SELECT COUNT(*) AS cnt FROM sys.v_$open_cursor WHERE sid = :1",
+            &exec_sid_bind,
+        )
+        .expect("open cursor count query must succeed");
+
+        let top_sql = execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            r#"
+                SELECT sql_text, COUNT(*) AS cnt
+                FROM sys.v_$open_cursor
+                WHERE sid = :1
+                GROUP BY sql_text
+                ORDER BY COUNT(*) DESC, sql_text
+                FETCH FIRST 15 ROWS ONLY
+            "#,
+            &exec_sid_bind,
+        )
+        .expect("top open cursor SQL query must succeed");
+
+        eprintln!("diagnostic exec sid: {exec_sid}");
+        eprintln!(
+            "diagnostic candidate sessions after failure: {:?}",
+            candidate_sessions_after.rows
+        );
+        eprintln!(
+            "diagnostic open cursor count rows: {:?}",
+            open_cursor_count.rows
+        );
+        for row in top_sql.rows {
+            eprintln!("open cursor top SQL: {:?}", row);
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin diagnostic reproduced failures.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic helper for open cursors after test9/test10 batch"]
+    fn oracle_thin_diagnostic_open_cursors_after_test9_and_test10() {
+        cleanup_stale_local_oracle_test_sessions();
+
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let exec_sid_result = crate::db::oracle_thin::execute_select_all_with_binds(
+            active_thin_conn.as_ref(),
+            "SELECT SYS_CONTEXT('USERENV', 'SID') AS SID FROM dual",
+            &[],
+        )
+        .expect("execution SID lookup must succeed");
+        let sid_index = exec_sid_result
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case("SID"))
+            .expect("execution SID column must exist");
+        let exec_sid = exec_sid_result
+            .rows
+            .first()
+            .and_then(|row| row.get(sid_index))
+            .cloned()
+            .expect("execution SID row must exist");
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test9.txt;\n@test/test10.txt;\n",
+            "oracle-thin-test9-test10-script",
+            &session,
+            Some(Arc::clone(&active_thin_conn)),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test9-test10 via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test9-test10 cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+
+        let probe_conn =
+            connect_oracle_thin(&test_connection_info()).expect("probe connection must succeed");
+        let open_cursor_rows = crate::db::oracle_thin::execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            &format!(
+                "SELECT COUNT(*) AS open_cursor_count FROM sys.v_$open_cursor WHERE sid = {}",
+                exec_sid
+            ),
+            &[],
+        )
+        .expect("open cursor count query must succeed");
+        let top_sql_rows = crate::db::oracle_thin::execute_select_all_with_binds(
+            probe_conn.as_ref(),
+            &format!(
+                r#"
+                SELECT *
+                FROM (
+                    SELECT SUBSTR(sql_text, 1, 160) AS sql_text,
+                           COUNT(*) AS cursor_count
+                    FROM sys.v_$open_cursor
+                    WHERE sid = {}
+                    GROUP BY SUBSTR(sql_text, 1, 160)
+                    ORDER BY COUNT(*) DESC, SUBSTR(sql_text, 1, 160)
+                )
+                WHERE ROWNUM <= 20
+                "#,
+                exec_sid
+            ),
+            &[],
+        )
+        .expect("top open cursor query must succeed");
+
+        eprintln!(
+            "open cursors after test9/test10: {}",
+            open_cursor_rows.rows[0][0]
+        );
+        for row in top_sql_rows.rows {
+            if row.len() >= 2 {
+                eprintln!("{} | {}", row[1], row[0]);
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+        let _ = close_oracle_thin(probe_conn.as_ref());
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test18_to_test23_without_errors() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test18.sql;\n@test/test22.sql;\n@test/test23.sql;\n",
+            "oracle-thin-test18-test23-script",
+            &session,
+            Some(active_thin_conn),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test18-test23 via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut guard = lock_connection(&shared_connection);
+            guard.disconnect();
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Oracle thin failed to execute test/test18-test23 cleanly.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE at localhost:1521/FREE"]
+    fn oracle_thin_executes_test5_package_body_after_running_test1_to_test4() {
+        let shared_connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .connect(test_connection_info())
+                .expect("oracle thin pre-connect must succeed");
+            guard.session_state()
+        };
+
+        let active_thin_conn = {
+            let mut guard = lock_connection(&shared_connection);
+            guard
+                .require_live_oracle_thin_connection()
+                .expect("oracle thin connection handle must be available")
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let current_oracle_thin_connection: Arc<Mutex<Option<Arc<ThinConnection>>>> =
+            Arc::new(Mutex::new(Some(Arc::clone(&active_thin_conn))));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        SqlEditorWidget::execute_oracle_thin_batch(
+            &shared_connection,
+            &sender,
+            "@test/test1.txt;\n@test/test2.txt;\n@test/test3.txt;\n@test/test4.txt;\n",
+            "oracle-thin-script-test",
+            &session,
+            Some(Arc::clone(&active_thin_conn)),
+            &current_oracle_thin_connection,
+            &cancel_flag,
+            true,
+            Some(Duration::from_secs(300)),
+            false,
+            "Executing test/test1-4.txt via Oracle thin",
+        );
+        drop(sender);
+
+        let mut failures = Vec::new();
+        while let Ok(progress) = receiver.recv() {
+            if let QueryProgress::StatementFinished {
+                index,
+                result,
+                timed_out,
+                ..
+            } = progress
+            {
+                if timed_out || !result.success {
+                    failures.push(format!(
+                        "setup statement #{index} failed\nSQL:\n{}\nMessage:\n{}",
+                        result.sql, result.message
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "setup scripts test1-4 must succeed before package body regression check.\n\n{}",
+            failures.join("\n\n--------------------\n\n")
+        );
+
+        let mut package_body = None;
+        for item in crate::db::query::QueryExecutor::split_script_items_for_db_type(
+            include_str!("../../../test/test5.txt"),
+            Some(crate::db::connection::DatabaseType::OracleThin),
+        ) {
+            match item {
+                crate::db::ScriptItem::Statement(statement) => {
+                    if statement.starts_with("CREATE OR REPLACE PACKAGE BODY oqt_deep_pkg AS") {
+                        package_body = Some(statement);
+                        break;
+                    }
+                    crate::db::oracle_thin::execute_statement_with_binds(
+                        active_thin_conn.as_ref(),
+                        &statement,
+                        &[],
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "test5 setup statement before package body must succeed after test1-4.\n\nSQL:\n{statement}\n\n{err}"
+                        )
+                    });
+                    crate::db::oracle_thin::get_dbms_output(active_thin_conn.as_ref(), 10_000)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "DBMS_OUTPUT fetch after test5 setup statement must succeed.\n\nSQL:\n{statement}\n\n{err}"
+                            )
+                        });
+                }
+                crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::SetServerOutput {
+                    enabled,
+                    size,
+                    unlimited,
+                }) => {
+                    if enabled {
+                        let resolved_size = if unlimited {
+                            None
+                        } else {
+                            size.or(Some(1_000_000))
+                        };
+                        crate::db::oracle_thin::enable_dbms_output(
+                            active_thin_conn.as_ref(),
+                            resolved_size,
+                        )
+                        .expect("DBMS_OUTPUT enable must succeed");
+                    } else {
+                        crate::db::oracle_thin::disable_dbms_output(active_thin_conn.as_ref())
+                            .expect("DBMS_OUTPUT disable must succeed");
+                    }
+                }
+                crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::ShowErrors {
+                    ..
+                })
+                | crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::MysqlShowErrors)
+                | crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::Prompt { .. }) => {}
+                crate::db::ScriptItem::ToolCommand(other) => {
+                    panic!(
+                        "unexpected tool command before test5 package body after test1-4: {other:?}"
+                    );
+                }
+            }
+        }
+        let package_body = package_body.expect("test5 package body statement must be present");
+
+        let resolved_binds = {
+            let guard = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::db::query::QueryExecutor::resolve_binds(&package_body, &guard)
+                .expect("package body bind resolution must not fail")
+        };
+        assert!(
+            resolved_binds.is_empty(),
+            "test5 package body must not resolve client binds in script mode: {resolved_binds:?}"
+        );
+
+        crate::db::oracle_thin::execute_statement_with_binds(
+            active_thin_conn.as_ref(),
+            &package_body,
+            &[],
+        )
+        .expect("test5 package body must execute directly after running test1-4");
     }
 }
 
