@@ -3965,9 +3965,9 @@ impl SqlEditorWidget {
                         let result = match execution {
                             Ok(execution) => {
                                 let elapsed = statement_start.elapsed();
-                                let normalized =
-                                    QueryExecutor::normalize_sql_for_execute(&sql_text);
-                                let upper = normalized.to_ascii_uppercase();
+                                let cleaned =
+                                    SqlEditorWidget::strip_leading_comments(&sql_text);
+                                let upper = cleaned.to_ascii_uppercase();
                                 let dml_type = if upper.starts_with("INSERT") {
                                     Some("INSERT")
                                 } else if upper.starts_with("UPDATE") {
@@ -9857,8 +9857,8 @@ impl SqlEditorWidget {
     }
 
     fn should_fetch_oracle_thin_dbms_output_after_statement(sql: &str) -> bool {
-        let normalized = QueryExecutor::normalize_sql_for_execute(sql);
-        let upper = normalized.to_ascii_uppercase();
+        let cleaned = SqlEditorWidget::strip_leading_comments(sql);
+        let upper = cleaned.to_ascii_uppercase();
         let is_plsql_like = upper.starts_with("BEGIN")
             || upper.starts_with("DECLARE")
             || upper.starts_with("CALL")
