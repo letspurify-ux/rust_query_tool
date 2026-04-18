@@ -79,19 +79,38 @@ python thin의 external cancel은 `_break_external()`에서 시작한다.
 
 즉, cancel은 "보내는 쪽 한 번"으로 끝나지 않는다. 수신 측이 후속 응답까지 같은 호출 안에서 끝까지 먹어야 한다.
 
+**idempotent 보장**: `_break_external()`은 `if not self._break_in_progress:` 가드로 시작한다. 이미 break가 진행 중이면 no-op. cancel 경로가 레이스로 두 번 진입해도 OOB/`INTERRUPT` 전송은 한 번만 일어난다.
+
 ## 5. 공통 message type 소비 규칙
 
 `message.process()` 안에서는 message type 경계를 정확히 맞춰야 한다.
 
+### 5.1 `Message` 기본 dispatch
+
 | Message Type | 의미 | 소비 규칙 |
 | --- | --- | --- |
-| `4` | Error | `_process_error_info()` |
-| `8` | Parameter | return parameter payload 전체 소비 |
-| `9` | Status | `ub4 call_status` + `ub2 end_to_end_seq_num` |
-| `15` | Warning | warning payload 전체 소비 |
-| `23` | ServerSidePiggyback | opcode별 payload 전체 소비 |
-| `29` | EndOfResponse | 응답 종료 |
-| `33` | Token | `ub8` 1개 소비 |
+| `TNS_MSG_TYPE_ERROR` | Error | `_process_error_info()` |
+| `TNS_MSG_TYPE_WARNING` | Warning | `_process_warning_info()` |
+| `TNS_MSG_TYPE_TOKEN` | Token | `ub8` 1개 소비 (토큰 일치 검증) |
+| `TNS_MSG_TYPE_STATUS` | Status | `ub4 call_status` + `ub2 end_to_end_seq_num`. `supports_end_of_response=False`면 `end_of_response=True` 전환 |
+| `TNS_MSG_TYPE_PARAMETER` | Parameter | `_process_return_parameters()` |
+| `TNS_MSG_TYPE_SERVER_SIDE_PIGGYBACK` | ServerSidePiggyback | `_process_server_side_piggyback()` (opcode 분기) |
+| `TNS_MSG_TYPE_END_OF_RESPONSE` | EndOfResponse | `end_of_response = True` |
+| 기타 | — | `ERR_MESSAGE_TYPE_UNKNOWN` raise |
+
+### 5.2 `MessageWithData` 추가 dispatch (쿼리/DML/PLSQL 응답 전용)
+
+`MessageWithData._process_message()`는 base dispatch를 오버라이드해서 fetch/bind 관련 type을 먼저 처리하고, 매치 안 되면 `Message._process_message()`로 위임한다.
+
+| Message Type | 의미 | 소비 규칙 |
+| --- | --- | --- |
+| `TNS_MSG_TYPE_DESCRIBE_INFO` | 컬럼 메타 | `ub1 (skip)` 후 `_process_describe_info()` |
+| `TNS_MSG_TYPE_ROW_HEADER` | row 헤더 | `_process_row_header()` |
+| `TNS_MSG_TYPE_ROW_DATA` | row 바디 | `_process_row_data()` |
+| `TNS_MSG_TYPE_BIT_VECTOR` | 중복 컬럼 비트맵 | `_process_bit_vector()` |
+| `TNS_MSG_TYPE_IO_VECTOR` | bind in/out 구분 | `_process_io_vector()` |
+| `TNS_MSG_TYPE_FLUSH_OUT_BINDS` | PL/SQL out flush | flush flag 세팅 후 `end_of_response=True` |
+| `TNS_MSG_TYPE_IMPLICIT_RESULTSET` | DBMS_SQL.RETURN_RESULT | `_process_implicit_result()` |
 
 여기서 한 필드라도 덜 읽으면 다음 message type 경계가 틀어져 이후 packet 전체가 어긋난다.
 
@@ -349,6 +368,8 @@ loop num_pairs:
 
 ## 18. `_process_server_side_piggyback()` opcode별 필드 맵
 
+opcode 분기 전체를 테이블로 소비해야 한다. 매치 안 되면 즉시 `ERR_UNKNOWN_SERVER_PIGGYBACK`이 발생하므로, opcode별 payload 크기를 정확히 맞추는 것이 경계 유지의 전제 조건이다.
+
 ```
 ub1  opcode
 
@@ -524,3 +545,94 @@ if supports_oob AND supports_oob_check:
 ```
 
 이후 일반 `_process_message(protocol_message)` 호출로 흘러간다. OOB check에서 별도 응답을 읽지 않는 것이 핵심이다.
+
+## 24. `_process_row_data()` 규칙
+
+쿼리/PLSQL 응답에서 실제 row bytes를 먹는 함수다. `out_var_impls`(describe 단계에서 세팅)를 인덱스 순으로 순회한다.
+
+각 `var_impl`에 대해:
+
+```
+if var_impl.is_array:
+    ub4  num_elements_in_array
+    loop num_elements_in_array:
+        _process_column_data(buf, var_impl, elem_index)
+elif var_impl._is_returning:
+    ub4  num_rows
+    loop num_rows:
+        _process_column_data(buf, var_impl, row)
+elif var_impl.fetching_arrow:
+    if _is_duplicate_data(i): append duplicate
+    else: _process_column_data(buf, var_impl, row_index)
+elif _is_duplicate_data(i):
+    # 직전 row의 값을 그대로 복제
+    (읽지 않음)
+else:
+    _process_column_data(buf, var_impl, row_index)
+```
+
+루프가 끝나면:
+1. `row_index += 1`
+2. cursor 상태 갱신
+3. `on_row_completed()` 호출
+
+**핵심**: `_is_duplicate_data(i)`는 직전 `_process_bit_vector` 결과를 참조한다. bit_vector가 컬럼을 "중복"으로 표시하면 그 컬럼은 payload가 생략되어 있다. 이 경로에서 `read_*`를 호출하면 안 된다.
+
+## 25. `_process_column_data()` 규칙
+
+`ora_type_num`별 분기로 컬럼 하나를 소비한다.
+
+| ora_type_num | 소비 필드 |
+| --- | --- |
+| `ROWID` | `ub1 num_bytes`; >0이면 `read_rowid` |
+| `UROWID` | `read_urowid` |
+| `CURSOR` | `ub1 (skip)` → `_create_cursor_from_describe(buf, column_value)` → `ub2 cursor_id` |
+| `CLOB` / `BLOB` / `BFILE` | `read_lob_with_length` |
+| `JSON` | `read_oson` |
+| `VECTOR` | `read_vector` (fetching_arrow면 추가 변환) |
+| `OBJECT` | `read_dbobject(typ_impl)` 또는 (xml_type면) `read_xmltype` |
+| 그 외 | `read_oracle_data` |
+
+fetch가 아닌 경로(out bind)에서는 끝에 다음이 붙는다:
+```
+sb4  actual_num_bytes     (값이 음수이거나 max_size 초과면 truncated 에러)
+```
+
+LONG/LONG RAW 타입은 본 값 뒤에 고정 skip 2개:
+```
+sb4  (skip) chunk_size
+ub4  (skip) chunk_count
+```
+
+**핵심**: `_process_column_data`는 describe 정보(`metadata.dbtype._ora_type_num`)로 분기한다. 즉 §19 describe가 정확해야 §25가 맞는 경로를 탄다. 하나가 어긋나면 row 바디 전체가 틀어진다.
+
+## 26. `_process_io_vector()` 필드 맵
+
+DML/PLSQL bind 응답에서 in/out 구분을 서버가 알려주는 블록.
+
+```
+ub1  (skip) flag
+ub2  temp16              (num_requests)
+ub4  temp32              (num_iters)
+num_binds = temp32 * 256 + temp16
+ub4  (skip) num_iters_this_time
+ub2  (skip) uac_buffer_length
+ub2  num_bytes           (bit vector for fast fetch)
+if num_bytes > 0: raw(num_bytes)
+ub2  num_bytes           (rowid)
+if num_bytes > 0: raw(num_bytes)
+
+out_var_impls = []
+loop num_binds:
+  ub1  bind_dir
+  if bind_dir != TNS_BIND_DIR_INPUT:
+    out_var_impls.append(bind_info._bind_var_impl)
+```
+
+`_process_row_data`가 쓰는 `out_var_impls`가 여기서 만들어진다. 즉 io_vector를 빠뜨리면 이후 `ROW_DATA`에서 어떤 var를 읽어야 할지 결정할 수 없다.
+
+## 27. `_process_implicit_result()` 개요
+
+`DBMS_SQL.RETURN_RESULT`로 반환되는 암시적 result set(즉, bind되지 않은 cursor)을 받는 경로. 서버가 `TNS_MSG_TYPE_IMPLICIT_RESULTSET`을 보내면 내부 cursor list에 새 cursor를 append하고 describe 정보를 받아들인다. bind 경로와 달리 `out_var_impls`를 쓰지 않고, 새 cursor가 자체 fetch 상태를 가진다.
+
+**핵심**: PL/SQL 블록 응답에서 이 타입이 등장할 수 있으므로, 구현이 `MessageWithData` dispatch에 이 분기를 두지 않으면 해당 PL/SQL 결과가 누락되거나 이후 message 경계가 깨진다.
