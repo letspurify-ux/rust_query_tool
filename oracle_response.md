@@ -10,18 +10,22 @@
 
 sync thin 기준 핵심 흐름은 `BaseProtocol._process_message()` 하나로 묶여 있다.
 
-1. `message.send()`
-2. `_receive_packet(message, check_request_boundary=True)`
-3. `message.process(read_buf)`
-4. `flush_out_binds`가 있으면 추가 요청/응답 1회
-5. `_break_in_progress`가 살아 있으면:
+1. `reset_packets()` (write/read buffer 초기화)
+2. `message.send(write_buf)`
+3. `_receive_packet(message, check_request_boundary=True)`
+4. `message.process(read_buf)`
+5. `flush_out_binds`가 있으면 추가 요청/응답 1회
+6. `_break_in_progress`가 살아 있으면:
    - `supports_oob`일 때만 `INTERRUPT` marker 추가 전송
-   - 응답을 한 번 더 받음
+   - 응답을 한 번 더 받음 (`_receive_packet`)
    - `message.process(read_buf)`를 다시 실행
-6. `call_status` 처리
-7. `message.error_occurred`면 raise/retry
+   - `_break_in_progress = False`
+7. `_process_call_status(conn_impl, message.call_status)`
+8. `message.error_occurred`일 때:
+   - `message.retry`면 `error_occurred = False`로 리셋 후 `_process_message`를 **재귀 호출** (1번부터 다시)
+   - 아니면 `message._check_and_raise_exception()`
 
-즉, python thin은 "첫 응답 1개 읽고 끝"이 아니다. marker/reset과 external cancel 후속 응답까지 같은 호출 안에서 마저 소비한다.
+즉, python thin은 "첫 응답 1개 읽고 끝"이 아니다. marker/reset과 external cancel 후속 응답까지 같은 호출 안에서 마저 소비하고, retry 시에도 동일 루틴으로 재진입한다.
 
 ## 2. `_receive_packet()` 규칙
 
@@ -291,8 +295,10 @@ if ttc_field_version >= TNS_CCAP_FIELD_VERSION_20_1:
   ub4   (skip) server_checksum
 
 if info.num != 0:
-  str   error_message       (read_str, rstrip)
   error_occurred = True
+  if error_pos > 0:
+    info.pos = error_pos
+  str   error_message       (read_str, rstrip → info.message)
 
 if !supports_end_of_response:
   end_of_response = True
@@ -363,7 +369,10 @@ SESS_RET (4):
       ub2 len; if > 0: skip_bytes()   (key)
       ub2 len; if > 0: skip_bytes()   (value)
       ub2 (skip) flags
-  ub4  session_flags    (TNS_SESSGET_SESSION_CHANGED=4 → clear open cursors)
+  ub4  session_flags
+    if (session_flags & TNS_SESSGET_SESSION_CHANGED) AND drcp_establish_session:
+      statement_cache.clear_open_cursors()
+    drcp_establish_session = False
   ub4  session_id
   ub2  serial_num
 
@@ -432,6 +441,10 @@ ub2  (skip) version
 ub2  (skip) charset_id
 ub1  csfrm               → DbType 결정
 ub4  max_size
+if ora_type_num == ORA_TYPE_NUM_RAW:
+  max_size = buffer_size       (read 아님, override)
+if ttc_field_version >= TNS_CCAP_FIELD_VERSION_12_2:
+  ub4  (skip) oaccolid
 ub1  nulls_allowed
 ub1  (skip) v7_len_of_name
 str_with_length  name
@@ -439,7 +452,34 @@ str_with_length  schema
 str_with_length  object_name
 ub2  (skip) column_position
 ub4  uds_flags           (IS_JSON 0x1, IS_OSON 0x2)
+
+if ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1:
+  str_with_length  domain_schema
+  str_with_length  domain_name
+
+if ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_1_EXT_3:
+  ub4  num_annotations
+  if num_annotations > 0:
+    ub1  (skip)
+    ub4  num_annotations         (chunk length)
+    ub1  (skip)
+    loop num_annotations:
+      str_with_length  key
+      str_with_length  value     (NULL이면 "")
+      ub4  (skip) flags
+    ub4  (skip) outer_flags
+
+if ttc_field_version >= TNS_CCAP_FIELD_VERSION_23_4:
+  ub4  vector_dimensions
+  ub1  vector_format
+  ub1  vector_flags
+
+if ora_type_num == ORA_TYPE_NUM_OBJECT:
+  type_cache.get_type_for_info(oid, schema, None, type_name)
+    → is_xml_type이면 DB_TYPE_XMLTYPE, 아니면 objtype 저장
 ```
+
+**주의**: 23.x 서버에서는 `domain_schema/domain_name`, `annotations`, `vector_*` 필드가 반드시 소비돼야 한다. 이 블록을 빠뜨리면 metadata 경계가 밀려 이후 모든 packet이 깨진다.
 
 ## 20. `_process_row_header()` 필드 맵
 
