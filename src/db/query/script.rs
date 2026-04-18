@@ -11387,7 +11387,11 @@ impl QueryExecutor {
             };
         }
 
-        let cleaned = path.trim_matches('"').trim_matches('\'').to_string();
+        let cleaned = path
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_end_matches(';')
+            .to_string();
 
         ToolCommand::RunScript {
             path: cleaned,
