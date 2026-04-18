@@ -378,8 +378,8 @@ impl ConnectionDialog {
             let mut svc_label_dt = svc_label.clone();
             dbtype_choice.set_callback(move |choice| {
                 let idx = choice.value();
-                if idx == 0 {
-                    // Oracle
+                if idx == 0 || idx == 1 {
+                    // Oracle OCI or Oracle thin
                     svc_label_dt.set_label("Service:");
                     if port_input_dt.value() == "3306" {
                         port_input_dt.set_value("1521");
