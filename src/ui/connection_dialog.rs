@@ -23,17 +23,18 @@ use crate::utils::AppConfig;
 pub struct ConnectionDialog;
 
 fn db_type_from_choice_index(idx: i32) -> DatabaseType {
-    if idx <= 0 {
-        DatabaseType::Oracle
-    } else {
-        DatabaseType::MySQL
+    match idx {
+        0 => DatabaseType::Oracle,
+        1 => DatabaseType::OracleThin,
+        _ => DatabaseType::MySQL,
     }
 }
 
 fn choice_index_from_db_type(db_type: DatabaseType) -> i32 {
     match db_type {
         DatabaseType::Oracle => 0,
-        DatabaseType::MySQL => 1,
+        DatabaseType::OracleThin => 1,
+        DatabaseType::MySQL => 2,
     }
 }
 
@@ -93,10 +94,10 @@ fn build_connection_info(
         return Err("Host contains invalid characters".to_string());
     }
     let svc_label = match db_type {
-        DatabaseType::Oracle => "Service name",
+        DatabaseType::Oracle | DatabaseType::OracleThin => "Service name",
         DatabaseType::MySQL => "Database name",
     };
-    let requires_service_name = matches!(db_type, DatabaseType::Oracle);
+    let requires_service_name = matches!(db_type, DatabaseType::Oracle | DatabaseType::OracleThin);
     if requires_service_name && service_name.is_empty() {
         return Err(format!("{} is required", svc_label));
     }
@@ -226,8 +227,8 @@ impl ConnectionDialog {
         dbtype_label.set_label_color(theme::text_primary());
         dbtype_flex.fixed(&dbtype_label, FORM_LABEL_WIDTH);
         let mut dbtype_choice = Choice::default();
-        dbtype_choice.add_choice("Oracle|MySQL or MariaDB");
-        dbtype_choice.set_value(0); // Oracle by default
+        dbtype_choice.add_choice("Oracle (OCI)|Oracle (thin)|MySQL or MariaDB");
+        dbtype_choice.set_value(0); // Oracle OCI by default
         dbtype_choice.set_color(theme::input_bg());
         dbtype_choice.set_text_color(theme::text_primary());
         dbtype_flex.end();
@@ -377,8 +378,8 @@ impl ConnectionDialog {
             let mut svc_label_dt = svc_label.clone();
             dbtype_choice.set_callback(move |choice| {
                 let idx = choice.value();
-                if idx == 0 {
-                    // Oracle
+                if idx == 0 || idx == 1 {
+                    // Oracle OCI or Oracle thin
                     svc_label_dt.set_label("Service:");
                     if port_input_dt.value() == "3306" {
                         port_input_dt.set_value("1521");
@@ -915,10 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn db_type_choice_indexes_treat_any_non_oracle_item_as_mysql() {
+    fn db_type_choice_indexes_map_correctly() {
         assert_eq!(super::db_type_from_choice_index(0), DatabaseType::Oracle);
-        assert_eq!(super::db_type_from_choice_index(1), DatabaseType::MySQL);
+        assert_eq!(super::db_type_from_choice_index(1), DatabaseType::OracleThin);
         assert_eq!(super::db_type_from_choice_index(2), DatabaseType::MySQL);
+        assert_eq!(super::db_type_from_choice_index(99), DatabaseType::MySQL);
     }
 
     #[test]

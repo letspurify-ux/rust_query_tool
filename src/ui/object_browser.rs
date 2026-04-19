@@ -996,7 +996,7 @@ impl ObjectBrowserWidget {
 
     fn preview_select_sql(db_type: crate::db::DatabaseType, object_name: &str) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => {
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
                 format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name)
             }
             crate::db::DatabaseType::MySQL => format!(
@@ -1030,7 +1030,9 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_procedure_script(qualified_name),
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
+                Self::build_simple_procedure_script(qualified_name)
+            }
             crate::db::DatabaseType::MySQL => {
                 format!(
                     "CALL {}();\n",
@@ -1045,7 +1047,9 @@ impl ObjectBrowserWidget {
         qualified_name: &str,
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_function_script(qualified_name),
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
+                Self::build_simple_function_script(qualified_name)
+            }
             crate::db::DatabaseType::MySQL => format!(
                 "SELECT {} AS result;\n",
                 if qualified_name.contains('(') {
@@ -1216,7 +1220,7 @@ impl ObjectBrowserWidget {
         arguments: &[ProcedureArgument],
     ) -> String {
         match db_type {
-            crate::db::DatabaseType::Oracle => {
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => {
                 Self::build_procedure_script(qualified_name, arguments)
             }
             crate::db::DatabaseType::MySQL => {
@@ -1761,6 +1765,9 @@ impl ObjectBrowserWidget {
                                             })
                                             .map_err(|err| err.to_string())
                                         }),
+                                    crate::db::DatabaseType::OracleThin => {
+                                        Err("Routine browser not supported in Oracle thin mode".to_string())
+                                    }
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -1988,6 +1995,9 @@ impl ObjectBrowserWidget {
                                             )
                                             .map_err(|err| err.to_string())
                                         }),
+                                    crate::db::DatabaseType::OracleThin => {
+                                        Err("Table structure not supported in Oracle thin mode".to_string())
+                                    }
                                 };
                                 let _ = sender.send(ObjectActionResult::TableStructure {
                                     table_name,
@@ -2038,6 +2048,9 @@ impl ObjectBrowserWidget {
                                             )
                                             .map_err(|err| err.to_string())
                                         }),
+                                    crate::db::DatabaseType::OracleThin => {
+                                        Err("Index browser not supported in Oracle thin mode".to_string())
+                                    }
                                 };
                                 let _ = sender
                                     .send(ObjectActionResult::TableIndexes { table_name, result });
@@ -2086,6 +2099,9 @@ impl ObjectBrowserWidget {
                                             )
                                             .map_err(|err| err.to_string())
                                         }),
+                                    crate::db::DatabaseType::OracleThin => {
+                                        Err("Constraints browser not supported in Oracle thin mode".to_string())
+                                    }
                                 };
                                 let _ = sender.send(ObjectActionResult::TableConstraints {
                                     table_name,
@@ -2282,6 +2298,9 @@ impl ObjectBrowserWidget {
                                                     .map_err(|err| err.to_string())
                                                 }),
                                         },
+                                        crate::db::DatabaseType::OracleThin => {
+                                            Err("DDL generation not supported in Oracle thin mode".to_string())
+                                        }
                                     };
                                     let _ = sender.send(ObjectActionResult::Ddl(result));
                                     app::awake();
@@ -2738,6 +2757,10 @@ impl ObjectBrowserWidget {
 
                 Some((db_type, cache))
             }
+            DatabaseType::OracleThin => {
+                // Oracle thin mode: object browser not yet implemented.
+                None
+            }
         }
     }
 
@@ -2788,7 +2811,7 @@ impl ObjectBrowserWidget {
         cache: &ObjectCache,
     ) -> Vec<&'static str> {
         match db_type {
-            crate::db::DatabaseType::Oracle => vec![
+            crate::db::DatabaseType::Oracle | crate::db::DatabaseType::OracleThin => vec![
                 "Tables",
                 "Views",
                 "Procedures",

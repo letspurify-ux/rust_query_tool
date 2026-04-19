@@ -358,6 +358,7 @@ pub struct SqlEditorWidget {
     query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+    current_thin_cancel_handle: Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
@@ -707,6 +708,7 @@ impl SqlEditorWidget {
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
+        let current_thin_cancel_handle = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
         let intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
@@ -742,6 +744,7 @@ impl SqlEditorWidget {
             query_running: query_running.clone(),
             current_query_connection,
             current_mysql_cancel_context,
+            current_thin_cancel_handle,
             cancel_flag,
             intellisense_data,
             intellisense_popup,
@@ -1189,6 +1192,9 @@ impl SqlEditorWidget {
                             },
                         )
                     }
+                    crate::db::DatabaseType::OracleThin => {
+                        Err("Explain plan not supported in Oracle thin mode".to_string())
+                    }
                 };
 
                 let _ = sender.send(UiActionResult::ExplainPlan(result));
@@ -1392,6 +1398,9 @@ impl SqlEditorWidget {
                             |mysql_conn| mysql_conn.query_drop(mysql_sql),
                         )
                     }
+                    crate::db::DatabaseType::OracleThin => {
+                        Err("Transaction action not supported in Oracle thin mode".to_string())
+                    }
                 };
 
                 let _ = sender.send(make_ui_result(result));
@@ -1457,8 +1466,16 @@ impl SqlEditorWidget {
         // Set cancel flag immediately so the execution thread can check it
         store_mutex_bool(&self.cancel_flag, true);
 
+        // For Oracle Thin: signal the cancel flag directly on the client
+        if let Ok(guard) = self.current_thin_cancel_handle.lock() {
+            if let Some(ref handle) = *guard {
+                handle.cancel();
+            }
+        }
+
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
+        let current_thin_cancel_handle = self.current_thin_cancel_handle.clone();
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
@@ -1467,11 +1484,10 @@ impl SqlEditorWidget {
                 SqlEditorWidget::clone_current_query_connection(&current_query_connection);
             let mut mysql_cancel_context =
                 SqlEditorWidget::clone_current_mysql_cancel_context(&current_mysql_cancel_context);
+            let thin_handle = SqlEditorWidget::clone_thin_cancel_handle(&current_thin_cancel_handle);
 
-            if !SqlEditorWidget::is_query_running_flag(&query_running)
-                && conn.is_none()
-                && mysql_cancel_context.is_none()
-            {
+            let has_any_handle = conn.is_some() || mysql_cancel_context.is_some() || thin_handle.is_some();
+            if !SqlEditorWidget::is_query_running_flag(&query_running) && !has_any_handle {
                 // Execution can still be transitioning into "running" and may not
                 // have published current_query_connection yet. Wait briefly so a
                 // cancel click that races with query start can still interrupt.
@@ -1494,10 +1510,8 @@ impl SqlEditorWidget {
                 }
             }
 
-            if !SqlEditorWidget::is_query_running_flag(&query_running)
-                && conn.is_none()
-                && mysql_cancel_context.is_none()
-            {
+            let has_any_handle = conn.is_some() || mysql_cancel_context.is_some() || thin_handle.is_some();
+            if !SqlEditorWidget::is_query_running_flag(&query_running) && !has_any_handle {
                 // This editor is idle. Do not attempt to cancel through the
                 // global DB connection because that can interrupt a query that
                 // is currently running in a different editor tab.
@@ -1507,7 +1521,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() && mysql_cancel_context.is_none() {
+            if conn.is_none() && mysql_cancel_context.is_none() && thin_handle.is_none() {
                 // Execution may still be initializing the DB connection.
                 // Wait briefly so a single cancel click can still interrupt reliably.
                 for _ in 0..40 {
@@ -1535,7 +1549,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if conn.is_none() && mysql_cancel_context.is_none() {
+            if conn.is_none() && mysql_cancel_context.is_none() && thin_handle.is_none() {
                 // The worker has not published a break-able connection yet.
                 // Keep cancel requested so execution stops at the first safe
                 // cancellation point, and surface a status update instead of
@@ -1547,6 +1561,10 @@ impl SqlEditorWidget {
 
             let result = if conn.is_some() {
                 SqlEditorWidget::break_current_query_connection(conn)
+            } else if let Some(ref handle) = thin_handle {
+                // Oracle Thin: cancel flag already set; also signal the client.
+                handle.cancel();
+                Ok(())
             } else {
                 SqlEditorWidget::break_current_mysql_query(mysql_cancel_context, &cancel_flag)
             };
@@ -1581,6 +1599,25 @@ impl SqlEditorWidget {
                 eprintln!("Warning: MySQL cancel context lock was poisoned; recovering.");
                 poisoned.into_inner().clone()
             }
+        }
+    }
+
+    fn clone_thin_cancel_handle(
+        current: &Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
+    ) -> Option<crate::db::OracleThinCancelHandle> {
+        match current.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub(super) fn set_current_thin_cancel_handle(
+        current: &Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
+        value: Option<crate::db::OracleThinCancelHandle>,
+    ) {
+        match current.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => *poisoned.into_inner() = value,
         }
     }
 

@@ -1295,7 +1295,8 @@ pub(crate) fn is_sql_keyword_for_db(
     db_type: crate::db::connection::DatabaseType,
 ) -> bool {
     match db_type {
-        crate::db::connection::DatabaseType::Oracle => is_oracle_sql_keyword(word),
+        crate::db::connection::DatabaseType::Oracle
+        | crate::db::connection::DatabaseType::OracleThin => is_oracle_sql_keyword(word),
         crate::db::connection::DatabaseType::MySQL => is_mysql_sql_keyword(word),
     }
 }
@@ -2170,7 +2171,8 @@ pub(crate) fn mysql_compatibility_for_sql(
 ) -> bool {
     match preferred_db_type {
         Some(crate::db::connection::DatabaseType::MySQL) => true,
-        Some(crate::db::connection::DatabaseType::Oracle) => false,
+        Some(crate::db::connection::DatabaseType::Oracle)
+        | Some(crate::db::connection::DatabaseType::OracleThin) => false,
         None => {
             if !should_cache_mysql_compatibility(sql) {
                 return sql_uses_mysql_compatible_syntax(sql);

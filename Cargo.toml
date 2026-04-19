@@ -30,6 +30,8 @@ once_cell = "1.19"
 keyring = { version = "3", default-features = false }
 libc = "0.2"
 miniquad = "0.4"
+oracle-rs = { path = "vendor/oracle-rs" }
+tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }

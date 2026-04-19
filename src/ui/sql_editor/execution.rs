@@ -86,6 +86,7 @@ struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+    current_thin_cancel_handle: Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
@@ -97,6 +98,7 @@ impl QueryExecutionCleanupGuard {
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        current_thin_cancel_handle: Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
     ) -> Self {
@@ -104,6 +106,7 @@ impl QueryExecutionCleanupGuard {
             sender,
             current_query_connection,
             current_mysql_cancel_context,
+            current_thin_cancel_handle,
             cancel_flag,
             query_running,
             timeout_connection: None,
@@ -126,6 +129,7 @@ impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
         SqlEditorWidget::set_current_mysql_cancel_context(&self.current_mysql_cancel_context, None);
+        SqlEditorWidget::set_current_thin_cancel_handle(&self.current_thin_cancel_handle, None);
         store_mutex_bool(&self.cancel_flag, false);
         // Keep execution state fail-safe even if the UI progress poller has
         // stopped (e.g. tab closed while worker thread is still unwinding).
@@ -709,6 +713,274 @@ impl SqlEditorWidget {
             Ok(guard) => guard.mysql_delimiter.clone(),
             Err(poisoned) => poisoned.into_inner().mysql_delimiter.clone(),
         }
+    }
+
+    // ─── Oracle Thin batch executor ─────────────────────────────────────────
+
+    /// Executes a SQL script via the pure-Rust Oracle Thin driver.
+    ///
+    /// The execution model is intentionally structurally identical to
+    /// `execute_mysql_batch`: it walks the same `ScriptItem` list, emits the
+    /// same `QueryProgress` messages, and respects the same `cancel_flag` and
+    /// session `continue_on_error` semantics so the rest of the UI is unaware
+    /// of which Oracle driver is active.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_thin_oracle_batch(
+        thin_client: Option<std::sync::Arc<crate::db::OracleThinClient>>,
+        sender: &mpsc::Sender<QueryProgress>,
+        sql_text: &str,
+        conn_name: &str,
+        session: &Arc<Mutex<SessionState>>,
+        current_thin_cancel_handle: &Arc<Mutex<Option<crate::db::OracleThinCancelHandle>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        script_mode: bool,
+        query_timeout: Option<Duration>,
+    ) {
+        use crate::db::OracleThinExecutor;
+
+        let items = super::query_text::split_script_items_for_db_type(
+            sql_text,
+            Some(crate::db::connection::DatabaseType::OracleThin),
+        );
+        if items.is_empty() {
+            return;
+        }
+
+        let _ = sender.send(QueryProgress::BatchStart);
+        app::awake();
+
+        let mut result_index = 0usize;
+        let mut continue_on_error = {
+            match session.lock() {
+                Ok(g) => g.continue_on_error,
+                Err(p) => p.into_inner().continue_on_error,
+            }
+        };
+        let mut stop_execution = false;
+        let mut frames = vec![ScriptExecutionFrame {
+            items,
+            index: 0,
+            base_dir: env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            source_path: None,
+        }];
+
+        while !frames.is_empty() {
+            if stop_execution || load_mutex_bool(cancel_flag) {
+                break;
+            }
+
+            let Some((item, _base_dir)) = ({
+                let frame = match frames.last_mut() {
+                    Some(f) => f,
+                    None => break,
+                };
+                if frame.index >= frame.items.len() {
+                    None
+                } else {
+                    let item = frame.items[frame.index].clone();
+                    frame.index += 1;
+                    Some((item, frame.base_dir.clone()))
+                }
+            }) else {
+                frames.pop();
+                continue;
+            };
+
+            match item {
+                ScriptItem::ToolCommand(cmd) => {
+                    // Handle the subset of tool commands that make sense for Oracle Thin.
+                    // Session-state commands (SET ERRORC, SET AUTOCOMMIT, PROMPT, etc.) are
+                    // forwarded to the shared SessionState.
+                    use crate::db::query::ToolCommand;
+                    match cmd {
+                        ToolCommand::SetErrorContinue { enabled } => {
+                            if let Ok(mut g) = session.lock() {
+                                g.continue_on_error = enabled;
+                            }
+                            continue_on_error = enabled;
+                        }
+                        ToolCommand::SetEcho { enabled } => {
+                            if let Ok(mut g) = session.lock() {
+                                g.echo_enabled = enabled;
+                            }
+                        }
+                        ToolCommand::SetNull { null_text: nt } => {
+                            if let Ok(mut g) = session.lock() {
+                                g.null_text = nt.clone();
+                            }
+                        }
+                        ToolCommand::Prompt { text } => {
+                            let _ = sender.send(QueryProgress::ScriptOutput {
+                                lines: vec![text],
+                            });
+                            app::awake();
+                        }
+                        ToolCommand::Exit | ToolCommand::Quit => {
+                            stop_execution = true;
+                        }
+                        ToolCommand::Unsupported { raw, message, .. } => {
+                            if script_mode {
+                                let _ = sender.send(QueryProgress::ScriptOutput {
+                                    lines: vec![format!("-- Skipped: {}: {}", raw.trim(), message)],
+                                });
+                                app::awake();
+                            }
+                        }
+                        _ => {
+                            // All remaining tool commands are not supported in Oracle Thin mode.
+                            if script_mode {
+                                let _ = sender.send(QueryProgress::ScriptOutput {
+                                    lines: vec![format!("-- Note: tool command not supported in Oracle thin mode")],
+                                });
+                                app::awake();
+                            }
+                        }
+                    }
+                }
+                ScriptItem::Statement(sql) => {
+                    if load_mutex_bool(cancel_flag) {
+                        break;
+                    }
+
+                    let _ = sender.send(QueryProgress::StatementStart { index: result_index });
+                    app::awake();
+
+                    let echo_enabled = match session.lock() {
+                        Ok(g) => g.echo_enabled,
+                        Err(p) => p.into_inner().echo_enabled,
+                    };
+                    if echo_enabled {
+                        let _ = sender.send(QueryProgress::ScriptOutput {
+                            lines: vec![format!("{}", sql.trim())],
+                        });
+                        app::awake();
+                    }
+
+                    let Some(ref client) = thin_client else {
+                        let result = crate::db::query::QueryResult::new_error(
+                            &sql,
+                            crate::db::NOT_CONNECTED_MESSAGE,
+                        );
+                        let _ = sender.send(QueryProgress::StatementFinished {
+                            index: result_index,
+                            result,
+                            connection_name: conn_name.to_string(),
+                            timed_out: false,
+                        });
+                        app::awake();
+                        stop_execution = true;
+                        continue;
+                    };
+
+                    // Check timeout
+                    let _ = client.set_call_timeout(query_timeout);
+
+                    // Streaming execution via OracleThinExecutor
+                    let current_null_text = {
+                        match session.lock() {
+                            Ok(g) => g.null_text.clone(),
+                            Err(p) => p.into_inner().null_text.clone(),
+                        }
+                    };
+
+                    let sender_for_rows = sender.clone();
+                    let cancel_for_rows = cancel_flag.clone();
+                    let result_index_for_rows = result_index;
+
+                    let mut select_started = false;
+                    let mut row_count_for_result = 0usize;
+                    let mut columns_for_result: Vec<crate::db::ColumnInfo> = Vec::new();
+
+                    let mut pending_rows: Vec<Vec<String>> = Vec::new();
+                    let mut last_flush = Instant::now();
+
+                    let mut on_select_start = |cols: &[crate::db::ColumnInfo]| {
+                        columns_for_result = cols.to_vec();
+                        select_started = true;
+                        let col_names = cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+                        let _ = sender_for_rows.send(QueryProgress::SelectStart {
+                            index: result_index_for_rows,
+                            columns: col_names,
+                            null_text: current_null_text.clone(),
+                        });
+                        app::awake();
+                    };
+
+                    let mut on_row = |row: Vec<String>| {
+                        if load_mutex_bool(&cancel_for_rows) {
+                            return false;
+                        }
+                        row_count_for_result += 1;
+                        pending_rows.push(row);
+
+                        let should_flush = pending_rows.len() >= PROGRESS_ROWS_INITIAL_BATCH
+                            || last_flush.elapsed() >= Duration::from_millis(200);
+
+                        if should_flush {
+                            let batch = std::mem::take(&mut pending_rows);
+                            let _ = sender_for_rows.send(QueryProgress::Rows {
+                                index: result_index_for_rows,
+                                rows: batch,
+                            });
+                            app::awake();
+                            last_flush = Instant::now();
+                        }
+                        true
+                    };
+
+                    let exec_result = OracleThinExecutor::execute_streaming(
+                        client,
+                        &sql,
+                        &mut on_select_start,
+                        &mut on_row,
+                    );
+
+                    // Flush remaining rows
+                    if !pending_rows.is_empty() {
+                        let _ = sender.send(QueryProgress::Rows {
+                            index: result_index,
+                            rows: std::mem::take(&mut pending_rows),
+                        });
+                        app::awake();
+                    }
+
+                    let timed_out = false; // oracle-rs timeout via connection flag
+                    let (result, was_cancelled) = match exec_result {
+                        Ok((mut qr, cancelled)) => {
+                            if select_started {
+                                qr.columns = columns_for_result.clone();
+                                qr.row_count = row_count_for_result;
+                            }
+                            (qr, cancelled)
+                        }
+                        Err(err) => {
+                            let qr = crate::db::query::QueryResult::new_error(&sql, &err);
+                            (qr, false)
+                        }
+                    };
+
+                    let result_success = result.success;
+                    let _ = sender.send(QueryProgress::StatementFinished {
+                        index: result_index,
+                        result,
+                        connection_name: conn_name.to_string(),
+                        timed_out,
+                    });
+                    app::awake();
+
+                    result_index += 1;
+
+                    if was_cancelled || load_mutex_bool(cancel_flag) || timed_out
+                        || (!result_success && !continue_on_error)
+                    {
+                        stop_execution = true;
+                    }
+                }
+            }
+        }
+
+        // Drop the cancel handle when done
+        SqlEditorWidget::set_current_thin_cancel_handle(current_thin_cancel_handle, None);
     }
 
     fn build_mysql_batch_items(
@@ -1828,6 +2100,7 @@ impl SqlEditorWidget {
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
+        let current_thin_cancel_handle = self.current_thin_cancel_handle.clone();
         let cancel_flag = self.cancel_flag.clone();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
@@ -1843,6 +2116,7 @@ impl SqlEditorWidget {
                     sender.clone(),
                     current_query_connection.clone(),
                     current_mysql_cancel_context.clone(),
+                    current_thin_cancel_handle.clone(),
                     cancel_flag.clone(),
                     query_running.clone(),
                 );
@@ -1899,6 +2173,56 @@ impl SqlEditorWidget {
                         query_timeout,
                         auto_commit,
                         &db_activity,
+                    );
+                    return;
+                }
+
+                // ── Oracle Thin (pure-Rust TNS) ──────────────────────────────
+                if db_type == crate::db::DatabaseType::OracleThin {
+                    if startup_policy.requires_connected_session
+                        && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
+                    {
+                        let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &message,
+                            None,
+                        );
+                        return;
+                    }
+
+                    let thin_client = conn_guard.get_thin_connection();
+                    let thin_cancel = conn_guard.oracle_thin_cancel_handle();
+
+                    if conn_guard.is_connected() {
+                        conn_name = conn_guard.get_info().name.clone();
+                    } else {
+                        conn_name.clear();
+                    }
+
+                    drop(conn_guard);
+
+                    // Publish the thin cancel handle for the cancel button
+                    SqlEditorWidget::set_current_thin_cancel_handle(
+                        &current_thin_cancel_handle,
+                        thin_cancel,
+                    );
+
+                    SqlEditorWidget::execute_thin_oracle_batch(
+                        thin_client,
+                        &sender,
+                        &sql_text,
+                        &conn_name,
+                        &session,
+                        &current_thin_cancel_handle,
+                        &cancel_flag,
+                        script_mode,
+                        query_timeout,
                     );
                     return;
                 }

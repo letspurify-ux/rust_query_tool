@@ -8,6 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::db::oracle_thin::client::{OracleThinCancelHandle, OracleThinClient};
 use crate::db::session::SessionState;
 use crate::utils::logging;
 
@@ -20,13 +21,23 @@ const ORACLE_CLIENT_LIB_ENV_VAR: &str = "ORACLE_CLIENT_LIB_DIR";
 pub enum DatabaseType {
     #[default]
     Oracle,
+    /// Oracle via pure-Rust TNS driver (no OCI / Instant Client required)
+    OracleThin,
     MySQL,
+}
+
+impl DatabaseType {
+    /// Returns true for both OCI and thin Oracle connection types.
+    pub fn is_oracle(self) -> bool {
+        matches!(self, DatabaseType::Oracle | DatabaseType::OracleThin)
+    }
 }
 
 impl fmt::Display for DatabaseType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DatabaseType::Oracle => write!(f, "Oracle"),
+            DatabaseType::Oracle => write!(f, "Oracle (OCI)"),
+            DatabaseType::OracleThin => write!(f, "Oracle (thin)"),
             DatabaseType::MySQL => write!(f, "MySQL"),
         }
     }
@@ -101,7 +112,9 @@ impl ConnectionInfo {
 
     pub fn connection_string(&self) -> String {
         match self.db_type {
-            DatabaseType::Oracle => format!("//{}:{}/{}", self.host, self.port, self.service_name),
+            DatabaseType::Oracle | DatabaseType::OracleThin => {
+                format!("//{}:{}/{}", self.host, self.port, self.service_name)
+            }
             DatabaseType::MySQL => {
                 let database = self.service_name.trim();
                 if database.is_empty() {
@@ -115,7 +128,10 @@ impl ConnectionInfo {
 
     pub fn default_for(db_type: DatabaseType) -> Self {
         match db_type {
-            DatabaseType::Oracle => Self::default(),
+            DatabaseType::Oracle | DatabaseType::OracleThin => Self {
+                db_type,
+                ..Self::default()
+            },
             DatabaseType::MySQL => Self {
                 name: String::new(),
                 username: String::new(),
@@ -131,7 +147,7 @@ impl ConnectionInfo {
     /// The label used for the service_name field depending on database type.
     pub fn service_name_label(&self) -> &'static str {
         match self.db_type {
-            DatabaseType::Oracle => "Service Name",
+            DatabaseType::Oracle | DatabaseType::OracleThin => "Service Name",
             DatabaseType::MySQL => "Database",
         }
     }
@@ -159,6 +175,8 @@ impl Default for ConnectionInfo {
 
 pub enum DbConnection {
     Oracle(Arc<Connection>),
+    /// Pure-Rust Oracle connection (oracle-rs, no Instant Client needed)
+    OracleThin(Arc<OracleThinClient>),
     MySQL(mysql::Conn),
 }
 
@@ -171,6 +189,8 @@ pub struct DatabaseConnection {
     session: Arc<Mutex<SessionState>>,
     last_disconnect_reason: Option<String>,
     connection_generation: u64,
+    /// Cancel handle for the current Oracle Thin connection (if any).
+    oracle_thin_cancel: Option<OracleThinCancelHandle>,
 }
 
 impl DatabaseConnection {
@@ -199,11 +219,12 @@ impl DatabaseConnection {
             session: Arc::new(Mutex::new(SessionState::default())),
             last_disconnect_reason: None,
             connection_generation: 0,
+            oracle_thin_cancel: None,
         }
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), String> {
-        let db_conn = match info.db_type {
+        let (db_conn, thin_cancel) = match info.db_type {
             DatabaseType::Oracle => {
                 ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
                 let conn_str = info.connection_string();
@@ -216,7 +237,22 @@ impl DatabaseConnection {
                     )?,
                 );
                 Self::apply_oracle_default_session_settings(connection.as_ref());
-                DbConnection::Oracle(connection)
+                (DbConnection::Oracle(connection), None)
+            }
+            DatabaseType::OracleThin => {
+                let (client, cancel_handle) = OracleThinClient::connect(
+                    &info.host,
+                    info.port,
+                    &info.service_name,
+                    &info.username,
+                    &info.password,
+                )
+                .map_err(|err| {
+                    eprintln!("Oracle thin connection error: {err}");
+                    err
+                })?;
+                client.apply_default_session_settings()?;
+                (DbConnection::OracleThin(Arc::new(client)), Some(cancel_handle))
             }
             DatabaseType::MySQL => {
                 let opts = Self::build_mysql_opts(&info);
@@ -226,14 +262,14 @@ impl DatabaseConnection {
                 })?;
                 Self::apply_mysql_default_session_settings(&mut conn);
                 Self::apply_mysql_autocommit_setting(&mut conn, self.auto_commit);
-                DbConnection::MySQL(conn)
+                (DbConnection::MySQL(conn), None)
             }
         };
-
         // Swap in the new connection only after a successful handshake.
         // This preserves the active session when users mistype credentials
         // during reconnect attempts.
         self.connection = Some(db_conn);
+        self.oracle_thin_cancel = thin_cancel;
         let db_type = info.db_type;
         let new_session_password = if db_type == DatabaseType::MySQL {
             info.password.clone()
@@ -309,6 +345,7 @@ impl DatabaseConnection {
     fn clear_connection_state(&mut self, disconnect_reason: Option<String>) {
         let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
+        self.oracle_thin_cancel = None;
         self.connected = false;
         self.last_disconnect_reason = disconnect_reason;
         self.info = ConnectionInfo::default();
@@ -329,14 +366,36 @@ impl DatabaseConnection {
             .unwrap_or_else(|| NOT_CONNECTED_MESSAGE.to_string())
     }
 
-    /// Returns the Oracle connection if connected to Oracle.
+    /// Returns the OCI Oracle connection if connected to Oracle (OCI mode).
     /// For backward compatibility with existing Oracle-specific code paths.
     pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
         let db_conn = self.require_live_db_connection()?;
         match db_conn {
             DbConnection::Oracle(conn) => Ok(conn),
+            DbConnection::OracleThin(_) => {
+                Err("Expected Oracle OCI connection but found Oracle Thin".to_string())
+            }
             DbConnection::MySQL(_) => Err("Expected Oracle connection but found MySQL".to_string()),
         }
+    }
+
+    /// Returns the Oracle Thin client if connected in thin mode.
+    pub fn require_live_thin_connection(&mut self) -> Result<Arc<OracleThinClient>, String> {
+        let db_conn = self.require_live_db_connection()?;
+        match db_conn {
+            DbConnection::OracleThin(client) => Ok(client),
+            DbConnection::Oracle(_) => {
+                Err("Expected Oracle Thin connection but found Oracle OCI".to_string())
+            }
+            DbConnection::MySQL(_) => {
+                Err("Expected Oracle Thin connection but found MySQL".to_string())
+            }
+        }
+    }
+
+    /// Returns the Oracle Thin cancel handle for the current connection, if any.
+    pub fn oracle_thin_cancel_handle(&self) -> Option<OracleThinCancelHandle> {
+        self.oracle_thin_cancel.clone()
     }
 
     /// Returns the underlying DbConnection enum for dispatch-based code.
@@ -380,12 +439,23 @@ impl DatabaseConnection {
     pub fn get_db_connection(&self) -> Option<DbConnection> {
         match &self.connection {
             Some(DbConnection::Oracle(conn)) => Some(DbConnection::Oracle(Arc::clone(conn))),
+            Some(DbConnection::OracleThin(client)) => {
+                Some(DbConnection::OracleThin(Arc::clone(client)))
+            }
             Some(DbConnection::MySQL(_)) => {
                 // MySQL connections are not Arc-wrapped; return None here.
                 // Use get_mysql_connection_mut() via mutable access instead.
                 None
             }
             None => None,
+        }
+    }
+
+    /// Returns the Oracle Thin client Arc if connected in thin mode.
+    pub fn get_thin_connection(&self) -> Option<Arc<OracleThinClient>> {
+        match &self.connection {
+            Some(DbConnection::OracleThin(client)) => Some(Arc::clone(client)),
+            _ => None,
         }
     }
 
@@ -413,6 +483,7 @@ impl DatabaseConnection {
             return None;
         }
 
+
         let mut info = self.info.clone();
         info.password = self.session_password.clone();
         Some(info)
@@ -424,8 +495,12 @@ impl DatabaseConnection {
 
     pub fn set_auto_commit(&mut self, enabled: bool) {
         self.auto_commit = enabled;
-        if let Some(DbConnection::MySQL(conn)) = self.connection.as_mut() {
-            Self::apply_mysql_autocommit_setting(conn, enabled);
+        match self.connection.as_mut() {
+            Some(DbConnection::MySQL(conn)) => {
+                Self::apply_mysql_autocommit_setting(conn, enabled);
+            }
+            // Oracle (OCI and thin) auto-commit is managed per-statement; nothing to set here.
+            _ => {}
         }
     }
 
@@ -461,6 +536,22 @@ impl DatabaseConnection {
                     eprintln!("Connection error: {err}");
                     err.to_string()
                 })?;
+                Ok(())
+            }
+            DatabaseType::OracleThin => {
+                let (client, _cancel) = OracleThinClient::connect(
+                    &info.host,
+                    info.port,
+                    &info.service_name,
+                    &info.username,
+                    &info.password,
+                )
+                .map_err(|err| {
+                    eprintln!("Oracle thin connection test error: {err}");
+                    err
+                })?;
+                // Quick smoke-test: select 1 from dual
+                let _ = client.query("SELECT 1 FROM DUAL", &[]);
                 Ok(())
             }
             DatabaseType::MySQL => {

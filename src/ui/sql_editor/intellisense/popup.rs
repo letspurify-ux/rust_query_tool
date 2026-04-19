@@ -198,6 +198,9 @@ impl SqlEditorWidget {
                 .and_then(|mysql_conn| {
                     Self::describe_mysql_object(mysql_conn, object_name, qualifier)
                 }),
+            crate::db::DatabaseType::OracleThin => {
+                Err("Quick describe not supported in Oracle thin mode".to_string())
+            }
         }
     }
 

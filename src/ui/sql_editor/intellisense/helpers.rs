@@ -191,6 +191,7 @@ impl SqlEditorWidget {
                 },
                 Err(_) => (Vec::new(), false),
             },
+            crate::db::DatabaseType::OracleThin => (Vec::new(), false),
             crate::db::DatabaseType::MySQL => conn_guard
                 .get_mysql_connection_mut()
                 .map(|mysql_conn| {

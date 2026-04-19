@@ -1227,7 +1227,9 @@ impl<'a> FoldedWord<'a> {
                     || sql_text::is_mysql_sql_keyword(upper_ref),
                 sql_text::is_sql_keyword_for_db(upper_ref, db_type),
                 match db_type {
-                    DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper_ref),
+                    DatabaseType::Oracle | DatabaseType::OracleThin => {
+                        ORACLE_FUNCTIONS_SET.contains(upper_ref)
+                    }
                     DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper_ref),
                 },
                 is_alias_eligible_plsql_control_keyword(upper_ref),

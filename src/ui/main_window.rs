@@ -2440,6 +2440,10 @@ impl MainWindow {
 
                     (tables, views, procedures, functions, Vec::new())
                 }
+                crate::db::DatabaseType::OracleThin => {
+                    // Oracle thin mode: schema metadata not yet implemented; skip.
+                    return None;
+                }
             };
 
             (
