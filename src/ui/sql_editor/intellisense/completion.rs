@@ -91,9 +91,21 @@ impl SqlEditorWidget {
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
         let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
-        let preferred_db_type = match connection.lock() {
-            Ok(conn_guard) => conn_guard.db_type(),
-            Err(poisoned) => poisoned.into_inner().db_type(),
+        // Avoid blocking the UI thread on the connection mutex (which the
+        // schema refresh worker or a running query may be holding). Fall back
+        // to the last observed db_type; it only changes on (re)connect.
+        let preferred_db_type = match connection.try_lock() {
+            Ok(conn_guard) => {
+                let db_type = conn_guard.db_type();
+                runtime.update_cached_db_type(db_type);
+                db_type
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let db_type = poisoned.into_inner().db_type();
+                runtime.update_cached_db_type(db_type);
+                db_type
+            }
+            Err(std::sync::TryLockError::WouldBlock) => runtime.cached_db_type(),
         };
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()

@@ -336,11 +336,15 @@ impl SqlEditorWidget {
     }
 
     fn session_bind_names(connection: &SharedConnection) -> Vec<String> {
-        let session = {
-            let guard = connection
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.session_state()
+        // Bind names are an optional enrichment. If the connection mutex is
+        // busy (schema refresh or an executing query), skip rather than
+        // blocking the UI thread; the next keystroke will retry.
+        let session = match connection.try_lock() {
+            Ok(guard) => guard.session_state(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().session_state()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
         };
 
         let names = session
