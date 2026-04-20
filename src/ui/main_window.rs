@@ -1604,22 +1604,18 @@ impl MainWindow {
         let weak_state_for_commit = Arc::downgrade(&state);
         commit_btn.set_callback(move |_| {
             if let Some(state_for_commit) = weak_state_for_commit.upgrade() {
-                state_for_commit
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .commit();
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_commit) {
+                    editor.commit();
+                }
             }
         });
 
         let weak_state_for_rollback = Arc::downgrade(&state);
         rollback_btn.set_callback(move |_| {
             if let Some(state_for_rollback) = weak_state_for_rollback.upgrade() {
-                state_for_rollback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .rollback();
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_rollback) {
+                    editor.rollback();
+                }
             }
         });
 
@@ -3302,11 +3298,9 @@ impl MainWindow {
                 true
             }
             "Query/Quick Describe" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .quick_describe_at_cursor();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.quick_describe_at_cursor();
+                }
                 true
             }
             "Query/Explain Plan" => {
@@ -3316,19 +3310,15 @@ impl MainWindow {
                 true
             }
             "Query/Commit" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .commit();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.commit();
+                }
                 true
             }
             "Query/Rollback" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .rollback();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.rollback();
+                }
                 true
             }
             "Tools/Refresh Objects" => {
