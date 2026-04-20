@@ -852,6 +852,22 @@ impl SplitState {
         self.has_non_case_block_context()
     }
 
+    fn should_arm_repeat_block(&self, end_token_role: EndTokenRole) -> bool {
+        if end_token_role.is_suffix(PendingEndSuffix::Repeat) {
+            return false;
+        }
+
+        if self.top_level_token_state == TopLevelTokenState::NoneSeen {
+            return true;
+        }
+
+        // SQL expressions can legally use REPEAT(...) as a scalar function in
+        // SELECT lists and recursive CTE projections. Outside an already-open
+        // procedural block that token must remain expression-local instead of
+        // arming a phantom REPEAT ... END REPEAT block.
+        self.has_non_case_block_context()
+    }
+
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
     fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
         if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
@@ -899,7 +915,7 @@ impl SplitState {
         }
 
         // REPEAT (opening, not END REPEAT)
-        if upper == "REPEAT" && !end_token_role.is_suffix(PendingEndSuffix::Repeat) {
+        if upper == "REPEAT" && self.should_arm_repeat_block(end_token_role) {
             self.block_stack.push(BlockKind::Repeat);
         }
 

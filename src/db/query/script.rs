@@ -9644,6 +9644,10 @@ impl QueryExecutor {
             return Some(Self::parse_null_command(trimmed));
         }
 
+        if upper == "@TRANSACTION" {
+            return Some(ToolCommand::SetAutoCommit { enabled: false });
+        }
+
         if Self::is_sqlplus_set_command(upper.as_str()) {
             return Some(ToolCommand::Unsupported {
                 raw: trimmed.to_string(),
@@ -10537,8 +10541,10 @@ impl QueryExecutor {
     }
 
     fn parse_connect_command(raw: &str) -> ToolCommand {
-        // CONNECT syntax: CONNECT user/password@host:port/service_name
-        // or: CONNECT user/password@//host:port/service_name
+        // CONNECT syntax:
+        // - CONNECT user/password@host:port/service_name
+        // - CONNECT user/password@//host:port/service_name
+        // - CONNECT user/password@tns_alias
         let raw_upper = raw.to_ascii_uppercase();
         let rest = if raw_upper.starts_with("CONNECT") {
             raw[7..].trim()
@@ -10551,8 +10557,9 @@ impl QueryExecutor {
         if rest.is_empty() {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
-                message: "CONNECT requires connection string: user/password@host:port/service_name"
-                    .to_string(),
+                message:
+                    "CONNECT requires connection string: user/password@host:port/service_name or user/password@tns_alias"
+                        .to_string(),
                 is_error: true,
             };
         }
@@ -10561,8 +10568,9 @@ impl QueryExecutor {
         let Some((credentials_raw, conn_str_raw)) = rest.rsplit_once('@') else {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
-                message: "Invalid CONNECT syntax. Expected: user/password@host:port/service_name"
-                    .to_string(),
+                message:
+                    "Invalid CONNECT syntax. Expected: user/password@host:port/service_name or user/password@tns_alias"
+                        .to_string(),
                 is_error: true,
             };
         };
@@ -10590,7 +10598,35 @@ impl QueryExecutor {
 
         // Parse connection string (//host:port/service_name or host:port/service_name)
         let conn_str = conn_str_raw.trim();
+        let had_double_slash = conn_str.starts_with("//");
         let conn_str = conn_str.strip_prefix("//").unwrap_or(conn_str);
+
+        if !conn_str.contains('/') {
+            if had_double_slash || conn_str.contains(':') {
+                return ToolCommand::Unsupported {
+                    raw: raw.to_string(),
+                    message: "Invalid connection string. Expected: host:port/service_name"
+                        .to_string(),
+                    is_error: true,
+                };
+            }
+            let service_name = conn_str.trim().to_string();
+            if service_name.is_empty() {
+                return ToolCommand::Unsupported {
+                    raw: raw.to_string(),
+                    message: "TNS alias cannot be empty".to_string(),
+                    is_error: true,
+                };
+            }
+
+            return ToolCommand::Connect {
+                username,
+                password,
+                host: String::new(),
+                port: 0,
+                service_name,
+            };
+        }
 
         // Split by / to separate host:port from service_name
         let conn_parts: Vec<&str> = conn_str.splitn(2, '/').collect();

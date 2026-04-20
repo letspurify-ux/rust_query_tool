@@ -383,6 +383,24 @@ FROM DUAL;"
 }
 
 #[test]
+fn format_sql_preserves_connect_tns_alias() {
+    let input = "CONNECT user/pass@LOCAL_FREE\nSELECT 1 FROM dual;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("CONNECT user/pass@LOCAL_FREE"),
+        "CONNECT TNS alias should be preserved, got:\n{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("SELECT 1\nFROM DUAL;"),
+        "SELECT statement should still be formatted normally, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_select_hint_comment_is_idempotent() {
     let input = "SELECT /*+ INDEX(emp emp_idx1) */\nempno,\nename\nFROM emp;";
 

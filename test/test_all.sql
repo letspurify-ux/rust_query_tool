@@ -1,4 +1,4 @@
-Connect system/password@localhost:1521/FREE
+--Connect system/password@localhost:1521/FREE
 
 @test/test1.txt;
 @test/test2.txt;

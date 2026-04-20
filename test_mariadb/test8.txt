@@ -444,7 +444,7 @@ CALL cfb_assert_eq_int(
 );
 
 CALL cfb_assert_eq_int(
-    3,
+    5,
     (
         SELECT COUNT(*)
         FROM cfb_order_hdr

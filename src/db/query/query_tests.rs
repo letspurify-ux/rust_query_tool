@@ -7005,6 +7005,71 @@ fn test_connect_tool_command_supports_slash_in_password() {
 }
 
 #[test]
+fn test_connect_tool_command_supports_tns_alias() {
+    let sql = "CONNECT user/pass@LOCAL_FREE";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let has_expected_connect = items.iter().any(|item| {
+        matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::Connect {
+                username,
+                password,
+                host,
+                port,
+                service_name,
+            }) if username == "user"
+                && password == "pass"
+                && host.is_empty()
+                && *port == 0
+                && service_name == "LOCAL_FREE"
+        )
+    });
+
+    assert!(
+        has_expected_connect,
+        "CONNECT command with TNS alias should parse correctly, got: {:?}",
+        items
+    );
+}
+
+#[test]
+fn test_transaction_at_command_maps_to_set_autocommit_off() {
+    let command = QueryExecutor::parse_tool_command("@TRANSACTION");
+
+    assert!(
+        matches!(
+            command,
+            Some(ToolCommand::SetAutoCommit { enabled: false })
+        ),
+        "@TRANSACTION should disable autocommit instead of being treated as a script include: {command:?}"
+    );
+}
+
+#[test]
+fn test_connect_tool_command_rejects_host_port_without_service_name() {
+    let sql = "CONNECT user/pass@localhost:1521";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let has_expected_error = items.iter().any(|item| {
+        matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::Unsupported {
+                message,
+                is_error: true,
+                ..
+            }) if message.contains("Invalid connection string")
+        )
+    });
+
+    assert!(
+        has_expected_error,
+        "CONNECT command missing service name should remain a syntax error, got: {:?}",
+        items
+    );
+}
+
+#[test]
 fn test_column_new_value_tool_command_parsed() {
     let sql = "COLUMN col NEW_VALUE var";
     let items = QueryExecutor::split_script_items(sql);
@@ -11312,6 +11377,32 @@ fn test_split_script_items_mysql_if_function_followed_by_case_then_stays_two_sta
 }
 
 #[test]
+fn test_split_script_items_mysql_repeat_function_does_not_open_block_depth() {
+    let sql = "WITH RECURSIVE cat_tree AS (\n    SELECT 1 AS lvl\n)\nSELECT REPEAT('  ', lvl) AS indent_prefix FROM cat_tree;\nSELECT 'FINAL_STATUS' AS section_name;";
+    let items = QueryExecutor::split_script_items_for_db_type(
+        sql,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "REPEAT() function must not keep parser inside a phantom REPEAT block: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("SELECT REPEAT('  ', lvl) AS indent_prefix FROM cat_tree"),
+        "first statement should preserve REPEAT() scalar function call: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 'FINAL_STATUS' AS section_name"),
+        "second statement should remain a separate trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_split_script_items_if_alias_in_case_when_does_not_open_if_block() {
     let sql = "SELECT\n    CASE\n        WHEN if.flag = 'Y' THEN 'YES'\n        ELSE 'NO'\n    END AS flag_text\nFROM qt_if_base if;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
@@ -11438,6 +11529,35 @@ fn test_split_script_items_mariadb_executable_comment_stays_runnable_statement()
         statements[0]
     );
     assert_eq!(statements[1], "SELECT 1");
+}
+
+#[test]
+fn test_split_script_items_mariadb_comment_final_boss_keeps_transaction_directive_as_tool_command() {
+    let sql = load_mariadb_query_test_file("test8.txt");
+    assert!(
+        !sql.is_empty(),
+        "test_mariadb/test8.txt should not be empty"
+    );
+
+    let items = QueryExecutor::split_script_items(&sql);
+
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::SetAutoCommit { enabled: false })
+        )),
+        "test8 should keep @TRANSACTION as a transaction directive: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|item| matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::RunScript {
+                path,
+                relative_to_caller: false,
+            }) if path.eq_ignore_ascii_case("TRANSACTION")
+        )),
+        "test8 transaction directive must not be parsed as @TRANSACTION script include: {items:?}"
+    );
 }
 
 #[test]
@@ -14848,6 +14968,31 @@ SELECT 2 FROM dual;";
     assert!(
         matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { message, is_error: true, .. }) if message.contains("CONNECT requires connection string")),
         "second item should classify bare CONN as CONNECT syntax error command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_tns_connect_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+CONNECT scott/tiger@LOCAL_FREE
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("CONNECT scott/tiger@LOCAL_FREE")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Connect { username, host, port, service_name, .. }) if username == "scott" && host.is_empty() && *port == 0 && service_name == "LOCAL_FREE"),
+        "second item should parse TNS CONNECT command: {items:?}"
     );
     assert!(
         matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),

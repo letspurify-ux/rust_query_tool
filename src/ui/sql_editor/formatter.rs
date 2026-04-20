@@ -8257,10 +8257,14 @@ impl SqlEditorWidget {
                 service_name,
             } => {
                 // 자동 포맷팅 결과를 AI(Codex/Claude)가 재마스킹하지 않도록 실제 비밀번호를 그대로 유지한다.
-                format!(
-                    "CONNECT {}/{}@{}:{}/{}",
-                    username, password, host, port, service_name
-                )
+                if host.trim().is_empty() {
+                    format!("CONNECT {}/{}@{}", username, password, service_name)
+                } else {
+                    format!(
+                        "CONNECT {}/{}@{}:{}/{}",
+                        username, password, host, port, service_name
+                    )
+                }
             }
             ToolCommand::Disconnect => "DISCONNECT".to_string(),
             // MySQL-specific commands — format as-is

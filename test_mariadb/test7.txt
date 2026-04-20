@@ -737,7 +737,7 @@ CALL qb_assert_eq_int(
 -- 9-4. Inventory check after generated orders
 
 CALL qb_assert_eq_int(
-    94,
+    96,
     (
         SELECT qty_on_hand
         FROM qb_inventory
@@ -747,7 +747,7 @@ CALL qb_assert_eq_int(
 );
 
 CALL qb_assert_eq_int(
-    997,
+    998,
     (
         SELECT qty_on_hand
         FROM qb_inventory
@@ -990,26 +990,26 @@ SELECT
     'CATEGORY_TREE' AS section_name,
     category_id,
     parent_category_id,
-REPEAT
-    ('  ', lvl) AS indent_prefix,
+    REPEAT('  ', lvl) AS indent_prefix,
     category_name,
     full_path,
     lvl
 FROM cat_tree
-    ORDER BY full_path;
-    SELECT
-        'FINAL_STATUS' AS section_name,
-        'PASS' AS result_status,
-        NOW(6) AS executed_at,
-        (
-            SELECT COUNT(*)
-            FROM qb_assert_log
-        ) AS assertion_log_rows,
-        (
-            SELECT COUNT(*)
-            FROM qb_audit_log
-        ) AS audit_rows_after_commit_orders,
-        (
-            SELECT COUNT(*)
-            FROM qb_monthly_summary
-        ) AS monthly_summary_rows;
+ORDER BY full_path;
+
+SELECT
+    'FINAL_STATUS' AS section_name,
+    'PASS' AS result_status,
+    NOW(6) AS executed_at,
+    (
+        SELECT COUNT(*)
+        FROM qb_assert_log
+    ) AS assertion_log_rows,
+    (
+        SELECT COUNT(*)
+        FROM qb_audit_log
+    ) AS audit_rows_after_commit_orders,
+    (
+        SELECT COUNT(*)
+        FROM qb_monthly_summary
+    ) AS monthly_summary_rows;

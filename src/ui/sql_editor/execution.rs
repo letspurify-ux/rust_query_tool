@@ -3808,8 +3808,13 @@ impl SqlEditorWidget {
                                     port,
                                     service_name,
                                 } => {
+                                    let connection_name_target = if host.trim().is_empty() {
+                                        service_name.clone()
+                                    } else {
+                                        host.clone()
+                                    };
                                     let conn_info = ConnectionInfo {
-                                        name: format!("{}@{}", username, host),
+                                        name: format!("{}@{}", username, connection_name_target),
                                         username,
                                         password,
                                         host,
@@ -7949,6 +7954,180 @@ mod execution_startup_error_tests {
             }
             _ => panic!("expected StatementFinished progress event"),
         }
+    }
+}
+
+#[cfg(test)]
+mod mysql_batch_execution_regression_tests {
+    use super::{MySqlQueryCancelContext, QueryProgress, SqlEditorWidget};
+    use crate::db::{
+        connection::{ConnectionInfo, DatabaseType},
+        DatabaseConnection, SessionState,
+    };
+    use std::env;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    fn mysql_test_env(name: &str) -> Option<String> {
+        env::var(name).ok().filter(|value| !value.trim().is_empty())
+    }
+
+    fn summarize_progress(progress: &[QueryProgress]) -> String {
+        progress
+            .iter()
+            .map(|message| match message {
+                QueryProgress::BatchStart => "BatchStart".to_string(),
+                QueryProgress::StatementStart { index } => {
+                    format!("StatementStart({index})")
+                }
+                QueryProgress::SelectStart { index, columns, .. } => {
+                    format!("SelectStart({index}, cols={})", columns.len())
+                }
+                QueryProgress::Rows { index, rows } => {
+                    format!("Rows({index}, count={})", rows.len())
+                }
+                QueryProgress::ScriptOutput { lines } => {
+                    format!("ScriptOutput({})", lines.join(" | "))
+                }
+                QueryProgress::PromptInput { prompt, .. } => {
+                    format!("PromptInput({prompt})")
+                }
+                QueryProgress::AutoCommitChanged { enabled } => {
+                    format!("AutoCommitChanged({enabled})")
+                }
+                QueryProgress::ConnectionChanged { info } => format!(
+                    "ConnectionChanged({})",
+                    info.as_ref()
+                        .map(|value| value.connection_string())
+                        .unwrap_or_else(|| "None".to_string())
+                ),
+                QueryProgress::WorkerPanicked { message } => {
+                    format!("WorkerPanicked({message})")
+                }
+                QueryProgress::StatementFinished { index, result, .. } => format!(
+                    "StatementFinished({index}, success={}, sql={}, message={})",
+                    result.success,
+                    result.sql.lines().next().unwrap_or_default(),
+                    result.message
+                ),
+                QueryProgress::BatchFinished => "BatchFinished".to_string(),
+                QueryProgress::MetadataRefreshNeeded => "MetadataRefreshNeeded".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_mysql_batch_script_reaches_final_status_pass(script: &str, db_activity: &str) {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection.set_auto_commit(true);
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL regression test connection should succeed");
+
+        let shared_connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::MySQL,
+            ..SessionState::default()
+        }));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::execute_mysql_batch(
+            &shared_connection,
+            &sender,
+            script,
+            "MYSQL_TEST",
+            &session,
+            &current_mysql_cancel_context,
+            &cancel_flag,
+            true,
+            None,
+            None,
+            true,
+            db_activity,
+        );
+        drop(sender);
+
+        let progress = receiver.try_iter().collect::<Vec<_>>();
+        let progress_summary = summarize_progress(&progress);
+        let final_status_index = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. }
+                if result.sql.contains("'FINAL_STATUS' AS section_name") =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        });
+
+        assert!(
+            progress.iter().any(|message| matches!(
+                message,
+                QueryProgress::AutoCommitChanged { enabled: false }
+            )),
+            "@TRANSACTION should disable autocommit during batch execution\n{progress_summary}"
+        );
+        assert!(
+            final_status_index.is_some(),
+            "batch execution should emit the FINAL_STATUS select\n{progress_summary}"
+        );
+        assert!(
+            progress.iter().any(|message| match (final_status_index, message) {
+                (Some(index), QueryProgress::Rows { index: row_index, rows })
+                    if *row_index == index =>
+                {
+                    rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
+                }
+                _ => false,
+            }),
+            "batch execution should reach the FINAL_STATUS PASS result\n{progress_summary}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_test8_reaches_final_status_after_transaction_directive() {
+        assert_mysql_batch_script_reaches_final_status_pass(
+            include_str!("../../../test_mariadb/test8.txt"),
+            "mysql test8 regression",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_test7_reaches_final_status_after_transaction_directive() {
+        assert_mysql_batch_script_reaches_final_status_pass(
+            include_str!("../../../test_mariadb/test7.txt"),
+            "mysql test7 regression",
+        );
     }
 }
 

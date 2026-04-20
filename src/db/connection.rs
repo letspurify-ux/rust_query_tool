@@ -46,6 +46,12 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    pub fn uses_oracle_tns_alias(&self) -> bool {
+        self.db_type == DatabaseType::Oracle
+            && self.host.trim().is_empty()
+            && !self.service_name.trim().is_empty()
+    }
+
     pub(crate) fn clear_secret(secret: &mut String) {
         // Overwrite the secret bytes with zeros before releasing the allocation.
         // SAFETY: 0x00 bytes are valid UTF-8 code points, so the String's UTF-8
@@ -101,7 +107,13 @@ impl ConnectionInfo {
 
     pub fn connection_string(&self) -> String {
         match self.db_type {
-            DatabaseType::Oracle => format!("//{}:{}/{}", self.host, self.port, self.service_name),
+            DatabaseType::Oracle => {
+                if self.uses_oracle_tns_alias() {
+                    self.service_name.trim().to_string()
+                } else {
+                    format!("//{}:{}/{}", self.host, self.port, self.service_name)
+                }
+            }
             DatabaseType::MySQL => {
                 let database = self.service_name.trim();
                 if database.is_empty() {
@@ -280,7 +292,6 @@ impl DatabaseConnection {
         let statements = [
             "SET SESSION sql_mode = 'TRADITIONAL'",
             "SET SESSION time_zone = '+00:00'",
-            "SET NAMES utf8mb4",
         ];
 
         for statement in statements {
@@ -288,6 +299,44 @@ impl DatabaseConnection {
                 eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
             }
         }
+
+        Self::apply_mysql_connection_encoding(conn);
+    }
+
+    fn apply_mysql_connection_encoding(conn: &mut mysql::Conn) {
+        let database_collation = match conn.query_first::<String, _>("SELECT @@collation_database") {
+            Ok(value) => value.map(|collation| collation.trim().to_string()),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to read MySQL database collation for session setup: {err}"
+                );
+                None
+            }
+        };
+        let statement = Self::mysql_set_names_statement(database_collation.as_deref());
+
+        if let Err(err) = conn.query_drop(statement.as_str()) {
+            eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
+        }
+    }
+
+    fn mysql_set_names_statement(database_collation: Option<&str>) -> String {
+        match database_collation.map(str::trim) {
+            Some(collation)
+                if !collation.is_empty()
+                    && Self::mysql_collation_name_is_safe(collation)
+                    && collation.starts_with("utf8mb4_") =>
+            {
+                format!("SET NAMES utf8mb4 COLLATE {collation}")
+            }
+            _ => "SET NAMES utf8mb4".to_string(),
+        }
+    }
+
+    fn mysql_collation_name_is_safe(collation: &str) -> bool {
+        collation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
     fn apply_mysql_autocommit_setting(conn: &mut mysql::Conn, enabled: bool) {
@@ -444,6 +493,7 @@ impl DatabaseConnection {
             .flatten()
             .map(|database| database.trim().to_string())
             .unwrap_or_default();
+        Self::apply_mysql_connection_encoding(conn);
         self.info.service_name = current_database.clone();
         Ok(current_database)
     }
@@ -856,6 +906,92 @@ mod tests {
         );
 
         assert_eq!(info.connection_string(), "mysql://localhost:3306");
+    }
+
+    #[test]
+    fn oracle_connection_string_uses_tns_alias_when_host_is_empty() {
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            "system",
+            "pw",
+            "",
+            0,
+            "LOCAL_FREE",
+            DatabaseType::Oracle,
+        );
+
+        assert_eq!(info.connection_string(), "LOCAL_FREE");
+    }
+
+    #[test]
+    fn mysql_set_names_statement_uses_utf8mb4_database_collation_when_available() {
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci")),
+            "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"
+        );
+    }
+
+    #[test]
+    fn mysql_set_names_statement_falls_back_for_non_utf8mb4_database_collation() {
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement(Some("latin1_swedish_ci")),
+            "SET NAMES utf8mb4"
+        );
+    }
+
+    #[test]
+    fn mysql_set_names_statement_falls_back_for_unsafe_collation_name() {
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci;DROP")),
+            "SET NAMES utf8mb4"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus TNS_ADMIN/ORACLE_TEST_* environment variables"]
+    fn oracle_test_connection_supports_tns_alias_from_tns_admin() {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let alias = std::env::var("ORACLE_TEST_TNS_ALIAS").expect("ORACLE_TEST_TNS_ALIAS must be set");
+
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            "",
+            0,
+            &alias,
+            DatabaseType::Oracle,
+        );
+
+        DatabaseConnection::test_connection(&info)
+            .expect("TNS alias connection should succeed against local Oracle XE");
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_test_connection_supports_direct_local_xe() {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let service_name =
+            std::env::var("ORACLE_TEST_SERVICE_NAME").expect("ORACLE_TEST_SERVICE_NAME must be set");
+
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            "localhost",
+            1521,
+            &service_name,
+            DatabaseType::Oracle,
+        );
+
+        DatabaseConnection::test_connection(&info)
+            .expect("Direct localhost Oracle connection should succeed against local Oracle XE");
     }
 
     #[test]
