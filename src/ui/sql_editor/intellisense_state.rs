@@ -25,6 +25,25 @@ fn store_popup_transition_state(state: &Arc<AtomicU8>, value: IntellisensePopupT
     state.store(value as u8, Ordering::Relaxed);
 }
 
+// Encodes DatabaseType into an AtomicU8 so the UI thread can read the
+// preferred db type without taking the blocking connection mutex.
+const CACHED_DB_TYPE_ORACLE: u8 = 0;
+const CACHED_DB_TYPE_MYSQL: u8 = 1;
+
+fn db_type_to_u8(db_type: crate::db::connection::DatabaseType) -> u8 {
+    match db_type {
+        crate::db::connection::DatabaseType::Oracle => CACHED_DB_TYPE_ORACLE,
+        crate::db::connection::DatabaseType::MySQL => CACHED_DB_TYPE_MYSQL,
+    }
+}
+
+fn db_type_from_u8(raw: u8) -> crate::db::connection::DatabaseType {
+    match raw {
+        CACHED_DB_TYPE_MYSQL => crate::db::connection::DatabaseType::MySQL,
+        _ => crate::db::connection::DatabaseType::Oracle,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IntellisenseCompletionRange {
     start: usize,
@@ -59,6 +78,7 @@ pub(crate) struct IntellisenseRuntimeState {
     popup_show_in_progress: Arc<AtomicU8>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
+    cached_db_type: Arc<AtomicU8>,
 }
 
 impl IntellisenseRuntimeState {
@@ -75,6 +95,7 @@ impl IntellisenseRuntimeState {
             )),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None::<app::TimeoutHandle>)),
+            cached_db_type: Arc::new(AtomicU8::new(CACHED_DB_TYPE_ORACLE)),
         }
     }
 
@@ -237,6 +258,15 @@ impl IntellisenseRuntimeState {
             .keyup_debounce_generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn cached_db_type(&self) -> crate::db::connection::DatabaseType {
+        db_type_from_u8(self.cached_db_type.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn update_cached_db_type(&self, db_type: crate::db::connection::DatabaseType) {
+        self.cached_db_type
+            .store(db_type_to_u8(db_type), Ordering::Relaxed);
     }
 
     #[cfg(test)]
