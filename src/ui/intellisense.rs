@@ -2031,9 +2031,33 @@ pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec
 
     suggestions
         .iter()
-        .filter(|candidate| starts_with_ignore_ascii_case(candidate, prefix))
+        .filter(|candidate| suggestion_matches_completion_prefix(candidate, prefix))
         .cloned()
         .collect()
+}
+
+fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
+    starts_with_ignore_ascii_case(candidate, prefix)
+        || comparison_lhs_identifier_prefix(candidate)
+            .is_some_and(|identifier| starts_with_ignore_ascii_case(identifier, prefix))
+}
+
+fn comparison_lhs_identifier_prefix(candidate: &str) -> Option<&str> {
+    let lhs = candidate.split_once('=')?.0.trim_end();
+    let identifier = lhs.rsplit('.').next()?.trim();
+    Some(strip_matching_identifier_quotes(identifier))
+}
+
+fn strip_matching_identifier_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
@@ -2850,6 +2874,26 @@ mod intellisense_tests {
         let suggestions = vec!["SELECT".to_string(), "FROM".to_string()];
         let filtered = filter_suggestions_by_prefix(&suggestions, "zz");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_condition_comparison_left_column() {
+        let suggestions = vec![
+            "a.TOTAL = b.TOTAL".to_string(),
+            "a.NAME = b.NAME".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "to");
+        assert_eq!(filtered, vec!["a.TOTAL = b.TOTAL".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_matches_quoted_condition_comparison_left_column() {
+        let suggestions = vec![
+            "a.\"Order Id\" = b.\"Order Id\"".to_string(),
+            "a.\"Dept No\" = b.\"Dept No\"".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "or");
+        assert_eq!(filtered, vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()]);
     }
 
     #[test]

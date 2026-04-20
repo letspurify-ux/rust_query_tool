@@ -870,10 +870,10 @@ impl SqlEditorWidget {
                 .unwrap_or_default()
         };
         if !comparison_suggestions.is_empty() {
-            suggestions = Self::merge_suggestions_with_context_aliases(
+            suggestions = Self::merge_qualified_condition_comparison_suggestions(
                 suggestions,
                 comparison_suggestions,
-                true,
+                deep_ctx.phase,
             );
         }
         let wildcard_suggestions =
@@ -1640,6 +1640,24 @@ impl SqlEditorWidget {
         };
         merged.truncate(MAX_MERGED_SUGGESTIONS);
         merged
+    }
+
+    fn qualified_condition_comparison_precedes_base_suggestions(
+        phase: intellisense_context::SqlPhase,
+    ) -> bool {
+        matches!(phase, intellisense_context::SqlPhase::JoinCondition)
+    }
+
+    fn merge_qualified_condition_comparison_suggestions(
+        base: Vec<String>,
+        comparisons: Vec<String>,
+        phase: intellisense_context::SqlPhase,
+    ) -> Vec<String> {
+        Self::merge_suggestions_with_context_aliases(
+            base,
+            comparisons,
+            Self::qualified_condition_comparison_precedes_base_suggestions(phase),
+        )
     }
 
     fn maybe_merge_suggestions_with_context_aliases(

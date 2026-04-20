@@ -4005,6 +4005,31 @@ fn merge_suggestions_with_context_aliases_respects_max_without_aliases() {
 }
 
 #[test]
+fn merge_qualified_condition_comparison_suggestions_prioritizes_join_condition_matches() {
+    let merged = SqlEditorWidget::merge_qualified_condition_comparison_suggestions(
+        vec!["abc".to_string(), "deptno".to_string()],
+        vec!["a.abc = b.abc".to_string()],
+        intellisense_context::SqlPhase::JoinCondition,
+    );
+
+    assert_eq!(merged[0], "a.abc = b.abc");
+    assert_eq!(merged[1], "abc");
+}
+
+#[test]
+fn merge_qualified_condition_comparison_suggestions_deprioritizes_where_clause_matches() {
+    let merged = SqlEditorWidget::merge_qualified_condition_comparison_suggestions(
+        vec!["abc".to_string(), "deptno".to_string()],
+        vec!["a.abc = b.abc".to_string()],
+        intellisense_context::SqlPhase::WhereClause,
+    );
+
+    assert_eq!(merged[0], "abc");
+    assert_eq!(merged[1], "deptno");
+    assert_eq!(merged[2], "a.abc = b.abc");
+}
+
+#[test]
 fn maybe_merge_suggestions_with_context_aliases_skips_aliases_when_qualified() {
     let base = vec!["EMPNO".to_string(), "ENAME".to_string()];
     let aliases = vec!["e".to_string(), "emp".to_string()];
