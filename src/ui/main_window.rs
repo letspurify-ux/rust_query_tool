@@ -2474,9 +2474,9 @@ impl MainWindow {
     fn start_connection_metadata_refresh(
         state: &mut AppState,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
-    ) {
+    ) -> bool {
         if !try_set_mutex_flag(&state.schema_refresh_in_progress) {
-            return;
+            return false;
         }
 
         state.object_browser.refresh();
@@ -2491,6 +2491,7 @@ impl MainWindow {
             }
             clear_mutex_flag(&schema_refresh_guard);
         });
+        true
     }
 
     fn attach_editor_callbacks(
@@ -3331,10 +3332,22 @@ impl MainWindow {
                 true
             }
             "Tools/Refresh Objects" => {
-                let mut s = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                MainWindow::start_connection_metadata_refresh(&mut s, schema_sender);
+                let alert = {
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if s.is_any_query_running() {
+                        Some(crate::db::format_connection_busy_message())
+                    } else if !MainWindow::start_connection_metadata_refresh(&mut s, schema_sender)
+                    {
+                        Some("Object browser refresh already in progress.".to_string())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(message) = alert {
+                    SqlEditorWidget::show_alert_dialog(&message);
+                }
                 true
             }
             "Tools/Export Results" => {
