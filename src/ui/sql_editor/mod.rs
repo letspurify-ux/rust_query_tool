@@ -864,10 +864,11 @@ impl SqlEditorWidget {
                                 );
                             }
                             QueryProgress::BatchFinished => {
-                                SqlEditorWidget::finalize_execution_state(
-                                    &query_running,
-                                    &cancel_flag,
-                                );
+                                // query_running is already reset by QueryExecutionCleanupGuard
+                                // in the worker thread before BatchFinished is sent. Resetting
+                                // it here again would create a race: a new query could start
+                                // between the worker's reset and this handler firing, causing
+                                // this stale BatchFinished to clear the new query's lock.
                                 set_cursor(Cursor::Default);
                                 app::flush();
                             }
