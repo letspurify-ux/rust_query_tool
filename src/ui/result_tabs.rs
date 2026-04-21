@@ -123,6 +123,26 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
     }
 
+    fn invoke_lazy_fetch_callback(
+        callback_ref: &LazyFetchCallback,
+        session_id: u64,
+        request: crate::ui::sql_editor::LazyFetchRequest,
+    ) {
+        let mut callback = callback_ref
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback_fn) = callback.as_mut() {
+            callback_fn(session_id, request);
+        }
+        let mut callback_guard = callback_ref
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if callback_guard.is_none() {
+            *callback_guard = callback;
+        }
+    }
+
     fn content_bounds(tabs: &Tabs) -> (i32, i32, i32, i32) {
         // Keep a stable tab-header height regardless of surrounding splitter drags.
         // This avoids top/bottom header bar height jitter while panes are resized.
@@ -482,6 +502,15 @@ impl ResultTabsWidget {
             .len()
     }
 
+    pub fn lazy_fetch_sessions(&self) -> Vec<u64> {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|tab| tab.table.active_lazy_fetch_session())
+            .collect()
+    }
+
     pub fn active_result_index(&self) -> Option<usize> {
         *self
             .active_index
@@ -665,6 +694,31 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
+    pub fn abort_lazy_fetch_session(&mut self, session_id: u64) -> bool {
+        let tables: Vec<ResultTableWidget> = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|tab| {
+                if tab.table.active_lazy_fetch_session() == Some(session_id) {
+                    Some(tab.table.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if tables.is_empty() {
+            return false;
+        }
+        for mut table in tables {
+            table.clear_lazy_fetch_session(session_id, false);
+            table.finish_streaming();
+        }
+        self.fire_on_change_callback();
+        true
+    }
+
     pub fn finish_all_streaming(&mut self) {
         let tables: Vec<ResultTableWidget> = self
             .data
@@ -672,6 +726,25 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .map(|tab| tab.table.clone())
+            .collect();
+        for mut table in tables {
+            table.finish_streaming();
+        }
+    }
+
+    pub fn finish_non_lazy_streaming(&mut self) {
+        let tables: Vec<ResultTableWidget> = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|tab| {
+                if tab.table.active_lazy_fetch_session().is_none() {
+                    Some(tab.table.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         for mut table in tables {
             table.finish_streaming();
@@ -771,12 +844,7 @@ impl ResultTabsWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Box::new(move |id, request| {
-                let mut callback_guard = callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(callback_fn) = callback_guard.as_mut() {
-                    callback_fn(id, request);
-                }
+                ResultTabsWidget::invoke_lazy_fetch_callback(&callback, id, request);
             }));
         let tabs = self
             .data
@@ -959,13 +1027,17 @@ impl ResultTabsWidget {
     /// Close the currently active result tab, freeing its data and FLTK resources.
     /// Returns true if a tab was closed.
     pub fn close_current_tab(&mut self) -> bool {
+        self.close_current_tab_and_take_lazy_fetch().is_some()
+    }
+
+    pub fn close_current_tab_and_take_lazy_fetch(&mut self) -> Option<(usize, Option<u64>)> {
         let index = match *self
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
             Some(idx) => idx,
-            None => return false, // Script Output tab cannot be closed
+            None => return None, // Script Output tab cannot be closed
         };
 
         let _pointer_suppress_guard =
@@ -976,10 +1048,11 @@ impl ResultTabsWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if index >= data.len() {
-                return false;
+                return None;
             }
             data.remove(index)
         };
+        let lazy_fetch_session = tab.table.active_lazy_fetch_session();
 
         self.delete_tab(tab);
 
@@ -1039,7 +1112,7 @@ impl ResultTabsWidget {
             self.tabs.redraw();
         }
         self.fire_on_change_callback();
-        true
+        Some((index, lazy_fetch_session))
     }
 
     pub fn select_script_output(&mut self) {
@@ -1083,7 +1156,11 @@ impl Default for ResultTabsWidget {
 
 #[cfg(test)]
 mod tests {
+    use crate::ui::result_table::LazyFetchCallback;
+    use crate::ui::sql_editor::LazyFetchRequest;
+
     use super::ResultTabsWidget;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn tab_strip_left_anchor_reset_requires_multi_tab_layout() {
@@ -1106,5 +1183,21 @@ mod tests {
         ));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 0, 240));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 320, 0));
+    }
+
+    #[test]
+    fn lazy_fetch_callback_is_invoked_without_holding_callback_lock() {
+        let callback: LazyFetchCallback = Arc::new(Mutex::new(None));
+        let callback_for_assert = callback.clone();
+        *callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(move |session_id, request| {
+                assert_eq!(session_id, 11);
+                assert_eq!(request, LazyFetchRequest::Cancel);
+                assert!(callback_for_assert.try_lock().is_ok());
+            }));
+
+        ResultTabsWidget::invoke_lazy_fetch_callback(&callback, 11, LazyFetchRequest::Cancel);
     }
 }

@@ -2186,11 +2186,18 @@ impl ResultTableWidget {
         session_id: u64,
         request: LazyFetchRequest,
     ) {
+        let mut callback_fn = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback_fn) = callback_fn.as_mut() {
+            callback_fn(session_id, request);
+        }
         let mut callback_guard = callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(callback_fn) = callback_guard.as_mut() {
-            callback_fn(session_id, request);
+        if callback_guard.is_none() {
+            *callback_guard = callback_fn;
         }
     }
 
@@ -6349,12 +6356,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Box::new(move |id, request| {
-                let mut callback_guard = callback
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(callback_fn) = callback_guard.as_mut() {
-                    callback_fn(id, request);
-                }
+                ResultTableWidget::invoke_lazy_fetch_callback(&callback, id, request);
             }));
     }
 
@@ -6403,6 +6405,13 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    pub fn active_lazy_fetch_session(&self) -> Option<u64> {
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn queue_action_after_fetch_all(&self, action: LazyFetchPendingAction) -> bool {
@@ -6544,7 +6553,7 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        mutex_store_bool(&self.streaming_in_progress, false);
+        self.clear_lazy_fetch_state_for_abort();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
         self.clear_sort_state();
@@ -6910,6 +6919,7 @@ impl ResultTableWidget {
 
     /// Cleanup method to release resources before the widget is deleted.
     pub fn cleanup(&mut self) {
+        self.clear_lazy_fetch_state_for_abort();
         *self
             .edit_session
             .lock()
@@ -10914,6 +10924,22 @@ mod tests {
                 .map(|(_, row_count)| *row_count),
             Some(1)
         );
+    }
+
+    #[test]
+    fn lazy_fetch_callback_is_invoked_without_holding_callback_lock() {
+        let callback: LazyFetchCallback = Arc::new(Mutex::new(None));
+        let callback_for_assert = callback.clone();
+        *callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(move |session_id, request| {
+                assert_eq!(session_id, 7);
+                assert_eq!(request, LazyFetchRequest::More);
+                assert!(callback_for_assert.try_lock().is_ok());
+            }));
+
+        ResultTableWidget::invoke_lazy_fetch_callback(&callback, 7, LazyFetchRequest::More);
     }
 
     #[test]

@@ -255,6 +255,7 @@ pub enum QueryProgress {
 pub enum LazyFetchRequest {
     More,
     All,
+    Cancel,
 }
 
 #[derive(Debug)]
@@ -414,6 +415,11 @@ pub struct SqlEditorWidget {
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
 }
 impl SqlEditorWidget {
+    fn shared_lazy_fetch_session_counter() -> Arc<AtomicU64> {
+        static COUNTER: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+        Arc::clone(COUNTER.get_or_init(|| Arc::new(AtomicU64::new(1))))
+    }
+
     fn is_main_window_visible() -> bool {
         app::widget_from_id::<Window>("main_window")
             .map(|window| is_window_shown_and_visible(window.shown(), window.visible()))
@@ -744,7 +750,7 @@ impl SqlEditorWidget {
         let current_query_connection = Arc::new(Mutex::new(None));
         let pooled_db_session = Arc::new(Mutex::new(None));
         let active_lazy_fetch = Arc::new(Mutex::new(None));
-        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
+        let next_lazy_fetch_session_id = Self::shared_lazy_fetch_session_counter();
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
@@ -835,11 +841,24 @@ impl SqlEditorWidget {
         if handle.session_id != session_id {
             return false;
         }
+        if request == LazyFetchRequest::Cancel {
+            self.cancel_active_lazy_fetch();
+            return true;
+        }
         let command = match request {
             LazyFetchRequest::More => LazyFetchCommand::FetchMore(100),
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
+            LazyFetchRequest::Cancel => LazyFetchCommand::Cancel,
         };
         handle.sender.send(command).is_ok()
+    }
+
+    pub fn active_lazy_fetch_session(&self) -> Option<u64> {
+        self.active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|handle| handle.session_id)
     }
 
     fn cancel_active_lazy_fetch(&self) {
@@ -2106,6 +2125,14 @@ mod execution_state_tests {
 
         assert!(!load_mutex_bool(&query_running));
         assert!(!load_mutex_bool(&cancel_flag));
+    }
+
+    #[test]
+    fn lazy_fetch_session_counter_is_shared_across_editor_tabs() {
+        let first = SqlEditorWidget::shared_lazy_fetch_session_counter();
+        let second = SqlEditorWidget::shared_lazy_fetch_session_counter();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

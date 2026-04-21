@@ -220,6 +220,10 @@ impl SqlEditorWidget {
         }
     }
 
+    fn should_use_lazy_fetch_for_single_statement(items: &[ScriptItem]) -> bool {
+        items.len() == 1 && matches!(items[0], ScriptItem::Statement(_))
+    }
+
     pub fn execute_sql_text(&self, sql: &str) {
         self.execute_sql(sql, false);
     }
@@ -814,28 +818,11 @@ impl SqlEditorWidget {
         sender: &mpsc::Sender<QueryProgress>,
         index: usize,
         session_id: u64,
-        sql: &str,
-        column_info: &[ColumnInfo],
-        fetched_rows: usize,
-        elapsed: Duration,
-        heading_enabled: bool,
-        conn_name: &str,
     ) {
         let _ = sender.send(QueryProgress::LazyFetchClosed {
             index,
             session_id,
             cancelled: true,
-        });
-        let mut query_result =
-            QueryResult::new_select_streamed(sql, column_info.to_vec(), fetched_rows, elapsed);
-        SqlEditorWidget::apply_heading_to_result(&mut query_result, heading_enabled);
-        query_result.success = false;
-        query_result.message = "Fetch cancelled".to_string();
-        let _ = sender.send(QueryProgress::StatementFinished {
-            index,
-            result: query_result,
-            connection_name: conn_name.to_string(),
-            timed_out: false,
         });
         app::awake();
     }
@@ -864,6 +851,8 @@ impl SqlEditorWidget {
             Some(Arc::clone(&conn)),
             None,
         );
+        let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
+        app::awake();
         thread::spawn(move || {
             let statement_start = Instant::now();
             let mut fetched_rows = 0usize;
@@ -893,7 +882,6 @@ impl SqlEditorWidget {
                     columns: display_columns.clone(),
                     null_text: null_text.clone(),
                 });
-                let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
                 app::awake();
                 if !display_columns.is_empty() {
                     SqlEditorWidget::append_spool_output(
@@ -913,17 +901,7 @@ impl SqlEditorWidget {
                 SqlEditorWidget::append_spool_rows(&session, &rows);
                 Self::emit_lazy_rows(&sender, index, rows);
                 if Self::drain_lazy_cancel_request(&command_receiver, &mut pending_commands) {
-                    Self::emit_lazy_cancelled_result(
-                        &sender,
-                        index,
-                        session_id,
-                        &sql_to_execute,
-                        &column_info,
-                        fetched_rows,
-                        statement_start.elapsed(),
-                        heading_enabled,
-                        &conn_name,
-                    );
+                    Self::emit_lazy_cancelled_result(&sender, index, session_id);
                     return Ok(());
                 }
                 if eof {
@@ -979,17 +957,7 @@ impl SqlEditorWidget {
                                 &command_receiver,
                                 &mut pending_commands,
                             ) {
-                                Self::emit_lazy_cancelled_result(
-                                    &sender,
-                                    index,
-                                    session_id,
-                                    &sql_to_execute,
-                                    &column_info,
-                                    fetched_rows,
-                                    statement_start.elapsed(),
-                                    heading_enabled,
-                                    &conn_name,
-                                );
+                                Self::emit_lazy_cancelled_result(&sender, index, session_id);
                                 return Ok(());
                             }
                             if eof {
@@ -1047,17 +1015,7 @@ impl SqlEditorWidget {
                                 &command_receiver,
                                 &mut pending_commands,
                             ) {
-                                Self::emit_lazy_cancelled_result(
-                                    &sender,
-                                    index,
-                                    session_id,
-                                    &sql_to_execute,
-                                    &column_info,
-                                    fetched_rows,
-                                    statement_start.elapsed(),
-                                    heading_enabled,
-                                    &conn_name,
-                                );
+                                Self::emit_lazy_cancelled_result(&sender, index, session_id);
                                 return Ok(());
                             }
                             if eof {
@@ -1101,36 +1059,31 @@ impl SqlEditorWidget {
                             }
                         },
                         Ok(LazyFetchCommand::Cancel) | Err(_) => {
-                            Self::emit_lazy_cancelled_result(
-                                &sender,
-                                index,
-                                session_id,
-                                &sql_to_execute,
-                                &column_info,
-                                fetched_rows,
-                                statement_start.elapsed(),
-                                heading_enabled,
-                                &conn_name,
-                            );
+                            Self::emit_lazy_cancelled_result(&sender, index, session_id);
                             return Ok(());
                         }
                     }
                 }
             })();
             if let Err(err) = result {
+                let cancelled_by_owner =
+                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
                 let _ = sender.send(QueryProgress::LazyFetchClosed {
                     index,
                     session_id,
                     cancelled: true,
                 });
-                let mut error_result = QueryResult::new_error(&sql_to_execute, &err.to_string());
-                error_result.is_select = true;
-                let _ = sender.send(QueryProgress::StatementFinished {
-                    index,
-                    result: error_result,
-                    connection_name: conn_name,
-                    timed_out: false,
-                });
+                if !cancelled_by_owner {
+                    let mut error_result =
+                        QueryResult::new_error(&sql_to_execute, &err.to_string());
+                    error_result.is_select = true;
+                    let _ = sender.send(QueryProgress::StatementFinished {
+                        index,
+                        result: error_result,
+                        connection_name: conn_name,
+                        timed_out: false,
+                    });
+                }
                 app::awake();
             }
             let _ = conn.set_call_timeout(previous_timeout);
@@ -1168,6 +1121,8 @@ impl SqlEditorWidget {
             None,
             Some(lazy_cancel_context.clone()),
         );
+        let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
+        app::awake();
         thread::spawn(move || {
             let statement_start = Instant::now();
             let mut fetched_rows = 0usize;
@@ -1221,7 +1176,6 @@ impl SqlEditorWidget {
                     columns: display_columns.clone(),
                     null_text: null_text.clone(),
                 });
-                let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
                 app::awake();
                 if !display_columns.is_empty() {
                     SqlEditorWidget::append_spool_output(
@@ -1259,17 +1213,7 @@ impl SqlEditorWidget {
                 SqlEditorWidget::append_spool_rows(&session, &rows);
                 Self::emit_lazy_rows(&sender, index, rows);
                 if Self::drain_lazy_cancel_request(&command_receiver, &mut pending_commands) {
-                    Self::emit_lazy_cancelled_result(
-                        &sender,
-                        index,
-                        session_id,
-                        &sql_to_execute,
-                        &column_info,
-                        fetched_rows,
-                        statement_start.elapsed(),
-                        heading_enabled,
-                        &conn_name,
-                    );
+                    Self::emit_lazy_cancelled_result(&sender, index, session_id);
                     return Ok(());
                 }
                 if eof {
@@ -1313,17 +1257,7 @@ impl SqlEditorWidget {
                                 &command_receiver,
                                 &mut pending_commands,
                             ) {
-                                Self::emit_lazy_cancelled_result(
-                                    &sender,
-                                    index,
-                                    session_id,
-                                    &sql_to_execute,
-                                    &column_info,
-                                    fetched_rows,
-                                    statement_start.elapsed(),
-                                    heading_enabled,
-                                    &conn_name,
-                                );
+                                Self::emit_lazy_cancelled_result(&sender, index, session_id);
                                 return Ok(());
                             }
                             if eof {
@@ -1369,17 +1303,7 @@ impl SqlEditorWidget {
                                 &command_receiver,
                                 &mut pending_commands,
                             ) {
-                                Self::emit_lazy_cancelled_result(
-                                    &sender,
-                                    index,
-                                    session_id,
-                                    &sql_to_execute,
-                                    &column_info,
-                                    fetched_rows,
-                                    statement_start.elapsed(),
-                                    heading_enabled,
-                                    &conn_name,
-                                );
+                                Self::emit_lazy_cancelled_result(&sender, index, session_id);
                                 return Ok(());
                             }
                             if eof {
@@ -1418,36 +1342,30 @@ impl SqlEditorWidget {
                             }
                         },
                         Ok(LazyFetchCommand::Cancel) | Err(_) => {
-                            Self::emit_lazy_cancelled_result(
-                                &sender,
-                                index,
-                                session_id,
-                                &sql_to_execute,
-                                &column_info,
-                                fetched_rows,
-                                statement_start.elapsed(),
-                                heading_enabled,
-                                &conn_name,
-                            );
+                            Self::emit_lazy_cancelled_result(&sender, index, session_id);
                             return Ok(());
                         }
                     }
                 }
             })();
             if let Err(err) = result {
+                let cancelled_by_owner =
+                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
                 let _ = sender.send(QueryProgress::LazyFetchClosed {
                     index,
                     session_id,
                     cancelled: true,
                 });
-                let mut error_result = QueryResult::new_error(&sql_to_execute, &err);
-                error_result.is_select = true;
-                let _ = sender.send(QueryProgress::StatementFinished {
-                    index,
-                    result: error_result,
-                    connection_name: conn_name,
-                    timed_out: false,
-                });
+                if !cancelled_by_owner {
+                    let mut error_result = QueryResult::new_error(&sql_to_execute, &err);
+                    error_result.is_select = true;
+                    let _ = sender.send(QueryProgress::StatementFinished {
+                        index,
+                        result: error_result,
+                        connection_name: conn_name,
+                        timed_out: false,
+                    });
+                }
                 app::awake();
             }
             *lazy_cancel_context
@@ -1565,8 +1483,7 @@ impl SqlEditorWidget {
         if items.is_empty() {
             return;
         }
-        let lazy_fetch_single_statement =
-            !script_mode && items.len() == 1 && matches!(items[0], ScriptItem::Statement(_));
+        let lazy_fetch_single_statement = Self::should_use_lazy_fetch_for_single_statement(&items);
 
         let _ = sender.send(QueryProgress::BatchStart {
             activity: db_activity.to_string(),
@@ -2539,10 +2456,6 @@ impl SqlEditorWidget {
                             let _ = sender.send(QueryProgress::StatementStart {
                                 index: result_index,
                             });
-                            let _ = sender.send(QueryProgress::LazyFetchSession {
-                                index: result_index,
-                                session_id,
-                            });
                             app::awake();
                             SqlEditorWidget::start_mysql_lazy_select(
                                 connection_generation,
@@ -2679,6 +2592,13 @@ impl SqlEditorWidget {
             return;
         }
 
+        if self.active_lazy_fetch_session().is_some() {
+            self.emit_status(
+                "A lazy fetch is still open. Fetch all rows or cancel it before running this tab again.",
+            );
+            return;
+        }
+
         let mut query_run_reservation =
             match QueryRunningReservation::acquire(self.query_running.clone()) {
                 Some(reservation) => reservation,
@@ -2731,7 +2651,6 @@ impl SqlEditorWidget {
         let cancel_flag = self.cancel_flag.clone();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
-        self.cancel_active_lazy_fetch();
         // Reset cancel flag before starting new execution
         store_mutex_bool(&cancel_flag, false);
 
@@ -2865,9 +2784,8 @@ impl SqlEditorWidget {
                 if items.is_empty() {
                     return;
                 }
-                let lazy_fetch_single_statement = !script_mode
-                    && items.len() == 1
-                    && matches!(items[0], ScriptItem::Statement(_));
+                let lazy_fetch_single_statement =
+                    Self::should_use_lazy_fetch_for_single_statement(&items);
 
                 let _ = sender.send(QueryProgress::BatchStart {
                     activity: db_activity.clone(),
@@ -6207,10 +6125,6 @@ impl SqlEditorWidget {
                                 {
                                     let session_id = next_lazy_fetch_session_id
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let _ = sender.send(QueryProgress::LazyFetchSession {
-                                        index,
-                                        session_id,
-                                    });
                                     match SqlEditorWidget::start_oracle_lazy_select(
                                         Arc::clone(conn),
                                         sender.clone(),
@@ -8702,6 +8616,7 @@ mod query_execution_cleanup_tests {
         LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryExecutionCleanupGuard,
         QueryProgress, SqlEditorWidget,
     };
+    use crate::db::ScriptItem;
     use mysql::{Error as MysqlError, MySqlError};
     use oracle::Connection;
     use std::panic::{self, AssertUnwindSafe};
@@ -8883,6 +8798,44 @@ mod query_execution_cleanup_tests {
             SqlEditorWidget::lazy_fetch_query_timeout(Some(Duration::from_secs(1))),
             None
         );
+    }
+
+    #[test]
+    fn lazy_fetch_single_statement_policy_allows_script_mode_single_statement() {
+        let items = vec![ScriptItem::Statement("select * from dual".to_string())];
+
+        assert!(SqlEditorWidget::should_use_lazy_fetch_for_single_statement(
+            &items
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_single_statement_policy_rejects_multi_statement_scripts() {
+        let items = vec![
+            ScriptItem::Statement("select 1 from dual".to_string()),
+            ScriptItem::Statement("select 2 from dual".to_string()),
+        ];
+
+        assert!(!SqlEditorWidget::should_use_lazy_fetch_for_single_statement(&items));
+    }
+
+    #[test]
+    fn lazy_cancel_emits_closed_without_statement_finished() {
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::emit_lazy_cancelled_result(&sender, 3, 42);
+        drop(sender);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.first(),
+            Some(QueryProgress::LazyFetchClosed {
+                index: 3,
+                session_id: 42,
+                cancelled: true,
+            })
+        ));
     }
 
     #[test]

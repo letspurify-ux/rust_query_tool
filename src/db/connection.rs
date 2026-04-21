@@ -175,15 +175,37 @@ pub enum DbSessionLease {
 impl DbConnectionPool {
     pub fn acquire_session(&self) -> Result<DbPoolSession, String> {
         let mut session = match self {
-            DbConnectionPool::Oracle(pool) => {
-                DbPoolSession::Oracle(pool.get().map_err(|err| err.to_string())?)
-            }
+            DbConnectionPool::Oracle(pool) => DbPoolSession::Oracle(
+                pool.get()
+                    .map_err(|err| Self::format_oracle_pool_acquire_error(pool, &err))?,
+            ),
             DbConnectionPool::MySQL(pool) => {
                 DbPoolSession::MySQL(pool.get_conn().map_err(|err| err.to_string())?)
             }
         };
         backend_for(session.db_type()).apply_pool_session_defaults(&mut session);
         Ok(session)
+    }
+
+    fn format_oracle_pool_acquire_error(pool: &oracle::pool::Pool, err: &OracleError) -> String {
+        let message = err.to_string();
+        let lower = message.to_ascii_lowercase();
+        let looks_pool_exhausted = lower.contains("ocisessionget timed out")
+            || lower.contains("waiting for pool")
+            || lower.contains("connection pool");
+        if !looks_pool_exhausted {
+            return message;
+        }
+
+        let pool_counts = match (pool.busy_count(), pool.open_count()) {
+            (Ok(busy), Ok(open)) => format!(" busy/open sessions: {busy}/{open}."),
+            _ => String::new(),
+        };
+
+        format!(
+            "{}. Oracle session pool appears exhausted.{} Finish or cancel lazy fetches in other result tabs, close unused query tabs, or increase Settings > Connection pool size.",
+            message, pool_counts
+        )
     }
 }
 
