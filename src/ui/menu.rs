@@ -102,12 +102,7 @@ Highlights\n\
 Runtime\n\
 - Build: {build_profile}\n\
 - Platform: {platform}\n\
-- Splash screen: {splash_status}\n\
-\n\
-Notes\n\
-- Oracle connections require Oracle Instant Client.\n\
-- MySQL/MariaDB connections do not require Oracle Instant Client.\n\
-- See Help > Keyboard Shortcuts for editor and execution shortcuts."
+- Splash screen: {splash_status}"
     )
 }
 
