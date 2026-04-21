@@ -379,6 +379,12 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
+            "&Tools/&Session Activity",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
             "&Tools/Application &Log",
             Shortcut::None,
             MenuFlag::Normal,

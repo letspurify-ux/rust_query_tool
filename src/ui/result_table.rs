@@ -12,7 +12,7 @@ use fltk::{
     window::Window,
 };
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
 
@@ -78,6 +79,14 @@ const SORT_DESC_MARK: &str = "▼";
 
 pub type ResultGridSqlExecuteCallback =
     Arc<Mutex<Option<Box<dyn FnMut(String) -> Result<(), String>>>>>;
+pub type LazyFetchCallback = Arc<Mutex<Option<Box<dyn FnMut(u64, LazyFetchRequest)>>>>;
+
+enum LazyFetchPendingAction {
+    HeaderSort(usize),
+    CopyAll,
+    SelectAll,
+    ExportCsv(Box<dyn FnMut(String, usize)>),
+}
 
 fn mutex_load_bool(flag: &Arc<Mutex<bool>>) -> bool {
     match flag.lock() {
@@ -233,6 +242,10 @@ pub struct ResultTableWidget {
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
     streaming_in_progress: Arc<Mutex<bool>>,
+    lazy_fetch_session: Arc<Mutex<Option<u64>>>,
+    lazy_fetch_callback: LazyFetchCallback,
+    lazy_fetch_more_in_flight: Arc<Mutex<HashSet<u64>>>,
+    pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
     sort_state: Arc<Mutex<Option<ColumnSortState>>>,
 }
 
@@ -1329,6 +1342,12 @@ impl ResultTableWidget {
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
         let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let lazy_fetch_session: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let lazy_fetch_callback: LazyFetchCallback = Arc::new(Mutex::new(None));
+        let lazy_fetch_more_in_flight: Arc<Mutex<HashSet<u64>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
 
         let mut table = Table::new(x, y, w, h, None);
@@ -1566,6 +1585,10 @@ impl ResultTableWidget {
         let active_inline_edit_for_resize = active_inline_edit.clone();
         let sort_state_for_handle = sort_state.clone();
         let streaming_in_progress_for_handle = streaming_in_progress.clone();
+        let lazy_fetch_session_for_handle = lazy_fetch_session.clone();
+        let lazy_fetch_callback_for_handle = lazy_fetch_callback.clone();
+        let lazy_fetch_more_in_flight_for_handle = lazy_fetch_more_in_flight.clone();
+        let pending_lazy_actions_for_handle = pending_lazy_actions.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -1592,6 +1615,9 @@ impl ResultTableWidget {
                             &edit_session_for_handle,
                             &pending_save_request_for_handle,
                             &active_inline_edit_for_handle,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &pending_lazy_actions_for_handle,
                         );
                         return true;
                     }
@@ -1817,6 +1843,18 @@ impl ResultTableWidget {
                         if col >= 0
                             && header_sort_requires_double_click
                             && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
+                            && Self::queue_lazy_action_if_active(
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                                LazyFetchPendingAction::HeaderSort(col as usize),
+                            )
+                        {
+                            return true;
+                        }
+                        if col >= 0
+                            && header_sort_requires_double_click
+                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
                             // Streaming append mutates full_data incrementally, so block
                             // column sort until the result set is finalized.
                             && !mutex_load_bool(&streaming_in_progress_for_handle)
@@ -1873,6 +1911,14 @@ impl ResultTableWidget {
                             hidden_col,
                         );
                     }
+                    if matches!(key, Key::PageDown | Key::End | Key::Down) {
+                        Self::request_lazy_fetch_more_near_bottom(
+                            &table_for_handle,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &lazy_fetch_more_in_flight_for_handle,
+                        );
+                    }
 
                     if ctrl_or_cmd {
                         if key == Key::Delete || original_key == Key::Delete {
@@ -1905,6 +1951,14 @@ impl ResultTableWidget {
                             return true;
                         }
                         if Self::matches_shortcut_key(key, original_key, 'a') {
+                            if Self::queue_lazy_action_if_active(
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                                LazyFetchPendingAction::SelectAll,
+                            ) {
+                                return true;
+                            }
                             let rows = table_for_handle.rows();
                             let cols = table_for_handle.cols();
                             if rows > 0 && cols > 0 {
@@ -2020,6 +2074,14 @@ impl ResultTableWidget {
                         return true;
                     }
                     if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'a') {
+                        if Self::queue_lazy_action_if_active(
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &pending_lazy_actions_for_handle,
+                            LazyFetchPendingAction::SelectAll,
+                        ) {
+                            return true;
+                        }
                         let rows = table_for_handle.rows();
                         let cols = table_for_handle.cols();
                         if rows > 0 && cols > 0 {
@@ -2032,6 +2094,15 @@ impl ResultTableWidget {
                         app::paste_text(&table_for_handle);
                         return true;
                     }
+                    false
+                }
+                Event::MouseWheel => {
+                    Self::request_lazy_fetch_more_near_bottom(
+                        &table_for_handle,
+                        &lazy_fetch_session_for_handle,
+                        &lazy_fetch_callback_for_handle,
+                        &lazy_fetch_more_in_flight_for_handle,
+                    );
                     false
                 }
                 Event::Paste => {
@@ -2098,12 +2169,93 @@ impl ResultTableWidget {
             hidden_auto_rowid_col,
             active_inline_edit,
             streaming_in_progress,
+            lazy_fetch_session,
+            lazy_fetch_callback,
+            lazy_fetch_more_in_flight,
+            pending_lazy_actions,
             sort_state,
         }
     }
 
     fn is_streaming_in_progress(&self) -> bool {
         mutex_load_bool(&self.streaming_in_progress)
+    }
+
+    fn invoke_lazy_fetch_callback(
+        callback: &LazyFetchCallback,
+        session_id: u64,
+        request: LazyFetchRequest,
+    ) {
+        let mut callback_guard = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(callback_fn) = callback_guard.as_mut() {
+            callback_fn(session_id, request);
+        }
+    }
+
+    fn queue_lazy_action_if_active(
+        session: &Arc<Mutex<Option<u64>>>,
+        callback: &LazyFetchCallback,
+        pending_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
+        action: LazyFetchPendingAction,
+    ) -> bool {
+        let session_id = *session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session_id) = session_id {
+            pending_actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back((session_id, action));
+            Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::All);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn current_csv_snapshot(&self) -> (String, usize) {
+        (self.build_csv_snapshot(), self.row_count())
+    }
+
+    fn request_lazy_fetch_more_near_bottom(
+        table: &Table,
+        session: &Arc<Mutex<Option<u64>>>,
+        callback: &LazyFetchCallback,
+        in_flight: &Arc<Mutex<HashSet<u64>>>,
+    ) {
+        let session_id = *session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let rows = table.rows();
+        if rows <= 0 {
+            return;
+        }
+        let first_visible = table.row_position().max(0);
+        let row_h = Self::uniform_row_height_near_viewport(table, first_visible, rows)
+            .unwrap_or_else(|| table.row_height(first_visible));
+        if row_h <= 0 {
+            return;
+        }
+        let data_top = table.y().saturating_add(table.col_header_height());
+        let data_bottom = table.y().saturating_add(table.h());
+        let visible_rows = Self::visible_row_metrics(data_top, data_bottom, row_h)
+            .map(|(rows, _)| rows)
+            .unwrap_or(1);
+        if first_visible.saturating_add(visible_rows).saturating_add(1) >= rows {
+            let mut guard = in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.insert(session_id) {
+                return;
+            }
+            drop(guard);
+            Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::More);
+        }
     }
 
     fn show_inline_cell_editor(
@@ -5379,6 +5531,9 @@ impl ResultTableWidget {
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
         active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
+        lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
+        lazy_fetch_callback: &LazyFetchCallback,
+        pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -5489,7 +5644,17 @@ impl ResultTableWidget {
                 "Copy with Headers" => {
                     Self::copy_selected_with_headers(&table, headers, full_data, hidden_col);
                 }
-                "Copy All" => Self::copy_all_to_clipboard(headers, full_data, hidden_col),
+                "Copy All" => {
+                    if Self::queue_lazy_action_if_active(
+                        lazy_fetch_session,
+                        lazy_fetch_callback,
+                        pending_lazy_actions,
+                        LazyFetchPendingAction::CopyAll,
+                    ) {
+                        return;
+                    }
+                    Self::copy_all_to_clipboard(headers, full_data, hidden_col);
+                }
                 "Set Null" => {
                     if let Err(err) = Self::set_selected_cells_to_null_in_edit_mode(
                         &table,
@@ -5667,6 +5832,14 @@ impl ResultTableWidget {
 
     pub fn display_result(&mut self, result: &QueryResult) {
         mutex_store_bool(&self.streaming_in_progress, false);
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         // Query completion can race with an open inline editor focus change.
         // Commit any pending in-cell value first so failed/cancelled queries
@@ -5898,6 +6071,14 @@ impl ResultTableWidget {
 
     pub fn start_streaming(&mut self, headers: &[String]) {
         mutex_store_bool(&self.streaming_in_progress, true);
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         let save_pending = *self
             .pending_save_request
@@ -6012,6 +6193,18 @@ impl ResultTableWidget {
     pub fn append_rows(&mut self, mut rows: Vec<Vec<String>>) {
         if self.is_save_pending() {
             return;
+        }
+        if !rows.is_empty() {
+            if let Some(session_id) = *self
+                .lazy_fetch_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                self.lazy_fetch_more_in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&session_id);
+            }
         }
 
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows.
@@ -6128,6 +6321,14 @@ impl ResultTableWidget {
     /// Call this when streaming is complete to flush any remaining buffered rows
     pub fn finish_streaming(&mut self) {
         mutex_store_bool(&self.streaming_in_progress, false);
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         // flush_pending() already calls table.redraw() when rows are flushed.
         // Only issue an explicit redraw when the pending buffer was empty so the
         // streaming-complete state change is still rendered.
@@ -6139,6 +6340,143 @@ impl ResultTableWidget {
         self.flush_pending();
         if !had_pending {
             self.table.redraw();
+        }
+    }
+
+    pub fn set_lazy_fetch_callback(&mut self, callback: LazyFetchCallback) {
+        *self
+            .lazy_fetch_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(move |id, request| {
+                let mut callback_guard = callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(callback_fn) = callback_guard.as_mut() {
+                    callback_fn(id, request);
+                }
+            }));
+    }
+
+    pub fn set_lazy_fetch_session(&mut self, session_id: u64) {
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session_id);
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session_id);
+        mutex_store_bool(&self.streaming_in_progress, true);
+    }
+
+    pub fn clear_lazy_fetch_session(&mut self, session_id: u64, run_pending: bool) {
+        let mut guard = self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *guard == Some(session_id) {
+            *guard = None;
+        }
+        drop(guard);
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session_id);
+        if run_pending {
+            self.run_pending_lazy_actions(session_id);
+        } else {
+            self.clear_pending_lazy_actions_for_session(session_id);
+        }
+    }
+
+    pub fn clear_lazy_fetch_state_for_abort(&mut self) {
+        *self
+            .lazy_fetch_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.pending_lazy_actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn queue_action_after_fetch_all(&self, action: LazyFetchPendingAction) -> bool {
+        Self::queue_lazy_action_if_active(
+            &self.lazy_fetch_session,
+            &self.lazy_fetch_callback,
+            &self.pending_lazy_actions,
+            action,
+        )
+    }
+
+    fn apply_header_sort_action(&mut self, col_idx: usize) {
+        let next_state = {
+            let current = *self
+                .sort_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::next_sort_state(current, col_idx)
+        };
+        if Self::apply_sort_to_table_data(
+            &self.full_data,
+            &self.edit_session,
+            col_idx,
+            next_state.direction,
+        ) {
+            *self
+                .sort_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next_state);
+            self.table.redraw();
+        }
+    }
+
+    fn clear_pending_lazy_actions_for_session(&self, session_id: u64) {
+        let mut guard = self
+            .pending_lazy_actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|(queued_session_id, _)| *queued_session_id != session_id);
+    }
+
+    fn run_pending_lazy_actions(&mut self, session_id: u64) {
+        let actions = {
+            let mut guard = self
+                .pending_lazy_actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut actions = Vec::new();
+            let mut retained = VecDeque::new();
+            while let Some((queued_session_id, action)) = guard.pop_front() {
+                if queued_session_id == session_id {
+                    actions.push(action);
+                } else {
+                    retained.push_back((queued_session_id, action));
+                }
+            }
+            *guard = retained;
+            actions
+        };
+        for action in actions {
+            match action {
+                LazyFetchPendingAction::HeaderSort(col_idx) => {
+                    self.apply_header_sort_action(col_idx)
+                }
+                LazyFetchPendingAction::CopyAll => {
+                    let hidden_col = self.hidden_auto_rowid_col_value();
+                    Self::copy_all_to_clipboard(&self.headers, &self.full_data, hidden_col);
+                }
+                LazyFetchPendingAction::SelectAll => self.select_all(),
+                LazyFetchPendingAction::ExportCsv(mut callback) => {
+                    let (csv, row_count) = self.current_csv_snapshot();
+                    callback(csv, row_count);
+                }
+            }
         }
     }
 
@@ -6307,6 +6645,9 @@ impl ResultTableWidget {
     }
 
     pub fn select_all(&mut self) {
+        if self.queue_action_after_fetch_all(LazyFetchPendingAction::SelectAll) {
+            return;
+        }
         let rows = self.table.rows();
         let cols = self.table.cols();
         if rows > 0 && cols > 0 {
@@ -6361,8 +6702,7 @@ impl ResultTableWidget {
         }
     }
 
-    /// Export all data to CSV format
-    pub fn export_to_csv(&self) -> String {
+    fn build_csv_snapshot(&self) -> String {
         let line_ending = Self::csv_line_ending();
         let hidden_col = self.hidden_auto_rowid_col_value();
         let header_line = {
@@ -6403,6 +6743,22 @@ impl ResultTableWidget {
         }
 
         csv
+    }
+
+    /// Export all data to CSV format
+    pub fn export_to_csv(&self) -> String {
+        self.build_csv_snapshot()
+    }
+
+    pub fn export_to_csv_after_fetch_all(
+        &self,
+        callback: Box<dyn FnMut(String, usize)>,
+    ) -> Option<(String, usize)> {
+        if self.queue_action_after_fetch_all(LazyFetchPendingAction::ExportCsv(callback)) {
+            None
+        } else {
+            Some(self.current_csv_snapshot())
+        }
     }
 
     fn csv_line_ending() -> &'static str {
@@ -10476,6 +10832,7 @@ impl Default for ResultTableWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -10494,6 +10851,161 @@ mod tests {
             Key::from_char('c'),
             'c',
         ));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn lazy_fetch_finish_keeps_pending_export_until_close() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["A".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![vec!["1".to_string()]];
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((session_id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(77);
+
+        let exported = Arc::new(Mutex::new(None));
+        let exported_for_callback = exported.clone();
+        assert!(widget
+            .export_to_csv_after_fetch_all(Box::new(move |csv, row_count| {
+                *exported_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((csv, row_count));
+            }))
+            .is_none());
+
+        widget.finish_streaming();
+        assert!(exported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+
+        widget.clear_lazy_fetch_session(77, true);
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(77, LazyFetchRequest::All)]
+        );
+        assert_eq!(
+            exported
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .map(|(_, row_count)| *row_count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn lazy_fetch_copy_does_not_request_fetch_all() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["A".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![vec!["1".to_string()]];
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((session_id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(99);
+
+        let _ = widget.copy();
+        widget.copy_with_headers();
+
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(widget
+            .pending_lazy_actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn lazy_fetch_abort_drops_pending_export_action() {
+        let mut widget = ResultTableWidget::new();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((session_id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(88);
+
+        let exported = Arc::new(Mutex::new(false));
+        let exported_for_callback = exported.clone();
+        assert!(widget
+            .export_to_csv_after_fetch_all(Box::new(move |_, _| {
+                *exported_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            }))
+            .is_none());
+
+        widget.clear_lazy_fetch_state_for_abort();
+        widget.clear_lazy_fetch_session(88, true);
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(88, LazyFetchRequest::All)]
+        );
+        assert!(!*exported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_lazy_actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[test]

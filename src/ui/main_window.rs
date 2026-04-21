@@ -95,16 +95,33 @@ struct QueryProgressContext {
     result_tab_offset: usize,
     execution_target: Option<usize>,
     fetch_row_counts: HashMap<usize, usize>,
+    lazy_fetch_sessions: HashSet<u64>,
+    batch_finished: bool,
     last_fetch_status_update: Instant,
+    started_at: Instant,
+    activity_label: String,
+    active_statement_index: Option<usize>,
+    state_label: String,
 }
 
 impl QueryProgressContext {
-    fn new(result_tab_offset: usize, execution_target: Option<usize>) -> Self {
+    fn new(
+        result_tab_offset: usize,
+        execution_target: Option<usize>,
+        activity_label: String,
+    ) -> Self {
+        let now = Instant::now();
         Self {
             result_tab_offset,
             execution_target,
             fetch_row_counts: HashMap::new(),
-            last_fetch_status_update: Instant::now(),
+            lazy_fetch_sessions: HashSet::new(),
+            batch_finished: false,
+            last_fetch_status_update: now,
+            started_at: now,
+            activity_label,
+            active_statement_index: None,
+            state_label: "Starting".to_string(),
         }
     }
 }
@@ -718,6 +735,17 @@ fn resolve_active_progress_tab_index(
     ))
 }
 
+fn format_session_activity_elapsed(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let minutes = safe_div(total_seconds, 60);
+    let seconds = safe_rem(total_seconds, 60);
+    if minutes > 0 {
+        format!("{}m {:02}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
 impl MainWindow {
     fn clone_result_tabs_for_edit_action(
         state: &Arc<Mutex<AppState>>,
@@ -759,11 +787,16 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state.has_live_connection = false;
         state.pending_connection_metadata_refresh = false;
+        state.sql_editor.clear_pooled_db_session();
+        for tab in state.editor_tabs.iter() {
+            tab.sql_editor.clear_pooled_db_session();
+        }
 
         // Disconnection can happen mid-stream (network drop,
         // explicit disconnect while a worker is still unwinding). Ensure every
         // result grid exits streaming mode immediately so edit controls are not
         // left disabled waiting for a BatchFinished event that may never arrive.
+        state.result_tabs.clear_all_lazy_fetch_state_for_abort();
         state.result_tabs.finish_all_streaming();
         state.progress_contexts.clear();
 
@@ -989,6 +1022,10 @@ impl MainWindow {
 
     pub fn new_with_config(config: AppConfig) -> Self {
         let connection = create_shared_connection();
+        {
+            let mut guard = crate::db::lock_connection(&connection);
+            guard.set_connection_pool_size(config.normalized_connection_pool_size());
+        }
 
         let current_group = fltk::group::Group::try_current();
 
@@ -1574,6 +1611,32 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .result_tabs
                 .set_execute_sql_callback(grid_edit_callback);
+        }
+
+        let weak_state_for_lazy_fetch = Arc::downgrade(&state);
+        let lazy_fetch_callback = Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+            let Some(state_for_lazy_fetch) = weak_state_for_lazy_fetch.upgrade() else {
+                return;
+            };
+            let guard = state_for_lazy_fetch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.sql_editor.request_lazy_fetch(session_id, request) {
+                return;
+            }
+            for tab in guard.editor_tabs.iter() {
+                if tab.sql_editor.request_lazy_fetch(session_id, request) {
+                    return;
+                }
+            }
+        })
+            as Box<dyn FnMut(u64, crate::ui::sql_editor::LazyFetchRequest)>)));
+        {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .result_tabs
+                .set_lazy_fetch_callback(lazy_fetch_callback);
         }
 
         let weak_state_for_execute = Arc::downgrade(&state);
@@ -2596,7 +2659,7 @@ impl MainWindow {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match progress {
-                QueryProgress::BatchStart => {
+                QueryProgress::BatchStart { activity } => {
                     let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
@@ -2612,6 +2675,7 @@ impl MainWindow {
                     let context = QueryProgressContext::new(
                         resolve_result_tab_offset(tab_count, s.result_grid_execution_target),
                         s.result_grid_execution_target,
+                        activity,
                     );
                     s.progress_contexts.insert(tab_id, context);
                 }
@@ -2634,6 +2698,8 @@ impl MainWindow {
                             return;
                         };
                         context.fetch_row_counts.remove(&index);
+                        context.active_statement_index = Some(index);
+                        context.state_label = "Executing".to_string();
                         resolve_progress_tab_index(
                             tab_count,
                             context.result_tab_offset,
@@ -2673,6 +2739,8 @@ impl MainWindow {
                             return;
                         };
                         context.fetch_row_counts.insert(index, 0);
+                        context.active_statement_index = Some(index);
+                        context.state_label = "Fetching rows".to_string();
                         context.last_fetch_status_update = Instant::now();
                         resolve_progress_tab_index(
                             tab_count,
@@ -2705,6 +2773,8 @@ impl MainWindow {
                         *count += rows_len;
                         *count
                     };
+                    context.active_statement_index = Some(index);
+                    context.state_label = format!("Fetching rows: {}", new_count);
                     // Throttle status bar updates to avoid formatting a new string
                     // and touching the label widget on every row batch.
                     let needs_status_update =
@@ -2715,6 +2785,67 @@ impl MainWindow {
                     }
                     drop(s);
                     result_tabs.append_rows(tab_index, rows);
+                }
+                QueryProgress::LazyFetchSession { index, session_id } => {
+                    let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
+                    else {
+                        return;
+                    };
+                    let mut result_tabs = s.result_tabs.clone();
+                    let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                        return;
+                    };
+                    context.lazy_fetch_sessions.insert(session_id);
+                    context.active_statement_index = Some(index);
+                    context.state_label = "Lazy fetch open".to_string();
+                    drop(s);
+                    result_tabs.set_lazy_fetch_session(tab_index, session_id);
+                }
+                QueryProgress::LazyFetchClosed {
+                    index,
+                    session_id,
+                    cancelled,
+                } => {
+                    let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
+                    else {
+                        return;
+                    };
+                    let mut result_tabs = s.result_tabs.clone();
+                    let mut finished_all_lazy_fetches = false;
+                    if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                        context.lazy_fetch_sessions.remove(&session_id);
+                        context.active_statement_index = Some(index);
+                        context.state_label = if cancelled {
+                            "Fetch cancelled".to_string()
+                        } else {
+                            "Fetch complete".to_string()
+                        };
+                        finished_all_lazy_fetches =
+                            context.lazy_fetch_sessions.is_empty() && context.batch_finished;
+                    }
+                    if cancelled {
+                        s.set_status_message("Fetch cancelled");
+                    } else if finished_all_lazy_fetches {
+                        s.set_status_message("Ready");
+                    }
+                    drop(s);
+                    result_tabs.clear_lazy_fetch_session(tab_index, session_id, !cancelled);
+                    if finished_all_lazy_fetches && !cancelled {
+                        let mut s = state_for_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.progress_contexts.remove(&tab_id);
+                        s.result_grid_execution_target = None;
+                        s.result_tab_offset = s.result_tabs.tab_count();
+                        if s.pending_connection_metadata_refresh && s.has_live_connection {
+                            MainWindow::start_connection_metadata_refresh(
+                                &mut s,
+                                &schema_sender_for_progress,
+                            );
+                            s.pending_connection_metadata_refresh = false;
+                        }
+                        s.refresh_result_edit_controls();
+                    }
                 }
                 QueryProgress::ScriptOutput { lines } => {
                     let mut result_tabs = s.result_tabs.clone();
@@ -2800,7 +2931,20 @@ impl MainWindow {
                     }
                     if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
                         context.fetch_row_counts.remove(&index);
+                        context.active_statement_index = Some(index);
+                        context.state_label = if result.success {
+                            "Finished".to_string()
+                        } else {
+                            "Error".to_string()
+                        };
                     }
+                    let deferred_lazy_batch_done = s
+                        .progress_contexts
+                        .get(&tab_id)
+                        .map(|context| {
+                            context.batch_finished && context.lazy_fetch_sessions.is_empty()
+                        })
+                        .unwrap_or(false);
 
                     s.refresh_result_edit_controls();
                     drop(s);
@@ -2817,6 +2961,22 @@ impl MainWindow {
                             .start_statement(tab_index, &format!("Result {}", tab_index + 1));
                         result_tabs.display_result(tab_index, &result);
                     }
+                    if deferred_lazy_batch_done {
+                        let mut s = state_for_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.progress_contexts.remove(&tab_id);
+                        s.result_grid_execution_target = None;
+                        s.result_tab_offset = s.result_tabs.tab_count();
+                        if s.pending_connection_metadata_refresh && s.has_live_connection {
+                            MainWindow::start_connection_metadata_refresh(
+                                &mut s,
+                                &schema_sender_for_progress,
+                            );
+                            s.pending_connection_metadata_refresh = false;
+                        }
+                        s.refresh_result_edit_controls();
+                    }
                 }
                 QueryProgress::WorkerPanicked { message } => {
                     s.set_status_message(&message);
@@ -2829,6 +2989,14 @@ impl MainWindow {
                     );
                 }
                 QueryProgress::BatchFinished => {
+                    if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                        if !context.lazy_fetch_sessions.is_empty() {
+                            context.batch_finished = true;
+                            context.state_label = "Waiting for lazy fetch".to_string();
+                            s.refresh_result_edit_controls();
+                            return;
+                        }
+                    }
                     s.progress_contexts.remove(&tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
@@ -2950,11 +3118,16 @@ impl MainWindow {
     ) -> bool {
         match choice {
             "File/Connect" => {
-                let (popups, connection) = {
+                let (popups, connection, pool_size) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    (s.popups.clone(), s.connection.clone())
+                    let pool_size = s
+                        .config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .normalized_connection_pool_size();
+                    (s.popups.clone(), s.connection.clone(), pool_size)
                 };
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
                     let conn_sender = conn_sender.clone();
@@ -2975,6 +3148,7 @@ impl MainWindow {
                             app::awake();
                             return;
                         };
+                        db_conn.set_connection_pool_size(pool_size);
                         match db_conn.connect(info.clone()) {
                             Ok(_) => {
                                 db_conn.refresh_tracked_connection();
@@ -3359,17 +3533,29 @@ impl MainWindow {
                     return true;
                 }
 
-                let csv = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .export_to_csv();
-                let row_count = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .row_count();
                 let sender = file_sender.clone();
+                let deferred_sender = sender.clone();
+                let deferred_filename = filename.clone();
+                let export = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result_tabs
+                    .export_to_csv_after_fetch_all(Box::new(move |csv, row_count| {
+                        let sender = deferred_sender.clone();
+                        let filename = deferred_filename.clone();
+                        thread::spawn(move || {
+                            let result = fs::write(&filename, csv).map_err(|err| err.to_string());
+                            let _ = sender.send(FileActionResult::Export {
+                                path: filename,
+                                row_count,
+                                result,
+                            });
+                            app::awake();
+                        });
+                    }));
+                let Some((csv, row_count)) = export else {
+                    return true;
+                };
                 thread::spawn(move || {
                     let result = fs::write(&filename, csv).map_err(|err| err.to_string());
                     let _ = sender.send(FileActionResult::Export {
@@ -3471,6 +3657,78 @@ impl MainWindow {
                 MainWindow::open_query_history_dialog(state);
                 true
             }
+            "Tools/Session Activity" => {
+                let message = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let info = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let activity =
+                        crate::db::current_db_activity().unwrap_or_else(|| "Idle".to_string());
+                    let connection_name = info
+                        .as_ref()
+                        .map(|info| info.name.as_str())
+                        .unwrap_or("Not connected");
+                    let db_type = info
+                        .as_ref()
+                        .map(|info| info.db_type.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let pool_size = s
+                        .config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .normalized_connection_pool_size();
+                    let mut lines = vec![
+                        format!("Connection: {}", connection_name),
+                        format!("Database: {}", db_type),
+                        format!("Configured session pool size: {}", pool_size),
+                        format!("Current activity: {}", activity),
+                    ];
+                    if s.progress_contexts.is_empty() {
+                        lines.push("Active sessions: none".to_string());
+                    } else {
+                        let tab_count = s.result_tabs.tab_count();
+                        for (tab_id, context) in &s.progress_contexts {
+                            let tab_name = s
+                                .tab_display_name(*tab_id)
+                                .unwrap_or_else(|| format!("Tab {}", tab_id));
+                            let result_tab =
+                                context.active_statement_index.map(|statement_index| {
+                                    resolve_progress_tab_index(
+                                        tab_count,
+                                        context.result_tab_offset,
+                                        context.execution_target,
+                                        statement_index,
+                                    ) + 1
+                                });
+                            let fetched_rows = context
+                                .active_statement_index
+                                .and_then(|statement_index| {
+                                    context.fetch_row_counts.get(&statement_index).copied()
+                                })
+                                .unwrap_or(0);
+                            lines.push(format!(
+                                "\nTab: {}\nResult tab: {}\nStatus: {}\nSQL preview: {}\nFetched rows: {}\nElapsed: {}",
+                                tab_name,
+                                result_tab
+                                    .map(|index| index.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                context.state_label,
+                                context.activity_label,
+                                fetched_rows,
+                                format_session_activity_elapsed(context.started_at.elapsed())
+                            ));
+                        }
+                    }
+                    lines.join("\n")
+                };
+                fltk::dialog::message_default(&message);
+                true
+            }
             "Tools/Application Log" => {
                 let popups = state
                     .lock()
@@ -3560,8 +3818,15 @@ impl MainWindow {
                             config.result_font = settings.font;
                             config.result_font_size = settings.result_size;
                             config.result_cell_max_chars = settings.result_cell_max_chars;
+                            config.connection_pool_size = settings.connection_pool_size;
                             config.save()
                         };
+                        if let Some(mut connection) = try_lock_connection_with_activity(
+                            &s.connection,
+                            "Updating session pool preference",
+                        ) {
+                            connection.set_connection_pool_size(settings.connection_pool_size);
+                        }
                         MainWindow::apply_font_settings(&mut s);
                         save_result
                     };

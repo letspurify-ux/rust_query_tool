@@ -8,21 +8,24 @@ use fltk::{
     input::Input,
     prelude::*,
 };
+use mysql::prelude::Queryable;
 use mysql::Error as MysqlError;
 use oracle::{Connection, Error as OracleError};
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, QueryExecutor,
-    QueryResult, ScriptItem, SessionState, ToolCommand,
+    lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession,
+    DbSessionLease, QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -649,6 +652,824 @@ impl SqlEditorWidget {
         }
     }
 
+    fn acquire_oracle_pooled_execution_connection(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        sender: &mpsc::Sender<QueryProgress>,
+        has_connect_command: bool,
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+    ) -> Result<Option<Arc<Connection>>, String> {
+        if has_connect_command {
+            *pooled_db_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return Self::acquire_execution_connection(conn_guard, sender, true);
+        }
+
+        if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
+            *pooled_db_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return Self::acquire_execution_connection(conn_guard, sender, false);
+        }
+
+        let connection_generation = conn_guard.connection_generation();
+        {
+            let mut lease = pooled_db_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match lease.as_ref() {
+                Some((lease_generation, DbSessionLease::Oracle(conn)))
+                    if *lease_generation == connection_generation =>
+                {
+                    return Ok(Some(Arc::clone(conn)));
+                }
+                Some((lease_generation, _)) if *lease_generation != connection_generation => {
+                    *lease = None;
+                }
+                Some((_, existing)) if existing.db_type() != crate::db::DatabaseType::Oracle => {
+                    *lease = None;
+                }
+                _ => {}
+            }
+        }
+
+        match conn_guard.acquire_pool_session()? {
+            Some(DbPoolSession::Oracle(conn)) => {
+                let conn = Arc::new(conn);
+                let mut lease = pooled_db_session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *lease = Some((
+                    connection_generation,
+                    DbSessionLease::Oracle(Arc::clone(&conn)),
+                ));
+                Ok(Some(conn))
+            }
+            _ => Self::acquire_execution_connection(conn_guard, sender, false),
+        }
+    }
+
+    fn register_lazy_fetch_handle(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+        sender: mpsc::Sender<LazyFetchCommand>,
+        break_connection: Option<Arc<Connection>>,
+        mysql_cancel_context: Option<Arc<Mutex<Option<MySqlQueryCancelContext>>>>,
+    ) {
+        *active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LazyFetchHandle {
+            session_id,
+            sender,
+            break_connection,
+            mysql_cancel_context,
+        });
+    }
+
+    fn clear_lazy_fetch_handle(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+    ) {
+        let mut guard = active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|handle| handle.session_id == session_id)
+        {
+            *guard = None;
+        }
+    }
+
+    fn lazy_fetch_handle_matches(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+    ) -> bool {
+        active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| handle.session_id == session_id)
+    }
+
+    fn fetch_lazy_oracle_rows(
+        result_set: &mut oracle::ResultSet<'static, oracle::Row>,
+        column_count: usize,
+        limit: usize,
+        null_text: &str,
+        fetched_rows: &mut usize,
+        last_select_row: &mut Option<Vec<String>>,
+    ) -> Result<(Vec<Vec<String>>, bool), OracleError> {
+        let mut rows = Vec::new();
+        for _ in 0..limit {
+            let Some(row_result) = result_set.next() else {
+                return Ok((rows, true));
+            };
+            let row = row_result?;
+            let mut row_data = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                row_data.push(QueryExecutor::row_value_to_text(&row, i)?);
+            }
+            *last_select_row = Some(row_data.clone());
+            SqlEditorWidget::apply_null_text_to_row(&mut row_data, null_text);
+            rows.push(row_data);
+            *fetched_rows = fetched_rows.saturating_add(1);
+        }
+        Ok((rows, false))
+    }
+
+    fn emit_lazy_rows(sender: &mpsc::Sender<QueryProgress>, index: usize, rows: Vec<Vec<String>>) {
+        if !rows.is_empty() {
+            let _ = sender.send(QueryProgress::Rows { index, rows });
+            app::awake();
+        }
+    }
+
+    fn drain_lazy_cancel_request(
+        receiver: &mpsc::Receiver<LazyFetchCommand>,
+        pending_commands: &mut VecDeque<LazyFetchCommand>,
+    ) -> bool {
+        loop {
+            match receiver.try_recv() {
+                Ok(LazyFetchCommand::Cancel) => return true,
+                Ok(command) => pending_commands.push_back(command),
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => return true,
+            }
+        }
+    }
+
+    fn next_lazy_fetch_command(
+        receiver: &mpsc::Receiver<LazyFetchCommand>,
+        pending_commands: &mut VecDeque<LazyFetchCommand>,
+    ) -> Result<LazyFetchCommand, mpsc::RecvError> {
+        if let Some(command) = pending_commands.pop_front() {
+            Ok(command)
+        } else {
+            receiver.recv()
+        }
+    }
+
+    fn emit_lazy_cancelled_result(
+        sender: &mpsc::Sender<QueryProgress>,
+        index: usize,
+        session_id: u64,
+        sql: &str,
+        column_info: &[ColumnInfo],
+        fetched_rows: usize,
+        elapsed: Duration,
+        heading_enabled: bool,
+        conn_name: &str,
+    ) {
+        let _ = sender.send(QueryProgress::LazyFetchClosed {
+            index,
+            session_id,
+            cancelled: true,
+        });
+        let mut query_result =
+            QueryResult::new_select_streamed(sql, column_info.to_vec(), fetched_rows, elapsed);
+        SqlEditorWidget::apply_heading_to_result(&mut query_result, heading_enabled);
+        query_result.success = false;
+        query_result.message = "Fetch cancelled".to_string();
+        let _ = sender.send(QueryProgress::StatementFinished {
+            index,
+            result: query_result,
+            connection_name: conn_name.to_string(),
+            timed_out: false,
+        });
+        app::awake();
+    }
+
+    fn start_oracle_lazy_select(
+        conn: Arc<Connection>,
+        sender: mpsc::Sender<QueryProgress>,
+        session: Arc<Mutex<SessionState>>,
+        conn_name: String,
+        index: usize,
+        sql_to_execute: String,
+        binds: Vec<crate::db::ResolvedBind>,
+        heading_enabled: bool,
+        feedback_enabled: bool,
+        colsep: String,
+        null_text: String,
+        active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+        query_timeout: Option<Duration>,
+    ) -> Result<(), OracleError> {
+        let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
+        Self::register_lazy_fetch_handle(
+            &active_lazy_fetch,
+            session_id,
+            command_sender,
+            Some(Arc::clone(&conn)),
+            None,
+        );
+        thread::spawn(move || {
+            let statement_start = Instant::now();
+            let mut fetched_rows = 0usize;
+            let mut last_select_row: Option<Vec<String>> = None;
+            let mut raw_column_names: Vec<String> = Vec::new();
+            let mut pending_commands = VecDeque::new();
+            let lazy_fetch_timeout = Self::lazy_fetch_query_timeout(query_timeout);
+            let previous_timeout = conn.call_timeout().ok().flatten();
+            let _ = conn.set_call_timeout(lazy_fetch_timeout);
+            let result = (|| -> Result<(), OracleError> {
+                let (mut result_set, column_info) =
+                    QueryExecutor::open_select_lazy_cursor_with_binds(
+                        conn.as_ref(),
+                        &sql_to_execute,
+                        &binds,
+                    )?;
+                raw_column_names = column_info
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
+                let display_columns = SqlEditorWidget::apply_heading_setting(
+                    raw_column_names.clone(),
+                    heading_enabled,
+                );
+                let _ = sender.send(QueryProgress::SelectStart {
+                    index,
+                    columns: display_columns.clone(),
+                    null_text: null_text.clone(),
+                });
+                let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
+                app::awake();
+                if !display_columns.is_empty() {
+                    SqlEditorWidget::append_spool_output(
+                        &session,
+                        &[display_columns.join(&colsep)],
+                    );
+                }
+                let column_count = column_info.len();
+                let (rows, eof) = Self::fetch_lazy_oracle_rows(
+                    &mut result_set,
+                    column_count,
+                    PROGRESS_ROWS_INITIAL_BATCH,
+                    &null_text,
+                    &mut fetched_rows,
+                    &mut last_select_row,
+                )?;
+                SqlEditorWidget::append_spool_rows(&session, &rows);
+                Self::emit_lazy_rows(&sender, index, rows);
+                if Self::drain_lazy_cancel_request(&command_receiver, &mut pending_commands) {
+                    Self::emit_lazy_cancelled_result(
+                        &sender,
+                        index,
+                        session_id,
+                        &sql_to_execute,
+                        &column_info,
+                        fetched_rows,
+                        statement_start.elapsed(),
+                        heading_enabled,
+                        &conn_name,
+                    );
+                    return Ok(());
+                }
+                if eof {
+                    let mut query_result = QueryResult::new_select_streamed(
+                        &sql_to_execute,
+                        column_info.clone(),
+                        fetched_rows,
+                        statement_start.elapsed(),
+                    );
+                    SqlEditorWidget::apply_heading_to_result(&mut query_result, heading_enabled);
+                    if !feedback_enabled {
+                        query_result.message.clear();
+                    }
+                    if !query_result.message.trim().is_empty() {
+                        SqlEditorWidget::append_spool_output(
+                            &session,
+                            std::slice::from_ref(&query_result.message),
+                        );
+                    }
+                    SqlEditorWidget::apply_column_new_value_from_row(
+                        &session,
+                        &raw_column_names,
+                        last_select_row.as_deref(),
+                    );
+                    let _ = sender.send(QueryProgress::StatementFinished {
+                        index,
+                        result: query_result,
+                        connection_name: conn_name.clone(),
+                        timed_out: false,
+                    });
+                    let _ = sender.send(QueryProgress::LazyFetchClosed {
+                        index,
+                        session_id,
+                        cancelled: false,
+                    });
+                    app::awake();
+                    return Ok(());
+                }
+                loop {
+                    match Self::next_lazy_fetch_command(&command_receiver, &mut pending_commands) {
+                        Ok(LazyFetchCommand::FetchMore(limit)) => {
+                            let (rows, eof) = Self::fetch_lazy_oracle_rows(
+                                &mut result_set,
+                                column_count,
+                                limit,
+                                &null_text,
+                                &mut fetched_rows,
+                                &mut last_select_row,
+                            )?;
+                            SqlEditorWidget::append_spool_rows(&session, &rows);
+                            Self::emit_lazy_rows(&sender, index, rows);
+                            if Self::drain_lazy_cancel_request(
+                                &command_receiver,
+                                &mut pending_commands,
+                            ) {
+                                Self::emit_lazy_cancelled_result(
+                                    &sender,
+                                    index,
+                                    session_id,
+                                    &sql_to_execute,
+                                    &column_info,
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                    heading_enabled,
+                                    &conn_name,
+                                );
+                                return Ok(());
+                            }
+                            if eof {
+                                let mut query_result = QueryResult::new_select_streamed(
+                                    &sql_to_execute,
+                                    column_info.clone(),
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                );
+                                SqlEditorWidget::apply_heading_to_result(
+                                    &mut query_result,
+                                    heading_enabled,
+                                );
+                                if !feedback_enabled {
+                                    query_result.message.clear();
+                                }
+                                if !query_result.message.trim().is_empty() {
+                                    SqlEditorWidget::append_spool_output(
+                                        &session,
+                                        std::slice::from_ref(&query_result.message),
+                                    );
+                                }
+                                SqlEditorWidget::apply_column_new_value_from_row(
+                                    &session,
+                                    &raw_column_names,
+                                    last_select_row.as_deref(),
+                                );
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index,
+                                    result: query_result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out: false,
+                                });
+                                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                                    index,
+                                    session_id,
+                                    cancelled: false,
+                                });
+                                app::awake();
+                                return Ok(());
+                            }
+                        }
+                        Ok(LazyFetchCommand::FetchAll) => loop {
+                            let (rows, eof) = Self::fetch_lazy_oracle_rows(
+                                &mut result_set,
+                                column_count,
+                                PROGRESS_ROWS_MAX_BATCH,
+                                &null_text,
+                                &mut fetched_rows,
+                                &mut last_select_row,
+                            )?;
+                            SqlEditorWidget::append_spool_rows(&session, &rows);
+                            Self::emit_lazy_rows(&sender, index, rows);
+                            if Self::drain_lazy_cancel_request(
+                                &command_receiver,
+                                &mut pending_commands,
+                            ) {
+                                Self::emit_lazy_cancelled_result(
+                                    &sender,
+                                    index,
+                                    session_id,
+                                    &sql_to_execute,
+                                    &column_info,
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                    heading_enabled,
+                                    &conn_name,
+                                );
+                                return Ok(());
+                            }
+                            if eof {
+                                let mut query_result = QueryResult::new_select_streamed(
+                                    &sql_to_execute,
+                                    column_info.clone(),
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                );
+                                SqlEditorWidget::apply_heading_to_result(
+                                    &mut query_result,
+                                    heading_enabled,
+                                );
+                                if !feedback_enabled {
+                                    query_result.message.clear();
+                                }
+                                if !query_result.message.trim().is_empty() {
+                                    SqlEditorWidget::append_spool_output(
+                                        &session,
+                                        std::slice::from_ref(&query_result.message),
+                                    );
+                                }
+                                SqlEditorWidget::apply_column_new_value_from_row(
+                                    &session,
+                                    &raw_column_names,
+                                    last_select_row.as_deref(),
+                                );
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index,
+                                    result: query_result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out: false,
+                                });
+                                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                                    index,
+                                    session_id,
+                                    cancelled: false,
+                                });
+                                app::awake();
+                                return Ok(());
+                            }
+                        },
+                        Ok(LazyFetchCommand::Cancel) | Err(_) => {
+                            Self::emit_lazy_cancelled_result(
+                                &sender,
+                                index,
+                                session_id,
+                                &sql_to_execute,
+                                &column_info,
+                                fetched_rows,
+                                statement_start.elapsed(),
+                                heading_enabled,
+                                &conn_name,
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            })();
+            if let Err(err) = result {
+                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                    index,
+                    session_id,
+                    cancelled: true,
+                });
+                let mut error_result = QueryResult::new_error(&sql_to_execute, &err.to_string());
+                error_result.is_select = true;
+                let _ = sender.send(QueryProgress::StatementFinished {
+                    index,
+                    result: error_result,
+                    connection_name: conn_name,
+                    timed_out: false,
+                });
+                app::awake();
+            }
+            let _ = conn.set_call_timeout(previous_timeout);
+            Self::clear_lazy_fetch_handle(&active_lazy_fetch, session_id);
+        });
+        Ok(())
+    }
+
+    fn start_mysql_lazy_select(
+        connection_generation: u64,
+        mut conn: mysql::PooledConn,
+        connection_info: ConnectionInfo,
+        pooled_db_session: Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        sender: mpsc::Sender<QueryProgress>,
+        session: Arc<Mutex<SessionState>>,
+        conn_name: String,
+        index: usize,
+        sql_to_execute: String,
+        heading_enabled: bool,
+        feedback_enabled: bool,
+        colsep: String,
+        null_text: String,
+        auto_commit: bool,
+        query_timeout: Option<Duration>,
+        active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+    ) {
+        let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
+        let lazy_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        Self::register_lazy_fetch_handle(
+            &active_lazy_fetch,
+            session_id,
+            command_sender,
+            None,
+            Some(lazy_cancel_context.clone()),
+        );
+        thread::spawn(move || {
+            let statement_start = Instant::now();
+            let mut fetched_rows = 0usize;
+            let mut last_select_row: Option<Vec<String>> = None;
+            let mut keep_session = false;
+            let mut pending_commands = VecDeque::new();
+            let lazy_fetch_timeout = Self::lazy_fetch_query_timeout(query_timeout);
+            *lazy_cancel_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MySqlQueryCancelContext {
+                connection_info: connection_info.clone(),
+                connection_id: conn.connection_id(),
+            });
+            let result = (|| -> Result<(), String> {
+                conn.query_drop(if auto_commit {
+                    "SET autocommit=1"
+                } else {
+                    "SET autocommit=0"
+                })
+                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout))?;
+                crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                    &mut conn,
+                    lazy_fetch_timeout,
+                )
+                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout))?;
+                if Self::drain_lazy_cancel_request(&command_receiver, &mut pending_commands) {
+                    return Err(Self::cancel_message());
+                }
+                let mut result = conn.query_iter(sql_to_execute.as_str()).map_err(|err| {
+                    SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout)
+                })?;
+                let column_info: Vec<ColumnInfo> = result
+                    .columns()
+                    .as_ref()
+                    .iter()
+                    .map(|col| ColumnInfo {
+                        name: col.name_str().to_string(),
+                        data_type: format!("{:?}", col.column_type()),
+                    })
+                    .collect();
+                let raw_column_names = column_info
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<String>>();
+                let display_columns = SqlEditorWidget::apply_heading_setting(
+                    raw_column_names.clone(),
+                    heading_enabled,
+                );
+                let _ = sender.send(QueryProgress::SelectStart {
+                    index,
+                    columns: display_columns.clone(),
+                    null_text: null_text.clone(),
+                });
+                let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
+                app::awake();
+                if !display_columns.is_empty() {
+                    SqlEditorWidget::append_spool_output(
+                        &session,
+                        &[display_columns.join(&colsep)],
+                    );
+                }
+                let column_count = column_info.len();
+                macro_rules! fetch_rows {
+                    ($limit:expr) => {{
+                        let mut rows = Vec::new();
+                        let mut eof = false;
+                        for _ in 0..$limit {
+                            let Some(row_result) = result.next() else {
+                                eof = true;
+                                break;
+                            };
+                            let row: mysql::Row = row_result.map_err(|err| {
+                                SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout)
+                            })?;
+                            let mut row_data =
+                                crate::db::query::mysql_executor::MysqlExecutor::row_to_strings(
+                                    &row,
+                                    column_count,
+                                );
+                            last_select_row = Some(row_data.clone());
+                            SqlEditorWidget::apply_null_text_to_row(&mut row_data, &null_text);
+                            rows.push(row_data);
+                            fetched_rows = fetched_rows.saturating_add(1);
+                        }
+                        (rows, eof)
+                    }};
+                }
+                let (rows, eof) = fetch_rows!(PROGRESS_ROWS_INITIAL_BATCH);
+                SqlEditorWidget::append_spool_rows(&session, &rows);
+                Self::emit_lazy_rows(&sender, index, rows);
+                if Self::drain_lazy_cancel_request(&command_receiver, &mut pending_commands) {
+                    Self::emit_lazy_cancelled_result(
+                        &sender,
+                        index,
+                        session_id,
+                        &sql_to_execute,
+                        &column_info,
+                        fetched_rows,
+                        statement_start.elapsed(),
+                        heading_enabled,
+                        &conn_name,
+                    );
+                    return Ok(());
+                }
+                if eof {
+                    let mut query_result = QueryResult::new_select_streamed(
+                        &sql_to_execute,
+                        column_info.clone(),
+                        fetched_rows,
+                        statement_start.elapsed(),
+                    );
+                    SqlEditorWidget::apply_heading_to_result(&mut query_result, heading_enabled);
+                    if !feedback_enabled {
+                        query_result.message.clear();
+                    }
+                    SqlEditorWidget::apply_column_new_value_from_row(
+                        &session,
+                        &raw_column_names,
+                        last_select_row.as_deref(),
+                    );
+                    let _ = sender.send(QueryProgress::StatementFinished {
+                        index,
+                        result: query_result,
+                        connection_name: conn_name.clone(),
+                        timed_out: false,
+                    });
+                    let _ = sender.send(QueryProgress::LazyFetchClosed {
+                        index,
+                        session_id,
+                        cancelled: false,
+                    });
+                    keep_session = true;
+                    app::awake();
+                    return Ok(());
+                }
+                loop {
+                    match Self::next_lazy_fetch_command(&command_receiver, &mut pending_commands) {
+                        Ok(LazyFetchCommand::FetchMore(limit)) => {
+                            let (rows, eof) = fetch_rows!(limit);
+                            SqlEditorWidget::append_spool_rows(&session, &rows);
+                            Self::emit_lazy_rows(&sender, index, rows);
+                            if Self::drain_lazy_cancel_request(
+                                &command_receiver,
+                                &mut pending_commands,
+                            ) {
+                                Self::emit_lazy_cancelled_result(
+                                    &sender,
+                                    index,
+                                    session_id,
+                                    &sql_to_execute,
+                                    &column_info,
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                    heading_enabled,
+                                    &conn_name,
+                                );
+                                return Ok(());
+                            }
+                            if eof {
+                                let mut query_result = QueryResult::new_select_streamed(
+                                    &sql_to_execute,
+                                    column_info.clone(),
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                );
+                                SqlEditorWidget::apply_heading_to_result(
+                                    &mut query_result,
+                                    heading_enabled,
+                                );
+                                if !feedback_enabled {
+                                    query_result.message.clear();
+                                }
+                                SqlEditorWidget::apply_column_new_value_from_row(
+                                    &session,
+                                    &raw_column_names,
+                                    last_select_row.as_deref(),
+                                );
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index,
+                                    result: query_result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out: false,
+                                });
+                                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                                    index,
+                                    session_id,
+                                    cancelled: false,
+                                });
+                                keep_session = true;
+                                app::awake();
+                                return Ok(());
+                            }
+                        }
+                        Ok(LazyFetchCommand::FetchAll) => loop {
+                            let (rows, eof) = fetch_rows!(PROGRESS_ROWS_MAX_BATCH);
+                            SqlEditorWidget::append_spool_rows(&session, &rows);
+                            Self::emit_lazy_rows(&sender, index, rows);
+                            if Self::drain_lazy_cancel_request(
+                                &command_receiver,
+                                &mut pending_commands,
+                            ) {
+                                Self::emit_lazy_cancelled_result(
+                                    &sender,
+                                    index,
+                                    session_id,
+                                    &sql_to_execute,
+                                    &column_info,
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                    heading_enabled,
+                                    &conn_name,
+                                );
+                                return Ok(());
+                            }
+                            if eof {
+                                let mut query_result = QueryResult::new_select_streamed(
+                                    &sql_to_execute,
+                                    column_info.clone(),
+                                    fetched_rows,
+                                    statement_start.elapsed(),
+                                );
+                                SqlEditorWidget::apply_heading_to_result(
+                                    &mut query_result,
+                                    heading_enabled,
+                                );
+                                if !feedback_enabled {
+                                    query_result.message.clear();
+                                }
+                                SqlEditorWidget::apply_column_new_value_from_row(
+                                    &session,
+                                    &raw_column_names,
+                                    last_select_row.as_deref(),
+                                );
+                                let _ = sender.send(QueryProgress::StatementFinished {
+                                    index,
+                                    result: query_result,
+                                    connection_name: conn_name.clone(),
+                                    timed_out: false,
+                                });
+                                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                                    index,
+                                    session_id,
+                                    cancelled: false,
+                                });
+                                keep_session = true;
+                                app::awake();
+                                return Ok(());
+                            }
+                        },
+                        Ok(LazyFetchCommand::Cancel) | Err(_) => {
+                            Self::emit_lazy_cancelled_result(
+                                &sender,
+                                index,
+                                session_id,
+                                &sql_to_execute,
+                                &column_info,
+                                fetched_rows,
+                                statement_start.elapsed(),
+                                heading_enabled,
+                                &conn_name,
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            })();
+            if let Err(err) = result {
+                let _ = sender.send(QueryProgress::LazyFetchClosed {
+                    index,
+                    session_id,
+                    cancelled: true,
+                });
+                let mut error_result = QueryResult::new_error(&sql_to_execute, &err);
+                error_result.is_select = true;
+                let _ = sender.send(QueryProgress::StatementFinished {
+                    index,
+                    result: error_result,
+                    connection_name: conn_name,
+                    timed_out: false,
+                });
+                app::awake();
+            }
+            *lazy_cancel_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            let should_release_session =
+                keep_session && Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
+            if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                &mut conn, None,
+            ) {
+                crate::utils::logging::log_error(
+                    "mysql lazy fetch cleanup",
+                    &format!("Failed to reset MySQL lazy fetch session timeout: {err}"),
+                );
+            }
+            if should_release_session {
+                Self::release_mysql_pooled_session(&pooled_db_session, connection_generation, conn);
+            }
+            Self::clear_lazy_fetch_handle(&active_lazy_fetch, session_id);
+        });
+    }
+
     fn emit_execution_startup_error(
         sender: &mpsc::Sender<QueryProgress>,
         script_mode: bool,
@@ -728,6 +1549,9 @@ impl SqlEditorWidget {
         sql_text: &str,
         conn_name: &str,
         session: &Arc<Mutex<SessionState>>,
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
         script_mode: bool,
@@ -741,8 +1565,12 @@ impl SqlEditorWidget {
         if items.is_empty() {
             return;
         }
+        let lazy_fetch_single_statement =
+            !script_mode && items.len() == 1 && matches!(items[0], ScriptItem::Statement(_));
 
-        let _ = sender.send(QueryProgress::BatchStart);
+        let _ = sender.send(QueryProgress::BatchStart {
+            activity: db_activity.to_string(),
+        });
         app::awake();
 
         let mut conn_name = conn_name.to_string();
@@ -764,20 +1592,24 @@ impl SqlEditorWidget {
             source_path: None,
         }];
 
-        let execute_mysql_sql = |sql: &str| -> Result<Vec<QueryResult>, String> {
-            let mut conn_guard =
-                lock_connection_with_activity(shared_connection, db_activity.to_string());
-            SqlEditorWidget::run_mysql_action_with_timeout(
-                &mut conn_guard,
-                current_mysql_cancel_context,
-                cancel_flag,
-                query_timeout,
-                db_activity,
-                |mysql_conn| {
-                    crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
-                },
-            )
-        };
+        let execute_mysql_sql =
+            |sql: &str, auto_commit: bool| -> Result<Vec<QueryResult>, String> {
+                let refresh_encoding_after =
+                    crate::db::query::mysql_executor::MysqlExecutor::is_use_statement(sql);
+                SqlEditorWidget::run_mysql_pooled_action_with_timeout(
+                    shared_connection,
+                    pooled_db_session,
+                    current_mysql_cancel_context,
+                    cancel_flag,
+                    query_timeout,
+                    db_activity,
+                    auto_commit,
+                    refresh_encoding_after,
+                    |mysql_conn| {
+                        crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
+                    },
+                )
+            };
         let mysql_interruption_flags = |message: &str| {
             (
                 message == SqlEditorWidget::cancel_message(),
@@ -1104,6 +1936,9 @@ impl SqlEditorWidget {
                                 );
                                 conn_guard.set_auto_commit(enabled);
                             }
+                            *pooled_db_session
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             auto_commit = enabled;
                             SqlEditorWidget::emit_script_message(
                                 sender,
@@ -1332,6 +2167,9 @@ impl SqlEditorWidget {
                                 conn_guard.disconnect();
                                 had_connection
                             };
+                            *pooled_db_session
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             conn_name.clear();
                             let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                             app::awake();
@@ -1423,12 +2261,21 @@ impl SqlEditorWidget {
                             let use_sql = SqlEditorWidget::format_tool_command(&ToolCommand::Use {
                                 database: database.clone(),
                             });
-                            match execute_mysql_sql(use_sql.as_str()) {
+                            match execute_mysql_sql(use_sql.as_str(), auto_commit) {
                                 Ok(_) => {
-                                    let info = SqlEditorWidget::sync_mysql_connection_info_for_ui(
-                                        shared_connection,
-                                        db_activity,
-                                    );
+                                    let info = {
+                                        let conn_guard = lock_connection_with_activity(
+                                            shared_connection,
+                                            db_activity.to_string(),
+                                        );
+                                        if conn_guard.db_type() == crate::db::DatabaseType::MySQL {
+                                            Some(Self::connection_info_for_ui(
+                                                conn_guard.get_info(),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    };
                                     SqlEditorWidget::emit_script_output(
                                         sender,
                                         session,
@@ -1496,7 +2343,7 @@ impl SqlEditorWidget {
                         | ToolCommand::ShowWarnings
                         | ToolCommand::MysqlShowErrors) => {
                             let sql = SqlEditorWidget::format_tool_command(mysql_command);
-                            match execute_mysql_sql(sql.as_str()) {
+                            match execute_mysql_sql(sql.as_str(), auto_commit) {
                                 Ok(results) => {
                                     let Some(result) = results.into_iter().next() else {
                                         let _ = SqlEditorWidget::emit_non_select_result(
@@ -1670,7 +2517,57 @@ impl SqlEditorWidget {
                     }
 
                     let statement_start = Instant::now();
-                    match execute_mysql_sql(sql_text.as_str()) {
+                    if lazy_fetch_single_statement
+                        && crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(
+                            &sql_text,
+                        )
+                    {
+                        if let Ok((connection_generation, connection_info, conn)) =
+                            Self::acquire_mysql_pooled_session(
+                                shared_connection,
+                                pooled_db_session,
+                                db_activity,
+                                auto_commit,
+                            )
+                        {
+                            let (heading_enabled, feedback_enabled) =
+                                SqlEditorWidget::current_output_settings(session);
+                            let (colsep, null_text, _trimspool_enabled) =
+                                SqlEditorWidget::current_text_output_settings(session);
+                            let session_id = next_lazy_fetch_session_id
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = sender.send(QueryProgress::StatementStart {
+                                index: result_index,
+                            });
+                            let _ = sender.send(QueryProgress::LazyFetchSession {
+                                index: result_index,
+                                session_id,
+                            });
+                            app::awake();
+                            SqlEditorWidget::start_mysql_lazy_select(
+                                connection_generation,
+                                conn,
+                                connection_info,
+                                Arc::clone(pooled_db_session),
+                                sender.clone(),
+                                session.clone(),
+                                conn_name.clone(),
+                                result_index,
+                                sql_text.clone(),
+                                heading_enabled,
+                                feedback_enabled,
+                                colsep,
+                                null_text,
+                                auto_commit,
+                                query_timeout,
+                                active_lazy_fetch.clone(),
+                                session_id,
+                            );
+                            result_index += 1;
+                            continue;
+                        }
+                    }
+                    match execute_mysql_sql(sql_text.as_str(), auto_commit) {
                         Ok(results) => {
                             if load_mutex_bool(cancel_flag) {
                                 stop_execution = true;
@@ -1827,10 +2724,14 @@ impl SqlEditorWidget {
         let sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
+        let pooled_db_session = self.pooled_db_session.clone();
+        let active_lazy_fetch = self.active_lazy_fetch.clone();
+        let next_lazy_fetch_session_id = self.next_lazy_fetch_session_id.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
+        self.cancel_active_lazy_fetch();
         // Reset cancel flag before starting new execution
         store_mutex_bool(&cancel_flag, false);
 
@@ -1892,6 +2793,9 @@ impl SqlEditorWidget {
                         &sql_text,
                         &conn_name,
                         &session,
+                        &pooled_db_session,
+                        &active_lazy_fetch,
+                        &next_lazy_fetch_session_id,
                         &current_mysql_cancel_context,
                         &cancel_flag,
                         script_mode,
@@ -1903,10 +2807,11 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                let mut conn_opt = match Self::acquire_execution_connection(
+                let mut conn_opt = match Self::acquire_oracle_pooled_execution_connection(
                     &mut conn_guard,
                     &sender,
                     startup_policy.has_connect_command,
+                    &pooled_db_session,
                 ) {
                     Ok(conn) => conn,
                     Err(message) => {
@@ -1960,8 +2865,13 @@ impl SqlEditorWidget {
                 if items.is_empty() {
                     return;
                 }
+                let lazy_fetch_single_statement = !script_mode
+                    && items.len() == 1
+                    && matches!(items[0], ScriptItem::Statement(_));
 
-                let _ = sender.send(QueryProgress::BatchStart);
+                let _ = sender.send(QueryProgress::BatchStart {
+                    activity: db_activity.clone(),
+                });
                 app::awake();
 
                 // Set timeout only if we have a connection
@@ -3915,18 +4825,43 @@ impl SqlEditorWidget {
                                             app::awake();
                                         }
                                         Err(err) => {
-                                            conn_opt = None;
-                                            conn_name.clear();
+                                            let (
+                                                preserved_conn_opt,
+                                                preserved_conn_name,
+                                                preserved_conn_info,
+                                            ) = {
+                                                let conn_guard = lock_connection_with_activity(
+                                                    &shared_connection,
+                                                    db_activity.clone(),
+                                                );
+                                                if conn_guard.is_connected()
+                                                    && conn_guard.has_connection_handle()
+                                                {
+                                                    (
+                                                        conn_guard.get_connection(),
+                                                        conn_guard.get_info().name.clone(),
+                                                        Some(
+                                                            SqlEditorWidget::connection_info_for_ui(
+                                                                conn_guard.get_info(),
+                                                            ),
+                                                        ),
+                                                    )
+                                                } else {
+                                                    (None, String::new(), None)
+                                                }
+                                            };
+                                            conn_opt = preserved_conn_opt;
+                                            conn_name = preserved_conn_name;
                                             SqlEditorWidget::set_current_query_connection(
                                                 &current_query_connection,
-                                                None,
+                                                conn_opt.as_ref().map(Arc::clone),
                                             );
                                             let error_msg = format!("Connection failed: {}", err);
                                             SqlEditorWidget::emit_script_message(
                                                 &sender, &session, "CONNECT", &error_msg,
                                             );
                                             let _ = sender.send(QueryProgress::ConnectionChanged {
-                                                info: None,
+                                                info: preserved_conn_info,
                                             });
                                             app::awake();
                                             command_error = true;
@@ -3953,6 +4888,9 @@ impl SqlEditorWidget {
                                         };
                                         (had_connection, next_conn_opt, next_conn_name)
                                     };
+                                    *pooled_db_session
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
                                     // Clear cancel connection before disconnect
                                     SqlEditorWidget::set_current_query_connection(
@@ -5262,6 +6200,56 @@ impl SqlEditorWidget {
                                 };
                                 let transform_state =
                                     std::sync::Mutex::new(SelectTransformState::default());
+
+                                if lazy_fetch_single_statement
+                                    && break_column.is_none()
+                                    && compute_config.is_none()
+                                {
+                                    let session_id = next_lazy_fetch_session_id
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let _ = sender.send(QueryProgress::LazyFetchSession {
+                                        index,
+                                        session_id,
+                                    });
+                                    match SqlEditorWidget::start_oracle_lazy_select(
+                                        Arc::clone(conn),
+                                        sender.clone(),
+                                        session.clone(),
+                                        conn_name.clone(),
+                                        index,
+                                        sql_to_execute.clone(),
+                                        binds.clone(),
+                                        heading_enabled,
+                                        feedback_enabled,
+                                        colsep.clone(),
+                                        null_text.clone(),
+                                        active_lazy_fetch.clone(),
+                                        session_id,
+                                        query_timeout,
+                                    ) {
+                                        Ok(()) => {
+                                            result_index += 1;
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            let mut error_result =
+                                                QueryResult::new_error(&sql_text, &err.to_string());
+                                            error_result.is_select = true;
+                                            let _ = sender.send(QueryProgress::StatementFinished {
+                                                index,
+                                                result: error_result,
+                                                connection_name: conn_name.clone(),
+                                                timed_out: false,
+                                            });
+                                            app::awake();
+                                            result_index += 1;
+                                            if !continue_on_error {
+                                                stop_execution = true;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
 
                                 let result =
                                     match QueryExecutor::execute_select_streaming_with_binds(
@@ -7353,6 +8341,13 @@ impl SqlEditorWidget {
         "Query cancelled".to_string()
     }
 
+    fn lazy_fetch_query_timeout(_query_timeout: Option<Duration>) -> Option<Duration> {
+        // Match Toad-style grid fetching: an open lazy cursor is kept alive until
+        // EOF, explicit cancel, or disconnect. Query timeout applies to normal
+        // executions, not to idle/incremental grid fetches.
+        None
+    }
+
     pub(super) fn abort_if_cancelled(cancel_flag: &Arc<Mutex<bool>>) -> Result<(), String> {
         if load_mutex_bool(cancel_flag) {
             Err(Self::cancel_message())
@@ -7387,6 +8382,132 @@ impl SqlEditorWidget {
     ) {
         if let Some(mysql_conn) = conn_guard.get_mysql_connection_mut() {
             Self::reset_mysql_timeout_on_connection(mysql_conn, query_timeout, log_context);
+        }
+    }
+
+    fn acquire_mysql_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        db_activity: &str,
+        auto_commit: bool,
+    ) -> Result<(u64, ConnectionInfo, mysql::PooledConn), String> {
+        let (connection_generation, connection_info, pool, current_database) = {
+            let conn_guard =
+                lock_connection_with_activity(shared_connection, db_activity.to_string());
+            if conn_guard.db_type() != crate::db::DatabaseType::MySQL
+                || !conn_guard.is_connected()
+                || !conn_guard.has_connection_handle()
+            {
+                return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
+            }
+            let connection_info = conn_guard
+                .mysql_runtime_connection_info()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())?;
+            let pool = conn_guard
+                .get_pool()
+                .ok_or_else(|| "MySQL connection pool is not available".to_string())?;
+            (
+                conn_guard.connection_generation(),
+                connection_info,
+                pool,
+                conn_guard.get_info().service_name.clone(),
+            )
+        };
+
+        let mut lease = pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lease.as_ref().is_some_and(|(generation, existing)| {
+            *generation != connection_generation
+                || existing.db_type() != crate::db::DatabaseType::MySQL
+        }) {
+            *lease = None;
+        }
+        let mut conn = if let Some((_, DbSessionLease::MySQL(conn))) = lease.take() {
+            conn
+        } else {
+            match pool.acquire_session()? {
+                DbPoolSession::MySQL(mut conn) => {
+                    if !current_database.trim().is_empty() {
+                        let escaped = current_database.replace('`', "``");
+                        conn.query_drop(format!("USE `{escaped}`"))
+                            .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+                        crate::db::DatabaseConnection::apply_mysql_connection_encoding(&mut conn);
+                    }
+                    conn
+                }
+                other => {
+                    return Err(format!(
+                        "Expected MySQL pool session but acquired {}",
+                        other.db_type()
+                    ));
+                }
+            }
+        };
+        conn.query_drop(if auto_commit {
+            "SET autocommit=1"
+        } else {
+            "SET autocommit=0"
+        })
+        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+        Ok((connection_generation, connection_info, conn))
+    }
+
+    fn release_mysql_pooled_session(
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        connection_generation: u64,
+        conn: mysql::PooledConn,
+    ) {
+        let mut lease = pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lease.is_none() {
+            *lease = Some((connection_generation, DbSessionLease::MySQL(conn)));
+        }
+    }
+
+    fn release_mysql_pooled_session_if_current(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        connection_generation: u64,
+        conn: mysql::PooledConn,
+        db_activity: &str,
+    ) {
+        let should_release = {
+            let conn_guard =
+                lock_connection_with_activity(shared_connection, db_activity.to_string());
+            conn_guard.db_type() == crate::db::DatabaseType::MySQL
+                && conn_guard.is_connected()
+                && conn_guard.has_connection_handle()
+                && conn_guard.connection_generation() == connection_generation
+        };
+        if should_release {
+            Self::release_mysql_pooled_session(pooled_db_session, connection_generation, conn);
+        }
+    }
+
+    fn sync_mysql_pooled_session_info(
+        shared_connection: &crate::db::SharedConnection,
+        conn: &mut mysql::PooledConn,
+        db_activity: &str,
+        connection_generation: u64,
+        refresh_encoding: bool,
+    ) -> bool {
+        let mut conn_guard =
+            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        if conn_guard.db_type() != crate::db::DatabaseType::MySQL
+            || !conn_guard.is_connected()
+            || !conn_guard.has_connection_handle()
+            || conn_guard.connection_generation() != connection_generation
+        {
+            return false;
+        }
+        match conn_guard.sync_mysql_current_database_name_from_session(conn, refresh_encoding) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("Warning: failed to sync MySQL pooled session metadata: {err}");
+                false
+            }
         }
     }
 
@@ -7441,6 +8562,85 @@ impl SqlEditorWidget {
 
         Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
         Self::reset_mysql_timeout(conn_guard, query_timeout, log_context);
+        result
+    }
+
+    fn run_mysql_pooled_action_with_timeout<T, F>(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+        auto_commit: bool,
+        refresh_encoding_after: bool,
+        action: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(&mut mysql::PooledConn) -> Result<T, MysqlError>,
+    {
+        let (connection_generation, connection_info, mut conn) =
+            Self::acquire_mysql_pooled_session(
+                shared_connection,
+                pooled_db_session,
+                log_context,
+                auto_commit,
+            )?;
+        crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+            &mut conn,
+            query_timeout,
+        )
+        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout))?;
+        if let Err(cancelled) = Self::abort_if_cancelled(cancel_flag) {
+            let _ = crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                &mut conn, None,
+            );
+            Self::release_mysql_pooled_session_if_current(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                conn,
+                log_context,
+            );
+            return Err(cancelled);
+        }
+
+        Self::set_current_mysql_cancel_context(
+            current_mysql_cancel_context,
+            Some(MySqlQueryCancelContext {
+                connection_info,
+                connection_id: conn.connection_id(),
+            }),
+        );
+
+        let result = action(&mut conn)
+            .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout));
+
+        Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
+        if let Err(err) =
+            crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(&mut conn, None)
+        {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("Failed to reset MySQL pooled session timeout: {err}"),
+            );
+        }
+        let can_reuse_session = Self::sync_mysql_pooled_session_info(
+            shared_connection,
+            &mut conn,
+            log_context,
+            connection_generation,
+            refresh_encoding_after,
+        );
+        if can_reuse_session {
+            Self::release_mysql_pooled_session_if_current(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                conn,
+                log_context,
+            );
+        }
         result
     }
 
@@ -7499,7 +8699,8 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod query_execution_cleanup_tests {
     use super::{
-        MySqlQueryCancelContext, QueryExecutionCleanupGuard, QueryProgress, SqlEditorWidget,
+        LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryExecutionCleanupGuard,
+        QueryProgress, SqlEditorWidget,
     };
     use mysql::{Error as MysqlError, MySqlError};
     use oracle::Connection;
@@ -7673,6 +8874,80 @@ mod query_execution_cleanup_tests {
         let result = SqlEditorWidget::abort_if_cancelled(&cancel_flag);
 
         assert_eq!(result, Err(SqlEditorWidget::cancel_message()));
+    }
+
+    #[test]
+    fn lazy_fetch_query_timeout_is_disabled_to_match_grid_fetch_policy() {
+        assert_eq!(SqlEditorWidget::lazy_fetch_query_timeout(None), None);
+        assert_eq!(
+            SqlEditorWidget::lazy_fetch_query_timeout(Some(Duration::from_secs(1))),
+            None
+        );
+    }
+
+    #[test]
+    fn lazy_cancel_drain_preserves_non_cancel_commands() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(LazyFetchCommand::FetchMore(25))
+            .expect("send fetch more");
+        sender
+            .send(LazyFetchCommand::FetchAll)
+            .expect("send fetch all");
+        let mut pending = std::collections::VecDeque::new();
+
+        assert!(!SqlEditorWidget::drain_lazy_cancel_request(
+            &receiver,
+            &mut pending
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(LazyFetchCommand::FetchMore(25))
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(LazyFetchCommand::FetchAll)
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn lazy_cancel_drain_detects_cancel_after_queued_fetches() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(LazyFetchCommand::FetchMore(25))
+            .expect("send fetch more");
+        sender.send(LazyFetchCommand::Cancel).expect("send cancel");
+        let mut pending = std::collections::VecDeque::new();
+
+        assert!(SqlEditorWidget::drain_lazy_cancel_request(
+            &receiver,
+            &mut pending
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(LazyFetchCommand::FetchMore(25))
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn lazy_fetch_handle_match_requires_current_session() {
+        let (sender, _receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            sender,
+            break_connection: None,
+            mysql_cancel_context: None,
+        })));
+
+        assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
+        assert!(!SqlEditorWidget::lazy_fetch_handle_matches(&active, 43));
+
+        *active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        assert!(!SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
     }
 
     #[test]
@@ -7959,13 +9234,17 @@ mod execution_startup_error_tests {
 
 #[cfg(test)]
 mod mysql_batch_execution_regression_tests {
-    use super::{MySqlQueryCancelContext, QueryProgress, SqlEditorWidget};
+    use super::{
+        LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryProgress, SqlEditorWidget,
+    };
     use crate::db::{
         connection::{ConnectionInfo, DatabaseType},
-        DatabaseConnection, SessionState,
+        DatabaseConnection, DbSessionLease, SessionState,
     };
     use std::env;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
 
     fn mysql_test_env(name: &str) -> Option<String> {
         env::var(name).ok().filter(|value| !value.trim().is_empty())
@@ -7975,7 +9254,7 @@ mod mysql_batch_execution_regression_tests {
         progress
             .iter()
             .map(|message| match message {
-                QueryProgress::BatchStart => "BatchStart".to_string(),
+                QueryProgress::BatchStart { .. } => "BatchStart".to_string(),
                 QueryProgress::StatementStart { index } => {
                     format!("StatementStart({index})")
                 }
@@ -7985,6 +9264,14 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::Rows { index, rows } => {
                     format!("Rows({index}, count={})", rows.len())
                 }
+                QueryProgress::LazyFetchSession { index, session_id } => {
+                    format!("LazyFetchSession({index}, {session_id})")
+                }
+                QueryProgress::LazyFetchClosed {
+                    index,
+                    session_id,
+                    cancelled,
+                } => format!("LazyFetchClosed({index}, {session_id}, {cancelled})"),
                 QueryProgress::ScriptOutput { lines } => {
                     format!("ScriptOutput({})", lines.join(" | "))
                 }
@@ -8058,6 +9345,10 @@ mod mysql_batch_execution_regression_tests {
         }));
         let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
+        let pooled_db_session: Arc<Mutex<Option<(u64, DbSessionLease)>>> =
+            Arc::new(Mutex::new(None));
+        let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
         let (sender, receiver) = mpsc::channel();
 
@@ -8067,6 +9358,9 @@ mod mysql_batch_execution_regression_tests {
             script,
             "MYSQL_TEST",
             &session,
+            &pooled_db_session,
+            &active_lazy_fetch,
+            &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
             &cancel_flag,
             true,
@@ -8100,16 +9394,177 @@ mod mysql_batch_execution_regression_tests {
             "batch execution should emit the FINAL_STATUS select\n{progress_summary}"
         );
         assert!(
-            progress.iter().any(|message| match (final_status_index, message) {
-                (Some(index), QueryProgress::Rows { index: row_index, rows })
-                    if *row_index == index =>
-                {
-                    rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
-                }
-                _ => false,
-            }),
+            progress
+                .iter()
+                .any(|message| match (final_status_index, message) {
+                    (
+                        Some(index),
+                        QueryProgress::Rows {
+                            index: row_index,
+                            rows,
+                        },
+                    ) if *row_index == index => {
+                        rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
+                    }
+                    _ => false,
+                }),
             "batch execution should reach the FINAL_STATUS PASS result\n{progress_summary}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_lazy_cursor_fetches_incrementally_from_local_mariadb() {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection.set_auto_commit(true);
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL lazy fetch test connection should succeed");
+
+        let shared_connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::MySQL,
+            ..SessionState::default()
+        }));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        let pooled_db_session: Arc<Mutex<Option<(u64, DbSessionLease)>>> =
+            Arc::new(Mutex::new(None));
+        let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let sql = "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 250) SELECT n FROM seq ORDER BY n";
+
+        SqlEditorWidget::execute_mysql_batch(
+            &shared_connection,
+            &sender,
+            sql,
+            "MYSQL_TEST",
+            &session,
+            &pooled_db_session,
+            &active_lazy_fetch,
+            &next_lazy_fetch_session_id,
+            &current_mysql_cancel_context,
+            &cancel_flag,
+            false,
+            None,
+            None,
+            true,
+            "mysql lazy fetch integration",
+        );
+        drop(sender);
+
+        let mut progress = Vec::new();
+        let mut fetched_rows = 0usize;
+        while fetched_rows < 100 {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("initial lazy fetch progress should arrive");
+            if let QueryProgress::Rows { index, rows } = &message {
+                if *index == 0 {
+                    fetched_rows += rows.len();
+                }
+            }
+            progress.push(message);
+        }
+        assert_eq!(
+            fetched_rows,
+            100,
+            "initial lazy fetch should stop at 100 rows\n{}",
+            summarize_progress(&progress)
+        );
+
+        let handle = active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("lazy fetch handle should remain active after initial batch");
+        handle
+            .sender
+            .send(LazyFetchCommand::FetchMore(100))
+            .expect("send first fetch more");
+        while fetched_rows < 200 {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second lazy fetch progress should arrive");
+            if let QueryProgress::Rows { index, rows } = &message {
+                if *index == 0 {
+                    fetched_rows += rows.len();
+                }
+            }
+            progress.push(message);
+        }
+        assert_eq!(
+            fetched_rows,
+            200,
+            "first fetch more should append exactly 100 rows\n{}",
+            summarize_progress(&progress)
+        );
+
+        handle
+            .sender
+            .send(LazyFetchCommand::FetchMore(100))
+            .expect("send second fetch more");
+        let mut finished_row_count = None;
+        let mut closed = false;
+        while !closed || finished_row_count.is_none() {
+            let message = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("final lazy fetch progress should arrive");
+            match &message {
+                QueryProgress::Rows { index, rows } if *index == 0 => {
+                    fetched_rows += rows.len();
+                }
+                QueryProgress::StatementFinished { index, result, .. } if *index == 0 => {
+                    finished_row_count = Some(result.row_count);
+                }
+                QueryProgress::LazyFetchClosed {
+                    index, cancelled, ..
+                } if *index == 0 => {
+                    assert!(!cancelled, "lazy fetch should finish without cancellation");
+                    closed = true;
+                }
+                _ => {}
+            }
+            progress.push(message);
+        }
+
+        assert_eq!(
+            fetched_rows,
+            250,
+            "second fetch more should append the remaining 50 rows\n{}",
+            summarize_progress(&progress)
+        );
+        assert_eq!(finished_row_count, Some(250));
     }
 
     #[test]

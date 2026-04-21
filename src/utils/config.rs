@@ -14,6 +14,9 @@ const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
 const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
+pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 4;
+pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
+pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -28,6 +31,7 @@ pub struct AppConfig {
     pub result_cell_max_chars: u32,
     pub max_rows: u32,
     pub auto_commit: bool,
+    pub connection_pool_size: u32,
 }
 
 impl AppConfig {
@@ -59,7 +63,16 @@ impl AppConfig {
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             max_rows: 1000,
             auto_commit: false,
+            connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
         }
+    }
+
+    pub fn clamp_connection_pool_size(size: u32) -> u32 {
+        size.clamp(MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE)
+    }
+
+    pub fn normalized_connection_pool_size(&self) -> u32 {
+        Self::clamp_connection_pool_size(self.connection_pool_size)
     }
 
     pub fn config_path() -> Option<PathBuf> {
@@ -363,5 +376,64 @@ mod tests {
 
         assert_eq!(restored.recent_connections.len(), 1);
         assert_eq!(restored.recent_connections[0].db_type, DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn app_config_defaults_connection_pool_size_to_four() {
+        assert_eq!(
+            AppConfig::new().connection_pool_size,
+            super::DEFAULT_CONNECTION_POOL_SIZE
+        );
+    }
+
+    #[test]
+    fn app_config_clamps_connection_pool_size_to_supported_range() {
+        assert_eq!(AppConfig::clamp_connection_pool_size(0), 1);
+        assert_eq!(AppConfig::clamp_connection_pool_size(4), 4);
+        assert_eq!(AppConfig::clamp_connection_pool_size(99), 16);
+    }
+
+    #[test]
+    fn app_config_deserializes_missing_pool_size_with_default() {
+        let restored: AppConfig = serde_json::from_str(
+            r#"{
+                "recent_connections": [],
+                "last_connection": null,
+                "editor_font": "Courier",
+                "ui_font_size": 16,
+                "editor_font_size": 16,
+                "result_font": "Courier",
+                "result_font_size": 16,
+                "result_cell_max_chars": 50,
+                "max_rows": 1000,
+                "auto_commit": false
+            }"#,
+        )
+        .expect("old config should deserialize");
+
+        assert_eq!(
+            restored.connection_pool_size,
+            super::DEFAULT_CONNECTION_POOL_SIZE
+        );
+    }
+
+    #[test]
+    fn app_config_serializes_connection_pool_size_without_passwords() {
+        let mut config = AppConfig::new();
+        config.connection_pool_size = 8;
+        config.recent_connections.push(ConnectionInfo {
+            name: "prod".to_string(),
+            host: "localhost".to_string(),
+            port: 1521,
+            service_name: "FREE".to_string(),
+            username: "scott".to_string(),
+            password: "secret".to_string(),
+            db_type: DatabaseType::Oracle,
+        });
+
+        let serialized = serde_json::to_string(&config).expect("config should serialize");
+
+        assert!(serialized.contains("\"connection_pool_size\":8"));
+        assert!(!serialized.contains("secret"));
     }
 }

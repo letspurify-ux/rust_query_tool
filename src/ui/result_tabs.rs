@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
-use crate::ui::result_table::ResultGridSqlExecuteCallback;
+use crate::ui::result_table::{LazyFetchCallback, ResultGridSqlExecuteCallback};
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::ui::ResultTableWidget;
@@ -28,6 +28,7 @@ pub struct ResultTabsWidget {
     font_size: Arc<Mutex<u32>>,
     max_cell_display_chars: Arc<Mutex<usize>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    lazy_fetch_callback: LazyFetchCallback,
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
 }
@@ -244,6 +245,7 @@ impl ResultTabsWidget {
         ));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
+        let lazy_fetch_callback: LazyFetchCallback = Arc::new(Mutex::new(None));
         let on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
             Arc::new(Mutex::new(None));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
@@ -379,6 +381,7 @@ impl ResultTabsWidget {
             font_size,
             max_cell_display_chars,
             execute_sql_callback,
+            lazy_fetch_callback,
             on_change_callback,
             suppress_pointer_event_depth,
         }
@@ -568,6 +571,7 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         table.set_execute_sql_callback(execute_sql_callback);
+        table.set_lazy_fetch_callback(self.lazy_fetch_callback.clone());
         let widget = table.get_widget();
         group.resizable(&widget);
         group.end();
@@ -635,6 +639,32 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
+    pub fn set_lazy_fetch_session(&mut self, index: usize, session_id: u64) {
+        let table = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| tab.table.clone());
+        if let Some(mut table) = table {
+            table.set_lazy_fetch_session(session_id);
+        }
+        self.fire_on_change_callback();
+    }
+
+    pub fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
+        let table = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| tab.table.clone());
+        if let Some(mut table) = table {
+            table.clear_lazy_fetch_session(session_id, run_pending);
+        }
+        self.fire_on_change_callback();
+    }
+
     pub fn finish_all_streaming(&mut self) {
         let tables: Vec<ResultTableWidget> = self
             .data
@@ -646,6 +676,20 @@ impl ResultTabsWidget {
         for mut table in tables {
             table.finish_streaming();
         }
+    }
+
+    pub fn clear_all_lazy_fetch_state_for_abort(&mut self) {
+        let tables: Vec<ResultTableWidget> = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect();
+        for mut table in tables {
+            table.clear_lazy_fetch_state_for_abort();
+        }
+        self.fire_on_change_callback();
     }
 
     pub fn clear_orphaned_save_requests(&mut self) -> usize {
@@ -721,10 +765,41 @@ impl ResultTabsWidget {
         }
     }
 
+    pub fn set_lazy_fetch_callback(&mut self, callback: LazyFetchCallback) {
+        *self
+            .lazy_fetch_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(move |id, request| {
+                let mut callback_guard = callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(callback_fn) = callback_guard.as_mut() {
+                    callback_fn(id, request);
+                }
+            }));
+        let tabs = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tab in tabs.iter() {
+            let mut table = tab.table.clone();
+            table.set_lazy_fetch_callback(self.lazy_fetch_callback.clone());
+        }
+    }
+
     pub fn export_to_csv(&self) -> String {
         self.current_table()
             .map(|table| table.export_to_csv())
             .unwrap_or_default()
+    }
+
+    pub fn export_to_csv_after_fetch_all(
+        &self,
+        callback: Box<dyn FnMut(String, usize)>,
+    ) -> Option<(String, usize)> {
+        self.current_table()
+            .and_then(|table| table.export_to_csv_after_fetch_all(callback))
     }
 
     pub fn row_count(&self) -> usize {

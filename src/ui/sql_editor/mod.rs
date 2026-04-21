@@ -20,7 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::db::{
-    ColumnInfo, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail,
+    ColumnInfo, ConnectionInfo, DbSessionLease, QueryExecutor, QueryResult, SharedConnection,
+    TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -200,7 +201,9 @@ include!("undo_history.rs");
 
 #[derive(Clone)]
 pub enum QueryProgress {
-    BatchStart,
+    BatchStart {
+        activity: String,
+    },
     StatementStart {
         index: usize,
     },
@@ -212,6 +215,15 @@ pub enum QueryProgress {
     Rows {
         index: usize,
         rows: Vec<Vec<String>>,
+    },
+    LazyFetchSession {
+        index: usize,
+        session_id: u64,
+    },
+    LazyFetchClosed {
+        index: usize,
+        session_id: u64,
+        cancelled: bool,
     },
     ScriptOutput {
         lines: Vec<String>,
@@ -237,6 +249,27 @@ pub enum QueryProgress {
     },
     BatchFinished,
     MetadataRefreshNeeded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LazyFetchRequest {
+    More,
+    All,
+}
+
+#[derive(Debug)]
+pub(crate) enum LazyFetchCommand {
+    FetchMore(usize),
+    FetchAll,
+    Cancel,
+}
+
+#[derive(Clone)]
+pub(crate) struct LazyFetchHandle {
+    pub session_id: u64,
+    pub sender: mpsc::Sender<LazyFetchCommand>,
+    pub break_connection: Option<Arc<Connection>>,
+    pub mysql_cancel_context: Option<Arc<Mutex<Option<MySqlQueryCancelContext>>>>,
 }
 
 #[derive(Clone)]
@@ -329,7 +362,7 @@ enum UiActionResult {
 }
 
 #[derive(Clone)]
-struct MySqlQueryCancelContext {
+pub(crate) struct MySqlQueryCancelContext {
     connection_info: ConnectionInfo,
     connection_id: u32,
 }
@@ -357,6 +390,9 @@ pub struct SqlEditorWidget {
     ui_action_sender: mpsc::Sender<UiActionResult>,
     query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    pooled_db_session: Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+    active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
+    next_lazy_fetch_session_id: Arc<AtomicU64>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
@@ -706,6 +742,9 @@ impl SqlEditorWidget {
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
+        let pooled_db_session = Arc::new(Mutex::new(None));
+        let active_lazy_fetch = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
@@ -741,6 +780,9 @@ impl SqlEditorWidget {
             ui_action_sender,
             query_running: query_running.clone(),
             current_query_connection,
+            pooled_db_session,
+            active_lazy_fetch,
+            next_lazy_fetch_session_id,
             current_mysql_cancel_context,
             cancel_flag,
             intellisense_data,
@@ -771,6 +813,63 @@ impl SqlEditorWidget {
         widget.setup_ui_action_handler(ui_action_receiver);
 
         widget
+    }
+
+    pub fn clear_pooled_db_session(&self) {
+        *self
+            .pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.cancel_active_lazy_fetch();
+    }
+
+    pub fn request_lazy_fetch(&self, session_id: u64, request: LazyFetchRequest) -> bool {
+        let handle = self
+            .active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(handle) = handle else {
+            return false;
+        };
+        if handle.session_id != session_id {
+            return false;
+        }
+        let command = match request {
+            LazyFetchRequest::More => LazyFetchCommand::FetchMore(100),
+            LazyFetchRequest::All => LazyFetchCommand::FetchAll,
+        };
+        handle.sender.send(command).is_ok()
+    }
+
+    fn cancel_active_lazy_fetch(&self) {
+        *self
+            .pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let handle = self
+            .active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.sender.send(LazyFetchCommand::Cancel);
+            if let Some(conn) = handle.break_connection {
+                let _ = conn.break_execution();
+            }
+            if let Some(context) = handle.mysql_cancel_context {
+                let cancel_context = context
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(cancel_context) = cancel_context {
+                    let _ = crate::db::query::mysql_executor::MysqlExecutor::cancel_running_query(
+                        &cancel_context.connection_info,
+                        cancel_context.connection_id,
+                    );
+                }
+            }
+        }
     }
 
     fn setup_progress_handler(
@@ -1457,6 +1556,7 @@ impl SqlEditorWidget {
     pub fn cancel_current(&self) {
         // Set cancel flag immediately so the execution thread can check it
         store_mutex_bool(&self.cancel_flag, true);
+        self.cancel_active_lazy_fetch();
 
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();

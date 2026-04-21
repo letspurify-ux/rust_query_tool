@@ -11532,7 +11532,8 @@ fn test_split_script_items_mariadb_executable_comment_stays_runnable_statement()
 }
 
 #[test]
-fn test_split_script_items_mariadb_comment_final_boss_keeps_transaction_directive_as_tool_command() {
+fn test_split_script_items_mariadb_comment_final_boss_keeps_transaction_directive_as_tool_command()
+{
     let sql = load_mariadb_query_test_file("test8.txt");
     assert!(
         !sql.is_empty(),

@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::session::SessionState;
+use crate::utils::config::{
+    DEFAULT_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE,
+};
 use crate::utils::logging;
 
 pub const NOT_CONNECTED_MESSAGE: &str = "Not connected to database";
@@ -23,12 +26,21 @@ pub enum DatabaseType {
     MySQL,
 }
 
+impl DatabaseType {
+    pub const ALL: [Self; 2] = [Self::Oracle, Self::MySQL];
+
+    pub fn supported() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    pub fn choice_label(self) -> &'static str {
+        backend_for(self).choice_label()
+    }
+}
+
 impl fmt::Display for DatabaseType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DatabaseType::Oracle => write!(f, "Oracle"),
-            DatabaseType::MySQL => write!(f, "MySQL"),
-        }
+        write!(f, "{}", backend_for(*self).display_name())
     }
 }
 
@@ -106,46 +118,16 @@ impl ConnectionInfo {
     }
 
     pub fn connection_string(&self) -> String {
-        match self.db_type {
-            DatabaseType::Oracle => {
-                if self.uses_oracle_tns_alias() {
-                    self.service_name.trim().to_string()
-                } else {
-                    format!("//{}:{}/{}", self.host, self.port, self.service_name)
-                }
-            }
-            DatabaseType::MySQL => {
-                let database = self.service_name.trim();
-                if database.is_empty() {
-                    format!("mysql://{}:{}", self.host, self.port)
-                } else {
-                    format!("mysql://{}:{}/{}", self.host, self.port, database)
-                }
-            }
-        }
+        backend_for(self.db_type).connection_string(self)
     }
 
     pub fn default_for(db_type: DatabaseType) -> Self {
-        match db_type {
-            DatabaseType::Oracle => Self::default(),
-            DatabaseType::MySQL => Self {
-                name: String::new(),
-                username: String::new(),
-                password: String::new(),
-                host: "localhost".to_string(),
-                port: 3306,
-                service_name: String::new(),
-                db_type: DatabaseType::MySQL,
-            },
-        }
+        backend_for(db_type).default_connection_info()
     }
 
     /// The label used for the service_name field depending on database type.
     pub fn service_name_label(&self) -> &'static str {
-        match self.db_type {
-            DatabaseType::Oracle => "Service Name",
-            DatabaseType::MySQL => "Database",
-        }
+        backend_for(self.db_type).service_name_label()
     }
 
     /// Securely clear the password from memory by overwriting with zeros
@@ -174,8 +156,238 @@ pub enum DbConnection {
     MySQL(mysql::Conn),
 }
 
+#[derive(Clone)]
+pub enum DbConnectionPool {
+    Oracle(oracle::pool::Pool),
+    MySQL(mysql::Pool),
+}
+
+pub enum DbPoolSession {
+    Oracle(Connection),
+    MySQL(mysql::PooledConn),
+}
+
+pub enum DbSessionLease {
+    Oracle(Arc<Connection>),
+    MySQL(mysql::PooledConn),
+}
+
+impl DbConnectionPool {
+    pub fn acquire_session(&self) -> Result<DbPoolSession, String> {
+        let mut session = match self {
+            DbConnectionPool::Oracle(pool) => {
+                DbPoolSession::Oracle(pool.get().map_err(|err| err.to_string())?)
+            }
+            DbConnectionPool::MySQL(pool) => {
+                DbPoolSession::MySQL(pool.get_conn().map_err(|err| err.to_string())?)
+            }
+        };
+        backend_for(session.db_type()).apply_pool_session_defaults(&mut session);
+        Ok(session)
+    }
+}
+
+impl DbPoolSession {
+    pub fn db_type(&self) -> DatabaseType {
+        match self {
+            DbPoolSession::Oracle(_) => DatabaseType::Oracle,
+            DbPoolSession::MySQL(_) => DatabaseType::MySQL,
+        }
+    }
+}
+
+impl DbSessionLease {
+    pub fn db_type(&self) -> DatabaseType {
+        match self {
+            DbSessionLease::Oracle(_) => DatabaseType::Oracle,
+            DbSessionLease::MySQL(_) => DatabaseType::MySQL,
+        }
+    }
+}
+
+pub(crate) trait DbBackend: Sync {
+    fn display_name(&self) -> &'static str;
+    fn choice_label(&self) -> &'static str {
+        self.display_name()
+    }
+    fn default_connection_info(&self) -> ConnectionInfo;
+    fn connection_string(&self, info: &ConnectionInfo) -> String;
+    fn service_name_label(&self) -> &'static str;
+    fn connect(
+        &self,
+        info: &ConnectionInfo,
+        pool_size: u32,
+        auto_commit: bool,
+    ) -> Result<(DbConnection, DbConnectionPool), String>;
+    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
+    fn after_connect(&self, _connection: &mut DatabaseConnection) {}
+    fn apply_auto_commit(&self, _connection: &mut DbConnection, _enabled: bool) {}
+    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession);
+}
+
+struct OracleBackend;
+struct MysqlBackend;
+
+static ORACLE_BACKEND: OracleBackend = OracleBackend;
+static MYSQL_BACKEND: MysqlBackend = MysqlBackend;
+
+pub(crate) fn backend_for(db_type: DatabaseType) -> &'static dyn DbBackend {
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_BACKEND,
+        DatabaseType::MySQL => &MYSQL_BACKEND,
+    }
+}
+
+impl DbBackend for OracleBackend {
+    fn display_name(&self) -> &'static str {
+        "Oracle"
+    }
+
+    fn default_connection_info(&self) -> ConnectionInfo {
+        ConnectionInfo {
+            name: String::new(),
+            username: String::new(),
+            password: String::new(),
+            host: "localhost".to_string(),
+            port: 1521,
+            service_name: "ORCL".to_string(),
+            db_type: DatabaseType::Oracle,
+        }
+    }
+
+    fn connection_string(&self, info: &ConnectionInfo) -> String {
+        if info.uses_oracle_tns_alias() {
+            info.service_name.trim().to_string()
+        } else {
+            format!("//{}:{}/{}", info.host, info.port, info.service_name)
+        }
+    }
+
+    fn service_name_label(&self) -> &'static str {
+        "Service Name"
+    }
+
+    fn connect(
+        &self,
+        info: &ConnectionInfo,
+        pool_size: u32,
+        _auto_commit: bool,
+    ) -> Result<(DbConnection, DbConnectionPool), String> {
+        ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
+        let conn_str = info.connection_string();
+        let connection = Arc::new(
+            Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
+                eprintln!("Connection error: {err}");
+                err.to_string()
+            })?,
+        );
+        DatabaseConnection::apply_oracle_default_session_settings(connection.as_ref());
+        let pool = DatabaseConnection::build_oracle_pool(info, pool_size)?;
+        Ok((
+            DbConnection::Oracle(connection),
+            DbConnectionPool::Oracle(pool),
+        ))
+    }
+
+    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
+        ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
+        let conn_str = info.connection_string();
+        Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
+            eprintln!("Connection error: {err}");
+            err.to_string()
+        })?;
+        Ok(())
+    }
+
+    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession) {
+        if let DbPoolSession::Oracle(conn) = session {
+            DatabaseConnection::apply_oracle_default_session_settings(conn);
+        }
+    }
+}
+
+impl DbBackend for MysqlBackend {
+    fn display_name(&self) -> &'static str {
+        "MySQL"
+    }
+
+    fn choice_label(&self) -> &'static str {
+        "MySQL or MariaDB"
+    }
+
+    fn default_connection_info(&self) -> ConnectionInfo {
+        ConnectionInfo {
+            name: String::new(),
+            username: String::new(),
+            password: String::new(),
+            host: "localhost".to_string(),
+            port: 3306,
+            service_name: String::new(),
+            db_type: DatabaseType::MySQL,
+        }
+    }
+
+    fn connection_string(&self, info: &ConnectionInfo) -> String {
+        let database = info.service_name.trim();
+        if database.is_empty() {
+            format!("mysql://{}:{}", info.host, info.port)
+        } else {
+            format!("mysql://{}:{}/{}", info.host, info.port, database)
+        }
+    }
+
+    fn service_name_label(&self) -> &'static str {
+        "Database"
+    }
+
+    fn connect(
+        &self,
+        info: &ConnectionInfo,
+        pool_size: u32,
+        auto_commit: bool,
+    ) -> Result<(DbConnection, DbConnectionPool), String> {
+        let opts = DatabaseConnection::build_mysql_opts(info);
+        let mut conn = mysql::Conn::new(opts).map_err(|err| {
+            eprintln!("MySQL connection error: {err}");
+            err.to_string()
+        })?;
+        DatabaseConnection::apply_mysql_default_session_settings(&mut conn);
+        DatabaseConnection::apply_mysql_autocommit_setting(&mut conn, auto_commit);
+        let pool = DatabaseConnection::build_mysql_pool(info, pool_size)?;
+        Ok((DbConnection::MySQL(conn), DbConnectionPool::MySQL(pool)))
+    }
+
+    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
+        let opts = DatabaseConnection::build_mysql_opts(info);
+        mysql::Conn::new(opts).map_err(|err| {
+            eprintln!("MySQL connection error: {err}");
+            err.to_string()
+        })?;
+        Ok(())
+    }
+
+    fn after_connect(&self, connection: &mut DatabaseConnection) {
+        if let Err(err) = connection.sync_mysql_current_database_name() {
+            eprintln!("Warning: failed to sync MySQL current database after connect: {err}");
+        }
+    }
+
+    fn apply_auto_commit(&self, connection: &mut DbConnection, enabled: bool) {
+        if let DbConnection::MySQL(conn) = connection {
+            DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled);
+        }
+    }
+
+    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession) {
+        if let DbPoolSession::MySQL(conn) = session {
+            DatabaseConnection::apply_mysql_default_session_settings(conn);
+        }
+    }
+}
+
 pub struct DatabaseConnection {
     connection: Option<DbConnection>,
+    pool: Option<DbConnectionPool>,
     info: ConnectionInfo,
     session_password: String,
     connected: bool,
@@ -183,10 +395,22 @@ pub struct DatabaseConnection {
     session: Arc<Mutex<SessionState>>,
     last_disconnect_reason: Option<String>,
     connection_generation: u64,
+    connection_pool_size: u32,
 }
 
 impl DatabaseConnection {
+    fn clamp_connection_pool_size(size: u32) -> u32 {
+        size.clamp(MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE)
+    }
+
     fn build_mysql_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size(info, None)
+    }
+
+    fn build_mysql_opts_with_pool_size(
+        info: &ConnectionInfo,
+        pool_size: Option<u32>,
+    ) -> mysql::OptsBuilder {
         let mut opts = mysql::OptsBuilder::new()
             .ip_or_hostname(Some(&info.host))
             .tcp_port(info.port)
@@ -198,12 +422,42 @@ impl DatabaseConnection {
             opts = opts.db_name(Some(database));
         }
 
+        if let Some(pool_size) = pool_size {
+            let pool_size = Self::clamp_connection_pool_size(pool_size) as usize;
+            if let Some(constraints) = mysql::PoolConstraints::new(0, pool_size) {
+                opts = opts.pool_opts(Some(
+                    mysql::PoolOpts::default().with_constraints(constraints),
+                ));
+            }
+        }
+
         opts
+    }
+
+    fn build_oracle_pool(
+        info: &ConnectionInfo,
+        pool_size: u32,
+    ) -> Result<oracle::pool::Pool, String> {
+        let conn_str = info.connection_string();
+        let pool_size = Self::clamp_connection_pool_size(pool_size);
+        let mut builder =
+            oracle::pool::PoolBuilder::new(info.username.clone(), info.password.clone(), conn_str);
+        builder
+            .min_connections(1)
+            .max_connections(pool_size)
+            .connection_increment(1);
+        builder.build().map_err(|err| err.to_string())
+    }
+
+    fn build_mysql_pool(info: &ConnectionInfo, pool_size: u32) -> Result<mysql::Pool, String> {
+        let opts = Self::build_mysql_opts_with_pool_size(info, Some(pool_size));
+        mysql::Pool::new(opts).map_err(|err| err.to_string())
     }
 
     pub fn new() -> Self {
         Self {
             connection: None,
+            pool: None,
             info: ConnectionInfo::default(),
             session_password: String::new(),
             connected: false,
@@ -211,57 +465,28 @@ impl DatabaseConnection {
             session: Arc::new(Mutex::new(SessionState::default())),
             last_disconnect_reason: None,
             connection_generation: 0,
+            connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
         }
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), String> {
-        let db_conn = match info.db_type {
-            DatabaseType::Oracle => {
-                ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
-                let conn_str = info.connection_string();
-                let connection = Arc::new(
-                    Connection::connect(&info.username, &info.password, &conn_str).map_err(
-                        |err| {
-                            eprintln!("Connection error: {err}");
-                            err.to_string()
-                        },
-                    )?,
-                );
-                Self::apply_oracle_default_session_settings(connection.as_ref());
-                DbConnection::Oracle(connection)
-            }
-            DatabaseType::MySQL => {
-                let opts = Self::build_mysql_opts(&info);
-                let mut conn = mysql::Conn::new(opts).map_err(|err| {
-                    eprintln!("MySQL connection error: {err}");
-                    err.to_string()
-                })?;
-                Self::apply_mysql_default_session_settings(&mut conn);
-                Self::apply_mysql_autocommit_setting(&mut conn, self.auto_commit);
-                DbConnection::MySQL(conn)
-            }
-        };
+        let (db_conn, pool) = backend_for(info.db_type).connect(
+            &info,
+            self.connection_pool_size,
+            self.auto_commit,
+        )?;
 
         // Swap in the new connection only after a successful handshake.
         // This preserves the active session when users mistype credentials
         // during reconnect attempts.
         self.connection = Some(db_conn);
+        self.pool = Some(pool);
         let db_type = info.db_type;
-        let new_session_password = if db_type == DatabaseType::MySQL {
-            info.password.clone()
-        } else {
-            String::new()
-        };
+        let new_session_password = info.password.clone();
         ConnectionInfo::clear_secret(&mut self.session_password);
         self.session_password = new_session_password;
         self.info = info;
-        // Clear password from memory now that the connection is established
-        self.info.clear_password();
-        if db_type == DatabaseType::MySQL {
-            if let Err(err) = self.sync_mysql_current_database_name() {
-                eprintln!("Warning: failed to sync MySQL current database after connect: {err}");
-            }
-        }
+        backend_for(db_type).after_connect(self);
         self.connected = true;
         self.last_disconnect_reason = None;
         self.connection_generation = self.connection_generation.wrapping_add(1);
@@ -275,7 +500,7 @@ impl DatabaseConnection {
         Ok(())
     }
 
-    fn apply_oracle_default_session_settings(conn: &Connection) {
+    pub(crate) fn apply_oracle_default_session_settings(conn: &Connection) {
         let statements = [
             "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'yyyy-mm-dd hh24:mi:ss.ff6'",
             "ALTER SESSION SET NLS_DATE_FORMAT = 'yyyy-mm-dd hh24:mi:ss'",
@@ -288,7 +513,7 @@ impl DatabaseConnection {
         }
     }
 
-    fn apply_mysql_default_session_settings(conn: &mut mysql::Conn) {
+    pub(crate) fn apply_mysql_default_session_settings<C: Queryable>(conn: &mut C) {
         let statements = [
             "SET SESSION sql_mode = 'TRADITIONAL'",
             "SET SESSION time_zone = '+00:00'",
@@ -303,8 +528,9 @@ impl DatabaseConnection {
         Self::apply_mysql_connection_encoding(conn);
     }
 
-    fn apply_mysql_connection_encoding(conn: &mut mysql::Conn) {
-        let database_collation = match conn.query_first::<String, _>("SELECT @@collation_database") {
+    pub(crate) fn apply_mysql_connection_encoding<C: Queryable>(conn: &mut C) {
+        let database_collation = match conn.query_first::<String, _>("SELECT @@collation_database")
+        {
             Ok(value) => value.map(|collation| collation.trim().to_string()),
             Err(err) => {
                 eprintln!(
@@ -339,7 +565,7 @@ impl DatabaseConnection {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
-    fn apply_mysql_autocommit_setting(conn: &mut mysql::Conn, enabled: bool) {
+    fn apply_mysql_autocommit_setting<C: Queryable>(conn: &mut C, enabled: bool) {
         let statement = if enabled {
             "SET autocommit = 1"
         } else {
@@ -358,8 +584,10 @@ impl DatabaseConnection {
     fn clear_connection_state(&mut self, disconnect_reason: Option<String>) {
         let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
+        self.pool = None;
         self.connected = false;
         self.last_disconnect_reason = disconnect_reason;
+        self.info.clear_password();
         self.info = ConnectionInfo::default();
         ConnectionInfo::clear_secret(&mut self.session_password);
         self.auto_commit = false;
@@ -467,14 +695,34 @@ impl DatabaseConnection {
         Some(info)
     }
 
+    pub fn get_pool(&self) -> Option<DbConnectionPool> {
+        self.pool.clone()
+    }
+
+    pub fn acquire_pool_session(&self) -> Result<Option<DbPoolSession>, String> {
+        self.pool
+            .as_ref()
+            .map(DbConnectionPool::acquire_session)
+            .transpose()
+    }
+
+    pub fn connection_pool_size(&self) -> u32 {
+        self.connection_pool_size
+    }
+
+    pub fn set_connection_pool_size(&mut self, size: u32) {
+        self.connection_pool_size = Self::clamp_connection_pool_size(size);
+    }
+
     pub fn connection_generation(&self) -> u64 {
         self.connection_generation
     }
 
     pub fn set_auto_commit(&mut self, enabled: bool) {
         self.auto_commit = enabled;
-        if let Some(DbConnection::MySQL(conn)) = self.connection.as_mut() {
-            Self::apply_mysql_autocommit_setting(conn, enabled);
+        let db_type = self.info.db_type;
+        if let Some(connection) = self.connection.as_mut() {
+            backend_for(db_type).apply_auto_commit(connection, enabled);
         }
     }
 
@@ -498,30 +746,41 @@ impl DatabaseConnection {
         Ok(current_database)
     }
 
+    pub fn sync_mysql_current_database_name_from_session<C: Queryable>(
+        &mut self,
+        conn: &mut C,
+        refresh_encoding: bool,
+    ) -> Result<String, String> {
+        if self.info.db_type != DatabaseType::MySQL || !self.connected {
+            return Err("Expected MySQL connection but none is active".to_string());
+        }
+
+        let current_database = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .map_err(|err| err.to_string())?
+            .flatten()
+            .map(|database| database.trim().to_string())
+            .unwrap_or_default();
+        if refresh_encoding {
+            Self::apply_mysql_connection_encoding(conn);
+        }
+        self.info.service_name = current_database.clone();
+        Ok(current_database)
+    }
+
     pub fn session_state(&self) -> Arc<Mutex<SessionState>> {
         Arc::clone(&self.session)
     }
 
     pub fn test_connection(info: &ConnectionInfo) -> Result<(), String> {
-        match info.db_type {
-            DatabaseType::Oracle => {
-                ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
-                let conn_str = info.connection_string();
-                Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
-                    eprintln!("Connection error: {err}");
-                    err.to_string()
-                })?;
-                Ok(())
-            }
-            DatabaseType::MySQL => {
-                let opts = Self::build_mysql_opts(info);
-                mysql::Conn::new(opts).map_err(|err| {
-                    eprintln!("MySQL connection error: {err}");
-                    err.to_string()
-                })?;
-                Ok(())
-            }
-        }
+        backend_for(info.db_type).test_connection(info)
+    }
+
+    #[cfg(test)]
+    fn simulate_connected_metadata_for_test(&mut self, info: ConnectionInfo) {
+        self.connected = true;
+        self.session_password = info.password.clone();
+        self.info = info;
     }
 }
 
@@ -872,6 +1131,34 @@ mod tests {
     }
 
     #[test]
+    fn connected_metadata_retains_password_until_disconnect() {
+        let mut conn = DatabaseConnection::new();
+        conn.simulate_connected_metadata_for_test(ConnectionInfo::new(
+            "Prod", "scott", "pw", "db", 1521, "FREE",
+        ));
+
+        assert_eq!(conn.get_info().password, "pw");
+
+        conn.disconnect();
+
+        assert!(conn.get_info().password.is_empty());
+        assert!(conn.session_password.is_empty());
+    }
+
+    #[test]
+    fn connection_pool_size_defaults_and_clamps() {
+        let mut conn = DatabaseConnection::new();
+
+        assert_eq!(conn.connection_pool_size(), DEFAULT_CONNECTION_POOL_SIZE);
+
+        conn.set_connection_pool_size(0);
+        assert_eq!(conn.connection_pool_size(), MIN_CONNECTION_POOL_SIZE);
+
+        conn.set_connection_pool_size(99);
+        assert_eq!(conn.connection_pool_size(), MAX_CONNECTION_POOL_SIZE);
+    }
+
+    #[test]
     fn disconnect_resets_session_state() {
         let mut conn = DatabaseConnection::new();
         conn.connected = true;
@@ -954,7 +1241,8 @@ mod tests {
             std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
         let password =
             std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
-        let alias = std::env::var("ORACLE_TEST_TNS_ALIAS").expect("ORACLE_TEST_TNS_ALIAS must be set");
+        let alias =
+            std::env::var("ORACLE_TEST_TNS_ALIAS").expect("ORACLE_TEST_TNS_ALIAS must be set");
 
         let info = ConnectionInfo::new_with_type(
             "local",
@@ -977,21 +1265,79 @@ mod tests {
             std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
         let password =
             std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
-        let service_name =
-            std::env::var("ORACLE_TEST_SERVICE_NAME").expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let service_name = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
 
         let info = ConnectionInfo::new_with_type(
             "local",
             &username,
             &password,
-            "localhost",
-            1521,
+            &host,
+            port,
             &service_name,
             DatabaseType::Oracle,
         );
 
         DatabaseConnection::test_connection(&info)
             .expect("Direct localhost Oracle connection should succeed against local Oracle XE");
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pool_session_applies_default_session_settings_from_local_mariadb() {
+        let host = std::env::var("SPACE_QUERY_TEST_MYSQL_HOST")
+            .expect("SPACE_QUERY_TEST_MYSQL_HOST must be set");
+        let database = std::env::var("SPACE_QUERY_TEST_MYSQL_DATABASE")
+            .expect("SPACE_QUERY_TEST_MYSQL_DATABASE must be set");
+        let user = std::env::var("SPACE_QUERY_TEST_MYSQL_USER")
+            .expect("SPACE_QUERY_TEST_MYSQL_USER must be set");
+        let password = std::env::var("SPACE_QUERY_TEST_MYSQL_PASSWORD")
+            .expect("SPACE_QUERY_TEST_MYSQL_PASSWORD must be set");
+        let port = std::env::var("SPACE_QUERY_TEST_MYSQL_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "local",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MariaDB connection should succeed");
+
+        let Some(DbPoolSession::MySQL(mut conn)) = connection
+            .acquire_pool_session()
+            .expect("MySQL pool session should be acquired")
+        else {
+            panic!("expected MySQL pool session");
+        };
+        let sql_mode = conn
+            .query_first::<String, _>("SELECT @@SESSION.sql_mode")
+            .expect("read sql_mode")
+            .unwrap_or_default();
+        let time_zone = conn
+            .query_first::<String, _>("SELECT @@SESSION.time_zone")
+            .expect("read time_zone")
+            .unwrap_or_default();
+        let character_set_client = conn
+            .query_first::<String, _>("SELECT @@SESSION.character_set_client")
+            .expect("read character_set_client")
+            .unwrap_or_default();
+
+        assert!(sql_mode.contains("STRICT_TRANS_TABLES"));
+        assert_eq!(time_zone, "+00:00");
+        assert_eq!(character_set_client, "utf8mb4");
     }
 
     #[test]

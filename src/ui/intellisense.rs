@@ -2893,7 +2893,10 @@ mod intellisense_tests {
             "a.\"Dept No\" = b.\"Dept No\"".to_string(),
         ];
         let filtered = filter_suggestions_by_prefix(&suggestions, "or");
-        assert_eq!(filtered, vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()]);
+        assert_eq!(
+            filtered,
+            vec!["a.\"Order Id\" = b.\"Order Id\"".to_string()]
+        );
     }
 
     #[test]

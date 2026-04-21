@@ -16,6 +16,8 @@ pub struct QueryExecutor;
 
 const STREAM_FETCH_ARRAY_SIZE: u32 = 2_000;
 const STREAM_PREFETCH_ROWS: u32 = STREAM_FETCH_ARRAY_SIZE + 1;
+const LAZY_FETCH_ARRAY_SIZE: u32 = 100;
+const LAZY_PREFETCH_ROWS: u32 = LAZY_FETCH_ARRAY_SIZE;
 const MAX_NESTED_CURSOR_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -32,11 +34,25 @@ enum NestedCursorDisplayValue {
 }
 
 impl QueryExecutor {
-    fn build_streaming_statement(conn: &Connection, sql: &str) -> Result<Statement, OracleError> {
+    pub(crate) fn build_streaming_statement(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Statement, OracleError> {
         let mut builder = conn.statement(sql);
         let _ = builder
             .fetch_array_size(STREAM_FETCH_ARRAY_SIZE)
             .prefetch_rows(STREAM_PREFETCH_ROWS);
+        builder.build()
+    }
+
+    pub(crate) fn build_lazy_statement(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Statement, OracleError> {
+        let mut builder = conn.statement(sql);
+        let _ = builder
+            .fetch_array_size(LAZY_FETCH_ARRAY_SIZE)
+            .prefetch_rows(LAZY_PREFETCH_ROWS);
         builder.build()
     }
 
@@ -51,7 +67,7 @@ impl QueryExecutor {
             || (message.contains("ORA-00904") && message.to_ascii_uppercase().contains("ROWID"))
     }
 
-    fn row_value_to_text(row: &Row, index: usize) -> Result<String, OracleError> {
+    pub(crate) fn row_value_to_text(row: &Row, index: usize) -> Result<String, OracleError> {
         if Self::row_column_is_ref_cursor(row, index) {
             let cursor: Option<RefCursor> = row.get(index)?;
             return match cursor {
@@ -459,7 +475,10 @@ impl QueryExecutor {
         Ok(resolved)
     }
 
-    fn bind_statement(stmt: &mut Statement, binds: &[ResolvedBind]) -> Result<(), OracleError> {
+    pub(crate) fn bind_statement(
+        stmt: &mut Statement,
+        binds: &[ResolvedBind],
+    ) -> Result<(), OracleError> {
         for bind in binds {
             match bind.data_type {
                 BindDataType::RefCursor => {
@@ -2710,6 +2729,43 @@ impl QueryExecutor {
             QueryResult::new_select_streamed(sql, column_info, row_count, execution_time),
             cancelled,
         ))
+    }
+
+    pub(crate) fn open_select_lazy_cursor_with_binds(
+        conn: &Connection,
+        sql: &str,
+        binds: &[ResolvedBind],
+    ) -> Result<(oracle::ResultSet<'static, Row>, Vec<ColumnInfo>), OracleError> {
+        let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
+        let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
+        let mut normalize_internal_rowid_alias = sql_for_execution != sql;
+        let mut stmt = Self::build_lazy_statement(conn, &sql_for_execution)?;
+        Self::bind_statement(&mut stmt, binds)?;
+        let result_set = match stmt.into_result_set::<Row>(&[]) {
+            Ok(result_set) => result_set,
+            Err(err) => {
+                if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
+                    let mut retry_stmt = Self::build_lazy_statement(conn, sql)?;
+                    Self::bind_statement(&mut retry_stmt, binds)?;
+                    normalize_internal_rowid_alias = false;
+                    retry_stmt.into_result_set::<Row>(&[])?
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+        let column_info: Vec<ColumnInfo> = result_set
+            .column_info()
+            .iter()
+            .map(|col| ColumnInfo {
+                name: Self::normalize_result_column_name(
+                    col.name(),
+                    normalize_internal_rowid_alias,
+                ),
+                data_type: format!("{:?}", col.oracle_type()),
+            })
+            .collect();
+        Ok((result_set, column_info))
     }
 
     pub fn execute_ref_cursor_streaming<F, G>(
@@ -9384,5 +9440,73 @@ mod nested_cursor_serialization_tests {
             text,
             r#"{"columns":["EMP_ID","EMP_NO","SALES_CUR"],"rows":[["100","E-100",{"columns":["SALE_YEAR","TOTAL_SALES"],"rows":[["2024","1500"]]}],["101","E-101",{"columns":["SALE_YEAR","TOTAL_SALES"],"rows":[]}]]}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod oracle_lazy_fetch_integration_tests {
+    use super::QueryExecutor;
+    use oracle::Connection;
+
+    #[test]
+    #[ignore = "requires local Oracle XE reachable via ORACLE_TEST_* env vars"]
+    fn oracle_lazy_cursor_fetches_incrementally_from_local_xe() {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").expect("ORACLE_TEST_HOST must be set");
+        let port = std::env::var("ORACLE_TEST_PORT").expect("ORACLE_TEST_PORT must be set");
+        let service = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let connect_string = format!("//{host}:{port}/{service}");
+        let conn = Connection::connect(&username, &password, &connect_string)
+            .expect("Oracle XE connection should succeed");
+
+        let (mut cursor, columns) = QueryExecutor::open_select_lazy_cursor_with_binds(
+            &conn,
+            "SELECT LEVEL AS N FROM dual CONNECT BY LEVEL <= 250 ORDER BY LEVEL",
+            &[],
+        )
+        .expect("lazy cursor should open");
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "N");
+
+        let mut first_batch = Vec::new();
+        for _ in 0..100 {
+            let row = cursor
+                .next()
+                .expect("cursor should still have first-batch row")
+                .expect("row fetch should succeed");
+            first_batch.push(QueryExecutor::row_value_to_text(&row, 0).expect("row text"));
+        }
+        assert_eq!(first_batch.first().map(String::as_str), Some("1"));
+        assert_eq!(first_batch.last().map(String::as_str), Some("100"));
+
+        let mut second_batch_count = 0usize;
+        for _ in 0..100 {
+            let row = cursor
+                .next()
+                .expect("cursor should still have second-batch row")
+                .expect("row fetch should succeed");
+            second_batch_count += 1;
+            if second_batch_count == 100 {
+                assert_eq!(
+                    QueryExecutor::row_value_to_text(&row, 0).expect("row text"),
+                    "200"
+                );
+            }
+        }
+        assert_eq!(second_batch_count, 100);
+
+        let mut remaining = Vec::new();
+        for row in cursor {
+            let row = row.expect("remaining row fetch should succeed");
+            remaining.push(QueryExecutor::row_value_to_text(&row, 0).expect("row text"));
+        }
+        assert_eq!(remaining.len(), 50);
+        assert_eq!(remaining.first().map(String::as_str), Some("201"));
+        assert_eq!(remaining.last().map(String::as_str), Some("250"));
     }
 }

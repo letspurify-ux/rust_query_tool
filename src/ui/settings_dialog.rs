@@ -17,7 +17,7 @@ fn fold_for_case_insensitive(value: &str) -> String {
 
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
-use crate::utils::AppConfig;
+use crate::utils::{AppConfig, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE};
 
 pub struct FontSettings {
     pub font: String,
@@ -25,6 +25,7 @@ pub struct FontSettings {
     pub editor_size: u32,
     pub result_size: u32,
     pub result_cell_max_chars: u32,
+    pub connection_pool_size: u32,
 }
 
 fn validate_size(label: &str, value: &str) -> Option<u32> {
@@ -62,6 +63,21 @@ fn validate_result_cell_max_chars(value: &str) -> Option<u32> {
             fltk::dialog::alert_default(&format!(
                 "Cell preview max length must be a number between {} and {}.",
                 RESULT_CELL_MAX_DISPLAY_CHARS_MIN, RESULT_CELL_MAX_DISPLAY_CHARS_MAX
+            ));
+            None
+        }
+    }
+}
+
+fn validate_connection_pool_size(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(size) if (MIN_CONNECTION_POOL_SIZE..=MAX_CONNECTION_POOL_SIZE).contains(&size) => {
+            Some(size)
+        }
+        _ => {
+            fltk::dialog::alert_default(&format!(
+                "Connection pool size must be a number between {} and {}.",
+                MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE
             ));
             None
         }
@@ -288,6 +304,49 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_group.resizable(&result_flex);
     result_group.end();
 
+    let mut connection_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
+    connection_group.set_label("Connection");
+    connection_group.set_color(theme::panel_bg());
+    connection_group.begin();
+
+    let mut connection_flex = Flex::new(
+        content_x + DIALOG_MARGIN,
+        tab_body_y + DIALOG_MARGIN,
+        content_w - DIALOG_MARGIN * 2,
+        tab_body_h - DIALOG_MARGIN * 2,
+        None,
+    );
+    connection_flex.set_type(FlexType::Column);
+    connection_flex.set_spacing(DIALOG_SPACING);
+
+    let mut pool_size_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    pool_size_row.set_type(FlexType::Row);
+    pool_size_row.set_spacing(DIALOG_SPACING);
+    let mut pool_size_label = Frame::default().with_label("Session Pool:");
+    pool_size_label.set_label_color(theme::text_primary());
+    pool_size_row.fixed(&pool_size_label, FORM_LABEL_WIDTH);
+    let mut pool_size_input = IntInput::default();
+    pool_size_input.set_value(&config.normalized_connection_pool_size().to_string());
+    pool_size_input.set_color(theme::input_bg());
+    pool_size_input.set_text_color(theme::text_primary());
+    pool_size_row.fixed(&pool_size_input, NUMERIC_INPUT_WIDTH);
+    let _pool_size_spacer = Frame::default();
+    pool_size_row.end();
+    connection_flex.fixed(&pool_size_row, INPUT_ROW_HEIGHT);
+
+    let mut pool_hint = Frame::default().with_label(&format!(
+        "Parallel DB sessions per connection: {} ~ {} (applies on next connect)",
+        MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE
+    ));
+    pool_hint.set_label_color(theme::text_secondary());
+    connection_flex.fixed(&pool_hint, LABEL_ROW_HEIGHT);
+
+    let connection_filler = Frame::default();
+    connection_flex.resizable(&connection_filler);
+    connection_flex.end();
+    connection_group.resizable(&connection_flex);
+    connection_group.end();
+
     tabs.end();
 
     let mut button_row = Flex::new(
@@ -382,6 +441,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let result_size_input_ok = result_size_input.clone();
     let global_size_input_ok = global_size_input.clone();
     let result_cell_max_input_ok = result_cell_max_input.clone();
+    let pool_size_input_ok = pool_size_input.clone();
     let selected_font_ok = selected_font.clone();
     ok_btn.set_callback(move |_| {
         let ui_size = match validate_ui_size(&global_size_input_ok.value()) {
@@ -401,6 +461,11 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
                 Some(size) => size,
                 None => return,
             };
+        let connection_pool_size = match validate_connection_pool_size(&pool_size_input_ok.value())
+        {
+            Some(size) => size,
+            None => return,
+        };
         let font = selected_font_ok
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -418,6 +483,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             editor_size,
             result_size,
             result_cell_max_chars,
+            connection_pool_size,
         });
         dialog_handle.hide();
         app::awake();

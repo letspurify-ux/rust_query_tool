@@ -69,18 +69,22 @@ fn oracle_form_values_for_mode(
 }
 
 fn db_type_from_choice_index(idx: i32) -> DatabaseType {
-    if idx <= 0 {
-        DatabaseType::Oracle
-    } else {
-        DatabaseType::MySQL
+    let supported = DatabaseType::supported();
+    if idx < 0 {
+        return supported.first().copied().unwrap_or_default();
     }
+    supported
+        .get(idx as usize)
+        .copied()
+        .or_else(|| supported.last().copied())
+        .unwrap_or_default()
 }
 
 fn choice_index_from_db_type(db_type: DatabaseType) -> i32 {
-    match db_type {
-        DatabaseType::Oracle => 0,
-        DatabaseType::MySQL => 1,
-    }
+    DatabaseType::supported()
+        .iter()
+        .position(|candidate| *candidate == db_type)
+        .unwrap_or_default() as i32
 }
 
 fn oracle_connect_mode_from_choice_index(idx: i32) -> OracleConnectMode {
@@ -288,9 +292,7 @@ fn build_connection_info(
     }
 
     let (host, port) = match db_type {
-        DatabaseType::Oracle if oracle_mode == OracleConnectMode::TnsAlias => {
-            (String::new(), 0)
-        }
+        DatabaseType::Oracle if oracle_mode == OracleConnectMode::TnsAlias => (String::new(), 0),
         _ => {
             if host.is_empty() {
                 return Err("Host is required".to_string());
@@ -439,7 +441,12 @@ impl ConnectionDialog {
         dbtype_label.set_label_color(theme::text_primary());
         dbtype_flex.fixed(&dbtype_label, FORM_LABEL_WIDTH);
         let mut dbtype_choice = Choice::default();
-        dbtype_choice.add_choice("Oracle|MySQL or MariaDB");
+        let db_choices = DatabaseType::supported()
+            .iter()
+            .map(|db_type| db_type.choice_label())
+            .collect::<Vec<_>>()
+            .join("|");
+        dbtype_choice.add_choice(&db_choices);
         dbtype_choice.set_value(0); // Oracle by default
         dbtype_choice.set_color(theme::input_bg());
         dbtype_choice.set_text_color(theme::text_primary());
@@ -680,7 +687,8 @@ impl ConnectionDialog {
                 let previous_mode = *current_oracle_mode_cb
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let next_mode = oracle_connect_mode_from_choice_index(oracle_mode_choice_cb.value());
+                let next_mode =
+                    oracle_connect_mode_from_choice_index(oracle_mode_choice_cb.value());
                 sync_oracle_mode_memory_from_form(
                     &oracle_mode_memory_cb,
                     previous_mode,

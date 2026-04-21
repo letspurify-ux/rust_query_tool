@@ -61,8 +61,8 @@ impl MysqlExecutor {
         }
     }
 
-    pub(crate) fn apply_session_timeout(
-        conn: &mut Conn,
+    pub(crate) fn apply_session_timeout<C: Queryable>(
+        conn: &mut C,
         timeout: Option<Duration>,
     ) -> Result<(), MysqlError> {
         let statement = Self::mysql_timeout_statement(timeout);
@@ -102,7 +102,7 @@ impl MysqlExecutor {
         }
     }
 
-    fn row_to_strings(row: &Row, column_count: usize) -> Vec<String> {
+    pub(crate) fn row_to_strings(row: &Row, column_count: usize) -> Vec<String> {
         let mut row_values = Vec::with_capacity(column_count);
         for index in 0..column_count {
             let value = row
@@ -112,6 +112,14 @@ impl MysqlExecutor {
             row_values.push(value);
         }
         row_values
+    }
+
+    pub(crate) fn is_select_statement(sql: &str) -> bool {
+        matches!(Self::classify_statement(sql), MysqlStatementKind::Select)
+    }
+
+    pub(crate) fn is_use_statement(sql: &str) -> bool {
+        matches!(Self::classify_statement(sql), MysqlStatementKind::Use)
     }
 
     fn value_to_string(value: &MysqlValue) -> String {
@@ -148,7 +156,7 @@ impl MysqlExecutor {
         }
     }
 
-    pub fn execute(conn: &mut Conn, sql: &str) -> Result<Vec<QueryResult>, MysqlError> {
+    pub fn execute<C: Queryable>(conn: &mut C, sql: &str) -> Result<Vec<QueryResult>, MysqlError> {
         let trimmed = sql.trim();
         match Self::classify_statement(trimmed) {
             MysqlStatementKind::Select => Ok(vec![Self::execute_select(conn, sql)?]),
@@ -201,7 +209,7 @@ impl MysqlExecutor {
         }
     }
 
-    fn execute_select(conn: &mut Conn, sql: &str) -> Result<QueryResult, MysqlError> {
+    fn execute_select<C: Queryable>(conn: &mut C, sql: &str) -> Result<QueryResult, MysqlError> {
         let start = Instant::now();
         let result = conn.query_iter(sql)?;
 
@@ -224,13 +232,14 @@ impl MysqlExecutor {
         Ok(QueryResult::new_select(sql, columns, rows, start.elapsed()))
     }
 
-    pub fn execute_select_streaming<F, G>(
-        conn: &mut Conn,
+    pub fn execute_select_streaming<C, F, G>(
+        conn: &mut C,
         sql: &str,
         on_select_start: &mut F,
         on_row: &mut G,
     ) -> Result<(QueryResult, bool), MysqlError>
     where
+        C: Queryable,
         F: FnMut(&[ColumnInfo]),
         G: FnMut(Vec<String>) -> bool,
     {
@@ -265,10 +274,10 @@ impl MysqlExecutor {
         Ok((result, cancelled))
     }
 
-    fn execute_dml(conn: &mut Conn, sql: &str) -> Result<QueryResult, MysqlError> {
+    fn execute_dml<C: Queryable>(conn: &mut C, sql: &str) -> Result<QueryResult, MysqlError> {
         let start = Instant::now();
-        conn.query_drop(sql)?;
-        let affected = conn.affected_rows();
+        let result = conn.query_iter(sql)?;
+        let affected = result.affected_rows();
         let trimmed = sql.trim();
         let stmt_type = if QueryExecutor::leading_keyword(trimmed)
             .as_deref()
@@ -290,7 +299,7 @@ impl MysqlExecutor {
         ))
     }
 
-    fn execute_ddl(conn: &mut Conn, sql: &str) -> Result<QueryResult, MysqlError> {
+    fn execute_ddl<C: Queryable>(conn: &mut C, sql: &str) -> Result<QueryResult, MysqlError> {
         let start = Instant::now();
         conn.query_drop(sql)?;
         let trimmed = sql.trim();
@@ -380,7 +389,7 @@ impl MysqlExecutor {
         results
     }
 
-    fn execute_call(conn: &mut Conn, sql: &str) -> Result<Vec<QueryResult>, MysqlError> {
+    fn execute_call<C: Queryable>(conn: &mut C, sql: &str) -> Result<Vec<QueryResult>, MysqlError> {
         // CALL may return multiple select and non-select result sets.
         let start = Instant::now();
         let mut query_result = conn.query_iter(sql)?;
@@ -420,10 +429,13 @@ impl MysqlExecutor {
         ))
     }
 
-    pub fn execute_batch(
-        conn: &mut Conn,
+    pub fn execute_batch<C>(
+        conn: &mut C,
         statements: &[String],
-    ) -> Vec<Result<QueryResult, MysqlError>> {
+    ) -> Vec<Result<QueryResult, MysqlError>>
+    where
+        C: Queryable,
+    {
         let mut results = Vec::new();
         for stmt in statements {
             let trimmed = stmt.trim();
@@ -2289,6 +2301,16 @@ mod tests {
             MysqlExecutor::extract_use_database_name("USE mydb;"),
             "mydb"
         );
+    }
+
+    #[test]
+    fn mysql_is_use_statement_detects_only_use() {
+        assert!(MysqlExecutor::is_use_statement("USE mydb"));
+        assert!(MysqlExecutor::is_use_statement("/* switch */ USE `mydb`"));
+        assert!(!MysqlExecutor::is_use_statement("SELECT * FROM users"));
+        assert!(!MysqlExecutor::is_use_statement(
+            "UPDATE users SET name = 'USE'"
+        ));
     }
 
     #[test]
