@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::app_icon;
 use crate::db::{
     create_shared_connection, format_connection_busy_message, lock_connection_with_activity,
-    try_lock_connection_with_activity, ObjectBrowser, QueryResult, SharedConnection,
+    try_lock_connection_with_activity, ColumnInfo, ObjectBrowser, QueryResult, SharedConnection,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::ResultGridSqlExecuteCallback;
@@ -105,6 +105,16 @@ struct QueryProgressContext {
     state_label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionActivityEntry {
+    tab_name: String,
+    result_tab: Option<usize>,
+    state: String,
+    sql_preview: String,
+    fetched_rows: usize,
+    elapsed: String,
+}
+
 impl QueryProgressContext {
     fn new(
         result_tab_offset: usize,
@@ -165,6 +175,46 @@ impl QueryProgressContext {
                     None
                 }
             })
+    }
+
+    fn lazy_fetch_sessions_without_result_tab_mapping<F>(
+        &self,
+        tab_count: usize,
+        mut session_at: F,
+    ) -> Vec<u64>
+    where
+        F: FnMut(usize) -> Option<u64>,
+    {
+        let mut sessions = self
+            .lazy_fetch_sessions
+            .iter()
+            .filter_map(|(session_id, statement_index)| {
+                let tab_index = resolve_progress_tab_index(
+                    tab_count,
+                    self.result_tab_offset,
+                    self.execution_target,
+                    *statement_index,
+                );
+                if tab_index >= tab_count || session_at(tab_index) != Some(*session_id) {
+                    Some(*session_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    fn shift_result_tabs_after_prior_close(&mut self, closed_result_tab_index: usize) {
+        if closed_result_tab_index < self.result_tab_offset {
+            self.result_tab_offset = self.result_tab_offset.saturating_sub(1);
+        }
+        if let Some(target) = self.execution_target.as_mut() {
+            if closed_result_tab_index < *target {
+                *target = target.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -374,6 +424,10 @@ impl AppState {
                 .execution_target
                 .filter(|idx| *idx < tab_count_before_close)
                 .unwrap_or_else(|| context.result_tab_offset.min(tab_count_before_close));
+            if result_tab_index < base_offset {
+                context.shift_result_tabs_after_prior_close(result_tab_index);
+                continue;
+            }
             let Some(statement_index) = result_tab_index.checked_sub(base_offset) else {
                 continue;
             };
@@ -430,6 +484,43 @@ impl AppState {
         sessions_to_cancel
     }
 
+    fn abort_lazy_fetches_without_result_tab_mapping(&mut self) -> Vec<u64> {
+        let tab_count = self.result_tabs.tab_count();
+        let mut sessions_to_cancel = Vec::new();
+        for context in self.progress_contexts.values() {
+            let unmapped = context
+                .lazy_fetch_sessions_without_result_tab_mapping(tab_count, |tab_index| {
+                    self.result_tabs.lazy_fetch_session_at(tab_index)
+                });
+            for session_id in unmapped {
+                Self::push_unique_session_id(&mut sessions_to_cancel, session_id);
+            }
+        }
+        if sessions_to_cancel.is_empty() {
+            return sessions_to_cancel;
+        }
+
+        let mut finished_contexts = Vec::new();
+        for (tab_id, context) in self.progress_contexts.iter_mut() {
+            for session_id in &sessions_to_cancel {
+                let Some(statement_index) = context.lazy_fetch_sessions.remove(session_id) else {
+                    continue;
+                };
+                context.mark_statement_closed(statement_index);
+            }
+            if context.lazy_fetch_sessions.is_empty() && context.batch_finished {
+                finished_contexts.push(*tab_id);
+            }
+        }
+        for session_id in &sessions_to_cancel {
+            self.result_tabs.abort_lazy_fetch_session(*session_id);
+        }
+        for tab_id in finished_contexts {
+            self.finish_progress_context(tab_id);
+        }
+        sessions_to_cancel
+    }
+
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
         self.progress_contexts.remove(&tab_id);
         self.result_grid_execution_target = None;
@@ -478,6 +569,15 @@ impl AppState {
         for tab in &self.editor_tabs {
             tab.sql_editor.release_pooled_db_session();
         }
+    }
+
+    fn cancel_oldest_lazy_fetch(&mut self, status_message: &str) -> Option<u64> {
+        let session_id = self.lazy_fetch_sessions_for_abort().into_iter().min()?;
+        self.mark_lazy_fetch_result_tab_closed(session_id);
+        self.result_tabs.abort_lazy_fetch_session(session_id);
+        self.set_status_message(status_message);
+        self.refresh_result_edit_controls();
+        Some(session_id)
     }
 
     fn mark_all_result_tabs_closed_for_clear(&mut self) {
@@ -692,6 +792,76 @@ impl AppState {
         self.result_tab_offset = result_tabs.tab_count();
         self.refresh_result_edit_controls();
         self.set_status_message(&status_message);
+    }
+
+    fn build_session_activity_result_request(&self) -> ResultTabRequest {
+        let info = self
+            .connection_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let connection_name = info
+            .as_ref()
+            .map(|info| info.name.as_str())
+            .unwrap_or("Not connected");
+        let db_type = info
+            .as_ref()
+            .map(|info| info.db_type.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let pool_size = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_connection_pool_size();
+        let current_activity =
+            crate::db::current_db_activity().unwrap_or_else(|| "Idle".to_string());
+        let tab_count = self.result_tabs.tab_count();
+        let mut entries = self
+            .progress_contexts
+            .iter()
+            .map(|(tab_id, context)| {
+                let result_tab = context.active_statement_index.map(|statement_index| {
+                    resolve_progress_tab_index(
+                        tab_count,
+                        context.result_tab_offset,
+                        context.execution_target,
+                        statement_index,
+                    ) + 1
+                });
+                let fetched_rows = context
+                    .active_statement_index
+                    .and_then(|statement_index| {
+                        context.fetch_row_counts.get(&statement_index).copied()
+                    })
+                    .unwrap_or(0);
+                (
+                    *tab_id,
+                    SessionActivityEntry {
+                        tab_name: self
+                            .tab_display_name(*tab_id)
+                            .unwrap_or_else(|| format!("Tab {}", tab_id)),
+                        result_tab,
+                        state: context.state_label.clone(),
+                        sql_preview: context.activity_label.clone(),
+                        fetched_rows,
+                        elapsed: format_session_activity_elapsed(context.started_at.elapsed()),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(tab_id, _)| *tab_id);
+        let entries = entries
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+
+        build_session_activity_result_request(
+            connection_name,
+            &db_type,
+            pool_size,
+            &current_activity,
+            entries,
+        )
     }
 
     fn start_status_animation(&mut self, message: &str) {
@@ -953,6 +1123,20 @@ fn should_finish_progress_after_lazy_fetch_close(
     finished_all_lazy_fetches
 }
 
+fn should_cancel_lazy_fetch_for_session_pool(
+    active_lazy_fetches: usize,
+    connection_pool_size: u32,
+) -> bool {
+    active_lazy_fetches > 0 && active_lazy_fetches >= connection_pool_size as usize
+}
+
+#[derive(Clone, Copy)]
+enum SqlExecutionRequest {
+    Current,
+    StatementAtCursor,
+    Selected,
+}
+
 fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
     let editor = {
         let guard = state
@@ -970,6 +1154,68 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
     }
 
     editor
+}
+
+fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -> bool {
+    let connection = {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .connection
+            .clone()
+    };
+    let connection_pool_size = connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .connection_pool_size();
+
+    let session_id = {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active_sessions = guard.lazy_fetch_sessions_for_abort();
+        if !should_cancel_lazy_fetch_for_session_pool(active_sessions.len(), connection_pool_size) {
+            return false;
+        }
+        let Some(session_id) =
+            guard.cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch")
+        else {
+            return false;
+        };
+        session_id
+    };
+
+    AppState::request_lazy_fetch_on_editors(
+        state,
+        session_id,
+        crate::ui::sql_editor::LazyFetchRequest::Cancel,
+    );
+    true
+}
+
+fn run_sql_execution_request(state: &Arc<Mutex<AppState>>, request: SqlExecutionRequest) {
+    let Some(editor) = acquire_sql_editor_if_idle(state) else {
+        return;
+    };
+    match request {
+        SqlExecutionRequest::Current => editor.execute_current(),
+        SqlExecutionRequest::StatementAtCursor => editor.execute_statement_at_cursor(),
+        SqlExecutionRequest::Selected => editor.execute_selected(),
+    }
+}
+
+fn execute_sql_request_with_session_pool_slot(
+    state: &Arc<Mutex<AppState>>,
+    request: SqlExecutionRequest,
+) {
+    if cancel_oldest_lazy_fetch_if_session_pool_full(state) {
+        let state_for_execute = Arc::clone(state);
+        app::add_timeout3(0.2, move |_| {
+            run_sql_execution_request(&state_for_execute, request);
+        });
+    } else {
+        run_sql_execution_request(state, request);
+    }
 }
 
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
@@ -1029,6 +1275,91 @@ fn format_session_activity_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn session_activity_column(name: &str, data_type: &str) -> ColumnInfo {
+    ColumnInfo {
+        name: name.to_string(),
+        data_type: data_type.to_string(),
+    }
+}
+
+fn build_session_activity_result_request(
+    connection_name: &str,
+    db_type: &str,
+    pool_size: u32,
+    current_activity: &str,
+    entries: Vec<SessionActivityEntry>,
+) -> ResultTabRequest {
+    let columns = vec![
+        session_activity_column("Connection", "VARCHAR2"),
+        session_activity_column("Database", "VARCHAR2"),
+        session_activity_column("Pool Size", "NUMBER"),
+        session_activity_column("Tab", "VARCHAR2"),
+        session_activity_column("Result Tab", "VARCHAR2"),
+        session_activity_column("State", "VARCHAR2"),
+        session_activity_column("Current Activity", "VARCHAR2"),
+        session_activity_column("SQL Preview", "VARCHAR2"),
+        session_activity_column("Fetched Rows", "NUMBER"),
+        session_activity_column("Elapsed", "VARCHAR2"),
+    ];
+
+    let pool_size = pool_size.to_string();
+    let has_active_entries = !entries.is_empty();
+    let rows = if !has_active_entries {
+        vec![vec![
+            connection_name.to_string(),
+            db_type.to_string(),
+            pool_size,
+            "-".to_string(),
+            "-".to_string(),
+            "Idle".to_string(),
+            current_activity.to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ]]
+    } else {
+        entries
+            .into_iter()
+            .map(|entry| {
+                vec![
+                    connection_name.to_string(),
+                    db_type.to_string(),
+                    pool_size.clone(),
+                    entry.tab_name,
+                    entry
+                        .result_tab
+                        .map(|index| index.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    entry.state,
+                    current_activity.to_string(),
+                    entry.sql_preview,
+                    entry.fetched_rows.to_string(),
+                    entry.elapsed,
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    let message = if has_active_entries {
+        format!("{} active session(s)", rows.len())
+    } else {
+        "No active sessions".to_string()
+    };
+
+    ResultTabRequest {
+        label: "Session Activity".to_string(),
+        result: QueryResult {
+            sql: String::new(),
+            columns,
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::from_secs(0),
+            message,
+            is_select: true,
+            success: true,
+        },
+    }
+}
+
 impl MainWindow {
     fn clone_result_tabs_for_edit_action(
         state: &Arc<Mutex<AppState>>,
@@ -1063,7 +1394,11 @@ impl MainWindow {
         });
     }
 
-    fn transition_to_disconnected_state(state: &mut AppState, error_message: Option<&str>) {
+    fn transition_to_disconnected_state(
+        state: &mut AppState,
+        error_message: Option<&str>,
+    ) -> Vec<u64> {
+        let lazy_fetch_sessions = state.lazy_fetch_sessions_for_abort();
         *state
             .connection_info
             .lock()
@@ -1144,6 +1479,7 @@ impl MainWindow {
         // changed pending_save_request, ensuring buttons reflect the final state
         // rather than any intermediate snapshot from before orphan cleanup.
         state.refresh_result_edit_controls();
+        lazy_fetch_sessions
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
@@ -1939,9 +2275,10 @@ impl MainWindow {
         let weak_state_for_execute = Arc::downgrade(&state);
         execute_btn.set_callback(move |_| {
             if let Some(state_for_execute) = weak_state_for_execute.upgrade() {
-                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_execute) {
-                    editor.execute_current();
-                }
+                execute_sql_request_with_session_pool_slot(
+                    &state_for_execute,
+                    SqlExecutionRequest::StatementAtCursor,
+                );
             }
         });
 
@@ -1999,15 +2336,14 @@ impl MainWindow {
                 let tab_count_before_close = s.result_tabs.tab_count();
                 let closed = s.result_tabs.close_current_tab_and_take_lazy_fetch();
                 if let Some((closed_tab_index, lazy_fetch_session)) = closed {
-                    let mut sessions_to_cancel = Vec::new();
+                    let mut sessions_to_cancel =
+                        s.mark_result_tab_closed_by_index(closed_tab_index, tab_count_before_close);
                     if let Some(session_id) = lazy_fetch_session {
                         s.mark_lazy_fetch_result_tab_closed(session_id);
-                        sessions_to_cancel.push(session_id);
-                    } else {
-                        sessions_to_cancel.extend(s.mark_result_tab_closed_by_index(
-                            closed_tab_index,
-                            tab_count_before_close,
-                        ));
+                        AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
+                    }
+                    for session_id in s.abort_lazy_fetches_without_result_tab_mapping() {
+                        AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
                     }
                     // A result tab drop can release large row buffers.
                     // Ask allocator to return free pages promptly.
@@ -2625,7 +2961,13 @@ impl MainWindow {
             return false;
         }
 
-        let (created_tab_id, schema_sender, file_sender, mut editor_to_cleanup) = {
+        let (
+            created_tab_id,
+            schema_sender,
+            file_sender,
+            mut editor_to_cleanup,
+            lazy_fetch_sessions,
+        ) = {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2651,6 +2993,9 @@ impl MainWindow {
                     lazy_fetch_sessions.push(session_id);
                 }
             }
+            if !s.query_tabs.close_tab(tab_id) {
+                return false;
+            }
             for session_id in &lazy_fetch_sessions {
                 s.mark_lazy_fetch_result_tab_closed(*session_id);
                 s.result_tabs.abort_lazy_fetch_session(*session_id);
@@ -2658,18 +3003,12 @@ impl MainWindow {
             if !lazy_fetch_sessions.is_empty() {
                 s.refresh_result_edit_controls();
             }
-            if !s.query_tabs.close_tab(tab_id) {
-                return false;
-            }
             s.editor_tabs.remove(index);
             s.progress_contexts.remove(&tab_id);
 
             let mut created_tab_id = None;
             if s.editor_tabs.is_empty() {
-                let Some(new_tab_id) = MainWindow::create_query_editor_tab(&mut s) else {
-                    return false;
-                };
-                created_tab_id = Some(new_tab_id);
+                created_tab_id = MainWindow::create_query_editor_tab(&mut s);
             }
 
             let next_tab_id = s
@@ -2726,9 +3065,14 @@ impl MainWindow {
                 s.schema_sender.clone(),
                 s.file_sender.clone(),
                 editor_to_cleanup,
+                lazy_fetch_sessions,
             )
         };
 
+        for session_id in &lazy_fetch_sessions {
+            editor_to_cleanup
+                .request_lazy_fetch(*session_id, crate::ui::sql_editor::LazyFetchRequest::Cancel);
+        }
         editor_to_cleanup.cleanup_for_close();
 
         if let Some(tab_id) = created_tab_id {
@@ -2787,8 +3131,8 @@ impl MainWindow {
             let mut conn_guard =
                 lock_connection_with_activity(connection, "Loading schema metadata");
             let connection_generation = conn_guard.connection_generation();
-            let fetched = match conn_guard.db_type() {
-                crate::db::DatabaseType::Oracle => {
+            let fetched = match conn_guard.db_type().sql_dialect() {
+                crate::db::DbSqlDialect::Oracle => {
                     let Ok(conn) = conn_guard.require_live_connection() else {
                         return None;
                     };
@@ -2826,7 +3170,7 @@ impl MainWindow {
 
                     (tables, views, procedures, functions, packages)
                 }
-                crate::db::DatabaseType::MySQL => {
+                crate::db::DbSqlDialect::MySql => {
                     let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 
                     let tables =
@@ -3258,6 +3602,21 @@ impl MainWindow {
                     result_tabs.append_script_output_lines(&lines);
                 }
                 QueryProgress::PromptInput { .. } => {}
+                QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
+                    let session_id = s
+                        .cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch");
+                    drop(s);
+                    if let Some(session_id) = session_id {
+                        AppState::request_lazy_fetch_on_editors(
+                            &state_for_progress,
+                            session_id,
+                            crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                        );
+                        let _ = response.send(true);
+                    } else {
+                        let _ = response.send(false);
+                    }
+                }
                 QueryProgress::AutoCommitChanged { enabled } => {
                     if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
                         if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") {
@@ -3311,7 +3670,16 @@ impl MainWindow {
                             );
                         }
                     } else {
-                        Self::transition_to_disconnected_state(&mut s, None);
+                        let lazy_fetch_sessions =
+                            Self::transition_to_disconnected_state(&mut s, None);
+                        drop(s);
+                        for session_id in lazy_fetch_sessions {
+                            AppState::request_lazy_fetch_on_editors(
+                                &state_for_progress,
+                                session_id,
+                                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                            );
+                        }
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
@@ -3659,7 +4027,7 @@ impl MainWindow {
                 let mut s = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                MainWindow::transition_to_disconnected_state(&mut s, None);
+                let _ = MainWindow::transition_to_disconnected_state(&mut s, None);
                 true
             }
             "File/Open SQL File" => {
@@ -3867,9 +4235,7 @@ impl MainWindow {
                 true
             }
             "Query/Execute" => {
-                if let Some(editor) = acquire_sql_editor_if_idle(state) {
-                    editor.execute_current();
-                }
+                execute_sql_request_with_session_pool_slot(state, SqlExecutionRequest::Current);
                 true
             }
             "File/New SQL File" => {
@@ -3902,21 +4268,21 @@ impl MainWindow {
                 true
             }
             "Query/Execute Statement" => {
-                if let Some(editor) = acquire_sql_editor_if_idle(state) {
-                    editor.execute_statement_at_cursor();
-                }
+                execute_sql_request_with_session_pool_slot(
+                    state,
+                    SqlExecutionRequest::StatementAtCursor,
+                );
                 true
             }
             "Query/Execute Statement (F9)" => {
-                if let Some(editor) = acquire_sql_editor_if_idle(state) {
-                    editor.execute_statement_at_cursor();
-                }
+                execute_sql_request_with_session_pool_slot(
+                    state,
+                    SqlExecutionRequest::StatementAtCursor,
+                );
                 true
             }
             "Query/Execute Selected" => {
-                if let Some(editor) = acquire_sql_editor_if_idle(state) {
-                    editor.execute_selected();
-                }
+                execute_sql_request_with_session_pool_slot(state, SqlExecutionRequest::Selected);
                 true
             }
             "Query/Quick Describe" => {
@@ -4106,75 +4472,11 @@ impl MainWindow {
                 true
             }
             "Tools/Session Activity" => {
-                let message = {
-                    let s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let info = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    let activity =
-                        crate::db::current_db_activity().unwrap_or_else(|| "Idle".to_string());
-                    let connection_name = info
-                        .as_ref()
-                        .map(|info| info.name.as_str())
-                        .unwrap_or("Not connected");
-                    let db_type = info
-                        .as_ref()
-                        .map(|info| info.db_type.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let pool_size = s
-                        .config
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .normalized_connection_pool_size();
-                    let mut lines = vec![
-                        format!("Connection: {}", connection_name),
-                        format!("Database: {}", db_type),
-                        format!("Configured session pool size: {}", pool_size),
-                        format!("Current activity: {}", activity),
-                    ];
-                    if s.progress_contexts.is_empty() {
-                        lines.push("Active sessions: none".to_string());
-                    } else {
-                        let tab_count = s.result_tabs.tab_count();
-                        for (tab_id, context) in &s.progress_contexts {
-                            let tab_name = s
-                                .tab_display_name(*tab_id)
-                                .unwrap_or_else(|| format!("Tab {}", tab_id));
-                            let result_tab =
-                                context.active_statement_index.map(|statement_index| {
-                                    resolve_progress_tab_index(
-                                        tab_count,
-                                        context.result_tab_offset,
-                                        context.execution_target,
-                                        statement_index,
-                                    ) + 1
-                                });
-                            let fetched_rows = context
-                                .active_statement_index
-                                .and_then(|statement_index| {
-                                    context.fetch_row_counts.get(&statement_index).copied()
-                                })
-                                .unwrap_or(0);
-                            lines.push(format!(
-                                "\nTab: {}\nResult tab: {}\nStatus: {}\nSQL preview: {}\nFetched rows: {}\nElapsed: {}",
-                                tab_name,
-                                result_tab
-                                    .map(|index| index.to_string())
-                                    .unwrap_or_else(|| "-".to_string()),
-                                context.state_label,
-                                context.activity_label,
-                                fetched_rows,
-                                format_session_activity_elapsed(context.started_at.elapsed())
-                            ));
-                        }
-                    }
-                    lines.join("\n")
-                };
-                fltk::dialog::message_default(&message);
+                let mut s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let request = s.build_session_activity_result_request();
+                s.append_result_tab_request(request);
                 true
             }
             "Tools/Application Log" => {
@@ -5310,6 +5612,83 @@ mod tests {
     }
 
     #[test]
+    fn session_pool_slot_check_cancels_only_when_lazy_fetches_fill_pool() {
+        assert!(!should_cancel_lazy_fetch_for_session_pool(0, 1));
+        assert!(!should_cancel_lazy_fetch_for_session_pool(3, 4));
+        assert!(should_cancel_lazy_fetch_for_session_pool(4, 4));
+        assert!(should_cancel_lazy_fetch_for_session_pool(5, 4));
+    }
+
+    #[test]
+    fn session_activity_result_request_uses_idle_row_when_no_active_entries() {
+        let request =
+            build_session_activity_result_request("Local", "Oracle", 4, "Idle", Vec::new());
+
+        assert_eq!(request.label, "Session Activity");
+        assert_eq!(request.result.message, "No active sessions");
+        assert_eq!(request.result.row_count, 1);
+        assert_eq!(
+            request
+                .result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Connection",
+                "Database",
+                "Pool Size",
+                "Tab",
+                "Result Tab",
+                "State",
+                "Current Activity",
+                "SQL Preview",
+                "Fetched Rows",
+                "Elapsed"
+            ]
+        );
+        assert_eq!(
+            request.result.rows[0],
+            vec!["Local", "Oracle", "4", "-", "-", "Idle", "Idle", "-", "-", "-"]
+        );
+    }
+
+    #[test]
+    fn session_activity_result_request_formats_active_rows() {
+        let request = build_session_activity_result_request(
+            "Local",
+            "Oracle",
+            4,
+            "SELECT running",
+            vec![SessionActivityEntry {
+                tab_name: "Query 1".to_string(),
+                result_tab: Some(2),
+                state: "Fetching rows".to_string(),
+                sql_preview: "select * from employees".to_string(),
+                fetched_rows: 42,
+                elapsed: "3s".to_string(),
+            }],
+        );
+
+        assert_eq!(request.result.message, "1 active session(s)");
+        assert_eq!(
+            request.result.rows[0],
+            vec![
+                "Local",
+                "Oracle",
+                "4",
+                "Query 1",
+                "2",
+                "Fetching rows",
+                "SELECT running",
+                "select * from employees",
+                "42",
+                "3s"
+            ]
+        );
+    }
+
+    #[test]
     fn normalize_line_endings_for_editor_keeps_lf_only_content() {
         let text = String::from("select 1;\nselect 2;");
         let normalized = MainWindow::normalize_line_endings_for_editor(text.clone());
@@ -5441,6 +5820,50 @@ mod tests {
     }
 
     #[test]
+    fn progress_context_keeps_lazy_session_with_matching_result_tab() {
+        let mut context = QueryProgressContext::new(1, None, "Executing".to_string());
+        context.lazy_fetch_sessions.insert(44, 2);
+
+        let unmapped =
+            context.lazy_fetch_sessions_without_result_tab_mapping(
+                4,
+                |tab_index| match tab_index {
+                    3 => Some(44),
+                    _ => None,
+                },
+            );
+
+        assert!(unmapped.is_empty());
+    }
+
+    #[test]
+    fn progress_context_finds_lazy_session_without_result_tab() {
+        let mut context = QueryProgressContext::new(1, None, "Executing".to_string());
+        context.lazy_fetch_sessions.insert(44, 2);
+
+        let unmapped = context.lazy_fetch_sessions_without_result_tab_mapping(3, |_| None);
+
+        assert_eq!(unmapped, vec![44]);
+    }
+
+    #[test]
+    fn progress_context_finds_lazy_session_with_mismatched_result_tab() {
+        let mut context = QueryProgressContext::new(1, None, "Executing".to_string());
+        context.lazy_fetch_sessions.insert(44, 2);
+
+        let unmapped =
+            context.lazy_fetch_sessions_without_result_tab_mapping(
+                4,
+                |tab_index| match tab_index {
+                    3 => Some(55),
+                    _ => None,
+                },
+            );
+
+        assert_eq!(unmapped, vec![44]);
+    }
+
+    #[test]
     fn progress_context_clear_marks_active_statement_before_lazy_session_event() {
         let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
         context.active_statement_index = Some(0);
@@ -5464,6 +5887,34 @@ mod tests {
         assert!(context.closed_statement_indices.contains(&2));
         assert!(context.lazy_fetch_sessions.is_empty());
         assert!(context.fetch_row_counts.is_empty());
+    }
+
+    #[test]
+    fn progress_context_shifts_batch_offset_when_prior_result_tab_closes() {
+        let mut context = QueryProgressContext::new(3, None, "Executing".to_string());
+
+        context.shift_result_tabs_after_prior_close(1);
+
+        assert_eq!(context.result_tab_offset, 2);
+        assert_eq!(context.execution_target, None);
+    }
+
+    #[test]
+    fn progress_context_shifts_execution_target_when_prior_result_tab_closes() {
+        let mut context = QueryProgressContext::new(5, Some(4), "Executing".to_string());
+
+        context.shift_result_tabs_after_prior_close(2);
+
+        assert_eq!(context.execution_target, Some(3));
+    }
+
+    #[test]
+    fn progress_context_keeps_base_when_closing_first_statement_tab() {
+        let mut context = QueryProgressContext::new(3, None, "Executing".to_string());
+
+        context.shift_result_tabs_after_prior_close(3);
+
+        assert_eq!(context.result_tab_offset, 3);
     }
 
     #[test]

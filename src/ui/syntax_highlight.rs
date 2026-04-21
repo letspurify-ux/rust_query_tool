@@ -549,7 +549,8 @@ impl SqlHighlighter {
                 }
             }
             LexerState::InSingleQuote => {
-                match scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL) {
+                match scan_until_single_quote_end(bytes, idx, self.db_type.uses_mysql_sql_dialect())
+                {
                     ScanResult::Closed { next_idx } => {
                         idx = next_idx;
                         styles[..idx].fill(STYLE_STRING as u8);
@@ -573,7 +574,8 @@ impl SqlHighlighter {
                 }
             }
             LexerState::InDoubleQuote => {
-                match scan_until_double_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL) {
+                match scan_until_double_quote_end(bytes, idx, self.db_type.uses_mysql_sql_dialect())
+                {
                     ScanResult::Closed { next_idx } => {
                         idx = next_idx;
                         styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
@@ -638,8 +640,11 @@ impl SqlHighlighter {
             }
 
             // Single-line comment (--)
-            if sql_text::is_dash_line_comment_start(bytes, idx, self.db_type == DatabaseType::MySQL)
-            {
+            if sql_text::is_dash_line_comment_start(
+                bytes,
+                idx,
+                self.db_type.uses_mysql_sql_dialect(),
+            ) {
                 let start = idx;
                 idx += 2;
                 while let Some(&b) = bytes.get(idx) {
@@ -653,7 +658,7 @@ impl SqlHighlighter {
                 continue;
             }
 
-            if self.db_type == DatabaseType::MySQL && bytes.get(idx) == Some(&b'#') {
+            if self.db_type.uses_mysql_sql_dialect() && bytes.get(idx) == Some(&b'#') {
                 let start = idx;
                 idx += 1;
                 while let Some(&b) = bytes.get(idx) {
@@ -727,7 +732,7 @@ impl SqlHighlighter {
                     let scan_result = scan_until_single_quote_end(
                         bytes,
                         idx,
-                        self.db_type == DatabaseType::MySQL,
+                        self.db_type.uses_mysql_sql_dialect(),
                     );
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
@@ -748,7 +753,7 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 1;
                 let scan_result =
-                    scan_until_single_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
+                    scan_until_single_quote_end(bytes, idx, self.db_type.uses_mysql_sql_dialect());
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -768,7 +773,7 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 1;
                 let scan_result =
-                    scan_until_double_quote_end(bytes, idx, self.db_type == DatabaseType::MySQL);
+                    scan_until_double_quote_end(bytes, idx, self.db_type.uses_mysql_sql_dialect());
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -785,7 +790,7 @@ impl SqlHighlighter {
                 continue;
             }
 
-            if self.db_type == DatabaseType::MySQL && byte == b'`' {
+            if self.db_type.uses_mysql_sql_dialect() && byte == b'`' {
                 let start = idx;
                 idx += 1;
                 let scan_result = scan_until_backtick_quote_end(bytes, idx);
@@ -822,7 +827,7 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 1;
                 while let Some(&next_byte) = bytes.get(idx) {
-                    if self.db_type == DatabaseType::MySQL && next_byte == b'#' {
+                    if self.db_type.uses_mysql_sql_dialect() && next_byte == b'#' {
                         break;
                     }
                     if !sql_text::is_identifier_byte(next_byte) {
@@ -831,7 +836,7 @@ impl SqlHighlighter {
                     idx += 1;
                 }
                 let mut word_end = idx;
-                if self.db_type == DatabaseType::MySQL {
+                if self.db_type.uses_mysql_sql_dialect() {
                     if let Some(suffix_start) = text
                         .get(start..word_end)
                         .and_then(mysql_keyword_delimiter_suffix_start)
@@ -862,7 +867,7 @@ impl SqlHighlighter {
                         let scan_result = scan_until_single_quote_end(
                             bytes,
                             look_ahead,
-                            self.db_type == DatabaseType::MySQL,
+                            self.db_type.uses_mysql_sql_dialect(),
                         );
                         look_ahead = match scan_result {
                             ScanResult::Closed { next_idx }
@@ -1226,9 +1231,10 @@ impl<'a> FoldedWord<'a> {
                 sql_text::is_oracle_sql_keyword(upper_ref)
                     || sql_text::is_mysql_sql_keyword(upper_ref),
                 sql_text::is_sql_keyword_for_db(upper_ref, db_type),
-                match db_type {
-                    DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper_ref),
-                    DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper_ref),
+                if db_type.uses_mysql_sql_dialect() {
+                    MYSQL_FUNCTIONS_SET.contains(upper_ref)
+                } else {
+                    ORACLE_FUNCTIONS_SET.contains(upper_ref)
                 },
                 is_alias_eligible_plsql_control_keyword(upper_ref),
             )

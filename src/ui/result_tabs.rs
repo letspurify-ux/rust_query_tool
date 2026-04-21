@@ -511,6 +511,14 @@ impl ResultTabsWidget {
             .collect()
     }
 
+    pub fn lazy_fetch_session_at(&self, index: usize) -> Option<u64> {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .and_then(|tab| tab.table.active_lazy_fetch_session())
+    }
+
     pub fn active_result_index(&self) -> Option<usize> {
         *self
             .active_index
@@ -1031,14 +1039,10 @@ impl ResultTabsWidget {
     }
 
     pub fn close_current_tab_and_take_lazy_fetch(&mut self) -> Option<(usize, Option<u64>)> {
-        let index = match *self
+        let index = (*self
             .active_index
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            Some(idx) => idx,
-            None => return None, // Script Output tab cannot be closed
-        };
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
 
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());

@@ -296,10 +296,15 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(HighlightData::new());
-        self.rehighlight_full_buffer();
-
-        self.buffer.set_text("");
-        self.style_buffer.set_text("");
+        self.highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        {
+            let _suppress_callbacks = self.suppress_buffer_callbacks();
+            self.buffer.set_text("");
+            self.style_buffer.set_text("");
+        }
         self.intellisense_runtime.clear_ui_tracking();
         self.intellisense_runtime.clear_parse_cache();
         self.intellisense_runtime.clear_routine_symbol_cache();

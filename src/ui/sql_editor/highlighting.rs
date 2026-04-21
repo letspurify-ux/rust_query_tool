@@ -408,6 +408,14 @@ impl SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
+    fn redraw_editor_if_live(&self) {
+        let mut editor = self.editor.clone();
+        if editor.was_deleted() {
+            return;
+        }
+        editor.redraw();
+    }
+
     pub fn update_highlight_data(&mut self, data: HighlightData) {
         self.highlighter
             .lock()
@@ -483,8 +491,7 @@ impl SqlEditorWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
-            let mut editor = self.editor.clone();
-            editor.redraw();
+            self.redraw_editor_if_live();
             return;
         }
 
@@ -519,8 +526,7 @@ impl SqlEditorWidget {
         };
         match updated {
             Some(true) | Some(false) => {
-                let mut editor = self.editor.clone();
-                editor.redraw();
+                self.redraw_editor_if_live();
             }
             None => self.rehighlight_full_buffer(),
         }
@@ -651,8 +657,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .rebuild(text.to_string(), &styles, line_exit_states);
-        let mut editor = self.editor.clone();
-        editor.redraw();
+        self.redraw_editor_if_live();
     }
 }
 

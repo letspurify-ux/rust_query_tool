@@ -1294,9 +1294,9 @@ pub(crate) fn is_sql_keyword_for_db(
     word: &str,
     db_type: crate::db::connection::DatabaseType,
 ) -> bool {
-    match db_type {
-        crate::db::connection::DatabaseType::Oracle => is_oracle_sql_keyword(word),
-        crate::db::connection::DatabaseType::MySQL => is_mysql_sql_keyword(word),
+    match db_type.sql_dialect() {
+        crate::db::connection::DbSqlDialect::Oracle => is_oracle_sql_keyword(word),
+        crate::db::connection::DbSqlDialect::MySql => is_mysql_sql_keyword(word),
     }
 }
 
@@ -2168,9 +2168,9 @@ pub(crate) fn mysql_compatibility_for_sql(
     sql: &str,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
 ) -> bool {
-    match preferred_db_type {
-        Some(crate::db::connection::DatabaseType::MySQL) => true,
-        Some(crate::db::connection::DatabaseType::Oracle) => false,
+    match preferred_db_type.map(crate::db::connection::DatabaseType::sql_dialect) {
+        Some(crate::db::connection::DbSqlDialect::MySql) => true,
+        Some(crate::db::connection::DbSqlDialect::Oracle) => false,
         None => {
             if !should_cache_mysql_compatibility(sql) {
                 return sql_uses_mysql_compatible_syntax(sql);

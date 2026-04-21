@@ -187,12 +187,12 @@ impl SqlEditorWidget {
         object_name: &str,
         qualifier: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
-        match conn_guard.db_type() {
-            crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+        match conn_guard.db_type().sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => match conn_guard.require_live_connection() {
                 Ok(db_conn) => Self::describe_object(db_conn.as_ref(), object_name, qualifier),
                 Err(message) => Err(message),
             },
-            crate::db::DatabaseType::MySQL => conn_guard
+            crate::db::DbSqlDialect::MySql => conn_guard
                 .get_mysql_connection_mut()
                 .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                 .and_then(|mysql_conn| {

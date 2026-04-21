@@ -819,7 +819,7 @@ pub(crate) fn active_mysql_delimiter_before_offset(
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
     initial_mysql_delimiter: Option<&str>,
 ) -> Option<String> {
-    if preferred_db_type != Some(crate::db::connection::DatabaseType::MySQL) {
+    if !preferred_db_type.is_some_and(|db_type| db_type.uses_mysql_sql_dialect()) {
         return None;
     }
 

@@ -1894,6 +1894,16 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
+                    if ctrl_or_cmd
+                        && Self::matches_end_key(key, original_key)
+                        && Self::request_lazy_fetch_all_if_active(
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                        )
+                    {
+                        return true;
+                    }
+
                     if Self::key_should_request_lazy_fetch_more(key) {
                         Self::request_lazy_fetch_more_near_bottom(
                             &table_for_handle,
@@ -2035,6 +2045,15 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
+                    if ctrl_or_cmd
+                        && Self::matches_end_key(key, original_key)
+                        && Self::request_lazy_fetch_all_if_active(
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                        )
+                    {
+                        return true;
+                    }
                     if ctrl_or_cmd && shift && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_with_headers(
                             &table_for_handle,
@@ -2223,8 +2242,69 @@ impl ResultTableWidget {
         }
     }
 
+    fn request_lazy_fetch_all_if_active(
+        session: &Arc<Mutex<Option<u64>>>,
+        callback: &LazyFetchCallback,
+    ) -> bool {
+        let session_id = *session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session_id) = session_id {
+            Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::All);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn matches_end_key(key: Key, original_key: Key) -> bool {
+        key == Key::End || original_key == Key::End
+    }
+
     fn current_csv_snapshot(&self) -> (String, usize) {
         (self.build_csv_snapshot(), self.row_count())
+    }
+
+    fn is_table_near_bottom(table: &Table) -> bool {
+        let rows = table.rows();
+        if rows <= 0 {
+            return false;
+        }
+        let first_visible = table.row_position().max(0);
+        let row_h = Self::uniform_row_height_near_viewport(table, first_visible, rows)
+            .unwrap_or_else(|| table.row_height(first_visible));
+        if row_h <= 0 {
+            return false;
+        }
+        let data_top = table.y().saturating_add(table.col_header_height());
+        let data_bottom = table.y().saturating_add(table.h());
+        let visible_rows = Self::visible_row_metrics(data_top, data_bottom, row_h)
+            .map(|(rows, _)| rows)
+            .unwrap_or(1);
+        first_visible.saturating_add(visible_rows).saturating_add(1) >= rows
+    }
+
+    fn request_lazy_fetch_more_for_session(
+        session_id: u64,
+        session: &Arc<Mutex<Option<u64>>>,
+        callback: &LazyFetchCallback,
+        in_flight: &Arc<Mutex<HashSet<u64>>>,
+    ) {
+        let active_session_id = *session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active_session_id != Some(session_id) {
+            return;
+        }
+
+        let mut guard = in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !guard.insert(session_id) {
+            return;
+        }
+        drop(guard);
+        Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::More);
     }
 
     fn request_lazy_fetch_more_near_bottom(
@@ -2239,30 +2319,8 @@ impl ResultTableWidget {
         let Some(session_id) = session_id else {
             return;
         };
-        let rows = table.rows();
-        if rows <= 0 {
-            return;
-        }
-        let first_visible = table.row_position().max(0);
-        let row_h = Self::uniform_row_height_near_viewport(table, first_visible, rows)
-            .unwrap_or_else(|| table.row_height(first_visible));
-        if row_h <= 0 {
-            return;
-        }
-        let data_top = table.y().saturating_add(table.col_header_height());
-        let data_bottom = table.y().saturating_add(table.h());
-        let visible_rows = Self::visible_row_metrics(data_top, data_bottom, row_h)
-            .map(|(rows, _)| rows)
-            .unwrap_or(1);
-        if first_visible.saturating_add(visible_rows).saturating_add(1) >= rows {
-            let mut guard = in_flight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !guard.insert(session_id) {
-                return;
-            }
-            drop(guard);
-            Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::More);
+        if Self::is_table_near_bottom(table) {
+            Self::request_lazy_fetch_more_for_session(session_id, session, callback, in_flight);
         }
     }
 
@@ -6206,18 +6264,26 @@ impl ResultTableWidget {
         if self.is_save_pending() {
             return;
         }
-        if !rows.is_empty() {
-            if let Some(session_id) = *self
+        let lazy_fetch_session_id = if rows.is_empty() {
+            None
+        } else {
+            *self
                 .lazy_fetch_session
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let continue_lazy_fetch_session = if let Some(session_id) = lazy_fetch_session_id {
+            let was_near_bottom = Self::is_table_near_bottom(&self.table);
             {
                 self.lazy_fetch_more_in_flight
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&session_id);
             }
-        }
+            was_near_bottom.then_some(session_id)
+        } else {
+            None
+        };
 
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows.
         // After that threshold the sampling path is skipped entirely to avoid
@@ -6262,6 +6328,15 @@ impl ResultTableWidget {
             .append(&mut rows);
 
         self.flush_pending();
+
+        if let Some(session_id) = continue_lazy_fetch_session {
+            Self::request_lazy_fetch_more_for_session(
+                session_id,
+                &self.lazy_fetch_session,
+                &self.lazy_fetch_callback,
+                &self.lazy_fetch_more_in_flight,
+            );
+        }
     }
 
     /// Flush all pending rows to the UI.
@@ -10882,6 +10957,170 @@ mod tests {
         assert!(!ResultTableWidget::key_should_request_lazy_fetch_more(
             Key::Up
         ));
+    }
+
+    #[test]
+    fn lazy_fetch_more_for_session_sets_in_flight_and_suppresses_duplicate() {
+        let session = Arc::new(Mutex::new(Some(7)));
+        let in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+
+        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
+        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(7, LazyFetchRequest::More)]
+        );
+        assert!(in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&7));
+    }
+
+    #[test]
+    fn lazy_fetch_more_for_session_ignores_stale_session() {
+        let session = Arc::new(Mutex::new(Some(8)));
+        let in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+
+        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
+
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn lazy_fetch_all_for_active_session_requests_fetch_all() {
+        let session = Arc::new(Mutex::new(Some(7)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+
+        assert!(ResultTableWidget::request_lazy_fetch_all_if_active(
+            &session, &callback
+        ));
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(7, LazyFetchRequest::All)]
+        );
+    }
+
+    #[test]
+    fn lazy_fetch_all_without_active_session_returns_false() {
+        let session = Arc::new(Mutex::new(None));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+
+        assert!(!ResultTableWidget::request_lazy_fetch_all_if_active(
+            &session, &callback
+        ));
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn ctrl_end_shortcut_matches_original_or_current_key() {
+        assert!(ResultTableWidget::matches_end_key(
+            Key::End,
+            Key::from_char('x')
+        ));
+        assert!(ResultTableWidget::matches_end_key(
+            Key::from_char('x'),
+            Key::End
+        ));
+        assert!(!ResultTableWidget::matches_end_key(
+            Key::PageDown,
+            Key::PageDown
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn append_rows_continues_lazy_fetch_when_existing_view_is_near_bottom() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(
+            (0..30)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+        widget.table.set_row_position(widget.table.rows() - 2);
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(77);
+        widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(77);
+
+        widget.append_rows(vec![vec!["30".to_string()]]);
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[(77, LazyFetchRequest::More)]
+        );
     }
 
     #[test]

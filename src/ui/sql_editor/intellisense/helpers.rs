@@ -182,8 +182,8 @@ impl SqlEditorWidget {
             )
         });
 
-        let (columns, cache_columns) = match conn_guard.db_type() {
-            crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
+        let (columns, cache_columns) = match conn_guard.db_type().sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => match conn_guard.require_live_connection() {
                 Ok(conn) => match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key)
                 {
                     Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
@@ -191,7 +191,7 @@ impl SqlEditorWidget {
                 },
                 Err(_) => (Vec::new(), false),
             },
-            crate::db::DatabaseType::MySQL => conn_guard
+            crate::db::DbSqlDialect::MySql => conn_guard
                 .get_mysql_connection_mut()
                 .map(|mysql_conn| {
                     let result = if let Some((schema, table)) = schema_and_table.as_ref() {

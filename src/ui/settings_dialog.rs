@@ -335,7 +335,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connection_flex.fixed(&pool_size_row, INPUT_ROW_HEIGHT);
 
     let mut pool_hint = Frame::default().with_label(&format!(
-        "Parallel DB sessions per connection: {} ~ {} (applies on next connect)",
+        "Pool size: {} ~ {} (next connect)",
         MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE
     ));
     pool_hint.set_label_color(theme::text_secondary());

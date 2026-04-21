@@ -26,6 +26,29 @@ pub enum DatabaseType {
     MySQL,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbConnectionFormSpec {
+    pub service_name_form_label: &'static str,
+    pub service_name_value_label: &'static str,
+    pub service_name_required: bool,
+    pub default_host: &'static str,
+    pub default_port: u16,
+    pub default_service_name: &'static str,
+    pub supports_tns_alias: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbExecutionEngine {
+    Oracle,
+    MySql,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbSqlDialect {
+    Oracle,
+    MySql,
+}
+
 impl DatabaseType {
     pub const ALL: [Self; 2] = [Self::Oracle, Self::MySQL];
 
@@ -35,6 +58,42 @@ impl DatabaseType {
 
     pub fn choice_label(self) -> &'static str {
         backend_for(self).choice_label()
+    }
+
+    pub fn connection_form_spec(self) -> DbConnectionFormSpec {
+        backend_for(self).connection_form_spec()
+    }
+
+    pub fn supports_tns_alias(self) -> bool {
+        self.connection_form_spec().supports_tns_alias
+    }
+
+    pub fn execution_engine(self) -> DbExecutionEngine {
+        backend_for(self).execution_engine()
+    }
+
+    pub fn sql_dialect(self) -> DbSqlDialect {
+        backend_for(self).sql_dialect()
+    }
+
+    pub fn uses_mysql_sql_dialect(self) -> bool {
+        self.sql_dialect() == DbSqlDialect::MySql
+    }
+
+    pub fn uses_oracle_sql_dialect(self) -> bool {
+        self.sql_dialect() == DbSqlDialect::Oracle
+    }
+
+    pub fn cache_key(self) -> u8 {
+        backend_for(self).cache_key()
+    }
+
+    pub fn from_cache_key(raw: u8) -> Self {
+        Self::supported()
+            .iter()
+            .copied()
+            .find(|db_type| db_type.cache_key() == raw)
+            .unwrap_or_default()
     }
 }
 
@@ -59,7 +118,7 @@ pub struct ConnectionInfo {
 
 impl ConnectionInfo {
     pub fn uses_oracle_tns_alias(&self) -> bool {
-        self.db_type == DatabaseType::Oracle
+        self.db_type.supports_tns_alias()
             && self.host.trim().is_empty()
             && !self.service_name.trim().is_empty()
     }
@@ -139,15 +198,7 @@ impl ConnectionInfo {
 
 impl Default for ConnectionInfo {
     fn default() -> Self {
-        Self {
-            name: String::new(),
-            username: String::new(),
-            password: String::new(),
-            host: "localhost".to_string(),
-            port: 1521,
-            service_name: "ORCL".to_string(),
-            db_type: DatabaseType::Oracle,
-        }
+        Self::default_for(DatabaseType::Oracle)
     }
 }
 
@@ -170,6 +221,16 @@ pub enum DbPoolSession {
 pub enum DbSessionLease {
     Oracle(Arc<Connection>),
     MySQL(mysql::PooledConn),
+}
+
+pub type SharedDbSessionLease = Arc<Mutex<Option<(u64, DbSessionLease)>>>;
+
+#[derive(Clone)]
+pub struct DbPoolSessionContext {
+    pub connection_generation: u64,
+    pub connection_info: ConnectionInfo,
+    pub pool: DbConnectionPool,
+    pub current_service_name: String,
 }
 
 impl DbConnectionPool {
@@ -216,6 +277,13 @@ impl DbPoolSession {
             DbPoolSession::MySQL(_) => DatabaseType::MySQL,
         }
     }
+
+    pub fn into_lease(self) -> DbSessionLease {
+        match self {
+            DbPoolSession::Oracle(conn) => DbSessionLease::Oracle(Arc::new(conn)),
+            DbPoolSession::MySQL(conn) => DbSessionLease::MySQL(conn),
+        }
+    }
 }
 
 impl DbSessionLease {
@@ -225,6 +293,115 @@ impl DbSessionLease {
             DbSessionLease::MySQL(_) => DatabaseType::MySQL,
         }
     }
+
+    pub fn oracle_connection(&self) -> Option<Arc<Connection>> {
+        match self {
+            DbSessionLease::Oracle(conn) => Some(Arc::clone(conn)),
+            DbSessionLease::MySQL(_) => None,
+        }
+    }
+
+    pub fn into_mysql_connection(self) -> Option<mysql::PooledConn> {
+        match self {
+            DbSessionLease::MySQL(conn) => Some(conn),
+            DbSessionLease::Oracle(_) => None,
+        }
+    }
+}
+
+pub fn create_shared_db_session_lease() -> SharedDbSessionLease {
+    Arc::new(Mutex::new(None))
+}
+
+pub fn clear_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) {
+    *pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+pub fn clear_pooled_session_lease_if_current(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    db_type: DatabaseType,
+) -> bool {
+    let mut lease = pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_clear = lease.as_ref().is_some_and(|(lease_generation, existing)| {
+        *lease_generation == connection_generation && existing.db_type() == db_type
+    });
+    if should_clear {
+        *lease = None;
+    }
+    should_clear
+}
+
+pub fn current_oracle_pooled_session_lease(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+) -> Option<Arc<Connection>> {
+    let mut lease = pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match lease.as_ref() {
+        Some((lease_generation, existing)) if *lease_generation == connection_generation => {
+            if let Some(conn) = existing.oracle_connection() {
+                Some(conn)
+            } else {
+                *lease = None;
+                None
+            }
+        }
+        Some(_) => {
+            *lease = None;
+            None
+        }
+        None => None,
+    }
+}
+
+pub fn take_reusable_pooled_session_lease(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    db_type: DatabaseType,
+) -> Option<DbSessionLease> {
+    let mut lease = pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let reusable = lease.as_ref().is_some_and(|(generation, existing)| {
+        *generation == connection_generation && existing.db_type() == db_type
+    });
+    if reusable {
+        lease.take().map(|(_, lease)| lease)
+    } else {
+        if lease.is_some() {
+            *lease = None;
+        }
+        None
+    }
+}
+
+pub fn store_pooled_session_lease_if_empty(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    lease_to_store: DbSessionLease,
+) -> bool {
+    let lease_db_type = lease_to_store.db_type();
+    let mut lease = pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_store = match lease.as_ref() {
+        None => true,
+        Some((existing_generation, existing)) => {
+            *existing_generation != connection_generation || existing.db_type() != lease_db_type
+        }
+    };
+    if should_store {
+        *lease = Some((connection_generation, lease_to_store));
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) trait DbBackend: Sync {
@@ -232,6 +409,10 @@ pub(crate) trait DbBackend: Sync {
     fn choice_label(&self) -> &'static str {
         self.display_name()
     }
+    fn connection_form_spec(&self) -> DbConnectionFormSpec;
+    fn execution_engine(&self) -> DbExecutionEngine;
+    fn sql_dialect(&self) -> DbSqlDialect;
+    fn cache_key(&self) -> u8;
     fn default_connection_info(&self) -> ConnectionInfo;
     fn connection_string(&self, info: &ConnectionInfo) -> String;
     fn service_name_label(&self) -> &'static str;
@@ -244,7 +425,7 @@ pub(crate) trait DbBackend: Sync {
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
     fn after_connect(&self, _connection: &mut DatabaseConnection) {}
     fn apply_auto_commit(&self, _connection: &mut DbConnection, _enabled: bool) {}
-    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession);
+    fn apply_pool_session_defaults(&self, _session: &mut DbPoolSession) {}
 }
 
 struct OracleBackend;
@@ -265,14 +446,39 @@ impl DbBackend for OracleBackend {
         "Oracle"
     }
 
+    fn connection_form_spec(&self) -> DbConnectionFormSpec {
+        DbConnectionFormSpec {
+            service_name_form_label: "Service:",
+            service_name_value_label: "Service name",
+            service_name_required: true,
+            default_host: "localhost",
+            default_port: 1521,
+            default_service_name: "ORCL",
+            supports_tns_alias: true,
+        }
+    }
+
+    fn execution_engine(&self) -> DbExecutionEngine {
+        DbExecutionEngine::Oracle
+    }
+
+    fn sql_dialect(&self) -> DbSqlDialect {
+        DbSqlDialect::Oracle
+    }
+
+    fn cache_key(&self) -> u8 {
+        0
+    }
+
     fn default_connection_info(&self) -> ConnectionInfo {
+        let form = self.connection_form_spec();
         ConnectionInfo {
             name: String::new(),
             username: String::new(),
             password: String::new(),
-            host: "localhost".to_string(),
-            port: 1521,
-            service_name: "ORCL".to_string(),
+            host: form.default_host.to_string(),
+            port: form.default_port,
+            service_name: form.default_service_name.to_string(),
             db_type: DatabaseType::Oracle,
         }
     }
@@ -337,14 +543,39 @@ impl DbBackend for MysqlBackend {
         "MySQL or MariaDB"
     }
 
+    fn connection_form_spec(&self) -> DbConnectionFormSpec {
+        DbConnectionFormSpec {
+            service_name_form_label: "Database:",
+            service_name_value_label: "Database name",
+            service_name_required: false,
+            default_host: "localhost",
+            default_port: 3306,
+            default_service_name: "",
+            supports_tns_alias: false,
+        }
+    }
+
+    fn execution_engine(&self) -> DbExecutionEngine {
+        DbExecutionEngine::MySql
+    }
+
+    fn sql_dialect(&self) -> DbSqlDialect {
+        DbSqlDialect::MySql
+    }
+
+    fn cache_key(&self) -> u8 {
+        1
+    }
+
     fn default_connection_info(&self) -> ConnectionInfo {
+        let form = self.connection_form_spec();
         ConnectionInfo {
             name: String::new(),
             username: String::new(),
             password: String::new(),
-            host: "localhost".to_string(),
-            port: 3306,
-            service_name: String::new(),
+            host: form.default_host.to_string(),
+            port: form.default_port,
+            service_name: form.default_service_name.to_string(),
             db_type: DatabaseType::MySQL,
         }
     }
@@ -704,17 +935,43 @@ impl DatabaseConnection {
         &self.info
     }
 
-    pub fn mysql_runtime_connection_info(&self) -> Option<ConnectionInfo> {
-        if self.info.db_type != DatabaseType::MySQL
-            || !self.connected
-            || !matches!(self.connection, Some(DbConnection::MySQL(_)))
-        {
+    pub fn runtime_connection_info_for(&self, db_type: DatabaseType) -> Option<ConnectionInfo> {
+        if self.info.db_type != db_type || !self.connected || self.connection.is_none() {
             return None;
         }
 
         let mut info = self.info.clone();
         info.password = self.session_password.clone();
         Some(info)
+    }
+
+    pub fn mysql_runtime_connection_info(&self) -> Option<ConnectionInfo> {
+        if !matches!(self.connection, Some(DbConnection::MySQL(_))) {
+            return None;
+        }
+        self.runtime_connection_info_for(DatabaseType::MySQL)
+    }
+
+    pub fn pool_session_context_for(
+        &self,
+        db_type: DatabaseType,
+    ) -> Result<DbPoolSessionContext, String> {
+        if !self.can_reuse_pool_session(self.connection_generation, db_type) {
+            return Err(NOT_CONNECTED_MESSAGE.to_string());
+        }
+
+        let pool = self
+            .get_pool()
+            .ok_or_else(|| format!("{} connection pool is not available", db_type))?;
+        let mut connection_info = self.info.clone();
+        connection_info.password = self.session_password.clone();
+
+        Ok(DbPoolSessionContext {
+            connection_generation: self.connection_generation,
+            connection_info,
+            pool,
+            current_service_name: self.info.service_name.clone(),
+        })
     }
 
     pub fn get_pool(&self) -> Option<DbConnectionPool> {
@@ -738,6 +995,17 @@ impl DatabaseConnection {
 
     pub fn connection_generation(&self) -> u64 {
         self.connection_generation
+    }
+
+    pub fn can_reuse_pool_session(
+        &self,
+        connection_generation: u64,
+        db_type: DatabaseType,
+    ) -> bool {
+        self.info.db_type == db_type
+            && self.connected
+            && self.connection.is_some()
+            && self.connection_generation == connection_generation
     }
 
     pub fn set_auto_commit(&mut self, enabled: bool) {
@@ -1230,6 +1498,42 @@ mod tests {
         );
 
         assert_eq!(info.connection_string(), "LOCAL_FREE");
+    }
+
+    #[test]
+    fn database_form_specs_keep_connection_defaults_in_backend_metadata() {
+        let oracle = DatabaseType::Oracle.connection_form_spec();
+        assert_eq!(oracle.default_port, 1521);
+        assert!(oracle.service_name_required);
+        assert!(oracle.supports_tns_alias);
+
+        let mysql = DatabaseType::MySQL.connection_form_spec();
+        assert_eq!(mysql.default_port, 3306);
+        assert!(!mysql.service_name_required);
+        assert!(!mysql.supports_tns_alias);
+    }
+
+    #[test]
+    fn database_backend_metadata_covers_execution_dialect_and_cache_keys() {
+        assert_eq!(
+            DatabaseType::Oracle.execution_engine(),
+            DbExecutionEngine::Oracle
+        );
+        assert_eq!(DatabaseType::Oracle.sql_dialect(), DbSqlDialect::Oracle);
+        assert_eq!(
+            DatabaseType::from_cache_key(DatabaseType::Oracle.cache_key()),
+            DatabaseType::Oracle
+        );
+
+        assert_eq!(
+            DatabaseType::MySQL.execution_engine(),
+            DbExecutionEngine::MySql
+        );
+        assert_eq!(DatabaseType::MySQL.sql_dialect(), DbSqlDialect::MySql);
+        assert_eq!(
+            DatabaseType::from_cache_key(DatabaseType::MySQL.cache_key()),
+            DatabaseType::MySQL
+        );
     }
 
     #[test]

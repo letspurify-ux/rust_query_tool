@@ -25,23 +25,12 @@ fn store_popup_transition_state(state: &Arc<AtomicU8>, value: IntellisensePopupT
     state.store(value as u8, Ordering::Relaxed);
 }
 
-// Encodes DatabaseType into an AtomicU8 so the UI thread can read the
-// preferred db type without taking the blocking connection mutex.
-const CACHED_DB_TYPE_ORACLE: u8 = 0;
-const CACHED_DB_TYPE_MYSQL: u8 = 1;
-
 fn db_type_to_u8(db_type: crate::db::connection::DatabaseType) -> u8 {
-    match db_type {
-        crate::db::connection::DatabaseType::Oracle => CACHED_DB_TYPE_ORACLE,
-        crate::db::connection::DatabaseType::MySQL => CACHED_DB_TYPE_MYSQL,
-    }
+    db_type.cache_key()
 }
 
 fn db_type_from_u8(raw: u8) -> crate::db::connection::DatabaseType {
-    match raw {
-        CACHED_DB_TYPE_MYSQL => crate::db::connection::DatabaseType::MySQL,
-        _ => crate::db::connection::DatabaseType::Oracle,
-    }
+    crate::db::connection::DatabaseType::from_cache_key(raw)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +84,9 @@ impl IntellisenseRuntimeState {
             )),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None::<app::TimeoutHandle>)),
-            cached_db_type: Arc::new(AtomicU8::new(CACHED_DB_TYPE_ORACLE)),
+            cached_db_type: Arc::new(AtomicU8::new(
+                crate::db::connection::DatabaseType::Oracle.cache_key(),
+            )),
         }
     }
 

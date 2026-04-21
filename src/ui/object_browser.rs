@@ -995,11 +995,11 @@ impl ObjectBrowserWidget {
     }
 
     fn preview_select_sql(db_type: crate::db::DatabaseType, object_name: &str) -> String {
-        match db_type {
-            crate::db::DatabaseType::Oracle => {
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => {
                 format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name)
             }
-            crate::db::DatabaseType::MySQL => format!(
+            crate::db::DbSqlDialect::MySql => format!(
                 "SELECT * FROM {} LIMIT 100",
                 Self::quote_mysql_identifier_path(object_name)
             ),
@@ -1029,9 +1029,9 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
     ) -> String {
-        match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_procedure_script(qualified_name),
-            crate::db::DatabaseType::MySQL => {
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => Self::build_simple_procedure_script(qualified_name),
+            crate::db::DbSqlDialect::MySql => {
                 format!(
                     "CALL {}();\n",
                     Self::quote_mysql_identifier_path(qualified_name)
@@ -1044,9 +1044,9 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         qualified_name: &str,
     ) -> String {
-        match db_type {
-            crate::db::DatabaseType::Oracle => Self::build_simple_function_script(qualified_name),
-            crate::db::DatabaseType::MySQL => format!(
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => Self::build_simple_function_script(qualified_name),
+            crate::db::DbSqlDialect::MySql => format!(
                 "SELECT {} AS result;\n",
                 if qualified_name.contains('(') {
                     qualified_name.to_string()
@@ -1215,11 +1215,11 @@ impl ObjectBrowserWidget {
         routine_type: &str,
         arguments: &[ProcedureArgument],
     ) -> String {
-        match db_type {
-            crate::db::DatabaseType::Oracle => {
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => {
                 Self::build_procedure_script(qualified_name, arguments)
             }
-            crate::db::DatabaseType::MySQL => {
+            crate::db::DbSqlDialect::MySql => {
                 Self::build_mysql_routine_script(qualified_name, routine_type, arguments)
             }
         }
@@ -1598,7 +1598,7 @@ impl ObjectBrowserWidget {
                 ObjectItem::Simple { object_type, .. }
                     if object_type == "PROCEDURES" || object_type == "FUNCTIONS" =>
                 {
-                    if db_type == crate::db::DatabaseType::MySQL {
+                    if db_type.uses_mysql_sql_dialect() {
                         if object_type == "PROCEDURES" {
                             "Execute Procedure|Generate DDL"
                         } else {
@@ -1614,7 +1614,7 @@ impl ObjectBrowserWidget {
                     "View Info|Generate DDL"
                 }
                 ObjectItem::Simple { object_type, .. } if object_type == "TRIGGERS" => {
-                    if db_type == crate::db::DatabaseType::MySQL {
+                    if db_type.uses_mysql_sql_dialect() {
                         "Generate DDL"
                     } else {
                     "Check Compilation|Generate DDL"
@@ -1724,8 +1724,8 @@ impl ObjectBrowserWidget {
                                 };
 
                                 let db_type = conn_guard.db_type();
-                                let result = match db_type {
-                                    crate::db::DatabaseType::Oracle => {
+                                let result = match db_type.sql_dialect() {
+                                    crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
                                                 db_conn.as_ref(),
@@ -1743,7 +1743,7 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
-                                    crate::db::DatabaseType::MySQL => conn_guard
+                                    crate::db::DbSqlDialect::MySql => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
@@ -1873,7 +1873,7 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                if conn_guard.db_type() == crate::db::DatabaseType::MySQL {
+                                if conn_guard.db_type().uses_mysql_sql_dialect() {
                                     let _ = sender.send(ObjectActionResult::CompilationErrors {
                                         object_name,
                                         object_type,
@@ -1967,8 +1967,8 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.db_type() {
-                                    crate::db::DatabaseType::Oracle => {
+                                let result = match conn_guard.db_type().sql_dialect() {
+                                    crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_structure(
                                                 db_conn.as_ref(),
@@ -1978,7 +1978,7 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
-                                    crate::db::DatabaseType::MySQL => conn_guard
+                                    crate::db::DbSqlDialect::MySql => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
@@ -2017,8 +2017,8 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.db_type() {
-                                    crate::db::DatabaseType::Oracle => {
+                                let result = match conn_guard.db_type().sql_dialect() {
+                                    crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_indexes(
                                                 db_conn.as_ref(),
@@ -2028,7 +2028,7 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
-                                    crate::db::DatabaseType::MySQL => conn_guard
+                                    crate::db::DbSqlDialect::MySql => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
@@ -2065,8 +2065,8 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = match conn_guard.db_type() {
-                                    crate::db::DatabaseType::Oracle => {
+                                let result = match conn_guard.db_type().sql_dialect() {
+                                    crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_constraints(
                                                 db_conn.as_ref(),
@@ -2076,7 +2076,7 @@ impl ObjectBrowserWidget {
                                             Err(message) => Err(message),
                                         }
                                     }
-                                    crate::db::DatabaseType::MySQL => conn_guard
+                                    crate::db::DbSqlDialect::MySql => conn_guard
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
@@ -2219,8 +2219,8 @@ impl ObjectBrowserWidget {
                                         return;
                                     };
 
-                                    let result = match conn_guard.db_type() {
-                                        crate::db::DatabaseType::Oracle => {
+                                    let result = match conn_guard.db_type().sql_dialect() {
+                                        crate::db::DbSqlDialect::Oracle => {
                                             match conn_guard.require_live_connection() {
                                                 Ok(db_conn) => match object_type.as_str() {
                                                     "TABLE" => ObjectBrowser::get_table_ddl(
@@ -2262,7 +2262,7 @@ impl ObjectBrowserWidget {
                                                 Err(message) => Err(message),
                                             }
                                         }
-                                        crate::db::DatabaseType::MySQL => match object_type.as_str()
+                                        crate::db::DbSqlDialect::MySql => match object_type.as_str()
                                         {
                                             "SEQUENCE" | "SYNONYM" | "PACKAGE" => Err(format!(
                                                 "{} DDL is not supported for MySQL/MariaDB connections",
@@ -2664,7 +2664,6 @@ impl ObjectBrowserWidget {
     fn load_metadata_cache(
         connection: &SharedConnection,
     ) -> Option<(crate::db::DatabaseType, ObjectCache)> {
-        use crate::db::connection::DatabaseType;
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
         // Acquire connection lock and hold it during all queries.
@@ -2673,8 +2672,8 @@ impl ObjectBrowserWidget {
 
         let db_type = conn_guard.db_type();
 
-        match db_type {
-            DatabaseType::Oracle => {
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => {
                 let Ok(db_conn) = conn_guard.require_live_connection() else {
                     return None;
                 };
@@ -2708,7 +2707,7 @@ impl ObjectBrowserWidget {
 
                 Some((db_type, cache))
             }
-            DatabaseType::MySQL => {
+            crate::db::DbSqlDialect::MySql => {
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
 
                 let mut cache = ObjectCache::default();
@@ -2787,8 +2786,8 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         cache: &ObjectCache,
     ) -> Vec<&'static str> {
-        match db_type {
-            crate::db::DatabaseType::Oracle => vec![
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => vec![
                 "Tables",
                 "Views",
                 "Procedures",
@@ -2798,7 +2797,7 @@ impl ObjectBrowserWidget {
                 "Synonyms",
                 "Packages",
             ],
-            crate::db::DatabaseType::MySQL => {
+            crate::db::DbSqlDialect::MySql => {
                 let mut categories = vec![
                     "Tables",
                     "Views",

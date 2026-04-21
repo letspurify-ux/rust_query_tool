@@ -825,7 +825,7 @@ impl IntellisenseData {
         // sorted array and hit MAX_SUGGESTIONS before useful entries appear,
         // so skip them – the caller already has context-specific entries
         // (tables, views, columns) for empty-prefix completions.
-        let is_mysql = matches!(db_type, Some(crate::db::DatabaseType::MySQL));
+        let is_mysql = db_type.is_some_and(crate::db::DatabaseType::uses_mysql_sql_dialect);
         if !prefix_upper.is_empty() {
             // SQL keywords – choose list based on connected database type
             let keywords: &[&str] = if is_mysql {

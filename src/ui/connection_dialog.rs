@@ -41,19 +41,20 @@ fn oracle_form_values_for_mode(
     oracle_mode: OracleConnectMode,
     memory: &mut OracleModeFieldMemory,
 ) -> (&'static str, String, String, String) {
+    let form = DatabaseType::Oracle.connection_form_spec();
     match oracle_mode {
         OracleConnectMode::Direct => {
             if memory.direct_host.trim().is_empty() {
-                memory.direct_host = "localhost".to_string();
+                memory.direct_host = form.default_host.to_string();
             }
             if memory.direct_port.trim().is_empty() {
-                memory.direct_port = "1521".to_string();
+                memory.direct_port = form.default_port.to_string();
             }
             if memory.direct_service.trim().is_empty() {
-                memory.direct_service = "ORCL".to_string();
+                memory.direct_service = form.default_service_name.to_string();
             }
             (
-                "Service:",
+                form.service_name_form_label,
                 memory.direct_host.clone(),
                 memory.direct_port.clone(),
                 memory.direct_service.clone(),
@@ -162,6 +163,29 @@ fn set_form_row_visible(form_col: &mut Flex, row: &mut Flex, visible: bool) {
     form_col.redraw();
 }
 
+fn replace_default_form_values_for_db_switch(
+    previous_db_type: DatabaseType,
+    next_db_type: DatabaseType,
+    host_input: &mut Input,
+    port_input: &mut Input,
+    service_input: &mut Input,
+) {
+    let previous = previous_db_type.connection_form_spec();
+    let next = next_db_type.connection_form_spec();
+
+    if host_input.value().trim().is_empty() || host_input.value() == previous.default_host {
+        host_input.set_value(next.default_host);
+    }
+    if port_input.value().trim().is_empty()
+        || port_input.value() == previous.default_port.to_string()
+    {
+        port_input.set_value(&next.default_port.to_string());
+    }
+    if service_input.value() == previous.default_service_name {
+        service_input.set_value(next.default_service_name);
+    }
+}
+
 fn apply_connection_form_mode(
     form_col: &mut Flex,
     db_type: DatabaseType,
@@ -176,51 +200,49 @@ fn apply_connection_form_mode(
     service_input: &mut Input,
     memory: &Arc<Mutex<OracleModeFieldMemory>>,
 ) {
-    match db_type {
-        DatabaseType::Oracle => {
-            set_form_row_visible(form_col, oracle_mode_row, true);
-            mode_choice.activate();
-            let mut memory = memory
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (svc_label_text, host_value, port_value, service_value) =
-                oracle_form_values_for_mode(oracle_mode, &mut memory);
-            svc_label.set_label(svc_label_text);
-            host_input.set_value(&host_value);
-            port_input.set_value(&port_value);
-            service_input.set_value(&service_value);
-            match oracle_mode {
-                OracleConnectMode::Direct => {
-                    set_form_row_visible(form_col, host_row, true);
-                    set_form_row_visible(form_col, port_row, true);
-                    host_input.activate();
-                    port_input.activate();
-                }
-                OracleConnectMode::TnsAlias => {
-                    set_form_row_visible(form_col, host_row, false);
-                    set_form_row_visible(form_col, port_row, false);
-                    host_input.deactivate();
-                    port_input.deactivate();
-                }
+    if db_type.supports_tns_alias() {
+        set_form_row_visible(form_col, oracle_mode_row, true);
+        mode_choice.activate();
+        let mut memory = memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (svc_label_text, host_value, port_value, service_value) =
+            oracle_form_values_for_mode(oracle_mode, &mut memory);
+        svc_label.set_label(svc_label_text);
+        host_input.set_value(&host_value);
+        port_input.set_value(&port_value);
+        service_input.set_value(&service_value);
+        match oracle_mode {
+            OracleConnectMode::Direct => {
+                set_form_row_visible(form_col, host_row, true);
+                set_form_row_visible(form_col, port_row, true);
+                host_input.activate();
+                port_input.activate();
+            }
+            OracleConnectMode::TnsAlias => {
+                set_form_row_visible(form_col, host_row, false);
+                set_form_row_visible(form_col, port_row, false);
+                host_input.deactivate();
+                port_input.deactivate();
             }
         }
-        DatabaseType::MySQL => {
-            set_form_row_visible(form_col, oracle_mode_row, false);
-            mode_choice.set_value(choice_index_from_oracle_connect_mode(
-                OracleConnectMode::Direct,
-            ));
-            mode_choice.deactivate();
-            set_form_row_visible(form_col, host_row, true);
-            set_form_row_visible(form_col, port_row, true);
-            svc_label.set_label("Database:");
-            host_input.activate();
-            port_input.activate();
-            if host_input.value().trim().is_empty() {
-                host_input.set_value("localhost");
-            }
-            if port_input.value().trim().is_empty() {
-                port_input.set_value("3306");
-            }
+    } else {
+        let form = db_type.connection_form_spec();
+        set_form_row_visible(form_col, oracle_mode_row, false);
+        mode_choice.set_value(choice_index_from_oracle_connect_mode(
+            OracleConnectMode::Direct,
+        ));
+        mode_choice.deactivate();
+        set_form_row_visible(form_col, host_row, true);
+        set_form_row_visible(form_col, port_row, true);
+        svc_label.set_label(form.service_name_form_label);
+        host_input.activate();
+        port_input.activate();
+        if host_input.value().trim().is_empty() {
+            host_input.set_value(form.default_host);
+        }
+        if port_input.value().trim().is_empty() {
+            port_input.set_value(&form.default_port.to_string());
         }
     }
 }
@@ -275,15 +297,15 @@ fn build_connection_info(
     if password.is_empty() {
         return Err("Password is required".to_string());
     }
-    let svc_label = match db_type {
-        DatabaseType::Oracle => match oracle_mode {
-            OracleConnectMode::Direct => "Service name",
-            OracleConnectMode::TnsAlias => "TNS alias",
-        },
-        DatabaseType::MySQL => "Database name",
+    let using_tns_alias =
+        db_type.supports_tns_alias() && oracle_mode == OracleConnectMode::TnsAlias;
+    let form = db_type.connection_form_spec();
+    let svc_label = if using_tns_alias {
+        "TNS alias"
+    } else {
+        form.service_name_value_label
     };
-    let requires_service_name = matches!(db_type, DatabaseType::Oracle)
-        || matches!(db_type, DatabaseType::MySQL) && !service_name.is_empty();
+    let requires_service_name = using_tns_alias || form.service_name_required;
     if requires_service_name && service_name.is_empty() {
         return Err(format!("{} is required", svc_label));
     }
@@ -291,39 +313,26 @@ fn build_connection_info(
         return Err(format!("{} contains invalid characters", svc_label));
     }
 
-    let (host, port) = match db_type {
-        DatabaseType::Oracle if oracle_mode == OracleConnectMode::TnsAlias => (String::new(), 0),
-        _ => {
-            if host.is_empty() {
-                return Err("Host is required".to_string());
-            }
-            if !is_valid_host(host) {
-                return Err("Host contains invalid characters".to_string());
-            }
-
-            let port = port_text
-                .parse::<u16>()
-                .map_err(|_| "Port must be a valid number between 0 and 65535".to_string())?;
-
-            if port == 0 {
-                return Err("Port must be between 1 and 65535".to_string());
-            }
-
-            (host.to_string(), port)
+    let (host, port) = if using_tns_alias {
+        (String::new(), 0)
+    } else {
+        if host.is_empty() {
+            return Err("Host is required".to_string());
         }
-    };
+        if !is_valid_host(host) {
+            return Err("Host contains invalid characters".to_string());
+        }
 
-    if db_type == DatabaseType::MySQL && service_name.is_empty() {
-        return Ok(ConnectionInfo::new_with_type(
-            name,
-            username,
-            password,
-            &host,
-            port,
-            service_name,
-            db_type,
-        ));
-    }
+        let port = port_text
+            .parse::<u16>()
+            .map_err(|_| "Port must be a valid number between 0 and 65535".to_string())?;
+
+        if port == 0 {
+            return Err("Port must be between 1 and 65535".to_string());
+        }
+
+        (host.to_string(), port)
+    };
 
     Ok(ConnectionInfo::new_with_type(
         name,
@@ -503,6 +512,8 @@ impl ConnectionDialog {
         pass_flex.end();
         right_col.fixed(&pass_flex, INPUT_ROW_HEIGHT);
 
+        let initial_form = DatabaseType::Oracle.connection_form_spec();
+
         // Host
         let mut host_flex = Flex::default();
         host_flex.set_type(fltk::group::FlexType::Row);
@@ -510,7 +521,7 @@ impl ConnectionDialog {
         host_label.set_label_color(theme::text_primary());
         host_flex.fixed(&host_label, FORM_LABEL_WIDTH);
         let mut host_input = Input::default();
-        host_input.set_value("localhost");
+        host_input.set_value(initial_form.default_host);
         host_input.set_color(theme::input_bg());
         host_input.set_text_color(theme::text_primary());
         host_flex.end();
@@ -523,7 +534,7 @@ impl ConnectionDialog {
         port_label.set_label_color(theme::text_primary());
         port_flex.fixed(&port_label, FORM_LABEL_WIDTH);
         let mut port_input = Input::default();
-        port_input.set_value("1521");
+        port_input.set_value(&initial_form.default_port.to_string());
         port_input.set_color(theme::input_bg());
         port_input.set_text_color(theme::text_primary());
         port_flex.end();
@@ -536,7 +547,7 @@ impl ConnectionDialog {
         svc_label.set_label_color(theme::text_primary());
         service_flex.fixed(&svc_label, FORM_LABEL_WIDTH);
         let mut service_input = Input::default();
-        service_input.set_value("ORCL");
+        service_input.set_value(initial_form.default_service_name);
         service_input.set_color(theme::input_bg());
         service_input.set_text_color(theme::text_primary());
         service_flex.end();
@@ -629,7 +640,7 @@ impl ConnectionDialog {
                 let previous_oracle_mode = *current_oracle_mode_dt
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if previous_db_type == DatabaseType::Oracle {
+                if previous_db_type.supports_tns_alias() {
                     sync_oracle_mode_memory_from_form(
                         &oracle_mode_memory_dt,
                         previous_oracle_mode,
@@ -638,17 +649,17 @@ impl ConnectionDialog {
                         &service_input_dt,
                     );
                 }
-                if db_type == DatabaseType::Oracle {
+                if db_type.supports_tns_alias() {
                     oracle_mode_choice_dt
                         .set_value(choice_index_from_oracle_connect_mode(previous_oracle_mode));
                 } else {
-                    // MySQL-compatible (MariaDB uses the same connection path)
-                    if port_input_dt.value() == "1521" {
-                        port_input_dt.set_value("3306");
-                    }
-                    if service_input_dt.value() == "ORCL" {
-                        service_input_dt.set_value("");
-                    }
+                    replace_default_form_values_for_db_switch(
+                        previous_db_type,
+                        db_type,
+                        &mut host_input_dt,
+                        &mut port_input_dt,
+                        &mut service_input_dt,
+                    );
                 }
                 apply_connection_form_mode(
                     &mut right_col_dt,
@@ -809,7 +820,7 @@ impl ConnectionDialog {
                     oracle_mode_choice_cb
                         .set_value(choice_index_from_oracle_connect_mode(oracle_mode));
                     dbtype_choice_cb.set_value(choice_index_from_db_type(conn.db_type));
-                    if conn.db_type == DatabaseType::MySQL {
+                    if !conn.db_type.supports_tns_alias() {
                         service_input_cb.set_value(&conn.service_name);
                         host_input_cb.set_value(&conn.host);
                         port_input_cb.set_value(&conn.port.to_string());
@@ -1346,10 +1357,17 @@ mod tests {
     }
 
     #[test]
-    fn db_type_choice_indexes_treat_any_non_oracle_item_as_mysql() {
-        assert_eq!(super::db_type_from_choice_index(0), DatabaseType::Oracle);
-        assert_eq!(super::db_type_from_choice_index(1), DatabaseType::MySQL);
-        assert_eq!(super::db_type_from_choice_index(2), DatabaseType::MySQL);
+    fn db_type_choice_indexes_follow_supported_database_order() {
+        let supported = DatabaseType::supported();
+
+        assert_eq!(super::db_type_from_choice_index(-1), supported[0]);
+        for (idx, db_type) in supported.iter().enumerate() {
+            assert_eq!(super::db_type_from_choice_index(idx as i32), *db_type);
+        }
+        assert_eq!(
+            super::db_type_from_choice_index(supported.len() as i32),
+            *supported.last().expect("at least one database type")
+        );
     }
 
     #[test]
