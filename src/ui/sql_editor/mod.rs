@@ -872,6 +872,38 @@ impl SqlEditorWidget {
         }
     }
 
+    fn has_active_lazy_fetch(active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>) -> bool {
+        active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn current_oracle_pooled_lease(
+        pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
+        connection_generation: u64,
+    ) -> Option<Arc<Connection>> {
+        let mut lease = pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match lease.as_ref() {
+            Some((lease_generation, DbSessionLease::Oracle(conn)))
+                if *lease_generation == connection_generation =>
+            {
+                Some(Arc::clone(conn))
+            }
+            Some((lease_generation, _)) if *lease_generation != connection_generation => {
+                *lease = None;
+                None
+            }
+            Some((_, existing)) if existing.db_type() != crate::db::DatabaseType::Oracle => {
+                *lease = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn setup_progress_handler(
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
@@ -1453,6 +1485,8 @@ impl SqlEditorWidget {
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let pooled_db_session = self.pooled_db_session.clone();
+        let active_lazy_fetch = self.active_lazy_fetch.clone();
 
         set_cursor(Cursor::Wait);
         app::flush();
@@ -1468,9 +1502,22 @@ impl SqlEditorWidget {
                     return;
                 };
 
+                if SqlEditorWidget::has_active_lazy_fetch(&active_lazy_fetch) {
+                    let _ = sender.send(make_ui_result(Err(
+                        "A lazy fetch is still open. Fetch all rows or cancel it before transaction control."
+                            .to_string(),
+                    )));
+                    app::awake();
+                    return;
+                }
+
                 let result = match conn_guard.db_type() {
-                    crate::db::DatabaseType::Oracle => match conn_guard.require_live_connection() {
-                        Ok(db_conn) => {
+                    crate::db::DatabaseType::Oracle => {
+                        let pooled_conn = SqlEditorWidget::current_oracle_pooled_lease(
+                            &pooled_db_session,
+                            conn_guard.connection_generation(),
+                        );
+                        if let Some(db_conn) = pooled_conn {
                             SqlEditorWidget::set_current_query_connection(
                                 &current_query_connection,
                                 Some(Arc::clone(&db_conn)),
@@ -1479,16 +1526,34 @@ impl SqlEditorWidget {
                                 let _ = db_conn.break_execution();
                             }
                             oracle_action(db_conn)
+                        } else {
+                            match conn_guard.require_live_connection() {
+                                Ok(db_conn) => {
+                                    SqlEditorWidget::set_current_query_connection(
+                                        &current_query_connection,
+                                        Some(Arc::clone(&db_conn)),
+                                    );
+                                    if load_mutex_bool(&cancel_flag) {
+                                        let _ = db_conn.break_execution();
+                                    }
+                                    oracle_action(db_conn)
+                                }
+                                Err(message) => Err(message),
+                            }
                         }
-                        Err(message) => Err(message),
-                    },
+                    }
                     crate::db::DatabaseType::MySQL => {
-                        SqlEditorWidget::run_mysql_action_with_timeout(
-                            &mut conn_guard,
+                        let auto_commit = conn_guard.auto_commit();
+                        drop(conn_guard);
+                        SqlEditorWidget::run_mysql_pooled_action_with_timeout(
+                            &connection,
+                            &pooled_db_session,
                             &current_mysql_cancel_context,
                             &cancel_flag,
                             query_timeout,
                             activity_label,
+                            auto_commit,
+                            false,
                             |mysql_conn| mysql_conn.query_drop(mysql_sql),
                         )
                     }

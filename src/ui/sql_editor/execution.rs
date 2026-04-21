@@ -8565,7 +8565,7 @@ impl SqlEditorWidget {
         result
     }
 
-    fn run_mysql_pooled_action_with_timeout<T, F>(
+    pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &Arc<Mutex<Option<(u64, DbSessionLease)>>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
