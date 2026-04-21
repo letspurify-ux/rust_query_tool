@@ -18,7 +18,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -700,6 +700,7 @@ impl SqlEditorWidget {
             || lower.contains("ocisessionget() timed out")
             || lower.contains("ocisessionget timed out")
             || lower.contains("session pool appears exhausted")
+            || lower.contains("connection pool appears exhausted")
             || lower.contains("waiting for a free connection")
     }
 
@@ -785,6 +786,7 @@ impl SqlEditorWidget {
             session_id,
             sender,
             cancel_handle,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
         });
     }
 
@@ -812,6 +814,32 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .is_some_and(|handle| handle.session_id == session_id)
+    }
+
+    fn lazy_fetch_cancel_requested(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+    ) -> bool {
+        active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| {
+                handle.session_id == session_id && handle.cancel_requested.load(Ordering::Relaxed)
+            })
+    }
+
+    fn lazy_fetch_can_keep_session(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+    ) -> bool {
+        active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|handle| {
+                handle.session_id == session_id && !handle.cancel_requested.load(Ordering::Relaxed)
+            })
     }
 
     fn fetch_lazy_oracle_rows(
@@ -1248,14 +1276,15 @@ impl SqlEditorWidget {
                 }
             })();
             if let Err(err) = result {
-                let cancelled_by_owner =
-                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
+                let suppress_error_result =
+                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id)
+                        || Self::lazy_fetch_cancel_requested(&active_lazy_fetch, session_id);
                 let _ = sender.send(QueryProgress::LazyFetchClosed {
                     index,
                     session_id,
                     cancelled: true,
                 });
-                if !cancelled_by_owner {
+                if !suppress_error_result {
                     let mut error_result =
                         QueryResult::new_error(&sql_to_execute, &err.to_string());
                     error_result.is_select = true;
@@ -1270,7 +1299,7 @@ impl SqlEditorWidget {
             }
             let _ = conn.set_call_timeout(previous_timeout);
             let should_keep_session =
-                keep_session && Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
+                keep_session && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
             if !should_keep_session {
                 crate::db::clear_pooled_session_lease_if_current(
                     &pooled_db_session,
@@ -1600,14 +1629,15 @@ impl SqlEditorWidget {
                 }
             })();
             if let Err(err) = result {
-                let cancelled_by_owner =
-                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
+                let suppress_error_result =
+                    !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id)
+                        || Self::lazy_fetch_cancel_requested(&active_lazy_fetch, session_id);
                 let _ = sender.send(QueryProgress::LazyFetchClosed {
                     index,
                     session_id,
                     cancelled: true,
                 });
-                if !cancelled_by_owner {
+                if !suppress_error_result {
                     let mut error_result = QueryResult::new_error(&sql_to_execute, &err);
                     error_result.is_select = true;
                     let _ = sender.send(QueryProgress::StatementFinished {
@@ -1623,7 +1653,7 @@ impl SqlEditorWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             let should_release_session =
-                keep_session && Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id);
+                keep_session && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
             if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
                 &mut conn, None,
             ) {
@@ -1773,6 +1803,7 @@ impl SqlEditorWidget {
                 SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                     shared_connection,
                     pooled_db_session,
+                    Some(sender),
                     current_mysql_cancel_context,
                     cancel_flag,
                     query_timeout,
@@ -2700,6 +2731,7 @@ impl SqlEditorWidget {
                                 pooled_db_session,
                                 db_activity,
                                 auto_commit,
+                                Some(sender),
                             )
                         {
                             let (heading_enabled, feedback_enabled) =
@@ -8574,6 +8606,7 @@ impl SqlEditorWidget {
         pooled_db_session: &SharedDbSessionLease,
         db_activity: &str,
         auto_commit: bool,
+        session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
     ) -> Result<(u64, ConnectionInfo, mysql::PooledConn), String> {
         let context = {
             let conn_guard =
@@ -8590,7 +8623,20 @@ impl SqlEditorWidget {
         {
             conn
         } else {
-            match context.pool.acquire_session()? {
+            let pool_session = match context.pool.acquire_session() {
+                Ok(session) => session,
+                Err(message)
+                    if Self::session_pool_error_is_exhausted(&message)
+                        && session_pool_sender.is_some_and(
+                            Self::request_cancel_oldest_lazy_fetch_for_session_pool,
+                        ) =>
+                {
+                    thread::sleep(Duration::from_millis(250));
+                    context.pool.acquire_session()?
+                }
+                Err(message) => return Err(message),
+            };
+            match pool_session {
                 DbPoolSession::MySQL(mut conn) => {
                     if !context.current_service_name.trim().is_empty() {
                         let escaped = context.current_service_name.replace('`', "``");
@@ -8725,6 +8771,7 @@ impl SqlEditorWidget {
     pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
+        session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
         query_timeout: Option<Duration>,
@@ -8742,6 +8789,7 @@ impl SqlEditorWidget {
                 pooled_db_session,
                 log_context,
                 auto_commit,
+                session_pool_sender,
             )?;
         crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
             &mut conn,
@@ -8863,6 +8911,7 @@ mod query_execution_cleanup_tests {
     use mysql::{Error as MysqlError, MySqlError};
     use oracle::Connection;
     use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -9084,6 +9133,13 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn session_pool_exhaustion_detects_mysql_pool_timeout_message() {
+        assert!(SqlEditorWidget::session_pool_error_is_exhausted(
+            "Operation timed out. MySQL connection pool appears exhausted."
+        ));
+    }
+
+    #[test]
     fn lazy_fetch_single_statement_policy_allows_script_mode_single_statement() {
         let items = vec![ScriptItem::Statement("select * from dual".to_string())];
 
@@ -9192,6 +9248,7 @@ mod query_execution_cleanup_tests {
             session_id: 42,
             sender,
             cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
         })));
 
         assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
@@ -9201,6 +9258,48 @@ mod query_execution_cleanup_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         assert!(!SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
+    }
+
+    #[test]
+    fn cancelling_lazy_fetch_keeps_active_handle_until_worker_closes() {
+        let (sender, receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+        })));
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session
+        ));
+
+        assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
+        assert!(SqlEditorWidget::lazy_fetch_cancel_requested(&active, 42));
+        assert!(matches!(receiver.try_recv(), Ok(LazyFetchCommand::Cancel)));
+
+        SqlEditorWidget::clear_lazy_fetch_handle(&active, 42);
+        assert!(!SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
+    }
+
+    #[test]
+    fn cancelled_lazy_fetch_cannot_keep_pooled_session() {
+        let (sender, _receiver) = mpsc::channel();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            sender,
+            cancel_handle: None,
+            cancel_requested: cancel_requested.clone(),
+        })));
+
+        assert!(SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
+
+        cancel_requested.store(true, Ordering::Relaxed);
+
+        assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
     }
 
     #[test]

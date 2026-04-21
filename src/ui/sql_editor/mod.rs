@@ -14,7 +14,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -283,6 +283,7 @@ pub(crate) struct LazyFetchHandle {
     pub session_id: u64,
     pub sender: mpsc::Sender<LazyFetchCommand>,
     pub cancel_handle: Option<LazyFetchCancelHandle>,
+    pub cancel_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -880,6 +881,9 @@ impl SqlEditorWidget {
             self.cancel_active_lazy_fetch();
             return true;
         }
+        if handle.cancel_requested.load(Ordering::Relaxed) {
+            return false;
+        }
         let command = match request {
             LazyFetchRequest::More => LazyFetchCommand::FetchMore(100),
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
@@ -897,17 +901,27 @@ impl SqlEditorWidget {
     }
 
     fn cancel_active_lazy_fetch(&self) {
-        crate::db::clear_pooled_session_lease(&self.pooled_db_session);
-        let handle = self
-            .active_lazy_fetch
+        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session);
+    }
+
+    fn cancel_lazy_fetch_handle(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        pooled_db_session: &SharedDbSessionLease,
+    ) -> bool {
+        crate::db::clear_pooled_session_lease(pooled_db_session);
+        let handle = active_lazy_fetch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .clone();
         if let Some(handle) = handle {
+            handle.cancel_requested.store(true, Ordering::Relaxed);
             let _ = handle.sender.send(LazyFetchCommand::Cancel);
             if let Some(cancel_handle) = handle.cancel_handle {
                 cancel_handle.cancel();
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -1571,6 +1585,7 @@ impl SqlEditorWidget {
                         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                             &connection,
                             &pooled_db_session,
+                            None,
                             &current_mysql_cancel_context,
                             &cancel_flag,
                             query_timeout,

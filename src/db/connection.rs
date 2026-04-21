@@ -7,6 +7,7 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use crate::db::session::SessionState;
 use crate::utils::config::{
@@ -18,6 +19,7 @@ pub const NOT_CONNECTED_MESSAGE: &str = "Not connected to database";
 const ORACLE_CLIENT_LOAD_HELP_URL: &str =
     "https://oracle.github.io/odpi/doc/installation.html#macos";
 const ORACLE_CLIENT_LIB_ENV_VAR: &str = "ORACLE_CLIENT_LIB_DIR";
+const MYSQL_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DatabaseType {
@@ -240,9 +242,10 @@ impl DbConnectionPool {
                 pool.get()
                     .map_err(|err| Self::format_oracle_pool_acquire_error(pool, &err))?,
             ),
-            DbConnectionPool::MySQL(pool) => {
-                DbPoolSession::MySQL(pool.get_conn().map_err(|err| err.to_string())?)
-            }
+            DbConnectionPool::MySQL(pool) => DbPoolSession::MySQL(
+                pool.try_get_conn(MYSQL_POOL_ACQUIRE_TIMEOUT)
+                    .map_err(|err| Self::format_mysql_pool_acquire_error(&err))?,
+            ),
         };
         backend_for(session.db_type()).apply_pool_session_defaults(&mut session);
         Ok(session)
@@ -266,6 +269,20 @@ impl DbConnectionPool {
         format!(
             "{}. Oracle session pool appears exhausted.{} Finish or cancel lazy fetches in other result tabs, close unused query tabs, or increase Settings > Connection pool size.",
             message, pool_counts
+        )
+    }
+
+    fn format_mysql_pool_acquire_error(err: &mysql::Error) -> String {
+        let message = err.to_string();
+        let lower = message.to_ascii_lowercase();
+        let looks_pool_exhausted = lower.contains("operation timed out");
+        if !looks_pool_exhausted {
+            return message;
+        }
+
+        format!(
+            "{}. MySQL connection pool appears exhausted. Finish or cancel lazy fetches in other result tabs, close unused query tabs, or increase Settings > Connection pool size.",
+            message
         )
     }
 }
