@@ -1894,6 +1894,15 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
+                    if Self::key_should_request_lazy_fetch_more(key) {
+                        Self::request_lazy_fetch_more_near_bottom(
+                            &table_for_handle,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &lazy_fetch_more_in_flight_for_handle,
+                        );
+                    }
+
                     if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down) {
                         let hidden_col = *hidden_auto_rowid_col_for_handle
                             .lock()
@@ -1909,14 +1918,6 @@ impl ResultTableWidget {
                             &table_for_handle,
                             key,
                             hidden_col,
-                        );
-                    }
-                    if matches!(key, Key::PageDown | Key::End | Key::Down) {
-                        Self::request_lazy_fetch_more_near_bottom(
-                            &table_for_handle,
-                            &lazy_fetch_session_for_handle,
-                            &lazy_fetch_callback_for_handle,
-                            &lazy_fetch_more_in_flight_for_handle,
                         );
                     }
 
@@ -2263,6 +2264,10 @@ impl ResultTableWidget {
             drop(guard);
             Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::More);
         }
+    }
+
+    fn key_should_request_lazy_fetch_more(key: Key) -> bool {
+        matches!(key, Key::PageDown | Key::End | Key::Down)
     }
 
     fn show_inline_cell_editor(
@@ -10860,6 +10865,22 @@ mod tests {
             Key::from_char('ㅊ'),
             Key::from_char('c'),
             'c',
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_more_navigation_keys_include_down_page_down_and_end() {
+        assert!(ResultTableWidget::key_should_request_lazy_fetch_more(
+            Key::Down
+        ));
+        assert!(ResultTableWidget::key_should_request_lazy_fetch_more(
+            Key::PageDown
+        ));
+        assert!(ResultTableWidget::key_should_request_lazy_fetch_more(
+            Key::End
+        ));
+        assert!(!ResultTableWidget::key_should_request_lazy_fetch_more(
+            Key::Up
         ));
     }
 

@@ -154,6 +154,18 @@ impl QueryProgressContext {
         }
         self.lazy_fetch_sessions.clear();
     }
+
+    fn lazy_fetch_session_for_statement(&self, statement_index: usize) -> Option<u64> {
+        self.lazy_fetch_sessions
+            .iter()
+            .find_map(|(session_id, index)| {
+                if *index == statement_index {
+                    Some(*session_id)
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 pub struct AppState {
@@ -322,9 +334,15 @@ impl AppState {
     }
 
     fn is_any_query_running(&self) -> bool {
-        self.editor_tabs
-            .iter()
-            .any(|tab| tab.sql_editor.is_query_running())
+        self.sql_editor.is_query_running()
+            || self
+                .editor_tabs
+                .iter()
+                .any(|tab| tab.sql_editor.is_query_running())
+    }
+
+    fn has_active_lazy_fetches(&self) -> bool {
+        !self.lazy_fetch_sessions_for_abort().is_empty()
     }
 
     fn mark_lazy_fetch_result_tab_closed(&mut self, session_id: u64) {
@@ -438,6 +456,27 @@ impl AppState {
     {
         for session_id in session_ids {
             self.mark_lazy_fetch_result_tab_closed(session_id);
+        }
+    }
+
+    fn abort_lazy_fetch_result_tabs_for_connection_transition(&mut self) -> Vec<u64> {
+        let lazy_fetch_sessions = self.lazy_fetch_sessions_for_abort();
+        if lazy_fetch_sessions.is_empty() {
+            return lazy_fetch_sessions;
+        }
+
+        self.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.iter().copied());
+        for session_id in &lazy_fetch_sessions {
+            self.result_tabs.abort_lazy_fetch_session(*session_id);
+        }
+        self.refresh_result_edit_controls();
+        lazy_fetch_sessions
+    }
+
+    fn release_all_pooled_db_sessions(&self) {
+        self.sql_editor.release_pooled_db_session();
+        for tab in &self.editor_tabs {
+            tab.sql_editor.release_pooled_db_session();
         }
     }
 
@@ -889,6 +928,29 @@ fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), 
     } else {
         Ok(())
     }
+}
+
+fn connection_transition_block_message(
+    has_running_query: bool,
+    has_active_lazy_fetches: bool,
+    action: &str,
+) -> Option<String> {
+    if has_running_query {
+        Some(format!("A query is running. Stop it before {action}."))
+    } else if has_active_lazy_fetches {
+        Some(format!(
+            "A lazy fetch is still open. Fetch all rows or cancel it before {action}."
+        ))
+    } else {
+        None
+    }
+}
+
+fn should_finish_progress_after_lazy_fetch_close(
+    _cancelled: bool,
+    finished_all_lazy_fetches: bool,
+) -> bool {
+    finished_all_lazy_fetches
 }
 
 fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
@@ -3034,7 +3096,7 @@ impl MainWindow {
                     }
                     let tab_count = s.result_tabs.tab_count();
                     let mut result_tabs = s.result_tabs.clone();
-                    let tab_index = {
+                    let (tab_index, lazy_fetch_session) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
                         };
@@ -3045,12 +3107,13 @@ impl MainWindow {
                         context.active_statement_index = Some(index);
                         context.state_label = "Fetching rows".to_string();
                         context.last_fetch_status_update = Instant::now();
-                        resolve_progress_tab_index(
+                        let tab_index = resolve_progress_tab_index(
                             tab_count,
                             context.result_tab_offset,
                             context.execution_target,
                             index,
-                        )
+                        );
+                        (tab_index, context.lazy_fetch_session_for_statement(index))
                     };
                     let was_running = s.status_animation_running;
                     s.start_status_animation("Fetching rows: 0");
@@ -3060,6 +3123,9 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.start_streaming(tab_index, &columns, &null_text);
+                    if let Some(session_id) = lazy_fetch_session {
+                        result_tabs.set_lazy_fetch_session(tab_index, session_id);
+                    }
                 }
                 QueryProgress::Rows { index, rows } => {
                     let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
@@ -3106,6 +3172,21 @@ impl MainWindow {
                     context.state_label = "Lazy fetch open".to_string();
                     drop(s);
                     result_tabs.set_lazy_fetch_session(tab_index, session_id);
+                }
+                QueryProgress::LazyFetchWaiting { index, session_id } => {
+                    if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                        if context.closed_statement_indices.contains(&index) {
+                            return;
+                        }
+                        if context.lazy_fetch_sessions.get(&session_id) != Some(&index) {
+                            return;
+                        }
+                        context.active_statement_index = Some(index);
+                        context.state_label = "Waiting for lazy fetch".to_string();
+                    } else {
+                        return;
+                    }
+                    s.set_status_message("Waiting for lazy fetch");
                 }
                 QueryProgress::LazyFetchClosed {
                     index,
@@ -3160,7 +3241,10 @@ impl MainWindow {
                     } else {
                         result_tabs.clear_lazy_fetch_session(tab_index, session_id, true);
                     }
-                    if finished_all_lazy_fetches && !cancelled {
+                    if should_finish_progress_after_lazy_fetch_close(
+                        cancelled,
+                        finished_all_lazy_fetches,
+                    ) {
                         let mut s = state_for_progress
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3193,6 +3277,9 @@ impl MainWindow {
                 }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
+                        let lazy_fetch_sessions =
+                            s.abort_lazy_fetch_result_tabs_for_connection_transition();
+                        s.release_all_pooled_db_sessions();
                         let has_running_queries = s.sql_editor.is_query_running()
                             || s.editor_tabs
                                 .iter()
@@ -3214,6 +3301,14 @@ impl MainWindow {
                                 &schema_sender_for_progress,
                             );
                             s.pending_connection_metadata_refresh = false;
+                        }
+                        drop(s);
+                        for session_id in lazy_fetch_sessions {
+                            AppState::request_lazy_fetch_on_editors(
+                                &state_for_progress,
+                                session_id,
+                                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                            );
                         }
                     } else {
                         Self::transition_to_disconnected_state(&mut s, None);
@@ -3315,6 +3410,7 @@ impl MainWindow {
                         if !context.lazy_fetch_sessions.is_empty() {
                             context.batch_finished = true;
                             context.state_label = "Waiting for lazy fetch".to_string();
+                            s.set_status_message("Waiting for lazy fetch");
                             s.refresh_result_edit_controls();
                             return;
                         }
@@ -3440,6 +3536,21 @@ impl MainWindow {
     ) -> bool {
         match choice {
             "File/Connect" => {
+                let block_message = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    connection_transition_block_message(
+                        s.is_any_query_running(),
+                        s.has_active_lazy_fetches(),
+                        "connecting",
+                    )
+                };
+                if let Some(message) = block_message {
+                    fltk::dialog::alert_default(&message);
+                    return true;
+                }
+
                 let (popups, connection, pool_size) = {
                     let s = state
                         .lock()
@@ -3500,6 +3611,21 @@ impl MainWindow {
                 true
             }
             "File/Disconnect" => {
+                let block_message = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    connection_transition_block_message(
+                        s.is_any_query_running(),
+                        s.has_active_lazy_fetches(),
+                        "disconnecting",
+                    )
+                };
+                if let Some(message) = block_message {
+                    fltk::dialog::alert_default(&message);
+                    return true;
+                }
+
                 let connection = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4663,6 +4789,7 @@ impl MainWindow {
                                         "connection",
                                         &format!("Connected to {} ({})", info.name, info.db_type),
                                     );
+                                    s.release_all_pooled_db_sessions();
                                     for tab in &s.editor_tabs {
                                         tab.sql_editor.set_db_type(info.db_type);
                                     }
@@ -5220,6 +5347,36 @@ mod tests {
     }
 
     #[test]
+    fn connection_transition_blocks_running_query_before_lazy_fetch() {
+        assert_eq!(
+            connection_transition_block_message(true, true, "connecting"),
+            Some("A query is running. Stop it before connecting.".to_string())
+        );
+    }
+
+    #[test]
+    fn connection_transition_blocks_active_lazy_fetch() {
+        assert_eq!(
+            connection_transition_block_message(false, true, "disconnecting"),
+            Some(
+                "A lazy fetch is still open. Fetch all rows or cancel it before disconnecting."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            connection_transition_block_message(false, false, "disconnecting"),
+            None
+        );
+    }
+
+    #[test]
+    fn cancelled_lazy_fetch_can_finish_progress_context() {
+        assert!(should_finish_progress_after_lazy_fetch_close(true, true));
+        assert!(should_finish_progress_after_lazy_fetch_close(false, true));
+        assert!(!should_finish_progress_after_lazy_fetch_close(true, false));
+    }
+
+    #[test]
     fn resolve_progress_tab_index_uses_valid_target_for_grid_execution() {
         assert_eq!(resolve_progress_tab_index(5, 9, Some(2), 0), 2);
         assert_eq!(resolve_progress_tab_index(5, 9, Some(2), 1), 3);
@@ -5270,6 +5427,17 @@ mod tests {
         assert!(!context.fetch_row_counts.contains_key(&2));
         assert_eq!(context.active_statement_index, None);
         assert_eq!(context.lazy_fetch_sessions.get(&44), Some(&2));
+    }
+
+    #[test]
+    fn progress_context_finds_lazy_session_for_statement() {
+        let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
+        context.lazy_fetch_sessions.insert(44, 2);
+        context.lazy_fetch_sessions.insert(55, 3);
+
+        assert_eq!(context.lazy_fetch_session_for_statement(2), Some(44));
+        assert_eq!(context.lazy_fetch_session_for_statement(3), Some(55));
+        assert_eq!(context.lazy_fetch_session_for_statement(4), None);
     }
 
     #[test]

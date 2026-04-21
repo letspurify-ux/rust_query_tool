@@ -220,6 +220,10 @@ pub enum QueryProgress {
         index: usize,
         session_id: u64,
     },
+    LazyFetchWaiting {
+        index: usize,
+        session_id: u64,
+    },
     LazyFetchClosed {
         index: usize,
         session_id: u64,
@@ -821,11 +825,15 @@ impl SqlEditorWidget {
         widget
     }
 
-    pub fn clear_pooled_db_session(&self) {
+    pub fn release_pooled_db_session(&self) {
         *self
             .pooled_db_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub fn clear_pooled_db_session(&self) {
+        self.release_pooled_db_session();
         self.cancel_active_lazy_fetch();
     }
 

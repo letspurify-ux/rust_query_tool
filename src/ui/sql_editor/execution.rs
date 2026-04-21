@@ -827,6 +827,11 @@ impl SqlEditorWidget {
         app::awake();
     }
 
+    fn emit_lazy_waiting(sender: &mpsc::Sender<QueryProgress>, index: usize, session_id: u64) {
+        let _ = sender.send(QueryProgress::LazyFetchWaiting { index, session_id });
+        app::awake();
+    }
+
     fn start_oracle_lazy_select(
         conn: Arc<Connection>,
         sender: mpsc::Sender<QueryProgress>,
@@ -940,6 +945,7 @@ impl SqlEditorWidget {
                     app::awake();
                     return Ok(());
                 }
+                Self::emit_lazy_waiting(&sender, index, session_id);
                 loop {
                     match Self::next_lazy_fetch_command(&command_receiver, &mut pending_commands) {
                         Ok(LazyFetchCommand::FetchMore(limit)) => {
@@ -999,6 +1005,7 @@ impl SqlEditorWidget {
                                 app::awake();
                                 return Ok(());
                             }
+                            Self::emit_lazy_waiting(&sender, index, session_id);
                         }
                         Ok(LazyFetchCommand::FetchAll) => loop {
                             let (rows, eof) = Self::fetch_lazy_oracle_rows(
@@ -1094,6 +1101,7 @@ impl SqlEditorWidget {
 
     fn start_mysql_lazy_select(
         connection_generation: u64,
+        shared_connection: crate::db::SharedConnection,
         mut conn: mysql::PooledConn,
         connection_info: ConnectionInfo,
         pooled_db_session: Arc<Mutex<Option<(u64, DbSessionLease)>>>,
@@ -1247,6 +1255,7 @@ impl SqlEditorWidget {
                     app::awake();
                     return Ok(());
                 }
+                Self::emit_lazy_waiting(&sender, index, session_id);
                 loop {
                     match Self::next_lazy_fetch_command(&command_receiver, &mut pending_commands) {
                         Ok(LazyFetchCommand::FetchMore(limit)) => {
@@ -1294,6 +1303,7 @@ impl SqlEditorWidget {
                                 app::awake();
                                 return Ok(());
                             }
+                            Self::emit_lazy_waiting(&sender, index, session_id);
                         }
                         Ok(LazyFetchCommand::FetchAll) => loop {
                             let (rows, eof) = fetch_rows!(PROGRESS_ROWS_MAX_BATCH);
@@ -1382,7 +1392,13 @@ impl SqlEditorWidget {
                 );
             }
             if should_release_session {
-                Self::release_mysql_pooled_session(&pooled_db_session, connection_generation, conn);
+                Self::release_mysql_pooled_session_if_current(
+                    &shared_connection,
+                    &pooled_db_session,
+                    connection_generation,
+                    conn,
+                    "mysql lazy fetch cleanup",
+                );
             }
             Self::clear_lazy_fetch_handle(&active_lazy_fetch, session_id);
         });
@@ -2459,6 +2475,7 @@ impl SqlEditorWidget {
                             app::awake();
                             SqlEditorWidget::start_mysql_lazy_select(
                                 connection_generation,
+                                Arc::clone(shared_connection),
                                 conn,
                                 connection_info,
                                 Arc::clone(pooled_db_session),
@@ -8839,6 +8856,24 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn lazy_waiting_emits_waiting_progress_event() {
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::emit_lazy_waiting(&sender, 3, 42);
+        drop(sender);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.first(),
+            Some(QueryProgress::LazyFetchWaiting {
+                index: 3,
+                session_id: 42,
+            })
+        ));
+    }
+
+    #[test]
     fn lazy_cancel_drain_preserves_non_cancel_commands() {
         let (sender, receiver) = mpsc::channel();
         sender
@@ -9219,6 +9254,9 @@ mod mysql_batch_execution_regression_tests {
                 }
                 QueryProgress::LazyFetchSession { index, session_id } => {
                     format!("LazyFetchSession({index}, {session_id})")
+                }
+                QueryProgress::LazyFetchWaiting { index, session_id } => {
+                    format!("LazyFetchWaiting({index}, {session_id})")
                 }
                 QueryProgress::LazyFetchClosed {
                     index,
