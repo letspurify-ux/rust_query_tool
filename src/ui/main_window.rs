@@ -3605,8 +3605,8 @@ impl MainWindow {
                 QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
                     let session_id = s
                         .cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch");
-                    drop(s);
                     if let Some(session_id) = session_id {
+                        drop(s);
                         AppState::request_lazy_fetch_on_editors(
                             &state_for_progress,
                             session_id,
@@ -3614,7 +3614,10 @@ impl MainWindow {
                         );
                         let _ = response.send(true);
                     } else {
-                        let _ = response.send(false);
+                        s.release_all_pooled_db_sessions();
+                        s.set_status_message("Session pool full; released idle pooled sessions");
+                        drop(s);
+                        let _ = response.send(true);
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
