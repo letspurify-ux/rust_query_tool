@@ -1569,10 +1569,9 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state.has_live_connection = false;
         state.pending_connection_metadata_refresh = false;
-        state.sql_editor.clear_pooled_db_session();
-        for tab in state.editor_tabs.iter() {
-            tab.sql_editor.clear_pooled_db_session();
-        }
+        // Active lazy fetch cancellation is dispatched by the caller after the
+        // AppState lock is released; only drop idle/reusable leases here.
+        state.release_all_pooled_db_sessions();
 
         // Disconnection can happen mid-stream (network drop,
         // explicit disconnect while a worker is still unwinding). Ensure every
