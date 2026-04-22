@@ -2522,6 +2522,10 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     app::redraw();
                     sessions_to_cancel
+                } else if s.result_tabs.close_current_script_output_tab() {
+                    s.refresh_result_edit_controls();
+                    app::redraw();
+                    Vec::new()
                 } else {
                     s.refresh_result_edit_controls();
                     app::redraw();

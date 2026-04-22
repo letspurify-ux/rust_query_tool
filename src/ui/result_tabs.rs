@@ -46,6 +46,7 @@ struct ScriptOutputTab {
     group: Group,
     display: TextDisplay,
     buffer: TextBuffer,
+    attached: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +242,18 @@ impl ResultTabsWidget {
         }
     }
 
+    fn layout_script_output_tab(tabs: &Tabs, script_output: &mut ScriptOutputTab) {
+        let (x, y, w, h) = Self::content_bounds(tabs);
+        script_output.group.resize(x, y, w, h);
+        let padding = constants::SCRIPT_OUTPUT_PADDING;
+        script_output.display.resize(
+            x + padding,
+            y + padding,
+            (w - padding * 2).max(10),
+            (h - padding * 2).max(10),
+        );
+    }
+
     fn should_reset_tab_strip_left_anchor(child_count: i32, width: i32, height: i32) -> bool {
         child_count > 1 && width > 0 && height > 0
     }
@@ -322,6 +335,116 @@ impl ResultTabsWidget {
 
     fn result_tab_label(status: ResultTabStatus, row_count: usize) -> String {
         format!("{} ({})", status.label(), row_count)
+    }
+
+    fn tabs_contains_group(tabs: &Tabs, group: &Group) -> bool {
+        !tabs.was_deleted() && !group.was_deleted() && tabs.find(group) < tabs.children()
+    }
+
+    fn active_result_group(&self) -> Option<Group> {
+        let index = (*self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| tab.group.clone())
+    }
+
+    fn script_output_tab_is_visible(&self) -> bool {
+        if self.tabs.was_deleted() {
+            return false;
+        }
+        let (script_group, attached) = {
+            let script_output = self
+                .script_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (script_output.group.clone(), script_output.attached)
+        };
+        attached && Self::tabs_contains_group(&self.tabs, &script_group)
+    }
+
+    fn script_output_tab_is_current(&self) -> bool {
+        if !self.script_output_tab_is_visible() {
+            return false;
+        }
+        let script_group = self
+            .script_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .group
+            .clone();
+        self.tabs
+            .value()
+            .is_some_and(|current| current.as_widget_ptr() == script_group.as_widget_ptr())
+    }
+
+    fn ensure_script_output_tab_visible(&mut self) {
+        if self.tabs.was_deleted() {
+            return;
+        }
+
+        let active_group = self.active_result_group();
+        let script_output_ref = self.script_output.clone();
+        let script_group = {
+            let mut script_output = script_output_ref
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if script_output.group.was_deleted() {
+                return;
+            }
+            Self::layout_script_output_tab(&self.tabs, &mut script_output);
+            if !Self::tabs_contains_group(&self.tabs, &script_output.group) {
+                self.tabs.add(&script_output.group);
+            }
+            script_output.attached = true;
+            script_output.group.clone()
+        };
+
+        if let Some(group) = active_group {
+            if !group.was_deleted() {
+                let _ = self.tabs.set_value(&group);
+            }
+        } else {
+            let _ = self.tabs.set_value(&script_group);
+            *self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.reset_tab_strip_left_anchor();
+        self.tabs.redraw();
+    }
+
+    fn hide_script_output_tab(&mut self) {
+        if self.tabs.was_deleted() {
+            return;
+        }
+
+        let script_output_ref = self.script_output.clone();
+        let removed = {
+            let mut script_output = script_output_ref
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if script_output.group.was_deleted()
+                || !script_output.attached
+                || !Self::tabs_contains_group(&self.tabs, &script_output.group)
+            {
+                false
+            } else {
+                self.tabs.remove(&script_output.group);
+                script_output.attached = false;
+                true
+            }
+        };
+
+        if removed {
+            self.reset_tab_strip_left_anchor();
+            self.tabs.redraw();
+        }
     }
 
     fn update_tab_group_label(
@@ -420,11 +543,13 @@ impl ResultTabsWidget {
         script_group.resizable(&script_display);
         script_group.end();
         tabs.end();
+        tabs.remove(&script_group);
 
         let script_output = Arc::new(Mutex::new(ScriptOutputTab {
             group: script_group,
             display: script_display,
             buffer: script_buffer,
+            attached: false,
         }));
 
         let data_for_cb = data.clone();
@@ -592,16 +717,6 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let script_group = {
-            let script_output = self
-                .script_output
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            script_output.group.clone()
-        };
-        if !self.tabs.was_deleted() && !script_group.was_deleted() {
-            let _ = self.tabs.set_value(&script_group);
-        }
         self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
         let script_output = self
@@ -647,14 +762,15 @@ impl ResultTabsWidget {
     }
 
     pub fn append_script_output_lines(&mut self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        self.ensure_script_output_tab_visible();
         let mut script_output = self
             .script_output
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut buffer = script_output.buffer.clone();
-        if lines.is_empty() {
-            return;
-        }
         let has_prefix_newline = buffer.length() > 0 && !Self::buffer_ends_with_newline(&buffer);
         let mut append_capacity = lines.iter().map(|line| line.len() + 1).sum::<usize>();
         if has_prefix_newline {
@@ -1254,6 +1370,36 @@ impl ResultTabsWidget {
         self.close_current_tab_and_take_lazy_fetch().is_some()
     }
 
+    pub fn close_current_script_output_tab(&mut self) -> bool {
+        if !self.script_output_tab_is_current() {
+            return false;
+        }
+
+        let next_group = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first()
+            .map(|tab| tab.group.clone());
+        self.clear_script_output();
+        if let Some(group) = next_group {
+            if !self.tabs.was_deleted() && !group.was_deleted() {
+                let _ = self.tabs.set_value(&group);
+                *self
+                    .active_index
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(0);
+            }
+        } else {
+            *self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.fire_on_change_callback();
+        true
+    }
+
     pub fn close_current_tab_and_take_lazy_fetch(&mut self) -> Option<(usize, Option<u64>)> {
         let index = (*self
             .active_index
@@ -1295,14 +1441,16 @@ impl ResultTabsWidget {
                 .active_index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            let script_group = self
-                .script_output
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .group
-                .clone();
-            if !self.tabs.was_deleted() && !script_group.was_deleted() {
-                let _ = self.tabs.set_value(&script_group);
+            if self.script_output_tab_is_visible() {
+                let script_group = self
+                    .script_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .group
+                    .clone();
+                if !self.tabs.was_deleted() && !script_group.was_deleted() {
+                    let _ = self.tabs.set_value(&script_group);
+                }
             }
         } else {
             let new_index = if index >= remaining {
@@ -1344,8 +1492,13 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .group
             .clone();
-        if !self.tabs.was_deleted() && !script_group.was_deleted() {
+        if !self.tabs.was_deleted()
+            && !script_group.was_deleted()
+            && Self::tabs_contains_group(&self.tabs, &script_group)
+        {
             let _ = self.tabs.set_value(&script_group);
+        } else {
+            return;
         }
         *self
             .active_index
@@ -1354,17 +1507,20 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    fn clear_script_output(&self) {
-        let mut script_output = self
-            .script_output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Recreate the buffer to drop retained capacity after very large script outputs.
-        let mut new_buffer = TextBuffer::default();
-        new_buffer.set_text("");
-        script_output.display.set_buffer(new_buffer.clone());
-        script_output.buffer = new_buffer;
-        script_output.display.scroll(0, 0);
+    fn clear_script_output(&mut self) {
+        {
+            let mut script_output = self
+                .script_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Recreate the buffer to drop retained capacity after very large script outputs.
+            let mut new_buffer = TextBuffer::default();
+            new_buffer.set_text("");
+            script_output.display.set_buffer(new_buffer.clone());
+            script_output.buffer = new_buffer;
+            script_output.display.scroll(0, 0);
+        }
+        self.hide_script_output_tab();
     }
 }
 
