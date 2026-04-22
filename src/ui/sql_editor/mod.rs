@@ -915,10 +915,10 @@ impl SqlEditorWidget {
             .clone();
         if let Some(handle) = handle {
             handle.cancel_requested.store(true, Ordering::Relaxed);
-            let _ = handle.sender.send(LazyFetchCommand::Cancel);
             if let Some(cancel_handle) = handle.cancel_handle {
                 cancel_handle.cancel();
             }
+            let _ = handle.sender.send(LazyFetchCommand::Cancel);
             true
         } else {
             false

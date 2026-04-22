@@ -2,6 +2,19 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
+use syn::{Expr, ExprCall, ExprMacro, ExprMethodCall, ItemFn, ItemMod, Macro};
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct PanicSyntaxOffender {
+    path: String,
+    line: usize,
+    syntax: String,
+}
+
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -33,111 +46,168 @@ fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn strip_test_blocks(content: &str) -> String {
-    let mut output = String::with_capacity(content.len());
-    let mut i = 0;
+fn find_banned_panic_syntax(content: &str) -> Vec<&'static str> {
+    const BANNED_PANIC_SYNTAX: [&str; 18] = [
+        "panic!(",
+        "panic_any(",
+        "std::panic::panic_any",
+        "todo!(",
+        "unimplemented!(",
+        "unreachable!(",
+        "assert!(",
+        "assert_eq!(",
+        "assert_ne!(",
+        ".unwrap(",
+        ".expect(",
+        ".expect_err(",
+        ".unwrap_err(",
+        ".unwrap_unchecked(",
+        "Option::unwrap",
+        "Option::expect",
+        "Result::unwrap",
+        "Result::expect",
+    ];
 
-    while i < content.len() {
-        let rest = &content[i..];
-
-        if rest.starts_with("#[cfg(test)]") {
-            i += "#[cfg(test)]".len();
-            while i < content.len() {
-                let c = content.as_bytes()[i] as char;
-                if c.is_whitespace() {
-                    i += 1;
-                    continue;
-                }
-                break;
-            }
-
-            if content[i..].starts_with("mod") {
-                if let Some(open_brace_rel) = content[i..].find('{') {
-                    let open_brace = i + open_brace_rel;
-                    if let Some(after_block) = find_matching_brace_end(content, open_brace) {
-                        i = after_block;
-                        continue;
-                    }
-                }
-            }
-
-            continue;
-        }
-
-        if rest.starts_with("#[test]") {
-            i += "#[test]".len();
-            while i < content.len() {
-                let c = content.as_bytes()[i] as char;
-                if c.is_whitespace() {
-                    i += 1;
-                    continue;
-                }
-                break;
-            }
-
-            if content[i..].starts_with("fn") {
-                if let Some(open_brace_rel) = content[i..].find('{') {
-                    let open_brace = i + open_brace_rel;
-                    if let Some(after_block) = find_matching_brace_end(content, open_brace) {
-                        i = after_block;
-                        continue;
-                    }
-                }
-            }
-
-            continue;
-        }
-
-        if let Some(ch) = rest.chars().next() {
-            output.push(ch);
-            i += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    output
+    BANNED_PANIC_SYNTAX
+        .iter()
+        .filter(|pattern| content.contains(**pattern))
+        .copied()
+        .collect()
 }
 
-fn find_matching_brace_end(content: &str, open_index: usize) -> Option<usize> {
-    if content.as_bytes().get(open_index).copied() != Some(b'{') {
-        return None;
+fn attr_is_test_only(attr: &syn::Attribute) -> bool {
+    if attr.path().is_ident("test") {
+        return true;
     }
 
-    let mut depth = 0usize;
-    for (offset, byte) in content[open_index..].bytes().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(open_index + offset + 1);
-                }
-            }
-            _ => {}
+    if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
+        let tokens = attr.meta.to_token_stream().to_string();
+        return tokens.contains("test");
+    }
+
+    false
+}
+
+fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(attr_is_test_only)
+}
+
+fn macro_panic_syntax(mac: &Macro) -> Option<String> {
+    let ident = mac.path.segments.last()?.ident.to_string();
+    match ident.as_str() {
+        "panic" | "todo" | "unimplemented" | "unreachable" | "assert" | "assert_eq"
+        | "assert_ne" => Some(format!("{ident}!")),
+        _ => None,
+    }
+}
+
+fn method_panic_syntax(node: &ExprMethodCall) -> Option<String> {
+    match node.method.to_string().as_str() {
+        "unwrap" | "expect" | "expect_err" | "unwrap_err" | "unwrap_unchecked" => {
+            Some(format!(".{}()", node.method))
+        }
+        _ => None,
+    }
+}
+
+fn call_path_segments(node: &ExprCall) -> Option<Vec<String>> {
+    let Expr::Path(path) = node.func.as_ref() else {
+        return None;
+    };
+    Some(
+        path.path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+    )
+}
+
+fn path_ends_with(path: &[String], suffix: &[&str]) -> bool {
+    path.len() >= suffix.len()
+        && path[path.len() - suffix.len()..]
+            .iter()
+            .map(String::as_str)
+            .eq(suffix.iter().copied())
+}
+
+fn call_panic_syntax(node: &ExprCall) -> Option<String> {
+    let path = call_path_segments(node)?;
+    if path.last().is_some_and(|segment| segment == "panic_any") {
+        return Some("panic_any()".to_string());
+    }
+
+    for suffix in [
+        &["Option", "unwrap"][..],
+        &["Option", "expect"][..],
+        &["Result", "unwrap"][..],
+        &["Result", "expect"][..],
+    ] {
+        if path_ends_with(&path, suffix) {
+            return Some(format!("{}()", suffix.join("::")));
         }
     }
 
     None
 }
 
-fn find_banned_patterns(content: &str) -> Vec<&'static str> {
-    const BANNED_PATTERNS: [&str; 8] = [
-        "panic!(",
-        ".unwrap(",
-        ".expect(",
-        ".unwrap_err(",
-        ".unwrap_unchecked(",
-        "Option::unwrap",
-        "Result::unwrap",
-        "Result::expect",
-    ];
+struct PanicSyntaxVisitor<'a> {
+    path: &'a str,
+    offenders: Vec<PanicSyntaxOffender>,
+}
 
-    BANNED_PATTERNS
-        .iter()
-        .filter(|pattern| content.contains(**pattern))
-        .copied()
-        .collect()
+impl<'a> PanicSyntaxVisitor<'a> {
+    fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            offenders: Vec::new(),
+        }
+    }
+
+    fn push_offender(&mut self, line: usize, syntax: String) {
+        self.offenders.push(PanicSyntaxOffender {
+            path: self.path.to_string(),
+            line,
+            syntax,
+        });
+    }
+}
+
+impl Visit<'_> for PanicSyntaxVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &ItemMod) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_fn(&mut self, node: &ItemFn) {
+        if attrs_are_test_only(&node.attrs) {
+            return;
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &ExprMacro) {
+        if let Some(syntax) = macro_panic_syntax(&node.mac) {
+            self.push_offender(node.mac.span().start().line, syntax);
+        }
+        visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &ExprMethodCall) {
+        if let Some(syntax) = method_panic_syntax(node) {
+            self.push_offender(node.method.span().start().line, syntax);
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &ExprCall) {
+        if let Some(syntax) = call_panic_syntax(node) {
+            self.push_offender(node.span().start().line, syntax);
+        }
+        visit::visit_expr_call(self, node);
+    }
 }
 
 fn is_test_source_file(path: &Path) -> bool {
@@ -155,7 +225,8 @@ fn is_test_source_file(path: &Path) -> bool {
 }
 
 #[test]
-fn non_test_source_does_not_use_panic_prone_calls() {
+fn non_test_source_does_not_use_panic_prone_syntax() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
 
@@ -168,18 +239,54 @@ fn non_test_source_does_not_use_panic_prone_calls() {
             Ok(content) => content,
             Err(err) => panic!("failed to read source file {}: {err}", file.display()),
         };
+        let parsed = match syn::parse_file(&content) {
+            Ok(parsed) => parsed,
+            Err(err) => panic!("failed to parse source file {}: {err}", file.display()),
+        };
+        let relative_path = match file.strip_prefix(manifest_dir) {
+            Ok(path) => path.display().to_string(),
+            Err(err) => panic!("failed to relativize {}: {err}", file.display()),
+        };
 
-        let non_test_code = strip_test_blocks(&content);
-        let matched_patterns = find_banned_patterns(&non_test_code);
-
-        if !matched_patterns.is_empty() {
-            offenders.push((file, matched_patterns));
-        }
+        let mut visitor = PanicSyntaxVisitor::new(&relative_path);
+        visitor.visit_file(&parsed);
+        offenders.extend(visitor.offenders);
     }
 
     assert!(
         offenders.is_empty(),
-        "found panic-prone calls in non-test source files: {:?}",
+        "found panic-prone syntax in non-test source files: {:?}",
         offenders
+    );
+}
+
+#[test]
+fn panic_syntax_detector_covers_common_panic_forms() {
+    let sample = [
+        "panic!(\"boom\")",
+        "std::panic::panic_any(\"boom\")",
+        "todo!()",
+        "unimplemented!()",
+        "unreachable!()",
+        "assert!(ready)",
+        "assert_eq!(left, right)",
+        "value.unwrap()",
+        "value.expect(\"present\")",
+        "value.expect_err(\"error\")",
+        "value.unwrap_err()",
+        "unsafe { value.unwrap_unchecked() }",
+        "Option::unwrap(value)",
+        "Option::expect(value, \"present\")",
+        "Result::unwrap(value)",
+        "Result::expect(value, \"ok\")",
+    ]
+    .join("\n");
+
+    let matched = find_banned_panic_syntax(&sample);
+
+    assert!(
+        matched.len() >= 16,
+        "panic syntax detector missed expected forms: {:?}",
+        matched
     );
 }
