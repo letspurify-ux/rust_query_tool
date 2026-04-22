@@ -254,7 +254,9 @@ impl DbConnectionPool {
     fn format_oracle_pool_acquire_error(pool: &oracle::pool::Pool, err: &OracleError) -> String {
         let message = err.to_string();
         let lower = message.to_ascii_lowercase();
-        let looks_pool_exhausted = lower.contains("ocisessionget timed out")
+        let looks_pool_exhausted = lower.contains("ora-24418")
+            || lower.contains("ora-24496")
+            || lower.contains("ocisessionget timed out")
             || lower.contains("waiting for pool")
             || lower.contains("connection pool");
         if !looks_pool_exhausted {

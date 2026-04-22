@@ -704,7 +704,8 @@ impl SqlEditorWidget {
 
     fn session_pool_error_is_exhausted(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
-        lower.contains("ora-24496")
+        lower.contains("ora-24418")
+            || lower.contains("ora-24496")
             || lower.contains("ocisessionget() timed out")
             || lower.contains("ocisessionget timed out")
             || lower.contains("session pool appears exhausted")
@@ -9331,6 +9332,13 @@ mod query_execution_cleanup_tests {
     fn session_pool_exhaustion_detects_ora_24496_message() {
         assert!(SqlEditorWidget::session_pool_error_is_exhausted(
             "ORA-24496: OCISessionGet() timed out waiting for a free connection"
+        ));
+    }
+
+    #[test]
+    fn session_pool_exhaustion_detects_ora_24418_message() {
+        assert!(SqlEditorWidget::session_pool_error_is_exhausted(
+            "ORA-24418: Cannot open further sessions."
         ));
     }
 
