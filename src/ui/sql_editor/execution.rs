@@ -1131,6 +1131,7 @@ impl SqlEditorWidget {
         active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
         session_id: u64,
         query_timeout: Option<Duration>,
+        previous_timeout: Option<Duration>,
     ) -> Result<(), OracleError> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         Self::register_lazy_fetch_handle(
@@ -1142,7 +1143,6 @@ impl SqlEditorWidget {
         let _ = sender.send(QueryProgress::LazyFetchSession { index, session_id });
         app::awake();
         thread::spawn(move || {
-            let previous_timeout = conn.call_timeout().ok().flatten();
             let worker_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let statement_start = Instant::now();
                 let mut fetched_rows = 0usize;
@@ -6636,8 +6636,12 @@ impl SqlEditorWidget {
                                         active_lazy_fetch.clone(),
                                         session_id,
                                         query_timeout,
+                                        previous_timeout,
                                     ) {
                                         Ok(()) => {
+                                            // The lazy worker now owns this pooled connection and
+                                            // restores its timeout when the cursor closes.
+                                            cleanup.clear_timeout_tracking();
                                             result_index += 1;
                                             continue;
                                         }
