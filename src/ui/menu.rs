@@ -133,14 +133,14 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Open SQL File",
-            Shortcut::Ctrl | Shortcut::Command | 'o',
+            "&File/&New SQL File",
+            Shortcut::Command | 't',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/&New SQL File",
-            Shortcut::Command | 't',
+            "&File/&Open SQL File",
+            Shortcut::Ctrl | Shortcut::Command | 'o',
             MenuFlag::Normal,
             forward_menu_callback,
         );
