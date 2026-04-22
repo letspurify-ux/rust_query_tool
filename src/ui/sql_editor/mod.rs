@@ -392,6 +392,20 @@ impl Drop for MySqlQueryCancelContext {
 
 impl LazyFetchCancelHandle {
     fn cancel(self) {
+        let fallback = self.clone();
+        let spawn_result = thread::Builder::new()
+            .name("lazy-fetch-cancel".to_string())
+            .spawn(move || self.cancel_blocking());
+        if let Err(err) = spawn_result {
+            crate::utils::logging::log_error(
+                "lazy fetch cancel",
+                &format!("Failed to spawn lazy fetch cancel thread: {err}"),
+            );
+            fallback.cancel_blocking();
+        }
+    }
+
+    fn cancel_blocking(self) {
         match self {
             LazyFetchCancelHandle::Oracle(conn) => {
                 let _ = conn.break_execution();
@@ -873,6 +887,19 @@ impl SqlEditorWidget {
         self.release_pooled_db_session()
     }
 
+    pub fn has_idle_pooled_db_session(&self) -> bool {
+        if !Self::pooled_session_is_idle_for_release(
+            self.is_query_running(),
+            self.active_lazy_fetch_session(),
+        ) {
+            return false;
+        }
+        self.pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
     fn pooled_session_is_idle_for_release(
         query_running: bool,
         active_lazy_fetch_session: Option<u64>,
@@ -952,7 +979,7 @@ impl SqlEditorWidget {
         pooled_db_session: &SharedDbSessionLease,
         expected_session_id: Option<u64>,
     ) -> bool {
-        let handle = active_lazy_fetch
+        let cancel_request = active_lazy_fetch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
@@ -960,15 +987,17 @@ impl SqlEditorWidget {
                 if expected_session_id.is_some_and(|session_id| handle.session_id != session_id) {
                     return None;
                 }
-                handle.cancel_requested.store(true, Ordering::Relaxed);
-                Some(handle.clone())
+                let first_cancel_request = !handle.cancel_requested.swap(true, Ordering::Relaxed);
+                Some((handle.clone(), first_cancel_request))
             });
-        let Some(handle) = handle else {
+        let Some((handle, first_cancel_request)) = cancel_request else {
             return false;
         };
         crate::db::clear_pooled_session_lease(pooled_db_session);
-        if let Some(cancel_handle) = handle.cancel_handle {
-            cancel_handle.cancel();
+        if first_cancel_request {
+            if let Some(cancel_handle) = handle.cancel_handle {
+                cancel_handle.cancel();
+            }
         }
         let _ = handle.sender.send(LazyFetchCommand::Cancel);
         true
@@ -1362,7 +1391,14 @@ impl SqlEditorWidget {
         set_cursor(Cursor::Wait);
         app::flush();
 
-        thread::spawn(move || {
+        let spawn_error_sender = sender.clone();
+        let spawn_error_query_running = query_running.clone();
+        let spawn_error_cancel_flag = cancel_flag.clone();
+        let spawn_error_current_query_connection = current_query_connection.clone();
+        let spawn_error_current_mysql_cancel_context = current_mysql_cancel_context.clone();
+        let spawn_result = thread::Builder::new()
+            .name("explain-plan".to_string())
+            .spawn(move || {
             let sender_fallback = sender.clone();
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
@@ -1428,6 +1464,28 @@ impl SqlEditorWidget {
                 app::awake();
             }
         });
+        if let Err(err) = spawn_result {
+            let message = format!("Failed to start explain plan thread: {err}");
+            crate::utils::logging::log_error("sql_editor::explain", &message);
+            SqlEditorWidget::set_current_query_connection(
+                &spawn_error_current_query_connection,
+                None,
+            );
+            SqlEditorWidget::set_current_mysql_cancel_context(
+                &spawn_error_current_mysql_cancel_context,
+                None,
+            );
+            SqlEditorWidget::finalize_execution_state(
+                &spawn_error_query_running,
+                &spawn_error_cancel_flag,
+            );
+            let _ = spawn_error_sender.send(UiActionResult::ExplainPlan(Err(message)));
+            app::awake();
+            if app::is_ui_thread() {
+                set_cursor(Cursor::Default);
+                app::flush();
+            }
+        }
     }
 
     fn render_explain_plan(plan_lines: &[String]) -> String {
@@ -1575,7 +1633,14 @@ impl SqlEditorWidget {
         set_cursor(Cursor::Wait);
         app::flush();
 
-        thread::spawn(move || {
+        let spawn_error_sender = sender.clone();
+        let spawn_error_query_running = query_running.clone();
+        let spawn_error_cancel_flag = cancel_flag.clone();
+        let spawn_error_current_query_connection = current_query_connection.clone();
+        let spawn_error_current_mysql_cancel_context = current_mysql_cancel_context.clone();
+        let spawn_result = thread::Builder::new()
+            .name(activity_label.to_string())
+            .spawn(move || {
             let sender_fallback = sender.clone();
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(mut conn_guard) =
@@ -1665,6 +1730,28 @@ impl SqlEditorWidget {
                 app::awake();
             }
         });
+        if let Err(err) = spawn_result {
+            let message = format!("Failed to start {activity_label} thread: {err}");
+            crate::utils::logging::log_error(panic_context, &message);
+            SqlEditorWidget::set_current_query_connection(
+                &spawn_error_current_query_connection,
+                None,
+            );
+            SqlEditorWidget::set_current_mysql_cancel_context(
+                &spawn_error_current_mysql_cancel_context,
+                None,
+            );
+            SqlEditorWidget::finalize_execution_state(
+                &spawn_error_query_running,
+                &spawn_error_cancel_flag,
+            );
+            let _ = spawn_error_sender.send(make_ui_result(Err(message)));
+            app::awake();
+            if app::is_ui_thread() {
+                set_cursor(Cursor::Default);
+                app::flush();
+            }
+        }
     }
 
     pub fn clear(&self) {
@@ -1713,98 +1800,115 @@ impl SqlEditorWidget {
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
-        thread::spawn(move || {
-            let mut conn =
-                SqlEditorWidget::clone_current_query_connection(&current_query_connection);
-            let mut mysql_cancel_context =
-                SqlEditorWidget::clone_current_mysql_cancel_context(&current_mysql_cancel_context);
+        let spawn_error_sender = sender.clone();
+        let spawn_error_query_running = query_running.clone();
+        let spawn_error_cancel_flag = cancel_flag.clone();
+        let spawn_result = thread::Builder::new()
+            .name("query-cancel".to_string())
+            .spawn(move || {
+                let mut conn =
+                    SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+                let mut mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
+                    &current_mysql_cancel_context,
+                );
 
-            if !SqlEditorWidget::is_query_running_flag(&query_running)
-                && conn.is_none()
-                && mysql_cancel_context.is_none()
-            {
-                // Execution can still be transitioning into "running" and may not
-                // have published current_query_connection yet. Wait briefly so a
-                // cancel click that races with query start can still interrupt.
-                for _ in 0..40 {
-                    if !load_mutex_bool(&cancel_flag) {
-                        break;
-                    }
-                    if SqlEditorWidget::is_query_running_flag(&query_running) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                    conn =
-                        SqlEditorWidget::clone_current_query_connection(&current_query_connection);
-                    mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
-                        &current_mysql_cancel_context,
-                    );
-                    if conn.is_some() || mysql_cancel_context.is_some() {
-                        break;
-                    }
-                }
-            }
-
-            if !SqlEditorWidget::is_query_running_flag(&query_running)
-                && conn.is_none()
-                && mysql_cancel_context.is_none()
-            {
-                // This editor is idle. Do not attempt to cancel through the
-                // global DB connection because that can interrupt a query that
-                // is currently running in a different editor tab.
-                store_mutex_bool(&cancel_flag, false);
-                let _ = sender.send(UiActionResult::Cancel(Ok(())));
-                app::awake();
-                return;
-            }
-
-            if conn.is_none() && mysql_cancel_context.is_none() {
-                // Execution may still be initializing the DB connection.
-                // Wait briefly so a single cancel click can still interrupt reliably.
-                for _ in 0..40 {
-                    if !load_mutex_bool(&cancel_flag) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                    conn =
-                        SqlEditorWidget::clone_current_query_connection(&current_query_connection);
-                    mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
-                        &current_mysql_cancel_context,
-                    );
-                    if conn.is_some() || mysql_cancel_context.is_some() {
-                        break;
+                if !SqlEditorWidget::is_query_running_flag(&query_running)
+                    && conn.is_none()
+                    && mysql_cancel_context.is_none()
+                {
+                    // Execution can still be transitioning into "running" and may not
+                    // have published current_query_connection yet. Wait briefly so a
+                    // cancel click that races with query start can still interrupt.
+                    for _ in 0..40 {
+                        if !load_mutex_bool(&cancel_flag) {
+                            break;
+                        }
+                        if SqlEditorWidget::is_query_running_flag(&query_running) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                        conn = SqlEditorWidget::clone_current_query_connection(
+                            &current_query_connection,
+                        );
+                        mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
+                            &current_mysql_cancel_context,
+                        );
+                        if conn.is_some() || mysql_cancel_context.is_some() {
+                            break;
+                        }
                     }
                 }
-            }
 
-            // Re-check the cancel flag before breaking the connection. If it is
-            // already false the previous query has already finished and reset it;
-            // breaking the connection now would interrupt a newly-started query.
-            if !load_mutex_bool(&cancel_flag) {
-                let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                if !SqlEditorWidget::is_query_running_flag(&query_running)
+                    && conn.is_none()
+                    && mysql_cancel_context.is_none()
+                {
+                    // This editor is idle. Do not attempt to cancel through the
+                    // global DB connection because that can interrupt a query that
+                    // is currently running in a different editor tab.
+                    store_mutex_bool(&cancel_flag, false);
+                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    app::awake();
+                    return;
+                }
+
+                if conn.is_none() && mysql_cancel_context.is_none() {
+                    // Execution may still be initializing the DB connection.
+                    // Wait briefly so a single cancel click can still interrupt reliably.
+                    for _ in 0..40 {
+                        if !load_mutex_bool(&cancel_flag) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                        conn = SqlEditorWidget::clone_current_query_connection(
+                            &current_query_connection,
+                        );
+                        mysql_cancel_context = SqlEditorWidget::clone_current_mysql_cancel_context(
+                            &current_mysql_cancel_context,
+                        );
+                        if conn.is_some() || mysql_cancel_context.is_some() {
+                            break;
+                        }
+                    }
+                }
+
+                // Re-check the cancel flag before breaking the connection. If it is
+                // already false the previous query has already finished and reset it;
+                // breaking the connection now would interrupt a newly-started query.
+                if !load_mutex_bool(&cancel_flag) {
+                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    app::awake();
+                    return;
+                }
+
+                if conn.is_none() && mysql_cancel_context.is_none() {
+                    // The worker has not published a break-able connection yet.
+                    // Keep cancel requested so execution stops at the first safe
+                    // cancellation point, and surface a status update instead of
+                    // pretending the DB-level break already happened.
+                    let _ = sender.send(UiActionResult::CancelPending);
+                    app::awake();
+                    return;
+                }
+
+                let result = if conn.is_some() {
+                    SqlEditorWidget::break_current_query_connection(conn)
+                } else {
+                    SqlEditorWidget::break_current_mysql_query(mysql_cancel_context, &cancel_flag)
+                };
+
+                let _ = sender.send(UiActionResult::Cancel(result));
                 app::awake();
-                return;
+            });
+        if let Err(err) = spawn_result {
+            let message = format!("Failed to start query cancel thread: {err}");
+            crate::utils::logging::log_error("sql_editor::cancel", &message);
+            if !SqlEditorWidget::is_query_running_flag(&spawn_error_query_running) {
+                store_mutex_bool(&spawn_error_cancel_flag, false);
             }
-
-            if conn.is_none() && mysql_cancel_context.is_none() {
-                // The worker has not published a break-able connection yet.
-                // Keep cancel requested so execution stops at the first safe
-                // cancellation point, and surface a status update instead of
-                // pretending the DB-level break already happened.
-                let _ = sender.send(UiActionResult::CancelPending);
-                app::awake();
-                return;
-            }
-
-            let result = if conn.is_some() {
-                SqlEditorWidget::break_current_query_connection(conn)
-            } else {
-                SqlEditorWidget::break_current_mysql_query(mysql_cancel_context, &cancel_flag)
-            };
-
-            let _ = sender.send(UiActionResult::Cancel(result));
+            let _ = spawn_error_sender.send(UiActionResult::Cancel(Err(message)));
             app::awake();
-        });
+        }
     }
 
     fn is_query_running_flag(query_running: &Arc<Mutex<bool>>) -> bool {

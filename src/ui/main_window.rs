@@ -633,14 +633,6 @@ impl AppState {
         released_any
     }
 
-    fn release_all_idle_pooled_db_sessions(&self) -> bool {
-        let mut released_any = self.sql_editor.release_idle_pooled_db_session();
-        for tab in &self.editor_tabs {
-            released_any |= tab.sql_editor.release_idle_pooled_db_session();
-        }
-        released_any
-    }
-
     fn oldest_lazy_fetch_session(&self) -> Option<u64> {
         self.lazy_fetch_sessions_for_abort().into_iter().min()
     }
@@ -1260,14 +1252,21 @@ fn should_finish_progress_after_lazy_fetch_close(
     finished_all_lazy_fetches
 }
 
-fn should_cancel_lazy_fetch_for_session_pool(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPoolSlotAction {
+    None,
+    CancelLazyFetch,
+}
+
+fn session_pool_slot_action(
     active_lazy_fetches: usize,
     connection_pool_size: u32,
-    released_idle_pooled_session: bool,
-) -> bool {
-    !released_idle_pooled_session
-        && active_lazy_fetches > 0
-        && active_lazy_fetches >= connection_pool_size as usize
+) -> SessionPoolSlotAction {
+    let connection_pool_size = (connection_pool_size as usize).max(1);
+    if active_lazy_fetches >= connection_pool_size {
+        return SessionPoolSlotAction::CancelLazyFetch;
+    }
+    SessionPoolSlotAction::None
 }
 
 fn request_lazy_fetch_cancel_for_session_pool(
@@ -1286,9 +1285,6 @@ fn request_lazy_fetch_cancel_for_session_pool(
         guard.mark_lazy_fetch_canceling(session_id);
         guard.set_status_message("Session pool full; canceling oldest lazy fetch...");
         guard.refresh_result_edit_controls();
-        true
-    } else if guard.release_all_idle_pooled_db_sessions() {
-        guard.set_status_message("Session pool full; released idle pooled sessions");
         true
     } else {
         guard.mark_lazy_fetch_cancelled(session_id, "Session pool full; lazy fetch already closed");
@@ -1339,14 +1335,10 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let released_idle_pooled_session = guard.release_all_idle_pooled_db_sessions();
         let active_sessions = guard.lazy_fetch_sessions_for_abort();
-        if !should_cancel_lazy_fetch_for_session_pool(
-            active_sessions.len(),
-            connection_pool_size,
-            released_idle_pooled_session,
-        ) {
-            return false;
+        match session_pool_slot_action(active_sessions.len(), connection_pool_size) {
+            SessionPoolSlotAction::None => return false,
+            SessionPoolSlotAction::CancelLazyFetch => {}
         }
         let Some(session_id) = guard.oldest_lazy_fetch_session() else {
             return false;
@@ -3888,12 +3880,7 @@ impl MainWindow {
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
-                    let released_pooled_session = s.release_all_idle_pooled_db_sessions();
-                    if released_pooled_session {
-                        s.set_status_message("Session pool full; released idle pooled sessions");
-                        drop(s);
-                        let _ = response.send(true);
-                    } else if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                    if let Some(session_id) = s.oldest_lazy_fetch_session() {
                         drop(s);
                         let requested = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -5972,16 +5959,27 @@ mod tests {
     }
 
     #[test]
-    fn session_pool_slot_check_cancels_only_when_lazy_fetches_fill_pool() {
-        assert!(!should_cancel_lazy_fetch_for_session_pool(0, 1, false));
-        assert!(!should_cancel_lazy_fetch_for_session_pool(3, 4, false));
-        assert!(should_cancel_lazy_fetch_for_session_pool(4, 4, false));
-        assert!(should_cancel_lazy_fetch_for_session_pool(5, 4, false));
+    fn session_pool_slot_action_preserves_idle_sessions_when_pool_has_room() {
+        assert_eq!(session_pool_slot_action(0, 4), SessionPoolSlotAction::None);
+        assert_eq!(session_pool_slot_action(2, 4), SessionPoolSlotAction::None);
     }
 
     #[test]
-    fn session_pool_slot_check_prefers_released_idle_session_over_lazy_cancel() {
-        assert!(!should_cancel_lazy_fetch_for_session_pool(4, 4, true));
+    fn session_pool_slot_action_does_not_release_idle_sessions_implicitly() {
+        assert_eq!(session_pool_slot_action(3, 4), SessionPoolSlotAction::None);
+        assert_eq!(session_pool_slot_action(1, 4), SessionPoolSlotAction::None);
+    }
+
+    #[test]
+    fn session_pool_slot_action_cancels_when_lazy_fetches_fill_pool() {
+        assert_eq!(
+            session_pool_slot_action(4, 4),
+            SessionPoolSlotAction::CancelLazyFetch
+        );
+        assert_eq!(
+            session_pool_slot_action(5, 4),
+            SessionPoolSlotAction::CancelLazyFetch
+        );
     }
 
     #[test]

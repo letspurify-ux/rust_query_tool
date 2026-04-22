@@ -518,18 +518,11 @@ impl MysqlExecutor {
     }
 
     fn build_cancel_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
-        let mut opts = mysql::OptsBuilder::new()
+        mysql::OptsBuilder::new()
             .ip_or_hostname(Some(&info.host))
             .tcp_port(info.port)
             .user(Some(&info.username))
-            .pass(Some(&info.password));
-
-        let database = info.service_name.trim();
-        if !database.is_empty() {
-            opts = opts.db_name(Some(database));
-        }
-
-        opts
+            .pass(Some(&info.password))
     }
 
     pub fn cancel_running_query(
@@ -1997,6 +1990,7 @@ impl MysqlObjectBrowser {
 #[cfg(test)]
 mod tests {
     use super::{MysqlExecutor, MysqlObjectBrowser, MysqlResultSetSnapshot};
+    use crate::db::connection::{ConnectionInfo, DatabaseType};
     use crate::db::query::types::ColumnInfo;
     use mysql::{Error as MysqlError, MySqlError, Value as MysqlValue};
     use std::time::Duration;
@@ -2094,6 +2088,21 @@ mod tests {
             MysqlExecutor::mysql_timeout_statement(None),
             "SET SESSION MAX_EXECUTION_TIME = 0"
         );
+    }
+
+    #[test]
+    fn mysql_cancel_connection_opts_do_not_require_current_database() {
+        let opts = mysql::Opts::from(MysqlExecutor::build_cancel_opts(&ConnectionInfo {
+            name: "local".to_string(),
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            service_name: "possibly_dropped_database".to_string(),
+            db_type: DatabaseType::MySQL,
+        }));
+
+        assert_eq!(opts.get_db_name(), None);
     }
 
     #[test]

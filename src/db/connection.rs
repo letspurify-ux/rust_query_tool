@@ -276,8 +276,8 @@ impl DbConnectionPool {
 
     fn format_mysql_pool_acquire_error(err: &mysql::Error) -> String {
         let message = err.to_string();
-        let lower = message.to_ascii_lowercase();
-        let looks_pool_exhausted = lower.contains("operation timed out");
+        let looks_pool_exhausted =
+            matches!(err, mysql::Error::DriverError(mysql::DriverError::Timeout));
         if !looks_pool_exhausted {
             return message;
         }
@@ -353,6 +353,31 @@ pub fn clear_pooled_session_lease_if_current(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let should_clear = lease.as_ref().is_some_and(|(lease_generation, existing)| {
             *lease_generation == connection_generation && existing.db_type() == db_type
+        });
+        if should_clear {
+            lease.take()
+        } else {
+            None
+        }
+    };
+    lease_to_drop.is_some()
+}
+
+pub fn clear_oracle_pooled_session_lease_if_current_connection(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    expected_conn: &Arc<Connection>,
+) -> bool {
+    let lease_to_drop = {
+        let mut lease = pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_clear = lease.as_ref().is_some_and(|(lease_generation, existing)| {
+            *lease_generation == connection_generation
+                && matches!(
+                    existing,
+                    DbSessionLease::Oracle(conn) if Arc::ptr_eq(conn, expected_conn)
+                )
         });
         if should_clear {
             lease.take()
@@ -709,6 +734,18 @@ impl DatabaseConnection {
         info: &ConnectionInfo,
         pool_size: Option<u32>,
     ) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size_and_database(info, pool_size, true)
+    }
+
+    fn build_mysql_pool_opts(info: &ConnectionInfo, pool_size: u32) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size_and_database(info, Some(pool_size), false)
+    }
+
+    fn build_mysql_opts_with_pool_size_and_database(
+        info: &ConnectionInfo,
+        pool_size: Option<u32>,
+        include_database: bool,
+    ) -> mysql::OptsBuilder {
         let mut opts = mysql::OptsBuilder::new()
             .ip_or_hostname(Some(&info.host))
             .tcp_port(info.port)
@@ -716,7 +753,7 @@ impl DatabaseConnection {
             .pass(Some(&info.password));
 
         let database = info.service_name.trim();
-        if !database.is_empty() {
+        if include_database && !database.is_empty() {
             opts = opts.db_name(Some(database));
         }
 
@@ -748,7 +785,7 @@ impl DatabaseConnection {
     }
 
     fn build_mysql_pool(info: &ConnectionInfo, pool_size: u32) -> Result<mysql::Pool, String> {
-        let opts = Self::build_mysql_opts_with_pool_size(info, Some(pool_size));
+        let opts = Self::build_mysql_pool_opts(info, pool_size);
         mysql::Pool::new(opts).map_err(|err| err.to_string())
     }
 
@@ -841,8 +878,30 @@ impl DatabaseConnection {
     }
 
     pub(crate) fn apply_mysql_connection_encoding<C: Queryable>(conn: &mut C) {
-        let database_collation = match conn.query_first::<String, _>("SELECT @@collation_database")
-        {
+        let database_collation = Self::mysql_current_database_collation(conn);
+        let statement = Self::mysql_set_names_statement(database_collation.as_deref());
+
+        if let Err(err) = conn.query_drop(statement.as_str()) {
+            eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
+        }
+    }
+
+    fn mysql_current_database_collation<C: Queryable>(conn: &mut C) -> Option<String> {
+        match conn.query_first::<String, _>(
+            "SELECT DEFAULT_COLLATION_NAME \
+             FROM INFORMATION_SCHEMA.SCHEMATA \
+             WHERE SCHEMA_NAME = DATABASE()",
+        ) {
+            Ok(Some(collation)) => return Some(collation.trim().to_string()),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to read MySQL current database collation for session setup: {err}"
+                );
+            }
+        }
+
+        match conn.query_first::<String, _>("SELECT @@collation_database") {
             Ok(value) => value.map(|collation| collation.trim().to_string()),
             Err(err) => {
                 eprintln!(
@@ -850,11 +909,6 @@ impl DatabaseConnection {
                 );
                 None
             }
-        };
-        let statement = Self::mysql_set_names_statement(database_collation.as_deref());
-
-        if let Err(err) = conn.query_drop(statement.as_str()) {
-            eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
         }
     }
 
@@ -1578,6 +1632,38 @@ mod tests {
     }
 
     #[test]
+    fn mysql_interactive_connection_opts_keep_requested_database() {
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            "root",
+            "pw",
+            "localhost",
+            3306,
+            "initial_db",
+            DatabaseType::MySQL,
+        );
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+
+        assert_eq!(opts.get_db_name(), Some("initial_db"));
+    }
+
+    #[test]
+    fn mysql_pool_opts_do_not_pin_initial_database() {
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            "root",
+            "pw",
+            "localhost",
+            3306,
+            "initial_db",
+            DatabaseType::MySQL,
+        );
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_pool_opts(&info, 4));
+
+        assert_eq!(opts.get_db_name(), None);
+    }
+
+    #[test]
     fn oracle_connection_string_uses_tns_alias_when_host_is_empty() {
         let info = ConnectionInfo::new_with_type(
             "local",
@@ -1650,6 +1736,26 @@ mod tests {
             DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci;DROP")),
             "SET NAMES utf8mb4"
         );
+    }
+
+    #[test]
+    fn mysql_pool_timeout_error_gets_actionable_exhaustion_message() {
+        let message = DbConnectionPool::format_mysql_pool_acquire_error(
+            &mysql::Error::DriverError(mysql::DriverError::Timeout),
+        );
+
+        assert!(message.contains("MySQL connection pool appears exhausted"));
+    }
+
+    #[test]
+    fn mysql_network_timeout_error_is_not_reported_as_pool_exhaustion() {
+        let err = mysql::Error::IoError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Operation timed out",
+        ));
+        let message = DbConnectionPool::format_mysql_pool_acquire_error(&err);
+
+        assert!(!message.contains("MySQL connection pool appears exhausted"));
     }
 
     #[test]

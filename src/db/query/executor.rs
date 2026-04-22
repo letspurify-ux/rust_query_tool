@@ -9446,6 +9446,7 @@ mod nested_cursor_serialization_tests {
 #[cfg(test)]
 mod oracle_lazy_fetch_integration_tests {
     use super::QueryExecutor;
+    use crate::db::{ConnectionInfo, DatabaseConnection, DatabaseType};
     use oracle::Connection;
 
     #[test]
@@ -9459,7 +9460,18 @@ mod oracle_lazy_fetch_integration_tests {
         let port = std::env::var("ORACLE_TEST_PORT").expect("ORACLE_TEST_PORT must be set");
         let service = std::env::var("ORACLE_TEST_SERVICE_NAME")
             .expect("ORACLE_TEST_SERVICE_NAME must be set");
-        let connect_string = format!("//{host}:{port}/{service}");
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            &host,
+            port.parse::<u16>()
+                .expect("ORACLE_TEST_PORT must be a valid port"),
+            &service,
+            DatabaseType::Oracle,
+        );
+        DatabaseConnection::test_connection(&info).expect("Oracle client should initialize");
+        let connect_string = info.connection_string();
         let conn = Connection::connect(&username, &password, &connect_string)
             .expect("Oracle XE connection should succeed");
 
