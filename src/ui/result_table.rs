@@ -2479,12 +2479,10 @@ impl ResultTableWidget {
                 let mut state = drag_state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if table.was_deleted() || !state.vertical_scrollbar_sequence {
-                    state.vertical_scrollbar_sequence = false;
-                    state.vertical_scrollbar_polling = false;
-                    state.vertical_scrollbar_fetch_requested = false;
-                    false
-                } else if app::pushed().is_none() {
+                if table.was_deleted()
+                    || !state.vertical_scrollbar_sequence
+                    || app::pushed().is_none()
+                {
                     state.vertical_scrollbar_sequence = false;
                     state.vertical_scrollbar_polling = false;
                     state.vertical_scrollbar_fetch_requested = false;

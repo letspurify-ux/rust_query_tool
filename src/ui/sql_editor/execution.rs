@@ -1066,7 +1066,7 @@ impl SqlEditorWidget {
                     if remaining.is_zero() {
                         return Ok((rows, false, true));
                     }
-                    let _ = conn.set_call_timeout(Some(remaining));
+                    conn.set_call_timeout(Some(remaining))?;
                 }
             }
             let Some(row_result) = result_set.next() else {
@@ -9586,14 +9586,13 @@ impl SqlEditorWidget {
             };
         }
         let should_release_session = if Self::mysql_pooled_action_can_reuse_session(&result) {
-            let can_reuse_session = Self::sync_mysql_pooled_session_info(
+            Self::sync_mysql_pooled_session_info(
                 shared_connection,
                 &mut conn,
                 log_context,
                 connection_generation,
                 refresh_encoding_after,
-            );
-            can_reuse_session
+            )
         } else {
             false
         };
