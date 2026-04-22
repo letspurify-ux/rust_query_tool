@@ -1049,6 +1049,14 @@ fn should_update_fetch_status(previous_count: usize, elapsed: Duration) -> bool 
     previous_count == 0 || elapsed >= FETCH_STATUS_UPDATE_INTERVAL
 }
 
+fn should_refresh_fetch_status_animation(
+    status_animation_running: bool,
+    previous_count: usize,
+    elapsed: Duration,
+) -> bool {
+    !status_animation_running || should_update_fetch_status(previous_count, elapsed)
+}
+
 pub struct MainWindow {
     state: Arc<Mutex<AppState>>,
 }
@@ -3479,26 +3487,36 @@ impl MainWindow {
                     };
                     let rows_len = rows.len();
                     let mut result_tabs = s.result_tabs.clone();
+                    let status_animation_was_running = s.status_animation_running;
                     let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                         return;
                     };
-                    let (previous_count, new_count) = {
+                    let status_update = {
                         let count = context.fetch_row_counts.entry(index).or_insert(0);
                         let previous_count = *count;
                         *count = previous_count.saturating_add(rows_len);
-                        (previous_count, *count)
+                        let new_count = *count;
+                        context.active_statement_index = Some(index);
+                        let status_message = format!("Fetching rows: {}", new_count);
+                        context.state_label = status_message.clone();
+                        // Throttle active animations, but restart immediately after
+                        // lazy fetch waiting has stopped the status animation.
+                        if should_refresh_fetch_status_animation(
+                            status_animation_was_running,
+                            previous_count,
+                            context.last_fetch_status_update.elapsed(),
+                        ) {
+                            context.last_fetch_status_update = Instant::now();
+                            Some(status_message)
+                        } else {
+                            None
+                        }
                     };
-                    context.active_statement_index = Some(index);
-                    context.state_label = format!("Fetching rows: {}", new_count);
-                    // Throttle status bar updates to avoid formatting a new string
-                    // and touching the label widget on every row batch.
-                    let needs_status_update = should_update_fetch_status(
-                        previous_count,
-                        context.last_fetch_status_update.elapsed(),
-                    );
-                    if needs_status_update {
-                        context.last_fetch_status_update = Instant::now();
-                        s.update_status_animation(&format!("Fetching rows: {}", new_count));
+                    if let Some(status_message) = status_update {
+                        s.update_status_animation(&status_message);
+                        if !status_animation_was_running {
+                            MainWindow::start_status_animation_timer(&state_for_progress);
+                        }
                     }
                     drop(s);
                     result_tabs.append_rows(tab_index, rows);
@@ -5793,6 +5811,29 @@ mod tests {
             FETCH_STATUS_UPDATE_INTERVAL.saturating_sub(Duration::from_millis(1))
         ));
         assert!(should_update_fetch_status(
+            100,
+            FETCH_STATUS_UPDATE_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn fetch_status_restarts_when_animation_is_stopped() {
+        assert!(should_refresh_fetch_status_animation(
+            false,
+            100,
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn fetch_status_keeps_throttle_when_animation_is_running() {
+        assert!(!should_refresh_fetch_status_animation(
+            true,
+            100,
+            FETCH_STATUS_UPDATE_INTERVAL.saturating_sub(Duration::from_millis(1))
+        ));
+        assert!(should_refresh_fetch_status_animation(
+            true,
             100,
             FETCH_STATUS_UPDATE_INTERVAL
         ));

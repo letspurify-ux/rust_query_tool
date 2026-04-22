@@ -18173,7 +18173,8 @@ END;"#;
     fn emit_select_result_uses_streaming_sized_initial_batch() {
         let (sender, receiver) = mpsc::channel();
         let session = Arc::new(Mutex::new(SessionState::default()));
-        let rows = (0..101)
+        let expected_row_count = PROGRESS_ROWS_INITIAL_BATCH + 1;
+        let rows = (0..expected_row_count)
             .map(|index| vec![format!("value_{index}")])
             .collect::<Vec<Vec<String>>>();
 
@@ -18230,7 +18231,7 @@ END;"#;
                 assert_eq!(*index, 4);
                 assert_eq!(connection_name, "LOCAL");
                 assert!(!timed_out);
-                assert_eq!(result.row_count, 101);
+                assert_eq!(result.row_count, expected_row_count);
             }
             _ => panic!("expected QueryProgress::StatementFinished"),
         }

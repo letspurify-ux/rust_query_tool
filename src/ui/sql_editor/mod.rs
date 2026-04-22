@@ -885,7 +885,9 @@ impl SqlEditorWidget {
             return false;
         }
         let command = match request {
-            LazyFetchRequest::More => LazyFetchCommand::FetchMore(100),
+            LazyFetchRequest::More => {
+                LazyFetchCommand::FetchMore(execution::PROGRESS_ROWS_INITIAL_BATCH)
+            }
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
             LazyFetchRequest::Cancel => LazyFetchCommand::Cancel,
         };

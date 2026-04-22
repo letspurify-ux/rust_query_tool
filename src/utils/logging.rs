@@ -2,7 +2,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -128,14 +129,47 @@ impl AppLog {
         Self::new()
     }
 
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::log_path()
-            .ok_or_else(|| std::io::Error::other("Log directory is unavailable"))?;
+    fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = fs::File::create(&path)?;
-        serde_json::to_writer(file, self)?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp.{}.{}",
+            LOG_FILE_NAME,
+            std::process::id(),
+            timestamp
+        ));
+
+        let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut file = fs::File::create(&tmp_path)?;
+            serde_json::to_writer(&mut file, self)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(Box::new(err));
+        }
+
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::log_path()
+            .ok_or_else(|| std::io::Error::other("Log directory is unavailable"))?;
+        self.save_to_path(&path)?;
         Ok(())
     }
 
@@ -416,6 +450,40 @@ mod logging_tests {
         assert_eq!(log.entries.len(), 10);
         assert_eq!(log.entries[0].message, "msg9");
         assert_eq!(log.entries[9].message, "msg0");
+    }
+
+    #[test]
+    fn app_log_save_writes_complete_json_without_tmp_file_leftover() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "space_query_log_save_test_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let path = dir.join(LOG_FILE_NAME);
+        let mut log = AppLog::new();
+        log.add_entry(LogEntry {
+            timestamp: "t".to_string(),
+            level: LogLevel::Info,
+            source: "test".to_string(),
+            message: "saved".to_string(),
+        });
+
+        log.save_to_path(&path).expect("log save should succeed");
+
+        let saved = fs::read_to_string(&path).expect("saved log should be readable");
+        let parsed: AppLog = serde_json::from_str(&saved).expect("saved log should be valid JSON");
+        assert_eq!(parsed.entries[0].message, "saved");
+        let leftovers = fs::read_dir(&dir)
+            .expect("log test dir should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

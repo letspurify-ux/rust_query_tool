@@ -50,10 +50,10 @@ struct SelectTransformState {
 // Flush streamed rows in bounded batches so very large fetches still surface
 // progressive UI updates without waiting for oversized buffers.
 // Send buffered rows when either:
-// - first batch reaches 100 rows
+// - first batch reaches 10,000 rows
 // - 200ms passes
 // - an additional batch reaches 10,000 rows
-pub(super) const PROGRESS_ROWS_INITIAL_BATCH: usize = 100;
+pub(super) const PROGRESS_ROWS_INITIAL_BATCH: usize = 10_000;
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
@@ -9866,6 +9866,7 @@ mod execution_startup_error_tests {
 mod mysql_batch_execution_regression_tests {
     use super::{
         LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryProgress, SqlEditorWidget,
+        PROGRESS_ROWS_INITIAL_BATCH,
     };
     use crate::db::{
         connection::{ConnectionInfo, DatabaseType},
@@ -10096,12 +10097,30 @@ mod mysql_batch_execution_regression_tests {
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
         let (sender, receiver) = mpsc::channel();
-        let sql = "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 250) SELECT n FROM seq ORDER BY n";
+        let lazy_fetch_batch = PROGRESS_ROWS_INITIAL_BATCH;
+        let total_rows = lazy_fetch_batch * 2 + 50;
+        let sql = format!(
+            "WITH digits AS (\
+                SELECT 0 AS i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 \
+                UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9\
+             ) \
+             SELECT n \
+             FROM (\
+                SELECT ones.i + tens.i * 10 + hundreds.i * 100 + thousands.i * 1000 + ten_thousands.i * 10000 + 1 AS n \
+                FROM digits ones \
+                CROSS JOIN digits tens \
+                CROSS JOIN digits hundreds \
+                CROSS JOIN digits thousands \
+                CROSS JOIN digits ten_thousands\
+             ) seq \
+             WHERE n <= {total_rows} \
+             ORDER BY n"
+        );
 
         SqlEditorWidget::execute_mysql_batch(
             &shared_connection,
             &sender,
-            sql,
+            &sql,
             "MYSQL_TEST",
             &session,
             &pooled_db_session,
@@ -10119,7 +10138,7 @@ mod mysql_batch_execution_regression_tests {
 
         let mut progress = Vec::new();
         let mut fetched_rows = 0usize;
-        while fetched_rows < 100 {
+        while fetched_rows < lazy_fetch_batch {
             let message = receiver
                 .recv_timeout(Duration::from_secs(5))
                 .expect("initial lazy fetch progress should arrive");
@@ -10132,8 +10151,8 @@ mod mysql_batch_execution_regression_tests {
         }
         assert_eq!(
             fetched_rows,
-            100,
-            "initial lazy fetch should stop at 100 rows\n{}",
+            lazy_fetch_batch,
+            "initial lazy fetch should stop at {lazy_fetch_batch} rows\n{}",
             summarize_progress(&progress)
         );
 
@@ -10144,9 +10163,9 @@ mod mysql_batch_execution_regression_tests {
             .expect("lazy fetch handle should remain active after initial batch");
         handle
             .sender
-            .send(LazyFetchCommand::FetchMore(100))
+            .send(LazyFetchCommand::FetchMore(lazy_fetch_batch))
             .expect("send first fetch more");
-        while fetched_rows < 200 {
+        while fetched_rows < lazy_fetch_batch * 2 {
             let message = receiver
                 .recv_timeout(Duration::from_secs(5))
                 .expect("second lazy fetch progress should arrive");
@@ -10159,14 +10178,14 @@ mod mysql_batch_execution_regression_tests {
         }
         assert_eq!(
             fetched_rows,
-            200,
-            "first fetch more should append exactly 100 rows\n{}",
+            lazy_fetch_batch * 2,
+            "first fetch more should append exactly {lazy_fetch_batch} rows\n{}",
             summarize_progress(&progress)
         );
 
         handle
             .sender
-            .send(LazyFetchCommand::FetchMore(100))
+            .send(LazyFetchCommand::FetchMore(lazy_fetch_batch))
             .expect("send second fetch more");
         let mut finished_row_count = None;
         let mut closed = false;
@@ -10194,11 +10213,11 @@ mod mysql_batch_execution_regression_tests {
 
         assert_eq!(
             fetched_rows,
-            250,
+            total_rows,
             "second fetch more should append the remaining 50 rows\n{}",
             summarize_progress(&progress)
         );
-        assert_eq!(finished_row_count, Some(250));
+        assert_eq!(finished_row_count, Some(total_rows));
     }
 
     #[test]
