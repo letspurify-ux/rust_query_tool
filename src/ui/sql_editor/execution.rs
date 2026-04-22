@@ -96,6 +96,8 @@ struct QueryExecutionCleanupGuard {
     query_running: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
     previous_timeout: Option<Duration>,
+    oracle_pooled_session: Option<(SharedDbSessionLease, u64, Arc<Connection>)>,
+    oracle_pooled_session_invalidated: bool,
 }
 
 impl QueryExecutionCleanupGuard {
@@ -114,12 +116,32 @@ impl QueryExecutionCleanupGuard {
             query_running,
             timeout_connection: None,
             previous_timeout: None,
+            oracle_pooled_session: None,
+            oracle_pooled_session_invalidated: false,
         }
     }
 
     fn track_timeout(&mut self, connection: Arc<Connection>, previous_timeout: Option<Duration>) {
         self.timeout_connection = Some(connection);
         self.previous_timeout = previous_timeout;
+    }
+
+    fn track_oracle_pooled_session(
+        &mut self,
+        pooled_db_session: SharedDbSessionLease,
+        connection_generation: u64,
+        connection: Arc<Connection>,
+    ) {
+        self.oracle_pooled_session = Some((pooled_db_session, connection_generation, connection));
+    }
+
+    fn invalidate_oracle_pooled_session(&mut self) {
+        self.oracle_pooled_session_invalidated = true;
+    }
+
+    fn clear_oracle_pooled_session_tracking(&mut self) {
+        self.oracle_pooled_session = None;
+        self.oracle_pooled_session_invalidated = false;
     }
 
     fn clear_timeout_tracking(&mut self) {
@@ -138,6 +160,21 @@ impl Drop for QueryExecutionCleanupGuard {
                 crate::utils::logging::log_error(
                     "sql_editor::cleanup",
                     &format!("Failed to reset Oracle call timeout: {err}"),
+                );
+            }
+        }
+
+        let should_invalidate_oracle_session = self.oracle_pooled_session_invalidated
+            || load_mutex_bool(&self.cancel_flag)
+            || std::thread::panicking();
+        if should_invalidate_oracle_session {
+            if let Some((pooled_db_session, connection_generation, conn)) =
+                self.oracle_pooled_session.as_ref()
+            {
+                crate::db::clear_oracle_pooled_session_lease_if_current_connection(
+                    pooled_db_session,
+                    *connection_generation,
+                    conn,
                 );
             }
         }
@@ -820,14 +857,6 @@ impl SqlEditorWidget {
                 .contains("unknown database")
     }
 
-    fn mysql_session_current_database(conn: &mut mysql::PooledConn) -> Result<String, String> {
-        conn.query_first::<Option<String>, _>("SELECT DATABASE()")
-            .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?
-            .flatten()
-            .map(|database| database.trim().to_string())
-            .ok_or_else(String::new)
-    }
-
     fn reset_mysql_pooled_session_to_no_database(
         conn: &mut mysql::PooledConn,
     ) -> Result<(), String> {
@@ -847,11 +876,9 @@ impl SqlEditorWidget {
             return Ok(());
         }
 
-        if Self::mysql_session_current_database(conn).as_deref() == Ok(database) {
-            crate::db::DatabaseConnection::apply_mysql_connection_encoding(conn);
-            return Ok(());
-        }
-
+        // Re-select even when SELECT DATABASE() would report the same name.
+        // A database can be dropped while an idle pooled session still carries
+        // that name as its default schema; COM_INIT_DB validates it before use.
         match conn.as_mut().select_db(database) {
             Ok(()) => {
                 crate::db::DatabaseConnection::apply_mysql_connection_encoding(conn);
@@ -3527,6 +3554,11 @@ impl SqlEditorWidget {
 
                 if let Some(conn) = conn_opt.as_ref() {
                     cleanup.track_timeout(Arc::clone(conn), previous_timeout);
+                    cleanup.track_oracle_pooled_session(
+                        Arc::clone(&pooled_db_session),
+                        connection_generation,
+                        Arc::clone(conn),
+                    );
                 }
 
                 let requires_transaction_first_statement =
@@ -5408,6 +5440,8 @@ impl SqlEditorWidget {
                                             sanitized_conn_info,
                                             next_conn_name,
                                         )) => {
+                                            crate::db::clear_pooled_session_lease(&pooled_db_session);
+                                            cleanup.clear_oracle_pooled_session_tracking();
                                             conn_opt = next_conn_opt;
                                             conn_name = next_conn_name;
                                             // Update cancel connection so break_execution() uses the new connection
@@ -5563,6 +5597,7 @@ impl SqlEditorWidget {
                                         disconnect_message,
                                     );
                                     cleanup.clear_timeout_tracking();
+                                    cleanup.clear_oracle_pooled_session_tracking();
                                     let _ = sender
                                         .send(QueryProgress::ConnectionChanged { info: None });
                                     app::awake();
@@ -5866,6 +5901,10 @@ impl SqlEditorWidget {
                                     },
                                     Err(err) => {
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                            &mut cleanup,
+                                            &err,
+                                        );
                                         QueryResult::new_error(&sql_text, &err.to_string())
                                     }
                                 };
@@ -5936,6 +5975,10 @@ impl SqlEditorWidget {
                                     },
                                     Err(err) => {
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                            &mut cleanup,
+                                            &err,
+                                        );
                                         QueryResult::new_error(&sql_text, &err.to_string())
                                     }
                                 };
@@ -6092,6 +6135,10 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                            &mut cleanup,
+                                            &err,
+                                        );
                                         let message =
                                             SqlEditorWidget::choose_execution_error_message(
                                                 cancelled,
@@ -6228,6 +6275,10 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                            SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                                &mut cleanup,
+                                                &err,
+                                            );
                                             let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -6290,6 +6341,10 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                            &mut cleanup,
+                                            &err,
+                                        );
                                         let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -6476,6 +6531,7 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::timeout_message(query_timeout);
                                                 query_result.success = false;
                                                 cursor_timed_out = true;
+                                                cleanup.invalidate_oracle_pooled_session();
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -6543,6 +6599,10 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
+                                            SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                                &mut cleanup,
+                                                &err,
+                                            );
                                             let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -6660,6 +6720,7 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::timeout_message(query_timeout);
                                                 query_result.success = false;
                                                 cursor_timed_out = true;
+                                                cleanup.invalidate_oracle_pooled_session();
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -6712,6 +6773,10 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
+                                            SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                                &mut cleanup,
+                                                &err,
+                                            );
                                             let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -6873,6 +6938,7 @@ impl SqlEditorWidget {
                                             // The lazy worker now owns this pooled connection and
                                             // restores its timeout when the cursor closes.
                                             cleanup.clear_timeout_tracking();
+                                            cleanup.clear_oracle_pooled_session_tracking();
                                             result_index += 1;
                                             continue;
                                         }
@@ -7115,6 +7181,7 @@ impl SqlEditorWidget {
                                                 query_result.success = false;
                                                 timed_out = true;
                                                 statement_interrupted = true;
+                                                cleanup.invalidate_oracle_pooled_session();
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -7136,6 +7203,10 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
                                             statement_interrupted = timed_out || cancelled;
+                                            SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                                &mut cleanup,
+                                                &err,
+                                            );
                                             let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -7317,6 +7388,10 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
+                                            &mut cleanup,
+                                            &err,
+                                        );
                                         let message =
                                             SqlEditorWidget::choose_execution_error_message(
                                                 cancelled,
@@ -9021,30 +9096,63 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let lower = err.to_string().to_ascii_lowercase();
+        Self::oracle_error_message_allows_session_reuse(&err.to_string())
+    }
+
+    fn invalidate_oracle_pooled_session_after_error(
+        cleanup: &mut QueryExecutionCleanupGuard,
+        err: &OracleError,
+    ) {
+        if !Self::oracle_error_allows_session_reuse(err) {
+            cleanup.invalidate_oracle_pooled_session();
+        }
+    }
+
+    pub(super) fn oracle_error_message_allows_session_reuse(message: &str) -> bool {
+        let trimmed = message.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed == Self::cancel_message()
+            || lower.contains("ora-01013")
+            || Self::timeout_error_message_contains_timeout_signal(trimmed)
+        {
+            return false;
+        }
+
         ![
             "dpi-1010",
+            "dpi-1002",
             "dpi-1080",
             "not connected",
             "closed connection",
+            "connection closed",
             "connection lost contact",
             "ora-00028",
             "ora-01012",
+            "ora-01033",
+            "ora-01034",
             "ora-01089",
+            "ora-03106",
+            "ora-03108",
+            "ora-03111",
             "ora-03113",
             "ora-03114",
+            "ora-03115",
             "ora-03135",
             "ora-03136",
             "ora-03137",
             "ora-03138",
             "ora-12153",
             "ora-12170",
+            "ora-12514",
             "ora-12537",
+            "ora-12541",
             "ora-12547",
             "ora-12570",
             "ora-12571",
             "ora-12592",
+            "ora-12637",
             "ora-25408",
+            "ora-28547",
             "end-of-file on communication channel",
             "tns:",
         ]
@@ -9069,13 +9177,17 @@ impl SqlEditorWidget {
             "connection lost",
             "connection refused",
             "connection reset",
+            "commands out of sync",
             "driver error",
             "drivererror",
+            "failed to read packet",
             "failed to read from socket",
+            "failed to receive packet",
             "failed to write to socket",
             "lost connection",
             "not connected to database",
             "operation timed out",
+            "packet out of order",
             "packets out of order",
             "server has gone away",
         ]
@@ -9135,6 +9247,28 @@ impl SqlEditorWidget {
         }
     }
 
+    fn prepare_mysql_pooled_session_or_retry_once(
+        context: &crate::db::DbPoolSessionContext,
+        session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
+        mut conn: mysql::PooledConn,
+    ) -> Result<mysql::PooledConn, String> {
+        match Self::prepare_mysql_pooled_session_database(&mut conn, &context.current_service_name)
+        {
+            Ok(()) => Ok(conn),
+            Err(message) if !Self::mysql_error_allows_session_reuse(&message) => {
+                drop(conn);
+                let mut conn =
+                    Self::acquire_fresh_mysql_pool_session(context, session_pool_sender)?;
+                Self::prepare_mysql_pooled_session_database(
+                    &mut conn,
+                    &context.current_service_name,
+                )?;
+                Ok(conn)
+            }
+            Err(message) => Err(message),
+        }
+    }
+
     fn acquire_mysql_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
@@ -9162,18 +9296,16 @@ impl SqlEditorWidget {
                 conn
             } else {
                 drop(conn);
-                let mut conn =
-                    Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
-                Self::prepare_mysql_pooled_session_database(
-                    &mut conn,
-                    &context.current_service_name,
-                )?;
-                conn
+                let conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+                Self::prepare_mysql_pooled_session_or_retry_once(
+                    &context,
+                    session_pool_sender,
+                    conn,
+                )?
             }
         } else {
-            let mut conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
-            Self::prepare_mysql_pooled_session_database(&mut conn, &context.current_service_name)?;
-            conn
+            let conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+            Self::prepare_mysql_pooled_session_or_retry_once(&context, session_pool_sender, conn)?
         };
         conn.query_drop(if auto_commit {
             "SET autocommit=1"
@@ -10046,6 +10178,9 @@ mod query_execution_cleanup_tests {
             Ok(Err("Connection lost while reading packet".to_string()));
         let driver_error: std::thread::Result<Result<(), String>> =
             Ok(Err("DriverError { Packet out of order }".to_string()));
+        let protocol_error: std::thread::Result<Result<(), String>> = Ok(Err(
+            "Commands out of sync; you can't run this command now".to_string(),
+        ));
         let cancel_error: std::thread::Result<Result<(), String>> =
             Ok(Err(SqlEditorWidget::cancel_message()));
         let timeout_error: std::thread::Result<Result<(), String>> = Ok(Err(
@@ -10060,6 +10195,9 @@ mod query_execution_cleanup_tests {
         ));
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &driver_error
+        ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
+            &protocol_error
         ));
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &cancel_error
@@ -10077,6 +10215,12 @@ mod query_execution_cleanup_tests {
         );
 
         assert!(!SqlEditorWidget::oracle_error_allows_session_reuse(&err));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "DPI-1080: connection was closed by ORA-03113"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "DPI-1067: call timeout of 5000 ms exceeded with ORA-01013"
+        ));
     }
 
     #[test]

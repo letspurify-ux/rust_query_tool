@@ -1421,8 +1421,15 @@ impl SqlEditorWidget {
                                 if load_mutex_bool(&cancel_flag) {
                                     let _ = db_conn.break_execution();
                                 }
-                                QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
-                                    .map_err(|err| err.to_string())
+                                SqlEditorWidget::run_oracle_action_with_timeout(
+                                    db_conn,
+                                    query_timeout,
+                                    "Generating explain plan",
+                                    |db_conn| {
+                                        QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
+                                            .map_err(|err| err.to_string())
+                                    },
+                                )
                             }
                             Err(message) => Err(message),
                         }
@@ -1600,6 +1607,42 @@ impl SqlEditorWidget {
         Self::invoke_status_callback(&self.status_callback, message);
     }
 
+    fn run_oracle_action_with_timeout<T, F>(
+        db_conn: Arc<Connection>,
+        query_timeout: Option<Duration>,
+        log_context: &str,
+        action: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(Arc<Connection>) -> Result<T, String>,
+    {
+        let previous_timeout = db_conn
+            .call_timeout()
+            .map_err(|err| format!("Failed to read Oracle call timeout: {err}"))?;
+        db_conn
+            .set_call_timeout(query_timeout)
+            .map_err(|err| format!("Failed to apply Oracle call timeout: {err}"))?;
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| action(Arc::clone(&db_conn))));
+        let reset_result = db_conn
+            .set_call_timeout(previous_timeout)
+            .map_err(|err| format!("Failed to reset Oracle call timeout: {err}"));
+
+        match result {
+            Ok(Ok(value)) => reset_result.map(|_| value),
+            Ok(Err(message)) => match reset_result {
+                Ok(()) => Err(message),
+                Err(reset_message) => Err(format!("{message}; {reset_message}")),
+            },
+            Err(payload) => {
+                if let Err(reset_message) = reset_result {
+                    crate::utils::logging::log_error(log_context, &reset_message);
+                }
+                panic::resume_unwind(payload);
+            }
+        }
+    }
+
     fn spawn_tracked_transaction_action<F>(
         &self,
         activity_label: &'static str,
@@ -1662,9 +1705,10 @@ impl SqlEditorWidget {
 
                 let result = match conn_guard.db_type().execution_engine() {
                     crate::db::DbExecutionEngine::Oracle => {
+                        let connection_generation = conn_guard.connection_generation();
                         let pooled_conn = SqlEditorWidget::current_oracle_pooled_lease(
                             &pooled_db_session,
-                            conn_guard.connection_generation(),
+                            connection_generation,
                         );
                         if let Some(db_conn) = pooled_conn {
                             SqlEditorWidget::set_current_query_connection(
@@ -1674,7 +1718,28 @@ impl SqlEditorWidget {
                             if load_mutex_bool(&cancel_flag) {
                                 let _ = db_conn.break_execution();
                             }
-                            oracle_action(db_conn)
+                            let result = SqlEditorWidget::run_oracle_action_with_timeout(
+                                Arc::clone(&db_conn),
+                                query_timeout,
+                                activity_label,
+                                oracle_action,
+                            );
+                            if result
+                                .as_ref()
+                                .err()
+                                .is_some_and(|message| {
+                                    !SqlEditorWidget::oracle_error_message_allows_session_reuse(
+                                        message,
+                                    )
+                                })
+                            {
+                                crate::db::clear_oracle_pooled_session_lease_if_current_connection(
+                                    &pooled_db_session,
+                                    connection_generation,
+                                    &db_conn,
+                                );
+                            }
+                            result
                         } else {
                             match conn_guard.require_live_connection() {
                                 Ok(db_conn) => {
@@ -1685,7 +1750,12 @@ impl SqlEditorWidget {
                                     if load_mutex_bool(&cancel_flag) {
                                         let _ = db_conn.break_execution();
                                     }
-                                    oracle_action(db_conn)
+                                    SqlEditorWidget::run_oracle_action_with_timeout(
+                                        db_conn,
+                                        query_timeout,
+                                        activity_label,
+                                        oracle_action,
+                                    )
                                 }
                                 Err(message) => Err(message),
                             }
