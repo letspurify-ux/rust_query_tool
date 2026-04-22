@@ -2526,25 +2526,44 @@ impl SqlEditorWidget {
                             );
                         }
                         ToolCommand::SetAutoCommit { enabled } => {
-                            {
+                            let connection_generation = {
                                 let mut conn_guard = lock_connection_with_activity(
                                     shared_connection,
                                     db_activity.to_string(),
                                 );
                                 conn_guard.set_auto_commit(enabled);
-                            }
-                            crate::db::clear_pooled_session_lease(pooled_db_session);
+                                conn_guard.connection_generation()
+                            };
                             auto_commit = enabled;
-                            SqlEditorWidget::emit_script_message(
-                                sender,
-                                session,
-                                "SET AUTOCOMMIT",
-                                if enabled {
-                                    "Auto-commit enabled"
-                                } else {
-                                    "Auto-commit disabled"
-                                },
-                            );
+                            match SqlEditorWidget::apply_mysql_autocommit_to_reusable_pooled_session(
+                                shared_connection,
+                                pooled_db_session,
+                                connection_generation,
+                                enabled,
+                                db_activity,
+                            ) {
+                                Ok(()) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SET AUTOCOMMIT",
+                                        if enabled {
+                                            "Auto-commit enabled"
+                                        } else {
+                                            "Auto-commit disabled"
+                                        },
+                                    );
+                                }
+                                Err(message) => {
+                                    SqlEditorWidget::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SET AUTOCOMMIT",
+                                        &format!("Error: {}", message),
+                                    );
+                                    command_error = true;
+                                }
+                            }
                             let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
                             app::awake();
                         }
@@ -9127,6 +9146,7 @@ impl SqlEditorWidget {
             "connection closed",
             "connection lost contact",
             "ora-00028",
+            "ora-02396",
             "ora-01012",
             "ora-01033",
             "ora-01034",
@@ -9154,6 +9174,7 @@ impl SqlEditorWidget {
             "ora-25408",
             "ora-28547",
             "end-of-file on communication channel",
+            "exceeded maximum idle time",
             "tns:",
         ]
         .iter()
@@ -9178,18 +9199,26 @@ impl SqlEditorWidget {
             "connection refused",
             "connection reset",
             "commands out of sync",
+            "communications link failure",
+            "can't connect to mysql server",
             "driver error",
             "drivererror",
+            "error 2006",
+            "error 2013",
             "failed to read packet",
             "failed to read from socket",
             "failed to receive packet",
             "failed to write to socket",
             "lost connection",
+            "malformed packet",
             "not connected to database",
             "operation timed out",
             "packet out of order",
             "packets out of order",
+            "server closed the connection",
+            "server has closed the connection",
             "server has gone away",
+            "unexpected eof",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
@@ -9345,6 +9374,39 @@ impl SqlEditorWidget {
         } else {
             drop(conn);
         }
+    }
+
+    fn apply_mysql_autocommit_to_reusable_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        enabled: bool,
+        db_activity: &str,
+    ) -> Result<(), String> {
+        let Some(mut conn) = crate::db::take_reusable_pooled_session_lease(
+            pooled_db_session,
+            connection_generation,
+            crate::db::DatabaseType::MySQL,
+        )
+        .and_then(DbSessionLease::into_mysql_connection) else {
+            return Ok(());
+        };
+
+        conn.query_drop(if enabled {
+            "SET autocommit=1"
+        } else {
+            "SET autocommit=0"
+        })
+        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+
+        Self::release_mysql_pooled_session_if_current(
+            shared_connection,
+            pooled_db_session,
+            connection_generation,
+            conn,
+            db_activity,
+        );
+        Ok(())
     }
 
     fn mysql_pooled_action_can_reuse_session<T>(
@@ -10208,6 +10270,24 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn mysql_session_reuse_rejects_server_disconnect_variants() {
+        for message in [
+            "ERROR 2006 (HY000): MySQL server has gone away",
+            "ERROR 2013 (HY000): Lost connection to MySQL server during query",
+            "Communications link failure: server closed the connection",
+            "DriverError { Malformed packet }",
+            "unexpected EOF while reading packet",
+            "Can't connect to MySQL server on '127.0.0.1'",
+        ] {
+            let result: std::thread::Result<Result<(), String>> = Ok(Err(message.to_string()));
+            assert!(
+                !SqlEditorWidget::mysql_pooled_action_can_reuse_session(&result),
+                "message should force pooled session drop: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn oracle_session_reuse_rejects_connection_loss_errors() {
         let err = OracleError::new(
             OracleErrorKind::InternalError,
@@ -10220,6 +10300,9 @@ mod query_execution_cleanup_tests {
         ));
         assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
             "DPI-1067: call timeout of 5000 ms exceeded with ORA-01013"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "ORA-02396: exceeded maximum idle time, please connect again"
         ));
     }
 
@@ -10929,6 +11012,26 @@ mod mysql_batch_execution_regression_tests {
         assert_mysql_batch_script_reaches_final_status_pass(
             include_str!("../../../test_mariadb/test7.txt"),
             "mysql test7 regression",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_set_autocommit_on_preserves_and_commits_pooled_transaction() {
+        assert_mysql_batch_script_reaches_final_status_pass(
+            "\
+DROP TABLE IF EXISTS qt_pool_autocommit_regression;
+CREATE TABLE qt_pool_autocommit_regression (id INT PRIMARY KEY);
+SET AUTOCOMMIT OFF;
+INSERT INTO qt_pool_autocommit_regression (id) VALUES (1);
+SET AUTOCOMMIT ON;
+ROLLBACK;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE WHEN COUNT(*) = 1 THEN 'PASS' ELSE CONCAT('FAIL count=', COUNT(*)) END AS status
+FROM qt_pool_autocommit_regression;
+DROP TABLE IF EXISTS qt_pool_autocommit_regression;
+",
+            "mysql pooled autocommit regression",
         );
     }
 }
