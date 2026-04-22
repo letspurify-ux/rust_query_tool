@@ -3553,7 +3553,8 @@ impl MainWindow {
                     result_tabs.set_lazy_fetch_session(tab_index, session_id);
                 }
                 QueryProgress::LazyFetchWaiting { index, session_id } => {
-                    if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                    let tab_count = s.result_tabs.tab_count();
+                    let tab_index = if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
                         if context.closed_statement_indices.contains(&index) {
                             return;
                         }
@@ -3562,10 +3563,19 @@ impl MainWindow {
                         }
                         context.active_statement_index = Some(index);
                         context.state_label = "Waiting for lazy fetch".to_string();
+                        resolve_progress_tab_index(
+                            tab_count,
+                            context.result_tab_offset,
+                            context.execution_target,
+                            index,
+                        )
                     } else {
                         return;
-                    }
+                    };
+                    let mut result_tabs = s.result_tabs.clone();
                     s.set_status_message("Waiting for lazy fetch");
+                    drop(s);
+                    result_tabs.mark_lazy_fetch_waiting(tab_index);
                 }
                 QueryProgress::LazyFetchClosed {
                     index,
@@ -3640,9 +3650,7 @@ impl MainWindow {
                 QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
                     let released_pooled_session = s.release_all_idle_pooled_db_sessions();
                     if released_pooled_session {
-                        s.set_status_message(
-                            "Session pool full; released idle pooled sessions",
-                        );
+                        s.set_status_message("Session pool full; released idle pooled sessions");
                         drop(s);
                         let _ = response.send(true);
                     } else if let Some(session_id) =

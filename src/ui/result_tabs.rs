@@ -37,6 +37,8 @@ pub struct ResultTabsWidget {
 struct ResultTab {
     group: Group,
     table: ResultTableWidget,
+    status: ResultTabStatus,
+    row_count: usize,
 }
 
 #[derive(Clone)]
@@ -44,6 +46,29 @@ struct ScriptOutputTab {
     group: Group,
     display: TextDisplay,
     buffer: TextBuffer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultTabStatus {
+    Running,
+    Fetching,
+    Waiting,
+    Done,
+    Error,
+    Cancelled,
+}
+
+impl ResultTabStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Fetching => "Fetching",
+            Self::Waiting => "Waiting",
+            Self::Done => "Done",
+            Self::Error => "Error",
+            Self::Cancelled => "Cancelled",
+        }
+    }
 }
 
 struct PointerEventSuppressGuard {
@@ -239,6 +264,47 @@ impl ResultTabsWidget {
         if cut > 0 {
             buffer.remove(0, cut as i32);
         }
+    }
+
+    fn result_tab_label(status: ResultTabStatus, row_count: usize) -> String {
+        format!("{} ({})", status.label(), row_count)
+    }
+
+    fn update_tab_group_label(
+        &mut self,
+        mut group: Group,
+        status: ResultTabStatus,
+        row_count: usize,
+    ) {
+        if self.tabs.was_deleted() || group.was_deleted() {
+            return;
+        }
+        group.set_label(&Self::result_tab_label(status, row_count));
+        group.redraw();
+        self.tabs.redraw();
+    }
+
+    fn set_result_tab_state(
+        &mut self,
+        index: usize,
+        status: ResultTabStatus,
+        row_count: usize,
+    ) -> Option<(Group, ResultTableWidget)> {
+        let tab_parts = {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get_mut(index).map(|tab| {
+                tab.status = status;
+                tab.row_count = row_count;
+                (tab.group.clone(), tab.table.clone())
+            })
+        };
+        if let Some((group, _)) = tab_parts.as_ref() {
+            self.update_tab_group_label(group.clone(), status, row_count);
+        }
+        tab_parts
     }
 
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
@@ -555,16 +621,12 @@ impl ResultTabsWidget {
         script_output.display.show_insert_position();
     }
 
-    pub fn start_statement(&mut self, index: usize, label: &str) {
+    pub fn start_statement(&mut self, index: usize, _label: &str) {
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
-        let existing_group = {
-            self.data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(index)
-                .map(|tab| tab.group.clone())
-        };
+        let existing_group = self
+            .set_result_tab_state(index, ResultTabStatus::Running, 0)
+            .map(|(group, _)| group);
         if let Some(group) = existing_group {
             // Extract the group before calling set_value to avoid re-entrant borrow
             // when the tabs callback fires
@@ -579,7 +641,8 @@ impl ResultTabsWidget {
         self.tabs.begin();
         // Use explicit tab content bounds to avoid relying on hard-coded header height.
         let (x, y, w, h) = Self::content_bounds(&self.tabs);
-        let mut group = Group::new(x, y, w, h, None).with_label(label);
+        let mut group = Group::new(x, y, w, h, None)
+            .with_label(&Self::result_tab_label(ResultTabStatus::Running, 0));
         group.set_color(theme::panel_bg());
         group.set_label_color(theme::text_secondary());
         group.set_align(Align::Center | Align::Inside);
@@ -619,7 +682,12 @@ impl ResultTabsWidget {
                 .data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.push(ResultTab { group, table });
+            data.push(ResultTab {
+                group,
+                table,
+                status: ResultTabStatus::Running,
+                row_count: 0,
+            });
             let idx = data.len().saturating_sub(1);
             let group = data.get(idx).map(|tab| tab.group.clone());
             (idx, group)
@@ -639,11 +707,8 @@ impl ResultTabsWidget {
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
         let table = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-            .map(|tab| tab.table.clone());
+            .set_result_tab_state(index, ResultTabStatus::Fetching, 0)
+            .map(|(_, table)| table);
         if let Some(mut table) = table {
             table.set_null_text(null_text);
             table.start_streaming(columns);
@@ -652,12 +717,19 @@ impl ResultTabsWidget {
     }
 
     pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
-        let table = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-            .map(|tab| tab.table.clone());
+        let rows_len = rows.len();
+        let table = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get(index)
+                .map(|tab| (tab.row_count.saturating_add(rows_len), tab.table.clone()))
+        }
+        .and_then(|(row_count, table)| {
+            self.set_result_tab_state(index, ResultTabStatus::Fetching, row_count)
+                .map(|_| table)
+        });
         if let Some(mut table) = table {
             table.append_rows(rows);
         }
@@ -689,13 +761,34 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
-        let table = self
+    pub fn mark_lazy_fetch_waiting(&mut self, index: usize) {
+        let row_count = self
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(index)
-            .map(|tab| tab.table.clone());
+            .map(|tab| tab.row_count);
+        if let Some(row_count) = row_count {
+            self.set_result_tab_state(index, ResultTabStatus::Waiting, row_count);
+        }
+        self.fire_on_change_callback();
+    }
+
+    pub fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
+        let tab_parts = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| (tab.row_count, tab.table.clone()));
+        let table = if let Some((row_count, table)) = tab_parts {
+            if !run_pending {
+                self.set_result_tab_state(index, ResultTabStatus::Done, row_count);
+            }
+            Some(table)
+        } else {
+            None
+        };
         if let Some(mut table) = table {
             table.clear_lazy_fetch_session(session_id, run_pending);
         }
@@ -703,21 +796,34 @@ impl ResultTabsWidget {
     }
 
     pub fn abort_lazy_fetch_session(&mut self, session_id: u64) -> bool {
-        let tables: Vec<ResultTableWidget> = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter_map(|tab| {
-                if tab.table.active_lazy_fetch_session() == Some(session_id) {
-                    Some(tab.table.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if tables.is_empty() {
+        let tab_updates: Vec<(usize, ResultTabStatus, usize, ResultTableWidget)> = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.iter()
+                .enumerate()
+                .filter_map(|(index, tab)| {
+                    if tab.table.active_lazy_fetch_session() == Some(session_id) {
+                        let status = if tab.status == ResultTabStatus::Error {
+                            ResultTabStatus::Error
+                        } else {
+                            ResultTabStatus::Cancelled
+                        };
+                        Some((index, status, tab.row_count, tab.table.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if tab_updates.is_empty() {
             return false;
+        }
+        let mut tables = Vec::with_capacity(tab_updates.len());
+        for (index, status, row_count, table) in tab_updates {
+            self.set_result_tab_state(index, status, row_count);
+            tables.push(table);
         }
         for mut table in tables {
             table.clear_lazy_fetch_session(session_id, false);
@@ -819,13 +925,16 @@ impl ResultTabsWidget {
     }
 
     pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
-        if let Some(tab) = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-        {
-            let mut table = tab.table.clone();
+        let status = if result.success {
+            ResultTabStatus::Done
+        } else {
+            ResultTabStatus::Error
+        };
+        let table = self
+            .set_result_tab_state(index, status, result.row_count)
+            .map(|(_, table)| table);
+        if let Some(table) = table {
+            let mut table = table;
             table.display_result(result);
         }
         self.fire_on_change_callback();
@@ -1163,7 +1272,7 @@ mod tests {
     use crate::ui::result_table::LazyFetchCallback;
     use crate::ui::sql_editor::LazyFetchRequest;
 
-    use super::ResultTabsWidget;
+    use super::{ResultTabStatus, ResultTabsWidget};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1187,6 +1296,26 @@ mod tests {
         ));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 0, 240));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 320, 0));
+    }
+
+    #[test]
+    fn result_tab_label_uses_status_and_row_count() {
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Running, 0),
+            "Running (0)"
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Fetching, 42),
+            "Fetching (42)"
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Done, 128),
+            "Done (128)"
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Error, 0),
+            "Error (0)"
+        );
     }
 
     #[test]
