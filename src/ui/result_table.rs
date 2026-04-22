@@ -74,6 +74,9 @@ const MAX_HITTEST_ROW_BACKTRACK: i32 = 4096;
 /// Limit stale column-position fallback scans for very wide result sets.
 const MAX_HITTEST_COL_BACKTRACK: i32 = 512;
 const HEADER_SORT_CLICK_MOVE_TOLERANCE_PX: u32 = 4;
+const LAZY_FETCH_SCROLL_THRESHOLD_NUMERATOR: i64 = 1;
+const LAZY_FETCH_SCROLL_THRESHOLD_DENOMINATOR: i64 = 1;
+const LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const SORT_ASC_MARK: &str = "▲";
 const SORT_DESC_MARK: &str = "▼";
 
@@ -247,12 +250,16 @@ pub struct ResultTableWidget {
     lazy_fetch_more_in_flight: Arc<Mutex<HashSet<u64>>>,
     pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
     sort_state: Arc<Mutex<Option<ColumnSortState>>>,
+    drag_state: Arc<Mutex<DragState>>,
 }
 
 #[derive(Default)]
 struct DragState {
     is_dragging: bool,
     consume_background_pointer_sequence: bool,
+    vertical_scrollbar_sequence: bool,
+    vertical_scrollbar_polling: bool,
+    vertical_scrollbar_fetch_requested: bool,
     header_sort_candidate_col: Option<i32>,
     header_sort_requires_double_click: bool,
     header_sort_start_x: i32,
@@ -1349,6 +1356,7 @@ impl ResultTableWidget {
         let pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
+        let drag_state = Arc::new(Mutex::new(DragState::default()));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -1571,7 +1579,7 @@ impl ResultTableWidget {
 
         // Setup event handler for mouse selection and keyboard shortcuts
         let headers_for_handle = headers.clone();
-        let drag_state_for_handle = Arc::new(Mutex::new(DragState::default()));
+        let drag_state_for_handle = drag_state.clone();
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
@@ -1595,12 +1603,51 @@ impl ResultTableWidget {
             }
             match ev {
                 Event::Push => {
-                    // Let FLTK handle clicks on embedded scrollbar widgets.
-                    if Self::is_mouse_on_table_scrollbar(
+                    let mouse_x = app::event_x();
+                    let mouse_y = app::event_y();
+                    if Self::is_mouse_on_vertical_table_scrollbar(
                         &table_for_handle,
-                        app::event_x(),
-                        app::event_y(),
+                        mouse_x,
+                        mouse_y,
                     ) {
+                        let should_start_scrollbar_poll = {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.vertical_scrollbar_sequence = true;
+                            state.vertical_scrollbar_fetch_requested = false;
+                            if state.vertical_scrollbar_polling {
+                                false
+                            } else {
+                                state.vertical_scrollbar_polling = true;
+                                true
+                            }
+                        };
+                        Self::request_lazy_fetch_more_for_scrollbar_sequence(
+                            &table_for_handle,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &lazy_fetch_more_in_flight_for_handle,
+                            &drag_state_for_handle,
+                        );
+                        if should_start_scrollbar_poll {
+                            Self::start_vertical_scrollbar_lazy_fetch_poll(
+                                table_for_handle.clone(),
+                                lazy_fetch_session_for_handle.clone(),
+                                lazy_fetch_callback_for_handle.clone(),
+                                lazy_fetch_more_in_flight_for_handle.clone(),
+                                drag_state_for_handle.clone(),
+                            );
+                        }
+                        return false;
+                    }
+                    // Let FLTK handle clicks on embedded scrollbar widgets.
+                    if Self::is_mouse_on_table_scrollbar(&table_for_handle, mouse_x, mouse_y) {
+                        let mut state = drag_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.vertical_scrollbar_sequence = false;
+                        state.vertical_scrollbar_fetch_requested = false;
                         return false;
                     }
                     let button = app::event_button();
@@ -1636,6 +1683,8 @@ impl ResultTableWidget {
                                 state.header_sort_start_y = app::event_y();
                                 state.is_dragging = false;
                                 state.consume_background_pointer_sequence = false;
+                                state.vertical_scrollbar_sequence = false;
+                                state.vertical_scrollbar_fetch_requested = false;
                                 return true;
                             }
                         }
@@ -1646,6 +1695,8 @@ impl ResultTableWidget {
                             state.header_sort_candidate_col = None;
                             state.header_sort_requires_double_click = false;
                             state.consume_background_pointer_sequence = false;
+                            state.vertical_scrollbar_sequence = false;
+                            state.vertical_scrollbar_fetch_requested = false;
                         }
                         let target_cell = if app::event_clicks() {
                             // On double-click, prefer the already-selected single cell.
@@ -1715,6 +1766,8 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.is_dragging = true;
                             state.consume_background_pointer_sequence = false;
+                            state.vertical_scrollbar_sequence = false;
+                            state.vertical_scrollbar_fetch_requested = false;
                             drop(state);
 
                             if let Some((row_start, col_start, row_end, col_end)) = next_selection {
@@ -1744,6 +1797,8 @@ impl ResultTableWidget {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.is_dragging = false;
                             state.consume_background_pointer_sequence = true;
+                            state.vertical_scrollbar_sequence = false;
+                            state.vertical_scrollbar_fetch_requested = false;
                             drop(state);
 
                             if table_for_handle.try_get_selection().is_some() {
@@ -1759,6 +1814,7 @@ impl ResultTableWidget {
                     let (
                         is_dragging,
                         consume_background_pointer_sequence,
+                        vertical_scrollbar_sequence,
                         header_sort_candidate,
                         header_sort_requires_double_click,
                         header_start_x,
@@ -1770,12 +1826,23 @@ impl ResultTableWidget {
                         (
                             state.is_dragging,
                             state.consume_background_pointer_sequence,
+                            state.vertical_scrollbar_sequence,
                             state.header_sort_candidate_col,
                             state.header_sort_requires_double_click,
                             state.header_sort_start_x,
                             state.header_sort_start_y,
                         )
                     };
+                    if vertical_scrollbar_sequence {
+                        Self::request_lazy_fetch_more_for_scrollbar_sequence(
+                            &table_for_handle,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &lazy_fetch_more_in_flight_for_handle,
+                            &drag_state_for_handle,
+                        );
+                        return false;
+                    }
                     if header_sort_candidate.is_some() {
                         if !header_sort_requires_double_click {
                             let mut state = drag_state_for_handle
@@ -1819,6 +1886,8 @@ impl ResultTableWidget {
                         header_sort_requires_double_click,
                         was_dragging,
                         consumed_background_pointer_sequence,
+                        vertical_scrollbar_sequence,
+                        vertical_scrollbar_fetch_requested,
                     ) = {
                         let mut state = drag_state_for_handle
                             .lock()
@@ -1826,6 +1895,12 @@ impl ResultTableWidget {
                         let header_candidate = state.header_sort_candidate_col.take();
                         let header_is_double_click = state.header_sort_requires_double_click;
                         state.header_sort_requires_double_click = false;
+                        let vertical_scrollbar_sequence = state.vertical_scrollbar_sequence;
+                        let vertical_scrollbar_fetch_requested =
+                            state.vertical_scrollbar_fetch_requested;
+                        state.vertical_scrollbar_sequence = false;
+                        state.vertical_scrollbar_polling = false;
+                        state.vertical_scrollbar_fetch_requested = false;
                         let consumed_background = state.consume_background_pointer_sequence;
                         state.consume_background_pointer_sequence = false;
                         let dragging = state.is_dragging;
@@ -1837,8 +1912,21 @@ impl ResultTableWidget {
                             header_is_double_click,
                             dragging,
                             consumed_background,
+                            vertical_scrollbar_sequence,
+                            vertical_scrollbar_fetch_requested,
                         )
                     };
+                    if vertical_scrollbar_sequence {
+                        if !vertical_scrollbar_fetch_requested {
+                            Self::request_lazy_fetch_more_near_bottom(
+                                &table_for_handle,
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &lazy_fetch_more_in_flight_for_handle,
+                            );
+                        }
+                        return false;
+                    }
                     if let Some(col) = header_sort_candidate {
                         if col >= 0
                             && header_sort_requires_double_click
@@ -2194,6 +2282,7 @@ impl ResultTableWidget {
             lazy_fetch_more_in_flight,
             pending_lazy_actions,
             sort_state,
+            drag_state,
         }
     }
 
@@ -2281,7 +2370,26 @@ impl ResultTableWidget {
         let visible_rows = Self::visible_row_metrics(data_top, data_bottom, row_h)
             .map(|(rows, _)| rows)
             .unwrap_or(1);
-        first_visible.saturating_add(visible_rows).saturating_add(1) >= rows
+        Self::is_lazy_fetch_scroll_threshold_reached(first_visible, visible_rows, rows)
+    }
+
+    fn is_lazy_fetch_scroll_threshold_reached(
+        first_visible: i32,
+        visible_rows: i32,
+        rows: i32,
+    ) -> bool {
+        if rows <= 0 {
+            return false;
+        }
+        let visible_rows = visible_rows.max(1);
+        let max_scroll_start = rows.saturating_sub(visible_rows);
+        if max_scroll_start <= 0 {
+            return true;
+        }
+
+        let first_visible = first_visible.clamp(0, max_scroll_start);
+        i64::from(first_visible) * LAZY_FETCH_SCROLL_THRESHOLD_DENOMINATOR
+            >= i64::from(max_scroll_start) * LAZY_FETCH_SCROLL_THRESHOLD_NUMERATOR
     }
 
     fn request_lazy_fetch_more_for_session(
@@ -2289,22 +2397,23 @@ impl ResultTableWidget {
         session: &Arc<Mutex<Option<u64>>>,
         callback: &LazyFetchCallback,
         in_flight: &Arc<Mutex<HashSet<u64>>>,
-    ) {
+    ) -> bool {
         let active_session_id = *session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if active_session_id != Some(session_id) {
-            return;
+            return false;
         }
 
         let mut guard = in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !guard.insert(session_id) {
-            return;
+            return false;
         }
         drop(guard);
         Self::invoke_lazy_fetch_callback(callback, session_id, LazyFetchRequest::More);
+        true
     }
 
     fn request_lazy_fetch_more_near_bottom(
@@ -2312,16 +2421,97 @@ impl ResultTableWidget {
         session: &Arc<Mutex<Option<u64>>>,
         callback: &LazyFetchCallback,
         in_flight: &Arc<Mutex<HashSet<u64>>>,
-    ) {
+    ) -> bool {
         let session_id = *session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(session_id) = session_id else {
-            return;
+            return false;
         };
         if Self::is_table_near_bottom(table) {
-            Self::request_lazy_fetch_more_for_session(session_id, session, callback, in_flight);
+            return Self::request_lazy_fetch_more_for_session(
+                session_id, session, callback, in_flight,
+            );
         }
+        false
+    }
+
+    fn request_lazy_fetch_more_for_scrollbar_sequence(
+        table: &Table,
+        session: &Arc<Mutex<Option<u64>>>,
+        callback: &LazyFetchCallback,
+        in_flight: &Arc<Mutex<HashSet<u64>>>,
+        drag_state: &Arc<Mutex<DragState>>,
+    ) {
+        if !Self::is_table_near_bottom(table) {
+            drag_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vertical_scrollbar_fetch_requested = false;
+            return;
+        }
+        {
+            let mut state = drag_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.vertical_scrollbar_fetch_requested {
+                return;
+            }
+            state.vertical_scrollbar_fetch_requested = true;
+        }
+        if !Self::request_lazy_fetch_more_near_bottom(table, session, callback, in_flight) {
+            drag_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vertical_scrollbar_fetch_requested = false;
+        }
+    }
+
+    fn start_vertical_scrollbar_lazy_fetch_poll(
+        table: Table,
+        session: Arc<Mutex<Option<u64>>>,
+        callback: LazyFetchCallback,
+        in_flight: Arc<Mutex<HashSet<u64>>>,
+        drag_state: Arc<Mutex<DragState>>,
+    ) {
+        app::add_timeout3(LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS, move |_| {
+            let should_continue = {
+                let mut state = drag_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if table.was_deleted() || !state.vertical_scrollbar_sequence {
+                    state.vertical_scrollbar_sequence = false;
+                    state.vertical_scrollbar_polling = false;
+                    state.vertical_scrollbar_fetch_requested = false;
+                    false
+                } else if app::pushed().is_none() {
+                    state.vertical_scrollbar_sequence = false;
+                    state.vertical_scrollbar_polling = false;
+                    state.vertical_scrollbar_fetch_requested = false;
+                    false
+                } else {
+                    true
+                }
+            };
+            if !should_continue {
+                return;
+            }
+
+            Self::request_lazy_fetch_more_for_scrollbar_sequence(
+                &table,
+                &session,
+                &callback,
+                &in_flight,
+                &drag_state,
+            );
+            Self::start_vertical_scrollbar_lazy_fetch_poll(
+                table.clone(),
+                session.clone(),
+                callback.clone(),
+                in_flight.clone(),
+                drag_state.clone(),
+            );
+        });
     }
 
     fn key_should_request_lazy_fetch_more(key: Key) -> bool {
@@ -3317,14 +3507,8 @@ impl ResultTableWidget {
     /// Returns `true` when the mouse position falls inside one of the FLTK
     /// Table's embedded scrollbar widgets (vertical or horizontal).
     fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
-        // Check vertical scrollbar.
-        let vsb = table.scrollbar();
-        if vsb.visible() {
-            let vx = vsb.x();
-            let vy = vsb.y();
-            if mouse_x >= vx && mouse_x < vx + vsb.w() && mouse_y >= vy && mouse_y < vy + vsb.h() {
-                return true;
-            }
+        if Self::is_mouse_on_vertical_table_scrollbar(table, mouse_x, mouse_y) {
+            return true;
         }
         // Check horizontal scrollbar.
         let hsb = table.hscrollbar();
@@ -3332,6 +3516,18 @@ impl ResultTableWidget {
             let hx = hsb.x();
             let hy = hsb.y();
             if mouse_x >= hx && mouse_x < hx + hsb.w() && mouse_y >= hy && mouse_y < hy + hsb.h() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_mouse_on_vertical_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
+        let vsb = table.scrollbar();
+        if vsb.visible() {
+            let vx = vsb.x();
+            let vy = vsb.y();
+            if mouse_x >= vx && mouse_x < vx + vsb.w() && mouse_y >= vy && mouse_y < vy + vsb.h() {
                 return true;
             }
         }
@@ -6272,18 +6468,12 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
-        let continue_lazy_fetch_session = if let Some(session_id) = lazy_fetch_session_id {
-            let was_near_bottom = Self::is_table_near_bottom(&self.table);
-            {
-                self.lazy_fetch_more_in_flight
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&session_id);
-            }
-            was_near_bottom.then_some(session_id)
-        } else {
-            None
-        };
+        if let Some(session_id) = lazy_fetch_session_id {
+            self.lazy_fetch_more_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&session_id);
+        }
 
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows.
         // After that threshold the sampling path is skipped entirely to avoid
@@ -6332,14 +6522,20 @@ impl ResultTableWidget {
         if let Some(sampled_rows) = updated_sampled_rows {
             mutex_store_usize(&self.width_sampled_rows, sampled_rows);
         }
-
-        if let Some(session_id) = continue_lazy_fetch_session {
-            Self::request_lazy_fetch_more_for_session(
-                session_id,
-                &self.lazy_fetch_session,
-                &self.lazy_fetch_callback,
-                &self.lazy_fetch_more_in_flight,
-            );
+        if let Some(session_id) = lazy_fetch_session_id {
+            if Self::is_table_near_bottom(&self.table) {
+                Self::request_lazy_fetch_more_for_session(
+                    session_id,
+                    &self.lazy_fetch_session,
+                    &self.lazy_fetch_callback,
+                    &self.lazy_fetch_more_in_flight,
+                );
+            } else {
+                self.drag_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .vertical_scrollbar_fetch_requested = false;
+            }
         }
     }
 
@@ -11017,6 +11213,26 @@ mod tests {
     }
 
     #[test]
+    fn lazy_fetch_scroll_threshold_starts_at_full_scroll_range() {
+        assert!(!ResultTableWidget::is_lazy_fetch_scroll_threshold_reached(
+            79, 20, 100
+        ));
+        assert!(ResultTableWidget::is_lazy_fetch_scroll_threshold_reached(
+            80, 20, 100
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_scroll_threshold_handles_fully_visible_rows() {
+        assert!(ResultTableWidget::is_lazy_fetch_scroll_threshold_reached(
+            0, 120, 100
+        ));
+        assert!(!ResultTableWidget::is_lazy_fetch_scroll_threshold_reached(
+            0, 1, 0
+        ));
+    }
+
+    #[test]
     fn lazy_fetch_more_for_session_sets_in_flight_and_suppresses_duplicate() {
         let session = Arc::new(Mutex::new(Some(7)));
         let in_flight = Arc::new(Mutex::new(HashSet::new()));
@@ -11030,8 +11246,12 @@ mod tests {
                     .push((id, request));
             }))));
 
-        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
-        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
+        assert!(ResultTableWidget::request_lazy_fetch_more_for_session(
+            7, &session, &callback, &in_flight
+        ));
+        assert!(!ResultTableWidget::request_lazy_fetch_more_for_session(
+            7, &session, &callback, &in_flight
+        ));
 
         assert_eq!(
             requests
@@ -11060,7 +11280,9 @@ mod tests {
                     .push((id, request));
             }))));
 
-        ResultTableWidget::request_lazy_fetch_more_for_session(7, &session, &callback, &in_flight);
+        assert!(!ResultTableWidget::request_lazy_fetch_more_for_session(
+            7, &session, &callback, &in_flight
+        ));
 
         assert!(requests
             .lock()
@@ -11070,6 +11292,60 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn scrollbar_sequence_rearms_when_in_flight_suppresses_request() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(
+            (0..30)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+        widget.table.set_row_position(widget.table.rows() - 2);
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(77);
+        widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(77);
+
+        ResultTableWidget::request_lazy_fetch_more_for_scrollbar_sequence(
+            &widget.table,
+            &widget.lazy_fetch_session,
+            &widget.lazy_fetch_callback,
+            &widget.lazy_fetch_more_in_flight,
+            &widget.drag_state,
+        );
+
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(
+            !widget
+                .drag_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vertical_scrollbar_fetch_requested
+        );
     }
 
     #[test]
@@ -11141,7 +11417,7 @@ mod tests {
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
-    fn append_rows_continues_lazy_fetch_when_existing_view_is_near_bottom() {
+    fn append_rows_continues_lazy_fetch_when_appended_view_stays_near_bottom() {
         let mut widget = ResultTableWidget::new();
         let headers = vec!["A".to_string()];
         widget.start_streaming(&headers);
@@ -11177,6 +11453,103 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
             &[(77, LazyFetchRequest::More)]
+        );
+        assert!(widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&77));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn append_rows_stops_lazy_fetch_when_appended_view_drops_below_threshold() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(
+            (0..30)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+        widget.table.set_row_position(widget.table.rows() - 2);
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_callback = requests.clone();
+        let callback: LazyFetchCallback =
+            Arc::new(Mutex::new(Some(Box::new(move |id, request| {
+                requests_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((id, request));
+            }))));
+        widget.set_lazy_fetch_callback(callback);
+        widget.set_lazy_fetch_session(77);
+        widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(77);
+
+        widget.append_rows(
+            (30..1030)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(!widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&77));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn append_rows_below_threshold_rearms_scrollbar_sequence() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(
+            (0..30)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+        widget.table.set_row_position(widget.table.rows() - 2);
+        widget.set_lazy_fetch_session(77);
+        widget
+            .lazy_fetch_more_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(77);
+        widget
+            .drag_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .vertical_scrollbar_fetch_requested = true;
+
+        widget.append_rows(
+            (30..1030)
+                .map(|value| vec![value.to_string()])
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(
+            !widget
+                .drag_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vertical_scrollbar_fetch_requested
         );
     }
 
