@@ -731,6 +731,21 @@ impl SqlEditorWidget {
             .unwrap_or(false)
     }
 
+    fn notify_cancel_oldest_lazy_fetch_for_session_pool(
+        sender: &mpsc::Sender<QueryProgress>,
+    ) -> bool {
+        let (response_sender, _response_receiver) = mpsc::channel();
+        let sent = sender
+            .send(QueryProgress::CancelOldestLazyFetchForSessionPool {
+                response: response_sender,
+            })
+            .is_ok();
+        if sent {
+            app::awake();
+        }
+        sent
+    }
+
     fn retry_oracle_pool_session_after_lazy_cancel(
         conn_guard: &crate::db::ConnectionLockGuard<'_>,
     ) -> Result<Option<DbPoolSession>, String> {
@@ -833,7 +848,7 @@ impl SqlEditorWidget {
             Ok(session) => session,
             Err(message)
                 if Self::session_pool_error_is_exhausted(&message)
-                    && Self::request_cancel_oldest_lazy_fetch_for_session_pool(sender) =>
+                    && Self::notify_cancel_oldest_lazy_fetch_for_session_pool(sender) =>
             {
                 Self::retry_oracle_pool_session_after_lazy_cancel(conn_guard)?
             }
@@ -9402,6 +9417,21 @@ mod query_execution_cleanup_tests {
                 index: 3,
                 session_id: 42,
             })
+        ));
+    }
+
+    #[test]
+    fn oracle_session_pool_cancel_notification_does_not_wait_for_ui_response() {
+        let (sender, receiver) = mpsc::channel();
+
+        assert!(SqlEditorWidget::notify_cancel_oldest_lazy_fetch_for_session_pool(&sender));
+
+        let event = receiver
+            .try_recv()
+            .expect("cancel-oldest notification should be queued");
+        assert!(matches!(
+            event,
+            QueryProgress::CancelOldestLazyFetchForSessionPool { .. }
         ));
     }
 
