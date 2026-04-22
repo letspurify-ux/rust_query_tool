@@ -1182,6 +1182,7 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         else {
             return false;
         };
+        guard.release_all_pooled_db_sessions();
         session_id
     };
 
@@ -3606,6 +3607,7 @@ impl MainWindow {
                     let session_id = s
                         .cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch");
                     if let Some(session_id) = session_id {
+                        s.release_all_pooled_db_sessions();
                         drop(s);
                         AppState::request_lazy_fetch_on_editors(
                             &state_for_progress,

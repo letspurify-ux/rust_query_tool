@@ -8933,15 +8933,20 @@ impl SqlEditorWidget {
             }),
         );
 
-        let result = match conn_guard.get_mysql_connection_mut() {
-            Some(mysql_conn) => action(mysql_conn)
-                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout)),
-            None => Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-        };
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            match conn_guard.get_mysql_connection_mut() {
+                Some(mysql_conn) => action(mysql_conn)
+                    .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout)),
+                None => Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+            }
+        }));
 
         Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
         Self::reset_mysql_timeout(conn_guard, query_timeout, log_context);
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => panic::resume_unwind(payload),
+        }
     }
 
     pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(
@@ -8999,8 +9004,10 @@ impl SqlEditorWidget {
             }),
         );
 
-        let result = action(&mut conn)
-            .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            action(&mut conn)
+                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout))
+        }));
 
         Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
         if let Err(err) =
@@ -9011,27 +9018,37 @@ impl SqlEditorWidget {
                 &format!("Failed to reset MySQL pooled session timeout: {err}"),
             );
             drop(conn);
-            return result;
+            return match result {
+                Ok(result) => result,
+                Err(payload) => panic::resume_unwind(payload),
+            };
         }
-        let can_reuse_session = Self::sync_mysql_pooled_session_info(
-            shared_connection,
-            &mut conn,
-            log_context,
-            connection_generation,
-            refresh_encoding_after,
-        );
-        if can_reuse_session {
-            Self::release_mysql_pooled_session_if_current(
+        if result.is_ok() {
+            let can_reuse_session = Self::sync_mysql_pooled_session_info(
                 shared_connection,
-                pooled_db_session,
-                connection_generation,
-                conn,
+                &mut conn,
                 log_context,
+                connection_generation,
+                refresh_encoding_after,
             );
+            if can_reuse_session {
+                Self::release_mysql_pooled_session_if_current(
+                    shared_connection,
+                    pooled_db_session,
+                    connection_generation,
+                    conn,
+                    log_context,
+                );
+            } else {
+                drop(conn);
+            }
         } else {
             drop(conn);
         }
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => panic::resume_unwind(payload),
+        }
     }
 
     pub(super) fn choose_execution_error_message(
