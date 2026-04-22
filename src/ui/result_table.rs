@@ -6289,6 +6289,7 @@ impl ResultTableWidget {
         // After that threshold the sampling path is skipped entirely to avoid
         // locking pending_widths and iterating rows on the UI thread.
         let sampled = mutex_load_usize(&self.width_sampled_rows);
+        let mut updated_sampled_rows = None;
         if sampled < WIDTH_SAMPLE_ROWS {
             let remaining = WIDTH_SAMPLE_ROWS - sampled;
             let sample_count = rows.len().min(remaining);
@@ -6318,7 +6319,7 @@ impl ResultTableWidget {
                 );
             }
             drop(widths);
-            mutex_store_usize(&self.width_sampled_rows, sampled + sample_count);
+            updated_sampled_rows = Some(sampled + sample_count);
         }
 
         // Add rows to pending buffer
@@ -6328,6 +6329,9 @@ impl ResultTableWidget {
             .append(&mut rows);
 
         self.flush_pending();
+        if let Some(sampled_rows) = updated_sampled_rows {
+            mutex_store_usize(&self.width_sampled_rows, sampled_rows);
+        }
 
         if let Some(session_id) = continue_lazy_fetch_session {
             Self::request_lazy_fetch_more_for_session(
@@ -6370,7 +6374,18 @@ impl ResultTableWidget {
         // Once WIDTH_SAMPLE_ROWS rows have been measured, column widths are
         // finalized and we skip the lock + per-column iteration entirely.
         let sampled = mutex_load_usize(&self.width_sampled_rows);
-        if sampled < WIDTH_SAMPLE_ROWS {
+        let should_apply_sampled_widths = sampled < WIDTH_SAMPLE_ROWS;
+
+        // Move data into full_data — zero-copy, no clone!
+        self.full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(rows_to_add);
+
+        // Just update row count — draw_cell reads from full_data on demand
+        self.set_table_rows_for_current_font(new_total);
+
+        if should_apply_sampled_widths {
             {
                 let widths = self
                     .pending_widths
@@ -6391,15 +6406,6 @@ impl ResultTableWidget {
             }
             self.apply_hidden_rowid_column_width();
         }
-
-        // Move data into full_data — zero-copy, no clone!
-        self.full_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(rows_to_add);
-
-        // Just update row count — draw_cell reads from full_data on demand
-        self.set_table_rows_for_current_font(new_total);
 
         mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         self.table.redraw();
@@ -10213,6 +10219,57 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         assert_eq!(widget.table.row_height(0), expected_height);
         assert_eq!(widget.table.row_height(2), expected_height);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn append_rows_applies_widths_when_batch_reaches_sample_limit() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        let initial_width = widget.table.col_width(0);
+
+        let mut rows = (0..WIDTH_SAMPLE_ROWS)
+            .map(|_| vec!["1".to_string()])
+            .collect::<Vec<_>>();
+        rows[WIDTH_SAMPLE_ROWS - 1] = vec!["W".repeat(50)];
+
+        widget.append_rows(rows);
+
+        assert_eq!(
+            mutex_load_usize(&widget.width_sampled_rows),
+            WIDTH_SAMPLE_ROWS
+        );
+        assert!(
+            widget.table.col_width(0) > initial_width,
+            "sampled width should be applied before sampling is marked complete"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn append_rows_applies_widths_for_first_small_lazy_batch() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string()];
+        widget.start_streaming(&headers);
+        let initial_width = widget.table.col_width(0);
+
+        let mut rows = (0..100).map(|_| vec!["1".to_string()]).collect::<Vec<_>>();
+        rows[99] = vec!["W".repeat(50)];
+
+        widget.append_rows(rows);
+
+        assert_eq!(mutex_load_usize(&widget.width_sampled_rows), 100);
+        assert!(
+            widget.table.col_width(0) > initial_width,
+            "first lazy batch should auto-fit sampled row contents"
+        );
     }
 
     #[test]
