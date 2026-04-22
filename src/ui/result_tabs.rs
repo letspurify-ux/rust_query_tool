@@ -49,24 +49,78 @@ struct ScriptOutputTab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResultTabStatus {
+pub(crate) enum ResultTabStatus {
     Running,
     Fetching,
     Waiting,
+    Canceling,
     Done,
     Error,
     Cancelled,
 }
 
 impl ResultTabStatus {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Running => "Running",
             Self::Fetching => "Fetching",
             Self::Waiting => "Waiting",
+            Self::Canceling => "Canceling",
             Self::Done => "Done",
             Self::Error => "Error",
             Self::Cancelled => "Cancelled",
+        }
+    }
+
+    pub(crate) fn status_bar_message(self) -> &'static str {
+        match self {
+            Self::Running => "Running query...",
+            Self::Fetching => "Fetching rows",
+            Self::Waiting => "Waiting for lazy fetch",
+            Self::Canceling => "Canceling",
+            Self::Done => "Done",
+            Self::Error => "Error",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    pub(crate) fn status_bar_message_with_rows(self, row_count: usize) -> String {
+        if self == Self::Fetching {
+            format!("{}: {}", self.status_bar_message(), row_count)
+        } else {
+            self.status_bar_message().to_string()
+        }
+    }
+
+    fn for_stream_update(current: Self) -> Self {
+        match current {
+            Self::Canceling | Self::Cancelled | Self::Done | Self::Error => current,
+            Self::Running | Self::Fetching | Self::Waiting => Self::Fetching,
+        }
+    }
+
+    fn is_cancelled_message(message: &str) -> bool {
+        let trimmed = message.trim();
+        let normalized = if trimmed
+            .get(.."Error:".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Error:"))
+        {
+            &trimmed["Error:".len()..]
+        } else {
+            trimmed
+        }
+        .trim();
+        normalized.eq_ignore_ascii_case("Query cancelled")
+            || normalized.eq_ignore_ascii_case("Query canceled")
+    }
+
+    pub(crate) fn from_query_result(result: &crate::db::QueryResult) -> Self {
+        if result.success {
+            Self::Done
+        } else if Self::is_cancelled_message(&result.message) {
+            Self::Cancelled
+        } else {
+            Self::Error
         }
     }
 }
@@ -706,8 +760,14 @@ impl ResultTabsWidget {
     }
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
-        let table = self
-            .set_result_tab_state(index, ResultTabStatus::Fetching, 0)
+        let status = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| ResultTabStatus::for_stream_update(tab.status));
+        let table = status
+            .and_then(|status| self.set_result_tab_state(index, status, 0))
             .map(|(_, table)| table);
         if let Some(mut table) = table {
             table.set_null_text(null_text);
@@ -723,11 +783,16 @@ impl ResultTabsWidget {
                 .data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.get(index)
-                .map(|tab| (tab.row_count.saturating_add(rows_len), tab.table.clone()))
+            data.get(index).map(|tab| {
+                (
+                    tab.row_count.saturating_add(rows_len),
+                    ResultTabStatus::for_stream_update(tab.status),
+                    tab.table.clone(),
+                )
+            })
         }
-        .and_then(|(row_count, table)| {
-            self.set_result_tab_state(index, ResultTabStatus::Fetching, row_count)
+        .and_then(|(row_count, status, table)| {
+            self.set_result_tab_state(index, status, row_count)
                 .map(|_| table)
         });
         if let Some(mut table) = table {
@@ -774,6 +839,54 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
+    pub fn mark_statement_canceling(&mut self, index: usize) {
+        self.mark_statement_status(index, ResultTabStatus::Canceling);
+    }
+
+    pub fn mark_statement_cancelled(&mut self, index: usize) {
+        self.mark_statement_status(index, ResultTabStatus::Cancelled);
+    }
+
+    fn mark_statement_status(&mut self, index: usize, status: ResultTabStatus) {
+        let row_count = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| tab.row_count);
+        if let Some(row_count) = row_count {
+            self.set_result_tab_state(index, status, row_count);
+        }
+        self.fire_on_change_callback();
+    }
+
+    pub fn mark_lazy_fetch_canceling(&mut self, session_id: u64) -> bool {
+        let tab_updates: Vec<(usize, usize)> = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.iter()
+                .enumerate()
+                .filter_map(|(index, tab)| {
+                    if tab.table.active_lazy_fetch_session() == Some(session_id) {
+                        Some((index, tab.row_count))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if tab_updates.is_empty() {
+            return false;
+        }
+        for (index, row_count) in tab_updates {
+            self.set_result_tab_state(index, ResultTabStatus::Canceling, row_count);
+        }
+        self.fire_on_change_callback();
+        true
+    }
+
     pub fn clear_lazy_fetch_session(&mut self, index: usize, session_id: u64, run_pending: bool) {
         let tab_parts = self
             .data
@@ -782,9 +895,7 @@ impl ResultTabsWidget {
             .get(index)
             .map(|tab| (tab.row_count, tab.table.clone()));
         let table = if let Some((row_count, table)) = tab_parts {
-            if !run_pending {
-                self.set_result_tab_state(index, ResultTabStatus::Done, row_count);
-            }
+            self.set_result_tab_state(index, ResultTabStatus::Done, row_count);
             Some(table)
         } else {
             None
@@ -925,11 +1036,7 @@ impl ResultTabsWidget {
     }
 
     pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
-        let status = if result.success {
-            ResultTabStatus::Done
-        } else {
-            ResultTabStatus::Error
-        };
+        let status = ResultTabStatus::from_query_result(result);
         let table = self
             .set_result_tab_state(index, status, result.row_count)
             .map(|(_, table)| table);
@@ -1269,11 +1376,13 @@ impl Default for ResultTabsWidget {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::QueryResult;
     use crate::ui::result_table::LazyFetchCallback;
     use crate::ui::sql_editor::LazyFetchRequest;
 
     use super::{ResultTabStatus, ResultTabsWidget};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn tab_strip_left_anchor_reset_requires_multi_tab_layout() {
@@ -1309,12 +1418,92 @@ mod tests {
             "Fetching (42)"
         );
         assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Waiting, 42),
+            "Waiting (42)"
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Canceling, 42),
+            "Canceling (42)"
+        );
+        assert_eq!(
             ResultTabsWidget::result_tab_label(ResultTabStatus::Done, 128),
             "Done (128)"
         );
         assert_eq!(
             ResultTabsWidget::result_tab_label(ResultTabStatus::Error, 0),
             "Error (0)"
+        );
+        assert_eq!(
+            ResultTabsWidget::result_tab_label(ResultTabStatus::Cancelled, 0),
+            "Cancelled (0)"
+        );
+    }
+
+    #[test]
+    fn result_status_uses_shared_terminal_state_mapping() {
+        let done = QueryResult::new_select("select 1", Vec::new(), Vec::new(), Duration::ZERO);
+        let mut cancelled = QueryResult::new_error("select sleep", "Query cancelled");
+        cancelled.message = "Query cancelled".to_string();
+        let prefixed_cancelled = QueryResult::new_error("select sleep", "Query cancelled");
+        let mut american_canceled = QueryResult::new_error("select sleep", "Query canceled");
+        american_canceled.message = "ERROR: Query canceled".to_string();
+        let error = QueryResult::new_error("select missing", "table not found");
+
+        assert_eq!(
+            ResultTabStatus::from_query_result(&done),
+            ResultTabStatus::Done
+        );
+        assert_eq!(
+            ResultTabStatus::from_query_result(&cancelled),
+            ResultTabStatus::Cancelled
+        );
+        assert_eq!(
+            ResultTabStatus::from_query_result(&prefixed_cancelled),
+            ResultTabStatus::Cancelled
+        );
+        assert_eq!(
+            ResultTabStatus::from_query_result(&american_canceled),
+            ResultTabStatus::Cancelled
+        );
+        assert_eq!(
+            ResultTabStatus::from_query_result(&error),
+            ResultTabStatus::Error
+        );
+    }
+
+    #[test]
+    fn status_bar_message_uses_same_state_labels() {
+        assert_eq!(
+            ResultTabStatus::Fetching.status_bar_message_with_rows(42),
+            "Fetching rows: 42"
+        );
+        assert_eq!(
+            ResultTabStatus::Canceling.status_bar_message(),
+            ResultTabStatus::Canceling.label()
+        );
+    }
+
+    #[test]
+    fn stream_updates_do_not_overwrite_terminal_or_canceling_status() {
+        assert_eq!(
+            ResultTabStatus::for_stream_update(ResultTabStatus::Running),
+            ResultTabStatus::Fetching
+        );
+        assert_eq!(
+            ResultTabStatus::for_stream_update(ResultTabStatus::Waiting),
+            ResultTabStatus::Fetching
+        );
+        assert_eq!(
+            ResultTabStatus::for_stream_update(ResultTabStatus::Canceling),
+            ResultTabStatus::Canceling
+        );
+        assert_eq!(
+            ResultTabStatus::for_stream_update(ResultTabStatus::Error),
+            ResultTabStatus::Error
+        );
+        assert_eq!(
+            ResultTabStatus::for_stream_update(ResultTabStatus::Cancelled),
+            ResultTabStatus::Cancelled
         );
     }
 

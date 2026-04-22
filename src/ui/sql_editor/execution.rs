@@ -3065,20 +3065,25 @@ impl SqlEditorWidget {
             return;
         }
 
-        if self.active_lazy_fetch_session().is_some() {
-            self.emit_status("Cancelling previous lazy fetch...");
-            self.cancel_active_lazy_fetch();
-            let widget = self.clone();
-            let sql = sql.to_string();
-            let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
-            app::add_timeout3(0.2, move |_| {
-                widget.execute_sql_with_mysql_delimiter(
-                    &sql,
-                    script_mode,
-                    initial_mysql_delimiter_for_retry.clone(),
-                );
-            });
-            return;
+        if let Some(session_id) = self.active_lazy_fetch_session() {
+            if self.cancel_lazy_fetch_session(session_id) {
+                self.emit_status("Canceling previous lazy fetch...");
+                let _ = self
+                    .progress_sender
+                    .send(QueryProgress::LazyFetchCanceling { session_id });
+                app::awake();
+                let widget = self.clone();
+                let sql = sql.to_string();
+                let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
+                app::add_timeout3(0.2, move |_| {
+                    widget.execute_sql_with_mysql_delimiter(
+                        &sql,
+                        script_mode,
+                        initial_mysql_delimiter_for_retry.clone(),
+                    );
+                });
+                return;
+            }
         }
 
         let mut query_run_reservation =
@@ -9525,6 +9530,29 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn cancelling_lazy_fetch_with_stale_session_id_is_ignored() {
+        let (sender, receiver) = mpsc::channel();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            sender,
+            cancel_handle: None,
+            cancel_requested: cancel_requested.clone(),
+        })));
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+
+        assert!(!SqlEditorWidget::cancel_lazy_fetch_handle_for_session(
+            &active,
+            &pooled_db_session,
+            Some(43),
+        ));
+
+        assert!(SqlEditorWidget::lazy_fetch_handle_matches(&active, 42));
+        assert!(!cancel_requested.load(Ordering::Relaxed));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn cancelled_lazy_fetch_cannot_keep_pooled_session() {
         let (sender, _receiver) = mpsc::channel();
         let cancel_requested = Arc::new(AtomicBool::new(false));
@@ -9929,6 +9957,9 @@ mod mysql_batch_execution_regression_tests {
                 }
                 QueryProgress::LazyFetchWaiting { index, session_id } => {
                     format!("LazyFetchWaiting({index}, {session_id})")
+                }
+                QueryProgress::LazyFetchCanceling { session_id } => {
+                    format!("LazyFetchCanceling({session_id})")
                 }
                 QueryProgress::LazyFetchClosed {
                     index,

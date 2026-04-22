@@ -224,6 +224,9 @@ pub enum QueryProgress {
         index: usize,
         session_id: u64,
     },
+    LazyFetchCanceling {
+        session_id: u64,
+    },
     LazyFetchClosed {
         index: usize,
         session_id: u64,
@@ -895,8 +898,14 @@ impl SqlEditorWidget {
             return false;
         }
         if request == LazyFetchRequest::Cancel {
-            self.cancel_active_lazy_fetch();
-            return true;
+            if self.cancel_lazy_fetch_session(session_id) {
+                let _ = self
+                    .progress_sender
+                    .send(QueryProgress::LazyFetchCanceling { session_id });
+                app::awake();
+                return true;
+            }
+            return false;
         }
         if handle.cancel_requested.load(Ordering::Relaxed) {
             return false;
@@ -919,29 +928,50 @@ impl SqlEditorWidget {
             .map(|handle| handle.session_id)
     }
 
-    fn cancel_active_lazy_fetch(&self) {
-        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session);
+    fn cancel_active_lazy_fetch(&self) -> bool {
+        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session)
+    }
+
+    fn cancel_lazy_fetch_session(&self, session_id: u64) -> bool {
+        Self::cancel_lazy_fetch_handle_for_session(
+            &self.active_lazy_fetch,
+            &self.pooled_db_session,
+            Some(session_id),
+        )
     }
 
     fn cancel_lazy_fetch_handle(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         pooled_db_session: &SharedDbSessionLease,
     ) -> bool {
-        crate::db::clear_pooled_session_lease(pooled_db_session);
+        Self::cancel_lazy_fetch_handle_for_session(active_lazy_fetch, pooled_db_session, None)
+    }
+
+    fn cancel_lazy_fetch_handle_for_session(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        pooled_db_session: &SharedDbSessionLease,
+        expected_session_id: Option<u64>,
+    ) -> bool {
         let handle = active_lazy_fetch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(handle) = handle {
-            handle.cancel_requested.store(true, Ordering::Relaxed);
-            if let Some(cancel_handle) = handle.cancel_handle {
-                cancel_handle.cancel();
-            }
-            let _ = handle.sender.send(LazyFetchCommand::Cancel);
-            true
-        } else {
-            false
+            .as_ref()
+            .and_then(|handle| {
+                if expected_session_id.is_some_and(|session_id| handle.session_id != session_id) {
+                    return None;
+                }
+                handle.cancel_requested.store(true, Ordering::Relaxed);
+                Some(handle.clone())
+            });
+        let Some(handle) = handle else {
+            return false;
+        };
+        crate::db::clear_pooled_session_lease(pooled_db_session);
+        if let Some(cancel_handle) = handle.cancel_handle {
+            cancel_handle.cancel();
         }
+        let _ = handle.sender.send(LazyFetchCommand::Cancel);
+        true
     }
 
     fn has_active_lazy_fetch(active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>) -> bool {
@@ -1267,9 +1297,7 @@ impl SqlEditorWidget {
                                 }
                             }
                             UiActionResult::CancelPending => {
-                                widget.emit_status(
-                                    "Cancel requested; waiting for query initialization",
-                                );
+                                widget.emit_status("Canceling; waiting for query initialization");
                             }
                             UiActionResult::QueryAlreadyRunning => {
                                 let busy_message = crate::db::format_connection_busy_message();
