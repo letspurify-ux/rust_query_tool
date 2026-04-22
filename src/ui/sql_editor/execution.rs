@@ -1041,15 +1041,16 @@ impl SqlEditorWidget {
         }
     }
 
-    fn emit_lazy_cancelled_result(
+    fn emit_lazy_closed_result(
         sender: &mpsc::Sender<QueryProgress>,
         index: usize,
         session_id: u64,
+        cancelled: bool,
     ) {
         let _ = sender.send(QueryProgress::LazyFetchClosed {
             index,
             session_id,
-            cancelled: true,
+            cancelled,
         });
         app::awake();
     }
@@ -1126,8 +1127,8 @@ impl SqlEditorWidget {
         session_id: u64,
         panic_payload: &(dyn std::any::Any + Send),
     ) {
-        Self::emit_lazy_worker_panicked(sender, index, session_id, panic_payload);
         Self::clear_lazy_fetch_handle(active_lazy_fetch, session_id);
+        Self::emit_lazy_worker_panicked(sender, index, session_id, panic_payload);
     }
 
     fn start_oracle_lazy_select(
@@ -1241,11 +1242,6 @@ impl SqlEditorWidget {
                             connection_name: conn_name.clone(),
                             timed_out: false,
                         });
-                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                            index,
-                            session_id,
-                            cancelled: false,
-                        });
                         app::awake();
                         return Ok(LazyFetchWorkerOutcome::Completed);
                     }
@@ -1303,11 +1299,6 @@ impl SqlEditorWidget {
                                         result: query_result,
                                         connection_name: conn_name.clone(),
                                         timed_out: false,
-                                    });
-                                    let _ = sender.send(QueryProgress::LazyFetchClosed {
-                                        index,
-                                        session_id,
-                                        cancelled: false,
                                     });
                                     app::awake();
                                     return Ok(LazyFetchWorkerOutcome::Completed);
@@ -1386,11 +1377,6 @@ impl SqlEditorWidget {
                                             connection_name: conn_name.clone(),
                                             timed_out: false,
                                         });
-                                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                                            index,
-                                            session_id,
-                                            cancelled: false,
-                                        });
                                         app::awake();
                                         return Ok(LazyFetchWorkerOutcome::Completed);
                                     }
@@ -1402,37 +1388,34 @@ impl SqlEditorWidget {
                         }
                     }
                 })();
-                // Emit cancellation after the fetch closure returns so ResultSet/Statement
-                // drop closes the server cursor before the UI treats the lazy fetch as closed.
+                // Defer the close event until the fetch closure returns so ResultSet/Statement
+                // drops and cleanup runs before the UI treats the lazy fetch as closed.
+                let mut close_cancelled = false;
+                let mut error_result = None;
                 match result {
                     Ok(LazyFetchWorkerOutcome::Completed) => {}
                     Ok(LazyFetchWorkerOutcome::Cancelled) => {
-                        Self::emit_lazy_cancelled_result(&sender, index, session_id);
+                        close_cancelled = true;
                     }
                     Err(err) => {
+                        close_cancelled = true;
                         let suppress_error_result =
                             !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id)
                                 || Self::lazy_fetch_cancel_requested(
                                     &active_lazy_fetch,
                                     session_id,
                                 );
-                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                            index,
-                            session_id,
-                            cancelled: true,
-                        });
                         if !suppress_error_result {
-                            let mut error_result =
+                            let mut query_result =
                                 QueryResult::new_error(&sql_to_execute, &err.to_string());
-                            error_result.is_select = true;
-                            let _ = sender.send(QueryProgress::StatementFinished {
+                            query_result.is_select = true;
+                            error_result = Some(QueryProgress::StatementFinished {
                                 index,
-                                result: error_result,
-                                connection_name: conn_name,
+                                result: query_result,
+                                connection_name: conn_name.clone(),
                                 timed_out: false,
                             });
                         }
-                        app::awake();
                     }
                 }
                 let _ = conn.set_call_timeout(previous_timeout);
@@ -1446,6 +1429,11 @@ impl SqlEditorWidget {
                     );
                 }
                 Self::clear_lazy_fetch_handle(&active_lazy_fetch, session_id);
+                if let Some(error_result) = error_result {
+                    let _ = sender.send(error_result);
+                    app::awake();
+                }
+                Self::emit_lazy_closed_result(&sender, index, session_id, close_cancelled);
             }));
             if let Err(payload) = worker_result {
                 let _ = conn.set_call_timeout(previous_timeout);
@@ -1500,6 +1488,8 @@ impl SqlEditorWidget {
         thread::spawn(move || {
             let mut conn = Some(conn);
             let mut should_release_session = false;
+            let mut close_cancelled = false;
+            let mut error_result = None;
             let worker_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let Some(conn) = conn.as_mut() else {
                     return;
@@ -1659,11 +1649,6 @@ impl SqlEditorWidget {
                             connection_name: conn_name.clone(),
                             timed_out: false,
                         });
-                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                            index,
-                            session_id,
-                            cancelled: false,
-                        });
                         keep_session = true;
                         app::awake();
                         return Ok(LazyFetchWorkerOutcome::Completed);
@@ -1708,11 +1693,6 @@ impl SqlEditorWidget {
                                         result: query_result,
                                         connection_name: conn_name.clone(),
                                         timed_out: false,
-                                    });
-                                    let _ = sender.send(QueryProgress::LazyFetchClosed {
-                                        index,
-                                        session_id,
-                                        cancelled: false,
                                     });
                                     keep_session = true;
                                     app::awake();
@@ -1777,11 +1757,6 @@ impl SqlEditorWidget {
                                             connection_name: conn_name.clone(),
                                             timed_out: false,
                                         });
-                                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                                            index,
-                                            session_id,
-                                            cancelled: false,
-                                        });
                                         keep_session = true;
                                         app::awake();
                                         return Ok(LazyFetchWorkerOutcome::Completed);
@@ -1794,36 +1769,31 @@ impl SqlEditorWidget {
                         }
                     }
                 })();
-                // Emit cancellation after the fetch closure returns so the MySQL result
-                // object is dropped before the UI treats the lazy fetch as closed.
+                // Defer the close event until the fetch closure returns so the MySQL result
+                // object drops and cleanup runs before the UI treats the lazy fetch as closed.
                 match result {
                     Ok(LazyFetchWorkerOutcome::Completed) => {}
                     Ok(LazyFetchWorkerOutcome::Cancelled) => {
-                        Self::emit_lazy_cancelled_result(&sender, index, session_id);
+                        close_cancelled = true;
                     }
                     Err(err) => {
+                        close_cancelled = true;
                         let suppress_error_result =
                             !Self::lazy_fetch_handle_matches(&active_lazy_fetch, session_id)
                                 || Self::lazy_fetch_cancel_requested(
                                     &active_lazy_fetch,
                                     session_id,
                                 );
-                        let _ = sender.send(QueryProgress::LazyFetchClosed {
-                            index,
-                            session_id,
-                            cancelled: true,
-                        });
                         if !suppress_error_result {
-                            let mut error_result = QueryResult::new_error(&sql_to_execute, &err);
-                            error_result.is_select = true;
-                            let _ = sender.send(QueryProgress::StatementFinished {
+                            let mut query_result = QueryResult::new_error(&sql_to_execute, &err);
+                            query_result.is_select = true;
+                            error_result = Some(QueryProgress::StatementFinished {
                                 index,
-                                result: error_result,
+                                result: query_result,
                                 connection_name: conn_name,
                                 timed_out: false,
                             });
                         }
-                        app::awake();
                     }
                 }
                 *lazy_cancel_context
@@ -1861,6 +1831,11 @@ impl SqlEditorWidget {
                         }
                     }
                     Self::clear_lazy_fetch_handle(&active_lazy_fetch, session_id);
+                    if let Some(error_result) = error_result {
+                        let _ = sender.send(error_result);
+                        app::awake();
+                    }
+                    Self::emit_lazy_closed_result(&sender, index, session_id, close_cancelled);
                 }
                 Err(payload) => {
                     *lazy_cancel_context
@@ -8884,6 +8859,12 @@ impl SqlEditorWidget {
         }
     }
 
+    fn mysql_pooled_action_completed_successfully<T>(
+        result: &thread::Result<Result<T, String>>,
+    ) -> bool {
+        matches!(result, Ok(Ok(_)))
+    }
+
     fn sync_mysql_pooled_session_info(
         shared_connection: &crate::db::SharedConnection,
         conn: &mut mysql::PooledConn,
@@ -9039,7 +9020,7 @@ impl SqlEditorWidget {
                 Err(payload) => panic::resume_unwind(payload),
             };
         }
-        if result.is_ok() {
+        if Self::mysql_pooled_action_completed_successfully(&result) {
             let can_reuse_session = Self::sync_mysql_pooled_session_info(
                 shared_connection,
                 &mut conn,
@@ -9387,7 +9368,7 @@ mod query_execution_cleanup_tests {
     fn lazy_cancel_emits_closed_without_statement_finished() {
         let (sender, receiver) = mpsc::channel();
 
-        SqlEditorWidget::emit_lazy_cancelled_result(&sender, 3, 42);
+        SqlEditorWidget::emit_lazy_closed_result(&sender, 3, 42, true);
         drop(sender);
 
         let events = receiver.try_iter().collect::<Vec<_>>();
@@ -9398,6 +9379,25 @@ mod query_execution_cleanup_tests {
                 index: 3,
                 session_id: 42,
                 cancelled: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_completed_close_event_marks_not_cancelled() {
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::emit_lazy_closed_result(&sender, 3, 42, false);
+        drop(sender);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.first(),
+            Some(QueryProgress::LazyFetchClosed {
+                index: 3,
+                session_id: 42,
+                cancelled: false,
             })
         ));
     }
@@ -9540,6 +9540,35 @@ mod query_execution_cleanup_tests {
         cancel_requested.store(true, Ordering::Relaxed);
 
         assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
+    }
+
+    #[test]
+    fn pooled_session_idle_release_skips_running_or_lazy_editor() {
+        assert!(SqlEditorWidget::pooled_session_is_idle_for_release(
+            false, None
+        ));
+        assert!(!SqlEditorWidget::pooled_session_is_idle_for_release(
+            true, None
+        ));
+        assert!(!SqlEditorWidget::pooled_session_is_idle_for_release(
+            false,
+            Some(42)
+        ));
+    }
+
+    #[test]
+    fn mysql_pooled_action_reuses_session_only_after_success() {
+        let ok_result: std::thread::Result<Result<(), String>> = Ok(Ok(()));
+        let action_error: std::thread::Result<Result<(), String>> =
+            Ok(Err("connection lost".to_string()));
+        let panic_result: std::thread::Result<Result<(), String>> =
+            Err(Box::new("panic while using pooled session"));
+
+        assert!(SqlEditorWidget::mysql_pooled_action_completed_successfully(
+            &ok_result
+        ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_completed_successfully(&action_error));
+        assert!(!SqlEditorWidget::mysql_pooled_action_completed_successfully(&panic_result));
     }
 
     #[test]

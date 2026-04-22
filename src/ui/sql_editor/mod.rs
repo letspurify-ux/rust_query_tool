@@ -856,12 +856,29 @@ impl SqlEditorWidget {
         widget
     }
 
-    pub fn release_pooled_db_session(&self) {
-        crate::db::clear_pooled_session_lease(&self.pooled_db_session);
+    pub fn release_pooled_db_session(&self) -> bool {
+        crate::db::clear_pooled_session_lease(&self.pooled_db_session)
+    }
+
+    pub fn release_idle_pooled_db_session(&self) -> bool {
+        if !Self::pooled_session_is_idle_for_release(
+            self.is_query_running(),
+            self.active_lazy_fetch_session(),
+        ) {
+            return false;
+        }
+        self.release_pooled_db_session()
+    }
+
+    fn pooled_session_is_idle_for_release(
+        query_running: bool,
+        active_lazy_fetch_session: Option<u64>,
+    ) -> bool {
+        !query_running && active_lazy_fetch_session.is_none()
     }
 
     pub fn clear_pooled_db_session(&self) {
-        self.release_pooled_db_session();
+        let _ = self.release_pooled_db_session();
         self.cancel_active_lazy_fetch();
     }
 

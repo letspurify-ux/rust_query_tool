@@ -332,11 +332,14 @@ pub fn create_shared_db_session_lease() -> SharedDbSessionLease {
     Arc::new(Mutex::new(None))
 }
 
-pub fn clear_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) {
-    let _lease_to_drop = pooled_db_session
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+pub fn clear_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) -> bool {
+    let lease_to_drop = {
+        pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    };
+    lease_to_drop.is_some()
 }
 
 pub fn clear_pooled_session_lease_if_current(
@@ -749,6 +752,20 @@ impl DatabaseConnection {
         mysql::Pool::new(opts).map_err(|err| err.to_string())
     }
 
+    fn build_pool_for_info(
+        info: &ConnectionInfo,
+        pool_size: u32,
+    ) -> Result<DbConnectionPool, String> {
+        match info.db_type {
+            DatabaseType::Oracle => {
+                Self::build_oracle_pool(info, pool_size).map(DbConnectionPool::Oracle)
+            }
+            DatabaseType::MySQL => {
+                Self::build_mysql_pool(info, pool_size).map(DbConnectionPool::MySQL)
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             connection: None,
@@ -1033,6 +1050,26 @@ impl DatabaseConnection {
 
     pub fn set_connection_pool_size(&mut self, size: u32) {
         self.connection_pool_size = Self::clamp_connection_pool_size(size);
+    }
+
+    pub fn resize_current_connection_pool(&mut self, size: u32) -> Result<(), String> {
+        let size = Self::clamp_connection_pool_size(size);
+        if self.connection_pool_size == size {
+            return Ok(());
+        }
+
+        if !self.connected || self.connection.is_none() {
+            self.connection_pool_size = size;
+            return Ok(());
+        }
+
+        let mut info = self.info.clone();
+        info.password = self.session_password.clone();
+        let pool = Self::build_pool_for_info(&info, size)?;
+        self.pool = Some(pool);
+        self.connection_pool_size = size;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        Ok(())
     }
 
     pub fn connection_generation(&self) -> u64 {
@@ -1487,6 +1524,19 @@ mod tests {
         assert_eq!(conn.connection_pool_size(), MIN_CONNECTION_POOL_SIZE);
 
         conn.set_connection_pool_size(99);
+        assert_eq!(conn.connection_pool_size(), MAX_CONNECTION_POOL_SIZE);
+    }
+
+    #[test]
+    fn resize_disconnected_connection_pool_size_clamps_preference() {
+        let mut conn = DatabaseConnection::new();
+
+        conn.resize_current_connection_pool(0)
+            .expect("disconnected resize should not require a live pool");
+        assert_eq!(conn.connection_pool_size(), MIN_CONNECTION_POOL_SIZE);
+
+        conn.resize_current_connection_pool(99)
+            .expect("disconnected resize should not require a live pool");
         assert_eq!(conn.connection_pool_size(), MAX_CONNECTION_POOL_SIZE);
     }
 

@@ -564,11 +564,20 @@ impl AppState {
         lazy_fetch_sessions
     }
 
-    fn release_all_pooled_db_sessions(&self) {
-        self.sql_editor.release_pooled_db_session();
+    fn release_all_pooled_db_sessions(&self) -> bool {
+        let mut released_any = self.sql_editor.release_pooled_db_session();
         for tab in &self.editor_tabs {
-            tab.sql_editor.release_pooled_db_session();
+            released_any |= tab.sql_editor.release_pooled_db_session();
         }
+        released_any
+    }
+
+    fn release_all_idle_pooled_db_sessions(&self) -> bool {
+        let mut released_any = self.sql_editor.release_idle_pooled_db_session();
+        for tab in &self.editor_tabs {
+            released_any |= tab.sql_editor.release_idle_pooled_db_session();
+        }
+        released_any
     }
 
     fn cancel_oldest_lazy_fetch(&mut self, status_message: &str) -> Option<u64> {
@@ -1134,8 +1143,11 @@ fn should_finish_progress_after_lazy_fetch_close(
 fn should_cancel_lazy_fetch_for_session_pool(
     active_lazy_fetches: usize,
     connection_pool_size: u32,
+    released_idle_pooled_session: bool,
 ) -> bool {
-    active_lazy_fetches > 0 && active_lazy_fetches >= connection_pool_size as usize
+    !released_idle_pooled_session
+        && active_lazy_fetches > 0
+        && active_lazy_fetches >= connection_pool_size as usize
 }
 
 #[derive(Clone, Copy)]
@@ -1181,8 +1193,13 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         let mut guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let released_idle_pooled_session = guard.release_all_idle_pooled_db_sessions();
         let active_sessions = guard.lazy_fetch_sessions_for_abort();
-        if !should_cancel_lazy_fetch_for_session_pool(active_sessions.len(), connection_pool_size) {
+        if !should_cancel_lazy_fetch_for_session_pool(
+            active_sessions.len(),
+            connection_pool_size,
+            released_idle_pooled_session,
+        ) {
             return false;
         }
         let Some(session_id) =
@@ -1190,7 +1207,6 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         else {
             return false;
         };
-        guard.release_all_pooled_db_sessions();
         session_id
     };
 
@@ -3622,10 +3638,16 @@ impl MainWindow {
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
-                    let session_id = s
-                        .cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch");
-                    if let Some(session_id) = session_id {
-                        s.release_all_pooled_db_sessions();
+                    let released_pooled_session = s.release_all_idle_pooled_db_sessions();
+                    if released_pooled_session {
+                        s.set_status_message(
+                            "Session pool full; released idle pooled sessions",
+                        );
+                        drop(s);
+                        let _ = response.send(true);
+                    } else if let Some(session_id) =
+                        s.cancel_oldest_lazy_fetch("Session pool full; cancelled oldest lazy fetch")
+                    {
                         drop(s);
                         AppState::request_lazy_fetch_on_editors(
                             &state_for_progress,
@@ -3634,10 +3656,8 @@ impl MainWindow {
                         );
                         let _ = response.send(true);
                     } else {
-                        s.release_all_pooled_db_sessions();
-                        s.set_status_message("Session pool full; released idle pooled sessions");
                         drop(s);
-                        let _ = response.send(true);
+                        let _ = response.send(false);
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
@@ -4576,7 +4596,36 @@ impl MainWindow {
                     config_snapshot
                 };
                 if let Some(settings) = show_settings_dialog(&config_snapshot) {
-                    let save_result = {
+                    let pool_size_changed = settings.connection_pool_size
+                        != config_snapshot.normalized_connection_pool_size();
+                    let resize_result = if pool_size_changed {
+                        let (connection, blocked) = {
+                            let s = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (
+                                s.connection.clone(),
+                                s.is_any_query_running() || s.has_active_lazy_fetches(),
+                            )
+                        };
+                        if blocked {
+                            Err(
+                                "Finish or cancel running queries and lazy fetches before changing connection pool size."
+                                    .to_string(),
+                            )
+                        } else if let Some(mut connection) = try_lock_connection_with_activity(
+                            &connection,
+                            "Updating session pool preference",
+                        ) {
+                            connection.resize_current_connection_pool(settings.connection_pool_size)
+                        } else {
+                            Err(format_connection_busy_message())
+                        }
+                    } else {
+                        Ok(())
+                    };
+
+                    let save_result = resize_result.and_then(|_| {
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4594,15 +4643,12 @@ impl MainWindow {
                             config.connection_pool_size = settings.connection_pool_size;
                             config.save()
                         };
-                        if let Some(mut connection) = try_lock_connection_with_activity(
-                            &s.connection,
-                            "Updating session pool preference",
-                        ) {
-                            connection.set_connection_pool_size(settings.connection_pool_size);
+                        if pool_size_changed {
+                            s.release_all_pooled_db_sessions();
                         }
                         MainWindow::apply_font_settings(&mut s);
-                        save_result
-                    };
+                        save_result.map_err(|err| err.to_string())
+                    });
                     if let Err(err) = save_result {
                         fltk::dialog::alert_default(&format!("Failed to save settings: {}", err));
                     }
@@ -5636,10 +5682,15 @@ mod tests {
 
     #[test]
     fn session_pool_slot_check_cancels_only_when_lazy_fetches_fill_pool() {
-        assert!(!should_cancel_lazy_fetch_for_session_pool(0, 1));
-        assert!(!should_cancel_lazy_fetch_for_session_pool(3, 4));
-        assert!(should_cancel_lazy_fetch_for_session_pool(4, 4));
-        assert!(should_cancel_lazy_fetch_for_session_pool(5, 4));
+        assert!(!should_cancel_lazy_fetch_for_session_pool(0, 1, false));
+        assert!(!should_cancel_lazy_fetch_for_session_pool(3, 4, false));
+        assert!(should_cancel_lazy_fetch_for_session_pool(4, 4, false));
+        assert!(should_cancel_lazy_fetch_for_session_pool(5, 4, false));
+    }
+
+    #[test]
+    fn session_pool_slot_check_prefers_released_idle_session_over_lazy_cancel() {
+        assert!(!should_cancel_lazy_fetch_for_session_pool(4, 4, true));
     }
 
     #[test]
