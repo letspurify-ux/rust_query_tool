@@ -3,6 +3,7 @@ use fltk::{
     enums::{Event, Key},
     group::{Flex, FlexType},
     input::Input,
+    menu::Choice,
     prelude::*,
     tree::{Tree, TreeItem, TreeSelect},
 };
@@ -70,12 +71,14 @@ enum RefreshEvent {
     Finished {
         cache: ObjectCache,
         db_type: crate::db::DatabaseType,
+        owner: Option<String>,
+        owners: Vec<String>,
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RefreshRequest {
-    Metadata,
+    Metadata { owner: Option<String> },
 }
 
 const REFRESH_TREE_BATCH_SIZE: usize = 300;
@@ -128,12 +131,16 @@ pub struct ObjectBrowserWidget {
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
     filter_input: Input,
+    owner_choice: Choice,
+    owner_list: Arc<Mutex<Vec<String>>>,
+    selected_owner: Arc<Mutex<Option<String>>>,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
+    owner_change_callback: Arc<Mutex<Option<Box<dyn FnMut(Option<String>)>>>>,
 }
 
 impl ObjectBrowserWidget {
@@ -150,6 +157,12 @@ impl ObjectBrowserWidget {
         let mut filter_row = Flex::default();
         filter_row.set_type(FlexType::Row);
         filter_row.set_spacing(DIALOG_SPACING);
+
+        let mut owner_choice = Choice::default();
+        owner_choice.set_color(theme::input_bg());
+        owner_choice.set_text_color(theme::text_primary());
+        owner_choice.hide();
+        filter_row.fixed(&owner_choice, 180);
 
         // Filter input with modern styling
         let mut filter_input = Input::default();
@@ -184,6 +197,8 @@ impl ObjectBrowserWidget {
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
+        let owner_list = Arc::new(Mutex::new(Vec::new()));
+        let selected_owner = Arc::new(Mutex::new(None));
         let current_db_type = Arc::new(Mutex::new(initial_db_type));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
@@ -200,6 +215,9 @@ impl ObjectBrowserWidget {
             tree,
             connection,
             filter_input,
+            owner_choice,
+            owner_list,
+            selected_owner,
             object_cache,
             current_db_type,
             pending_tree_refresh,
@@ -208,9 +226,11 @@ impl ObjectBrowserWidget {
             status_callback,
             refresh_request_sender,
             action_sender,
+            owner_change_callback: Arc::new(Mutex::new(None)),
         };
         widget.setup_callbacks();
         widget.setup_filter_callback();
+        widget.setup_owner_callback();
         widget.setup_refresh_handler(refresh_receiver);
         widget.setup_action_handler(action_receiver);
         widget
@@ -285,12 +305,48 @@ impl ObjectBrowserWidget {
         });
     }
 
+    fn setup_owner_callback(&mut self) {
+        let owner_choice = self.owner_choice.clone();
+        let owner_list = self.owner_list.clone();
+        let selected_owner = self.selected_owner.clone();
+        let refresh_sender = self.refresh_request_sender.clone();
+        let owner_change_callback = self.owner_change_callback.clone();
+
+        self.owner_choice.set_callback(move |_| {
+            let owners = owner_list
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let idx = owner_choice.value();
+            if idx < 0 {
+                return;
+            }
+            let Some(owner) = owners.get(idx as usize).cloned() else {
+                return;
+            };
+            *selected_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner.clone());
+            let _ = refresh_sender.send(RefreshRequest::Metadata {
+                owner: Some(owner.clone()),
+            });
+            if let Ok(mut callback_guard) = owner_change_callback.lock() {
+                if let Some(callback) = callback_guard.as_mut() {
+                    callback(Some(owner));
+                }
+            }
+        });
+    }
+
     fn setup_refresh_handler(&mut self, refresh_receiver: std::sync::mpsc::Receiver<RefreshEvent>) {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
         let filter_input = self.filter_input.clone();
         let pending_tree_refresh = self.pending_tree_refresh.clone();
+        let owner_choice = self.owner_choice.clone();
+        let owner_list = self.owner_list.clone();
+        let selected_owner = self.selected_owner.clone();
 
         let lifecycle = Arc::downgrade(&self.poll_lifecycle);
 
@@ -305,6 +361,9 @@ impl ObjectBrowserWidget {
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
             filter_input: Input,
             pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
+            mut owner_choice: Choice,
+            owner_list: Arc<Mutex<Vec<String>>>,
+            selected_owner: Arc<Mutex<Option<String>>>,
             status_callback: StatusCallback,
             lifecycle: Weak<()>,
         ) {
@@ -319,7 +378,12 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             // Keep receiver lock scope minimal: drain messages first, then perform UI work.
             // This prevents long lock hold while rebuilding tree widgets.
-            let mut latest_cache: Option<(crate::db::DatabaseType, ObjectCache)> = None;
+            let mut latest_cache: Option<(
+                crate::db::DatabaseType,
+                ObjectCache,
+                Option<String>,
+                Vec<String>,
+            )> = None;
 
             {
                 let r = receiver
@@ -327,8 +391,13 @@ impl ObjectBrowserWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
-                        Ok(RefreshEvent::Finished { cache, db_type }) => {
-                            latest_cache = Some((db_type, cache));
+                        Ok(RefreshEvent::Finished {
+                            cache,
+                            db_type,
+                            owner,
+                            owners,
+                        }) => {
+                            latest_cache = Some((db_type, cache, owner, owners));
                             match current_db_type.lock() {
                                 Ok(mut guard) => *guard = db_type,
                                 Err(poisoned) => *poisoned.into_inner() = db_type,
@@ -343,7 +412,7 @@ impl ObjectBrowserWidget {
                 }
             }
 
-            if let Some((db_type, cache)) = latest_cache {
+            if let Some((db_type, cache, owner, owners)) = latest_cache {
                 let filter_text = filter_input.value().to_lowercase();
                 let paths = ObjectBrowserWidget::collect_tree_paths(&cache, &filter_text);
                 let cache_snapshot = cache.clone();
@@ -353,6 +422,33 @@ impl ObjectBrowserWidget {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *cache_guard = cache;
+                }
+                {
+                    *owner_list
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = owners.clone();
+                    *selected_owner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner.clone();
+                }
+                if db_type.uses_oracle_sql_dialect() && !owners.is_empty() {
+                    owner_choice.clear();
+                    owner_choice.add_choice(&owners.join("|"));
+                    if let Some(selected_owner_name) = owner {
+                        let selected_upper = selected_owner_name.to_uppercase();
+                        let selected_idx = owners
+                            .iter()
+                            .position(|candidate| candidate.to_uppercase() == selected_upper)
+                            .unwrap_or(0);
+                        owner_choice.set_value(selected_idx as i32);
+                    } else {
+                        owner_choice.set_value(0);
+                    }
+                    owner_choice.show();
+                    owner_choice.activate();
+                } else {
+                    owner_choice.clear();
+                    owner_choice.hide();
                 }
 
                 ObjectBrowserWidget::rebuild_root_categories_for_db_type(
@@ -422,6 +518,9 @@ impl ObjectBrowserWidget {
                     current_db_type.clone(),
                     filter_input.clone(),
                     pending_tree_refresh.clone(),
+                    owner_choice.clone(),
+                    owner_list.clone(),
+                    selected_owner.clone(),
                     status_callback.clone(),
                     lifecycle.clone(),
                 );
@@ -436,6 +535,9 @@ impl ObjectBrowserWidget {
             current_db_type,
             filter_input,
             pending_tree_refresh,
+            owner_choice,
+            owner_list,
+            selected_owner,
             self.status_callback.clone(),
             lifecycle,
         );
@@ -2606,6 +2708,16 @@ impl ObjectBrowserWidget {
         self.clear_pending_tree_refresh();
         self.clear_items();
         self.filter_input.set_value("");
+        self.owner_choice.clear();
+        self.owner_choice.hide();
+        *self
+            .owner_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Vec::new();
+        *self
+            .selected_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .object_cache
             .lock()
@@ -2623,8 +2735,27 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
         self.emit_status("Refreshing object browser metadata");
+        let owner = self.selected_owner();
+        let _ = self
+            .refresh_request_sender
+            .send(RefreshRequest::Metadata { owner });
+    }
 
-        let _ = self.refresh_request_sender.send(RefreshRequest::Metadata);
+    pub fn selected_owner(&self) -> Option<String> {
+        self.selected_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_owner_change_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(Option<String>) + 'static,
+    {
+        *self
+            .owner_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     fn spawn_refresh_worker(
@@ -2635,9 +2766,16 @@ impl ObjectBrowserWidget {
         thread::spawn(move || {
             while let Ok(request) = Self::recv_latest_refresh_request(&refresh_request_receiver) {
                 match request {
-                    RefreshRequest::Metadata => {
-                        if let Some((db_type, cache)) = Self::load_metadata_cache(&connection) {
-                            let _ = refresh_sender.send(RefreshEvent::Finished { cache, db_type });
+                    RefreshRequest::Metadata { owner } => {
+                        if let Some((db_type, cache, selected_owner, owners)) =
+                            Self::load_metadata_cache(&connection, owner.as_deref())
+                        {
+                            let _ = refresh_sender.send(RefreshEvent::Finished {
+                                cache,
+                                db_type,
+                                owner: selected_owner,
+                                owners,
+                            });
                             app::awake();
                         }
                     }
@@ -2663,7 +2801,13 @@ impl ObjectBrowserWidget {
 
     fn load_metadata_cache(
         connection: &SharedConnection,
-    ) -> Option<(crate::db::DatabaseType, ObjectCache)> {
+        requested_owner: Option<&str>,
+    ) -> Option<(
+        crate::db::DatabaseType,
+        ObjectCache,
+        Option<String>,
+        Vec<String>,
+    )> {
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
         // Acquire connection lock and hold it during all queries.
@@ -2678,34 +2822,56 @@ impl ObjectBrowserWidget {
                     return None;
                 };
 
+                let owners = ObjectBrowser::get_users(db_conn.as_ref()).unwrap_or_default();
+                let default_owner = ObjectBrowser::get_current_owner(db_conn.as_ref())
+                    .unwrap_or_else(|_| conn_guard.get_info().username.to_uppercase());
+                let selected_owner = requested_owner
+                    .map(|owner| owner.trim().to_uppercase())
+                    .filter(|owner| !owner.is_empty())
+                    .unwrap_or(default_owner);
+
                 let mut cache = ObjectCache::default();
 
-                if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
+                if let Ok(tables) = ObjectBrowser::get_tables_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.tables = tables;
                 }
-                if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
+                if let Ok(views) = ObjectBrowser::get_views_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.views = views;
                 }
-                if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
+                if let Ok(procedures) =
+                    ObjectBrowser::get_procedures_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.procedures = procedures;
                 }
-                if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
+                if let Ok(functions) =
+                    ObjectBrowser::get_functions_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.functions = functions;
                 }
-                if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
+                if let Ok(sequences) =
+                    ObjectBrowser::get_sequences_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.sequences = sequences;
                 }
-                if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
+                if let Ok(triggers) =
+                    ObjectBrowser::get_triggers_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.triggers = triggers;
                 }
-                if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
+                if let Ok(synonyms) =
+                    ObjectBrowser::get_synonyms_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.synonyms = synonyms;
                 }
-                if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
+                if let Ok(packages) =
+                    ObjectBrowser::get_packages_by_owner(db_conn.as_ref(), &selected_owner)
+                {
                     cache.packages = packages;
                 }
 
-                Some((db_type, cache))
+                Some((db_type, cache, Some(selected_owner), owners))
             }
             crate::db::DbSqlDialect::MySql => {
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
@@ -2735,7 +2901,7 @@ impl ObjectBrowserWidget {
                 }
                 // MySQL/MariaDB connections do not expose Oracle-only synonyms or packages.
 
-                Some((db_type, cache))
+                Some((db_type, cache, None, Vec::new()))
             }
         }
     }
