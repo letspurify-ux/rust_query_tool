@@ -1,23 +1,10 @@
 use fltk::{enums::ColorDepth, image::RgbImage, prelude::WindowExt};
-use miniquad::conf::Icon;
 
 use crate::utils::arithmetic::safe_div;
 
 include!("icon_fill.rs");
 
 const BIG_ICON_SIZE: usize = 64;
-
-pub fn miniquad_icon() -> Icon {
-    let mut small = [0u8; 16 * 16 * 4];
-    let mut medium = [0u8; 32 * 32 * 4];
-    let mut big = [0u8; 64 * 64 * 4];
-
-    fill_icon(&mut small, 16);
-    fill_icon(&mut medium, 32);
-    fill_icon(&mut big, 64);
-
-    Icon { small, medium, big }
-}
 
 pub fn apply_window_icon<W: WindowExt>(window: &mut W) {
     if let Some(image) = fltk_icon_image() {

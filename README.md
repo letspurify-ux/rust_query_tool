@@ -148,15 +148,6 @@ export ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_23_3
 cargo run --release
 ```
 
-### Splash 화면
-
-- 기본 feature는 `no-splash`라서 OpenGL splash 화면이 꺼져 있습니다.
-- splash를 다시 켜려면 default feature를 끄고 실행합니다.
-
-```bash
-cargo run --release --no-default-features
-```
-
 ### Linux 빌드 메모
 
 `build.rs`는 제한된 환경에서 일부 X11 개발 라이브러리가 없을 때 테스트/빌드가 진행되도록 stub 라이브러리를 연결할 수 있습니다. 다만 실제 GUI 실행 환경에서는 일반적인 X11/데스크톱 런타임 의존성이 여전히 필요합니다.
@@ -220,8 +211,6 @@ src/
   - 멀티스레드/패닉 가드 회귀 테스트
 - `test/`, `test_mariadb/`
   - 포매터/파서/분리기 회귀용 SQL 샘플
-- `vendor/miniquad/`
-  - splash 렌더링에 쓰는 patched dependency
 
 ## 프로젝트 성격
 

@@ -79,11 +79,6 @@ fn build_about_dialog_content() -> String {
     } else {
         "Release"
     };
-    let splash_status = if cfg!(feature = "no-splash") {
-        "Disabled"
-    } else {
-        "Enabled"
-    };
     let platform = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
 
     format!(
@@ -101,8 +96,7 @@ Highlights\n\
 \n\
 Runtime\n\
 - Build: {build_profile}\n\
-- Platform: {platform}\n\
-- Splash screen: {splash_status}"
+- Platform: {platform}"
     )
 }
 

@@ -11,13 +11,6 @@ name = "space_query"
 path = "src/main.rs"
 test = false
 
-[features]
-# Disable the OpenGL splash screen by default for faster startup and better
-# compatibility in headless environments.
-# To re-enable the splash screen, build with: cargo build --no-default-features
-default = ["no-splash"]
-no-splash = []
-
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }
 oracle = "0.6"
@@ -29,7 +22,6 @@ dirs = "6.0"
 once_cell = "1.19"
 keyring = { version = "3", default-features = false }
 libc = "0.2"
-miniquad = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
@@ -60,6 +52,3 @@ winres = "0.1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
-
-[patch.crates-io]
-miniquad = { path = "vendor/miniquad" }

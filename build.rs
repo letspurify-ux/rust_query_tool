@@ -46,7 +46,6 @@ fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<(
 struct CfgContext {
     target_os: String,
     debug_assertions: bool,
-    no_splash_enabled: bool,
 }
 
 fn parse_cfg_items(list: &syn::MetaList) -> syn::Result<Punctuated<Meta, Token![,]>> {
@@ -91,9 +90,6 @@ fn eval_cfg(meta: &Meta, ctx: &CfgContext) -> syn::Result<bool> {
                 syn::Error::new_spanned(list, "cfg(not()) requires one predicate")
             })?;
             Ok(!eval_cfg(item, ctx)?)
-        }
-        Meta::NameValue(meta) if meta.path.is_ident("feature") => {
-            Ok(meta_string_value(meta).as_deref() == Some("no-splash") && ctx.no_splash_enabled)
         }
         Meta::NameValue(meta) if meta.path.is_ident("target_os") => {
             Ok(meta_string_value(meta).as_deref() == Some(ctx.target_os.as_str()))
@@ -194,10 +190,6 @@ fn count_rust_tests_in_dir(
 
     let mut count = 0;
     for path in files {
-        if ctx.no_splash_enabled && path.starts_with(Path::new("src/splash")) {
-            continue;
-        }
-
         let source = fs::read_to_string(&path)?;
         let parsed = syn::parse_file(&source)?;
         count += count_test_items(&parsed.items, ctx)?;
@@ -224,7 +216,6 @@ fn configure_display_version() -> Result<(), Box<dyn std::error::Error>> {
         debug_assertions: env::var("DEBUG")
             .map(|value| value == "true")
             .unwrap_or(cfg!(debug_assertions)),
-        no_splash_enabled: env::var_os("CARGO_FEATURE_NO_SPLASH").is_some(),
     };
     let base_version = env::var("CARGO_PKG_VERSION")?;
     let test_count = count_rust_tests_in_dir(Path::new("src"), &cfg)?

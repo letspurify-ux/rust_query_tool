@@ -25,9 +25,6 @@ impl App {
     }
 
     pub fn run(&self) {
-        #[cfg(not(feature = "no-splash"))]
-        crate::splash::run_splash();
-
         let startup = Self::bootstrap();
 
         let app = app::App::default()
