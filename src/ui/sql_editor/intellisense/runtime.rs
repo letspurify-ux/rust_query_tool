@@ -40,15 +40,29 @@ impl SqlEditorWidget {
                     ));
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
+                    let (_, word_start, _) = Self::word_at_cursor(
+                        &buffer_for_insert,
+                        &text_shadow_for_insert,
+                        cursor_pos,
+                    );
+                    let qualifier = Self::qualifier_before_word(
+                        &buffer_for_insert,
+                        &text_shadow_for_insert,
+                        word_start,
+                    );
+                    let table_lookup = qualifier
+                        .as_deref()
+                        .map(|qualifier| format!("{}.{}", qualifier, selected))
+                        .unwrap_or_else(|| selected.clone());
                     let should_prefetch = {
                         let data = intellisense_data_for_insert
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        data.is_known_relation(&selected)
+                        Self::resolve_table_column_load_key(&data, &table_lookup).is_some()
                     };
                     if should_prefetch {
                         Self::request_table_columns(
-                            &selected,
+                            &table_lookup,
                             &intellisense_data_for_insert,
                             &column_sender_for_insert,
                             &connection_for_insert,

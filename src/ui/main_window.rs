@@ -32,9 +32,9 @@ use crate::ui::result_table::ResultGridSqlExecuteCallback;
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
-    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QueryHistoryDialog, QueryProgress,
-    QueryTabId, QueryTabsWidget, ResultTabRequest, ResultTabStatus, ResultTabsWidget, SqlAction,
-    SqlEditorWidget,
+    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QualifiedMemberKind,
+    QueryHistoryDialog, QueryProgress, QueryTabId, QueryTabsWidget, ResultTabRequest,
+    ResultTabStatus, ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -3355,106 +3355,187 @@ impl MainWindow {
 
     fn load_schema_update_for_current_connection(
         connection: &SharedConnection,
+        requested_scope: Option<String>,
     ) -> Option<SchemaUpdate> {
-        let (connection_generation, tables, views, procedures, functions, packages) = {
+        let (connection_generation, data) = {
             let mut conn_guard =
                 lock_connection_with_activity(connection, "Loading schema metadata");
             let connection_generation = conn_guard.connection_generation();
-            let fetched = match conn_guard.db_type().sql_dialect() {
+            let data = match conn_guard.db_type().sql_dialect() {
                 crate::db::DbSqlDialect::Oracle => {
                     let Ok(conn) = conn_guard.require_live_connection() else {
                         return None;
                     };
-
-                    let tables = match ObjectBrowser::get_tables(conn.as_ref()) {
-                        Ok(tables) => tables,
-                        Err(err) => {
-                            crate::utils::logging::log_error(
-                                "schema",
-                                &format!(
-                                    "failed to load tables for intellisense schema update: {err}"
-                                ),
-                            );
-                            return None;
+                    let current_schema = ObjectBrowser::get_current_schema(conn.as_ref())
+                        .ok()
+                        .map(|schema| schema.trim().to_string())
+                        .filter(|schema| !schema.is_empty())
+                        .or_else(|| {
+                            let username = conn_guard.get_info().username.trim();
+                            (!username.is_empty()).then(|| username.to_ascii_uppercase())
+                        });
+                    let mut owners = ObjectBrowser::get_users(conn.as_ref()).unwrap_or_default();
+                    if let Some(ref current_schema) = current_schema {
+                        if !owners
+                            .iter()
+                            .any(|owner| owner.eq_ignore_ascii_case(current_schema))
+                        {
+                            owners.push(current_schema.clone());
                         }
-                    };
+                    }
+                    owners.sort();
+                    owners.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
-                    let views = match ObjectBrowser::get_views(conn.as_ref()) {
-                        Ok(views) => views,
-                        Err(err) => {
-                            crate::utils::logging::log_error(
-                                "schema",
-                                &format!(
-                                    "failed to load views for intellisense schema update: {err}"
-                                ),
-                            );
-                            Vec::new()
+                    let selected_owner = requested_scope
+                        .clone()
+                        .filter(|scope| !scope.trim().is_empty())
+                        .or(current_schema)
+                        .or_else(|| owners.first().cloned());
+
+                    let schema_objects =
+                        ObjectBrowser::get_schema_objects_by_owner(conn.as_ref()).unwrap_or_default();
+                    let relation_members =
+                        ObjectBrowser::get_schema_relation_members_by_owner(conn.as_ref())
+                            .unwrap_or_default();
+
+                    let mut data = IntellisenseData::new();
+                    data.users = owners;
+                    data.set_default_qualifier(selected_owner.clone());
+
+                    for (owner, objects) in &schema_objects {
+                        let qualifier_members = objects
+                            .iter()
+                            .map(|(name, object_type)| {
+                                (
+                                    name.clone(),
+                                    QualifiedMemberKind::from_object_type_name(object_type),
+                                )
+                            })
+                            .collect();
+                        data.set_members_for_qualifier_with_kinds(owner, qualifier_members);
+                    }
+                    for (owner, members) in &relation_members {
+                        data.set_relation_members_for_qualifier(owner, members.clone());
+                    }
+
+                    if let Some(selected_owner) = selected_owner {
+                        if let Some(objects) = schema_objects
+                            .iter()
+                            .find(|(owner, _)| owner.eq_ignore_ascii_case(&selected_owner))
+                            .map(|(_, objects)| objects)
+                        {
+                            for (name, object_type) in objects {
+                                match object_type.as_str() {
+                                    "TABLE" => data.tables.push(name.clone()),
+                                    "VIEW" => data.views.push(name.clone()),
+                                    "PROCEDURE" => data.procedures.push(name.clone()),
+                                    "FUNCTION" => data.functions.push(name.clone()),
+                                    "PACKAGE" => data.packages.push(name.clone()),
+                                    "SEQUENCE" => data.sequences.push(name.clone()),
+                                    "SYNONYM" => data.synonyms.push(name.clone()),
+                                    _ => {}
+                                }
+                            }
                         }
-                    };
+                    }
 
-                    let procedures =
-                        ObjectBrowser::get_procedures(conn.as_ref()).unwrap_or_default();
-                    let functions = ObjectBrowser::get_functions(conn.as_ref()).unwrap_or_default();
-                    let packages = ObjectBrowser::get_packages(conn.as_ref()).unwrap_or_default();
+                    if let Some(objects) = schema_objects
+                        .iter()
+                        .find(|(owner, _)| owner.eq_ignore_ascii_case("PUBLIC"))
+                        .map(|(_, objects)| objects)
+                    {
+                        for (name, object_type) in objects {
+                            if object_type == "PUBLIC SYNONYM" {
+                                data.public_synonyms.push(name.clone());
+                            }
+                        }
+                    }
 
-                    (tables, views, procedures, functions, packages)
+                    data
                 }
                 crate::db::DbSqlDialect::MySql => {
+                    let current_database = conn_guard.get_info().service_name.trim().to_string();
                     let mysql_conn = conn_guard.get_mysql_connection_mut()?;
-
-                    let tables =
-                        match crate::db::query::mysql_executor::MysqlObjectBrowser::get_tables(
-                            mysql_conn,
-                        ) {
-                            Ok(tables) => tables,
-                            Err(err) => {
-                                crate::utils::logging::log_error(
-                                    "schema",
-                                    &format!(
-                                        "failed to load MySQL tables for intellisense schema update: {err}"
-                                    ),
-                                );
-                                return None;
-                            }
-                        };
-
-                    let views =
-                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_views(mysql_conn)
+                    let mut schemas =
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_schemas(mysql_conn)
                             .unwrap_or_default();
-                    let procedures =
-                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_procedures(
+                    if !current_database.is_empty()
+                        && !schemas
+                            .iter()
+                            .any(|schema| schema.eq_ignore_ascii_case(&current_database))
+                    {
+                        schemas.push(current_database.clone());
+                    }
+                    schemas.sort();
+                    schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+                    let selected_schema = requested_scope
+                        .clone()
+                        .filter(|scope| !scope.trim().is_empty())
+                        .or_else(|| (!current_database.is_empty()).then_some(current_database.clone()))
+                        .or_else(|| schemas.first().cloned());
+
+                    let schema_objects =
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_schema_objects_by_schema(
                             mysql_conn,
                         )
                         .unwrap_or_default();
-                    let functions =
-                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_functions(
+                    let relation_members =
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_schema_relation_members_by_schema(
                             mysql_conn,
                         )
                         .unwrap_or_default();
 
-                    (tables, views, procedures, functions, Vec::new())
+                    let mut data = IntellisenseData::new();
+                    data.users = schemas;
+                    data.set_default_qualifier(selected_schema.clone());
+
+                    for (schema, objects) in &schema_objects {
+                        let qualifier_members = objects
+                            .iter()
+                            .map(|(name, object_type)| {
+                                (
+                                    name.clone(),
+                                    QualifiedMemberKind::from_object_type_name(object_type),
+                                )
+                            })
+                            .collect();
+                        data.set_members_for_qualifier_with_kinds(schema, qualifier_members);
+                    }
+                    for (schema, members) in &relation_members {
+                        data.set_relation_members_for_qualifier(schema, members.clone());
+                    }
+
+                    if let Some(selected_schema) = selected_schema {
+                        if let Some(objects) = schema_objects
+                            .iter()
+                            .find(|(schema, _)| schema.eq_ignore_ascii_case(&selected_schema))
+                            .map(|(_, objects)| objects)
+                        {
+                            for (name, object_type) in objects {
+                                match object_type.as_str() {
+                                    "TABLE" => data.tables.push(name.clone()),
+                                    "VIEW" => data.views.push(name.clone()),
+                                    "PROCEDURE" => data.procedures.push(name.clone()),
+                                    "FUNCTION" => data.functions.push(name.clone()),
+                                    "SEQUENCE" => data.sequences.push(name.clone()),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    data
                 }
             };
 
-            (
-                connection_generation,
-                fetched.0,
-                fetched.1,
-                fetched.2,
-                fetched.3,
-                fetched.4,
-            )
+            (connection_generation, data)
         };
 
-        let mut data = IntellisenseData::new();
         let mut highlight_data = HighlightData::new();
-        highlight_data.tables = tables.clone();
-        data.tables = tables;
-        highlight_data.views = views.clone();
-        data.views = views;
-        data.procedures = procedures;
-        data.functions = functions;
-        data.packages = packages;
+        highlight_data.tables = data.tables.clone();
+        highlight_data.views = data.views.clone();
+        let mut data = data;
         data.rebuild_indices();
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);
 
@@ -3473,12 +3554,16 @@ impl MainWindow {
             return false;
         }
 
+        let selected_scope = state.object_browser.selected_scope();
         state.object_browser.refresh();
         let schema_sender = schema_sender.clone();
         let connection = state.connection.clone();
         let schema_refresh_guard = state.schema_refresh_in_progress.clone();
         thread::spawn(move || {
-            if let Some(update) = MainWindow::load_schema_update_for_current_connection(&connection)
+            if let Some(update) = MainWindow::load_schema_update_for_current_connection(
+                &connection,
+                selected_scope,
+            )
             {
                 let _ = schema_sender.send(update);
                 app::awake();
@@ -4725,7 +4810,7 @@ impl MainWindow {
                 let deferred_sender = sender.clone();
                 let deferred_filename = filename.clone();
                 let export = match MainWindow::prepare_result_export(
-                    &state,
+                    state,
                     Box::new(move |csv, row_count| {
                         let sender = deferred_sender.clone();
                         let filename = deferred_filename.clone();
@@ -5310,6 +5395,55 @@ impl MainWindow {
                     .sql_editor
                     .focus();
                 app::redraw();
+            }
+        });
+
+        let weak_state_for_scope_change = Arc::downgrade(&state);
+        let schema_sender_for_scope_change = schema_sender.clone();
+        object_browser.set_scope_change_callback(move || {
+            let Some(state_for_scope_change) = weak_state_for_scope_change.upgrade() else {
+                return;
+            };
+
+            let should_retry = {
+                let mut s = state_for_scope_change
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let connection_info = {
+                    let conn_guard = s
+                        .connection
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if conn_guard.is_connected() {
+                        Some(conn_guard.get_info().clone())
+                    } else {
+                        None
+                    }
+                };
+                *s.connection_info
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_info;
+                !MainWindow::start_connection_metadata_refresh(
+                    &mut s,
+                    &schema_sender_for_scope_change,
+                )
+            };
+
+            if should_retry {
+                let weak_state_for_retry = weak_state_for_scope_change.clone();
+                let schema_sender_for_retry = schema_sender_for_scope_change.clone();
+                app::add_timeout3(0.15, move |_| {
+                    let Some(state_for_retry) = weak_state_for_retry.upgrade() else {
+                        return;
+                    };
+                    let retry_result = state_for_retry.try_lock();
+                    if let Ok(mut s) = retry_result {
+                        let _ = MainWindow::start_connection_metadata_refresh(
+                            &mut s,
+                            &schema_sender_for_retry,
+                        );
+                    }
+                });
             }
         });
 

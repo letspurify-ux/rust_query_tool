@@ -1,4 +1,4 @@
-use oracle::sql_type::{OracleType, RefCursor};
+use oracle::sql_type::{OracleType, RefCursor, ToSql};
 use oracle::{Connection, Error as OracleError, Row, Statement};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -3388,6 +3388,58 @@ impl QueryExecutor {
         } else {
             (None, trimmed.to_string())
         }
+    }
+
+    fn split_normalized_owner_object_name(value: &str) -> (Option<String>, String) {
+        let (owner_raw, name_raw) = Self::split_qualified_name(value);
+        (
+            owner_raw
+                .map(|owner| Self::normalize_object_name(&owner))
+                .filter(|owner| !owner.is_empty()),
+            Self::normalize_object_name(&name_raw),
+        )
+    }
+
+    fn query_single_text_column(
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn ToSql],
+    ) -> Result<Vec<String>, OracleError> {
+        let mut stmt = match conn.statement(sql).build() {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+        let rows = match stmt.query(params) {
+            Ok(rows) => rows,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+
+        let mut values = Vec::new();
+        for row_result in rows {
+            let row = match row_result {
+                Ok(row) => row,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            let value: String = match row.get(0) {
+                Ok(value) => value,
+                Err(err) => {
+                    logging::log_error("executor", &format!("Database operation failed: {err}"));
+                    return Err(err);
+                }
+            };
+            values.push(value);
+        }
+
+        Ok(values)
     }
 
     /// Describe a table or view, optionally schema-qualified (owner.object).
@@ -7807,9 +7859,21 @@ impl ObjectBrowser {
         Self::get_object_list(conn, sql)
     }
 
+    pub fn get_tables_by_owner(conn: &Connection, owner: &str) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT table_name FROM all_tables WHERE owner = :1 ORDER BY table_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
+    }
+
     pub fn get_views(conn: &Connection) -> Result<Vec<String>, OracleError> {
         let sql = "SELECT view_name FROM user_views ORDER BY view_name";
         Self::get_object_list(conn, sql)
+    }
+
+    pub fn get_views_by_owner(conn: &Connection, owner: &str) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT view_name FROM all_views WHERE owner = :1 ORDER BY view_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
     }
 
     pub fn get_procedures(conn: &Connection) -> Result<Vec<String>, OracleError> {
@@ -7817,9 +7881,27 @@ impl ObjectBrowser {
         Self::get_object_list(conn, sql)
     }
 
+    pub fn get_procedures_by_owner(
+        conn: &Connection,
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT object_name FROM all_procedures WHERE owner = :1 AND object_type = 'PROCEDURE' ORDER BY object_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
+    }
+
     pub fn get_functions(conn: &Connection) -> Result<Vec<String>, OracleError> {
         let sql = "SELECT object_name FROM user_procedures WHERE object_type = 'FUNCTION' ORDER BY object_name";
         Self::get_object_list(conn, sql)
+    }
+
+    pub fn get_functions_by_owner(
+        conn: &Connection,
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT object_name FROM all_procedures WHERE owner = :1 AND object_type = 'FUNCTION' ORDER BY object_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
     }
 
     pub fn get_sequences(conn: &Connection) -> Result<Vec<String>, OracleError> {
@@ -7827,28 +7909,31 @@ impl ObjectBrowser {
         Self::get_object_list(conn, sql)
     }
 
+    pub fn get_sequences_by_owner(
+        conn: &Connection,
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT sequence_name FROM all_sequences WHERE sequence_owner = :1 ORDER BY sequence_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
+    }
+
     pub fn get_triggers(conn: &Connection) -> Result<Vec<String>, OracleError> {
         let sql = "SELECT trigger_name FROM user_triggers ORDER BY trigger_name";
         Self::get_object_list(conn, sql)
     }
 
-    pub fn get_sequence_info(
+    pub fn get_triggers_by_owner(
         conn: &Connection,
-        seq_name: &str,
-    ) -> Result<SequenceInfo, OracleError> {
-        let sql = r#"
-            SELECT
-                sequence_name,
-                TO_CHAR(min_value),
-                TO_CHAR(max_value),
-                TO_CHAR(increment_by),
-                cycle_flag,
-                order_flag,
-                TO_CHAR(cache_size),
-                TO_CHAR(last_number)
-            FROM user_sequences
-            WHERE sequence_name = :1
-        "#;
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT trigger_name FROM all_triggers WHERE owner = :1 ORDER BY trigger_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
+    }
+
+    pub fn get_current_schema(conn: &Connection) -> Result<String, OracleError> {
+        let sql = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual";
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -7856,7 +7941,64 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let row = match stmt.query_row(&[&seq_name.to_uppercase()]) {
+        let row = match stmt.query_row(&[]) {
+            Ok(row) => row,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+        row.get::<_, Option<String>>(0)
+            .map(|value| value.unwrap_or_default())
+    }
+
+    pub fn get_sequence_info(
+        conn: &Connection,
+        seq_name: &str,
+    ) -> Result<SequenceInfo, OracleError> {
+        let (owner, sequence_name) = QueryExecutor::split_normalized_owner_object_name(seq_name);
+        let sql = if owner.is_some() {
+            r#"
+                SELECT
+                    sequence_name,
+                    TO_CHAR(min_value),
+                    TO_CHAR(max_value),
+                    TO_CHAR(increment_by),
+                    cycle_flag,
+                    order_flag,
+                    TO_CHAR(cache_size),
+                    TO_CHAR(last_number)
+                FROM all_sequences
+                WHERE sequence_owner = :1
+                  AND sequence_name = :2
+            "#
+        } else {
+            r#"
+                SELECT
+                    sequence_name,
+                    TO_CHAR(min_value),
+                    TO_CHAR(max_value),
+                    TO_CHAR(increment_by),
+                    cycle_flag,
+                    order_flag,
+                    TO_CHAR(cache_size),
+                    TO_CHAR(last_number)
+                FROM user_sequences
+                WHERE sequence_name = :1
+            "#
+        };
+        let mut stmt = match conn.statement(sql).build() {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
+            }
+        };
+        let row = match owner.as_deref() {
+            Some(owner) => stmt.query_row(&[&owner, &sequence_name]),
+            None => stmt.query_row(&[&sequence_name]),
+        };
+        let row = match row {
             Ok(row) => row,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -7888,6 +8030,15 @@ impl ObjectBrowser {
     pub fn get_synonyms(conn: &Connection) -> Result<Vec<String>, OracleError> {
         let sql = "SELECT synonym_name FROM user_synonyms ORDER BY synonym_name";
         Self::get_object_list(conn, sql)
+    }
+
+    pub fn get_synonyms_by_owner(
+        conn: &Connection,
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT synonym_name FROM all_synonyms WHERE owner = :1 ORDER BY synonym_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
     }
 
     pub fn get_public_synonyms(conn: &Connection) -> Result<Vec<String>, OracleError> {
@@ -7938,15 +8089,29 @@ impl ObjectBrowser {
     }
 
     pub fn get_synonym_info(conn: &Connection, syn_name: &str) -> Result<SynonymInfo, OracleError> {
-        let sql = r#"
-            SELECT
-                synonym_name,
-                table_owner,
-                table_name,
-                db_link
-            FROM user_synonyms
-            WHERE synonym_name = :1
-        "#;
+        let (owner, synonym_name) = QueryExecutor::split_normalized_owner_object_name(syn_name);
+        let sql = if owner.is_some() {
+            r#"
+                SELECT
+                    synonym_name,
+                    table_owner,
+                    table_name,
+                    db_link
+                FROM all_synonyms
+                WHERE owner = :1
+                  AND synonym_name = :2
+            "#
+        } else {
+            r#"
+                SELECT
+                    synonym_name,
+                    table_owner,
+                    table_name,
+                    db_link
+                FROM user_synonyms
+                WHERE synonym_name = :1
+            "#
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -7954,7 +8119,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let row = match stmt.query_row(&[&syn_name.to_uppercase()]) {
+        let row = match owner.as_deref() {
+            Some(owner) => stmt.query_row(&[&owner, &synonym_name]),
+            None => stmt.query_row(&[&synonym_name]),
+        };
+        let row = match row {
             Ok(row) => row,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -7980,6 +8149,15 @@ impl ObjectBrowser {
         Self::get_object_list(conn, sql)
     }
 
+    pub fn get_packages_by_owner(
+        conn: &Connection,
+        owner: &str,
+    ) -> Result<Vec<String>, OracleError> {
+        let owner_upper = QueryExecutor::normalize_object_name(owner);
+        let sql = "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'PACKAGE' ORDER BY object_name";
+        QueryExecutor::query_single_text_column(conn, sql, &[&owner_upper])
+    }
+
     pub fn get_package_routines(
         conn: &Connection,
         package_name: &str,
@@ -7987,8 +8165,11 @@ impl ObjectBrowser {
         // Fast path: parse package spec source from USER_SOURCE to identify
         // PROCEDURE vs FUNCTION declarations. This avoids the slow
         // user_arguments view entirely, which is the main bottleneck.
-        let pkg_upper = package_name.to_uppercase();
-        if let Ok(routines) = Self::get_package_routines_from_source(conn, &pkg_upper) {
+        let (owner, package_name) =
+            QueryExecutor::split_normalized_owner_object_name(package_name);
+        if let Ok(routines) =
+            Self::get_package_routines_from_source(conn, owner.as_deref(), &package_name)
+        {
             if !routines.is_empty() {
                 return Ok(routines);
             }
@@ -7996,7 +8177,7 @@ impl ObjectBrowser {
 
         // Fallback: query user_procedures + user_arguments if source parsing
         // returned no results (e.g. wrapped/encrypted packages)
-        Self::get_package_routines_from_dict(conn, &pkg_upper)
+        Self::get_package_routines_from_dict(conn, owner.as_deref(), &package_name)
     }
 
     /// Parse package spec source text to extract PROCEDURE/FUNCTION declarations.
@@ -8004,11 +8185,19 @@ impl ObjectBrowser {
     /// table scan with no complex joins.
     fn get_package_routines_from_source(
         conn: &Connection,
+        owner: Option<&str>,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let sql = "SELECT text FROM user_source WHERE name = :1 AND type = 'PACKAGE' ORDER BY line";
+        let sql = if owner.is_some() {
+            "SELECT text FROM all_source WHERE owner = :1 AND name = :2 AND type = 'PACKAGE' ORDER BY line"
+        } else {
+            "SELECT text FROM user_source WHERE name = :1 AND type = 'PACKAGE' ORDER BY line"
+        };
         let mut stmt = conn.statement(sql).build()?;
-        let rows = stmt.query(&[&package_name])?;
+        let rows = match owner {
+            Some(owner) => stmt.query(&[&owner, &package_name])?,
+            None => stmt.query(&[&package_name])?,
+        };
 
         let mut source = String::new();
         for row_result in rows {
@@ -8150,27 +8339,52 @@ impl ObjectBrowser {
     /// Used when source parsing fails (e.g. wrapped/encrypted packages).
     fn get_package_routines_from_dict(
         conn: &Connection,
+        owner: Option<&str>,
         package_name: &str,
     ) -> Result<Vec<PackageRoutine>, OracleError> {
-        let sql = r#"
-            SELECT DISTINCT
-                p.procedure_name,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1 FROM user_arguments a
-                        WHERE a.package_name = p.object_name
-                        AND a.object_name = p.procedure_name
-                        AND a.position = 0
-                        AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
-                    ) THEN 'FUNCTION'
-                    ELSE 'PROCEDURE'
-                END AS routine_type
-            FROM user_procedures p
-            WHERE p.object_type = 'PACKAGE'
-              AND p.object_name = :1
-              AND p.procedure_name IS NOT NULL
-            ORDER BY p.procedure_name
-        "#;
+        let sql = if owner.is_some() {
+            r#"
+                SELECT DISTINCT
+                    p.procedure_name,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM all_arguments a
+                            WHERE a.owner = p.owner
+                            AND a.package_name = p.object_name
+                            AND a.object_name = p.procedure_name
+                            AND a.position = 0
+                            AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
+                        ) THEN 'FUNCTION'
+                        ELSE 'PROCEDURE'
+                    END AS routine_type
+                FROM all_procedures p
+                WHERE p.owner = :1
+                  AND p.object_type = 'PACKAGE'
+                  AND p.object_name = :2
+                  AND p.procedure_name IS NOT NULL
+                ORDER BY p.procedure_name
+            "#
+        } else {
+            r#"
+                SELECT DISTINCT
+                    p.procedure_name,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM user_arguments a
+                            WHERE a.package_name = p.object_name
+                            AND a.object_name = p.procedure_name
+                            AND a.position = 0
+                            AND (a.overload = p.overload OR (a.overload IS NULL AND p.overload IS NULL))
+                        ) THEN 'FUNCTION'
+                        ELSE 'PROCEDURE'
+                    END AS routine_type
+                FROM user_procedures p
+                WHERE p.object_type = 'PACKAGE'
+                  AND p.object_name = :1
+                  AND p.procedure_name IS NOT NULL
+                ORDER BY p.procedure_name
+            "#
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -8178,7 +8392,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&package_name]) {
+        let rows = match owner {
+            Some(owner) => stmt.query(&[&owner, &package_name]),
+            None => stmt.query(&[&package_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -8325,48 +8543,111 @@ impl ObjectBrowser {
         package_name: Option<&str>,
         procedure_name: &str,
     ) -> Result<Vec<ProcedureArgument>, OracleError> {
-        let sql = if package_name.is_some() {
-            r#"
-            SELECT
-                argument_name,
-                position,
-                sequence,
-                data_type,
-                in_out,
-                data_length,
-                data_precision,
-                data_scale,
-                type_owner,
-                type_name,
-                pls_type,
-                overload,
-                default_value
-            FROM user_arguments
-            WHERE package_name = :1
-              AND object_name = :2
-            ORDER BY NVL(overload, 0), position, sequence
-            "#
+        let (owner, package_name, procedure_name) = if let Some(package_name) = package_name {
+            let (owner, package_name) =
+                QueryExecutor::split_normalized_owner_object_name(package_name);
+            (
+                owner,
+                Some(package_name),
+                QueryExecutor::normalize_object_name(procedure_name),
+            )
         } else {
-            r#"
-            SELECT
-                argument_name,
-                position,
-                sequence,
-                data_type,
-                in_out,
-                data_length,
-                data_precision,
-                data_scale,
-                type_owner,
-                type_name,
-                pls_type,
-                overload,
-                default_value
-            FROM user_arguments
-            WHERE package_name IS NULL
-              AND object_name = :1
-            ORDER BY NVL(overload, 0), position, sequence
-            "#
+            let (owner, procedure_name) =
+                QueryExecutor::split_normalized_owner_object_name(procedure_name);
+            (owner, None, procedure_name)
+        };
+
+        let sql = match (owner.is_some(), package_name.is_some()) {
+            (true, true) => {
+                r#"
+                SELECT
+                    argument_name,
+                    position,
+                    sequence,
+                    data_type,
+                    in_out,
+                    data_length,
+                    data_precision,
+                    data_scale,
+                    type_owner,
+                    type_name,
+                    pls_type,
+                    overload,
+                    default_value
+                FROM all_arguments
+                WHERE owner = :1
+                  AND package_name = :2
+                  AND object_name = :3
+                ORDER BY NVL(overload, 0), position, sequence
+                "#
+            }
+            (false, true) => {
+                r#"
+                SELECT
+                    argument_name,
+                    position,
+                    sequence,
+                    data_type,
+                    in_out,
+                    data_length,
+                    data_precision,
+                    data_scale,
+                    type_owner,
+                    type_name,
+                    pls_type,
+                    overload,
+                    default_value
+                FROM user_arguments
+                WHERE package_name = :1
+                  AND object_name = :2
+                ORDER BY NVL(overload, 0), position, sequence
+                "#
+            }
+            (true, false) => {
+                r#"
+                SELECT
+                    argument_name,
+                    position,
+                    sequence,
+                    data_type,
+                    in_out,
+                    data_length,
+                    data_precision,
+                    data_scale,
+                    type_owner,
+                    type_name,
+                    pls_type,
+                    overload,
+                    default_value
+                FROM all_arguments
+                WHERE owner = :1
+                  AND package_name IS NULL
+                  AND object_name = :2
+                ORDER BY NVL(overload, 0), position, sequence
+                "#
+            }
+            (false, false) => {
+                r#"
+                SELECT
+                    argument_name,
+                    position,
+                    sequence,
+                    data_type,
+                    in_out,
+                    data_length,
+                    data_precision,
+                    data_scale,
+                    type_owner,
+                    type_name,
+                    pls_type,
+                    overload,
+                    default_value
+                FROM user_arguments
+                WHERE package_name IS NULL
+                  AND object_name = :1
+                ORDER BY NVL(overload, 0), position, sequence
+                "#
+            }
         };
 
         let mut stmt = match conn.statement(sql).build() {
@@ -8377,21 +8658,17 @@ impl ObjectBrowser {
             }
         };
 
-        let rows = if let Some(pkg_name) = package_name {
-            match stmt.query(&[&pkg_name.to_uppercase(), &procedure_name.to_uppercase()]) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            }
-        } else {
-            match stmt.query(&[&procedure_name.to_uppercase()]) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
+        let rows = match (owner.as_deref(), package_name.as_deref()) {
+            (Some(owner), Some(pkg_name)) => stmt.query(&[&owner, &pkg_name, &procedure_name]),
+            (None, Some(pkg_name)) => stmt.query(&[&pkg_name, &procedure_name]),
+            (Some(owner), None) => stmt.query(&[&owner, &procedure_name]),
+            (None, None) => stmt.query(&[&procedure_name]),
+        };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(err) => {
+                logging::log_error("executor", &format!("Database operation failed: {err}"));
+                return Err(err);
             }
         };
 
@@ -8525,7 +8802,12 @@ impl ObjectBrowser {
         conn: &Connection,
         table_name: &str,
     ) -> Result<Vec<ColumnInfo>, OracleError> {
-        let sql = "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id";
+        let (owner, table_name) = QueryExecutor::split_normalized_owner_object_name(table_name);
+        let sql = if owner.is_some() {
+            "SELECT column_name, data_type FROM all_tab_columns WHERE owner = :1 AND table_name = :2 ORDER BY column_id"
+        } else {
+            "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id"
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -8533,7 +8815,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&table_name.to_uppercase()]) {
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &table_name]),
+            None => stmt.query(&[&table_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -8715,7 +9001,12 @@ impl ObjectBrowser {
         conn: &Connection,
         object_name: &str,
     ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT DISTINCT object_type FROM user_objects WHERE object_name = :1";
+        let (owner, object_name) = QueryExecutor::split_normalized_owner_object_name(object_name);
+        let sql = if owner.is_some() {
+            "SELECT DISTINCT object_type FROM all_objects WHERE owner = :1 AND object_name = :2"
+        } else {
+            "SELECT DISTINCT object_type FROM user_objects WHERE object_name = :1"
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -8723,7 +9014,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&object_name.to_uppercase()]) {
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &object_name]),
+            None => stmt.query(&[&object_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -8758,25 +9053,52 @@ impl ObjectBrowser {
         conn: &Connection,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, OracleError> {
-        let sql = r#"
-            SELECT
-                c.column_name,
-                c.data_type,
-                c.data_length,
-                c.data_precision,
-                c.data_scale,
-                c.nullable,
-                c.data_default,
-                (SELECT 'PK' FROM user_cons_columns cc
-                 JOIN user_constraints con ON cc.constraint_name = con.constraint_name
-                 WHERE con.constraint_type = 'P'
-                 AND cc.table_name = c.table_name
-                 AND cc.column_name = c.column_name
-                 AND ROWNUM = 1) as is_pk
-            FROM user_tab_columns c
-            WHERE c.table_name = :1
-            ORDER BY c.column_id
-        "#;
+        let (owner, table_name) = QueryExecutor::split_normalized_owner_object_name(table_name);
+        let sql = if owner.is_some() {
+            r#"
+                SELECT
+                    c.column_name,
+                    c.data_type,
+                    c.data_length,
+                    c.data_precision,
+                    c.data_scale,
+                    c.nullable,
+                    c.data_default,
+                    (SELECT 'PK' FROM all_cons_columns cc
+                     JOIN all_constraints con
+                       ON cc.owner = con.owner
+                      AND cc.constraint_name = con.constraint_name
+                     WHERE con.owner = c.owner
+                       AND con.constraint_type = 'P'
+                       AND cc.table_name = c.table_name
+                       AND cc.column_name = c.column_name
+                       AND ROWNUM = 1) as is_pk
+                FROM all_tab_columns c
+                WHERE c.owner = :1
+                  AND c.table_name = :2
+                ORDER BY c.column_id
+            "#
+        } else {
+            r#"
+                SELECT
+                    c.column_name,
+                    c.data_type,
+                    c.data_length,
+                    c.data_precision,
+                    c.data_scale,
+                    c.nullable,
+                    c.data_default,
+                    (SELECT 'PK' FROM user_cons_columns cc
+                     JOIN user_constraints con ON cc.constraint_name = con.constraint_name
+                     WHERE con.constraint_type = 'P'
+                     AND cc.table_name = c.table_name
+                     AND cc.column_name = c.column_name
+                     AND ROWNUM = 1) as is_pk
+                FROM user_tab_columns c
+                WHERE c.table_name = :1
+                ORDER BY c.column_id
+            "#
+        };
 
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
@@ -8785,7 +9107,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&table_name.to_uppercase()]) {
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &table_name]),
+            None => stmt.query(&[&table_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -8878,17 +9204,35 @@ impl ObjectBrowser {
         conn: &Connection,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, OracleError> {
-        let sql = r#"
-            SELECT
-                i.index_name,
-                i.uniqueness,
-                LISTAGG(ic.column_name, ', ') WITHIN GROUP (ORDER BY ic.column_position) as columns
-            FROM user_indexes i
-            JOIN user_ind_columns ic ON i.index_name = ic.index_name
-            WHERE i.table_name = :1
-            GROUP BY i.index_name, i.uniqueness
-            ORDER BY i.index_name
-        "#;
+        let (owner, table_name) = QueryExecutor::split_normalized_owner_object_name(table_name);
+        let sql = if owner.is_some() {
+            r#"
+                SELECT
+                    i.index_name,
+                    i.uniqueness,
+                    LISTAGG(ic.column_name, ', ') WITHIN GROUP (ORDER BY ic.column_position) as columns
+                FROM all_indexes i
+                JOIN all_ind_columns ic
+                  ON i.owner = ic.index_owner
+                 AND i.index_name = ic.index_name
+                WHERE i.table_owner = :1
+                  AND i.table_name = :2
+                GROUP BY i.index_name, i.uniqueness
+                ORDER BY i.index_name
+            "#
+        } else {
+            r#"
+                SELECT
+                    i.index_name,
+                    i.uniqueness,
+                    LISTAGG(ic.column_name, ', ') WITHIN GROUP (ORDER BY ic.column_position) as columns
+                FROM user_indexes i
+                JOIN user_ind_columns ic ON i.index_name = ic.index_name
+                WHERE i.table_name = :1
+                GROUP BY i.index_name, i.uniqueness
+                ORDER BY i.index_name
+            "#
+        };
 
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
@@ -8897,7 +9241,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&table_name.to_uppercase()]) {
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &table_name]),
+            None => stmt.query(&[&table_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -8950,19 +9298,42 @@ impl ObjectBrowser {
         conn: &Connection,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, OracleError> {
-        let sql = r#"
-            SELECT
-                c.constraint_name,
-                c.constraint_type,
-                LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
-                c.r_constraint_name,
-                (SELECT table_name FROM user_constraints WHERE constraint_name = c.r_constraint_name) as ref_table
-            FROM user_constraints c
-            LEFT JOIN user_cons_columns cc ON c.constraint_name = cc.constraint_name
-            WHERE c.table_name = :1
-            GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name
-            ORDER BY c.constraint_type, c.constraint_name
-        "#;
+        let (owner, table_name) = QueryExecutor::split_normalized_owner_object_name(table_name);
+        let sql = if owner.is_some() {
+            r#"
+                SELECT
+                    c.constraint_name,
+                    c.constraint_type,
+                    LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
+                    c.r_constraint_name,
+                    (SELECT table_name
+                     FROM all_constraints refc
+                     WHERE refc.owner = c.r_owner
+                       AND refc.constraint_name = c.r_constraint_name) as ref_table
+                FROM all_constraints c
+                LEFT JOIN all_cons_columns cc
+                  ON c.owner = cc.owner
+                 AND c.constraint_name = cc.constraint_name
+                WHERE c.owner = :1
+                  AND c.table_name = :2
+                GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name, c.r_owner
+                ORDER BY c.constraint_type, c.constraint_name
+            "#
+        } else {
+            r#"
+                SELECT
+                    c.constraint_name,
+                    c.constraint_type,
+                    LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position) as columns,
+                    c.r_constraint_name,
+                    (SELECT table_name FROM user_constraints WHERE constraint_name = c.r_constraint_name) as ref_table
+                FROM user_constraints c
+                LEFT JOIN user_cons_columns cc ON c.constraint_name = cc.constraint_name
+                WHERE c.table_name = :1
+                GROUP BY c.constraint_name, c.constraint_type, c.r_constraint_name
+                ORDER BY c.constraint_type, c.constraint_name
+            "#
+        };
 
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
@@ -8971,7 +9342,11 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&table_name.to_uppercase()]) {
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &table_name]),
+            None => stmt.query(&[&table_name]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -9035,164 +9410,32 @@ impl ObjectBrowser {
 
     /// Generate DDL for a table
     pub fn get_table_ddl(conn: &Connection, table_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('TABLE', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&table_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "TABLE", table_name)
     }
 
     /// Generate DDL for a view
     pub fn get_view_ddl(conn: &Connection, view_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('VIEW', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&view_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "VIEW", view_name)
     }
 
     /// Generate DDL for a procedure
     pub fn get_procedure_ddl(conn: &Connection, proc_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('PROCEDURE', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&proc_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "PROCEDURE", proc_name)
     }
 
     /// Generate DDL for a function
     pub fn get_function_ddl(conn: &Connection, func_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('FUNCTION', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&func_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "FUNCTION", func_name)
     }
 
     /// Generate DDL for a sequence
     pub fn get_sequence_ddl(conn: &Connection, seq_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('SEQUENCE', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&seq_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "SEQUENCE", seq_name)
     }
 
     /// Generate DDL for a synonym
     pub fn get_synonym_ddl(conn: &Connection, syn_name: &str) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('SYNONYM', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&syn_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "SYNONYM", syn_name)
     }
 
     /// Generate DDL for a package specification
@@ -9200,29 +9443,7 @@ impl ObjectBrowser {
         conn: &Connection,
         package_name: &str,
     ) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL('PACKAGE', :1) FROM DUAL";
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let row = match stmt.query_row(&[&package_name.to_uppercase()]) {
-            Ok(row) => row,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let ddl: String = match row.get(0) {
-            Ok(ddl) => ddl,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        Ok(Self::normalize_generated_ddl(ddl))
+        Self::get_object_ddl(conn, "PACKAGE", package_name)
     }
 
     /// Generate DDL for any supported object type.
@@ -9231,7 +9452,12 @@ impl ObjectBrowser {
         object_type: &str,
         object_name: &str,
     ) -> Result<String, OracleError> {
-        let sql = "SELECT DBMS_METADATA.GET_DDL(:1, :2) FROM DUAL";
+        let (owner, object_name) = QueryExecutor::split_normalized_owner_object_name(object_name);
+        let sql = if owner.is_some() {
+            "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL"
+        } else {
+            "SELECT DBMS_METADATA.GET_DDL(:1, :2) FROM DUAL"
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -9239,8 +9465,12 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let row = match stmt.query_row(&[&object_type.to_uppercase(), &object_name.to_uppercase()])
-        {
+        let object_type = object_type.to_uppercase();
+        let row = match owner.as_deref() {
+            Some(owner) => stmt.query_row(&[&object_type, &object_name, &owner]),
+            None => stmt.query_row(&[&object_type, &object_name]),
+        };
+        let row = match row {
             Ok(row) => row,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -9263,10 +9493,18 @@ impl ObjectBrowser {
         object_name: &str,
         object_type: &str,
     ) -> Result<Vec<CompilationError>, OracleError> {
-        let sql = "SELECT line, position, text, attribute \
-                   FROM user_errors \
-                   WHERE name = :1 AND type = :2 \
-                   ORDER BY sequence";
+        let (owner, object_name) = QueryExecutor::split_normalized_owner_object_name(object_name);
+        let sql = if owner.is_some() {
+            "SELECT line, position, text, attribute \
+             FROM all_errors \
+             WHERE owner = :1 AND name = :2 AND type = :3 \
+             ORDER BY sequence"
+        } else {
+            "SELECT line, position, text, attribute \
+             FROM user_errors \
+             WHERE name = :1 AND type = :2 \
+             ORDER BY sequence"
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -9274,7 +9512,12 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let rows = match stmt.query(&[&object_name.to_uppercase(), &object_type.to_uppercase()]) {
+        let object_type = object_type.to_uppercase();
+        let rows = match owner.as_deref() {
+            Some(owner) => stmt.query(&[&owner, &object_name, &object_type]),
+            None => stmt.query(&[&object_name, &object_type]),
+        };
+        let rows = match rows {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -9313,7 +9556,12 @@ impl ObjectBrowser {
         object_name: &str,
         object_type: &str,
     ) -> Result<String, OracleError> {
-        let sql = "SELECT status FROM user_objects WHERE object_name = :1 AND object_type = :2";
+        let (owner, object_name) = QueryExecutor::split_normalized_owner_object_name(object_name);
+        let sql = if owner.is_some() {
+            "SELECT status FROM all_objects WHERE owner = :1 AND object_name = :2 AND object_type = :3"
+        } else {
+            "SELECT status FROM user_objects WHERE object_name = :1 AND object_type = :2"
+        };
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -9321,8 +9569,12 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let row = match stmt.query_row(&[&object_name.to_uppercase(), &object_type.to_uppercase()])
-        {
+        let object_type = object_type.to_uppercase();
+        let row = match owner.as_deref() {
+            Some(owner) => stmt.query_row(&[&owner, &object_name, &object_type]),
+            None => stmt.query_row(&[&object_name, &object_type]),
+        };
+        let row = match row {
             Ok(row) => row,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));

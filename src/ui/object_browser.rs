@@ -1,8 +1,10 @@
 use fltk::{
     app,
     enums::{Event, Key},
+    frame::Frame,
     group::{Flex, FlexType},
     input::Input,
+    menu::Choice,
     prelude::*,
     tree::{Tree, TreeItem, TreeSelect},
 };
@@ -36,6 +38,7 @@ pub enum SqlAction {
 /// Callback type for executing SQL from object browser
 pub type SqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
 type StatusCallback = Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
+type ScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut()>>>>;
 
 #[derive(Clone)]
 enum ObjectItem {
@@ -70,12 +73,14 @@ enum RefreshEvent {
     Finished {
         cache: ObjectCache,
         db_type: crate::db::DatabaseType,
+        available_scopes: Vec<String>,
+        selected_scope: Option<String>,
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RefreshRequest {
-    Metadata,
+    Metadata { selected_scope: Option<String> },
 }
 
 const REFRESH_TREE_BATCH_SIZE: usize = 300;
@@ -127,9 +132,15 @@ pub struct ObjectBrowserWidget {
     connection: SharedConnection,
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
+    scope_change_callback: ScopeChangeCallback,
+    scope_label: Frame,
+    scope_choice: Choice,
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
+    scope_options: Arc<Mutex<Vec<String>>>,
+    selected_scope: Arc<Mutex<Option<String>>>,
+    suppress_scope_events: Arc<Mutex<bool>>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
@@ -146,6 +157,22 @@ impl ObjectBrowserWidget {
         let mut flex = Flex::default().with_pos(x, y).with_size(w, h);
         flex.set_type(FlexType::Column);
         flex.set_spacing(DIALOG_SPACING);
+
+        let mut scope_row = Flex::default();
+        scope_row.set_type(FlexType::Row);
+        scope_row.set_spacing(DIALOG_SPACING);
+
+        let mut scope_label = Frame::default().with_label(Self::scope_label_text(initial_db_type));
+        scope_label.set_label_color(theme::text_primary());
+        scope_row.fixed(&scope_label, 72);
+
+        let mut scope_choice = Choice::default();
+        scope_choice.set_color(theme::input_bg());
+        scope_choice.set_text_color(theme::text_primary());
+        scope_choice.deactivate();
+        scope_row.resizable(&scope_choice);
+        scope_row.end();
+        flex.fixed(&scope_row, FILTER_INPUT_HEIGHT);
 
         let mut filter_row = Flex::default();
         filter_row.set_type(FlexType::Row);
@@ -183,8 +210,12 @@ impl ObjectBrowserWidget {
 
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
+        let scope_change_callback: ScopeChangeCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
         let current_db_type = Arc::new(Mutex::new(initial_db_type));
+        let scope_options = Arc::new(Mutex::new(Vec::new()));
+        let selected_scope = Arc::new(Mutex::new(None));
+        let suppress_scope_events = Arc::new(Mutex::new(false));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
 
@@ -199,9 +230,15 @@ impl ObjectBrowserWidget {
             flex,
             tree,
             connection,
+            scope_change_callback,
+            scope_label,
+            scope_choice,
             filter_input,
             object_cache,
             current_db_type,
+            scope_options,
+            selected_scope,
+            suppress_scope_events,
             pending_tree_refresh,
             poll_lifecycle,
             sql_callback,
@@ -210,6 +247,7 @@ impl ObjectBrowserWidget {
             action_sender,
         };
         widget.setup_callbacks();
+        widget.setup_scope_callback();
         widget.setup_filter_callback();
         widget.setup_refresh_handler(refresh_receiver);
         widget.setup_action_handler(action_receiver);
@@ -221,6 +259,9 @@ impl ObjectBrowserWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, ui_size: i32) {
+        self.scope_label.set_label_size(ui_size);
+        self.scope_choice.set_text_font(profile.normal);
+        self.scope_choice.set_text_size(ui_size);
         self.filter_input.set_text_font(profile.normal);
         self.filter_input.set_text_size(ui_size);
         self.tree.set_item_label_font(profile.normal);
@@ -244,10 +285,28 @@ impl ObjectBrowserWidget {
         self.tree.resize(x, y, w, h);
         self.flex.layout();
         self.filter_input.redraw();
+        self.scope_choice.redraw();
         self.tree.redraw();
         if canceled_pending_refresh {
             self.emit_status("Object browser metadata refresh completed");
         }
+    }
+
+    pub fn selected_scope(&self) -> Option<String> {
+        self.selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_scope_change_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut() + 'static,
+    {
+        *self
+            .scope_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     fn setup_filter_callback(&mut self) {
@@ -285,10 +344,134 @@ impl ObjectBrowserWidget {
         });
     }
 
+    fn setup_scope_callback(&mut self) {
+        let connection = self.connection.clone();
+        let current_db_type = self.current_db_type.clone();
+        let selected_scope = self.selected_scope.clone();
+        let suppress_scope_events = self.suppress_scope_events.clone();
+        let status_callback = self.status_callback.clone();
+        let scope_change_callback = self.scope_change_callback.clone();
+        let mut scope_choice = self.scope_choice.clone();
+
+        self.scope_choice.set_callback(move |choice| {
+            let suppressed = *suppress_scope_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if suppressed {
+                return;
+            }
+
+            let next_scope = choice.choice().map(|value| value.trim().to_string());
+            let next_scope = next_scope.filter(|value| !value.is_empty());
+            let previous_scope = selected_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+
+            if next_scope == previous_scope {
+                return;
+            }
+
+            let db_type = *current_db_type
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if db_type.uses_mysql_sql_dialect() {
+                let Some(target_scope) = next_scope.clone() else {
+                    return;
+                };
+                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                    &connection,
+                    format!("Switching database to {}", target_scope),
+                ) else {
+                    if let Some(previous_scope) = previous_scope {
+                        *suppress_scope_events
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        if let Some(index) = Self::choice_index_for_value(&scope_choice, &previous_scope)
+                        {
+                            scope_choice.set_value(index);
+                        }
+                        *suppress_scope_events
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                    }
+                    let busy_message = format_connection_busy_message();
+                    Self::emit_status_callback(&status_callback, &busy_message);
+                    fltk::dialog::message_default(&busy_message);
+                    return;
+                };
+
+                if let Err(err) = conn_guard.switch_mysql_database(&target_scope) {
+                    drop(conn_guard);
+                    if let Some(previous_scope) = previous_scope {
+                        *suppress_scope_events
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        if let Some(index) = Self::choice_index_for_value(&scope_choice, &previous_scope)
+                        {
+                            scope_choice.set_value(index);
+                        }
+                        *suppress_scope_events
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                    }
+                    fltk::dialog::alert_default(&format!(
+                        "Failed to switch database to {}: {}",
+                        target_scope, err
+                    ));
+                    return;
+                }
+            }
+
+            *selected_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_scope.clone();
+
+            Self::emit_status_callback(
+                &status_callback,
+                &match (db_type.sql_dialect(), next_scope.as_deref()) {
+                    (crate::db::DbSqlDialect::Oracle, Some(scope)) => {
+                        format!("Loading object browser metadata for owner {}", scope)
+                    }
+                    (crate::db::DbSqlDialect::MySql, Some(scope)) => {
+                        format!("Loading object browser metadata for database {}", scope)
+                    }
+                    _ => "Refreshing object browser metadata".to_string(),
+                },
+            );
+
+            let callback = {
+                let mut slot = scope_change_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                slot.take()
+            };
+
+            if let Some(mut callback) = callback {
+                let call_result = panic::catch_unwind(AssertUnwindSafe(&mut callback));
+                let mut slot = scope_change_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if slot.is_none() {
+                    *slot = Some(callback);
+                }
+                if let Err(payload) = call_result {
+                    Self::log_callback_panic("scope change callback", payload.as_ref());
+                }
+            }
+        });
+    }
+
     fn setup_refresh_handler(&mut self, refresh_receiver: std::sync::mpsc::Receiver<RefreshEvent>) {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
+        let scope_label = self.scope_label.clone();
+        let scope_choice = self.scope_choice.clone();
+        let scope_options = self.scope_options.clone();
+        let selected_scope = self.selected_scope.clone();
+        let suppress_scope_events = self.suppress_scope_events.clone();
         let filter_input = self.filter_input.clone();
         let pending_tree_refresh = self.pending_tree_refresh.clone();
 
@@ -303,6 +486,11 @@ impl ObjectBrowserWidget {
             mut tree: Tree,
             object_cache: Arc<Mutex<ObjectCache>>,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
+            mut scope_label: Frame,
+            mut scope_choice: Choice,
+            scope_options: Arc<Mutex<Vec<String>>>,
+            selected_scope: Arc<Mutex<Option<String>>>,
+            suppress_scope_events: Arc<Mutex<bool>>,
             filter_input: Input,
             pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
             status_callback: StatusCallback,
@@ -312,14 +500,19 @@ impl ObjectBrowserWidget {
                 return;
             }
 
-            if tree.was_deleted() || filter_input.was_deleted() {
+            if tree.was_deleted() || filter_input.was_deleted() || scope_choice.was_deleted() {
                 return;
             }
 
             let mut disconnected = false;
             // Keep receiver lock scope minimal: drain messages first, then perform UI work.
             // This prevents long lock hold while rebuilding tree widgets.
-            let mut latest_cache: Option<(crate::db::DatabaseType, ObjectCache)> = None;
+            let mut latest_cache: Option<(
+                crate::db::DatabaseType,
+                ObjectCache,
+                Vec<String>,
+                Option<String>,
+            )> = None;
 
             {
                 let r = receiver
@@ -327,8 +520,13 @@ impl ObjectBrowserWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
-                        Ok(RefreshEvent::Finished { cache, db_type }) => {
-                            latest_cache = Some((db_type, cache));
+                        Ok(RefreshEvent::Finished {
+                            cache,
+                            db_type,
+                            available_scopes,
+                            selected_scope,
+                        }) => {
+                            latest_cache = Some((db_type, cache, available_scopes, selected_scope));
                             match current_db_type.lock() {
                                 Ok(mut guard) => *guard = db_type,
                                 Err(poisoned) => *poisoned.into_inner() = db_type,
@@ -343,7 +541,7 @@ impl ObjectBrowserWidget {
                 }
             }
 
-            if let Some((db_type, cache)) = latest_cache {
+            if let Some((db_type, cache, available_scopes, resolved_scope)) = latest_cache {
                 let filter_text = filter_input.value().to_lowercase();
                 let paths = ObjectBrowserWidget::collect_tree_paths(&cache, &filter_text);
                 let cache_snapshot = cache.clone();
@@ -360,6 +558,47 @@ impl ObjectBrowserWidget {
                     db_type,
                     &cache_snapshot,
                 );
+                scope_label.set_label(ObjectBrowserWidget::scope_label_text(db_type));
+                {
+                    let mut options_guard = scope_options
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *options_guard = available_scopes.clone();
+                }
+                {
+                    let mut selected_guard = selected_scope
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *selected_guard = resolved_scope.clone();
+                }
+                {
+                    let mut suppress = suppress_scope_events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *suppress = true;
+                }
+                scope_choice.clear();
+                if !available_scopes.is_empty() {
+                    scope_choice.add_choice(&available_scopes.join("|"));
+                    if let Some(ref resolved_scope) = resolved_scope {
+                        if let Some(index) =
+                            ObjectBrowserWidget::choice_index_for_value(&scope_choice, resolved_scope)
+                        {
+                            scope_choice.set_value(index);
+                        }
+                    } else {
+                        scope_choice.set_value(0);
+                    }
+                    scope_choice.activate();
+                } else {
+                    scope_choice.deactivate();
+                }
+                {
+                    let mut suppress = suppress_scope_events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *suppress = false;
+                }
                 ObjectBrowserWidget::clear_tree_items(&mut tree);
                 {
                     let mut pending = pending_tree_refresh
@@ -420,6 +659,11 @@ impl ObjectBrowserWidget {
                     tree.clone(),
                     object_cache.clone(),
                     current_db_type.clone(),
+                    scope_label.clone(),
+                    scope_choice.clone(),
+                    scope_options.clone(),
+                    selected_scope.clone(),
+                    suppress_scope_events.clone(),
                     filter_input.clone(),
                     pending_tree_refresh.clone(),
                     status_callback.clone(),
@@ -434,6 +678,11 @@ impl ObjectBrowserWidget {
             tree,
             object_cache,
             current_db_type,
+            scope_label,
+            scope_choice,
+            scope_options,
+            selected_scope,
+            suppress_scope_events,
             filter_input,
             pending_tree_refresh,
             self.status_callback.clone(),
@@ -714,6 +963,7 @@ impl ObjectBrowserWidget {
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
+        let selected_scope = self.selected_scope.clone();
 
         self.tree.handle(move |t, ev| {
             if !t.active() {
@@ -738,6 +988,7 @@ impl ObjectBrowserWidget {
                                 &sql_callback,
                                 &status_callback,
                                 &action_sender,
+                                &selected_scope,
                             );
                         } else if let Some(item) = t.first_selected_item() {
                             Self::show_context_menu(
@@ -747,6 +998,7 @@ impl ObjectBrowserWidget {
                                 &sql_callback,
                                 &status_callback,
                                 &action_sender,
+                                &selected_scope,
                             );
                         }
                         return true;
@@ -784,6 +1036,7 @@ impl ObjectBrowserWidget {
                                     if should_fetch {
                                         let connection = connection.clone();
                                         let sender = action_sender.clone();
+                                        let selected_scope = selected_scope.clone();
                                         Self::emit_status_callback(
                                             &status_callback,
                                             &format!(
@@ -811,11 +1064,21 @@ impl ObjectBrowserWidget {
 
                                             let result = match conn_guard.require_live_connection()
                                             {
-                                                Ok(db_conn) => ObjectBrowser::get_package_routines(
-                                                    db_conn.as_ref(),
-                                                    &package_name,
-                                                )
-                                                .map_err(|err| err.to_string()),
+                                                Ok(db_conn) => {
+                                                    let scope = ObjectBrowserWidget::scope_snapshot(
+                                                        &selected_scope,
+                                                    );
+                                                    let qualified_package =
+                                                        ObjectBrowserWidget::qualify_oracle_object_name(
+                                                            scope.as_deref(),
+                                                            &package_name,
+                                                        );
+                                                    ObjectBrowser::get_package_routines(
+                                                        db_conn.as_ref(),
+                                                        &qualified_package,
+                                                    )
+                                                    .map_err(|err| err.to_string())
+                                                }
                                                 Err(message) => Err(message),
                                             };
 
@@ -833,7 +1096,13 @@ impl ObjectBrowserWidget {
                             }
 
                             // Double-click on other items: insert text into SQL editor
-                            if let Some(insert_text) = Self::get_insert_text(&item) {
+                            let db_type = *current_db_type
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let scope = Self::scope_snapshot(&selected_scope);
+                            if let Some(insert_text) =
+                                Self::get_insert_text(&item, db_type, scope.as_deref())
+                            {
                                 ObjectBrowserWidget::emit_sql_callback(
                                     &sql_callback,
                                     SqlAction::Insert(insert_text),
@@ -878,6 +1147,7 @@ impl ObjectBrowserWidget {
                                     };
                                     let sql = ObjectBrowserWidget::preview_select_sql(
                                         db_type,
+                                        Self::scope_snapshot(&selected_scope).as_deref(),
                                         &object_name,
                                     );
                                     ObjectBrowserWidget::emit_sql_callback(
@@ -957,10 +1227,14 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn get_insert_text(item: &TreeItem) -> Option<String> {
+    fn get_insert_text(
+        item: &TreeItem,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+    ) -> Option<String> {
         Self::get_item_info(item)
             .as_ref()
-            .map(copy_text_for_object_item)
+            .map(|item_info| Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope))
     }
 
     fn copy_text_for_selected_item(item: &TreeItem) -> Option<String> {
@@ -994,14 +1268,109 @@ impl ObjectBrowserWidget {
             .join(".")
     }
 
-    fn preview_select_sql(db_type: crate::db::DatabaseType, object_name: &str) -> String {
+    fn scope_label_text(db_type: crate::db::DatabaseType) -> &'static str {
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => "Owner:",
+            crate::db::DbSqlDialect::MySql => "Database:",
+        }
+    }
+
+    fn choice_index_for_value(choice: &Choice, value: &str) -> Option<i32> {
+        let target = value.trim();
+        let size = choice.size();
+        (0..size).find(|&index| {
+            choice
+                .text(index)
+                .is_some_and(|entry| entry.trim().eq_ignore_ascii_case(target))
+        })
+    }
+
+    fn scope_snapshot(selected_scope: &Arc<Mutex<Option<String>>>) -> Option<String> {
+        selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn qualify_oracle_object_name(selected_scope: Option<&str>, object_name: &str) -> String {
+        let object_name = object_name.trim();
+        if object_name.is_empty() || object_name.contains('.') {
+            return object_name.to_string();
+        }
+
+        selected_scope
+            .filter(|scope| !scope.trim().is_empty())
+            .map(|scope| format!("{}.{}", scope.trim(), object_name))
+            .unwrap_or_else(|| object_name.to_string())
+    }
+
+    fn qualify_object_name_for_scope(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        object_name: &str,
+    ) -> String {
+        let object_name = object_name.trim();
+        if object_name.is_empty() || object_name.contains('.') {
+            return object_name.to_string();
+        }
+
         match db_type.sql_dialect() {
             crate::db::DbSqlDialect::Oracle => {
-                format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name)
+                Self::qualify_oracle_object_name(selected_scope, object_name)
+            }
+            crate::db::DbSqlDialect::MySql => selected_scope
+                .filter(|scope| !scope.trim().is_empty())
+                .map(|scope| format!("{}.{}", scope.trim(), object_name))
+                .unwrap_or_else(|| object_name.to_string()),
+        }
+    }
+
+    fn qualify_package_member_name(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        package_name: &str,
+        routine_name: &str,
+    ) -> String {
+        let package_name = Self::qualify_object_name_for_scope(db_type, selected_scope, package_name);
+        format!("{}.{}", package_name, routine_name.trim())
+    }
+
+    fn copy_text_for_object_item_with_scope(
+        item_info: &ObjectItem,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+    ) -> String {
+        match item_info {
+            ObjectItem::Simple { object_name, .. } => {
+                Self::qualify_object_name_for_scope(db_type, selected_scope, object_name)
+            }
+            ObjectItem::PackageRoutine {
+                package_name,
+                routine_name,
+                ..
+            } => Self::qualify_package_member_name(
+                db_type,
+                selected_scope,
+                package_name,
+                routine_name,
+            ),
+        }
+    }
+
+    fn preview_select_sql(
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+        object_name: &str,
+    ) -> String {
+        let qualified_name =
+            Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
+        match db_type.sql_dialect() {
+            crate::db::DbSqlDialect::Oracle => {
+                format!("SELECT * FROM {} WHERE ROWNUM <= 100", qualified_name)
             }
             crate::db::DbSqlDialect::MySql => format!(
                 "SELECT * FROM {} LIMIT 100",
-                Self::quote_mysql_identifier_path(object_name)
+                Self::quote_mysql_identifier_path(&qualified_name)
             ),
         }
     }
@@ -1582,12 +1951,14 @@ impl ObjectBrowserWidget {
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+        selected_scope: &Arc<Mutex<Option<String>>>,
     ) {
         if let Some(item_info) = Self::get_item_info(item) {
             let db_type = match current_db_type.lock() {
                 Ok(guard) => *guard,
                 Err(poisoned) => *poisoned.into_inner(),
             };
+            let selected_scope = Self::scope_snapshot(selected_scope);
             let menu_choices = match &item_info {
                 ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => {
                     "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL"
@@ -1662,13 +2033,18 @@ impl ObjectBrowserWidget {
                 let handle_choice = || {
                     match (choice_label.as_str(), &item_info) {
                         ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
+                            let qualified_name = Self::qualify_object_name_for_scope(
+                                db_type,
+                                selected_scope.as_deref(),
+                                object_name,
+                            );
                             Self::emit_status_callback(
                                 status_callback,
-                                &format!("Preparing SELECT TOP 100 for {}", object_name),
+                                &format!("Preparing SELECT TOP 100 for {}", qualified_name),
                             );
                             let Some(conn_guard) = try_lock_connection_with_activity(
                                 connection,
-                                format!("Preparing SELECT TOP 100 for {}", object_name),
+                                format!("Preparing SELECT TOP 100 for {}", qualified_name),
                             ) else {
                                 let _ = action_sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1681,7 +2057,11 @@ impl ObjectBrowserWidget {
                             }
                             let db_type = conn_guard.db_type();
                             drop(conn_guard);
-                            let sql = ObjectBrowserWidget::preview_select_sql(db_type, object_name);
+                            let sql = ObjectBrowserWidget::preview_select_sql(
+                                db_type,
+                                selected_scope.as_deref(),
+                                object_name,
+                            );
                             ObjectBrowserWidget::emit_sql_callback(
                                 sql_callback,
                                 SqlAction::Execute(sql),
@@ -1704,6 +2084,7 @@ impl ObjectBrowserWidget {
                             } else {
                                 "PROCEDURE".to_string()
                             };
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Loading {} arguments for {}", routine_type, object_name),
@@ -1724,17 +2105,22 @@ impl ObjectBrowserWidget {
                                 };
 
                                 let db_type = conn_guard.db_type();
+                                let qualified_name = ObjectBrowserWidget::qualify_object_name_for_scope(
+                                    db_type,
+                                    selected_scope.as_deref(),
+                                    &object_name,
+                                );
                                 let result = match db_type.sql_dialect() {
                                     crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
                                                 db_conn.as_ref(),
-                                                &object_name,
+                                                &qualified_name,
                                             )
                                             .map(|arguments| {
                                                 ObjectBrowserWidget::build_routine_script_for_db(
                                                     db_type,
-                                                    &object_name,
+                                                    &qualified_name,
                                                     &routine_type,
                                                     &arguments,
                                                 )
@@ -1747,14 +2133,15 @@ impl ObjectBrowserWidget {
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
-                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments(
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
                                                 mysql_conn,
+                                                selected_scope.as_deref(),
                                                 &object_name,
                                             )
                                             .map(|arguments| {
                                                 ObjectBrowserWidget::build_routine_script_for_db(
                                                     db_type,
-                                                    &object_name,
+                                                    &qualified_name,
                                                     &routine_type,
                                                     &arguments,
                                                 )
@@ -1764,7 +2151,7 @@ impl ObjectBrowserWidget {
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
-                                    qualified_name: object_name,
+                                    qualified_name,
                                     routine_type,
                                     db_type,
                                     result,
@@ -1785,10 +2172,16 @@ impl ObjectBrowserWidget {
                         {
                             let connection = connection.clone();
                             let sender = action_sender.clone();
-                            let qualified_name = format!("{}.{}", package_name, routine_name);
                             let package_name = package_name.clone();
                             let routine_name = routine_name.clone();
                             let routine_type = routine_type.clone();
+                            let selected_scope = selected_scope.clone();
+                            let qualified_name = Self::qualify_package_member_name(
+                                crate::db::DatabaseType::Oracle,
+                                selected_scope.as_deref(),
+                                &package_name,
+                                &routine_name,
+                            );
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!(
@@ -1814,7 +2207,10 @@ impl ObjectBrowserWidget {
                                 let result = match conn_guard.require_live_connection() {
                                     Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
                                         db_conn.as_ref(),
-                                        &package_name,
+                                        &ObjectBrowserWidget::qualify_oracle_object_name(
+                                            selected_scope.as_deref(),
+                                            &package_name,
+                                        ),
                                         &routine_name,
                                     )
                                     .map(|arguments| {
@@ -1857,6 +2253,7 @@ impl ObjectBrowserWidget {
                             let sender = action_sender.clone();
                             let object_name = object_name.clone();
                             let object_type = db_object_type.to_string();
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Checking compilation status for {}", object_name),
@@ -1882,9 +2279,14 @@ impl ObjectBrowserWidget {
                                     });
                                     app::awake();
                                 } else if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                    let qualified_name =
+                                        ObjectBrowserWidget::qualify_oracle_object_name(
+                                            selected_scope.as_deref(),
+                                            &object_name,
+                                        );
                                     let status = ObjectBrowser::get_object_status(
                                         db_conn.as_ref(),
-                                        &object_name,
+                                        &qualified_name,
                                         &object_type,
                                     )
                                     .unwrap_or_else(|_| "UNKNOWN".to_string());
@@ -1893,7 +2295,7 @@ impl ObjectBrowserWidget {
                                     let body_status = if object_type == "PACKAGE" {
                                         ObjectBrowser::get_object_status(
                                             db_conn.as_ref(),
-                                            &object_name,
+                                            &qualified_name,
                                             "PACKAGE BODY",
                                         )
                                         .ok()
@@ -1903,7 +2305,7 @@ impl ObjectBrowserWidget {
 
                                     let mut errors = ObjectBrowser::get_compilation_errors(
                                         db_conn.as_ref(),
-                                        &object_name,
+                                        &qualified_name,
                                         &object_type,
                                     )
                                     .unwrap_or_default();
@@ -1913,7 +2315,7 @@ impl ObjectBrowserWidget {
                                         if let Ok(body_errors) =
                                             ObjectBrowser::get_compilation_errors(
                                                 db_conn.as_ref(),
-                                                &object_name,
+                                                &qualified_name,
                                                 "PACKAGE BODY",
                                             )
                                         {
@@ -1951,6 +2353,7 @@ impl ObjectBrowserWidget {
                             let connection = connection.clone();
                             let sender = action_sender.clone();
                             let table_name = object_name.clone();
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Loading table structure for {}", table_name),
@@ -1972,7 +2375,10 @@ impl ObjectBrowserWidget {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_structure(
                                                 db_conn.as_ref(),
-                                                &table_name,
+                                                &ObjectBrowserWidget::qualify_oracle_object_name(
+                                                    selected_scope.as_deref(),
+                                                    &table_name,
+                                                ),
                                             )
                                             .map_err(|err| err.to_string()),
                                             Err(message) => Err(message),
@@ -2001,6 +2407,7 @@ impl ObjectBrowserWidget {
                             let connection = connection.clone();
                             let sender = action_sender.clone();
                             let table_name = object_name.clone();
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Loading indexes for {}", table_name),
@@ -2022,7 +2429,10 @@ impl ObjectBrowserWidget {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_indexes(
                                                 db_conn.as_ref(),
-                                                &table_name,
+                                                &ObjectBrowserWidget::qualify_oracle_object_name(
+                                                    selected_scope.as_deref(),
+                                                    &table_name,
+                                                ),
                                             )
                                             .map_err(|err| err.to_string()),
                                             Err(message) => Err(message),
@@ -2049,6 +2459,7 @@ impl ObjectBrowserWidget {
                             let connection = connection.clone();
                             let sender = action_sender.clone();
                             let table_name = object_name.clone();
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Loading constraints for {}", table_name),
@@ -2070,7 +2481,10 @@ impl ObjectBrowserWidget {
                                         match conn_guard.require_live_connection() {
                                             Ok(db_conn) => ObjectBrowser::get_table_constraints(
                                                 db_conn.as_ref(),
-                                                &table_name,
+                                                &ObjectBrowserWidget::qualify_oracle_object_name(
+                                                    selected_scope.as_deref(),
+                                                    &table_name,
+                                                ),
                                             )
                                             .map_err(|err| err.to_string()),
                                             Err(message) => Err(message),
@@ -2106,6 +2520,7 @@ impl ObjectBrowserWidget {
                             let sender = action_sender.clone();
                             let name = object_name.clone();
                             let obj_type = object_type.clone();
+                            let selected_scope = selected_scope.clone();
                             Self::emit_status_callback(
                                 status_callback,
                                 &format!("Loading {} info for {}", obj_type, name),
@@ -2148,11 +2563,16 @@ impl ObjectBrowserWidget {
                                     };
 
                                 if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                    let qualified_name =
+                                        ObjectBrowserWidget::qualify_oracle_object_name(
+                                            selected_scope.as_deref(),
+                                            &name,
+                                        );
                                     match obj_type.as_str() {
                                         "SYNONYMS" => {
                                             let result = ObjectBrowser::get_synonym_info(
                                                 db_conn.as_ref(),
-                                                &name,
+                                                &qualified_name,
                                             )
                                             .map_err(|err| err.to_string());
                                             let _ = sender
@@ -2161,7 +2581,7 @@ impl ObjectBrowserWidget {
                                         _ => {
                                             let result = ObjectBrowser::get_sequence_info(
                                                 db_conn.as_ref(),
-                                                &name,
+                                                &qualified_name,
                                             )
                                             .map_err(|err| err.to_string());
                                             let _ = sender
@@ -2199,6 +2619,7 @@ impl ObjectBrowserWidget {
                                 let sender = action_sender.clone();
                                 let object_type = obj_type.to_string();
                                 let object_name = object_name.clone();
+                                let selected_scope = selected_scope.clone();
                                 Self::emit_status_callback(
                                     status_callback,
                                     &format!("Generating {} DDL for {}", object_type, object_name),
@@ -2222,41 +2643,48 @@ impl ObjectBrowserWidget {
                                     let result = match conn_guard.db_type().sql_dialect() {
                                         crate::db::DbSqlDialect::Oracle => {
                                             match conn_guard.require_live_connection() {
-                                                Ok(db_conn) => match object_type.as_str() {
+                                                Ok(db_conn) => {
+                                                    let qualified_name =
+                                                        ObjectBrowserWidget::qualify_oracle_object_name(
+                                                            selected_scope.as_deref(),
+                                                            &object_name,
+                                                        );
+                                                    match object_type.as_str() {
                                                     "TABLE" => ObjectBrowser::get_table_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "VIEW" => ObjectBrowser::get_view_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "PROCEDURE" => ObjectBrowser::get_procedure_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "FUNCTION" => ObjectBrowser::get_function_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "SEQUENCE" => ObjectBrowser::get_sequence_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "TRIGGER" => ObjectBrowser::get_object_ddl(
                                                         db_conn.as_ref(),
                                                         "TRIGGER",
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "SYNONYM" => ObjectBrowser::get_synonym_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     "PACKAGE" => ObjectBrowser::get_package_spec_ddl(
                                                         db_conn.as_ref(),
-                                                        &object_name,
+                                                        &qualified_name,
                                                     ),
                                                     _ => return,
+                                                }
                                                 }
                                                 .map_err(|err| err.to_string()),
                                                 Err(message) => Err(message),
@@ -2274,8 +2702,9 @@ impl ObjectBrowserWidget {
                                                     crate::db::NOT_CONNECTED_MESSAGE.to_string()
                                                 })
                                                 .and_then(|mysql_conn| {
-                                                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_create_object(
+                                                    crate::db::query::mysql_executor::MysqlObjectBrowser::get_create_object_in_schema(
                                                         mysql_conn,
+                                                        selected_scope.as_deref(),
                                                         object_type.as_str(),
                                                         &object_name,
                                                     )
@@ -2606,6 +3035,17 @@ impl ObjectBrowserWidget {
         self.clear_pending_tree_refresh();
         self.clear_items();
         self.filter_input.set_value("");
+        self.scope_choice.clear();
+        self.scope_choice.deactivate();
+        self.scope_label.set_label(Self::scope_label_text(crate::db::DatabaseType::Oracle));
+        *self
+            .scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Vec::new();
+        *self
+            .selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .object_cache
             .lock()
@@ -2624,7 +3064,9 @@ impl ObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
         self.emit_status("Refreshing object browser metadata");
 
-        let _ = self.refresh_request_sender.send(RefreshRequest::Metadata);
+        let _ = self.refresh_request_sender.send(RefreshRequest::Metadata {
+            selected_scope: self.selected_scope(),
+        });
     }
 
     fn spawn_refresh_worker(
@@ -2635,9 +3077,16 @@ impl ObjectBrowserWidget {
         thread::spawn(move || {
             while let Ok(request) = Self::recv_latest_refresh_request(&refresh_request_receiver) {
                 match request {
-                    RefreshRequest::Metadata => {
-                        if let Some((db_type, cache)) = Self::load_metadata_cache(&connection) {
-                            let _ = refresh_sender.send(RefreshEvent::Finished { cache, db_type });
+                    RefreshRequest::Metadata { selected_scope } => {
+                        if let Some((db_type, cache, available_scopes, selected_scope)) =
+                            Self::load_metadata_cache(&connection, selected_scope)
+                        {
+                            let _ = refresh_sender.send(RefreshEvent::Finished {
+                                cache,
+                                db_type,
+                                available_scopes,
+                                selected_scope,
+                            });
                             app::awake();
                         }
                     }
@@ -2663,7 +3112,13 @@ impl ObjectBrowserWidget {
 
     fn load_metadata_cache(
         connection: &SharedConnection,
-    ) -> Option<(crate::db::DatabaseType, ObjectCache)> {
+        requested_scope: Option<String>,
+    ) -> Option<(
+        crate::db::DatabaseType,
+        ObjectCache,
+        Vec<String>,
+        Option<String>,
+    )> {
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
         // Acquire connection lock and hold it during all queries.
@@ -2678,37 +3133,91 @@ impl ObjectBrowserWidget {
                     return None;
                 };
 
+                let current_schema = ObjectBrowser::get_current_schema(db_conn.as_ref())
+                    .ok()
+                    .map(|schema| schema.trim().to_string())
+                    .filter(|schema| !schema.is_empty())
+                    .or_else(|| {
+                        let username = conn_guard.get_info().username.trim();
+                        (!username.is_empty()).then(|| username.to_ascii_uppercase())
+                    });
+                let mut available_scopes = ObjectBrowser::get_users(db_conn.as_ref()).unwrap_or_default();
+                if let Some(ref current_schema) = current_schema {
+                    if !available_scopes
+                        .iter()
+                        .any(|scope| scope.eq_ignore_ascii_case(current_schema))
+                    {
+                        available_scopes.push(current_schema.clone());
+                    }
+                }
+                available_scopes.sort();
+                available_scopes.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                let selected_scope = requested_scope
+                    .filter(|scope| !scope.trim().is_empty())
+                    .or(current_schema)
+                    .or_else(|| available_scopes.first().cloned());
+
                 let mut cache = ObjectCache::default();
+                if let Some(ref selected_scope) = selected_scope {
+                    if let Ok(tables) = ObjectBrowser::get_tables_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.tables = tables;
+                    }
+                    if let Ok(views) = ObjectBrowser::get_views_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.views = views;
+                    }
+                    if let Ok(procedures) =
+                        ObjectBrowser::get_procedures_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.procedures = procedures;
+                    }
+                    if let Ok(functions) =
+                        ObjectBrowser::get_functions_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.functions = functions;
+                    }
+                    if let Ok(sequences) =
+                        ObjectBrowser::get_sequences_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.sequences = sequences;
+                    }
+                    if let Ok(triggers) =
+                        ObjectBrowser::get_triggers_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.triggers = triggers;
+                    }
+                    if let Ok(synonyms) =
+                        ObjectBrowser::get_synonyms_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.synonyms = synonyms;
+                    }
+                    if let Ok(packages) =
+                        ObjectBrowser::get_packages_by_owner(db_conn.as_ref(), selected_scope)
+                    {
+                        cache.packages = packages;
+                    }
+                }
 
-                if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
-                    cache.tables = tables;
-                }
-                if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
-                    cache.views = views;
-                }
-                if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
-                    cache.procedures = procedures;
-                }
-                if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
-                    cache.functions = functions;
-                }
-                if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
-                    cache.sequences = sequences;
-                }
-                if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
-                    cache.triggers = triggers;
-                }
-                if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
-                    cache.synonyms = synonyms;
-                }
-                if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
-                    cache.packages = packages;
-                }
-
-                Some((db_type, cache))
+                Some((db_type, cache, available_scopes, selected_scope))
             }
             crate::db::DbSqlDialect::MySql => {
+                let current_database = conn_guard.get_info().service_name.trim().to_string();
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
+                let mut available_scopes = MysqlObjectBrowser::get_schemas(mysql_conn).unwrap_or_default();
+                if !current_database.is_empty()
+                    && !available_scopes
+                        .iter()
+                        .any(|scope| scope.eq_ignore_ascii_case(&current_database))
+                {
+                    available_scopes.push(current_database.clone());
+                }
+                available_scopes.sort();
+                available_scopes.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                let selected_scope = requested_scope
+                    .filter(|scope| !scope.trim().is_empty())
+                    .or_else(|| (!current_database.is_empty()).then_some(current_database.clone()))
+                    .or_else(|| available_scopes.first().cloned());
 
                 let mut cache = ObjectCache::default();
 
@@ -2735,7 +3244,7 @@ impl ObjectBrowserWidget {
                 }
                 // MySQL/MariaDB connections do not expose Oracle-only synonyms or packages.
 
-                Some((db_type, cache))
+                Some((db_type, cache, available_scopes, selected_scope))
             }
         }
     }
@@ -2964,6 +3473,7 @@ impl Drop for ObjectBrowserWidget {
         // Release callback closures early so captured state does not outlive
         // the widget tree unnecessarily.
         self.filter_input.set_callback(|_| {});
+        self.scope_choice.set_callback(|_| {});
         self.tree.handle(|_, _| false);
         *self
             .sql_callback
@@ -2971,6 +3481,10 @@ impl Drop for ObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .status_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .scope_change_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
@@ -3014,10 +3528,52 @@ mod tests {
 
     #[test]
     fn preview_select_sql_uses_mysql_limit_and_identifier_quotes() {
-        let sql =
-            ObjectBrowserWidget::preview_select_sql(crate::db::DatabaseType::MySQL, "order.items");
+        let sql = ObjectBrowserWidget::preview_select_sql(
+            crate::db::DatabaseType::MySQL,
+            None,
+            "order.items",
+        );
 
         assert_eq!(sql, "SELECT * FROM `order`.`items` LIMIT 100");
+    }
+
+    #[test]
+    fn preview_select_sql_qualifies_oracle_object_name_with_selected_owner() {
+        let sql = ObjectBrowserWidget::preview_select_sql(
+            crate::db::DatabaseType::Oracle,
+            Some("SCOTT"),
+            "EMP",
+        );
+
+        assert_eq!(sql, "SELECT * FROM SCOTT.EMP WHERE ROWNUM <= 100");
+    }
+
+    #[test]
+    fn preview_select_sql_qualifies_mysql_object_name_with_selected_database() {
+        let sql = ObjectBrowserWidget::preview_select_sql(
+            crate::db::DatabaseType::MySQL,
+            Some("sales"),
+            "orders",
+        );
+
+        assert_eq!(sql, "SELECT * FROM `sales`.`orders` LIMIT 100");
+    }
+
+    #[test]
+    fn copy_text_for_object_item_with_scope_qualifies_package_routine() {
+        let item = ObjectItem::PackageRoutine {
+            package_name: "DEMO_PKG".to_string(),
+            routine_name: "RUN_JOB".to_string(),
+            routine_type: "PROCEDURE".to_string(),
+        };
+
+        let text = ObjectBrowserWidget::copy_text_for_object_item_with_scope(
+            &item,
+            DatabaseType::Oracle,
+            Some("SCOTT"),
+        );
+
+        assert_eq!(text, "SCOTT.DEMO_PKG.RUN_JOB");
     }
 
     #[test]

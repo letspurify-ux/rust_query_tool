@@ -1486,7 +1486,12 @@ impl SqlEditorWidget {
         }
 
         fn table_is_loading(data: &IntellisenseData, table: &str) -> bool {
-            // Fast path: check uppercased name directly before allocating candidates.
+            if let Some(key) = SqlEditorWidget::resolve_table_column_load_key(data, table) {
+                if data.columns_loading.contains(&key.to_uppercase()) {
+                    return true;
+                }
+            }
+
             let upper = table.to_uppercase();
             if data.columns_loading.contains(&upper) {
                 return true;
@@ -2496,7 +2501,7 @@ impl SqlEditorWidget {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.is_known_relation(word)
+            Self::resolve_table_column_load_key(&data, word).is_some()
         };
 
         if should_prefetch {
@@ -2510,20 +2515,11 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
-        let table_key_candidates = Self::table_lookup_key_candidates(table_name);
-        if table_key_candidates.is_empty() {
-            return;
-        }
-
         let table_key = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let selected = table_key_candidates
-                .iter()
-                .find(|candidate| data.is_known_relation(candidate))
-                .cloned();
-            let Some(selected) = selected else {
+            let Some(selected) = Self::resolve_table_column_load_key(&data, table_name) else {
                 return;
             };
             if !data.mark_columns_loading(&selected) {
@@ -2553,6 +2549,47 @@ impl SqlEditorWidget {
             });
             app::awake();
         }
+    }
+
+    fn resolve_table_column_load_key(
+        data: &IntellisenseData,
+        table_name: &str,
+    ) -> Option<String> {
+        let candidates = Self::table_lookup_key_candidates(table_name);
+        let normalized = candidates.first()?.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        if let Some((qualifier, member)) = normalized.rsplit_once('.') {
+            if data.qualifier_has_member(qualifier, member, true)
+                || data.qualifier_has_member(qualifier, member, false)
+            {
+                return Some(normalized.to_ascii_uppercase());
+            }
+        }
+
+        if !normalized.contains('.') {
+            if let Some(default_qualifier) = data.default_qualifier() {
+                if data.qualifier_has_member(default_qualifier, normalized, true)
+                    || data.qualifier_has_member(default_qualifier, normalized, false)
+                {
+                    return Some(
+                        format!("{}.{}", default_qualifier, normalized).to_ascii_uppercase(),
+                    );
+                }
+            }
+        }
+
+        if data.is_known_relation(normalized) {
+            return Some(normalized.to_ascii_uppercase());
+        }
+
+        candidates
+            .iter()
+            .skip(1)
+            .find(|candidate| data.is_known_relation(candidate))
+            .map(|candidate| candidate.to_ascii_uppercase())
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {

@@ -1191,6 +1191,22 @@ impl DatabaseConnection {
         Ok(current_database)
     }
 
+    pub fn switch_mysql_database(&mut self, database: &str) -> Result<(), String> {
+        if self.info.db_type != DatabaseType::MySQL || !self.connected {
+            return Err("Expected MySQL connection but none is active".to_string());
+        }
+
+        let target_database = database.trim();
+        let Some(conn) = self.get_mysql_connection_mut() else {
+            return Err("Expected MySQL connection but none is active".to_string());
+        };
+
+        conn.select_db(target_database).map_err(|err| err.to_string())?;
+        Self::apply_mysql_connection_encoding(conn);
+        self.info.service_name = target_database.to_string();
+        Ok(())
+    }
+
     pub fn session_state(&self) -> Arc<Mutex<SessionState>> {
         Arc::clone(&self.session)
     }

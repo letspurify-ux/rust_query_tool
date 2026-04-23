@@ -3315,9 +3315,71 @@ fn request_table_columns_falls_back_to_unqualified_name() {
 }
 
 #[test]
+fn request_table_columns_uses_default_qualifier_for_unqualified_name() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.set_default_qualifier(Some("SCOTT".to_string()));
+        guard.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("EMP", &data, &sender, &connection);
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("selected default qualifier should drive unqualified column loading");
+    assert_eq!(update.table, "SCOTT.EMP");
+    assert!(!update.cache_columns);
+}
+
+#[test]
+fn request_table_columns_keeps_selected_qualifier_for_qualified_name() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.set_members_for_qualifier_with_kinds(
+            "SCOTT",
+            vec![("EMP".to_string(), Some(QualifiedMemberKind::Table))],
+        );
+    }
+
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _conn_guard = connection.lock().ok();
+
+    SqlEditorWidget::request_table_columns("SCOTT.EMP", &data, &sender, &connection);
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("schema-qualified names should keep the explicit qualifier");
+    assert_eq!(update.table, "SCOTT.EMP");
+    assert!(!update.cache_columns);
+}
+
+#[test]
 fn column_loading_scope_detects_unqualified_pending_refresh() {
     let mut data = IntellisenseData::new();
     data.columns_loading.insert("EMP".to_string());
+    let column_tables = vec!["emp".to_string()];
+    let deps = HashMap::new();
+    assert!(SqlEditorWidget::has_column_loading_for_scope(
+        true,
+        &column_tables,
+        &deps,
+        &data
+    ));
+}
+
+#[test]
+fn column_loading_scope_detects_default_qualified_pending_refresh() {
+    let mut data = IntellisenseData::new();
+    data.set_default_qualifier(Some("SCOTT".to_string()));
+    data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+    data.columns_loading.insert("SCOTT.EMP".to_string());
     let column_tables = vec!["emp".to_string()];
     let deps = HashMap::new();
     assert!(SqlEditorWidget::has_column_loading_for_scope(

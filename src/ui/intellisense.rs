@@ -673,6 +673,7 @@ pub struct IntellisenseData {
     pub synonyms: Vec<String>,
     pub public_synonyms: Vec<String>,
     pub users: Vec<String>,
+    default_qualifier: Option<String>,
     table_entries: Vec<NameEntry>,
     view_entries: Vec<NameEntry>,
     procedure_entries: Vec<NameEntry>,
@@ -710,6 +711,7 @@ impl IntellisenseData {
             synonyms: Vec::new(),
             public_synonyms: Vec::new(),
             users: Vec::new(),
+            default_qualifier: None,
             table_entries: Vec::new(),
             view_entries: Vec::new(),
             procedure_entries: Vec::new(),
@@ -1182,10 +1184,55 @@ impl IntellisenseData {
         None
     }
 
+    pub fn set_default_qualifier(&mut self, qualifier: Option<String>) {
+        self.default_qualifier = qualifier
+            .map(|value| Self::normalize_qualifier_lookup_key(&value))
+            .filter(|value| !value.is_empty());
+    }
+
+    pub fn default_qualifier(&self) -> Option<&str> {
+        self.default_qualifier.as_deref()
+    }
+
+    pub fn qualifier_has_member(
+        &self,
+        qualifier: &str,
+        candidate: &str,
+        relation_only: bool,
+    ) -> bool {
+        let candidate_upper = candidate.trim().to_ascii_uppercase();
+        if candidate_upper.is_empty() {
+            return false;
+        }
+
+        self.member_entries_for_qualifier(qualifier, relation_only)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.upper == candidate_upper))
+    }
+
+    fn default_qualified_relation_key(&self, table: &str) -> Option<String> {
+        if table.trim().is_empty() || table.contains('.') {
+            return None;
+        }
+
+        let qualifier = self.default_qualifier()?;
+        if self.qualifier_has_member(qualifier, table, true)
+            || self.qualifier_has_member(qualifier, table, false)
+        {
+            Some(format!("{}.{}", qualifier, table.trim()).to_ascii_uppercase())
+        } else {
+            None
+        }
+    }
+
     fn column_entries_for_scope_table(&self, table: &str) -> Option<&[NameEntry]> {
         let key = table.to_uppercase();
         if let Some(entries) = self.column_entries_for_exact_key(&key) {
             return Some(entries);
+        }
+        if let Some(default_key) = self.default_qualified_relation_key(table) {
+            if let Some(entries) = self.column_entries_for_exact_key(&default_key) {
+                return Some(entries);
+            }
         }
         if let Some(short) = key.rsplit('.').next() {
             if short != key {
@@ -1242,6 +1289,14 @@ impl IntellisenseData {
         }
         if let Some(columns) = self.columns.get(&key) {
             return columns.clone();
+        }
+        if let Some(default_key) = self.default_qualified_relation_key(table_name) {
+            if let Some(columns) = self.virtual_column_entries_by_table.get(&default_key) {
+                return columns.iter().map(|entry| entry.name.clone()).collect();
+            }
+            if let Some(columns) = self.columns.get(&default_key) {
+                return columns.clone();
+            }
         }
         if let Some(short) = key.rsplit('.').next() {
             if short != key {
@@ -3050,6 +3105,17 @@ mod intellisense_tests {
         data.set_columns_for_table("EMP", vec!["EMPNO".to_string()]);
 
         let columns = data.get_columns_for_table("SCOTT.EMP");
+        assert_eq!(columns, vec!["EMPNO".to_string()]);
+    }
+
+    #[test]
+    fn get_columns_for_table_uses_default_qualifier_cache_key() {
+        let mut data = IntellisenseData::new();
+        data.set_default_qualifier(Some("SCOTT".to_string()));
+        data.set_relation_members_for_qualifier("SCOTT", vec!["EMP".to_string()]);
+        data.set_columns_for_table("SCOTT.EMP", vec!["EMPNO".to_string()]);
+
+        let columns = data.get_columns_for_table("EMP");
         assert_eq!(columns, vec!["EMPNO".to_string()]);
     }
 
