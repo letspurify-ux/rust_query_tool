@@ -957,7 +957,7 @@ impl SqlEditorWidget {
 
 fn inserted_text(
     buf: &TextBuffer,
-    text_shadow: &Arc<Mutex<HighlightShadowState>>,
+    _text_shadow: &Arc<Mutex<HighlightShadowState>>,
     pos: i32,
     ins: i32,
 ) -> String {
@@ -966,7 +966,7 @@ fn inserted_text(
     }
 
     let insert_end = pos.saturating_add(ins).min(buf.length());
-    text_buffer_access::text_range(buf, Some(text_shadow), pos, insert_end)
+    buf.text_range(pos, insert_end).unwrap_or_default()
 }
 
 fn classify_edit_granularity(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGranularity {

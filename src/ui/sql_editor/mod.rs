@@ -2338,11 +2338,12 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod execution_state_tests {
     use super::{
-        classify_edit_group, load_mutex_bool, try_mark_query_running, BufferEdit, EditGranularity,
-        EditOperation, IntellisenseRuntimeState, QueryProgress, SqlEditorWidget, UndoDelta,
-        UndoSnapshot, WordUndoRedoState,
+        classify_edit_group, inserted_text, load_mutex_bool, try_mark_query_running, BufferEdit,
+        EditGranularity, EditOperation, HighlightShadowState, IntellisenseRuntimeState,
+        QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState, STYLE_DEFAULT,
     };
     use fltk::app;
+    use fltk::text::TextBuffer;
     use std::ptr::NonNull;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2521,6 +2522,29 @@ mod execution_state_tests {
         assert_eq!(insert_group.operation, EditOperation::Insert);
         assert_eq!(delete_group.operation, EditOperation::Delete);
         assert_ne!(insert_group, delete_group);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+    )]
+    fn inserted_text_reads_live_buffer_for_same_length_replacement() {
+        let original = "SELECT a FROM dual";
+        let mut buffer = TextBuffer::default();
+        buffer.set_text(original);
+
+        let styles = std::iter::repeat_n(STYLE_DEFAULT, original.len()).collect::<String>();
+        let shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
+        shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rebuild(original.to_string(), &styles, Vec::new());
+
+        let pos = original.find("a FROM").unwrap_or(0);
+        buffer.replace(pos as i32, pos.saturating_add(1) as i32, "'");
+
+        assert_eq!(inserted_text(&buffer, &shadow, pos as i32, 1), "'");
     }
 
     #[test]
