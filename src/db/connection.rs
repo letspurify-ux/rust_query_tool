@@ -713,6 +713,7 @@ pub struct DatabaseConnection {
     pool: Option<DbConnectionPool>,
     info: ConnectionInfo,
     session_password: String,
+    oracle_current_schema: Option<String>,
     connected: bool,
     auto_commit: bool,
     session: Arc<Mutex<SessionState>>,
@@ -809,6 +810,7 @@ impl DatabaseConnection {
             pool: None,
             info: ConnectionInfo::default(),
             session_password: String::new(),
+            oracle_current_schema: None,
             connected: false,
             auto_commit: false,
             session: Arc::new(Mutex::new(SessionState::default())),
@@ -835,6 +837,7 @@ impl DatabaseConnection {
         ConnectionInfo::clear_secret(&mut self.session_password);
         self.session_password = new_session_password;
         self.info = info;
+        self.oracle_current_schema = None;
         backend_for(db_type).after_connect(self);
         self.connected = true;
         self.last_disconnect_reason = None;
@@ -860,6 +863,21 @@ impl DatabaseConnection {
                 eprintln!("Warning: failed to apply default session setting `{statement}`: {err}");
             }
         }
+    }
+
+    fn normalize_oracle_current_schema_name(schema: &str) -> Option<String> {
+        let trimmed = schema.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    fn set_tracked_oracle_current_schema(&mut self, schema: Option<String>) {
+        self.oracle_current_schema = schema
+            .as_deref()
+            .and_then(Self::normalize_oracle_current_schema_name);
     }
 
     pub(crate) fn apply_mysql_default_session_settings<C: Queryable>(conn: &mut C) {
@@ -964,6 +982,26 @@ impl DatabaseConnection {
         )
     }
 
+    fn read_oracle_current_schema(conn: &Connection) -> Result<String, String> {
+        let sql = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual";
+        let mut stmt = conn.statement(sql).build().map_err(|err| err.to_string())?;
+        let row = stmt.query_row(&[]).map_err(|err| err.to_string())?;
+        row.get::<_, Option<String>>(0)
+            .map_err(|err| err.to_string())
+            .map(|value| value.unwrap_or_default().trim().to_string())
+    }
+
+    fn apply_oracle_current_schema(conn: &Connection, schema: Option<&str>) -> Result<(), String> {
+        let Some(schema) = schema.and_then(Self::normalize_oracle_current_schema_name) else {
+            return Ok(());
+        };
+
+        let statement = Self::oracle_set_current_schema_statement(&schema);
+        conn.execute(&statement, &[])
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     fn apply_mysql_autocommit_setting<C: Queryable>(conn: &mut C, enabled: bool) {
         let statement = if enabled {
             "SET autocommit = 1"
@@ -989,6 +1027,7 @@ impl DatabaseConnection {
         self.info.clear_password();
         self.info = ConnectionInfo::default();
         ConnectionInfo::clear_secret(&mut self.session_password);
+        self.oracle_current_schema = None;
         self.auto_commit = false;
         match self.session.lock() {
             Ok(mut guard) => guard.reset(),
@@ -1186,6 +1225,10 @@ impl DatabaseConnection {
         self.auto_commit
     }
 
+    pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
+        Self::apply_oracle_current_schema(conn, self.oracle_current_schema.as_deref())
+    }
+
     pub fn sync_mysql_current_database_name(&mut self) -> Result<String, String> {
         let Some(conn) = self.get_mysql_connection_mut() else {
             return Err("Expected MySQL connection but none is active".to_string());
@@ -1241,6 +1284,32 @@ impl DatabaseConnection {
         Ok(())
     }
 
+    pub fn sync_oracle_current_schema_from_session(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<String, String> {
+        if self.info.db_type != DatabaseType::Oracle || !self.connected {
+            return Err("Expected Oracle connection but none is active".to_string());
+        }
+
+        let current_schema = Self::read_oracle_current_schema(conn)?;
+        self.set_tracked_oracle_current_schema(Some(current_schema.clone()));
+
+        if let Ok(primary_conn) = self.require_live_connection() {
+            if !std::ptr::eq(primary_conn.as_ref(), conn) {
+                if let Err(err) =
+                    Self::apply_oracle_current_schema(primary_conn.as_ref(), Some(&current_schema))
+                {
+                    eprintln!(
+                        "Warning: failed to mirror Oracle current schema to primary connection: {err}"
+                    );
+                }
+            }
+        }
+
+        Ok(current_schema)
+    }
+
     pub fn switch_oracle_current_schema(&mut self, schema: &str) -> Result<(), String> {
         if self.info.db_type != DatabaseType::Oracle || !self.connected {
             return Err("Expected Oracle connection but none is active".to_string());
@@ -1255,7 +1324,9 @@ impl DatabaseConnection {
         let statement = Self::oracle_set_current_schema_statement(target_schema);
         conn.execute(&statement, &[])
             .map(|_| ())
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        self.set_tracked_oracle_current_schema(Some(target_schema.to_string()));
+        Ok(())
     }
 
     pub fn session_state(&self) -> Arc<Mutex<SessionState>> {
@@ -1270,6 +1341,7 @@ impl DatabaseConnection {
     fn simulate_connected_metadata_for_test(&mut self, info: ConnectionInfo) {
         self.connected = true;
         self.session_password = info.password.clone();
+        self.oracle_current_schema = None;
         self.info = info;
     }
 }
@@ -1819,6 +1891,30 @@ mod tests {
             DatabaseConnection::oracle_set_current_schema_statement("Sales Ops"),
             r#"ALTER SESSION SET CURRENT_SCHEMA = "Sales Ops""#
         );
+    }
+
+    #[test]
+    fn normalize_oracle_current_schema_name_trims_blank_values() {
+        assert_eq!(
+            DatabaseConnection::normalize_oracle_current_schema_name("   "),
+            None
+        );
+        assert_eq!(
+            DatabaseConnection::normalize_oracle_current_schema_name(" sys "),
+            Some("sys".to_string())
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_tracked_oracle_current_schema() {
+        let mut conn = DatabaseConnection::new();
+        conn.info = ConnectionInfo::new("Prod", "scott", "pw", "db", 1521, "FREE");
+        conn.connected = true;
+        conn.oracle_current_schema = Some("SYS".to_string());
+
+        conn.disconnect();
+
+        assert!(conn.oracle_current_schema.is_none());
     }
 
     #[test]

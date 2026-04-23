@@ -918,6 +918,14 @@ impl SqlEditorWidget {
             crate::db::current_oracle_pooled_session_lease(pooled_db_session, connection_generation)
         {
             if conn.ping().is_ok() {
+                if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()) {
+                    crate::db::clear_oracle_pooled_session_lease_if_current_connection(
+                        pooled_db_session,
+                        connection_generation,
+                        &conn,
+                    );
+                    return Err(message);
+                }
                 return Ok(Some(conn));
             }
             crate::db::clear_oracle_pooled_session_lease_if_current_connection(
@@ -944,6 +952,7 @@ impl SqlEditorWidget {
                 let conn = lease
                     .oracle_connection()
                     .ok_or_else(|| "Expected Oracle pool session".to_string())?;
+                conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())?;
                 crate::db::store_pooled_session_lease_if_empty(
                     pooled_db_session,
                     connection_generation,
@@ -7598,6 +7607,22 @@ impl SqlEditorWidget {
                                     }
                                 }
 
+                                let current_schema_changed = result.success
+                                    && SqlEditorWidget::oracle_statement_sets_current_schema(
+                                        &sql_to_execute,
+                                    );
+                                if current_schema_changed
+                                    && SqlEditorWidget::sync_oracle_pooled_session_current_schema(
+                                        &shared_connection,
+                                        conn,
+                                        &db_activity,
+                                        connection_generation,
+                                    )
+                                {
+                                    let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
+                                    app::awake();
+                                }
+
                                 // Capture success before moving result into the channel
                                 // to avoid cloning the entire QueryResult.
                                 let result_success = result.success;
@@ -9060,6 +9085,23 @@ impl SqlEditorWidget {
         }
     }
 
+    fn oracle_statement_sets_current_schema(sql: &str) -> bool {
+        let cleaned = Self::strip_leading_comments(sql);
+        let upper = cleaned.to_uppercase();
+        if !upper.starts_with("ALTER SESSION") {
+            return false;
+        }
+
+        upper.split_whitespace().any(|token| {
+            token
+                .split('=')
+                .next()
+                .unwrap_or(token)
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ',' | ';'))
+                == "CURRENT_SCHEMA"
+        })
+    }
+
     fn normalize_object_name(value: &str) -> String {
         let trimmed = value.trim();
         if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
@@ -9441,6 +9483,28 @@ impl SqlEditorWidget {
         }
     }
 
+    fn sync_oracle_pooled_session_current_schema(
+        shared_connection: &crate::db::SharedConnection,
+        conn: &Arc<Connection>,
+        db_activity: &str,
+        connection_generation: u64,
+    ) -> bool {
+        let mut conn_guard =
+            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        if !conn_guard.can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
+        {
+            return false;
+        }
+
+        match conn_guard.sync_oracle_current_schema_from_session(conn.as_ref()) {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("Warning: failed to sync Oracle pooled session schema: {err}");
+                false
+            }
+        }
+    }
+
     pub(super) fn run_mysql_action_with_timeout<T, F>(
         conn_guard: &mut crate::db::DatabaseConnection,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -9663,6 +9727,31 @@ impl SqlEditorWidget {
             .progress_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+}
+
+#[cfg(test)]
+mod oracle_current_schema_statement_tests {
+    use super::SqlEditorWidget;
+
+    #[test]
+    fn oracle_statement_sets_current_schema_detects_alter_session_command() {
+        assert!(SqlEditorWidget::oracle_statement_sets_current_schema(
+            "ALTER SESSION SET CURRENT_SCHEMA = SYS"
+        ));
+        assert!(SqlEditorWidget::oracle_statement_sets_current_schema(
+            "/* lead */ ALTER SESSION SET CURRENT_SCHEMA=app_user"
+        ));
+    }
+
+    #[test]
+    fn oracle_statement_sets_current_schema_ignores_other_session_changes() {
+        assert!(!SqlEditorWidget::oracle_statement_sets_current_schema(
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"
+        ));
+        assert!(!SqlEditorWidget::oracle_statement_sets_current_schema(
+            "BEGIN NULL; END;"
+        ));
     }
 }
 
