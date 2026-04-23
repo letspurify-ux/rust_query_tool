@@ -71,6 +71,26 @@ fn clear_mutex_flag(flag: &Arc<Mutex<bool>>) {
     }
 }
 
+fn next_active_editor_tab_id_after_close(
+    tab_ids: &[QueryTabId],
+    closing_index: usize,
+    active_editor_tab_id: QueryTabId,
+) -> Option<QueryTabId> {
+    let closing_tab_id = *tab_ids.get(closing_index)?;
+    if active_editor_tab_id != closing_tab_id {
+        return Some(active_editor_tab_id);
+    }
+
+    tab_ids
+        .get(closing_index + 1)
+        .or_else(|| {
+            closing_index
+                .checked_sub(1)
+                .and_then(|prev| tab_ids.get(prev))
+        })
+        .copied()
+}
+
 #[derive(Clone)]
 struct SchemaUpdate {
     data: IntellisenseData,
@@ -3205,6 +3225,14 @@ impl MainWindow {
             };
 
             let was_active = s.active_editor_tab_id == tab_id;
+            // Avoid reading FLTK tab selection during the close transaction.
+            // `Fl_Tabs::value()` can still observe the closing child and panic.
+            let editor_tab_ids = s.editor_tabs.iter().map(|tab| tab.tab_id).collect::<Vec<_>>();
+            let next_active_tab_id = next_active_editor_tab_id_after_close(
+                &editor_tab_ids,
+                index,
+                s.active_editor_tab_id,
+            );
             let editor_to_cleanup = s.editor_tabs[index].sql_editor.clone();
             let mut lazy_fetch_sessions = s
                 .progress_contexts
@@ -3240,9 +3268,8 @@ impl MainWindow {
                 created_tab_id = MainWindow::create_query_editor_tab(&mut s);
             }
 
-            let next_tab_id = s
-                .query_tabs
-                .selected_id()
+            let next_tab_id = created_tab_id
+                .or(next_active_tab_id)
                 .or_else(|| s.query_tabs.tab_ids().first().copied())
                 .or_else(|| s.editor_tabs.first().map(|tab| tab.tab_id));
             let switched_to_next = next_tab_id
@@ -6283,6 +6310,42 @@ mod tests {
     #[test]
     fn resolve_result_tab_offset_falls_back_to_tab_count_when_target_is_missing() {
         assert_eq!(resolve_result_tab_offset(5, None), 5);
+    }
+
+    #[test]
+    fn next_active_editor_tab_after_close_keeps_current_active_tab_when_closing_background_tab() {
+        let tab_ids = vec![10, 20, 30];
+
+        let next_tab_id = next_active_editor_tab_id_after_close(&tab_ids, 0, 30);
+
+        assert_eq!(next_tab_id, Some(30));
+    }
+
+    #[test]
+    fn next_active_editor_tab_after_close_moves_to_next_tab_when_closing_active_tab() {
+        let tab_ids = vec![10, 20, 30];
+
+        let next_tab_id = next_active_editor_tab_id_after_close(&tab_ids, 1, 20);
+
+        assert_eq!(next_tab_id, Some(30));
+    }
+
+    #[test]
+    fn next_active_editor_tab_after_close_falls_back_to_previous_tab_at_end() {
+        let tab_ids = vec![10, 20, 30];
+
+        let next_tab_id = next_active_editor_tab_id_after_close(&tab_ids, 2, 30);
+
+        assert_eq!(next_tab_id, Some(20));
+    }
+
+    #[test]
+    fn next_active_editor_tab_after_close_returns_none_for_last_remaining_tab() {
+        let tab_ids = vec![10];
+
+        let next_tab_id = next_active_editor_tab_id_after_close(&tab_ids, 0, 10);
+
+        assert_eq!(next_tab_id, None);
     }
 
     #[test]
