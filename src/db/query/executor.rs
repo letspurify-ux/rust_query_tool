@@ -7773,76 +7773,6 @@ pub struct PackageRoutine {
 }
 
 impl ObjectBrowser {
-    pub fn get_current_owner(conn: &Connection) -> Result<String, OracleError> {
-        let mut stmt = conn.statement("SELECT USER FROM dual").build()?;
-        let owner = stmt.query_row_as::<String>(&[])?;
-        Ok(owner.trim().to_uppercase())
-    }
-
-    fn normalized_owner(owner: &str) -> String {
-        owner.trim().trim_matches('"').to_uppercase()
-    }
-
-    pub fn get_tables_by_owner(conn: &Connection, owner: &str) -> Result<Vec<String>, OracleError> {
-        let sql =
-            "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'TABLE' ORDER BY object_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_views_by_owner(conn: &Connection, owner: &str) -> Result<Vec<String>, OracleError> {
-        let sql =
-            "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'VIEW' ORDER BY object_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_procedures_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'PROCEDURE' ORDER BY object_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_functions_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'FUNCTION' ORDER BY object_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_sequences_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT sequence_name FROM all_sequences WHERE sequence_owner = :1 ORDER BY sequence_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_triggers_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT trigger_name FROM all_triggers WHERE owner = :1 ORDER BY trigger_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_synonyms_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT synonym_name FROM all_synonyms WHERE owner = :1 ORDER BY synonym_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
-    pub fn get_packages_by_owner(
-        conn: &Connection,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let sql = "SELECT object_name FROM all_objects WHERE owner = :1 AND object_type = 'PACKAGE' ORDER BY object_name";
-        Self::get_object_list_with_owner(conn, sql, owner)
-    }
-
     fn normalize_generated_ddl(ddl: String) -> String {
         let normalized_newlines = ddl.replace("\r\n", "\n");
         let trimmed = normalized_newlines.trim_matches('\n');
@@ -8649,49 +8579,6 @@ impl ObjectBrowser {
             }
         };
         let rows = match stmt.query(&[]) {
-            Ok(rows) => rows,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-
-        let mut objects: Vec<String> = Vec::new();
-        for row_result in rows {
-            let row: Row = match row_result {
-                Ok(row) => row,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            let name: String = match row.get(0) {
-                Ok(name) => name,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            objects.push(name);
-        }
-
-        Ok(objects)
-    }
-
-    fn get_object_list_with_owner(
-        conn: &Connection,
-        sql: &str,
-        owner: &str,
-    ) -> Result<Vec<String>, OracleError> {
-        let owner = Self::normalized_owner(owner);
-        let mut stmt = match conn.statement(sql).build() {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                logging::log_error("executor", &format!("Database operation failed: {err}"));
-                return Err(err);
-            }
-        };
-        let rows = match stmt.query(&[&owner]) {
             Ok(rows) => rows,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));

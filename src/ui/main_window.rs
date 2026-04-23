@@ -3338,7 +3338,6 @@ impl MainWindow {
 
     fn load_schema_update_for_current_connection(
         connection: &SharedConnection,
-        selected_owner: Option<&str>,
     ) -> Option<SchemaUpdate> {
         let (connection_generation, tables, views, procedures, functions, packages) = {
             let mut conn_guard =
@@ -3349,26 +3348,9 @@ impl MainWindow {
                     let Ok(conn) = conn_guard.require_live_connection() else {
                         return None;
                     };
-                    let owner = selected_owner
-                        .map(|value| value.trim().to_uppercase())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| conn_guard.get_info().username.to_uppercase());
-                    let owner_prefix = format!("{}.", owner);
-                    let qualify_names = |names: Vec<String>| -> Vec<String> {
-                        names
-                            .into_iter()
-                            .map(|name| {
-                                if name.contains('.') {
-                                    name
-                                } else {
-                                    format!("{owner_prefix}{name}")
-                                }
-                            })
-                            .collect()
-                    };
 
-                    let tables = match ObjectBrowser::get_tables_by_owner(conn.as_ref(), &owner) {
-                        Ok(tables) => qualify_names(tables),
+                    let tables = match ObjectBrowser::get_tables(conn.as_ref()) {
+                        Ok(tables) => tables,
                         Err(err) => {
                             crate::utils::logging::log_error(
                                 "schema",
@@ -3380,8 +3362,8 @@ impl MainWindow {
                         }
                     };
 
-                    let views = match ObjectBrowser::get_views_by_owner(conn.as_ref(), &owner) {
-                        Ok(views) => qualify_names(views),
+                    let views = match ObjectBrowser::get_views(conn.as_ref()) {
+                        Ok(views) => views,
                         Err(err) => {
                             crate::utils::logging::log_error(
                                 "schema",
@@ -3394,15 +3376,9 @@ impl MainWindow {
                     };
 
                     let procedures =
-                        ObjectBrowser::get_procedures_by_owner(conn.as_ref(), &owner)
-                            .map(qualify_names)
-                            .unwrap_or_default();
-                    let functions = ObjectBrowser::get_functions_by_owner(conn.as_ref(), &owner)
-                        .map(qualify_names)
-                        .unwrap_or_default();
-                    let packages = ObjectBrowser::get_packages_by_owner(conn.as_ref(), &owner)
-                        .map(qualify_names)
-                        .unwrap_or_default();
+                        ObjectBrowser::get_procedures(conn.as_ref()).unwrap_or_default();
+                    let functions = ObjectBrowser::get_functions(conn.as_ref()).unwrap_or_default();
+                    let packages = ObjectBrowser::get_packages(conn.as_ref()).unwrap_or_default();
 
                     (tables, views, procedures, functions, packages)
                 }
@@ -3483,13 +3459,10 @@ impl MainWindow {
         state.object_browser.refresh();
         let schema_sender = schema_sender.clone();
         let connection = state.connection.clone();
-        let selected_owner = state.object_browser.selected_owner();
         let schema_refresh_guard = state.schema_refresh_in_progress.clone();
         thread::spawn(move || {
-            if let Some(update) = MainWindow::load_schema_update_for_current_connection(
-                &connection,
-                selected_owner.as_deref(),
-            ) {
+            if let Some(update) = MainWindow::load_schema_update_for_current_connection(&connection)
+            {
                 let _ = schema_sender.send(update);
                 app::awake();
             }
@@ -5262,18 +5235,6 @@ impl MainWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 s.status_bar.set_label(&format_status(message, &conn_info));
-            };
-        });
-
-        let weak_state_for_owner_change = Arc::downgrade(&state);
-        let schema_sender_for_owner_change = schema_sender.clone();
-        object_browser.set_owner_change_callback(move |_| {
-            let Some(state_for_owner_change) = weak_state_for_owner_change.upgrade() else {
-                return;
-            };
-            let maybe_state_guard = state_for_owner_change.try_lock();
-            if let Ok(mut s) = maybe_state_guard {
-                MainWindow::start_connection_metadata_refresh(&mut s, &schema_sender_for_owner_change);
             };
         });
 
