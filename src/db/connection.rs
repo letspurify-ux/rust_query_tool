@@ -931,6 +931,39 @@ impl DatabaseConnection {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
+    fn oracle_identifier_needs_quotes(identifier: &str) -> bool {
+        let mut chars = identifier.chars();
+        let Some(first) = chars.next() else {
+            return true;
+        };
+        if !(first.is_ascii_alphabetic() || matches!(first, '_' | '$' | '#')) {
+            return true;
+        }
+        !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    }
+
+    fn quote_oracle_identifier(identifier: &str) -> String {
+        let trimmed = identifier.trim();
+        if trimmed.is_empty() {
+            return "\"\"".to_string();
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return trimmed.to_string();
+        }
+        if Self::oracle_identifier_needs_quotes(trimmed) {
+            format!("\"{}\"", trimmed.replace('"', "\"\""))
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn oracle_set_current_schema_statement(schema: &str) -> String {
+        format!(
+            "ALTER SESSION SET CURRENT_SCHEMA = {}",
+            Self::quote_oracle_identifier(schema)
+        )
+    }
+
     fn apply_mysql_autocommit_setting<C: Queryable>(conn: &mut C, enabled: bool) {
         let statement = if enabled {
             "SET autocommit = 1"
@@ -1201,10 +1234,28 @@ impl DatabaseConnection {
             return Err("Expected MySQL connection but none is active".to_string());
         };
 
-        conn.select_db(target_database).map_err(|err| err.to_string())?;
+        conn.select_db(target_database)
+            .map_err(|err| err.to_string())?;
         Self::apply_mysql_connection_encoding(conn);
         self.info.service_name = target_database.to_string();
         Ok(())
+    }
+
+    pub fn switch_oracle_current_schema(&mut self, schema: &str) -> Result<(), String> {
+        if self.info.db_type != DatabaseType::Oracle || !self.connected {
+            return Err("Expected Oracle connection but none is active".to_string());
+        }
+
+        let target_schema = schema.trim();
+        if target_schema.is_empty() {
+            return Err("Schema name cannot be empty".to_string());
+        }
+
+        let conn = self.require_live_connection()?;
+        let statement = Self::oracle_set_current_schema_statement(target_schema);
+        conn.execute(&statement, &[])
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 
     pub fn session_state(&self) -> Arc<Mutex<SessionState>> {
@@ -1751,6 +1802,22 @@ mod tests {
         assert_eq!(
             DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci;DROP")),
             "SET NAMES utf8mb4"
+        );
+    }
+
+    #[test]
+    fn oracle_set_current_schema_statement_keeps_simple_identifier_unquoted() {
+        assert_eq!(
+            DatabaseConnection::oracle_set_current_schema_statement("SCOTT"),
+            "ALTER SESSION SET CURRENT_SCHEMA = SCOTT"
+        );
+    }
+
+    #[test]
+    fn oracle_set_current_schema_statement_quotes_schema_when_needed() {
+        assert_eq!(
+            DatabaseConnection::oracle_set_current_schema_statement("Sales Ops"),
+            r#"ALTER SESSION SET CURRENT_SCHEMA = "Sales Ops""#
         );
     }
 

@@ -392,18 +392,11 @@ impl ObjectBrowserWidget {
                     &connection,
                     format!("Switching database to {}", target_scope),
                 ) else {
-                    if let Some(previous_scope) = previous_scope {
-                        *suppress_scope_events
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-                        if let Some(index) = Self::choice_index_for_value(&scope_choice, &previous_scope)
-                        {
-                            scope_choice.set_value(index);
-                        }
-                        *suppress_scope_events
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-                    }
+                    Self::restore_previous_scope_choice(
+                        &mut scope_choice,
+                        &suppress_scope_events,
+                        previous_scope.as_deref(),
+                    );
                     let busy_message = format_connection_busy_message();
                     Self::emit_status_callback(&status_callback, &busy_message);
                     fltk::dialog::message_default(&busy_message);
@@ -412,20 +405,45 @@ impl ObjectBrowserWidget {
 
                 if let Err(err) = conn_guard.switch_mysql_database(&target_scope) {
                     drop(conn_guard);
-                    if let Some(previous_scope) = previous_scope {
-                        *suppress_scope_events
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-                        if let Some(index) = Self::choice_index_for_value(&scope_choice, &previous_scope)
-                        {
-                            scope_choice.set_value(index);
-                        }
-                        *suppress_scope_events
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-                    }
+                    Self::restore_previous_scope_choice(
+                        &mut scope_choice,
+                        &suppress_scope_events,
+                        previous_scope.as_deref(),
+                    );
                     fltk::dialog::alert_default(&format!(
                         "Failed to switch database to {}: {}",
+                        target_scope, err
+                    ));
+                    return;
+                }
+            } else if db_type.uses_oracle_sql_dialect() {
+                let Some(target_scope) = next_scope.clone() else {
+                    return;
+                };
+                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                    &connection,
+                    format!("Switching current schema to {}", target_scope),
+                ) else {
+                    Self::restore_previous_scope_choice(
+                        &mut scope_choice,
+                        &suppress_scope_events,
+                        previous_scope.as_deref(),
+                    );
+                    let busy_message = format_connection_busy_message();
+                    Self::emit_status_callback(&status_callback, &busy_message);
+                    fltk::dialog::message_default(&busy_message);
+                    return;
+                };
+
+                if let Err(err) = conn_guard.switch_oracle_current_schema(&target_scope) {
+                    drop(conn_guard);
+                    Self::restore_previous_scope_choice(
+                        &mut scope_choice,
+                        &suppress_scope_events,
+                        previous_scope.as_deref(),
+                    );
+                    fltk::dialog::alert_default(&format!(
+                        "Failed to switch current schema to {}: {}",
                         target_scope, err
                     ));
                     return;
@@ -589,9 +607,10 @@ impl ObjectBrowserWidget {
                 if !available_scopes.is_empty() {
                     scope_choice.add_choice(&available_scopes.join("|"));
                     if let Some(ref resolved_scope) = resolved_scope {
-                        if let Some(index) =
-                            ObjectBrowserWidget::choice_index_for_value(&scope_choice, resolved_scope)
-                        {
+                        if let Some(index) = ObjectBrowserWidget::choice_index_for_value(
+                            &scope_choice,
+                            resolved_scope,
+                        ) {
                             scope_choice.set_value(index);
                         }
                     } else {
@@ -1240,9 +1259,9 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
     ) -> Option<String> {
-        Self::get_item_info(item)
-            .as_ref()
-            .map(|item_info| Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope))
+        Self::get_item_info(item).as_ref().map(|item_info| {
+            Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope)
+        })
     }
 
     fn copy_text_for_selected_item(item: &TreeItem) -> Option<String> {
@@ -1281,13 +1300,38 @@ impl ObjectBrowserWidget {
     }
 
     fn choice_index_for_value(choice: &Choice, value: &str) -> Option<i32> {
+        let options = (0..choice.size())
+            .filter_map(|index| choice.text(index))
+            .collect::<Vec<_>>();
+        Self::scope_option_index(&options, value)
+    }
+
+    fn scope_option_index(options: &[String], value: &str) -> Option<i32> {
         let target = value.trim();
-        let size = choice.size();
-        (0..size).find(|&index| {
-            choice
-                .text(index)
-                .is_some_and(|entry| entry.trim().eq_ignore_ascii_case(target))
-        })
+        options
+            .iter()
+            .position(|entry| entry.trim().eq_ignore_ascii_case(target))
+            .map(|index| index as i32)
+    }
+
+    fn restore_previous_scope_choice(
+        scope_choice: &mut Choice,
+        suppress_scope_events: &Arc<Mutex<bool>>,
+        previous_scope: Option<&str>,
+    ) {
+        let Some(previous_scope) = previous_scope else {
+            return;
+        };
+
+        *suppress_scope_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        if let Some(index) = Self::choice_index_for_value(scope_choice, previous_scope) {
+            scope_choice.set_value(index);
+        }
+        *suppress_scope_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     }
 
     fn scope_snapshot(selected_scope: &Arc<Mutex<Option<String>>>) -> Option<String> {
@@ -1336,7 +1380,8 @@ impl ObjectBrowserWidget {
         package_name: &str,
         routine_name: &str,
     ) -> String {
-        let package_name = Self::qualify_object_name_for_scope(db_type, selected_scope, package_name);
+        let package_name =
+            Self::qualify_object_name_for_scope(db_type, selected_scope, package_name);
         format!("{}.{}", package_name, routine_name.trim())
     }
 
@@ -2110,11 +2155,12 @@ impl ObjectBrowserWidget {
                                 };
 
                                 let db_type = conn_guard.db_type();
-                                let qualified_name = ObjectBrowserWidget::qualify_object_name_for_scope(
-                                    db_type,
-                                    selected_scope.as_deref(),
-                                    &object_name,
-                                );
+                                let qualified_name =
+                                    ObjectBrowserWidget::qualify_object_name_for_scope(
+                                        db_type,
+                                        selected_scope.as_deref(),
+                                        &object_name,
+                                    );
                                 let result = match db_type.sql_dialect() {
                                     crate::db::DbSqlDialect::Oracle => {
                                         match conn_guard.require_live_connection() {
@@ -3042,7 +3088,8 @@ impl ObjectBrowserWidget {
         self.filter_input.set_value("");
         self.scope_choice.clear();
         self.scope_choice.deactivate();
-        self.scope_label.set_label(Self::scope_label_text(crate::db::DatabaseType::Oracle));
+        self.scope_label
+            .set_label(Self::scope_label_text(crate::db::DatabaseType::Oracle));
         *self
             .scope_options
             .lock()
@@ -3146,7 +3193,8 @@ impl ObjectBrowserWidget {
                         let username = conn_guard.get_info().username.trim();
                         (!username.is_empty()).then(|| username.to_ascii_uppercase())
                     });
-                let mut available_scopes = ObjectBrowser::get_users(db_conn.as_ref()).unwrap_or_default();
+                let mut available_scopes =
+                    ObjectBrowser::get_users(db_conn.as_ref()).unwrap_or_default();
                 if let Some(ref current_schema) = current_schema {
                     if !available_scopes
                         .iter()
@@ -3164,11 +3212,13 @@ impl ObjectBrowserWidget {
 
                 let mut cache = ObjectCache::default();
                 if let Some(ref selected_scope) = selected_scope {
-                    if let Ok(tables) = ObjectBrowser::get_tables_by_owner(db_conn.as_ref(), selected_scope)
+                    if let Ok(tables) =
+                        ObjectBrowser::get_tables_by_owner(db_conn.as_ref(), selected_scope)
                     {
                         cache.tables = tables;
                     }
-                    if let Ok(views) = ObjectBrowser::get_views_by_owner(db_conn.as_ref(), selected_scope)
+                    if let Ok(views) =
+                        ObjectBrowser::get_views_by_owner(db_conn.as_ref(), selected_scope)
                     {
                         cache.views = views;
                     }
@@ -3209,7 +3259,8 @@ impl ObjectBrowserWidget {
             crate::db::DbSqlDialect::MySql => {
                 let current_database = conn_guard.get_info().service_name.trim().to_string();
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
-                let mut available_scopes = MysqlObjectBrowser::get_schemas(mysql_conn).unwrap_or_default();
+                let mut available_scopes =
+                    MysqlObjectBrowser::get_schemas(mysql_conn).unwrap_or_default();
                 if !current_database.is_empty()
                     && !available_scopes
                         .iter()
@@ -3579,6 +3630,24 @@ mod tests {
         );
 
         assert_eq!(text, "SCOTT.DEMO_PKG.RUN_JOB");
+    }
+
+    #[test]
+    fn scope_option_index_matches_scope_case_insensitively() {
+        let options = vec!["SCOTT".to_string(), "HR".to_string(), "APP".to_string()];
+
+        assert_eq!(
+            ObjectBrowserWidget::scope_option_index(&options, " scott "),
+            Some(0)
+        );
+        assert_eq!(
+            ObjectBrowserWidget::scope_option_index(&options, "Hr"),
+            Some(1)
+        );
+        assert_eq!(
+            ObjectBrowserWidget::scope_option_index(&options, "missing"),
+            None
+        );
     }
 
     #[test]
