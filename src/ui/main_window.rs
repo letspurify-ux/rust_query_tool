@@ -423,6 +423,14 @@ impl AppState {
     }
 
     fn set_active_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
+        self.set_active_editor_tab_with_display_stabilization(tab_id, true)
+    }
+
+    fn set_active_editor_tab_with_display_stabilization(
+        &mut self,
+        tab_id: QueryTabId,
+        stabilize_display: bool,
+    ) -> bool {
         let Some(index) = self.find_tab_index(tab_id) else {
             return false;
         };
@@ -430,7 +438,9 @@ impl AppState {
         self.active_editor_tab_id = tab_id;
         self.sql_editor = tab.sql_editor;
         self.sql_editor.sync_db_type_from_connection();
-        self.sql_editor.stabilize_display_metrics();
+        if stabilize_display {
+            self.sql_editor.stabilize_display_metrics();
+        }
         self.sql_buffer = tab.sql_buffer;
         *self
             .current_file
@@ -3150,6 +3160,13 @@ impl MainWindow {
     }
 
     fn create_query_editor_tab(state: &mut AppState) -> Option<QueryTabId> {
+        Self::create_query_editor_tab_with_display_stabilization(state, true)
+    }
+
+    fn create_query_editor_tab_with_display_stabilization(
+        state: &mut AppState,
+        stabilize_display: bool,
+    ) -> Option<QueryTabId> {
         let label = format!("Query {}", state.next_editor_tab_number);
         state.next_editor_tab_number = state.next_editor_tab_number.saturating_add(1);
         let tab_id = state.query_tabs.add_tab(&label);
@@ -3162,7 +3179,9 @@ impl MainWindow {
         editor_group.layout();
         group.resizable(&editor_group);
         group.end();
-        editor.stabilize_display_metrics();
+        if stabilize_display {
+            editor.stabilize_display_metrics();
+        }
         let inherited_intellisense = state.schema_intellisense_data.clone();
         *editor
             .get_intellisense_data()
@@ -3187,7 +3206,7 @@ impl MainWindow {
             schema_generation: state.current_schema_generation(),
         });
         state.query_tabs.select(tab_id);
-        let _ = state.set_active_editor_tab(tab_id);
+        let _ = state.set_active_editor_tab_with_display_stabilization(tab_id, stabilize_display);
         Some(tab_id)
     }
 
@@ -3216,6 +3235,8 @@ impl MainWindow {
             file_sender,
             mut editor_to_cleanup,
             lazy_fetch_sessions,
+            deferred_display_tab_id,
+            focus_after_close,
         ) = {
             let mut s = state
                 .lock()
@@ -3227,7 +3248,11 @@ impl MainWindow {
             let was_active = s.active_editor_tab_id == tab_id;
             // Avoid reading FLTK tab selection during the close transaction.
             // `Fl_Tabs::value()` can still observe the closing child and panic.
-            let editor_tab_ids = s.editor_tabs.iter().map(|tab| tab.tab_id).collect::<Vec<_>>();
+            let editor_tab_ids = s
+                .editor_tabs
+                .iter()
+                .map(|tab| tab.tab_id)
+                .collect::<Vec<_>>();
             let next_active_tab_id = next_active_editor_tab_id_after_close(
                 &editor_tab_ids,
                 index,
@@ -3264,8 +3289,10 @@ impl MainWindow {
             s.progress_contexts.remove(&tab_id);
 
             let mut created_tab_id = None;
+            let mut deferred_display_tab_id = None;
             if s.editor_tabs.is_empty() {
-                created_tab_id = MainWindow::create_query_editor_tab(&mut s);
+                created_tab_id =
+                    MainWindow::create_query_editor_tab_with_display_stabilization(&mut s, false);
             }
 
             let next_tab_id = created_tab_id
@@ -3273,41 +3300,45 @@ impl MainWindow {
                 .or_else(|| s.query_tabs.tab_ids().first().copied())
                 .or_else(|| s.editor_tabs.first().map(|tab| tab.tab_id));
             let switched_to_next = next_tab_id
-                .map(|next_tab_id| s.set_active_editor_tab(next_tab_id))
+                .map(|next_tab_id| {
+                    let switched =
+                        s.set_active_editor_tab_with_display_stabilization(next_tab_id, false);
+                    if switched {
+                        deferred_display_tab_id = Some(next_tab_id);
+                    }
+                    switched
+                })
                 .unwrap_or(false);
 
-            if switched_to_next {
-                if was_active {
-                    s.sql_editor.focus();
+            if !switched_to_next {
+                if let Some(fallback_tab) = s.editor_tabs.first().cloned() {
+                    // Defensive fallback: if tab/widget selection loses sync, still point
+                    // app state to a live editor tab so closed-tab resources are not held
+                    // by stale SqlEditorWidget/TextBuffer handles.
+                    s.active_editor_tab_id = fallback_tab.tab_id;
+                    s.sql_editor = fallback_tab.sql_editor;
+                    s.sql_buffer = fallback_tab.sql_buffer;
+                    *s.current_file
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        fallback_tab.current_file;
+                    s.query_tabs.select(fallback_tab.tab_id);
+                    s.refresh_window_title();
+                    deferred_display_tab_id = Some(fallback_tab.tab_id);
+                } else if was_active {
+                    // Defensive fallback: if tab selection cannot be resolved,
+                    // clear active editor references so closed-tab resources are
+                    // not kept alive by stale handles in application state.
+                    let detached_editor =
+                        SqlEditorWidget::new(s.connection.clone(), s.query_timeout_input.clone());
+                    s.active_editor_tab_id = 0;
+                    s.sql_buffer = detached_editor.get_buffer();
+                    s.sql_editor = detached_editor;
+                    *s.current_file
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    s.refresh_window_title();
                 }
-            } else if let Some(fallback_tab) = s.editor_tabs.first().cloned() {
-                // Defensive fallback: if tab/widget selection loses sync, still point
-                // app state to a live editor tab so closed-tab resources are not held
-                // by stale SqlEditorWidget/TextBuffer handles.
-                s.active_editor_tab_id = fallback_tab.tab_id;
-                s.sql_editor = fallback_tab.sql_editor;
-                s.sql_buffer = fallback_tab.sql_buffer;
-                *s.current_file
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fallback_tab.current_file;
-                s.query_tabs.select(fallback_tab.tab_id);
-                s.refresh_window_title();
-                if was_active {
-                    s.sql_editor.focus();
-                }
-            } else if was_active {
-                // Defensive fallback: if tab selection cannot be resolved,
-                // clear active editor references so closed-tab resources are
-                // not kept alive by stale handles in application state.
-                let detached_editor =
-                    SqlEditorWidget::new(s.connection.clone(), s.query_timeout_input.clone());
-                s.active_editor_tab_id = 0;
-                s.sql_buffer = detached_editor.get_buffer();
-                s.sql_editor = detached_editor;
-                *s.current_file
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                s.refresh_window_title();
             }
 
             s.right_tile.redraw();
@@ -3322,6 +3353,8 @@ impl MainWindow {
                 s.file_sender.clone(),
                 editor_to_cleanup,
                 lazy_fetch_sessions,
+                deferred_display_tab_id,
+                was_active,
             )
         };
 
@@ -3338,10 +3371,31 @@ impl MainWindow {
             if let Some(file_sender) = file_sender {
                 Self::attach_file_drop_callback(state, tab_id, file_sender);
             }
-            let mut s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.sql_editor.focus();
+        }
+
+        if let Some(tab_id) = deferred_display_tab_id {
+            let state_for_deferred_display = Arc::clone(state);
+            app::add_timeout3(0.0, move |_| {
+                let editor = {
+                    let s = state_for_deferred_display
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if s.active_editor_tab_id == tab_id {
+                        Some(s.sql_editor.clone())
+                    } else {
+                        None
+                    }
+                };
+                let Some(mut editor) = editor else {
+                    return;
+                };
+                // Run after the close transaction so FLTK can finish pending
+                // widget deletion before a metric refresh calls into flush().
+                editor.stabilize_display_metrics();
+                if focus_after_close {
+                    editor.focus();
+                }
+            });
         }
 
         true
