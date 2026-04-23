@@ -597,35 +597,6 @@ impl ObjectBrowserWidget {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *selected_guard = resolved_scope.clone();
                 }
-                {
-                    let mut suppress = suppress_scope_events
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *suppress = true;
-                }
-                scope_choice.clear();
-                if !available_scopes.is_empty() {
-                    scope_choice.add_choice(&available_scopes.join("|"));
-                    if let Some(ref resolved_scope) = resolved_scope {
-                        if let Some(index) = ObjectBrowserWidget::choice_index_for_value(
-                            &scope_choice,
-                            resolved_scope,
-                        ) {
-                            scope_choice.set_value(index);
-                        }
-                    } else {
-                        scope_choice.set_value(0);
-                    }
-                    scope_choice.activate();
-                } else {
-                    scope_choice.deactivate();
-                }
-                {
-                    let mut suppress = suppress_scope_events
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    *suppress = false;
-                }
                 ObjectBrowserWidget::clear_tree_items(&mut tree);
                 {
                     let mut pending = pending_tree_refresh
@@ -637,6 +608,21 @@ impl ObjectBrowserWidget {
                     });
                 }
             }
+
+            let desired_scopes = scope_options
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let desired_scope = selected_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            ObjectBrowserWidget::sync_scope_choice_widget(
+                &mut scope_choice,
+                &suppress_scope_events,
+                &desired_scopes,
+                desired_scope.as_deref(),
+            );
 
             let mut next_paths = Vec::new();
             let mut finished_refresh = false;
@@ -1297,6 +1283,74 @@ impl ObjectBrowserWidget {
 
     fn scope_label_text(_db_type: crate::db::DatabaseType) -> &'static str {
         ""
+    }
+
+    fn scope_choice_values(choice: &Choice) -> Vec<String> {
+        (0..choice.size())
+            .filter_map(|index| choice.text(index))
+            .collect()
+    }
+
+    fn scope_options_match(current_options: &[String], desired_options: &[String]) -> bool {
+        current_options.len() == desired_options.len()
+            && current_options
+                .iter()
+                .zip(desired_options.iter())
+                .all(|(current, desired)| {
+                    current.trim().eq_ignore_ascii_case(desired.trim())
+                })
+    }
+
+    fn sync_scope_choice_widget(
+        scope_choice: &mut Choice,
+        suppress_scope_events: &Arc<Mutex<bool>>,
+        available_scopes: &[String],
+        resolved_scope: Option<&str>,
+    ) {
+        // FLTK menu widgets are not safe to mutate while a pulldown is active.
+        // Defer all menu rebuilding until the grab is released.
+        if app::grab().is_some() {
+            return;
+        }
+
+        let current_options = Self::scope_choice_values(scope_choice);
+        let needs_rebuild = !Self::scope_options_match(&current_options, available_scopes);
+        let desired_scope = resolved_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
+            .or_else(|| available_scopes.first().cloned());
+
+        *suppress_scope_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        if needs_rebuild {
+            scope_choice.clear();
+            if !available_scopes.is_empty() {
+                scope_choice.add_choice(&available_scopes.join("|"));
+            }
+        }
+
+        if let Some(ref desired_scope) = desired_scope {
+            if let Some(index) = Self::choice_index_for_value(scope_choice, desired_scope) {
+                scope_choice.set_value(index);
+            } else if !available_scopes.is_empty() {
+                scope_choice.set_value(0);
+            }
+        } else if !available_scopes.is_empty() {
+            scope_choice.set_value(0);
+        }
+
+        if available_scopes.is_empty() {
+            scope_choice.deactivate();
+        } else {
+            scope_choice.activate();
+        }
+
+        *suppress_scope_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     }
 
     fn choice_index_for_value(choice: &Choice, value: &str) -> Option<i32> {
@@ -3648,6 +3702,30 @@ mod tests {
             ObjectBrowserWidget::scope_option_index(&options, "missing"),
             None
         );
+    }
+
+    #[test]
+    fn scope_options_match_ignores_case_and_whitespace() {
+        let current = vec![" SCOTT ".to_string(), "Hr".to_string()];
+        let desired = vec!["scott".to_string(), "HR".to_string()];
+
+        assert!(ObjectBrowserWidget::scope_options_match(
+            &current, &desired
+        ));
+    }
+
+    #[test]
+    fn scope_options_match_rejects_different_scope_sets() {
+        let current = vec!["SCOTT".to_string(), "HR".to_string()];
+        let reordered = vec!["HR".to_string(), "SCOTT".to_string()];
+        let shortened = vec!["SCOTT".to_string()];
+
+        assert!(!ObjectBrowserWidget::scope_options_match(
+            &current, &reordered
+        ));
+        assert!(!ObjectBrowserWidget::scope_options_match(
+            &current, &shortened
+        ));
     }
 
     #[test]
