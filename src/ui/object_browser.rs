@@ -160,11 +160,12 @@ impl ObjectBrowserWidget {
 
         let mut scope_row = Flex::default();
         scope_row.set_type(FlexType::Row);
-        scope_row.set_spacing(DIALOG_SPACING);
+        scope_row.set_spacing(0);
 
         let mut scope_label = Frame::default().with_label(Self::scope_label_text(initial_db_type));
         scope_label.set_label_color(theme::text_primary());
-        scope_row.fixed(&scope_label, 72);
+        scope_label.hide();
+        scope_row.fixed(&scope_label, 0);
 
         let mut scope_choice = Choice::default();
         scope_choice.set_color(theme::input_bg());
@@ -297,6 +298,13 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub fn reset_selected_scope(&mut self) {
+        *self
+            .selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn set_scope_change_callback<F>(&mut self, callback: F)
@@ -1268,11 +1276,8 @@ impl ObjectBrowserWidget {
             .join(".")
     }
 
-    fn scope_label_text(db_type: crate::db::DatabaseType) -> &'static str {
-        match db_type.sql_dialect() {
-            crate::db::DbSqlDialect::Oracle => "Owner:",
-            crate::db::DbSqlDialect::MySql => "Database:",
-        }
+    fn scope_label_text(_db_type: crate::db::DatabaseType) -> &'static str {
+        ""
     }
 
     fn choice_index_for_value(choice: &Choice, value: &str) -> Option<i32> {

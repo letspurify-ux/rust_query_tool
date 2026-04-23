@@ -4070,6 +4070,7 @@ impl MainWindow {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
                         s.has_live_connection = true;
+                        s.object_browser.reset_selected_scope();
                         s.set_status_message(&format!("Connected | {}", info.name));
                         s.sql_editor.focus();
                         s.refresh_connection_dependent_controls();
@@ -5641,6 +5642,7 @@ impl MainWindow {
                                         Some(info.clone());
                                     s.has_live_connection = true;
                                     s.pending_connection_metadata_refresh = false;
+                                    s.object_browser.reset_selected_scope();
                                     s.status_bar.set_label(&format!(
                                         "Connected | {} ({})",
                                         info.name, info.db_type
