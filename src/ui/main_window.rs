@@ -1571,6 +1571,23 @@ impl MainWindow {
         Ok(guard.result_tabs.clone())
     }
 
+    fn prepare_result_export(
+        state: &Arc<Mutex<AppState>>,
+        callback: Box<dyn FnMut(String, usize)>,
+    ) -> Result<Option<(String, usize)>, String> {
+        let result_tabs = {
+            let guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.result_tabs.has_data() {
+                return Err("No results to export".to_string());
+            }
+            guard.result_tabs.clone()
+        };
+
+        Ok(result_tabs.export_to_csv_after_fetch_all(callback))
+    }
+
     fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
         let weak_state = Arc::downgrade(state);
         app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
@@ -4696,16 +4713,6 @@ impl MainWindow {
                 true
             }
             "Tools/Export Results" => {
-                let has_data = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .has_data();
-                if !has_data {
-                    fltk::dialog::alert_default("No results to export");
-                    return true;
-                }
-
                 let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
                 dialog.set_filter("CSV Files\t*.csv");
                 dialog.show();
@@ -4717,11 +4724,9 @@ impl MainWindow {
                 let sender = file_sender.clone();
                 let deferred_sender = sender.clone();
                 let deferred_filename = filename.clone();
-                let export = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .export_to_csv_after_fetch_all(Box::new(move |csv, row_count| {
+                let export = match MainWindow::prepare_result_export(
+                    &state,
+                    Box::new(move |csv, row_count| {
                         let sender = deferred_sender.clone();
                         let filename = deferred_filename.clone();
                         thread::spawn(move || {
@@ -4733,7 +4738,14 @@ impl MainWindow {
                             });
                             app::awake();
                         });
-                    }));
+                    }),
+                ) {
+                    Ok(export) => export,
+                    Err(message) => {
+                        fltk::dialog::alert_default(&message);
+                        return true;
+                    }
+                };
                 let Some((csv, row_count)) = export else {
                     return true;
                 };
@@ -5972,7 +5984,11 @@ impl Default for MainWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::configure_fltk_globals;
+    use crate::ui::result_table::LazyFetchCallback;
+    use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::{Key, Shortcut};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn resolve_window_shortcut_prefers_current_key_match() {
@@ -6406,5 +6422,59 @@ mod tests {
     fn next_spinner_frame_wraps_with_non_zero_frame_count() {
         assert_eq!(AppState::next_spinner_frame(0, 10), Some(1));
         assert_eq!(AppState::next_spinner_frame(9, 10), Some(0));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn prepare_result_export_releases_app_state_lock_before_lazy_fetch_request() {
+        let _app = fltk::app::App::default();
+        configure_fltk_globals(&AppConfig::default());
+        let window = MainWindow::new_with_config(AppConfig::default());
+        let state = window.state.clone();
+        let lock_visible = Arc::new(Mutex::new(None::<bool>));
+
+        {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.result_tabs.start_statement(0, "Result 1");
+            guard
+                .result_tabs
+                .start_streaming(0, &["A".to_string()], "NULL");
+            guard
+                .result_tabs
+                .append_rows(0, vec![vec!["1".to_string()]]);
+            guard.result_tabs.set_lazy_fetch_session(0, 77);
+
+            let weak_state = Arc::downgrade(&state);
+            let lock_visible_for_callback = lock_visible.clone();
+            let callback: LazyFetchCallback =
+                Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+                    *lock_visible_for_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                        session_id == 77
+                            && request == LazyFetchRequest::All
+                            && weak_state
+                                .upgrade()
+                                .is_some_and(|state| state.try_lock().is_ok()),
+                    );
+                }))));
+            guard.result_tabs.set_lazy_fetch_callback(callback);
+        }
+
+        let export = MainWindow::prepare_result_export(&state, Box::new(|_, _| {}))
+            .expect("prepare export should succeed");
+
+        assert!(export.is_none());
+        assert_eq!(
+            *lock_visible
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(true)
+        );
     }
 }
