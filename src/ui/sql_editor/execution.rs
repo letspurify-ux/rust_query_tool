@@ -799,6 +799,10 @@ impl SqlEditorWidget {
             .unwrap_or(false)
     }
 
+    // Fire-and-forget cancel request; the receiver is intentionally ignored so
+    // the worker can keep making forward progress while the UI processes the
+    // cancel on its own thread. Used on the Oracle acquire path where waiting
+    // synchronously would extend the connection-mutex holding window.
     fn notify_cancel_oldest_lazy_fetch_for_session_pool(
         sender: &mpsc::Sender<QueryProgress>,
     ) -> bool {
@@ -814,25 +818,25 @@ impl SqlEditorWidget {
         sent
     }
 
+    // Retry pool acquisition against a cloned pool handle. Taking the pool by
+    // reference (not the connection guard) means the retry loop does not depend
+    // on holding the connection mutex — callers can release the mutex across
+    // the cooperative sleep between attempts so UI threads, metadata
+    // refreshes, and lazy-fetch finalizers stay unblocked while we are only
+    // waiting for a pool slot to free up.
     fn retry_oracle_pool_session_after_lazy_cancel(
-        conn_guard: &crate::db::ConnectionLockGuard<'_>,
-    ) -> Result<Option<DbPoolSession>, String> {
-        let started_at = Instant::now();
-        loop {
-            match conn_guard.acquire_pool_session() {
-                Ok(session) => return Ok(session),
-                Err(message)
-                    if Self::session_pool_error_is_exhausted(&message)
-                        && started_at.elapsed() < SESSION_POOL_CANCEL_WAIT_TIMEOUT =>
-                {
-                    thread::sleep(SESSION_POOL_CANCEL_RETRY_INTERVAL);
-                }
-                Err(message) => return Err(message),
-            }
-        }
+        pool: &crate::db::DbConnectionPool,
+    ) -> Result<DbPoolSession, String> {
+        Self::retry_pool_session_after_lazy_cancel(pool)
     }
 
     fn retry_mysql_pool_session_after_lazy_cancel(
+        pool: &crate::db::DbConnectionPool,
+    ) -> Result<DbPoolSession, String> {
+        Self::retry_pool_session_after_lazy_cancel(pool)
+    }
+
+    fn retry_pool_session_after_lazy_cancel(
         pool: &crate::db::DbConnectionPool,
     ) -> Result<DbPoolSession, String> {
         let started_at = Instant::now();
@@ -922,20 +926,32 @@ impl SqlEditorWidget {
         }
     }
 
-    fn acquire_oracle_pooled_execution_connection(
-        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+    // Acquires the Oracle connection for the upcoming execution. The caller
+    // passes the connection guard by value so this function can release the
+    // connection mutex during the cooperative pool-retry sleep when the pool
+    // is exhausted. The guard (re-acquired before returning) is threaded back
+    // to the caller so follow-up operations can continue to use it.
+    fn acquire_oracle_pooled_execution_connection<'a>(
+        mut conn_guard: crate::db::ConnectionLockGuard<'a>,
+        shared_connection: &'a crate::db::SharedConnection,
+        db_activity: &str,
         sender: &mpsc::Sender<QueryProgress>,
         has_connect_command: bool,
         pooled_db_session: &SharedDbSessionLease,
-    ) -> Result<Option<Arc<Connection>>, String> {
+    ) -> (
+        crate::db::ConnectionLockGuard<'a>,
+        Result<Option<Arc<Connection>>, String>,
+    ) {
         if has_connect_command {
             crate::db::clear_pooled_session_lease(pooled_db_session);
-            return Self::acquire_execution_connection(conn_guard, sender, true);
+            let result = Self::acquire_execution_connection(&mut conn_guard, sender, true);
+            return (conn_guard, result);
         }
 
         if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
             crate::db::clear_pooled_session_lease(pooled_db_session);
-            return Self::acquire_execution_connection(conn_guard, sender, false);
+            let result = Self::acquire_execution_connection(&mut conn_guard, sender, false);
+            return (conn_guard, result);
         }
 
         let connection_generation = conn_guard.connection_generation();
@@ -949,9 +965,9 @@ impl SqlEditorWidget {
                         connection_generation,
                         &conn,
                     );
-                    return Err(message);
+                    return (conn_guard, Err(message));
                 }
-                return Ok(Some(conn));
+                return (conn_guard, Ok(Some(conn)));
             }
             crate::db::clear_oracle_pooled_session_lease_if_current_connection(
                 pooled_db_session,
@@ -966,26 +982,65 @@ impl SqlEditorWidget {
                 if Self::session_pool_error_is_exhausted(&message)
                     && Self::notify_cancel_oldest_lazy_fetch_for_session_pool(sender) =>
             {
-                Self::retry_oracle_pool_session_after_lazy_cancel(conn_guard)?
+                // Snapshot the pool so the retry does not depend on the
+                // connection mutex, then release it so other threads can run.
+                let Some(pool) = conn_guard.get_pool() else {
+                    return (
+                        conn_guard,
+                        Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+                    );
+                };
+                drop(conn_guard);
+                let retry_result = Self::retry_oracle_pool_session_after_lazy_cancel(&pool);
+                conn_guard =
+                    lock_connection_with_activity(shared_connection, db_activity.to_string());
+                match retry_result {
+                    Ok(session) => Some(session),
+                    Err(message) => return (conn_guard, Err(message)),
+                }
             }
-            Err(message) => return Err(message),
+            Err(message) => return (conn_guard, Err(message)),
         };
 
         match pool_session {
             Some(session @ DbPoolSession::Oracle(_)) => {
+                // While the mutex was released the user could have triggered
+                // a reconnect or disconnect; verify the generation is still
+                // current before keeping this session.
+                if !conn_guard
+                    .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
+                {
+                    drop(session);
+                    return (
+                        conn_guard,
+                        Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+                    );
+                }
                 let lease = session.into_lease();
-                let conn = lease
-                    .oracle_connection()
-                    .ok_or_else(|| "Expected Oracle pool session".to_string())?;
-                conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())?;
+                let conn = match lease.oracle_connection() {
+                    Some(conn) => conn,
+                    None => {
+                        return (
+                            conn_guard,
+                            Err("Expected Oracle pool session".to_string()),
+                        )
+                    }
+                };
+                if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())
+                {
+                    return (conn_guard, Err(message));
+                }
                 crate::db::store_pooled_session_lease_if_empty(
                     pooled_db_session,
                     connection_generation,
                     lease,
                 );
-                Ok(Some(conn))
+                (conn_guard, Ok(Some(conn)))
             }
-            _ => Self::acquire_execution_connection(conn_guard, sender, false),
+            _ => {
+                let result = Self::acquire_execution_connection(&mut conn_guard, sender, false);
+                (conn_guard, result)
+            }
         }
     }
 
@@ -3559,7 +3614,7 @@ impl SqlEditorWidget {
                 );
 
                 // Acquire connection lock inside thread and hold it during execution
-                let mut conn_guard =
+                let conn_guard =
                     lock_connection_with_activity(&shared_connection, db_activity.clone());
 
                 let mut conn_name = if conn_guard.is_connected() {
@@ -3620,12 +3675,17 @@ impl SqlEditorWidget {
                     crate::db::DbExecutionEngine::Oracle => {}
                 }
 
-                let mut conn_opt = match Self::acquire_oracle_pooled_execution_connection(
-                    &mut conn_guard,
-                    &sender,
-                    startup_policy.has_connect_command,
-                    &pooled_db_session,
-                ) {
+                let (guard_after_acquire, acquire_result) =
+                    Self::acquire_oracle_pooled_execution_connection(
+                        conn_guard,
+                        &shared_connection,
+                        &db_activity,
+                        &sender,
+                        startup_policy.has_connect_command,
+                        &pooled_db_session,
+                    );
+                let conn_guard = guard_after_acquire;
+                let mut conn_opt = match acquire_result {
                     Ok(conn) => conn,
                     Err(message) => {
                         SqlEditorWidget::emit_execution_startup_error(
