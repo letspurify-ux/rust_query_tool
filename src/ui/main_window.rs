@@ -4110,7 +4110,7 @@ impl MainWindow {
                     result_tabs.append_script_output_lines(&lines);
                 }
                 QueryProgress::PromptInput { .. } => {}
-                QueryProgress::CancelOldestLazyFetchForSessionPool { response } => {
+                QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
                     if s.release_idle_pooled_db_sessions() {
                         s.set_status_message("Session pool full; released idle pooled sessions");
                         s.refresh_result_edit_controls();
@@ -4126,6 +4126,18 @@ impl MainWindow {
                     } else {
                         drop(s);
                         let _ = response.send(false);
+                    }
+                }
+                QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
+                    if s.release_idle_pooled_db_sessions() {
+                        s.set_status_message("Session pool full; released idle pooled sessions");
+                        s.refresh_result_edit_controls();
+                    } else if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                        drop(s);
+                        let _ = request_lazy_fetch_cancel_for_session_pool(
+                            &state_for_progress,
+                            session_id,
+                        );
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {

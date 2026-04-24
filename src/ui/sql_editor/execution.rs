@@ -786,7 +786,7 @@ impl SqlEditorWidget {
     ) -> bool {
         let (response_sender, response_receiver) = mpsc::channel();
         if sender
-            .send(QueryProgress::CancelOldestLazyFetchForSessionPool {
+            .send(QueryProgress::RequestCancelOldestLazyFetchForSessionPool {
                 response: response_sender,
             })
             .is_err()
@@ -799,18 +799,14 @@ impl SqlEditorWidget {
             .unwrap_or(false)
     }
 
-    // Fire-and-forget cancel request; the receiver is intentionally ignored so
-    // the worker can keep making forward progress while the UI processes the
-    // cancel on its own thread. Used on the Oracle acquire path where waiting
-    // synchronously would extend the connection-mutex holding window.
+    // Fire-and-forget cancel notification; used on the Oracle acquire path
+    // where waiting synchronously would extend the connection-mutex holding
+    // window.
     fn notify_cancel_oldest_lazy_fetch_for_session_pool(
         sender: &mpsc::Sender<QueryProgress>,
     ) -> bool {
-        let (response_sender, _response_receiver) = mpsc::channel();
         let sent = sender
-            .send(QueryProgress::CancelOldestLazyFetchForSessionPool {
-                response: response_sender,
-            })
+            .send(QueryProgress::NotifyCancelOldestLazyFetchForSessionPool)
             .is_ok();
         if sent {
             app::awake();
@@ -10299,7 +10295,7 @@ mod query_execution_cleanup_tests {
             .expect("cancel-oldest notification should be queued");
         assert!(matches!(
             event,
-            QueryProgress::CancelOldestLazyFetchForSessionPool { .. }
+            QueryProgress::NotifyCancelOldestLazyFetchForSessionPool
         ));
     }
 
@@ -10963,8 +10959,11 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::PromptInput { prompt, .. } => {
                     format!("PromptInput({prompt})")
                 }
-                QueryProgress::CancelOldestLazyFetchForSessionPool { .. } => {
-                    "CancelOldestLazyFetchForSessionPool".to_string()
+                QueryProgress::RequestCancelOldestLazyFetchForSessionPool { .. } => {
+                    "RequestCancelOldestLazyFetchForSessionPool".to_string()
+                }
+                QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
+                    "NotifyCancelOldestLazyFetchForSessionPool".to_string()
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
                     format!("AutoCommitChanged({enabled})")
