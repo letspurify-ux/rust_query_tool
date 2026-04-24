@@ -111,8 +111,16 @@ impl SqlEditorWidget {
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
         let preferred_insert_position_for_handle = self.preferred_insert_position.clone();
+        let display_metrics_ready_for_handle = self.display_metrics_ready.clone();
 
         editor.handle(move |ed, ev| {
+            if Self::should_consume_pointer_event_until_display_metrics_ready(
+                display_metrics_ready_for_handle.load(Ordering::Acquire),
+                ev,
+            ) {
+                return true;
+            }
+
             match ev {
                 Event::DndEnter | Event::DndDrag => {
                     Self::set_dnd_drop_state(

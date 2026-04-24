@@ -438,6 +438,7 @@ impl AppState {
         self.active_editor_tab_id = tab_id;
         self.sql_editor = tab.sql_editor;
         self.sql_editor.sync_db_type_from_connection();
+        self.sql_editor.mark_display_metrics_pending();
         if stabilize_display {
             self.sql_editor.stabilize_display_metrics();
         }
@@ -3181,6 +3182,8 @@ impl MainWindow {
         group.end();
         if stabilize_display {
             editor.stabilize_display_metrics();
+        } else {
+            editor.mark_display_metrics_pending();
         }
         let inherited_intellisense = state.schema_intellisense_data.clone();
         *editor
@@ -3317,6 +3320,7 @@ impl MainWindow {
                     // by stale SqlEditorWidget/TextBuffer handles.
                     s.active_editor_tab_id = fallback_tab.tab_id;
                     s.sql_editor = fallback_tab.sql_editor;
+                    s.sql_editor.mark_display_metrics_pending();
                     s.sql_buffer = fallback_tab.sql_buffer;
                     *s.current_file
                         .lock()

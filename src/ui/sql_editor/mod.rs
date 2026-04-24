@@ -1,7 +1,7 @@
 use fltk::{
     app,
     draw::set_cursor,
-    enums::{Cursor, FrameType},
+    enums::{Cursor, Event, FrameType},
     frame::Frame,
     group::{Flex, FlexType},
     input::IntInput,
@@ -465,6 +465,7 @@ pub struct SqlEditorWidget {
     suppress_buffer_callbacks: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
+    display_metrics_ready: Arc<AtomicBool>,
 }
 impl SqlEditorWidget {
     fn shared_lazy_fetch_session_counter() -> Arc<AtomicU64> {
@@ -606,6 +607,17 @@ impl SqlEditorWidget {
         let (x, y, w, h) = (editor.x(), editor.y(), editor.w(), editor.h());
         editor.resize(x, y, w, h);
         editor.redraw();
+    }
+
+    fn should_consume_pointer_event_until_display_metrics_ready(
+        display_metrics_ready: bool,
+        ev: Event,
+    ) -> bool {
+        !display_metrics_ready
+            && matches!(
+                ev,
+                Event::Enter | Event::Move | Event::Push | Event::Drag | Event::Released
+            )
     }
 
     fn preferred_insert_position_for_external_insert(&self) -> i32 {
@@ -823,6 +835,7 @@ impl SqlEditorWidget {
         let suppress_buffer_callbacks = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
+        let display_metrics_ready = Arc::new(AtomicBool::new(true));
 
         let mut widget = Self {
             group,
@@ -860,6 +873,7 @@ impl SqlEditorWidget {
             suppress_buffer_callbacks,
             undo_redo_state,
             preferred_insert_position,
+            display_metrics_ready,
         };
 
         widget.setup_intellisense();
@@ -2204,9 +2218,19 @@ impl SqlEditorWidget {
     }
 
     pub fn stabilize_display_metrics(&mut self) {
+        self.mark_display_metrics_pending();
         Self::refresh_editor_display_metrics(&mut self.editor);
         app::redraw();
         app::flush();
+        self.mark_display_metrics_ready();
+    }
+
+    pub(crate) fn mark_display_metrics_pending(&self) {
+        self.display_metrics_ready.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn mark_display_metrics_ready(&self) {
+        self.display_metrics_ready.store(true, Ordering::Release);
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32, ui_size: i32) {
@@ -2343,6 +2367,7 @@ mod execution_state_tests {
         QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState, STYLE_DEFAULT,
     };
     use fltk::app;
+    use fltk::enums::Event;
     use fltk::text::TextBuffer;
     use std::ptr::NonNull;
     use std::sync::Arc;
@@ -2374,6 +2399,34 @@ mod execution_state_tests {
         let second = SqlEditorWidget::shared_lazy_fetch_session_counter();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn pending_display_metrics_consumes_pointer_hit_test_events_only() {
+        assert!(
+            SqlEditorWidget::should_consume_pointer_event_until_display_metrics_ready(
+                false,
+                Event::Push
+            )
+        );
+        assert!(
+            SqlEditorWidget::should_consume_pointer_event_until_display_metrics_ready(
+                false,
+                Event::Drag
+            )
+        );
+        assert!(
+            !SqlEditorWidget::should_consume_pointer_event_until_display_metrics_ready(
+                false,
+                Event::KeyDown
+            )
+        );
+        assert!(
+            !SqlEditorWidget::should_consume_pointer_event_until_display_metrics_ready(
+                true,
+                Event::Push
+            )
+        );
     }
 
     #[test]
