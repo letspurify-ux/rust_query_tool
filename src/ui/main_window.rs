@@ -7,7 +7,7 @@ use fltk::{
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
     input::IntInput,
-    menu::MenuBar,
+    menu::{Choice, MenuBar},
     prelude::*,
     text::TextBuffer,
     widget::Widget,
@@ -25,16 +25,17 @@ use std::time::{Duration, Instant};
 use crate::app_icon;
 use crate::db::{
     create_shared_connection, format_connection_busy_message, lock_connection_with_activity,
-    try_lock_connection_with_activity, ColumnInfo, ObjectBrowser, QueryResult, SharedConnection,
+    try_lock_connection_with_activity, ColumnInfo, DatabaseType, ObjectBrowser, QueryResult,
+    SharedConnection, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::ResultGridSqlExecuteCallback;
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
-    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QualifiedMemberKind,
-    QueryHistoryDialog, QueryProgress, QueryTabId, QueryTabsWidget, ResultTabRequest,
-    ResultTabStatus, ResultTabsWidget, SqlAction, SqlEditorWidget,
+    IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QualifiedMemberKind, QueryHistoryDialog,
+    QueryProgress, QueryTabId, QueryTabsWidget, ResultTabRequest, ResultTabStatus,
+    ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -300,6 +301,8 @@ pub struct AppState {
     explain_btn: Button,
     commit_btn: Button,
     rollback_btn: Button,
+    transaction_isolation_choice: Choice,
+    transaction_access_choice: Choice,
     pub result_tab_offset: usize,
     result_grid_execution_target: Option<usize>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
@@ -339,6 +342,67 @@ fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, 
             button.hide();
         }
         toolbar.fixed(button, 0);
+    }
+}
+
+fn transaction_isolation_choice_label(
+    isolation: TransactionIsolation,
+    default_isolation: TransactionIsolation,
+) -> String {
+    if isolation == TransactionIsolation::Default
+        && default_isolation != TransactionIsolation::Default
+    {
+        format!("Default ({})", default_isolation.label())
+    } else {
+        isolation.label().to_string()
+    }
+}
+
+fn transaction_isolation_choice_labels(
+    db_type: DatabaseType,
+    default_isolation: TransactionIsolation,
+) -> String {
+    db_type
+        .supported_transaction_isolations()
+        .iter()
+        .map(|isolation| transaction_isolation_choice_label(*isolation, default_isolation))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn transaction_isolation_from_choice_index(
+    db_type: DatabaseType,
+    index: i32,
+) -> TransactionIsolation {
+    db_type
+        .supported_transaction_isolations()
+        .get(index.max(0) as usize)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn transaction_isolation_choice_index(
+    db_type: DatabaseType,
+    isolation: TransactionIsolation,
+) -> i32 {
+    db_type
+        .supported_transaction_isolations()
+        .iter()
+        .position(|candidate| *candidate == isolation)
+        .unwrap_or(0) as i32
+}
+
+fn transaction_access_from_choice_index(index: i32) -> TransactionAccessMode {
+    match index {
+        1 => TransactionAccessMode::ReadOnly,
+        _ => TransactionAccessMode::ReadWrite,
+    }
+}
+
+fn transaction_access_choice_index(access_mode: TransactionAccessMode) -> i32 {
+    match access_mode {
+        TransactionAccessMode::ReadWrite => 0,
+        TransactionAccessMode::ReadOnly => 1,
     }
 }
 
@@ -959,6 +1023,93 @@ impl AppState {
             .set_label(&format_status(message, &conn_info));
     }
 
+    fn transaction_choice_labels(choice: &Choice) -> String {
+        (0..choice.size())
+            .filter_map(|index| choice.text(index))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn transaction_control_state(
+        &self,
+    ) -> Option<(DatabaseType, bool, TransactionMode, TransactionIsolation)> {
+        self.connection
+            .try_lock()
+            .map(|guard| {
+                (
+                    guard.db_type(),
+                    guard.is_connected(),
+                    guard.transaction_mode(),
+                    guard.default_transaction_isolation(),
+                )
+            })
+            .ok()
+    }
+
+    fn selected_transaction_mode_from_controls(&self, db_type: DatabaseType) -> TransactionMode {
+        TransactionMode::new(
+            transaction_isolation_from_choice_index(
+                db_type,
+                self.transaction_isolation_choice.value(),
+            ),
+            transaction_access_from_choice_index(self.transaction_access_choice.value()),
+        )
+    }
+
+    fn sync_transaction_mode_controls(&mut self) {
+        let Some((db_type, is_connected, mode, default_isolation)) =
+            self.transaction_control_state()
+        else {
+            if self.has_live_connection {
+                self.transaction_isolation_choice.activate();
+                self.transaction_access_choice.activate();
+            } else {
+                self.transaction_isolation_choice.deactivate();
+                self.transaction_access_choice.deactivate();
+            }
+            return;
+        };
+        let labels = transaction_isolation_choice_labels(db_type, default_isolation);
+        if Self::transaction_choice_labels(&self.transaction_isolation_choice) != labels {
+            self.transaction_isolation_choice.clear();
+            self.transaction_isolation_choice.add_choice(&labels);
+        }
+
+        self.transaction_isolation_choice
+            .set_value(transaction_isolation_choice_index(db_type, mode.isolation));
+        self.transaction_access_choice
+            .set_value(transaction_access_choice_index(mode.access_mode));
+
+        if is_connected {
+            self.transaction_isolation_choice.activate();
+            self.transaction_access_choice.activate();
+        } else {
+            self.transaction_isolation_choice.deactivate();
+            self.transaction_access_choice.deactivate();
+        }
+    }
+
+    fn sync_transaction_mode_controls_for_connected_db(&mut self, db_type: DatabaseType) {
+        let labels =
+            transaction_isolation_choice_labels(db_type, TransactionIsolation::ReadCommitted);
+        if Self::transaction_choice_labels(&self.transaction_isolation_choice) != labels {
+            self.transaction_isolation_choice.clear();
+            self.transaction_isolation_choice.add_choice(&labels);
+        }
+
+        self.transaction_isolation_choice
+            .set_value(transaction_isolation_choice_index(
+                db_type,
+                TransactionIsolation::Default,
+            ));
+        self.transaction_access_choice
+            .set_value(transaction_access_choice_index(
+                TransactionAccessMode::ReadWrite,
+            ));
+        self.transaction_isolation_choice.activate();
+        self.transaction_access_choice.activate();
+    }
+
     fn append_result_tab_request(&mut self, request: ResultTabRequest) {
         let mut result_tabs = self.result_tabs.clone();
         let tab_index = result_tabs.tab_count();
@@ -1207,6 +1358,7 @@ impl AppState {
                 }
             }
         }
+        self.sync_transaction_mode_controls();
     }
 }
 
@@ -1443,6 +1595,46 @@ fn execute_sql_request_with_session_pool_slot(
     } else {
         run_sql_execution_request(state, request);
     }
+}
+
+fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
+    let (connection, mode) = {
+        let s = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((db_type, _, _, _)) = s.transaction_control_state() else {
+            fltk::dialog::alert_default(&format_connection_busy_message());
+            return;
+        };
+        (
+            s.connection.clone(),
+            s.selected_transaction_mode_from_controls(db_type),
+        )
+    };
+
+    let (status, should_sync_controls) = if let Some(mut connection) =
+        try_lock_connection_with_activity(&connection, "Updating transaction mode")
+    {
+        match connection.set_transaction_mode(mode) {
+            Ok(()) => (format!("Transaction mode: {}", mode.label()), true),
+            Err(err) => {
+                fltk::dialog::alert_default(&err);
+                (format!("Transaction mode unchanged: {}", err), true)
+            }
+        }
+    } else {
+        let busy_message = format_connection_busy_message();
+        fltk::dialog::alert_default(&busy_message);
+        (busy_message, false)
+    };
+
+    let mut s = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if should_sync_controls {
+        s.sync_transaction_mode_controls();
+    }
+    s.set_status_message(&status);
 }
 
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
@@ -1991,6 +2183,25 @@ impl MainWindow {
         rollback_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&rollback_btn, BUTTON_WIDTH);
 
+        let mut transaction_isolation_choice = Choice::default().with_size(145, BUTTON_HEIGHT);
+        transaction_isolation_choice.add_choice(&transaction_isolation_choice_labels(
+            DatabaseType::Oracle,
+            TransactionIsolation::Default,
+        ));
+        transaction_isolation_choice.set_value(0);
+        transaction_isolation_choice.set_color(theme::input_bg());
+        transaction_isolation_choice.set_text_color(theme::text_primary());
+        transaction_isolation_choice.set_tooltip("Transaction isolation for new executions");
+        query_toolbar.fixed(&transaction_isolation_choice, 145);
+
+        let mut transaction_access_choice = Choice::default().with_size(105, BUTTON_HEIGHT);
+        transaction_access_choice.add_choice("Read write|Read only");
+        transaction_access_choice.set_value(0);
+        transaction_access_choice.set_color(theme::input_bg());
+        transaction_access_choice.set_text_color(theme::text_primary());
+        transaction_access_choice.set_tooltip("Transaction access mode for new executions");
+        query_toolbar.fixed(&transaction_access_choice, 105);
+
         let toolbar_spacer = Frame::default();
         query_toolbar.resizable(&toolbar_spacer);
 
@@ -2440,6 +2651,8 @@ impl MainWindow {
             explain_btn: explain_btn.clone(),
             commit_btn: commit_btn.clone(),
             rollback_btn: rollback_btn.clone(),
+            transaction_isolation_choice: transaction_isolation_choice.clone(),
+            transaction_access_choice: transaction_access_choice.clone(),
             result_tab_offset: 0,
             result_grid_execution_target: None,
             progress_contexts: HashMap::new(),
@@ -2572,6 +2785,20 @@ impl MainWindow {
                 if let Some(editor) = acquire_sql_editor_if_idle(&state_for_rollback) {
                     editor.rollback();
                 }
+            }
+        });
+
+        let weak_state_for_tx_isolation = Arc::downgrade(&state);
+        transaction_isolation_choice.set_callback(move |_| {
+            if let Some(state_for_tx_isolation) = weak_state_for_tx_isolation.upgrade() {
+                update_transaction_mode_from_controls(&state_for_tx_isolation);
+            }
+        });
+
+        let weak_state_for_tx_access = Arc::downgrade(&state);
+        transaction_access_choice.set_callback(move |_| {
+            if let Some(state_for_tx_access) = weak_state_for_tx_access.upgrade() {
+                update_transaction_mode_from_controls(&state_for_tx_access);
             }
         });
 
@@ -3477,8 +3704,8 @@ impl MainWindow {
                         .or(current_schema)
                         .or_else(|| owners.first().cloned());
 
-                    let schema_objects =
-                        ObjectBrowser::get_schema_objects_by_owner(conn.as_ref()).unwrap_or_default();
+                    let schema_objects = ObjectBrowser::get_schema_objects_by_owner(conn.as_ref())
+                        .unwrap_or_default();
                     let relation_members =
                         ObjectBrowser::get_schema_relation_members_by_owner(conn.as_ref())
                             .unwrap_or_default();
@@ -3548,8 +3775,10 @@ impl MainWindow {
                     let current_database = conn_guard.get_info().service_name.trim().to_string();
                     let mysql_conn = conn_guard.get_mysql_connection_mut()?;
                     let mut schemas =
-                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_schemas(mysql_conn)
-                            .unwrap_or_default();
+                        crate::db::query::mysql_executor::MysqlObjectBrowser::get_schemas(
+                            mysql_conn,
+                        )
+                        .unwrap_or_default();
                     if !current_database.is_empty()
                         && !schemas
                             .iter()
@@ -3563,7 +3792,9 @@ impl MainWindow {
                     let selected_schema = requested_scope
                         .clone()
                         .filter(|scope| !scope.trim().is_empty())
-                        .or_else(|| (!current_database.is_empty()).then_some(current_database.clone()))
+                        .or_else(|| {
+                            (!current_database.is_empty()).then_some(current_database.clone())
+                        })
                         .or_else(|| schemas.first().cloned());
 
                     let schema_objects =
@@ -3652,10 +3883,8 @@ impl MainWindow {
         let connection = state.connection.clone();
         let schema_refresh_guard = state.schema_refresh_in_progress.clone();
         thread::spawn(move || {
-            if let Some(update) = MainWindow::load_schema_update_for_current_connection(
-                &connection,
-                selected_scope,
-            )
+            if let Some(update) =
+                MainWindow::load_schema_update_for_current_connection(&connection, selected_scope)
             {
                 let _ = schema_sender.send(update);
                 app::awake();
@@ -3790,6 +4019,7 @@ impl MainWindow {
                         activity,
                     );
                     s.progress_contexts.insert(tab_id, context);
+                    s.sync_transaction_mode_controls();
                 }
                 QueryProgress::StatementStart { index } => {
                     let has_live_connection = s.has_live_connection;
@@ -4176,8 +4406,10 @@ impl MainWindow {
                         s.has_live_connection = true;
                         s.object_browser.reset_selected_scope();
                         s.set_status_message(&format!("Connected | {}", info.name));
+                        s.sync_transaction_mode_controls_for_connected_db(info.db_type);
                         s.sql_editor.focus();
                         s.refresh_connection_dependent_controls();
+                        s.sync_transaction_mode_controls();
                         if has_running_queries {
                             // CONNECT can appear mid-script. Deferring metadata fetch prevents
                             // object-browser/schema workers from competing with the active batch.
@@ -4295,6 +4527,7 @@ impl MainWindow {
                 QueryProgress::WorkerPanicked { message } => {
                     s.set_status_message(&message);
                     s.refresh_result_edit_controls();
+                    s.sync_transaction_mode_controls();
                 }
                 QueryProgress::MetadataRefreshNeeded => {
                     MainWindow::start_connection_metadata_refresh(
@@ -4330,6 +4563,7 @@ impl MainWindow {
                                 s.set_status_message(ResultTabStatus::Waiting.status_bar_message());
                             }
                             s.refresh_result_edit_controls();
+                            s.sync_transaction_mode_controls();
                             return;
                         }
                     }
@@ -4404,8 +4638,10 @@ impl MainWindow {
                             s.set_status_message(ResultTabStatus::Done.status_bar_message());
                         }
                         s.refresh_result_edit_controls();
+                        s.sync_transaction_mode_controls();
                     } else {
                         s.refresh_result_edit_controls();
+                        s.sync_transaction_mode_controls();
                     }
                 }
             }
@@ -5751,12 +5987,14 @@ impl MainWindow {
                                         "Connected | {} ({})",
                                         info.name, info.db_type
                                     ));
+                                    s.sync_transaction_mode_controls_for_connected_db(info.db_type);
+                                    s.sql_editor.focus();
+                                    s.refresh_connection_dependent_controls();
+                                    s.sync_transaction_mode_controls();
                                     MainWindow::start_connection_metadata_refresh(
                                         &mut s,
                                         &schema_sender,
                                     );
-                                    s.sql_editor.focus();
-                                    s.refresh_connection_dependent_controls();
                                 }
                                 ConnectionResult::Failure(err) => {
                                     let current_connection = s
@@ -6258,6 +6496,54 @@ mod tests {
         let normalized = MainWindow::normalize_line_endings_for_editor(text);
 
         assert_eq!(normalized, "select 1;\nselect 2;\nselect 3;");
+    }
+
+    #[test]
+    fn transaction_isolation_choices_follow_database_backend_capabilities() {
+        assert_eq!(
+            transaction_isolation_choice_labels(
+                DatabaseType::Oracle,
+                TransactionIsolation::Default
+            ),
+            "Default|Read committed|Serializable"
+        );
+        assert_eq!(
+            transaction_isolation_choice_labels(DatabaseType::MySQL, TransactionIsolation::Default),
+            "Default|Read uncommitted|Read committed|Repeatable read|Serializable"
+        );
+    }
+
+    #[test]
+    fn transaction_isolation_default_choice_shows_database_default_level() {
+        assert_eq!(
+            transaction_isolation_choice_labels(
+                DatabaseType::Oracle,
+                TransactionIsolation::ReadCommitted
+            ),
+            "Default (Read committed)|Read committed|Serializable"
+        );
+        assert_eq!(
+            transaction_isolation_choice_labels(
+                DatabaseType::MySQL,
+                TransactionIsolation::RepeatableRead
+            ),
+            "Default (Repeatable read)|Read uncommitted|Read committed|Repeatable read|Serializable"
+        );
+    }
+
+    #[test]
+    fn transaction_isolation_choice_index_defaults_when_backend_does_not_support_level() {
+        assert_eq!(
+            transaction_isolation_choice_index(
+                DatabaseType::Oracle,
+                TransactionIsolation::RepeatableRead
+            ),
+            0
+        );
+        assert_eq!(
+            transaction_isolation_from_choice_index(DatabaseType::MySQL, 3),
+            TransactionIsolation::RepeatableRead
+        );
     }
 
     #[test]

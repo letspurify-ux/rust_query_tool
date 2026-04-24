@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::db::session::SessionState;
+use crate::db::transaction::{TransactionAccessMode, TransactionIsolation, TransactionMode};
 use crate::utils::config::{
     DEFAULT_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE,
 };
@@ -76,6 +77,20 @@ impl DatabaseType {
 
     pub fn sql_dialect(self) -> DbSqlDialect {
         backend_for(self).sql_dialect()
+    }
+
+    pub fn supported_transaction_isolations(self) -> &'static [TransactionIsolation] {
+        backend_for(self).supported_transaction_isolations()
+    }
+
+    pub fn transaction_mode_requires_first_statement(self, mode: TransactionMode) -> bool {
+        backend_for(self).transaction_mode_requires_first_statement(mode)
+    }
+
+    fn fallback_default_transaction_isolation(self) -> TransactionIsolation {
+        match self {
+            DatabaseType::Oracle | DatabaseType::MySQL => TransactionIsolation::ReadCommitted,
+        }
     }
 
     pub fn uses_mysql_sql_dialect(self) -> bool {
@@ -233,6 +248,7 @@ pub struct DbPoolSessionContext {
     pub connection_info: ConnectionInfo,
     pub pool: DbConnectionPool,
     pub current_service_name: String,
+    pub transaction_mode: TransactionMode,
 }
 
 impl DbConnectionPool {
@@ -496,10 +512,44 @@ pub(crate) trait DbBackend: Sync {
     fn after_connect(&self, _connection: &mut DatabaseConnection) {}
     fn apply_auto_commit(&self, _connection: &mut DbConnection, _enabled: bool) {}
     fn apply_pool_session_defaults(&self, _session: &mut DbPoolSession) {}
+    fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
+        &DEFAULT_TRANSACTION_ISOLATIONS
+    }
+    fn transaction_mode_requires_first_statement(&self, _mode: TransactionMode) -> bool {
+        false
+    }
+    fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String> {
+        if self
+            .supported_transaction_isolations()
+            .contains(&mode.isolation)
+        {
+            Ok(Vec::new())
+        } else {
+            Err(format!(
+                "{} does not support {} transaction isolation",
+                self.display_name(),
+                mode.isolation.label()
+            ))
+        }
+    }
 }
 
 struct OracleBackend;
 struct MysqlBackend;
+
+const ORACLE_TRANSACTION_ISOLATIONS: [TransactionIsolation; 3] = [
+    TransactionIsolation::Default,
+    TransactionIsolation::ReadCommitted,
+    TransactionIsolation::Serializable,
+];
+const DEFAULT_TRANSACTION_ISOLATIONS: [TransactionIsolation; 1] = [TransactionIsolation::Default];
+const MYSQL_TRANSACTION_ISOLATIONS: [TransactionIsolation; 5] = [
+    TransactionIsolation::Default,
+    TransactionIsolation::ReadUncommitted,
+    TransactionIsolation::ReadCommitted,
+    TransactionIsolation::RepeatableRead,
+    TransactionIsolation::Serializable,
+];
 
 static ORACLE_BACKEND: OracleBackend = OracleBackend;
 static MYSQL_BACKEND: MysqlBackend = MysqlBackend;
@@ -601,6 +651,45 @@ impl DbBackend for OracleBackend {
         if let DbPoolSession::Oracle(conn) = session {
             DatabaseConnection::apply_oracle_default_session_settings(conn);
         }
+    }
+
+    fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
+        &ORACLE_TRANSACTION_ISOLATIONS
+    }
+
+    fn transaction_mode_requires_first_statement(&self, mode: TransactionMode) -> bool {
+        !mode.is_default()
+    }
+
+    fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String> {
+        if !self
+            .supported_transaction_isolations()
+            .contains(&mode.isolation)
+        {
+            return Err(format!(
+                "Oracle does not support {} transaction isolation",
+                mode.isolation.label()
+            ));
+        }
+
+        if mode.access_mode == TransactionAccessMode::ReadOnly {
+            if mode.isolation != TransactionIsolation::Default {
+                return Err(
+                    "Oracle does not support combining READ ONLY with an explicit transaction isolation level"
+                        .to_string(),
+                );
+            }
+            return Ok(vec![format!(
+                "SET TRANSACTION {}",
+                mode.access_mode.sql_clause()
+            )]);
+        }
+
+        if let Some(level) = mode.isolation.sql_level() {
+            return Ok(vec![format!("SET TRANSACTION ISOLATION LEVEL {level}")]);
+        }
+
+        Ok(Vec::new())
     }
 }
 
@@ -706,6 +795,33 @@ impl DbBackend for MysqlBackend {
             DatabaseConnection::apply_mysql_default_session_settings(conn);
         }
     }
+
+    fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
+        &MYSQL_TRANSACTION_ISOLATIONS
+    }
+
+    fn transaction_mode_statements(&self, mode: TransactionMode) -> Result<Vec<String>, String> {
+        if !self
+            .supported_transaction_isolations()
+            .contains(&mode.isolation)
+        {
+            return Err(format!(
+                "MySQL/MariaDB does not support {} transaction isolation",
+                mode.isolation.label()
+            ));
+        }
+
+        let mut characteristics = Vec::new();
+        if let Some(level) = mode.isolation.sql_level() {
+            characteristics.push(format!("ISOLATION LEVEL {level}"));
+        }
+        characteristics.push(mode.access_mode.sql_clause().to_string());
+
+        Ok(vec![format!(
+            "SET SESSION TRANSACTION {}",
+            characteristics.join(", ")
+        )])
+    }
 }
 
 pub struct DatabaseConnection {
@@ -716,6 +832,8 @@ pub struct DatabaseConnection {
     oracle_current_schema: Option<String>,
     connected: bool,
     auto_commit: bool,
+    transaction_mode: TransactionMode,
+    default_transaction_isolation: TransactionIsolation,
     session: Arc<Mutex<SessionState>>,
     last_disconnect_reason: Option<String>,
     connection_generation: u64,
@@ -813,6 +931,8 @@ impl DatabaseConnection {
             oracle_current_schema: None,
             connected: false,
             auto_commit: false,
+            transaction_mode: TransactionMode::default(),
+            default_transaction_isolation: TransactionIsolation::Default,
             session: Arc::new(Mutex::new(SessionState::default())),
             last_disconnect_reason: None,
             connection_generation: 0,
@@ -838,6 +958,8 @@ impl DatabaseConnection {
         self.session_password = new_session_password;
         self.info = info;
         self.oracle_current_schema = None;
+        self.sync_default_transaction_isolation(db_type);
+        self.transaction_mode = TransactionMode::default();
         backend_for(db_type).after_connect(self);
         self.connected = true;
         self.last_disconnect_reason = None;
@@ -856,6 +978,7 @@ impl DatabaseConnection {
         let statements = [
             "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'yyyy-mm-dd hh24:mi:ss.ff6'",
             "ALTER SESSION SET NLS_DATE_FORMAT = 'yyyy-mm-dd hh24:mi:ss'",
+            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
         ];
 
         for statement in statements {
@@ -884,6 +1007,7 @@ impl DatabaseConnection {
         let statements = [
             "SET SESSION sql_mode = 'TRADITIONAL'",
             "SET SESSION time_zone = '+00:00'",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
         ];
 
         for statement in statements {
@@ -991,6 +1115,23 @@ impl DatabaseConnection {
             .map(|value| value.unwrap_or_default().trim().to_string())
     }
 
+    fn read_oracle_default_transaction_isolation(
+        conn: &Connection,
+    ) -> Result<Option<TransactionIsolation>, String> {
+        let sql = "\
+            SELECT value \
+            FROM v$ses_optimizer_env \
+            WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
+              AND name = 'transaction_isolation_level'";
+        let mut stmt = conn.statement(sql).build().map_err(|err| err.to_string())?;
+        let row = stmt.query_row(&[]).map_err(|err| err.to_string())?;
+        let raw = row
+            .get::<_, Option<String>>(0)
+            .map_err(|err| err.to_string())?
+            .unwrap_or_default();
+        Ok(TransactionIsolation::from_sql_level(&raw))
+    }
+
     fn apply_oracle_current_schema(conn: &Connection, schema: Option<&str>) -> Result<(), String> {
         let Some(schema) = schema.and_then(Self::normalize_oracle_current_schema_name) else {
             return Ok(());
@@ -1029,6 +1170,8 @@ impl DatabaseConnection {
         ConnectionInfo::clear_secret(&mut self.session_password);
         self.oracle_current_schema = None;
         self.auto_commit = false;
+        self.transaction_mode = TransactionMode::default();
+        self.default_transaction_isolation = TransactionIsolation::Default;
         match self.session.lock() {
             Ok(mut guard) => guard.reset(),
             Err(poisoned) => poisoned.into_inner().reset(),
@@ -1156,6 +1299,7 @@ impl DatabaseConnection {
             connection_info,
             pool,
             current_service_name: self.info.service_name.clone(),
+            transaction_mode: self.transaction_mode,
         })
     }
 
@@ -1223,6 +1367,87 @@ impl DatabaseConnection {
 
     pub fn auto_commit(&self) -> bool {
         self.auto_commit
+    }
+
+    fn sync_default_transaction_isolation(&mut self, db_type: DatabaseType) {
+        self.default_transaction_isolation = self
+            .read_current_default_transaction_isolation(db_type)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| db_type.fallback_default_transaction_isolation());
+    }
+
+    fn read_current_default_transaction_isolation(
+        &mut self,
+        db_type: DatabaseType,
+    ) -> Result<Option<TransactionIsolation>, String> {
+        match (db_type, &mut self.connection) {
+            (DatabaseType::Oracle, Some(DbConnection::Oracle(conn))) => {
+                Self::read_oracle_default_transaction_isolation(conn.as_ref())
+            }
+            (DatabaseType::MySQL, Some(DbConnection::MySQL(conn))) => {
+                Self::read_mysql_default_transaction_isolation(conn)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn set_transaction_mode(&mut self, mode: TransactionMode) -> Result<(), String> {
+        backend_for(self.info.db_type).transaction_mode_statements(mode)?;
+        self.transaction_mode = mode;
+        Ok(())
+    }
+
+    pub fn transaction_mode(&self) -> TransactionMode {
+        self.transaction_mode
+    }
+
+    pub fn default_transaction_isolation(&self) -> TransactionIsolation {
+        self.default_transaction_isolation
+    }
+
+    pub fn transaction_mode_statements_for(
+        db_type: DatabaseType,
+        mode: TransactionMode,
+    ) -> Result<Vec<String>, String> {
+        backend_for(db_type).transaction_mode_statements(mode)
+    }
+
+    pub fn apply_oracle_transaction_mode(
+        conn: &Connection,
+        mode: TransactionMode,
+    ) -> Result<(), String> {
+        for statement in Self::transaction_mode_statements_for(DatabaseType::Oracle, mode)? {
+            conn.execute(&statement, &[])
+                .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_mysql_transaction_mode<C: Queryable>(
+        conn: &mut C,
+        mode: TransactionMode,
+    ) -> Result<(), String> {
+        for statement in Self::transaction_mode_statements_for(DatabaseType::MySQL, mode)? {
+            conn.query_drop(statement.as_str())
+                .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
+        }
+        Ok(())
+    }
+
+    fn read_mysql_default_transaction_isolation<C: Queryable>(
+        conn: &mut C,
+    ) -> Result<Option<TransactionIsolation>, String> {
+        let raw = match conn.query_first::<String, _>("SELECT @@transaction_isolation") {
+            Ok(value) => value,
+            Err(_) => conn
+                .query_first::<String, _>("SELECT @@tx_isolation")
+                .map_err(|err| err.to_string())?,
+        };
+
+        Ok(raw
+            .as_deref()
+            .and_then(TransactionIsolation::from_sql_level))
     }
 
     pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
@@ -1668,6 +1893,55 @@ pub fn try_lock_connection_with_activity(
 mod tests {
     use super::*;
 
+    fn oracle_test_connection_info_from_env() -> ConnectionInfo {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let service_name = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+
+        ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            &host,
+            port,
+            &service_name,
+            DatabaseType::Oracle,
+        )
+    }
+
+    fn mysql_test_connection_info_from_env() -> ConnectionInfo {
+        let host = std::env::var("SPACE_QUERY_TEST_MYSQL_HOST")
+            .expect("SPACE_QUERY_TEST_MYSQL_HOST must be set");
+        let database = std::env::var("SPACE_QUERY_TEST_MYSQL_DATABASE")
+            .expect("SPACE_QUERY_TEST_MYSQL_DATABASE must be set");
+        let user = std::env::var("SPACE_QUERY_TEST_MYSQL_USER")
+            .expect("SPACE_QUERY_TEST_MYSQL_USER must be set");
+        let password = std::env::var("SPACE_QUERY_TEST_MYSQL_PASSWORD")
+            .expect("SPACE_QUERY_TEST_MYSQL_PASSWORD must be set");
+        let port = std::env::var("SPACE_QUERY_TEST_MYSQL_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        ConnectionInfo::new_with_type(
+            "local",
+            &user,
+            &password,
+            &host,
+            port,
+            &database,
+            DatabaseType::MySQL,
+        )
+    }
+
     #[test]
     fn require_live_connection_returns_default_message_when_never_connected() {
         let mut conn = DatabaseConnection::new();
@@ -1678,15 +1952,20 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_resets_connection_metadata_and_auto_commit() {
+    fn disconnect_resets_connection_metadata_auto_commit_and_transaction_mode() {
         let mut conn = DatabaseConnection::new();
         conn.info = ConnectionInfo::new("Prod", "scott", "pw", "db", 1521, "FREE");
         conn.connected = true;
         conn.auto_commit = true;
+        conn.transaction_mode = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
         conn.disconnect();
 
         assert!(!conn.connected);
         assert!(!conn.auto_commit);
+        assert_eq!(conn.transaction_mode(), TransactionMode::default());
         assert!(conn.info.name.is_empty());
         assert!(conn.info.username.is_empty());
         assert_eq!(conn.info.host, "localhost");
@@ -1815,6 +2094,104 @@ mod tests {
         );
 
         assert_eq!(info.connection_string(), "LOCAL_FREE");
+    }
+
+    #[test]
+    fn oracle_transaction_mode_generates_first_statement_sql() {
+        let mode = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        );
+
+        assert_eq!(
+            DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
+                .expect("Oracle mode should be supported"),
+            vec!["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"]
+        );
+        assert!(DatabaseType::Oracle.transaction_mode_requires_first_statement(mode));
+    }
+
+    #[test]
+    fn oracle_transaction_mode_generates_read_only_sql() {
+        let mode = TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        assert_eq!(
+            DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
+                .expect("Oracle read-only mode should be supported"),
+            vec!["SET TRANSACTION READ ONLY"]
+        );
+        assert!(DatabaseType::Oracle.transaction_mode_requires_first_statement(mode));
+    }
+
+    #[test]
+    fn oracle_transaction_mode_rejects_read_only_with_explicit_isolation() {
+        let mode = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        let err = DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
+            .expect_err("Oracle cannot combine read-only and explicit isolation");
+        assert!(err.contains("READ ONLY"));
+        assert!(err.contains("isolation"));
+    }
+
+    #[test]
+    fn oracle_transaction_mode_rejects_unsupported_isolation() {
+        let mode = TransactionMode::new(
+            TransactionIsolation::RepeatableRead,
+            TransactionAccessMode::ReadWrite,
+        );
+
+        assert!(
+            DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mysql_transaction_mode_generates_session_sql() {
+        let mode = TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        assert_eq!(
+            DatabaseConnection::transaction_mode_statements_for(DatabaseType::MySQL, mode)
+                .expect("MySQL/MariaDB mode should be supported"),
+            vec!["SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"]
+        );
+    }
+
+    #[test]
+    fn mysql_default_transaction_mode_resets_access_mode_to_read_write() {
+        assert_eq!(
+            DatabaseConnection::transaction_mode_statements_for(
+                DatabaseType::MySQL,
+                TransactionMode::default()
+            )
+            .expect("MySQL/MariaDB default mode should be supported"),
+            vec!["SET SESSION TRANSACTION READ WRITE"]
+        );
+    }
+
+    #[test]
+    fn transaction_isolation_parses_database_reported_values() {
+        assert_eq!(
+            TransactionIsolation::from_sql_level("READ-COMMITTED"),
+            Some(TransactionIsolation::ReadCommitted)
+        );
+        assert_eq!(
+            TransactionIsolation::from_sql_level("read_commited"),
+            Some(TransactionIsolation::ReadCommitted)
+        );
+        assert_eq!(
+            TransactionIsolation::from_sql_level("REPEATABLE-READ"),
+            Some(TransactionIsolation::RepeatableRead)
+        );
     }
 
     #[test]
@@ -1991,6 +2368,229 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_connect_sets_read_committed_as_default_transaction_isolation() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(oracle_test_connection_info_from_env())
+            .expect("Direct localhost Oracle connection should succeed");
+
+        assert_eq!(
+            connection.default_transaction_isolation(),
+            TransactionIsolation::ReadCommitted
+        );
+        assert_eq!(connection.transaction_mode(), TransactionMode::default());
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_transaction_mode_applies_every_supported_isolation_from_local_xe() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(oracle_test_connection_info_from_env())
+            .expect("Direct localhost Oracle connection should succeed");
+        let conn = connection
+            .require_live_connection()
+            .expect("Oracle connection should be live");
+
+        for isolation in [
+            TransactionIsolation::ReadCommitted,
+            TransactionIsolation::Serializable,
+        ] {
+            DatabaseConnection::apply_oracle_transaction_mode(
+                conn.as_ref(),
+                TransactionMode::new(isolation, TransactionAccessMode::ReadWrite),
+            )
+            .unwrap_or_else(|err| panic!("Oracle should apply {}: {err}", isolation.label()));
+
+            let observed =
+                DatabaseConnection::read_oracle_default_transaction_isolation(conn.as_ref())
+                    .expect("read Oracle current transaction isolation")
+                    .expect("Oracle should report a transaction isolation");
+            assert_eq!(observed, isolation);
+            let _ = conn.rollback();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_transaction_mode_serializable_applies_from_local_xe() {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let service_name = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "local",
+                &username,
+                &password,
+                &host,
+                port,
+                &service_name,
+                DatabaseType::Oracle,
+            ))
+            .expect("Direct localhost Oracle connection should succeed");
+        let conn = connection
+            .require_live_connection()
+            .expect("Oracle connection should be live");
+
+        DatabaseConnection::apply_oracle_transaction_mode(
+            conn.as_ref(),
+            TransactionMode::new(
+                TransactionIsolation::Serializable,
+                TransactionAccessMode::ReadWrite,
+            ),
+        )
+        .expect("Oracle serializable transaction mode should apply");
+
+        let mut stmt = conn
+            .statement("SELECT 1 FROM dual")
+            .build()
+            .expect("build serializable probe statement");
+        let value = stmt
+            .query_row_as::<i64>(&[])
+            .expect("serializable transaction should allow SELECT");
+        assert_eq!(value, 1);
+        let _ = conn.rollback();
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_transaction_mode_read_only_blocks_dml_from_local_xe() {
+        let username =
+            std::env::var("ORACLE_TEST_USERNAME").expect("ORACLE_TEST_USERNAME must be set");
+        let password =
+            std::env::var("ORACLE_TEST_PASSWORD").expect("ORACLE_TEST_PASSWORD must be set");
+        let service_name = std::env::var("ORACLE_TEST_SERVICE_NAME")
+            .expect("ORACLE_TEST_SERVICE_NAME must be set");
+        let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+
+        let info = ConnectionInfo::new_with_type(
+            "local",
+            &username,
+            &password,
+            &host,
+            port,
+            &service_name,
+            DatabaseType::Oracle,
+        );
+
+        {
+            let mut setup = DatabaseConnection::new();
+            setup
+                .connect(info.clone())
+                .expect("Direct localhost Oracle connection should succeed");
+            let conn = setup
+                .require_live_connection()
+                .expect("Oracle setup connection should be live");
+            let _ = conn.execute("DROP TABLE qt_tx_mode_probe PURGE", &[]);
+            conn.execute("CREATE TABLE qt_tx_mode_probe (id NUMBER)", &[])
+                .expect("create transaction mode probe table");
+            conn.commit().expect("commit probe table DDL");
+        }
+
+        {
+            let mut connection = DatabaseConnection::new();
+            connection
+                .connect(info.clone())
+                .expect("Direct localhost Oracle connection should succeed");
+            let conn = connection
+                .require_live_connection()
+                .expect("Oracle connection should be live");
+
+            DatabaseConnection::apply_oracle_transaction_mode(
+                conn.as_ref(),
+                TransactionMode::new(
+                    TransactionIsolation::Default,
+                    TransactionAccessMode::ReadOnly,
+                ),
+            )
+            .expect("Oracle transaction mode should apply");
+
+            let mut stmt = conn
+                .statement("SELECT 1 FROM dual")
+                .build()
+                .expect("build read probe statement");
+            let value = stmt
+                .query_row_as::<i64>(&[])
+                .expect("read-only transaction should allow SELECT");
+            assert_eq!(value, 1);
+            drop(stmt);
+
+            let insert_err = conn
+                .execute("INSERT INTO qt_tx_mode_probe (id) VALUES (1)", &[])
+                .expect_err("read-only transaction should reject DML");
+            let insert_message = insert_err.to_string();
+            assert!(
+                insert_message.contains("ORA-01456")
+                    || insert_message.to_ascii_lowercase().contains("read only"),
+                "unexpected Oracle read-only DML error: {insert_message}"
+            );
+            let _ = conn.rollback();
+        }
+
+        {
+            let mut cleanup = DatabaseConnection::new();
+            cleanup
+                .connect(info)
+                .expect("Direct localhost Oracle connection should succeed for cleanup");
+            if let Ok(conn) = cleanup.require_live_connection() {
+                let _ = conn.execute("DROP TABLE qt_tx_mode_probe PURGE", &[]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_read_only_transaction_can_be_reapplied_after_rollback_from_local_xe() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(oracle_test_connection_info_from_env())
+            .expect("Direct localhost Oracle connection should succeed");
+        let conn = connection
+            .require_live_connection()
+            .expect("Oracle connection should be live");
+        let read_only_mode = TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        for attempt in 1..=2 {
+            DatabaseConnection::apply_oracle_transaction_mode(conn.as_ref(), read_only_mode)
+                .unwrap_or_else(|err| {
+                    panic!("Oracle read-only mode should apply on attempt {attempt}: {err}")
+                });
+
+            let mut stmt = conn
+                .statement("SELECT 1 FROM dual")
+                .build()
+                .unwrap_or_else(|err| panic!("build read-only probe on attempt {attempt}: {err}"));
+            let value = stmt
+                .query_row_as::<i64>(&[])
+                .unwrap_or_else(|err| panic!("run read-only probe on attempt {attempt}: {err}"));
+            assert_eq!(value, 1);
+            drop(stmt);
+
+            conn.rollback().unwrap_or_else(|err| {
+                panic!("close read-only transaction on attempt {attempt}: {err}")
+            });
+        }
+    }
+
+    #[test]
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_pool_session_applies_default_session_settings_from_local_mariadb() {
         let host = std::env::var("SPACE_QUERY_TEST_MYSQL_HOST")
@@ -2037,10 +2637,101 @@ mod tests {
             .query_first::<String, _>("SELECT @@SESSION.character_set_client")
             .expect("read character_set_client")
             .unwrap_or_default();
+        let isolation = DatabaseConnection::read_mysql_default_transaction_isolation(&mut conn)
+            .expect("read transaction isolation")
+            .expect("transaction isolation should be available");
 
         assert!(sql_mode.contains("STRICT_TRANS_TABLES"));
         assert_eq!(time_zone, "+00:00");
         assert_eq!(character_set_client, "utf8mb4");
+        assert_eq!(isolation, TransactionIsolation::ReadCommitted);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_connect_sets_read_committed_as_default_transaction_isolation() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(mysql_test_connection_info_from_env())
+            .expect("MySQL/MariaDB connection should succeed");
+
+        assert_eq!(
+            connection.default_transaction_isolation(),
+            TransactionIsolation::ReadCommitted
+        );
+        assert_eq!(connection.transaction_mode(), TransactionMode::default());
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_transaction_mode_applies_every_supported_isolation() {
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(mysql_test_connection_info_from_env())
+            .expect("MySQL/MariaDB connection should succeed");
+        let conn = connection
+            .get_mysql_connection_mut()
+            .expect("MySQL connection should be live");
+
+        for isolation in [
+            TransactionIsolation::ReadUncommitted,
+            TransactionIsolation::ReadCommitted,
+            TransactionIsolation::RepeatableRead,
+            TransactionIsolation::Serializable,
+        ] {
+            DatabaseConnection::apply_mysql_transaction_mode(
+                conn,
+                TransactionMode::new(isolation, TransactionAccessMode::ReadWrite),
+            )
+            .unwrap_or_else(|err| {
+                panic!("MySQL/MariaDB should apply {}: {err}", isolation.label())
+            });
+
+            let observed = DatabaseConnection::read_mysql_default_transaction_isolation(conn)
+                .expect("read MySQL/MariaDB transaction isolation")
+                .expect("MySQL/MariaDB should report a transaction isolation");
+            assert_eq!(observed, isolation);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_read_only_transaction_mode_blocks_dml() {
+        let mut connection = DatabaseConnection::new();
+        connection.set_auto_commit(true);
+        connection
+            .connect(mysql_test_connection_info_from_env())
+            .expect("MySQL/MariaDB connection should succeed");
+        let conn = connection
+            .get_mysql_connection_mut()
+            .expect("MySQL connection should be live");
+
+        let _ = conn.query_drop("DROP TABLE IF EXISTS qt_tx_mode_probe_mysql");
+        conn.query_drop("CREATE TABLE qt_tx_mode_probe_mysql (id INT)")
+            .expect("create transaction mode probe table");
+
+        DatabaseConnection::apply_mysql_transaction_mode(
+            conn,
+            TransactionMode::new(
+                TransactionIsolation::ReadCommitted,
+                TransactionAccessMode::ReadOnly,
+            ),
+        )
+        .expect("MySQL/MariaDB read-only mode should apply");
+
+        let insert_err = conn
+            .query_drop("INSERT INTO qt_tx_mode_probe_mysql (id) VALUES (1)")
+            .expect_err("read-only transaction should reject DML");
+        let insert_message = insert_err.to_string();
+        assert!(
+            insert_message.to_ascii_lowercase().contains("read only")
+                || insert_message.contains("1792"),
+            "unexpected MySQL/MariaDB read-only DML error: {insert_message}"
+        );
+
+        let _ = conn.query_drop("ROLLBACK");
+        let _ = conn.query_drop("SET SESSION TRANSACTION READ WRITE");
+        let _ = conn.query_drop("DROP TABLE IF EXISTS qt_tx_mode_probe_mysql");
     }
 
     #[test]

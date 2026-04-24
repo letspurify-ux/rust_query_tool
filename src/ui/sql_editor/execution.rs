@@ -98,6 +98,7 @@ struct QueryExecutionCleanupGuard {
     previous_timeout: Option<Duration>,
     oracle_pooled_session: Option<(SharedDbSessionLease, u64, Arc<Connection>)>,
     oracle_pooled_session_invalidated: bool,
+    oracle_read_only_transaction: Option<Arc<Connection>>,
 }
 
 impl QueryExecutionCleanupGuard {
@@ -118,6 +119,7 @@ impl QueryExecutionCleanupGuard {
             previous_timeout: None,
             oracle_pooled_session: None,
             oracle_pooled_session_invalidated: false,
+            oracle_read_only_transaction: None,
         }
     }
 
@@ -148,10 +150,27 @@ impl QueryExecutionCleanupGuard {
         self.timeout_connection = None;
         self.previous_timeout = None;
     }
+
+    fn track_oracle_read_only_transaction(&mut self, connection: Arc<Connection>) {
+        self.oracle_read_only_transaction = Some(connection);
+    }
+
+    fn clear_oracle_read_only_transaction_tracking(&mut self) {
+        self.oracle_read_only_transaction = None;
+    }
 }
 
 impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
+        if let Some(conn) = self.oracle_read_only_transaction.as_ref() {
+            if let Err(err) = conn.rollback() {
+                crate::utils::logging::log_error(
+                    "sql_editor::cleanup",
+                    &format!("Failed to close Oracle read-only transaction: {err}"),
+                );
+            }
+        }
+
         // Restore per-session driver state before the editor is marked idle.
         // Otherwise a fast follow-up execution can reuse the same pooled Oracle
         // session while this guard is still resetting its call timeout.
@@ -955,7 +974,8 @@ impl SqlEditorWidget {
             crate::db::current_oracle_pooled_session_lease(pooled_db_session, connection_generation)
         {
             if conn.ping().is_ok() {
-                if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()) {
+                if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())
+                {
                     crate::db::clear_oracle_pooled_session_lease_if_current_connection(
                         pooled_db_session,
                         connection_generation,
@@ -1015,12 +1035,7 @@ impl SqlEditorWidget {
                 let lease = session.into_lease();
                 let conn = match lease.oracle_connection() {
                     Some(conn) => conn,
-                    None => {
-                        return (
-                            conn_guard,
-                            Err("Expected Oracle pool session".to_string()),
-                        )
-                    }
+                    None => return (conn_guard, Err("Expected Oracle pool session".to_string())),
                 };
                 if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())
                 {
@@ -1317,6 +1332,7 @@ impl SqlEditorWidget {
         session_id: u64,
         query_timeout: Option<Duration>,
         previous_timeout: Option<Duration>,
+        close_read_only_transaction: bool,
     ) -> Result<(), OracleError> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         Self::register_lazy_fetch_handle(
@@ -1615,8 +1631,23 @@ impl SqlEditorWidget {
                             false
                         }
                     };
+                    let read_only_close_ok = if close_read_only_transaction {
+                        match conn.rollback() {
+                            Ok(()) => true,
+                            Err(err) => {
+                                crate::utils::logging::log_error(
+                                    "oracle lazy fetch cleanup",
+                                    &format!("Failed to close Oracle read-only transaction: {err}"),
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
                     let should_keep_session = keep_session
                         && timeout_reset_ok
+                        && read_only_close_ok
                         && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
                     if !should_keep_session {
                         crate::db::clear_oracle_pooled_session_lease_if_current_connection(
@@ -2222,7 +2253,10 @@ impl SqlEditorWidget {
                     }
                     fired_for_thread.store(true, Ordering::SeqCst);
                     if !finished_for_thread.load(Ordering::SeqCst) {
-                        SqlEditorWidget::cancel_mysql_lazy_fetch_query(&cancel_context, log_context);
+                        SqlEditorWidget::cancel_mysql_lazy_fetch_query(
+                            &cancel_context,
+                            log_context,
+                        );
                     }
                 }
             }) {
@@ -3621,6 +3655,7 @@ impl SqlEditorWidget {
 
                 let db_type = conn_guard.db_type();
                 let auto_commit = conn_guard.auto_commit();
+                let selected_transaction_mode = conn_guard.transaction_mode();
                 let session = conn_guard.session_state();
 
                 match db_type.execution_engine() {
@@ -3759,8 +3794,15 @@ impl SqlEditorWidget {
                     );
                 }
 
-                let requires_transaction_first_statement =
+                let explicit_transaction_first_statement =
                     SqlEditorWidget::requires_transaction_first_statement(&items);
+                let transaction_mode = if explicit_transaction_first_statement {
+                    crate::db::TransactionMode::default()
+                } else {
+                    selected_transaction_mode
+                };
+                let requires_transaction_first_statement = explicit_transaction_first_statement
+                    || db_type.transaction_mode_requires_first_statement(transaction_mode);
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
@@ -3774,6 +3816,23 @@ impl SqlEditorWidget {
                             Some(&session),
                         );
                         return;
+                    }
+                    if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
+                        conn.as_ref(),
+                        transaction_mode,
+                    ) {
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &err,
+                            Some(&session),
+                        );
+                        return;
+                    }
+                    if transaction_mode.access_mode == crate::db::TransactionAccessMode::ReadOnly {
+                        cleanup.track_oracle_read_only_transaction(Arc::clone(conn));
                     }
                     if !requires_transaction_first_statement {
                         if let Err(err) =
@@ -5640,6 +5699,7 @@ impl SqlEditorWidget {
                                         )) => {
                                             crate::db::clear_pooled_session_lease(&pooled_db_session);
                                             cleanup.clear_oracle_pooled_session_tracking();
+                                            cleanup.clear_oracle_read_only_transaction_tracking();
                                             conn_opt = next_conn_opt;
                                             conn_name = next_conn_name;
                                             // Update cancel connection so break_execution() uses the new connection
@@ -5685,15 +5745,43 @@ impl SqlEditorWidget {
                                                     );
                                                     command_error = true;
                                                 }
-                                                if let Err(err) =
-                                                    SqlEditorWidget::sync_serveroutput_with_session(
-                                                        conn.as_ref(),
-                                                        &session,
-                                                    )
-                                                {
-                                                    eprintln!(
-                                                        "Failed to apply SERVEROUTPUT after CONNECT: {err}"
-                                                    );
+                                                match crate::db::DatabaseConnection::apply_oracle_transaction_mode(
+                                                    conn.as_ref(),
+                                                    transaction_mode,
+                                                ) {
+                                                    Ok(()) => {
+                                                        if transaction_mode.access_mode
+                                                            == crate::db::TransactionAccessMode::ReadOnly
+                                                        {
+                                                            cleanup.track_oracle_read_only_transaction(
+                                                                Arc::clone(conn),
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        SqlEditorWidget::emit_script_message(
+                                                            &sender,
+                                                            &session,
+                                                            "CONNECT",
+                                                            &format!(
+                                                                "Error: Failed to apply transaction mode after CONNECT: {}",
+                                                                err
+                                                            ),
+                                                        );
+                                                        command_error = true;
+                                                    }
+                                                }
+                                                if !requires_transaction_first_statement {
+                                                    if let Err(err) =
+                                                        SqlEditorWidget::sync_serveroutput_with_session(
+                                                            conn.as_ref(),
+                                                            &session,
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "Failed to apply SERVEROUTPUT after CONNECT: {err}"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             let _ = sender.send(QueryProgress::ConnectionChanged {
@@ -6082,6 +6170,31 @@ impl SqlEditorWidget {
 
                             let cleaned = SqlEditorWidget::strip_leading_comments(&sql_text);
                             let upper = cleaned.to_uppercase();
+
+                            if transaction_mode.access_mode
+                                == crate::db::TransactionAccessMode::ReadOnly
+                                && !SqlEditorWidget::oracle_read_only_allows_statement(&sql_text)
+                            {
+                                let message = SqlEditorWidget::oracle_read_only_block_message();
+                                let emitted = SqlEditorWidget::emit_non_select_result(
+                                    &sender,
+                                    &session,
+                                    &conn_name,
+                                    result_index,
+                                    &sql_text,
+                                    message,
+                                    false,
+                                    false,
+                                    script_mode,
+                                );
+                                if emitted {
+                                    result_index += 1;
+                                }
+                                if !continue_on_error {
+                                    stop_execution = true;
+                                }
+                                continue;
+                            }
 
                             if QueryExecutor::is_plain_commit(&sql_text) {
                                 let mut timed_out = false;
@@ -7131,12 +7244,15 @@ impl SqlEditorWidget {
                                         session_id,
                                         query_timeout,
                                         previous_timeout,
+                                        transaction_mode.access_mode
+                                            == crate::db::TransactionAccessMode::ReadOnly,
                                     ) {
                                         Ok(()) => {
                                             // The lazy worker now owns this pooled connection and
                                             // restores its timeout when the cursor closes.
                                             cleanup.clear_timeout_tracking();
                                             cleanup.clear_oracle_pooled_session_tracking();
+                                            cleanup.clear_oracle_read_only_transaction_tracking();
                                             result_index += 1;
                                             continue;
                                         }
@@ -9138,6 +9254,23 @@ impl SqlEditorWidget {
             )
     }
 
+    fn oracle_read_only_allows_statement(statement: &str) -> bool {
+        let stripped = QueryExecutor::strip_leading_comments(statement);
+        let trimmed = stripped.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        QueryExecutor::is_select_statement(trimmed)
+            || QueryExecutor::is_plain_commit(trimmed)
+            || QueryExecutor::is_plain_rollback(trimmed)
+            || Self::is_transaction_first_statement(trimmed)
+    }
+
+    fn oracle_read_only_block_message() -> String {
+        "Error: Oracle read-only mode blocks non-query statements. Switch to Read write to run this statement.".to_string()
+    }
+
     fn sync_serveroutput_with_session(
         conn: &Connection,
         session: &Arc<Mutex<SessionState>>,
@@ -9556,6 +9689,10 @@ impl SqlEditorWidget {
             "SET autocommit=0"
         })
         .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+        crate::db::DatabaseConnection::apply_mysql_transaction_mode(
+            &mut conn,
+            context.transaction_mode,
+        )?;
         Ok((context.connection_generation, context.connection_info, conn))
     }
 
@@ -9663,7 +9800,8 @@ impl SqlEditorWidget {
     ) -> bool {
         let mut conn_guard =
             lock_connection_with_activity(shared_connection, db_activity.to_string());
-        if !conn_guard.can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
+        if !conn_guard
+            .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
         {
             return false;
         }
@@ -10226,6 +10364,42 @@ mod query_execution_cleanup_tests {
         ];
 
         assert!(!SqlEditorWidget::should_use_lazy_fetch_for_single_statement(&items));
+    }
+
+    #[test]
+    fn oracle_read_only_statement_guard_allows_queries_and_transaction_control() {
+        for sql in [
+            "select * from dual",
+            "with q as (select 1 id from dual) select * from q",
+            "commit",
+            "rollback",
+            "set transaction read only",
+            "alter session set isolation_level = read committed",
+        ] {
+            assert!(
+                SqlEditorWidget::oracle_read_only_allows_statement(sql),
+                "expected Oracle read-only mode to allow: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_read_only_statement_guard_blocks_writes_and_plsql() {
+        for sql in [
+            "insert into t values (1)",
+            "update t set id = 2",
+            "delete from t",
+            "merge into t using dual on (1 = 1) when matched then update set id = 1",
+            "create table t (id number)",
+            "truncate table t",
+            "begin insert into t values (1); end;",
+            "call p_write_data()",
+        ] {
+            assert!(
+                !SqlEditorWidget::oracle_read_only_allows_statement(sql),
+                "expected Oracle read-only mode to block: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -10914,7 +11088,8 @@ mod mysql_batch_execution_regression_tests {
     };
     use crate::db::{
         connection::{ConnectionInfo, DatabaseType},
-        DatabaseConnection, SessionState,
+        DatabaseConnection, SessionState, TransactionAccessMode, TransactionIsolation,
+        TransactionMode,
     };
     use std::env;
     use std::sync::atomic::AtomicU64;
@@ -10923,6 +11098,45 @@ mod mysql_batch_execution_regression_tests {
 
     fn mysql_test_env(name: &str) -> Option<String> {
         env::var(name).ok().filter(|value| !value.trim().is_empty())
+    }
+
+    fn mysql_test_connection_with_mode(mode: TransactionMode) -> Option<DatabaseConnection> {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return None;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return None;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return None;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return None;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL/MariaDB test connection should succeed");
+        connection
+            .set_transaction_mode(mode)
+            .expect("transaction mode should be supported by MySQL/MariaDB");
+        Some(connection)
     }
 
     fn summarize_progress(progress: &[QueryProgress]) -> String {
@@ -11207,6 +11421,93 @@ mod mysql_batch_execution_regression_tests {
                     _ => false,
                 }),
             "batch execution should reach a PASS status row\n{progress_summary}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_execution_applies_transaction_mode_selection() {
+        let Some(connection) = mysql_test_connection_with_mode(TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadOnly,
+        )) else {
+            return;
+        };
+
+        let shared_connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::MySQL,
+            ..SessionState::default()
+        }));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::execute_mysql_batch(
+            &shared_connection,
+            &sender,
+            "SHOW VARIABLES WHERE Variable_name IN ('transaction_isolation', 'tx_isolation', 'transaction_read_only', 'tx_read_only'); SELECT 1 AS done",
+            "MYSQL_TEST",
+            &session,
+            &pooled_db_session,
+            &active_lazy_fetch,
+            &next_lazy_fetch_session_id,
+            &current_mysql_cancel_context,
+            &cancel_flag,
+            true,
+            None,
+            None,
+            true,
+            "mysql transaction mode integration",
+        );
+        drop(sender);
+
+        let progress = receiver.try_iter().collect::<Vec<_>>();
+        let progress_summary = summarize_progress(&progress);
+        let rows = progress
+            .iter()
+            .find_map(|message| match message {
+                QueryProgress::Rows { index: 0, rows } => Some(rows.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut isolation = None;
+        let mut read_only = None;
+        for row in rows {
+            let Some(name) = row.first().map(|value| value.to_ascii_lowercase()) else {
+                continue;
+            };
+            let Some(value) = row.get(1) else {
+                continue;
+            };
+            match name.as_str() {
+                "transaction_isolation" | "tx_isolation" => {
+                    isolation = Some(
+                        value
+                            .replace('-', " ")
+                            .replace('_', " ")
+                            .to_ascii_uppercase(),
+                    );
+                }
+                "transaction_read_only" | "tx_read_only" => {
+                    read_only = Some(value.to_ascii_uppercase());
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            isolation.as_deref(),
+            Some("READ COMMITTED"),
+            "transaction isolation should be applied to pooled session\n{progress_summary}"
+        );
+        assert!(
+            matches!(read_only.as_deref(), Some("ON" | "1")),
+            "transaction read-only mode should be applied to pooled session, got {read_only:?}\n{progress_summary}"
         );
     }
 

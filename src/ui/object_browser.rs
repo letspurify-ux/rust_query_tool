@@ -1296,9 +1296,7 @@ impl ObjectBrowserWidget {
             && current_options
                 .iter()
                 .zip(desired_options.iter())
-                .all(|(current, desired)| {
-                    current.trim().eq_ignore_ascii_case(desired.trim())
-                })
+                .all(|(current, desired)| current.trim().eq_ignore_ascii_case(desired.trim()))
     }
 
     fn sync_scope_choice_widget(
@@ -3712,9 +3710,7 @@ mod tests {
         let current = vec![" SCOTT ".to_string(), "Hr".to_string()];
         let desired = vec!["scott".to_string(), "HR".to_string()];
 
-        assert!(ObjectBrowserWidget::scope_options_match(
-            &current, &desired
-        ));
+        assert!(ObjectBrowserWidget::scope_options_match(&current, &desired));
     }
 
     #[test]
