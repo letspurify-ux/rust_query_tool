@@ -633,6 +633,10 @@ impl NameEntry {
 pub enum QualifiedMemberKind {
     Table,
     View,
+    MaterializedView,
+    Type,
+    Trigger,
+    Index,
     Procedure,
     Function,
     Package,
@@ -646,10 +650,14 @@ impl QualifiedMemberKind {
     pub fn from_object_type_name(object_type: &str) -> Option<Self> {
         match object_type.trim().to_ascii_uppercase().as_str() {
             "TABLE" | "BASE TABLE" => Some(Self::Table),
-            "VIEW" => Some(Self::View),
+            "VIEW" | "EDITIONING VIEW" => Some(Self::View),
+            "MATERIALIZED VIEW" => Some(Self::MaterializedView),
+            "TYPE" | "TYPE BODY" => Some(Self::Type),
+            "TRIGGER" => Some(Self::Trigger),
+            "INDEX" => Some(Self::Index),
             "PROCEDURE" => Some(Self::Procedure),
             "FUNCTION" => Some(Self::Function),
-            "PACKAGE" => Some(Self::Package),
+            "PACKAGE" | "PACKAGE BODY" => Some(Self::Package),
             "SEQUENCE" => Some(Self::Sequence),
             "SYNONYM" => Some(Self::Synonym),
             "PUBLIC SYNONYM" => Some(Self::PublicSynonym),
@@ -666,6 +674,10 @@ pub struct IntellisenseData {
     pub columns_loading: HashSet<String>,
     column_loading_started_at: HashMap<String, Instant>,
     pub views: Vec<String>,
+    pub materialized_views: Vec<String>,
+    pub types: Vec<String>,
+    pub triggers: Vec<String>,
+    pub indexes: Vec<String>,
     pub procedures: Vec<String>,
     pub functions: Vec<String>,
     pub packages: Vec<String>,
@@ -676,6 +688,10 @@ pub struct IntellisenseData {
     default_qualifier: Option<String>,
     table_entries: Vec<NameEntry>,
     view_entries: Vec<NameEntry>,
+    materialized_view_entries: Vec<NameEntry>,
+    type_entries: Vec<NameEntry>,
+    trigger_entries: Vec<NameEntry>,
+    index_entries: Vec<NameEntry>,
     procedure_entries: Vec<NameEntry>,
     function_entries: Vec<NameEntry>,
     package_entries: Vec<NameEntry>,
@@ -704,6 +720,10 @@ impl IntellisenseData {
             columns_loading: HashSet::new(),
             column_loading_started_at: HashMap::new(),
             views: Vec::new(),
+            materialized_views: Vec::new(),
+            types: Vec::new(),
+            triggers: Vec::new(),
+            indexes: Vec::new(),
             procedures: Vec::new(),
             functions: Vec::new(),
             packages: Vec::new(),
@@ -714,6 +734,10 @@ impl IntellisenseData {
             default_qualifier: None,
             table_entries: Vec::new(),
             view_entries: Vec::new(),
+            materialized_view_entries: Vec::new(),
+            type_entries: Vec::new(),
+            trigger_entries: Vec::new(),
+            index_entries: Vec::new(),
             procedure_entries: Vec::new(),
             function_entries: Vec::new(),
             package_entries: Vec::new(),
@@ -794,6 +818,14 @@ impl IntellisenseData {
             }
             if Self::push_entries(
                 &self.view_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+            if Self::push_entries(
+                &self.materialized_view_entries,
                 &prefix_upper,
                 &mut suggestions,
                 &mut seen,
@@ -894,6 +926,15 @@ impl IntellisenseData {
             }
 
             if Self::push_entries(
+                &self.materialized_view_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                return suggestions;
+            }
+
+            if Self::push_entries(
                 &self.synonym_entries,
                 &prefix_upper,
                 &mut suggestions,
@@ -979,6 +1020,7 @@ impl IntellisenseData {
             &[
                 &self.table_entries,
                 &self.view_entries,
+                &self.materialized_view_entries,
                 &self.synonym_entries,
                 &self.public_synonym_entries,
                 &self.user_entries,
@@ -993,6 +1035,7 @@ impl IntellisenseData {
             &[
                 &self.table_entries,
                 &self.view_entries,
+                &self.materialized_view_entries,
                 &self.synonym_entries,
                 &self.public_synonym_entries,
                 &self.procedure_entries,
@@ -1016,6 +1059,34 @@ impl IntellisenseData {
         )
     }
 
+    pub fn get_executable_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.procedure_entries,
+                &self.package_entries,
+                &self.function_entries,
+                &self.type_entries,
+            ],
+        )
+    }
+
+    pub fn get_relation_or_sequence_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(
+            prefix,
+            &[
+                &self.table_entries,
+                &self.view_entries,
+                &self.materialized_view_entries,
+                &self.sequence_entries,
+                &self.synonym_entries,
+                &self.public_synonym_entries,
+            ],
+        )
+    }
+
     pub fn get_table_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.table_entries])
@@ -1024,6 +1095,26 @@ impl IntellisenseData {
     pub fn get_view_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.view_entries])
+    }
+
+    pub fn get_materialized_view_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.materialized_view_entries])
+    }
+
+    pub fn get_type_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.type_entries])
+    }
+
+    pub fn get_trigger_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.trigger_entries])
+    }
+
+    pub fn get_index_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.index_entries])
     }
 
     pub fn get_procedure_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
@@ -1391,6 +1482,10 @@ impl IntellisenseData {
         }
         self.tables.iter().any(|t| t.eq_ignore_ascii_case(&upper))
             || self.views.iter().any(|v| v.eq_ignore_ascii_case(&upper))
+            || self
+                .materialized_views
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&upper))
             || self.synonyms.iter().any(|v| v.eq_ignore_ascii_case(&upper))
             || self
                 .public_synonyms
@@ -1401,6 +1496,10 @@ impl IntellisenseData {
     pub fn rebuild_indices(&mut self) {
         self.table_entries = Self::build_entries(&self.tables);
         self.view_entries = Self::build_entries(&self.views);
+        self.materialized_view_entries = Self::build_entries(&self.materialized_views);
+        self.type_entries = Self::build_entries(&self.types);
+        self.trigger_entries = Self::build_entries(&self.triggers);
+        self.index_entries = Self::build_entries(&self.indexes);
         self.procedure_entries = Self::build_entries(&self.procedures);
         self.function_entries = Self::build_entries(&self.functions);
         self.package_entries = Self::build_entries(&self.packages);
@@ -1412,6 +1511,7 @@ impl IntellisenseData {
             .tables
             .iter()
             .chain(self.views.iter())
+            .chain(self.materialized_views.iter())
             .chain(self.synonyms.iter())
             .chain(self.public_synonyms.iter())
             .map(|name| name.to_uppercase())
@@ -1495,6 +1595,10 @@ impl IntellisenseData {
     fn ensure_base_indices(&mut self) {
         if self.table_entries.len() != self.tables.len()
             || self.view_entries.len() != self.views.len()
+            || self.materialized_view_entries.len() != self.materialized_views.len()
+            || self.type_entries.len() != self.types.len()
+            || self.trigger_entries.len() != self.triggers.len()
+            || self.index_entries.len() != self.indexes.len()
             || self.procedure_entries.len() != self.procedures.len()
             || self.function_entries.len() != self.functions.len()
             || self.package_entries.len() != self.packages.len()
@@ -3153,12 +3257,14 @@ mod intellisense_tests {
     fn get_relation_suggestions_include_synonyms() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["EMP".to_string()];
+        data.materialized_views = vec!["PAYROLL_MV".to_string()];
         data.synonyms = vec!["EMP_SYN".to_string()];
         data.public_synonyms = vec!["PUBLIC_EMP".to_string()];
         data.rebuild_indices();
 
         let suggestions = data.get_relation_suggestions("P");
 
+        assert!(suggestions.iter().any(|name| name == "PAYROLL_MV"));
         assert!(suggestions.iter().any(|name| name == "PUBLIC_EMP"));
         assert!(!suggestions.iter().any(|name| name == "PACKAGE"));
     }
@@ -3177,6 +3283,7 @@ mod intellisense_tests {
     #[test]
     fn get_object_suggestions_include_packages_sequences_and_synonyms() {
         let mut data = IntellisenseData::new();
+        data.materialized_views = vec!["SALES_MV".to_string()];
         data.procedures = vec!["RUN_JOB".to_string()];
         data.packages = vec!["UTIL_PKG".to_string()];
         data.sequences = vec!["SEQ_ORDER".to_string()];
@@ -3185,6 +3292,7 @@ mod intellisense_tests {
 
         let suggestions = data.get_object_suggestions("");
 
+        assert!(suggestions.iter().any(|name| name == "SALES_MV"));
         assert!(suggestions.iter().any(|name| name == "RUN_JOB"));
         assert!(suggestions.iter().any(|name| name == "UTIL_PKG"));
         assert!(suggestions.iter().any(|name| name == "SEQ_ORDER"));

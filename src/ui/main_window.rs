@@ -3508,10 +3508,16 @@ impl MainWindow {
                             for (name, object_type) in objects {
                                 match object_type.as_str() {
                                     "TABLE" => data.tables.push(name.clone()),
-                                    "VIEW" => data.views.push(name.clone()),
+                                    "VIEW" | "EDITIONING VIEW" => data.views.push(name.clone()),
+                                    "MATERIALIZED VIEW" => {
+                                        data.materialized_views.push(name.clone())
+                                    }
+                                    "TYPE" | "TYPE BODY" => data.types.push(name.clone()),
+                                    "TRIGGER" => data.triggers.push(name.clone()),
+                                    "INDEX" => data.indexes.push(name.clone()),
                                     "PROCEDURE" => data.procedures.push(name.clone()),
                                     "FUNCTION" => data.functions.push(name.clone()),
-                                    "PACKAGE" => data.packages.push(name.clone()),
+                                    "PACKAGE" | "PACKAGE BODY" => data.packages.push(name.clone()),
                                     "SEQUENCE" => data.sequences.push(name.clone()),
                                     "SYNONYM" => data.synonyms.push(name.clone()),
                                     _ => {}
@@ -3616,6 +3622,7 @@ impl MainWindow {
         let mut highlight_data = HighlightData::new();
         highlight_data.tables = data.tables.clone();
         highlight_data.views = data.views.clone();
+        highlight_data.views.extend(data.materialized_views.clone());
         let mut data = data;
         data.rebuild_indices();
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);

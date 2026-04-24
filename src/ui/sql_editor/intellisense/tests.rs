@@ -7161,6 +7161,41 @@ fn resolve_qualified_completion_mode_uses_package_members_in_general_context() {
 }
 
 #[test]
+fn resolve_qualified_completion_mode_uses_schema_members_for_oracle_object_ddl_contexts() {
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("EMP_PK".to_string(), Some(QualifiedMemberKind::Index)),
+        ],
+    );
+
+    for sql in [
+        "DROP INDEX scott.|",
+        "ALTER TRIGGER scott.|",
+        "GRANT EXECUTE ON scott.|",
+        "GRANT DEBUG ON scott.|",
+        "REVOKE SELECT, INSERT, UPDATE ON scott.|",
+    ] {
+        let deep_ctx = analyze_inline_cursor_sql(sql);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        let mode =
+            SqlEditorWidget::resolve_qualified_completion_mode("scott", context, &deep_ctx, &data);
+
+        assert_eq!(
+            mode,
+            Some(QualifiedCompletionMode::ObjectMembers),
+            "expected schema object-member completion for `{sql}`, got {mode:?} in {context:?}"
+        );
+    }
+}
+
+#[test]
 fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
     let order_ctx = analyze_inline_cursor_sql("SELECT * FROM emp ORDER |");
     let when_ctx = analyze_inline_cursor_sql(
@@ -7177,17 +7212,53 @@ fn collect_expected_keyword_suggestions_complete_common_clause_tails() {
 
 #[test]
 fn collect_expected_keyword_suggestions_include_ddl_object_type_tokens() {
+    let create_ctx = analyze_inline_cursor_sql("CREATE |");
     let create_or_replace_ctx = analyze_inline_cursor_sql("CREATE OR REPLACE |");
+    let create_or_replace_materialized_ctx =
+        analyze_inline_cursor_sql("CREATE OR REPLACE MATERIALIZED |");
+    let create_or_replace_editioning_ctx =
+        analyze_inline_cursor_sql("CREATE OR REPLACE EDITIONING |");
+    let create_editioning_ctx = analyze_inline_cursor_sql("CREATE EDITIONING |");
     let drop_public_ctx = analyze_inline_cursor_sql("DROP PUBLIC |");
+    let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE B|");
 
+    let create_suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &create_ctx);
     let create_or_replace_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_ctx);
+    let create_or_replace_materialized_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions(
+            "",
+            &create_or_replace_materialized_ctx,
+        );
+    let create_or_replace_editioning_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_or_replace_editioning_ctx);
+    let create_editioning_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &create_editioning_ctx);
     let drop_public_suggestions =
         SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_public_ctx);
+    let drop_package_body_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("B", &drop_package_body_ctx);
 
+    assert!(create_suggestions.iter().any(|value| value == "EDITIONING"));
+    assert!(create_or_replace_suggestions.iter().any(|value| value == "INDEX"));
+    assert!(create_or_replace_suggestions
+        .iter()
+        .any(|value| value == "EDITIONING"));
     assert!(create_or_replace_suggestions.iter().any(|value| value == "PACKAGE"));
+    assert!(create_or_replace_suggestions.iter().any(|value| value == "TRIGGER"));
+    assert!(create_or_replace_suggestions.iter().any(|value| value == "TYPE"));
     assert!(create_or_replace_suggestions.iter().any(|value| value == "USER"));
+    assert_eq!(
+        create_or_replace_materialized_suggestions,
+        vec!["VIEW".to_string()]
+    );
+    assert_eq!(
+        create_or_replace_editioning_suggestions,
+        vec!["VIEW".to_string()]
+    );
+    assert_eq!(create_editioning_suggestions, vec!["VIEW".to_string()]);
     assert_eq!(drop_public_suggestions, vec!["SYNONYM".to_string()]);
+    assert_eq!(drop_package_body_suggestions, vec!["BODY".to_string()]);
 }
 
 #[test]
@@ -7214,9 +7285,24 @@ fn collect_expected_object_suggestions_prefer_routines_for_call_context() {
 #[test]
 fn collect_expected_object_suggestions_filter_by_object_type_and_include_users() {
     let drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE |");
+    let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE BODY |");
+    let drop_type_ctx = analyze_inline_cursor_sql("DROP TYPE |");
+    let drop_trigger_ctx = analyze_inline_cursor_sql("DROP TRIGGER |");
+    let drop_index_ctx = analyze_inline_cursor_sql("DROP INDEX |");
+    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON |");
+    let grant_debug_ctx = analyze_inline_cursor_sql("GRANT DEBUG ON |");
+    let grant_multi_relation_ctx =
+        analyze_inline_cursor_sql("GRANT SELECT, INSERT, UPDATE ON |");
+    let revoke_select_ctx = analyze_inline_cursor_sql("REVOKE SELECT ON |");
+    let current_schema_ctx = analyze_inline_cursor_sql("ALTER SESSION SET CURRENT_SCHEMA = |");
     let prefixed_drop_package_ctx = analyze_inline_cursor_sql("DROP PACKAGE sc|");
     let mut data = IntellisenseData::new();
     data.tables = vec!["EMP".to_string()];
+    data.materialized_views = vec!["SALES_MV".to_string()];
+    data.types = vec!["ADDRESS_T".to_string()];
+    data.triggers = vec!["EMP_BIU_TRG".to_string()];
+    data.indexes = vec!["EMP_PK".to_string()];
+    data.procedures = vec!["RUN_JOB".to_string()];
     data.packages = vec!["UTIL_PKG".to_string()];
     data.sequences = vec!["SEQ_ORDER".to_string()];
     data.users = vec!["SCOTT".to_string()];
@@ -7224,10 +7310,69 @@ fn collect_expected_object_suggestions_filter_by_object_type_and_include_users()
 
     let package_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_package_ctx);
+    let package_body_suggestions = SqlEditorWidget::collect_expected_object_suggestions(
+        &mut data,
+        "",
+        &drop_package_body_ctx,
+    );
+    let type_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_type_ctx);
+    let trigger_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_trigger_ctx);
+    let index_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &drop_index_ctx);
+    let grant_execute_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &grant_execute_ctx);
+    let grant_debug_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &grant_debug_ctx);
+    let grant_multi_relation_suggestions = SqlEditorWidget::collect_expected_object_suggestions(
+        &mut data,
+        "",
+        &grant_multi_relation_ctx,
+    );
+    let revoke_select_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &revoke_select_ctx);
+    let current_schema_suggestions =
+        SqlEditorWidget::collect_expected_object_suggestions(&mut data, "", &current_schema_ctx);
     let prefixed_suggestions =
         SqlEditorWidget::collect_expected_object_suggestions(&mut data, "sc", &prefixed_drop_package_ctx);
 
     assert_eq!(package_suggestions, vec!["UTIL_PKG".to_string()]);
+    assert_eq!(package_body_suggestions, vec!["UTIL_PKG".to_string()]);
+    assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
+    assert_eq!(trigger_suggestions, vec!["EMP_BIU_TRG".to_string()]);
+    assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
+    assert!(grant_execute_suggestions.iter().any(|value| value == "ADDRESS_T"));
+    assert!(grant_execute_suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(grant_execute_suggestions.iter().any(|value| value == "UTIL_PKG"));
+    assert!(!grant_execute_suggestions.iter().any(|value| value == "EMP"));
+    assert!(grant_debug_suggestions.iter().any(|value| value == "ADDRESS_T"));
+    assert!(grant_debug_suggestions.iter().any(|value| value == "RUN_JOB"));
+    assert!(grant_debug_suggestions.iter().any(|value| value == "UTIL_PKG"));
+    assert!(!grant_debug_suggestions.iter().any(|value| value == "EMP"));
+    assert!(grant_multi_relation_suggestions
+        .iter()
+        .any(|value| value == "EMP"));
+    assert!(grant_multi_relation_suggestions
+        .iter()
+        .any(|value| value == "SALES_MV"));
+    assert!(grant_multi_relation_suggestions
+        .iter()
+        .any(|value| value == "SEQ_ORDER"));
+    assert!(!grant_multi_relation_suggestions
+        .iter()
+        .any(|value| value == "UTIL_PKG"));
+    assert!(revoke_select_suggestions.iter().any(|value| value == "EMP"));
+    assert!(revoke_select_suggestions
+        .iter()
+        .any(|value| value == "SALES_MV"));
+    assert!(revoke_select_suggestions
+        .iter()
+        .any(|value| value == "SEQ_ORDER"));
+    assert!(!revoke_select_suggestions
+        .iter()
+        .any(|value| value == "UTIL_PKG"));
+    assert_eq!(current_schema_suggestions, vec!["SCOTT".to_string()]);
     assert_eq!(prefixed_suggestions, vec!["SCOTT".to_string()]);
 }
 
@@ -7330,6 +7475,223 @@ fn expected_package_member_routine_suggestions_do_not_require_top_level_type_lis
 
     assert!(call_suggestions.iter().any(|value| value == "RUN_JOB"));
     assert!(call_suggestions.iter().any(|value| value == "CALC_BONUS"));
+}
+
+#[test]
+fn schema_relation_member_suggestions_filter_by_oracle_object_context() {
+    let drop_table_ctx = analyze_inline_cursor_sql("DROP TABLE scott.|");
+    let comment_table_ctx = analyze_inline_cursor_sql("COMMENT ON TABLE scott.|");
+    let comment_view_ctx = analyze_inline_cursor_sql("COMMENT ON VIEW scott.|");
+    let comment_editioning_view_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING VIEW scott.|");
+    let drop_mv_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED VIEW scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            ("EMP_VIEW".to_string(), Some(QualifiedMemberKind::View)),
+            (
+                "EMP_MV".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+        ],
+    );
+    data.set_relation_members_for_qualifier(
+        "SCOTT",
+        vec![
+            "EMP".to_string(),
+            "EMP_VIEW".to_string(),
+            "EMP_MV".to_string(),
+        ],
+    );
+
+    let table_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_table_ctx,
+    );
+    let mv_suggestions = SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_mv_ctx,
+    );
+    let comment_table_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &comment_table_ctx,
+        );
+    let comment_view_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &comment_view_ctx,
+        );
+    let comment_editioning_view_suggestions =
+        SqlEditorWidget::expected_relation_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &comment_editioning_view_ctx,
+        );
+
+    assert_eq!(table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(mv_suggestions, vec!["EMP_MV".to_string()]);
+    assert_eq!(comment_table_suggestions, vec!["EMP".to_string()]);
+    assert_eq!(comment_view_suggestions, vec!["EMP_VIEW".to_string()]);
+    assert_eq!(comment_editioning_view_suggestions, vec!["EMP_VIEW".to_string()]);
+}
+
+#[test]
+fn schema_object_member_suggestions_cover_oracle_ddl_object_types() {
+    let drop_package_body_ctx = analyze_inline_cursor_sql("DROP PACKAGE BODY scott.|");
+    let drop_type_ctx = analyze_inline_cursor_sql("DROP TYPE scott.|");
+    let drop_type_body_ctx = analyze_inline_cursor_sql("DROP TYPE BODY scott.|");
+    let alter_trigger_ctx = analyze_inline_cursor_sql("ALTER TRIGGER scott.|");
+    let drop_index_ctx = analyze_inline_cursor_sql("DROP INDEX scott.|");
+    let grant_execute_ctx = analyze_inline_cursor_sql("GRANT EXECUTE ON scott.|");
+    let grant_debug_ctx = analyze_inline_cursor_sql("GRANT DEBUG ON scott.|");
+    let grant_select_ctx = analyze_inline_cursor_sql("GRANT SELECT ON scott.|");
+    let grant_multi_relation_ctx =
+        analyze_inline_cursor_sql("GRANT SELECT, INSERT, UPDATE ON scott.|");
+    let mut data = IntellisenseData::new();
+    data.set_members_for_qualifier_with_kinds(
+        "SCOTT",
+        vec![
+            ("EMP".to_string(), Some(QualifiedMemberKind::Table)),
+            (
+                "SALES_MV".to_string(),
+                Some(QualifiedMemberKind::MaterializedView),
+            ),
+            ("SEQ_ORDER".to_string(), Some(QualifiedMemberKind::Sequence)),
+            ("RUN_JOB".to_string(), Some(QualifiedMemberKind::Procedure)),
+            ("UTIL_PKG".to_string(), Some(QualifiedMemberKind::Package)),
+            ("ADDRESS_T".to_string(), Some(QualifiedMemberKind::Type)),
+            ("EMP_BIU_TRG".to_string(), Some(QualifiedMemberKind::Trigger)),
+            ("EMP_PK".to_string(), Some(QualifiedMemberKind::Index)),
+        ],
+    );
+
+    let package_body_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_package_body_ctx,
+    );
+    let type_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_type_ctx,
+    );
+    let type_body_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_type_body_ctx,
+    );
+    let trigger_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &alter_trigger_ctx,
+    );
+    let index_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &drop_index_ctx,
+    );
+    let grant_execute_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_execute_ctx,
+    );
+    let grant_debug_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_debug_ctx,
+    );
+    let grant_select_suggestions = SqlEditorWidget::expected_member_suggestions_for_qualifier(
+        &mut data,
+        "scott",
+        "",
+        &grant_select_ctx,
+    );
+    let grant_multi_relation_suggestions =
+        SqlEditorWidget::expected_member_suggestions_for_qualifier(
+            &mut data,
+            "scott",
+            "",
+            &grant_multi_relation_ctx,
+        );
+
+    assert_eq!(package_body_suggestions, vec!["UTIL_PKG".to_string()]);
+    assert_eq!(type_suggestions, vec!["ADDRESS_T".to_string()]);
+    assert_eq!(type_body_suggestions, vec!["ADDRESS_T".to_string()]);
+    assert_eq!(trigger_suggestions, vec!["EMP_BIU_TRG".to_string()]);
+    assert_eq!(index_suggestions, vec!["EMP_PK".to_string()]);
+    assert_eq!(
+        grant_execute_suggestions,
+        vec![
+            "ADDRESS_T".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string()
+        ]
+    );
+    assert_eq!(
+        grant_debug_suggestions,
+        vec![
+            "ADDRESS_T".to_string(),
+            "RUN_JOB".to_string(),
+            "UTIL_PKG".to_string()
+        ]
+    );
+    assert_eq!(
+        grant_select_suggestions,
+        vec![
+            "EMP".to_string(),
+            "SALES_MV".to_string(),
+            "SEQ_ORDER".to_string()
+        ]
+    );
+    assert_eq!(
+        grant_multi_relation_suggestions,
+        vec![
+            "EMP".to_string(),
+            "SALES_MV".to_string(),
+            "SEQ_ORDER".to_string()
+        ]
+    );
+}
+
+#[test]
+fn collect_expected_keyword_suggestions_complete_materialized_view_tail() {
+    let drop_ctx = analyze_inline_cursor_sql("DROP MATERIALIZED |");
+    let comment_on_ctx = analyze_inline_cursor_sql("COMMENT ON |");
+    let comment_editioning_ctx = analyze_inline_cursor_sql("COMMENT ON EDITIONING |");
+    let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &drop_ctx);
+    let comment_on_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_on_ctx);
+    let comment_editioning_suggestions =
+        SqlEditorWidget::collect_expected_keyword_suggestions("", &comment_editioning_ctx);
+
+    assert_eq!(suggestions, vec!["VIEW".to_string()]);
+    assert_eq!(comment_editioning_suggestions, vec!["VIEW".to_string()]);
+    assert!(comment_on_suggestions.iter().any(|value| value == "COLUMN"));
+    assert!(comment_on_suggestions
+        .iter()
+        .any(|value| value == "EDITIONING"));
+    assert!(comment_on_suggestions
+        .iter()
+        .any(|value| value == "MATERIALIZED"));
 }
 
 #[test]

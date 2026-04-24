@@ -8058,7 +8058,7 @@ impl ObjectBrowser {
         let sql = r#"
             SELECT owner, object_name, object_type
             FROM all_objects
-            WHERE object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'SEQUENCE')
+            WHERE object_type IN ('TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW', 'TYPE', 'TYPE BODY', 'TRIGGER', 'INDEX', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SEQUENCE')
             UNION ALL
             SELECT
                 owner,
@@ -8079,7 +8079,7 @@ impl ObjectBrowser {
         let sql = r#"
             SELECT owner, object_name
             FROM all_objects
-            WHERE object_type IN ('TABLE', 'VIEW')
+            WHERE object_type IN ('TABLE', 'VIEW', 'EDITIONING VIEW', 'MATERIALIZED VIEW')
             UNION ALL
             SELECT owner, synonym_name
             FROM all_synonyms
@@ -8165,8 +8165,7 @@ impl ObjectBrowser {
         // Fast path: parse package spec source from USER_SOURCE to identify
         // PROCEDURE vs FUNCTION declarations. This avoids the slow
         // user_arguments view entirely, which is the main bottleneck.
-        let (owner, package_name) =
-            QueryExecutor::split_normalized_owner_object_name(package_name);
+        let (owner, package_name) = QueryExecutor::split_normalized_owner_object_name(package_name);
         if let Ok(routines) =
             Self::get_package_routines_from_source(conn, owner.as_deref(), &package_name)
         {

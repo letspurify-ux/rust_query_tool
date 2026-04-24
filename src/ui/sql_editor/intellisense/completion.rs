@@ -22,8 +22,14 @@ enum QualifiedCompletionMode {
 enum ExpectedObjectSuggestionKind {
     Any,
     Routine,
+    Executable,
+    RelationOrSequence,
     Table,
     View,
+    MaterializedView,
+    Type,
+    Trigger,
+    Index,
     Procedure,
     Function,
     Package,
@@ -624,7 +630,12 @@ impl SqlEditorWidget {
                 let mut data = intellisense_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                data.get_member_suggestions(qualifier, &snapshot.prefix, true)
+                Self::expected_relation_member_suggestions_for_qualifier(
+                    &mut data,
+                    qualifier,
+                    &snapshot.prefix,
+                    deep_ctx,
+                )
             }
             (Some(qualifier), Some(QualifiedCompletionMode::ObjectMembers)) => {
                 let mut data = intellisense_data
@@ -1113,6 +1124,10 @@ impl SqlEditorWidget {
         const OBJECT_TYPE_KEYWORDS: &[&str] = &[
             "TABLE",
             "VIEW",
+            "MATERIALIZED",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
             "PROCEDURE",
             "FUNCTION",
             "PACKAGE",
@@ -1121,6 +1136,24 @@ impl SqlEditorWidget {
             "USER",
             "PUBLIC",
         ];
+        const CREATE_OBJECT_TYPE_KEYWORDS: &[&str] = &[
+            "TABLE",
+            "VIEW",
+            "MATERIALIZED",
+            "EDITIONING",
+            "TYPE",
+            "TRIGGER",
+            "INDEX",
+            "PROCEDURE",
+            "FUNCTION",
+            "PACKAGE",
+            "SEQUENCE",
+            "SYNONYM",
+            "USER",
+            "PUBLIC",
+        ];
+        const COMMENT_OBJECT_TYPE_KEYWORDS: &[&str] =
+            &["COLUMN", "TABLE", "VIEW", "MATERIALIZED", "EDITIONING"];
 
         let tokens = Self::current_query_tokens(deep_ctx);
         let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
@@ -1147,13 +1180,41 @@ impl SqlEditorWidget {
             [.., last] if matches!(last.as_str(), "UNION" | "INTERSECT" | "EXCEPT" | "MINUS") => {
                 &["SELECT", "ALL"]
             }
-            [.., last] if *last == "CREATE" || *last == "DROP" || *last == "ALTER" => {
-                OBJECT_TYPE_KEYWORDS
+            [.., last] if *last == "CREATE" => CREATE_OBJECT_TYPE_KEYWORDS,
+            [.., last] if *last == "DROP" || *last == "ALTER" => OBJECT_TYPE_KEYWORDS,
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "DROP" | "ALTER" | "ON")
+                    && *last == "MATERIALIZED" =>
+            {
+                &["VIEW"]
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "MATERIALIZED" =>
+            {
+                &["VIEW"]
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "CREATE" | "ON") && *last == "EDITIONING" =>
+            {
+                &["VIEW"]
+            }
+            [.., a, b, c, d]
+                if *a == "CREATE" && *b == "OR" && *c == "REPLACE" && *d == "EDITIONING" =>
+            {
+                &["VIEW"]
+            }
+            [.., prev, last]
+                if !prefix.is_empty() && *prev == "DROP" && matches!(last.as_str(), "PACKAGE" | "TYPE") =>
+            {
+                &["BODY"]
             }
             [.., prev, last] if *prev == "DROP" && *last == "PUBLIC" => &["SYNONYM"],
             [.., prev, last] if *prev == "CREATE" && *last == "PUBLIC" => &["SYNONYM"],
+            [.., prev, last] if *prev == "COMMENT" && *last == "ON" => {
+                COMMENT_OBJECT_TYPE_KEYWORDS
+            }
             [.., a, b, c] if *a == "CREATE" && *b == "OR" && *c == "REPLACE" => {
-                OBJECT_TYPE_KEYWORDS
+                CREATE_OBJECT_TYPE_KEYWORDS
             }
             [.., last] if *last == "TRUNCATE" || *last == "LOCK" || *last == "FLASHBACK" => {
                 &["TABLE"]
@@ -1189,8 +1250,12 @@ impl SqlEditorWidget {
                 cursor_token_len,
                 !prefix.is_empty() || qualifier.is_some(),
             ),
-            4,
+            16,
         );
+
+        if let Some(kind) = Self::expected_grant_revoke_object_suggestion_kind(&words) {
+            return Some(kind);
+        }
 
         match words.as_slice() {
             [.., last] if matches!(last.as_str(), "CALL" | "EXEC" | "EXECUTE") => {
@@ -1207,8 +1272,45 @@ impl SqlEditorWidget {
             {
                 Some(ExpectedObjectSuggestionKind::Table)
             }
+            [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "TABLE" => {
+                Some(ExpectedObjectSuggestionKind::Table)
+            }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "VIEW" => {
                 Some(ExpectedObjectSuggestionKind::View)
+            }
+            [.., a, b, c] if *a == "COMMENT" && *b == "ON" && *c == "VIEW" => {
+                Some(ExpectedObjectSuggestionKind::View)
+            }
+            [.., a, b, c, d]
+                if *a == "COMMENT" && *b == "ON" && *c == "EDITIONING" && *d == "VIEW" =>
+            {
+                Some(ExpectedObjectSuggestionKind::View)
+            }
+            [.., a, b, c]
+                if matches!(a.as_str(), "ALTER" | "DROP")
+                    && *b == "MATERIALIZED"
+                    && *c == "VIEW" =>
+            {
+                Some(ExpectedObjectSuggestionKind::MaterializedView)
+            }
+            [.., a, b, c, d]
+                if *a == "COMMENT" && *b == "ON" && *c == "MATERIALIZED" && *d == "VIEW" =>
+            {
+                Some(ExpectedObjectSuggestionKind::MaterializedView)
+            }
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TYPE" => {
+                Some(ExpectedObjectSuggestionKind::Type)
+            }
+            [.., a, b, c] if *a == "DROP" && *b == "TYPE" && *c == "BODY" => {
+                Some(ExpectedObjectSuggestionKind::Type)
+            }
+            [.., prev, last]
+                if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "TRIGGER" =>
+            {
+                Some(ExpectedObjectSuggestionKind::Trigger)
+            }
+            [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "INDEX" => {
+                Some(ExpectedObjectSuggestionKind::Index)
             }
             [.., prev, last]
                 if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PROCEDURE" =>
@@ -1221,6 +1323,9 @@ impl SqlEditorWidget {
                 Some(ExpectedObjectSuggestionKind::Function)
             }
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "PACKAGE" => {
+                Some(ExpectedObjectSuggestionKind::Package)
+            }
+            [.., a, b, c] if *a == "DROP" && *b == "PACKAGE" && *c == "BODY" => {
                 Some(ExpectedObjectSuggestionKind::Package)
             }
             [.., prev, last]
@@ -1237,8 +1342,63 @@ impl SqlEditorWidget {
             [.., prev, last] if matches!(prev.as_str(), "ALTER" | "DROP") && *last == "USER" => {
                 Some(ExpectedObjectSuggestionKind::User)
             }
+            [.., a, b, c, d]
+                if *a == "ALTER" && *b == "SESSION" && *c == "SET" && *d == "CURRENT_SCHEMA" =>
+            {
+                Some(ExpectedObjectSuggestionKind::User)
+            }
             _ => None,
         }
+    }
+
+    fn expected_grant_revoke_object_suggestion_kind(
+        words: &[String],
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        if !words.last().is_some_and(|word| word == "ON") {
+            return None;
+        }
+        let grant_idx = words
+            .iter()
+            .rposition(|word| matches!(word.as_str(), "GRANT" | "REVOKE"))?;
+        let privilege_words = words.get(grant_idx + 1..words.len().saturating_sub(1))?;
+        if privilege_words.is_empty() {
+            return None;
+        }
+        if privilege_words
+            .iter()
+            .all(|word| Self::is_executable_object_privilege(word))
+        {
+            return Some(ExpectedObjectSuggestionKind::Executable);
+        }
+        if privilege_words
+            .iter()
+            .all(|word| Self::is_relation_or_sequence_object_privilege(word))
+        {
+            return Some(ExpectedObjectSuggestionKind::RelationOrSequence);
+        }
+
+        None
+    }
+
+    fn is_executable_object_privilege(word: &str) -> bool {
+        matches!(word, "EXECUTE" | "DEBUG")
+    }
+
+    fn is_relation_or_sequence_object_privilege(word: &str) -> bool {
+        matches!(
+            word,
+            "SELECT"
+                | "READ"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "REFERENCES"
+                | "INDEX"
+                | "ALTER"
+                | "FLASHBACK"
+                | "QUERY"
+                | "REWRITE"
+        )
     }
 
     fn expected_suggestion_context_end(
@@ -1263,8 +1423,18 @@ impl SqlEditorWidget {
         let suggestions = match kind {
             ExpectedObjectSuggestionKind::Any => data.get_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Routine => data.get_routine_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Executable => data.get_executable_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::RelationOrSequence => {
+                data.get_relation_or_sequence_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::Table => data.get_table_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::View => data.get_view_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::MaterializedView => {
+                data.get_materialized_view_object_suggestions(prefix)
+            }
+            ExpectedObjectSuggestionKind::Type => data.get_type_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Trigger => data.get_trigger_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Index => data.get_index_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Procedure => {
                 data.get_procedure_object_suggestions(prefix)
             }
@@ -1307,11 +1477,37 @@ impl SqlEditorWidget {
                     || Self::matches_string_list_case_insensitive(&data.functions, candidate)
                     || Self::matches_string_list_case_insensitive(&data.packages, candidate)
             }
+            ExpectedObjectSuggestionKind::Executable => {
+                Self::matches_string_list_case_insensitive(&data.procedures, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.functions, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.packages, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.types, candidate)
+            }
+            ExpectedObjectSuggestionKind::RelationOrSequence => {
+                Self::matches_string_list_case_insensitive(&data.tables, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.views, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.sequences, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.synonyms, candidate)
+                    || Self::matches_string_list_case_insensitive(&data.public_synonyms, candidate)
+            }
             ExpectedObjectSuggestionKind::Table => {
                 Self::matches_string_list_case_insensitive(&data.tables, candidate)
             }
             ExpectedObjectSuggestionKind::View => {
                 Self::matches_string_list_case_insensitive(&data.views, candidate)
+            }
+            ExpectedObjectSuggestionKind::MaterializedView => {
+                Self::matches_string_list_case_insensitive(&data.materialized_views, candidate)
+            }
+            ExpectedObjectSuggestionKind::Type => {
+                Self::matches_string_list_case_insensitive(&data.types, candidate)
+            }
+            ExpectedObjectSuggestionKind::Trigger => {
+                Self::matches_string_list_case_insensitive(&data.triggers, candidate)
+            }
+            ExpectedObjectSuggestionKind::Index => {
+                Self::matches_string_list_case_insensitive(&data.indexes, candidate)
             }
             ExpectedObjectSuggestionKind::Procedure => {
                 Self::matches_string_list_case_insensitive(&data.procedures, candidate)
@@ -1347,8 +1543,28 @@ impl SqlEditorWidget {
                 QualifiedMemberKind::Function,
                 QualifiedMemberKind::Package,
             ]),
+            ExpectedObjectSuggestionKind::Executable => Some(&[
+                QualifiedMemberKind::Procedure,
+                QualifiedMemberKind::Function,
+                QualifiedMemberKind::Package,
+                QualifiedMemberKind::Type,
+            ]),
+            ExpectedObjectSuggestionKind::RelationOrSequence => Some(&[
+                QualifiedMemberKind::Table,
+                QualifiedMemberKind::View,
+                QualifiedMemberKind::MaterializedView,
+                QualifiedMemberKind::Sequence,
+                QualifiedMemberKind::Synonym,
+                QualifiedMemberKind::PublicSynonym,
+            ]),
             ExpectedObjectSuggestionKind::Table => Some(&[QualifiedMemberKind::Table]),
             ExpectedObjectSuggestionKind::View => Some(&[QualifiedMemberKind::View]),
+            ExpectedObjectSuggestionKind::MaterializedView => {
+                Some(&[QualifiedMemberKind::MaterializedView])
+            }
+            ExpectedObjectSuggestionKind::Type => Some(&[QualifiedMemberKind::Type]),
+            ExpectedObjectSuggestionKind::Trigger => Some(&[QualifiedMemberKind::Trigger]),
+            ExpectedObjectSuggestionKind::Index => Some(&[QualifiedMemberKind::Index]),
             ExpectedObjectSuggestionKind::Procedure => Some(&[QualifiedMemberKind::Procedure]),
             ExpectedObjectSuggestionKind::Function => Some(&[QualifiedMemberKind::Function]),
             ExpectedObjectSuggestionKind::Package => Some(&[QualifiedMemberKind::Package]),
@@ -1412,6 +1628,46 @@ impl SqlEditorWidget {
             }
         }
         filtered
+    }
+
+    fn expected_relation_member_suggestions_for_qualifier(
+        data: &mut IntellisenseData,
+        qualifier: &str,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let suggestions = data.get_member_suggestions(qualifier, prefix, true);
+        let Some(kind) = Self::expected_object_suggestion_kind(prefix, Some(qualifier), deep_ctx)
+        else {
+            return suggestions;
+        };
+        let Some(expected_kinds) = Self::expected_qualifier_member_kinds(kind) else {
+            return suggestions;
+        };
+
+        let mut filtered = Vec::new();
+        let mut saw_kind_metadata = false;
+        let mut seen = HashSet::new();
+        for suggestion in &suggestions {
+            let Some(matches) =
+                data.qualifier_member_matches_kinds(qualifier, suggestion, expected_kinds)
+            else {
+                continue;
+            };
+            saw_kind_metadata = true;
+            if matches && seen.insert(suggestion.to_ascii_uppercase()) {
+                filtered.push(suggestion.clone());
+            }
+            if filtered.len() >= MAX_MERGED_SUGGESTIONS {
+                break;
+            }
+        }
+
+        if saw_kind_metadata {
+            filtered
+        } else {
+            suggestions
+        }
     }
 
     fn collect_expected_object_suggestions(
