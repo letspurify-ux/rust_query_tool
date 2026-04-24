@@ -88,7 +88,16 @@ enum LazyFetchPendingAction {
     HeaderSort(usize),
     CopyAll,
     SelectAll,
+    MoveToEdge(ResultTableEdge),
     ExportCsv(Box<dyn FnMut(String, usize)>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultTableEdge {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 fn mutex_load_bool(flag: &Arc<Mutex<bool>>) -> bool {
@@ -1021,6 +1030,111 @@ impl ResultTableWidget {
             .or_else(|| {
                 (clamped_col.saturating_add(1)..max_cols).find(|col| Some(*col) != hidden_col)
             })
+    }
+
+    fn edge_for_arrow_key(key: Key, original_key: Key) -> Option<ResultTableEdge> {
+        [key, original_key]
+            .into_iter()
+            .find_map(|event_key| match event_key {
+                Key::Left => Some(ResultTableEdge::Left),
+                Key::Right => Some(ResultTableEdge::Right),
+                Key::Up => Some(ResultTableEdge::Up),
+                Key::Down => Some(ResultTableEdge::Down),
+                _ => None,
+            })
+    }
+
+    fn target_cell_for_edge(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        hidden_col: Option<usize>,
+        edge: ResultTableEdge,
+        fallback_row: usize,
+        fallback_col: usize,
+    ) -> Option<(usize, usize)> {
+        if max_rows == 0 || max_cols == 0 {
+            return None;
+        }
+
+        let (first_visible_col, last_visible_col) =
+            Self::visible_column_bounds(max_cols, hidden_col)?;
+        let (row, col) = Self::selection_bounds_excluding_hidden_column(
+            selection, max_rows, max_cols, hidden_col,
+        )
+        .map(|(row_start, col_start, _, _)| (row_start, col_start))
+        .unwrap_or_else(|| {
+            (
+                fallback_row.min(max_rows.saturating_sub(1)),
+                Self::nearest_visible_column(max_cols, fallback_col, hidden_col)
+                    .unwrap_or(first_visible_col),
+            )
+        });
+
+        match edge {
+            ResultTableEdge::Left => Some((row, first_visible_col)),
+            ResultTableEdge::Right => Some((row, last_visible_col)),
+            ResultTableEdge::Up => Some((0, col)),
+            ResultTableEdge::Down => Some((max_rows.saturating_sub(1), col)),
+        }
+    }
+
+    fn move_table_selection_to_edge(
+        table: &mut Table,
+        edge: ResultTableEdge,
+        hidden_col: Option<usize>,
+    ) -> bool {
+        let rows = table.rows().max(0) as usize;
+        let cols = table.cols().max(0) as usize;
+        let fallback_row = table.row_position().max(0) as usize;
+        let fallback_col = table.col_position().max(0) as usize;
+        let Some((target_row, target_col)) = Self::target_cell_for_edge(
+            table.get_selection(),
+            rows,
+            cols,
+            hidden_col,
+            edge,
+            fallback_row,
+            fallback_col,
+        ) else {
+            return false;
+        };
+
+        let target_row = target_row as i32;
+        let target_col = target_col as i32;
+        table.set_selection(target_row, target_col, target_row, target_col);
+        table.set_row_position(target_row);
+        table.set_col_position(target_col);
+        table.redraw();
+        true
+    }
+
+    fn handle_ctrl_arrow_navigation(
+        table: &mut Table,
+        key: Key,
+        original_key: Key,
+        hidden_col: Option<usize>,
+        lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
+        lazy_fetch_callback: &LazyFetchCallback,
+        pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
+    ) -> bool {
+        let Some(edge) = Self::edge_for_arrow_key(key, original_key) else {
+            return false;
+        };
+
+        if edge == ResultTableEdge::Down
+            && Self::queue_lazy_action_if_active(
+                lazy_fetch_session,
+                lazy_fetch_callback,
+                pending_lazy_actions,
+                LazyFetchPendingAction::MoveToEdge(edge),
+            )
+        {
+            return true;
+        }
+
+        Self::move_table_selection_to_edge(table, edge, hidden_col);
+        true
     }
 
     fn selection_bounds_excluding_hidden_column(
@@ -1982,6 +2096,23 @@ impl ResultTableWidget {
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
+                    if ctrl_or_cmd {
+                        let hidden_col = *hidden_auto_rowid_col_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if Self::handle_ctrl_arrow_navigation(
+                            &mut table_for_handle,
+                            key,
+                            original_key,
+                            hidden_col,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &pending_lazy_actions_for_handle,
+                        ) {
+                            return true;
+                        }
+                    }
+
                     if ctrl_or_cmd
                         && Self::matches_end_key(key, original_key)
                         && Self::request_lazy_fetch_all_if_active(
@@ -2132,6 +2263,23 @@ impl ResultTableWidget {
                     let ctrl_or_cmd =
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
+
+                    if ctrl_or_cmd {
+                        let hidden_col = *hidden_auto_rowid_col_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if Self::handle_ctrl_arrow_navigation(
+                            &mut table_for_handle,
+                            key,
+                            original_key,
+                            hidden_col,
+                            &lazy_fetch_session_for_handle,
+                            &lazy_fetch_callback_for_handle,
+                            &pending_lazy_actions_for_handle,
+                        ) {
+                            return true;
+                        }
+                    }
 
                     if ctrl_or_cmd
                         && Self::matches_end_key(key, original_key)
@@ -6761,6 +6909,10 @@ impl ResultTableWidget {
                     Self::copy_all_to_clipboard(&self.headers, &self.full_data, hidden_col);
                 }
                 LazyFetchPendingAction::SelectAll => self.select_all(),
+                LazyFetchPendingAction::MoveToEdge(edge) => {
+                    let hidden_col = self.hidden_auto_rowid_col_value();
+                    Self::move_table_selection_to_edge(&mut self.table, edge, hidden_col);
+                }
                 LazyFetchPendingAction::ExportCsv(mut callback) => {
                     let (csv, row_count) = self.current_csv_snapshot();
                     callback(csv, row_count);
@@ -7597,6 +7749,38 @@ mod row_edit_sql_tests {
                 Some(0),
                 Key::Right,
             )
+        );
+    }
+
+    #[test]
+    fn ctrl_left_target_uses_first_visible_column_when_rowid_is_hidden() {
+        assert_eq!(
+            ResultTableWidget::target_cell_for_edge(
+                (2, 3, 2, 3),
+                5,
+                4,
+                Some(0),
+                ResultTableEdge::Left,
+                0,
+                0,
+            ),
+            Some((2, 1))
+        );
+    }
+
+    #[test]
+    fn ctrl_down_target_preserves_visible_column_after_hidden_rowid_selection() {
+        assert_eq!(
+            ResultTableWidget::target_cell_for_edge(
+                (2, 0, 2, 0),
+                6,
+                4,
+                Some(0),
+                ResultTableEdge::Down,
+                0,
+                0,
+            ),
+            Some((5, 1))
         );
     }
 
@@ -11192,6 +11376,22 @@ mod tests {
             Key::from_char('c'),
             'c',
         ));
+    }
+
+    #[test]
+    fn ctrl_arrow_edge_matches_original_or_current_key() {
+        assert_eq!(
+            ResultTableWidget::edge_for_arrow_key(Key::Left, Key::from_char('x')),
+            Some(ResultTableEdge::Left)
+        );
+        assert_eq!(
+            ResultTableWidget::edge_for_arrow_key(Key::from_char('x'), Key::Down),
+            Some(ResultTableEdge::Down)
+        );
+        assert_eq!(
+            ResultTableWidget::edge_for_arrow_key(Key::PageDown, Key::PageDown),
+            None
+        );
     }
 
     #[test]
