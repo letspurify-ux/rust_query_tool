@@ -201,6 +201,31 @@ enum LazyFetchWorkerOutcome {
     Cancelled,
 }
 
+struct MySqlLazyFetchTimeoutCancelGuard {
+    stop_sender: Option<mpsc::Sender<()>>,
+    fired: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl MySqlLazyFetchTimeoutCancelGuard {
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for MySqlLazyFetchTimeoutCancelGuard {
+    fn drop(&mut self) {
+        self.finish();
+        if let Some(stop_sender) = self.stop_sender.take() {
+            let _ = stop_sender.send(());
+        }
+    }
+}
+
 impl LazyFetchAllTimeout {
     fn new(timeout: Option<Duration>) -> Self {
         Self {
@@ -1738,12 +1763,16 @@ impl SqlEditorWidget {
                         }};
                     }
                         macro_rules! fetch_rows_with_timeout {
-                        ($limit:expr, $fetch_all_timeout:expr) => {{
+                        ($limit:expr, $fetch_all_timeout:expr, $timeout_cancel:expr) => {{
                             let mut rows = Vec::new();
                             let mut eof = false;
                             let mut timed_out = false;
                             for _ in 0..$limit {
-                                if $fetch_all_timeout.timed_out() {
+                                if $fetch_all_timeout.timed_out()
+                                    || $timeout_cancel
+                                        .as_ref()
+                                        .is_some_and(|guard| guard.fired())
+                                {
                                     timed_out = true;
                                     break;
                                 }
@@ -1752,7 +1781,17 @@ impl SqlEditorWidget {
                                     break;
                                 };
                                 let row: mysql::Row = row_result.map_err(|err| {
-                                    SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout)
+                                    if $timeout_cancel
+                                        .as_ref()
+                                        .is_some_and(|guard| guard.fired())
+                                    {
+                                        SqlEditorWidget::timeout_message(query_timeout)
+                                    } else {
+                                        SqlEditorWidget::mysql_error_message(
+                                            &err,
+                                            lazy_fetch_timeout,
+                                        )
+                                    }
                                 })?;
                                 let mut row_data =
                                     crate::db::query::mysql_executor::MysqlExecutor::row_to_strings(
@@ -1765,7 +1804,11 @@ impl SqlEditorWidget {
                                 fetched_rows = fetched_rows.saturating_add(1);
                                 $fetch_all_timeout.note_row_received();
                             }
-                            if $fetch_all_timeout.timed_out() {
+                            if $fetch_all_timeout.timed_out()
+                                || $timeout_cancel
+                                    .as_ref()
+                                    .is_some_and(|guard| guard.fired())
+                            {
                                 timed_out = true;
                             }
                             (rows, eof, timed_out)
@@ -1863,12 +1906,22 @@ impl SqlEditorWidget {
                                     Self::emit_lazy_waiting(&sender, index, session_id);
                                 }
                                 Ok(LazyFetchCommand::FetchAll) => {
+                                    let timeout_cancel =
+                                        Self::start_mysql_lazy_fetch_timeout_cancel(
+                                            query_timeout,
+                                            lazy_cancel_context.clone(),
+                                            "mysql lazy fetch timeout",
+                                        );
                                     let mut fetch_all_timeout =
                                         LazyFetchAllTimeout::new(query_timeout);
+                                    if fetched_rows > 0 {
+                                        fetch_all_timeout.note_row_received();
+                                    }
                                     loop {
                                         let (rows, eof, timed_out) = fetch_rows_with_timeout!(
                                             PROGRESS_ROWS_MAX_BATCH,
-                                            fetch_all_timeout
+                                            fetch_all_timeout,
+                                            timeout_cancel
                                         );
                                         SqlEditorWidget::append_spool_rows(&session, &rows);
                                         Self::emit_lazy_rows(&sender, index, rows);
@@ -1883,10 +1936,15 @@ impl SqlEditorWidget {
                                             return Ok(LazyFetchWorkerOutcome::Cancelled);
                                         }
                                         if timed_out {
-                                            Self::cancel_mysql_lazy_fetch_query(
-                                                &lazy_cancel_context,
-                                                "mysql lazy fetch timeout",
-                                            );
+                                            if !timeout_cancel
+                                                .as_ref()
+                                                .is_some_and(|guard| guard.fired())
+                                            {
+                                                Self::cancel_mysql_lazy_fetch_query(
+                                                    &lazy_cancel_context,
+                                                    "mysql lazy fetch timeout",
+                                                );
+                                            }
                                             Self::emit_lazy_fetch_timeout_statement_result(
                                                 &sender,
                                                 index,
@@ -1904,6 +1962,9 @@ impl SqlEditorWidget {
                                             return Ok(LazyFetchWorkerOutcome::Cancelled);
                                         }
                                         if eof {
+                                            if let Some(timeout_cancel) = timeout_cancel.as_ref() {
+                                                timeout_cancel.finish();
+                                            }
                                             let mut query_result = QueryResult::new_select_streamed(
                                                 &sql_to_execute,
                                                 column_info.clone(),
@@ -1953,6 +2014,8 @@ impl SqlEditorWidget {
                         }
                         Err(err) => {
                             close_cancelled = true;
+                            let timed_out =
+                                Self::timeout_error_message_contains_timeout_signal(&err);
                             if Self::mysql_error_allows_session_reuse(&err) {
                                 keep_session = true;
                             }
@@ -1970,7 +2033,7 @@ impl SqlEditorWidget {
                                     index,
                                     result: query_result,
                                     connection_name: conn_name,
-                                    timed_out: false,
+                                    timed_out,
                                 });
                             }
                         }
@@ -1989,6 +2052,15 @@ impl SqlEditorWidget {
                             );
                             should_release_session = false;
                         }
+                    }
+                    if should_release_session {
+                        should_release_session = Self::sync_mysql_pooled_session_info(
+                            &shared_connection,
+                            conn,
+                            "mysql lazy fetch cleanup",
+                            connection_generation,
+                            false,
+                        );
                     }
                     *lazy_cancel_context
                         .lock()
@@ -2072,6 +2144,48 @@ impl SqlEditorWidget {
                     log_context,
                     &format!("Failed to cancel MySQL lazy fetch query: {err}"),
                 );
+            }
+        }
+    }
+
+    fn start_mysql_lazy_fetch_timeout_cancel(
+        timeout: Option<Duration>,
+        cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        log_context: &'static str,
+    ) -> Option<MySqlLazyFetchTimeoutCancelGuard> {
+        let timeout = timeout?;
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_thread = fired.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_thread = finished.clone();
+        match thread::Builder::new()
+            .name("mysql-lazy-fetch-timeout".to_string())
+            .spawn(move || {
+                if matches!(
+                    stop_receiver.recv_timeout(timeout),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if finished_for_thread.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    fired_for_thread.store(true, Ordering::SeqCst);
+                    if !finished_for_thread.load(Ordering::SeqCst) {
+                        SqlEditorWidget::cancel_mysql_lazy_fetch_query(&cancel_context, log_context);
+                    }
+                }
+            }) {
+            Ok(_) => Some(MySqlLazyFetchTimeoutCancelGuard {
+                stop_sender: Some(stop_sender),
+                fired,
+                finished,
+            }),
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    log_context,
+                    &format!("Failed to start MySQL lazy fetch timeout watcher: {err}"),
+                );
+                None
             }
         }
     }
@@ -9257,6 +9371,8 @@ impl SqlEditorWidget {
             "operation timed out",
             "packet out of order",
             "packets out of order",
+            "query execution was interrupted",
+            "query was killed",
             "server closed the connection",
             "server has closed the connection",
             "server has gone away",
@@ -10331,6 +10447,10 @@ mod query_execution_cleanup_tests {
         let protocol_error: std::thread::Result<Result<(), String>> = Ok(Err(
             "Commands out of sync; you can't run this command now".to_string(),
         ));
+        let raw_interrupt_error: std::thread::Result<Result<(), String>> =
+            Ok(Err("Query execution was interrupted".to_string()));
+        let raw_kill_error: std::thread::Result<Result<(), String>> =
+            Ok(Err("Query was killed".to_string()));
         let cancel_error: std::thread::Result<Result<(), String>> =
             Ok(Err(SqlEditorWidget::cancel_message()));
         let timeout_error: std::thread::Result<Result<(), String>> = Ok(Err(
@@ -10348,6 +10468,12 @@ mod query_execution_cleanup_tests {
         ));
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &protocol_error
+        ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
+            &raw_interrupt_error
+        ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
+            &raw_kill_error
         ));
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &cancel_error
