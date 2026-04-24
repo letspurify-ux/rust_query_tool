@@ -2493,8 +2493,9 @@ impl ObjectBrowserWidget {
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
-                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_structure(
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_structure_in_schema(
                                                 mysql_conn,
+                                                selected_scope.as_deref(),
                                                 &table_name,
                                             )
                                             .map_err(|err| err.to_string())
@@ -2547,8 +2548,9 @@ impl ObjectBrowserWidget {
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
-                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_index_details(
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_index_details_in_schema(
                                                 mysql_conn,
+                                                selected_scope.as_deref(),
                                                 &table_name,
                                             )
                                             .map_err(|err| err.to_string())
@@ -2599,8 +2601,9 @@ impl ObjectBrowserWidget {
                                         .get_mysql_connection_mut()
                                         .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
                                         .and_then(|mysql_conn| {
-                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_constraints(
+                                            crate::db::query::mysql_executor::MysqlObjectBrowser::get_table_constraints_in_schema(
                                                 mysql_conn,
+                                                selected_scope.as_deref(),
                                                 &table_name,
                                             )
                                             .map_err(|err| err.to_string())

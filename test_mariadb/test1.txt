@@ -120,7 +120,7 @@ CREATE TABLE error_log (
 DELIMITER $$
 
 CREATE FUNCTION fn_currency_rate (p_currency_code CHAR(3))
-RETURNS DECIMAL(10, 4)
+RETURNS DECIMAL(10, 5)
 DETERMINISTIC
 BEGIN
     RETURN CASE UPPER(TRIM(p_currency_code))

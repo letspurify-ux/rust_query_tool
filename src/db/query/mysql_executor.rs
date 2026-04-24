@@ -508,8 +508,16 @@ impl MysqlExecutor {
         lines
     }
 
+    fn build_explain_sql(sql: &str) -> String {
+        let normalized = QueryExecutor::normalize_sql_for_execute(sql);
+        match QueryExecutor::leading_keyword(&normalized).as_deref() {
+            Some("EXPLAIN") | Some("DESCRIBE") | Some("DESC") => normalized,
+            _ => format!("EXPLAIN {}", normalized),
+        }
+    }
+
     pub fn get_explain_plan(conn: &mut Conn, sql: &str) -> Result<Vec<String>, MysqlError> {
-        let explain_sql = format!("EXPLAIN {}", sql);
+        let explain_sql = Self::build_explain_sql(sql);
         let result = Self::execute_select(conn, &explain_sql)?;
         Ok(Self::format_explain_lines(
             result.columns.as_slice(),
@@ -1592,11 +1600,20 @@ impl MysqlObjectBrowser {
     }
 
     pub fn get_indexes(conn: &mut Conn, table_name: &str) -> Result<Vec<String>, MysqlError> {
+        Self::get_indexes_in_schema(conn, None, table_name)
+    }
+
+    pub fn get_indexes_in_schema(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<String>, MysqlError> {
+        let schema_name = Self::optional_schema_param(schema_name);
         let rows: Vec<String> = conn.exec(
             "SELECT DISTINCT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
              ORDER BY INDEX_NAME",
-            (table_name,),
+            (schema_name, table_name),
         )?;
         Ok(rows)
     }
@@ -1605,14 +1622,23 @@ impl MysqlObjectBrowser {
         conn: &mut Conn,
         table_name: &str,
     ) -> Result<Vec<IndexInfo>, MysqlError> {
-        let rows: Vec<(String, u8, Option<String>)> = conn.exec(
+        Self::get_index_details_in_schema(conn, None, table_name)
+    }
+
+    pub fn get_index_details_in_schema(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<IndexInfo>, MysqlError> {
+        let schema_name = Self::optional_schema_param(schema_name);
+        let rows: Vec<(String, u64, Option<String>)> = conn.exec(
             "SELECT INDEX_NAME, NON_UNIQUE, \
              GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ') \
              FROM INFORMATION_SCHEMA.STATISTICS \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
              GROUP BY INDEX_NAME, NON_UNIQUE \
              ORDER BY INDEX_NAME",
-            (table_name,),
+            (schema_name, table_name),
         )?;
 
         Ok(rows
@@ -1761,6 +1787,15 @@ impl MysqlObjectBrowser {
         conn: &mut Conn,
         table_name: &str,
     ) -> Result<Vec<ConstraintInfo>, MysqlError> {
+        Self::get_table_constraints_in_schema(conn, None, table_name)
+    }
+
+    pub fn get_table_constraints_in_schema(
+        conn: &mut Conn,
+        schema_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<ConstraintInfo>, MysqlError> {
+        let schema_name = Self::optional_schema_param(schema_name);
         let rows: Vec<(String, String, Option<String>, Option<String>)> = conn.exec(
             "SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, \
              GROUP_CONCAT(kcu.COLUMN_NAME ORDER BY kcu.ORDINAL_POSITION SEPARATOR ', ') AS columns, \
@@ -1774,10 +1809,10 @@ impl MysqlObjectBrowser {
                ON tc.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA \
               AND tc.TABLE_NAME = rc.TABLE_NAME \
               AND tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
-             WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = ? \
+             WHERE tc.TABLE_SCHEMA = COALESCE(?, DATABASE()) AND tc.TABLE_NAME = ? \
              GROUP BY tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, rc.REFERENCED_TABLE_NAME \
              ORDER BY tc.CONSTRAINT_TYPE, tc.CONSTRAINT_NAME",
-            (table_name,),
+            (schema_name, table_name),
         )?;
 
         Ok(rows
@@ -2048,6 +2083,26 @@ mod tests {
         assert!(lines[1].contains("-+-"));
         assert!(lines[2].contains("employees"));
         assert!(lines[2].contains("Using where"));
+    }
+
+    #[test]
+    fn mysql_build_explain_sql_trims_statement_terminator() {
+        assert_eq!(
+            MysqlExecutor::build_explain_sql("  SELECT * FROM employees;   "),
+            "EXPLAIN SELECT * FROM employees"
+        );
+    }
+
+    #[test]
+    fn mysql_build_explain_sql_keeps_existing_explain_statement() {
+        assert_eq!(
+            MysqlExecutor::build_explain_sql(" EXPLAIN SELECT * FROM employees; "),
+            "EXPLAIN SELECT * FROM employees"
+        );
+        assert_eq!(
+            MysqlExecutor::build_explain_sql("DESC employees;"),
+            "DESC employees"
+        );
     }
 
     #[test]

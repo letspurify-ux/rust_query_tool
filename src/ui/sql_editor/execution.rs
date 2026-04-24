@@ -11098,6 +11098,118 @@ mod mysql_batch_execution_regression_tests {
         );
     }
 
+    fn assert_mysql_batch_script_reaches_status_pass(script: &str, db_activity: &str) {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection.set_auto_commit(true);
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL regression test connection should succeed");
+
+        let shared_connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::MySQL,
+            ..SessionState::default()
+        }));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::execute_mysql_batch(
+            &shared_connection,
+            &sender,
+            script,
+            "MYSQL_TEST",
+            &session,
+            &pooled_db_session,
+            &active_lazy_fetch,
+            &next_lazy_fetch_session_id,
+            &current_mysql_cancel_context,
+            &cancel_flag,
+            true,
+            None,
+            None,
+            true,
+            db_activity,
+        );
+        drop(sender);
+
+        let progress = receiver.try_iter().collect::<Vec<_>>();
+        let progress_summary = summarize_progress(&progress);
+        let failed_statement = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. } if !result.success => {
+                Some((*index, result.message.clone()))
+            }
+            _ => None,
+        });
+
+        assert!(
+            failed_statement.is_none(),
+            "batch execution should not emit a failed statement: {failed_statement:?}\n{progress_summary}"
+        );
+        let pass_status_index = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. }
+                if result.sql.contains("'PASS' AS status") =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        });
+
+        assert!(
+            pass_status_index.is_some(),
+            "batch execution should emit the final PASS status select\n{progress_summary}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|message| match (pass_status_index, message) {
+                    (
+                        Some(index),
+                        QueryProgress::Rows {
+                            index: row_index,
+                            rows,
+                        },
+                    ) if *row_index == index => {
+                        rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
+                    }
+                    _ => false,
+                }),
+            "batch execution should reach a PASS status row\n{progress_summary}"
+        );
+    }
+
     #[test]
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_lazy_cursor_fetches_incrementally_from_local_mariadb() {
@@ -11268,6 +11380,33 @@ mod mysql_batch_execution_regression_tests {
             summarize_progress(&progress)
         );
         assert_eq!(finished_row_count, Some(total_rows));
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_test1_reaches_pass_status() {
+        assert_mysql_batch_script_reaches_status_pass(
+            include_str!("../../../test_mariadb/test1.txt"),
+            "mysql test1 regression",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_test2_reaches_pass_status() {
+        assert_mysql_batch_script_reaches_status_pass(
+            include_str!("../../../test_mariadb/test2.txt"),
+            "mysql test2 regression",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_test3_reaches_pass_status() {
+        assert_mysql_batch_script_reaches_status_pass(
+            include_str!("../../../test_mariadb/test3.txt"),
+            "mysql test3 regression",
+        );
     }
 
     #[test]
