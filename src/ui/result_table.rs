@@ -83,6 +83,14 @@ const SORT_DESC_MARK: &str = "▼";
 pub type ResultGridSqlExecuteCallback =
     Arc<Mutex<Option<Box<dyn FnMut(String) -> Result<(), String>>>>>;
 pub type LazyFetchCallback = Arc<Mutex<Option<Box<dyn FnMut(u64, LazyFetchRequest)>>>>;
+pub type ResultTableContextActionCallback =
+    Arc<Mutex<Option<Box<dyn FnMut(ResultTableContextAction)>>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultTableContextAction {
+    ExportCsv,
+    Close,
+}
 
 enum LazyFetchPendingAction {
     HeaderSort(usize),
@@ -258,6 +266,7 @@ pub struct ResultTableWidget {
     lazy_fetch_callback: LazyFetchCallback,
     lazy_fetch_more_in_flight: Arc<Mutex<HashSet<u64>>>,
     pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
+    context_action_callback: ResultTableContextActionCallback,
     sort_state: Arc<Mutex<Option<ColumnSortState>>>,
     drag_state: Arc<Mutex<DragState>>,
 }
@@ -1469,6 +1478,7 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(HashSet::new()));
         let pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
+        let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
         let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
         let drag_state = Arc::new(Mutex::new(DragState::default()));
 
@@ -1711,6 +1721,7 @@ impl ResultTableWidget {
         let lazy_fetch_callback_for_handle = lazy_fetch_callback.clone();
         let lazy_fetch_more_in_flight_for_handle = lazy_fetch_more_in_flight.clone();
         let pending_lazy_actions_for_handle = pending_lazy_actions.clone();
+        let context_action_callback_for_handle = context_action_callback.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -1779,6 +1790,7 @@ impl ResultTableWidget {
                             &lazy_fetch_session_for_handle,
                             &lazy_fetch_callback_for_handle,
                             &pending_lazy_actions_for_handle,
+                            &context_action_callback_for_handle,
                         );
                         return true;
                     }
@@ -2429,6 +2441,7 @@ impl ResultTableWidget {
             lazy_fetch_callback,
             lazy_fetch_more_in_flight,
             pending_lazy_actions,
+            context_action_callback,
             sort_state,
             drag_state,
         }
@@ -2456,6 +2469,35 @@ impl ResultTableWidget {
         if callback_guard.is_none() {
             *callback_guard = callback_fn;
         }
+    }
+
+    fn invoke_context_action_callback(
+        callback: &ResultTableContextActionCallback,
+        action: ResultTableContextAction,
+    ) {
+        let mut callback_fn = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback_fn) = callback_fn.as_mut() {
+            callback_fn(action);
+        }
+        let mut callback_guard = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if callback_guard.is_none() {
+            *callback_guard = callback_fn;
+        }
+    }
+
+    fn schedule_context_action_callback(
+        callback: &ResultTableContextActionCallback,
+        action: ResultTableContextAction,
+    ) {
+        let callback = callback.clone();
+        app::add_timeout3(0.0, move |_| {
+            Self::invoke_context_action_callback(&callback, action);
+        });
     }
 
     fn queue_lazy_action_if_active(
@@ -4077,6 +4119,32 @@ impl ResultTableWidget {
         }
 
         None
+    }
+
+    fn has_visible_table_columns(table: &Table, hidden_col: Option<usize>) -> bool {
+        let cols = table.cols().max(0) as usize;
+        (0..cols).any(|col| Some(col) != hidden_col)
+    }
+
+    fn is_mouse_inside_table_body(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
+        let data_left = table.x() + table.row_header_width();
+        let data_top = table.y() + table.col_header_height();
+        mouse_x >= data_left
+            && mouse_x < table.x() + table.w()
+            && mouse_y >= data_top
+            && mouse_y < table.y() + table.h()
+    }
+
+    fn should_show_context_menu_for_hit(
+        clicked_cell: Option<(i32, i32)>,
+        clicked_row_header: Option<i32>,
+        clicked_col_header: Option<i32>,
+        clicked_empty_body_with_columns: bool,
+    ) -> bool {
+        clicked_cell.is_some()
+            || clicked_row_header.is_some()
+            || clicked_col_header.is_some()
+            || clicked_empty_body_with_columns
     }
 
     fn skip_hidden_columns(
@@ -5946,19 +6014,39 @@ impl ResultTableWidget {
         lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
+        context_action_callback: &ResultTableContextActionCallback,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
 
         let mut table = table.clone();
+        let hidden_col_for_hit = *hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let clicked_cell = Self::get_cell_at_mouse(&table);
         let clicked_row_header = if clicked_cell.is_none() {
             Self::get_row_header_at_mouse(&table)
         } else {
             None
         };
+        let clicked_col_header = if clicked_cell.is_none() && clicked_row_header.is_none() {
+            Self::get_col_header_at_mouse(&table)
+        } else {
+            None
+        };
+        let clicked_empty_body_with_columns = clicked_cell.is_none()
+            && clicked_row_header.is_none()
+            && clicked_col_header.is_none()
+            && table.rows() <= 0
+            && Self::has_visible_table_columns(&table, hidden_col_for_hit)
+            && Self::is_mouse_inside_table_body(&table, mouse_x, mouse_y);
 
-        if clicked_cell.is_none() && clicked_row_header.is_none() {
+        if !Self::should_show_context_menu_for_hit(
+            clicked_cell,
+            clicked_row_header,
+            clicked_col_header,
+            clicked_empty_body_with_columns,
+        ) {
             return;
         }
 
@@ -5978,6 +6066,12 @@ impl ResultTableWidget {
             // Row-header context actions (delete/insert defaults) should target the clicked row.
             table.set_selection(row, 0, row, cols.saturating_sub(1));
             table.redraw();
+        } else if let Some(col) = clicked_col_header {
+            let rows = table.rows();
+            if rows > 0 {
+                table.set_selection(0, col, rows.saturating_sub(1), col);
+                table.redraw();
+            }
         }
 
         // Prevent menu from being added to parent container
@@ -6034,7 +6128,13 @@ impl ResultTableWidget {
             }
         };
 
-        let mut menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
+        let mut menu_items = vec![
+            "Close",
+            "Save as CSV (Ctrl+E)",
+            "Copy",
+            "Copy with Headers",
+            "Copy All",
+        ];
         if can_set_null {
             menu_items.push("Set Null");
         }
@@ -6045,9 +6145,7 @@ impl ResultTableWidget {
         }
 
         if let Some(choice) = menu.popup() {
-            let hidden_col = *hidden_auto_rowid_col
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let hidden_col = hidden_col_for_hit;
             let choice_label = choice.label().unwrap_or_default();
             match choice_label.as_str() {
                 "Copy" => {
@@ -6066,6 +6164,18 @@ impl ResultTableWidget {
                         return;
                     }
                     Self::copy_all_to_clipboard(headers, full_data, hidden_col);
+                }
+                "Save as CSV (Ctrl+E)" => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::ExportCsv,
+                    );
+                }
+                "Close" => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::Close,
+                    );
                 }
                 "Set Null" => {
                     if let Err(err) = Self::set_selected_cells_to_null_in_edit_mode(
@@ -6786,6 +6896,16 @@ impl ResultTableWidget {
             Some(Box::new(move |id, request| {
                 ResultTableWidget::invoke_lazy_fetch_callback(&callback, id, request);
             }));
+    }
+
+    pub fn set_context_action_callback(&mut self, callback: ResultTableContextActionCallback) {
+        let mut guard = self
+            .context_action_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(Box::new(move |action| {
+            ResultTableWidget::invoke_context_action_callback(&callback, action);
+        }));
     }
 
     pub fn set_lazy_fetch_session(&mut self, session_id: u64) {
@@ -11392,6 +11512,28 @@ mod tests {
             ResultTableWidget::edge_for_arrow_key(Key::PageDown, Key::PageDown),
             None
         );
+    }
+
+    #[test]
+    fn context_menu_hit_accepts_column_header_and_empty_column_body() {
+        assert!(ResultTableWidget::should_show_context_menu_for_hit(
+            Some((0, 0)),
+            None,
+            None,
+            false,
+        ));
+        assert!(ResultTableWidget::should_show_context_menu_for_hit(
+            None,
+            None,
+            Some(0),
+            false,
+        ));
+        assert!(ResultTableWidget::should_show_context_menu_for_hit(
+            None, None, None, true,
+        ));
+        assert!(!ResultTableWidget::should_show_context_menu_for_hit(
+            None, None, None, false,
+        ));
     }
 
     #[test]

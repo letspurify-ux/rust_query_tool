@@ -12,6 +12,7 @@ use crate::utils::credential_store;
 const APP_DIR_NAME: &str = "space_query";
 const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
+pub const MAX_RECENT_SQL_FILES: usize = 10;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
 const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 4;
@@ -22,6 +23,7 @@ pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
 #[serde(default)]
 pub struct AppConfig {
     pub recent_connections: Vec<ConnectionInfo>,
+    pub recent_sql_files: Vec<PathBuf>,
     pub last_connection: Option<String>,
     pub editor_font: String,
     pub ui_font_size: u32,
@@ -54,6 +56,7 @@ impl AppConfig {
     pub fn new() -> Self {
         Self {
             recent_connections: Vec::new(),
+            recent_sql_files: Vec::new(),
             last_connection: None,
             editor_font: "맑은 고딕".to_string(),
             ui_font_size: 16,
@@ -184,6 +187,14 @@ impl AppConfig {
         // Keep only last 10 connections
         self.recent_connections.truncate(MAX_RECENT_CONNECTIONS);
         Ok(())
+    }
+
+    pub fn add_recent_sql_file(&mut self, path: &std::path::Path) {
+        let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent_sql_files
+            .retain(|existing| existing != &normalized_path);
+        self.recent_sql_files.insert(0, normalized_path);
+        self.recent_sql_files.truncate(MAX_RECENT_SQL_FILES);
     }
 
     pub fn get_connection_by_name(&self, name: &str) -> Option<&ConnectionInfo> {
@@ -414,6 +425,29 @@ mod tests {
         assert_eq!(
             restored.connection_pool_size,
             super::DEFAULT_CONNECTION_POOL_SIZE
+        );
+    }
+
+    #[test]
+    fn recent_sql_files_are_deduplicated_and_limited_to_ten() {
+        let mut config = AppConfig::new();
+        for idx in 0..12 {
+            config.add_recent_sql_file(std::path::Path::new(&format!("/tmp/query_{idx}.sql")));
+        }
+        config.add_recent_sql_file(std::path::Path::new("/tmp/query_5.sql"));
+
+        assert_eq!(config.recent_sql_files.len(), super::MAX_RECENT_SQL_FILES);
+        assert_eq!(
+            config.recent_sql_files.first(),
+            Some(&std::path::PathBuf::from("/tmp/query_5.sql"))
+        );
+        assert_eq!(
+            config
+                .recent_sql_files
+                .iter()
+                .filter(|path| path.as_path() == std::path::Path::new("/tmp/query_5.sql"))
+                .count(),
+            1
         );
     }
 

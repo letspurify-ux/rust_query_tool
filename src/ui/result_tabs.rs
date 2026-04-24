@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
-use crate::ui::result_table::{LazyFetchCallback, ResultGridSqlExecuteCallback};
+use crate::ui::result_table::{
+    LazyFetchCallback, ResultGridSqlExecuteCallback, ResultTableContextActionCallback,
+};
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::ui::ResultTableWidget;
@@ -29,6 +31,7 @@ pub struct ResultTabsWidget {
     max_cell_display_chars: Arc<Mutex<usize>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     lazy_fetch_callback: LazyFetchCallback,
+    context_action_callback: ResultTableContextActionCallback,
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
 }
@@ -282,6 +285,20 @@ impl ResultTabsWidget {
             > 0
     }
 
+    fn should_consume_empty_tab_pointer_event(child_count: i32, ev: Event) -> bool {
+        child_count == 0
+            && matches!(
+                ev,
+                Event::Enter
+                    | Event::Move
+                    | Event::Push
+                    | Event::Drag
+                    | Event::Released
+                    | Event::Leave
+                    | Event::MouseWheel
+            )
+    }
+
     fn reset_tab_strip_left_anchor(&mut self) {
         // Re-applying overflow mode resets FLTK's internal tab offset,
         // keeping the visible strip anchored from the left. Skip transient
@@ -293,6 +310,8 @@ impl ResultTabsWidget {
             self.tabs.h(),
         ) {
             self.tabs.handle_overflow(TabsOverflow::Pulldown);
+        } else {
+            self.tabs.handle_overflow(TabsOverflow::Compress);
         }
     }
 
@@ -497,7 +516,7 @@ impl ResultTabsWidget {
         // Keep tab header widths stable while surrounding panes are resized.
         // `Compress` dynamically shrinks/expands tab buttons as width changes,
         // which causes distracting header size jumps during splitter drags.
-        tabs.handle_overflow(TabsOverflow::Pulldown);
+        tabs.handle_overflow(TabsOverflow::Compress);
 
         let data = Arc::new(Mutex::new(Vec::<ResultTab>::new()));
         let active_index = Arc::new(Mutex::new(None));
@@ -509,6 +528,7 @@ impl ResultTabsWidget {
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let lazy_fetch_callback: LazyFetchCallback = Arc::new(Mutex::new(None));
+        let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
         let on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
             Arc::new(Mutex::new(None));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
@@ -589,6 +609,9 @@ impl ResultTabsWidget {
             if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
                 return true;
             }
+            if Self::should_consume_empty_tab_pointer_event(tabs.children(), ev) {
+                return true;
+            }
             if matches!(ev, Event::MouseWheel)
                 && Self::should_reapply_tab_overflow_mode_on_wheel(
                     tabs.children(),
@@ -647,6 +670,7 @@ impl ResultTabsWidget {
             max_cell_display_chars,
             execute_sql_callback,
             lazy_fetch_callback,
+            context_action_callback,
             on_change_callback,
             suppress_pointer_event_depth,
         }
@@ -842,6 +866,7 @@ impl ResultTabsWidget {
             .clone();
         table.set_execute_sql_callback(execute_sql_callback);
         table.set_lazy_fetch_callback(self.lazy_fetch_callback.clone());
+        table.set_context_action_callback(self.context_action_callback.clone());
         let widget = table.get_widget();
         group.resizable(&widget);
         group.end();
@@ -1196,6 +1221,36 @@ impl ResultTabsWidget {
         }
     }
 
+    pub fn set_context_action_callback(&mut self, callback: ResultTableContextActionCallback) {
+        let mut guard = self
+            .context_action_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(Box::new(move |action| {
+            let mut callback_fn = callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(callback_fn) = callback_fn.as_mut() {
+                callback_fn(action);
+            }
+            let mut callback_guard = callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if callback_guard.is_none() {
+                *callback_guard = callback_fn;
+            }
+        }));
+        let tabs = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tab in tabs.iter() {
+            let mut table = tab.table.clone();
+            table.set_context_action_callback(self.context_action_callback.clone());
+        }
+    }
+
     pub fn export_to_csv(&self) -> String {
         self.current_table()
             .map(|table| table.export_to_csv())
@@ -1408,7 +1463,7 @@ impl ResultTabsWidget {
 
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
-        let tab = {
+        let (tab, replacement_group) = {
             let mut data = self
                 .data
                 .lock()
@@ -1416,9 +1471,25 @@ impl ResultTabsWidget {
             if index >= data.len() {
                 return None;
             }
-            data.remove(index)
+            let replacement_group = if data.len() > 1 {
+                let replacement_index = if index + 1 < data.len() {
+                    index + 1
+                } else {
+                    index.saturating_sub(1)
+                };
+                data.get(replacement_index).map(|tab| tab.group.clone())
+            } else {
+                None
+            };
+            (data.remove(index), replacement_group)
         };
         let lazy_fetch_session = tab.table.active_lazy_fetch_session();
+
+        if let Some(group) = replacement_group.as_ref() {
+            if !self.tabs.was_deleted() && !group.was_deleted() {
+                let _ = self.tabs.set_value(group);
+            }
+        }
 
         self.delete_tab(tab);
 
@@ -1477,6 +1548,7 @@ impl ResultTabsWidget {
         }
 
         if !self.tabs.was_deleted() {
+            self.reset_tab_strip_left_anchor();
             self.tabs.redraw();
         }
         self.fire_on_change_callback();
@@ -1535,6 +1607,7 @@ mod tests {
     use crate::db::QueryResult;
     use crate::ui::result_table::LazyFetchCallback;
     use crate::ui::sql_editor::LazyFetchRequest;
+    use fltk::enums::Event;
 
     use super::{ResultTabStatus, ResultTabsWidget};
     use std::sync::{Arc, Mutex};
@@ -1561,6 +1634,30 @@ mod tests {
         ));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 0, 240));
         assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 320, 0));
+    }
+
+    #[test]
+    fn empty_result_tabs_consume_pointer_events() {
+        assert!(ResultTabsWidget::should_consume_empty_tab_pointer_event(
+            0,
+            Event::Push
+        ));
+        assert!(ResultTabsWidget::should_consume_empty_tab_pointer_event(
+            0,
+            Event::Released
+        ));
+        assert!(ResultTabsWidget::should_consume_empty_tab_pointer_event(
+            0,
+            Event::MouseWheel
+        ));
+        assert!(!ResultTabsWidget::should_consume_empty_tab_pointer_event(
+            1,
+            Event::Push
+        ));
+        assert!(!ResultTabsWidget::should_consume_empty_tab_pointer_event(
+            0,
+            Event::KeyDown
+        ));
     }
 
     #[test]

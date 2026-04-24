@@ -29,7 +29,7 @@ use crate::db::{
     SharedConnection, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
-use crate::ui::result_table::ResultGridSqlExecuteCallback;
+use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
@@ -1811,6 +1811,249 @@ impl MainWindow {
         Ok(result_tabs.export_to_csv_after_fetch_all(callback))
     }
 
+    fn sync_recent_sql_file_menu(recent_sql_files: &[PathBuf]) {
+        let recent_sql_files = recent_sql_files.to_vec();
+        app::add_timeout3(0.0, move |_| {
+            if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
+                MenuBarBuilder::sync_recent_sql_file_items(&mut menu, &recent_sql_files);
+            }
+        });
+    }
+
+    fn record_recent_sql_file(state: &mut AppState, path: &Path) {
+        let (recent_sql_files, save_result) = {
+            let mut config = state
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            config.add_recent_sql_file(path);
+            let recent_sql_files = config.recent_sql_files.clone();
+            let save_result = config.save().map_err(|err| err.to_string());
+            (recent_sql_files, save_result)
+        };
+        Self::sync_recent_sql_file_menu(&recent_sql_files);
+        if let Err(err) = save_result {
+            crate::utils::logging::log_warning(
+                "config",
+                &format!("Failed to save recent SQL file history: {err}"),
+            );
+        }
+    }
+
+    fn open_sql_file_path(
+        state: &Arc<Mutex<AppState>>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+        path: PathBuf,
+    ) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+
+        {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
+                MainWindow::record_recent_sql_file(&mut s, &path);
+                return;
+            }
+            let conn_info = s
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let file_label = path.file_name().unwrap_or_default().to_string_lossy();
+            s.status_bar.set_label(&format_status(
+                &format!("Opening {} in new tab", file_label),
+                &conn_info,
+            ));
+        }
+
+        let sender = file_sender.clone();
+        thread::spawn(move || {
+            let result = fs::read_to_string(&path).map_err(|err| err.to_string());
+            let _ = sender.send(FileActionResult::OpenInNewTab { path, result });
+            app::awake();
+        });
+    }
+
+    fn open_recent_sql_file_path(
+        state: &Arc<Mutex<AppState>>,
+        schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+        path: PathBuf,
+    ) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+
+        {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
+                MainWindow::record_recent_sql_file(&mut s, &path);
+                return;
+            }
+            let conn_info = s
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let file_label = path.file_name().unwrap_or_default().to_string_lossy();
+            s.status_bar.set_label(&format_status(
+                &format!("Opening {} in new tab", file_label),
+                &conn_info,
+            ));
+        }
+
+        let result = fs::read_to_string(&path).map_err(|err| err.to_string());
+        let mut created_tab: Option<QueryTabId> = None;
+        let mut created_editor: Option<SqlEditorWidget> = None;
+        let mut created_right_tile: Option<Tile> = None;
+        let mut deferred_alert: Option<String> = None;
+
+        {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match result {
+                Ok(content) => {
+                    if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
+                        MainWindow::record_recent_sql_file(&mut s, &path);
+                        return;
+                    }
+                    let normalized_content = MainWindow::normalize_line_endings_for_editor(content);
+                    if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
+                        s.sql_buffer.set_text(&normalized_content);
+                        s.sql_editor.reset_undo_redo_history();
+                        s.set_tab_file_path(tab_id, Some(path.clone()));
+                        s.set_tab_pristine_text(tab_id, normalized_content);
+                        created_editor = Some(s.sql_editor.clone());
+                        created_right_tile = Some(s.right_tile.clone());
+                        created_tab = Some(tab_id);
+                        MainWindow::record_recent_sql_file(&mut s, &path);
+                    }
+                }
+                Err(err) => {
+                    deferred_alert = Some(format!("Failed to open SQL file: {}", err));
+                }
+            }
+        }
+
+        if let Some(alert_msg) = deferred_alert {
+            fltk::dialog::alert_default(&alert_msg);
+        }
+
+        if let Some(tab_id) = created_tab {
+            MainWindow::attach_editor_callbacks(state, tab_id, schema_sender.clone());
+            MainWindow::attach_file_drop_callback(state, tab_id, file_sender.clone());
+            if let Some(mut editor) = created_editor {
+                editor.focus();
+            }
+            if let Some(mut right_tile) = created_right_tile {
+                right_tile.redraw();
+            }
+            app::redraw();
+        }
+    }
+
+    fn export_current_results_to_csv(
+        state: &Arc<Mutex<AppState>>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+    ) {
+        let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
+        dialog.set_filter("CSV Files\t*.csv");
+        dialog.show();
+        let filename = dialog.filename();
+        if filename.as_os_str().is_empty() {
+            return;
+        }
+
+        let sender = file_sender.clone();
+        let deferred_sender = sender.clone();
+        let deferred_filename = filename.clone();
+        let export = match MainWindow::prepare_result_export(
+            state,
+            Box::new(move |csv, row_count| {
+                let sender = deferred_sender.clone();
+                let filename = deferred_filename.clone();
+                thread::spawn(move || {
+                    let result = fs::write(&filename, csv).map_err(|err| err.to_string());
+                    let _ = sender.send(FileActionResult::Export {
+                        path: filename,
+                        row_count,
+                        result,
+                    });
+                    app::awake();
+                });
+            }),
+        ) {
+            Ok(export) => export,
+            Err(message) => {
+                fltk::dialog::alert_default(&message);
+                return;
+            }
+        };
+        let Some((csv, row_count)) = export else {
+            return;
+        };
+        thread::spawn(move || {
+            let result = fs::write(&filename, csv).map_err(|err| err.to_string());
+            let _ = sender.send(FileActionResult::Export {
+                path: filename,
+                row_count,
+                result,
+            });
+            app::awake();
+        });
+    }
+
+    fn close_current_result_tab(state: &Arc<Mutex<AppState>>) {
+        let query_running = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_any_query_running();
+        if query_running {
+            fltk::dialog::alert_default("A query is running. Stop it before closing tabs.");
+            return;
+        }
+        let lazy_fetch_sessions = {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let tab_count_before_close = s.result_tabs.tab_count();
+            let closed = s.result_tabs.close_current_tab_and_take_lazy_fetch();
+            if let Some((closed_tab_index, lazy_fetch_session)) = closed {
+                let mut sessions_to_cancel =
+                    s.mark_result_tab_closed_by_index(closed_tab_index, tab_count_before_close);
+                if let Some(session_id) = lazy_fetch_session {
+                    s.mark_lazy_fetch_result_tab_closed(session_id);
+                    AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
+                }
+                for session_id in s.abort_lazy_fetches_without_result_tab_mapping() {
+                    AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
+                }
+                malloc_trim_process();
+                s.refresh_result_edit_controls();
+                app::redraw();
+                sessions_to_cancel
+            } else {
+                s.result_tabs.close_current_script_output_tab();
+                s.refresh_result_edit_controls();
+                app::redraw();
+                Vec::new()
+            }
+        };
+        for session_id in lazy_fetch_sessions {
+            AppState::request_lazy_fetch_on_editors(
+                state,
+                session_id,
+                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+            );
+        }
+    }
+
     fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
         let weak_state = Arc::downgrade(state);
         app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
@@ -2025,6 +2268,7 @@ impl MainWindow {
             (s.tab_file_path(tab_id), sql_text)
         };
 
+        let should_record_recent = force_save_as || current_file.is_none();
         let target_path = if force_save_as { None } else { current_file }.or_else(|| {
             let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
             dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
@@ -2050,6 +2294,9 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         s.set_tab_file_path(tab_id, Some(path.clone()));
         s.set_tab_pristine_text(tab_id, sql_text);
+        if should_record_recent {
+            MainWindow::record_recent_sql_file(&mut s, &path);
+        }
         let file_label = path.file_name().unwrap_or_default().to_string_lossy();
         s.set_status_message(&format!("Saved {}", file_label));
         SaveTabOutcome::Saved
@@ -2135,7 +2382,7 @@ impl MainWindow {
         let mut main_flex = Flex::default_fill();
         main_flex.set_type(FlexType::Column);
 
-        let menu_bar = MenuBarBuilder::build();
+        let menu_bar = MenuBarBuilder::build_with_recent_sql_files(&config.recent_sql_files);
         main_flex.fixed(&menu_bar, MENU_BAR_HEIGHT);
 
         let mut query_toolbar = Flex::default();
@@ -2807,50 +3054,7 @@ impl MainWindow {
             let Some(state_for_result_close) = weak_state_for_result_close.upgrade() else {
                 return;
             };
-            let query_running = state_for_result_close
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_any_query_running();
-            if query_running {
-                fltk::dialog::alert_default("A query is running. Stop it before closing tabs.");
-                return;
-            }
-            let lazy_fetch_sessions = {
-                let mut s = state_for_result_close
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let tab_count_before_close = s.result_tabs.tab_count();
-                let closed = s.result_tabs.close_current_tab_and_take_lazy_fetch();
-                if let Some((closed_tab_index, lazy_fetch_session)) = closed {
-                    let mut sessions_to_cancel =
-                        s.mark_result_tab_closed_by_index(closed_tab_index, tab_count_before_close);
-                    if let Some(session_id) = lazy_fetch_session {
-                        s.mark_lazy_fetch_result_tab_closed(session_id);
-                        AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
-                    }
-                    for session_id in s.abort_lazy_fetches_without_result_tab_mapping() {
-                        AppState::push_unique_session_id(&mut sessions_to_cancel, session_id);
-                    }
-                    // A result tab drop can release large row buffers.
-                    // Ask allocator to return free pages promptly.
-                    malloc_trim_process();
-                    s.refresh_result_edit_controls();
-                    app::redraw();
-                    sessions_to_cancel
-                } else {
-                    s.result_tabs.close_current_script_output_tab();
-                    s.refresh_result_edit_controls();
-                    app::redraw();
-                    Vec::new()
-                }
-            };
-            for session_id in lazy_fetch_sessions {
-                AppState::request_lazy_fetch_on_editors(
-                    &state_for_result_close,
-                    session_id,
-                    crate::ui::sql_editor::LazyFetchRequest::Cancel,
-                );
-            }
+            MainWindow::close_current_result_tab(&state_for_result_close);
         });
 
         let weak_state_for_result_clear = Arc::downgrade(&state);
@@ -4682,6 +4886,7 @@ impl MainWindow {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
+                    MainWindow::record_recent_sql_file(&mut s, &path);
                     return;
                 }
                 let conn_info = s
@@ -4712,6 +4917,33 @@ impl MainWindow {
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
         choice: &str,
     ) -> bool {
+        if let Some(index) = MenuBarBuilder::recent_sql_file_choice_index(choice) {
+            let path = {
+                let s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let config = s
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                config.recent_sql_files.get(index).cloned()
+            };
+            if let Some(path) = path {
+                let state = state.clone();
+                let schema_sender = schema_sender.clone();
+                let file_sender = file_sender.clone();
+                app::add_timeout3(0.0, move |_| {
+                    MainWindow::open_recent_sql_file_path(
+                        &state,
+                        &schema_sender,
+                        &file_sender,
+                        path.clone(),
+                    );
+                });
+            }
+            return true;
+        }
+
         match choice {
             "File/Connect" => {
                 let block_message = {
@@ -4845,25 +5077,7 @@ impl MainWindow {
                 dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
                 dialog.show();
                 let filename = dialog.filename();
-                if !filename.as_os_str().is_empty() {
-                    {
-                        let mut s = state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &filename) {
-                            return true;
-                        }
-                    }
-                    let sender = file_sender.clone();
-                    thread::spawn(move || {
-                        let result = fs::read_to_string(&filename).map_err(|err| err.to_string());
-                        let _ = sender.send(FileActionResult::OpenInNewTab {
-                            path: filename,
-                            result,
-                        });
-                        app::awake();
-                    });
-                }
+                MainWindow::open_sql_file_path(state, file_sender, filename);
                 true
             }
             "File/Save SQL File" => {
@@ -5139,51 +5353,7 @@ impl MainWindow {
                 true
             }
             "Tools/Export Results" => {
-                let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
-                dialog.set_filter("CSV Files\t*.csv");
-                dialog.show();
-                let filename = dialog.filename();
-                if filename.as_os_str().is_empty() {
-                    return true;
-                }
-
-                let sender = file_sender.clone();
-                let deferred_sender = sender.clone();
-                let deferred_filename = filename.clone();
-                let export = match MainWindow::prepare_result_export(
-                    state,
-                    Box::new(move |csv, row_count| {
-                        let sender = deferred_sender.clone();
-                        let filename = deferred_filename.clone();
-                        thread::spawn(move || {
-                            let result = fs::write(&filename, csv).map_err(|err| err.to_string());
-                            let _ = sender.send(FileActionResult::Export {
-                                path: filename,
-                                row_count,
-                                result,
-                            });
-                            app::awake();
-                        });
-                    }),
-                ) {
-                    Ok(export) => export,
-                    Err(message) => {
-                        fltk::dialog::alert_default(&message);
-                        return true;
-                    }
-                };
-                let Some((csv, row_count)) = export else {
-                    return true;
-                };
-                thread::spawn(move || {
-                    let result = fs::write(&filename, csv).map_err(|err| err.to_string());
-                    let _ = sender.send(FileActionResult::Export {
-                        path: filename,
-                        row_count,
-                        result,
-                    });
-                    app::awake();
-                });
+                MainWindow::export_current_results_to_csv(state, file_sender);
                 true
             }
             "Edit/Find" => {
@@ -5641,6 +5811,36 @@ impl MainWindow {
         let (conn_sender, conn_receiver) = std::sync::mpsc::channel::<ConnectionResult>();
         let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
 
+        {
+            let weak_state_for_result_context = Arc::downgrade(&state);
+            let file_sender_for_result_context = file_sender.clone();
+            let callback = Arc::new(Mutex::new(Some(Box::new(
+                move |action: ResultTableContextAction| {
+                    let Some(state_for_result_context) = weak_state_for_result_context.upgrade()
+                    else {
+                        return;
+                    };
+                    match action {
+                        ResultTableContextAction::ExportCsv => {
+                            MainWindow::export_current_results_to_csv(
+                                &state_for_result_context,
+                                &file_sender_for_result_context,
+                            );
+                        }
+                        ResultTableContextAction::Close => {
+                            MainWindow::close_current_result_tab(&state_for_result_context);
+                        }
+                    }
+                },
+            )
+                as Box<dyn FnMut(ResultTableContextAction)>)));
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .result_tabs
+                .set_context_action_callback(callback);
+        }
+
         let tab_ids: Vec<QueryTabId> = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6072,6 +6272,7 @@ impl MainWindow {
                                         if MainWindow::focus_existing_tab_with_same_file_name(
                                             &mut s, &path,
                                         ) {
+                                            MainWindow::record_recent_sql_file(&mut s, &path);
                                             continue;
                                         }
                                         let normalized_content =
@@ -6087,6 +6288,7 @@ impl MainWindow {
                                             created_right_tile_for_open =
                                                 Some(s.right_tile.clone());
                                             created_tab_for_open = Some(tab_id);
+                                            MainWindow::record_recent_sql_file(&mut s, &path);
                                         }
                                     }
                                     Err(err) => {
@@ -6245,7 +6447,22 @@ impl MainWindow {
                 let Some(state_for_menu) = weak_state_for_menu.upgrade() else {
                     return;
                 };
-                let menu_path = m.item_pathname(None).ok().or_else(|| m.choice());
+                let recent_sql_file_count = state_for_menu
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recent_sql_files
+                    .len();
+                let recent_choice = MenuBarBuilder::recent_sql_file_slot_for_menu_value(
+                    m,
+                    m.value(),
+                    recent_sql_file_count,
+                )
+                .map(|slot| format!("File/Recent {}", slot + 1));
+                let menu_path =
+                    recent_choice.or_else(|| m.item_pathname(None).ok().or_else(|| m.choice()));
                 if let Some(path) = menu_path {
                     let choice = MainWindow::strip_menu_label_shortcut(&path);
                     if MainWindow::execute_menu_action(

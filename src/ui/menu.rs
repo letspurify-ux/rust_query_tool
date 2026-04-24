@@ -7,12 +7,14 @@ use fltk::{
     text::{TextBuffer, TextDisplay, WrapMode},
     window::Window,
 };
+use std::path::PathBuf;
 
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
 use crate::ui::{configured_editor_profile, configured_ui_font_size};
 use crate::utils::arithmetic::safe_div;
+use crate::utils::config::MAX_RECENT_SQL_FILES;
 
 pub struct MenuBarBuilder;
 
@@ -102,11 +104,104 @@ Runtime\n\
 
 impl MenuBarBuilder {
     pub fn build() -> MenuBar {
+        Self::build_with_recent_sql_files(&[])
+    }
+
+    pub fn build_with_recent_sql_files(recent_sql_files: &[PathBuf]) -> MenuBar {
         let mut menu = MenuBar::default();
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
         menu.set_id("main_menu");
+        Self::populate(&mut menu, recent_sql_files);
+        menu
+    }
 
+    pub fn sync_recent_sql_file_items(menu: &mut MenuBar, recent_sql_files: &[PathBuf]) {
+        menu.clear();
+        Self::populate(menu, recent_sql_files);
+        menu.redraw();
+    }
+
+    pub fn recent_sql_file_slot_for_menu_value(
+        menu: &MenuBar,
+        value: i32,
+        recent_sql_file_count: usize,
+    ) -> Option<usize> {
+        let first_idx = Self::recent_sql_file_first_index(menu)?;
+        if value < first_idx {
+            return None;
+        }
+        let slot = usize::try_from(value - first_idx).ok()?;
+        (slot < recent_sql_file_count.min(MAX_RECENT_SQL_FILES)).then_some(slot)
+    }
+
+    pub fn recent_sql_file_choice_index(choice: &str) -> Option<usize> {
+        choice
+            .strip_prefix("File/")
+            .and_then(Self::recent_sql_file_label_index)
+    }
+
+    fn recent_sql_file_first_index(menu: &MenuBar) -> Option<i32> {
+        let exit_idx = menu.find_index("&File/E&xit");
+        (exit_idx >= 0).then_some(exit_idx + 2)
+    }
+
+    fn recent_sql_file_label_index(label: &str) -> Option<usize> {
+        let rest = label.strip_prefix("Recent ")?;
+        let digits_len = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if digits_len == 0 {
+            return None;
+        }
+        let slot = rest[..digits_len].parse::<usize>().ok()?;
+        if !(1..=MAX_RECENT_SQL_FILES).contains(&slot) {
+            return None;
+        }
+        Some(slot - 1)
+    }
+
+    fn escape_menu_label(label: &str) -> String {
+        let mut escaped = String::with_capacity(label.len());
+        for ch in label.chars() {
+            if matches!(ch, '&' | '/' | '\\' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+
+    fn recent_sql_file_display_name(path: &std::path::Path) -> String {
+        path.file_name()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string())
+    }
+
+    fn recent_sql_file_menu_label(_slot: usize, path: &std::path::Path) -> String {
+        Self::escape_menu_label(&Self::recent_sql_file_display_name(path))
+    }
+
+    fn add_recent_sql_file_slots(menu: &mut MenuBar, recent_sql_files: &[PathBuf]) {
+        for (slot, path) in recent_sql_files
+            .iter()
+            .take(MAX_RECENT_SQL_FILES)
+            .enumerate()
+        {
+            let label = Self::recent_sql_file_menu_label(slot, path);
+            menu.add(
+                &format!("&File/{label}"),
+                Shortcut::None,
+                MenuFlag::Normal,
+                forward_menu_callback,
+            );
+        }
+    }
+
+    fn populate(menu: &mut MenuBar, recent_sql_files: &[PathBuf]) {
         // File menu
         menu.add(
             "&File/&Connect",
@@ -168,6 +263,13 @@ impl MenuBarBuilder {
             MenuFlag::Normal,
             forward_menu_callback,
         );
+        menu.add(
+            "&File/ ",
+            Shortcut::None,
+            MenuFlag::Inactive | MenuFlag::MenuDivider,
+            forward_menu_callback,
+        );
+        Self::add_recent_sql_file_slots(menu, recent_sql_files);
 
         // Edit menu
         menu.add(
@@ -470,7 +572,38 @@ impl MenuBarBuilder {
                 );
             },
         );
+    }
+}
 
-        menu
+#[cfg(test)]
+mod tests {
+    use super::MenuBarBuilder;
+
+    #[test]
+    fn recent_sql_file_choice_index_reads_numbered_file_menu_items() {
+        assert_eq!(
+            MenuBarBuilder::recent_sql_file_choice_index("File/Recent 1: query.sql"),
+            Some(0)
+        );
+        assert_eq!(
+            MenuBarBuilder::recent_sql_file_choice_index("File/Recent 10: query.sql"),
+            Some(9)
+        );
+        assert_eq!(
+            MenuBarBuilder::recent_sql_file_choice_index("File/Recent 11: query.sql"),
+            None
+        );
+    }
+
+    #[test]
+    fn recent_sql_file_menu_label_escapes_path_separators_and_accelerators() {
+        let label =
+            MenuBarBuilder::recent_sql_file_menu_label(0, std::path::Path::new("query.sql"));
+
+        assert_eq!(label, r"query.sql");
+        assert_eq!(
+            MenuBarBuilder::escape_menu_label("a&b/c_d\\e"),
+            r"a\&b\/c\_d\\e"
+        );
     }
 }
