@@ -239,9 +239,15 @@ pub enum QueryProgress {
         prompt: String,
         response: mpsc::Sender<Option<String>>,
     },
-    CancelOldestLazyFetchForSessionPool {
+    // Blocking cancel request; the worker waits on the response to decide
+    // whether to retry the pool acquire.
+    RequestCancelOldestLazyFetchForSessionPool {
         response: mpsc::Sender<bool>,
     },
+    // Fire-and-forget cancel notification; used when the worker cannot wait
+    // for a response (e.g. it is holding the connection mutex and must
+    // release promptly to avoid extending the mutex holding window).
+    NotifyCancelOldestLazyFetchForSessionPool,
     AutoCommitChanged {
         enabled: bool,
     },
