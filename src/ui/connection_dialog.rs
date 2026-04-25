@@ -1356,16 +1356,28 @@ impl ConnectionDialog {
                     if !keyring_load_failed {
                         pass_input_cb.set_value(&password);
                     }
-                    sync_oracle_mode_memory_from_info(&oracle_mode_memory_saved, conn);
-                    let oracle_mode = oracle_connect_mode_for_info(conn);
-                    *current_oracle_mode_saved
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = oracle_mode;
+                    // Only sync Oracle-specific state when the saved connection is
+                    // an Oracle connection. Loading a MySQL connection must not
+                    // overwrite the Oracle Direct-mode memory (host/port/service) or
+                    // reset the oracle mode choice, as doing so would show wrong
+                    // values if the user later switches DB type back to Oracle.
+                    let oracle_mode = if conn.db_type.supports_tns_alias() {
+                        sync_oracle_mode_memory_from_info(&oracle_mode_memory_saved, conn);
+                        let mode = oracle_connect_mode_for_info(conn);
+                        *current_oracle_mode_saved
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mode;
+                        oracle_mode_choice_cb
+                            .set_value(choice_index_from_oracle_connect_mode(mode));
+                        mode
+                    } else {
+                        *current_oracle_mode_saved
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    };
                     *current_db_type_saved
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = conn.db_type;
-                    oracle_mode_choice_cb
-                        .set_value(choice_index_from_oracle_connect_mode(oracle_mode));
                     dbtype_choice_cb.set_value(choice_index_from_db_type(conn.db_type));
                     if !conn.db_type.supports_tns_alias() {
                         service_input_cb.set_value(&conn.service_name);
@@ -2185,5 +2197,58 @@ mod tests {
         assert!(DatabaseType::Oracle
             .supported_transaction_isolations()
             .contains(&migrated.default_transaction_isolation));
+    }
+
+    #[test]
+    fn sync_oracle_mode_memory_from_info_updates_only_active_mode_fields() {
+        use crate::db::{ConnectionAdvancedSettings, ConnectionInfo, DatabaseType};
+        use std::sync::{Arc, Mutex};
+
+        let memory = Arc::new(Mutex::new(super::OracleModeFieldMemory {
+            direct_host: "prod-host".to_string(),
+            direct_port: "1521".to_string(),
+            direct_service: "PROD".to_string(),
+            tns_alias: "PROD_ALIAS".to_string(),
+        }));
+
+        // Loading a Direct Oracle connection updates only the direct_* fields.
+        let direct_conn = ConnectionInfo {
+            name: "direct".to_string(),
+            host: "dev-host".to_string(),
+            port: 1522,
+            service_name: "DEV".to_string(),
+            username: "dev".to_string(),
+            password: String::new(),
+            db_type: DatabaseType::Oracle,
+            advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
+        };
+        super::sync_oracle_mode_memory_from_info(&memory, &direct_conn);
+        {
+            let guard = memory.lock().unwrap();
+            assert_eq!(guard.direct_host, "dev-host");
+            assert_eq!(guard.direct_port, "1522");
+            assert_eq!(guard.direct_service, "DEV");
+            assert_eq!(guard.tns_alias, "PROD_ALIAS"); // tns_alias must not change
+        }
+
+        // Loading a TNS alias Oracle connection updates only tns_alias.
+        let tns_conn = ConnectionInfo {
+            name: "tns".to_string(),
+            host: String::new(), // empty host signals TNS alias
+            port: 0,
+            service_name: "DEV_ALIAS".to_string(),
+            username: "dev".to_string(),
+            password: String::new(),
+            db_type: DatabaseType::Oracle,
+            advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
+        };
+        super::sync_oracle_mode_memory_from_info(&memory, &tns_conn);
+        {
+            let guard = memory.lock().unwrap();
+            assert_eq!(guard.tns_alias, "DEV_ALIAS");
+            assert_eq!(guard.direct_host, "dev-host"); // direct_* must not change
+            assert_eq!(guard.direct_port, "1522");
+            assert_eq!(guard.direct_service, "DEV");
+        }
     }
 }
