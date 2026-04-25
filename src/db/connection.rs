@@ -936,6 +936,23 @@ pub fn take_reusable_pooled_session_lease(
         .map(|(lease, _)| lease)
 }
 
+/// Store a fresh lease in the slot only when the slot is empty, or when the
+/// stored entry references a different database backend (which can never be
+/// reused for the new lease anyway).
+///
+/// We deliberately do **not** evict an existing same-backend lease just because
+/// its `connection_generation` differs from the caller's. The caller's
+/// generation is captured at worker spawn time and may itself be stale relative
+/// to the live connection (for example, after a reconnect or a pool resize
+/// completes while a lazy fetch is still draining). Letting a stale-generation
+/// store evict a fresher entry would silently downgrade the cached session and
+/// — in the worst case — replace a healthy reusable session with one whose
+/// underlying `oracle::pool::Pool` / `mysql::Pool` is no longer the active
+/// pool. Stale entries that land in the slot are cleaned up automatically by
+/// the take path (`take_reusable_pooled_session_lease_with_state`) on the next
+/// reuse attempt, so refusing to store on generation mismatch only costs a
+/// single fresh acquire on the immediately following query — never silent
+/// corruption.
 pub fn store_pooled_session_lease_if_empty(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
@@ -950,10 +967,7 @@ pub fn store_pooled_session_lease_if_empty(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let should_store = match lease.as_ref() {
             None => true,
-            Some(existing) => {
-                existing.connection_generation != connection_generation
-                    || existing.lease.db_type() != lease_db_type
-            }
+            Some(existing) => existing.lease.db_type() != lease_db_type,
         };
         if should_store {
             let old_lease = lease.take();

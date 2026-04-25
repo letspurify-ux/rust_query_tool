@@ -131,6 +131,32 @@ fn oracle_transaction_actions_take_reusable_pool_session_exclusively() {
 }
 
 #[test]
+fn store_pooled_session_lease_if_empty_does_not_evict_on_generation_mismatch() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    // Locks in the fix for the cross-generation eviction bug:
+    // a worker whose captured `connection_generation` is stale (e.g. after a
+    // pool resize or reconnect completed while it was still draining a lazy
+    // fetch) must NOT evict a fresher entry that another worker just stored.
+    // The decision must depend only on whether the slot is empty or holds a
+    // different database backend.
+    assert!(
+        content.contains(
+            "let should_store = match lease.as_ref() {\n            None => true,\n            Some(existing) => existing.lease.db_type() != lease_db_type,\n        };"
+        ),
+        "store_pooled_session_lease_if_empty must only store when the slot is \
+         empty or holds a different db_type — never on connection_generation \
+         mismatch alone (otherwise stale workers can evict fresher entries)."
+    );
+    assert!(
+        !content.contains("existing.connection_generation != connection_generation\n                    || existing.lease.db_type() != lease_db_type"),
+        "Old eviction-on-generation-mismatch logic must remain removed."
+    );
+}
+
+#[test]
 fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
     let content = fs::read_to_string(&file)
