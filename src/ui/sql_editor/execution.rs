@@ -10122,22 +10122,73 @@ impl SqlEditorWidget {
                 false,
             )
         };
-        conn.query_drop(if auto_commit {
-            "SET autocommit=1"
-        } else {
-            "SET autocommit=0"
-        })
-        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
-        crate::db::DatabaseConnection::apply_mysql_transaction_mode(
+        if let Err(message) = Self::apply_mysql_pooled_execution_session_settings(
             &mut conn,
+            auto_commit,
             context.transaction_mode,
-        )?;
+        ) {
+            if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
+                crate::utils::logging::log_warning(
+                    "mysql pool session",
+                    &format!(
+                        "MySQL pooled session setup failed with a stale-session error; retrying once: {message}"
+                    ),
+                );
+                drop(conn);
+                let mut fresh_conn =
+                    Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+                fresh_conn = Self::prepare_mysql_pooled_session_or_retry_once(
+                    &context,
+                    session_pool_sender,
+                    fresh_conn,
+                )?;
+                Self::apply_mysql_pooled_execution_session_settings(
+                    &mut fresh_conn,
+                    auto_commit,
+                    context.transaction_mode,
+                )?;
+                return Ok((
+                    context.connection_generation,
+                    context.connection_info,
+                    fresh_conn,
+                    false,
+                ));
+            }
+
+            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
+                Self::release_mysql_pooled_session_if_current(
+                    shared_connection,
+                    pooled_db_session,
+                    context.connection_generation,
+                    conn,
+                    prior_may_have_uncommitted_work,
+                    db_activity,
+                );
+            } else {
+                drop(conn);
+            }
+            return Err(message);
+        }
         Ok((
             context.connection_generation,
             context.connection_info,
             conn,
             prior_may_have_uncommitted_work,
         ))
+    }
+
+    fn apply_mysql_pooled_execution_session_settings(
+        conn: &mut mysql::PooledConn,
+        auto_commit: bool,
+        transaction_mode: crate::db::TransactionMode,
+    ) -> Result<(), String> {
+        conn.query_drop(if auto_commit {
+            "SET autocommit=1"
+        } else {
+            "SET autocommit=0"
+        })
+        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+        crate::db::DatabaseConnection::apply_mysql_transaction_mode(conn, transaction_mode)
     }
 
     fn release_mysql_pooled_session(
@@ -10197,12 +10248,24 @@ impl SqlEditorWidget {
             return Ok(());
         };
 
-        conn.query_drop(if enabled {
+        if let Err(err) = conn.query_drop(if enabled {
             "SET autocommit=1"
         } else {
             "SET autocommit=0"
-        })
-        .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
+        }) {
+            let message = SqlEditorWidget::mysql_error_message(&err, None);
+            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
+                Self::release_mysql_pooled_session_if_current(
+                    shared_connection,
+                    pooled_db_session,
+                    connection_generation,
+                    conn,
+                    prior_may_have_uncommitted_work,
+                    db_activity,
+                );
+            }
+            return Err(message);
+        }
 
         let state_hint = MySqlSessionStateHint {
             clears_session_state: enabled,
@@ -10387,9 +10450,21 @@ impl SqlEditorWidget {
             &mut conn,
             query_timeout,
         ) {
+            let message = SqlEditorWidget::mysql_error_message(&err, query_timeout);
             Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
-            drop(conn);
-            return Err(SqlEditorWidget::mysql_error_message(&err, query_timeout));
+            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
+                Self::release_mysql_pooled_session_if_current(
+                    shared_connection,
+                    pooled_db_session,
+                    connection_generation,
+                    conn,
+                    prior_may_have_uncommitted_work,
+                    log_context,
+                );
+            } else {
+                drop(conn);
+            }
+            return Err(message);
         }
         if let Err(cancelled) = Self::abort_if_cancelled(cancel_flag) {
             if crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
