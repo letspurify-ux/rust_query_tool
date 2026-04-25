@@ -9783,7 +9783,6 @@ impl SqlEditorWidget {
     fn mysql_create_statement_is_temporary(sql: &str) -> bool {
         let cleaned = QueryExecutor::strip_leading_comments(sql);
         let mut words = cleaned
-            .trim()
             .split_whitespace()
             .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)));
         matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("CREATE"))
