@@ -214,10 +214,10 @@ impl Drop for QueryExecutionCleanupGuard {
                         conn.as_ref(),
                         "sql_editor::cleanup",
                     );
-                crate::db::set_pooled_session_may_have_uncommitted_work(
+                crate::db::store_pooled_session_lease_if_empty(
                     pooled_db_session,
                     *connection_generation,
-                    crate::db::DatabaseType::Oracle,
+                    DbSessionLease::Oracle(Arc::clone(conn)),
                     may_have_uncommitted_work,
                 );
             }
@@ -902,6 +902,51 @@ impl SqlEditorWidget {
         }
     }
 
+    fn acquire_fresh_oracle_pool_session_once(
+        pool: &crate::db::DbConnectionPool,
+        sender: &mpsc::Sender<QueryProgress>,
+    ) -> Result<DbPoolSession, String> {
+        match pool.acquire_session() {
+            Ok(session @ DbPoolSession::Oracle(_)) => Ok(session),
+            Ok(other) => Err(format!(
+                "Expected Oracle pool session but acquired {}",
+                other.db_type()
+            )),
+            Err(message)
+                if Self::session_pool_error_is_exhausted(&message)
+                    && Self::notify_cancel_oldest_lazy_fetch_for_session_pool(sender) =>
+            {
+                match Self::retry_oracle_pool_session_after_lazy_cancel(pool)? {
+                    session @ DbPoolSession::Oracle(_) => Ok(session),
+                    other => Err(format!(
+                        "Expected Oracle pool session but acquired {}",
+                        other.db_type()
+                    )),
+                }
+            }
+            Err(message) => Err(message),
+        }
+    }
+
+    fn acquire_fresh_oracle_pool_session(
+        pool: &crate::db::DbConnectionPool,
+        sender: &mpsc::Sender<QueryProgress>,
+    ) -> Result<DbPoolSession, String> {
+        match Self::acquire_fresh_oracle_pool_session_once(pool, sender) {
+            Ok(session) => Ok(session),
+            Err(message) if Self::oracle_pool_acquire_error_should_retry_fresh(&message) => {
+                crate::utils::logging::log_warning(
+                    "oracle pool session",
+                    &format!(
+                        "Oracle pool session acquire failed with a stale-session error; retrying once: {message}"
+                    ),
+                );
+                Self::acquire_fresh_oracle_pool_session_once(pool, sender)
+            }
+            Err(message) => Err(message),
+        }
+    }
+
     fn oracle_pool_acquire_error_should_retry_fresh(message: &str) -> bool {
         !Self::session_pool_error_is_exhausted(message)
             && !Self::oracle_error_message_allows_session_reuse(message)
@@ -1020,41 +1065,55 @@ impl SqlEditorWidget {
         pooled_db_session: &SharedDbSessionLease,
     ) -> (
         crate::db::ConnectionLockGuard<'a>,
-        Result<Option<Arc<Connection>>, String>,
+        Result<Option<(Arc<Connection>, bool)>, String>,
     ) {
         if has_connect_command {
             crate::db::clear_pooled_session_lease(pooled_db_session);
-            let result = Self::acquire_execution_connection(&mut conn_guard, sender, true);
+            let result = Self::acquire_execution_connection(&mut conn_guard, sender, true)
+                .map(|conn| conn.map(|conn| (conn, false)));
             return (conn_guard, result);
         }
 
         if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
             crate::db::clear_pooled_session_lease(pooled_db_session);
-            let result = Self::acquire_execution_connection(&mut conn_guard, sender, false);
+            let result = Self::acquire_execution_connection(&mut conn_guard, sender, false)
+                .map(|conn| conn.map(|conn| (conn, false)));
             return (conn_guard, result);
         }
 
         let connection_generation = conn_guard.connection_generation();
-        if let Some(conn) =
-            crate::db::current_oracle_pooled_session_lease(pooled_db_session, connection_generation)
+        if let Some((lease, prior_may_have_uncommitted_work)) =
+            crate::db::take_reusable_pooled_session_lease_with_state(
+                pooled_db_session,
+                connection_generation,
+                crate::db::DatabaseType::Oracle,
+            )
         {
+            let Some(conn) = lease.oracle_connection() else {
+                return (conn_guard, Err("Expected Oracle pool session".to_string()));
+            };
             let mut reuse_error = None;
             if conn.ping().is_ok() {
-                match crate::db::DatabaseConnection::apply_oracle_session_settings(
-                    conn.as_ref(),
-                    &conn_guard.get_info().advanced,
-                )
-                .and_then(|_| conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()))
-                {
-                    Ok(()) => return (conn_guard, Ok(Some(conn))),
+                let setup_result = if prior_may_have_uncommitted_work {
+                    Ok(())
+                } else {
+                    crate::db::DatabaseConnection::apply_oracle_session_settings(
+                        conn.as_ref(),
+                        &conn_guard.get_info().advanced,
+                    )
+                    .and_then(|_| conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()))
+                };
+                match setup_result {
+                    Ok(()) => {
+                        return (
+                            conn_guard,
+                            Ok(Some((conn, prior_may_have_uncommitted_work))),
+                        )
+                    }
                     Err(message) => reuse_error = Some(message),
                 }
             }
-            crate::db::clear_oracle_pooled_session_lease_if_current_connection(
-                pooled_db_session,
-                connection_generation,
-                &conn,
-            );
+            drop(lease);
             if let Some(message) = reuse_error {
                 if Self::oracle_pool_acquire_error_should_retry_fresh(&message) {
                     crate::utils::logging::log_warning(
@@ -1069,51 +1128,17 @@ impl SqlEditorWidget {
             }
         }
 
-        let pool_session = match conn_guard.acquire_pool_session() {
-            Ok(session) => session,
-            Err(message)
-                if Self::session_pool_error_is_exhausted(&message)
-                    && Self::notify_cancel_oldest_lazy_fetch_for_session_pool(sender) =>
-            {
-                // Snapshot the pool so the retry does not depend on the
-                // connection mutex, then release it so other threads can run.
-                let Some(pool) = conn_guard.get_pool() else {
-                    return (
-                        conn_guard,
-                        Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-                    );
-                };
-                drop(conn_guard);
-                let retry_result = Self::retry_oracle_pool_session_after_lazy_cancel(&pool);
-                conn_guard =
-                    lock_connection_with_activity(shared_connection, db_activity.to_string());
-                match retry_result {
-                    Ok(session) => Some(session),
-                    Err(message) => return (conn_guard, Err(message)),
-                }
-            }
-            Err(message) if Self::oracle_pool_acquire_error_should_retry_fresh(&message) => {
-                let Some(pool) = conn_guard.get_pool() else {
-                    return (
-                        conn_guard,
-                        Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-                    );
-                };
-                crate::utils::logging::log_warning(
-                    "oracle pool session",
-                    &format!(
-                        "Oracle pool session acquire failed with a stale-session error; retrying once: {message}"
-                    ),
-                );
-                drop(conn_guard);
-                let retry_result = pool.acquire_session();
-                conn_guard =
-                    lock_connection_with_activity(shared_connection, db_activity.to_string());
-                match retry_result {
-                    Ok(session) => Some(session),
-                    Err(message) => return (conn_guard, Err(message)),
-                }
-            }
+        let Some(pool) = conn_guard.get_pool() else {
+            return (
+                conn_guard,
+                Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+            );
+        };
+        drop(conn_guard);
+        let pool_session_result = Self::acquire_fresh_oracle_pool_session(&pool, sender);
+        conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
+        let pool_session = match pool_session_result {
+            Ok(session) => Some(session),
             Err(message) => return (conn_guard, Err(message)),
         };
 
@@ -1144,13 +1169,7 @@ impl SqlEditorWidget {
                     };
                     match conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()) {
                         Ok(()) => {
-                            crate::db::store_pooled_session_lease_if_empty(
-                                pooled_db_session,
-                                connection_generation,
-                                lease,
-                                false,
-                            );
-                            return (conn_guard, Ok(Some(conn)));
+                            return (conn_guard, Ok(Some((conn, false))));
                         }
                         Err(message)
                             if !retried_current_schema
@@ -1171,7 +1190,8 @@ impl SqlEditorWidget {
                             drop(conn);
                             drop(lease);
                             drop(conn_guard);
-                            let retry_result = pool.acquire_session();
+                            let retry_result =
+                                Self::acquire_fresh_oracle_pool_session(&pool, sender);
                             conn_guard = lock_connection_with_activity(
                                 shared_connection,
                                 db_activity.to_string(),
@@ -1199,7 +1219,8 @@ impl SqlEditorWidget {
                 }
             }
             _ => {
-                let result = Self::acquire_execution_connection(&mut conn_guard, sender, false);
+                let result = Self::acquire_execution_connection(&mut conn_guard, sender, false)
+                    .map(|conn| conn.map(|conn| (conn, false)));
                 (conn_guard, result)
             }
         }
@@ -1799,7 +1820,19 @@ impl SqlEditorWidget {
                         && timeout_reset_ok
                         && read_only_close_ok
                         && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
-                    if !should_keep_session {
+                    if should_keep_session {
+                        let may_have_uncommitted_work =
+                            Self::oracle_session_may_have_uncommitted_work(
+                                conn.as_ref(),
+                                "oracle lazy fetch cleanup",
+                            );
+                        crate::db::store_pooled_session_lease_if_empty(
+                            &pooled_db_session,
+                            connection_generation,
+                            DbSessionLease::Oracle(Arc::clone(&conn)),
+                            may_have_uncommitted_work,
+                        );
+                    } else {
                         crate::db::clear_oracle_pooled_session_lease_if_current_connection(
                             &pooled_db_session,
                             connection_generation,
@@ -3887,8 +3920,11 @@ impl SqlEditorWidget {
                         &pooled_db_session,
                     );
                 let conn_guard = guard_after_acquire;
-                let mut conn_opt = match acquire_result {
-                    Ok(conn) => conn,
+                let (mut conn_opt, oracle_prior_may_have_uncommitted_work) = match acquire_result {
+                    Ok(Some((conn, prior_may_have_uncommitted_work))) => {
+                        (Some(conn), prior_may_have_uncommitted_work)
+                    }
+                    Ok(None) => (None, false),
                     Err(message) => {
                         SqlEditorWidget::emit_execution_startup_error(
                             &sender,
@@ -3958,11 +3994,13 @@ impl SqlEditorWidget {
 
                 if let Some(conn) = conn_opt.as_ref() {
                     cleanup.track_timeout(Arc::clone(conn), previous_timeout);
-                    cleanup.track_oracle_pooled_session(
-                        Arc::clone(&pooled_db_session),
-                        connection_generation,
-                        Arc::clone(conn),
-                    );
+                    if !startup_policy.has_connect_command {
+                        cleanup.track_oracle_pooled_session(
+                            Arc::clone(&pooled_db_session),
+                            connection_generation,
+                            Arc::clone(conn),
+                        );
+                    }
                 }
 
                 let explicit_transaction_first_statement =
@@ -3974,6 +4012,8 @@ impl SqlEditorWidget {
                 };
                 let requires_transaction_first_statement = explicit_transaction_first_statement
                     || db_type.transaction_mode_requires_first_statement(transaction_mode);
+                let should_apply_oracle_transaction_mode =
+                    !oracle_prior_may_have_uncommitted_work;
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
@@ -3988,21 +4028,27 @@ impl SqlEditorWidget {
                         );
                         return;
                     }
-                    if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
-                        conn.as_ref(),
-                        transaction_mode,
-                    ) {
-                        SqlEditorWidget::emit_execution_startup_error(
-                            &sender,
-                            script_mode,
-                            &sql_text,
-                            &conn_name,
-                            &err,
-                            Some(&session),
-                        );
-                        return;
+                    if should_apply_oracle_transaction_mode {
+                        if let Err(err) =
+                            crate::db::DatabaseConnection::apply_oracle_transaction_mode(
+                                conn.as_ref(),
+                                transaction_mode,
+                            )
+                        {
+                            SqlEditorWidget::emit_execution_startup_error(
+                                &sender,
+                                script_mode,
+                                &sql_text,
+                                &conn_name,
+                                &err,
+                                Some(&session),
+                            );
+                            return;
+                        }
                     }
-                    if transaction_mode.access_mode == crate::db::TransactionAccessMode::ReadOnly {
+                    if should_apply_oracle_transaction_mode
+                        && transaction_mode.access_mode == crate::db::TransactionAccessMode::ReadOnly
+                    {
                         cleanup.track_oracle_read_only_transaction(Arc::clone(conn));
                     }
                     if !requires_transaction_first_statement {
@@ -7418,8 +7464,9 @@ impl SqlEditorWidget {
                                         session_id,
                                         query_timeout,
                                         previous_timeout,
-                                        transaction_mode.access_mode
-                                            == crate::db::TransactionAccessMode::ReadOnly,
+                                        should_apply_oracle_transaction_mode
+                                            && transaction_mode.access_mode
+                                                == crate::db::TransactionAccessMode::ReadOnly,
                                     ) {
                                         Ok(()) => {
                                             // The lazy worker now owns this pooled connection and

@@ -899,35 +899,6 @@ pub fn clear_oracle_pooled_session_lease_if_current_connection(
     lease_to_drop.is_some()
 }
 
-pub fn current_oracle_pooled_session_lease(
-    pooled_db_session: &SharedDbSessionLease,
-    connection_generation: u64,
-) -> Option<Arc<Connection>> {
-    let mut lease_to_drop = None;
-    let conn = {
-        let mut lease = pooled_db_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match lease.as_ref() {
-            Some(existing) if existing.connection_generation == connection_generation => {
-                if let Some(conn) = existing.lease.oracle_connection() {
-                    Some(conn)
-                } else {
-                    lease_to_drop = lease.take();
-                    None
-                }
-            }
-            Some(_) => {
-                lease_to_drop = lease.take();
-                None
-            }
-            None => None,
-        }
-    };
-    drop(lease_to_drop);
-    conn
-}
-
 pub fn take_reusable_pooled_session_lease_with_state(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
@@ -1000,25 +971,6 @@ pub fn store_pooled_session_lease_if_empty(
     };
     drop(old_lease_to_drop);
     lease_to_store.is_none()
-}
-
-pub fn set_pooled_session_may_have_uncommitted_work(
-    pooled_db_session: &SharedDbSessionLease,
-    connection_generation: u64,
-    db_type: DatabaseType,
-    may_have_uncommitted_work: bool,
-) -> bool {
-    let mut lease = pooled_db_session
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(existing) = lease.as_mut() else {
-        return false;
-    };
-    if !existing.matches(connection_generation, db_type) {
-        return false;
-    }
-    existing.may_have_uncommitted_work = may_have_uncommitted_work;
-    true
 }
 
 pub fn pooled_session_lease_is_releasable(pooled_db_session: &SharedDbSessionLease) -> bool {

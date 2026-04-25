@@ -20,8 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::db::{
-    ColumnInfo, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, SharedDbSessionLease,
-    TableColumnDetail,
+    ColumnInfo, ConnectionInfo, DbSessionLease, QueryExecutor, QueryResult, SharedConnection,
+    SharedDbSessionLease, TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -1033,13 +1033,6 @@ impl SqlEditorWidget {
             .is_some()
     }
 
-    fn current_oracle_pooled_lease(
-        pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-    ) -> Option<Arc<Connection>> {
-        crate::db::current_oracle_pooled_session_lease(pooled_db_session, connection_generation)
-    }
-
     fn setup_progress_handler(
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
@@ -1729,11 +1722,14 @@ impl SqlEditorWidget {
                 let result = match conn_guard.db_type().execution_engine() {
                     crate::db::DbExecutionEngine::Oracle => {
                         let connection_generation = conn_guard.connection_generation();
-                        let pooled_conn = SqlEditorWidget::current_oracle_pooled_lease(
+                        let pooled_lease = crate::db::take_reusable_pooled_session_lease_with_state(
                             &pooled_db_session,
                             connection_generation,
-                        );
-                        if let Some(db_conn) = pooled_conn {
+                            crate::db::DatabaseType::Oracle,
+                        )
+                        .and_then(|(lease, _)| lease.oracle_connection().map(|conn| (lease, conn)));
+                        if let Some((lease, db_conn)) = pooled_lease {
+                            drop(conn_guard);
                             SqlEditorWidget::set_current_query_connection(
                                 &current_query_connection,
                                 Some(Arc::clone(&db_conn)),
@@ -1755,28 +1751,25 @@ impl SqlEditorWidget {
                                         message,
                                     )
                                 });
-                            if should_clear_pooled_conn {
-                                crate::db::clear_oracle_pooled_session_lease_if_current_connection(
-                                    &pooled_db_session,
-                                    connection_generation,
-                                    &db_conn,
-                                );
-                            } else {
+                            if !should_clear_pooled_conn {
                                 let may_have_uncommitted_work =
                                     SqlEditorWidget::oracle_session_may_have_uncommitted_work(
                                         db_conn.as_ref(),
                                         activity_label,
                                     );
-                                crate::db::set_pooled_session_may_have_uncommitted_work(
+                                crate::db::store_pooled_session_lease_if_empty(
                                     &pooled_db_session,
                                     connection_generation,
-                                    crate::db::DatabaseType::Oracle,
+                                    DbSessionLease::Oracle(Arc::clone(&db_conn)),
                                     may_have_uncommitted_work,
                                 );
                             }
+                            drop(lease);
                             result
                         } else {
-                            match conn_guard.require_live_connection() {
+                            let primary_conn = conn_guard.require_live_connection();
+                            drop(conn_guard);
+                            match primary_conn {
                                 Ok(db_conn) => {
                                     SqlEditorWidget::set_current_query_connection(
                                         &current_query_connection,
