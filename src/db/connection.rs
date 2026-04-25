@@ -872,27 +872,6 @@ pub fn pooled_session_lease_snapshot(
         })
 }
 
-pub fn clear_pooled_session_lease_if_current(
-    pooled_db_session: &SharedDbSessionLease,
-    connection_generation: u64,
-    db_type: DatabaseType,
-) -> bool {
-    let lease_to_drop = {
-        let mut lease = pooled_db_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let should_clear = lease
-            .as_ref()
-            .is_some_and(|existing| existing.matches(connection_generation, db_type));
-        if should_clear {
-            lease.take()
-        } else {
-            None
-        }
-    };
-    lease_to_drop.is_some()
-}
-
 pub fn clear_oracle_pooled_session_lease_if_current_connection(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
@@ -944,15 +923,6 @@ pub fn take_reusable_pooled_session_lease_with_state(
     };
     drop(stale_lease_to_drop);
     reusable_lease
-}
-
-pub fn take_reusable_pooled_session_lease(
-    pooled_db_session: &SharedDbSessionLease,
-    connection_generation: u64,
-    db_type: DatabaseType,
-) -> Option<DbSessionLease> {
-    take_reusable_pooled_session_lease_with_state(pooled_db_session, connection_generation, db_type)
-        .map(|(lease, _)| lease)
 }
 
 pub fn store_pooled_session_lease_if_empty(

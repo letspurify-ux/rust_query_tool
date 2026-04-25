@@ -1027,11 +1027,6 @@ impl SqlEditorWidget {
         self.run_pooled_session_close_action(CloseSessionAction::Rollback)
     }
 
-    pub fn clear_pooled_db_session(&self) {
-        let _ = self.release_pooled_db_session();
-        self.cancel_active_lazy_fetch();
-    }
-
     pub fn request_lazy_fetch(&self, session_id: u64, request: LazyFetchRequest) -> bool {
         let handle = self
             .active_lazy_fetch
