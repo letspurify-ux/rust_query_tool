@@ -9962,6 +9962,11 @@ impl SqlEditorWidget {
             "exceeded maximum idle time",
             "failed to apply oracle call timeout",
             "failed to reset oracle call timeout",
+            "connection reset",
+            "connection timed out",
+            "broken pipe",
+            "dpi-1019",
+            "dpi-1041",
             "tns:",
         ]
         .iter()
@@ -9985,6 +9990,8 @@ impl SqlEditorWidget {
             "connection lost",
             "connection refused",
             "connection reset",
+            "connection timed out",
+            "connection was killed",
             "commands out of sync",
             "communications link failure",
             "can't connect to mysql server",
@@ -9998,15 +10005,19 @@ impl SqlEditorWidget {
             "failed to write to socket",
             "lost connection",
             "malformed packet",
+            "network is unreachable",
+            "no connection available",
             "not connected to database",
             "operation timed out",
             "packet out of order",
             "packets out of order",
+            "pool disconnected",
             "query execution was interrupted",
             "query was killed",
             "server closed the connection",
             "server has closed the connection",
             "server has gone away",
+            "server shutdown in progress",
             "unexpected eof",
         ]
         .iter()
@@ -11511,6 +11522,12 @@ mod query_execution_cleanup_tests {
             "DriverError { Malformed packet }",
             "unexpected EOF while reading packet",
             "Can't connect to MySQL server on '127.0.0.1'",
+            "Connection timed out (os error 60)",
+            "Network is unreachable (os error 51)",
+            "No connection available",
+            "Pool disconnected before a connection could be acquired",
+            "ERROR 1927 (70100): Connection was killed",
+            "ERROR 1053 (08S01): Server shutdown in progress",
         ] {
             let result: std::thread::Result<Result<(), String>> = Ok(Err(message.to_string()));
             assert!(
@@ -11542,6 +11559,18 @@ mod query_execution_cleanup_tests {
         ));
         assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
             "Failed to apply Oracle call timeout: DPI-1010: not connected"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "DPI-1019: not connected"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "TNS-12535: TNS:operation timed out"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Connection reset by peer"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Broken pipe"
         ));
     }
 

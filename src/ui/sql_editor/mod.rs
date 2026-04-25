@@ -1682,6 +1682,7 @@ impl SqlEditorWidget {
 
         let connection = self.connection.clone();
         let sender = self.ui_action_sender.clone();
+        let session_pool_sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
@@ -1795,7 +1796,7 @@ impl SqlEditorWidget {
                         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                             &connection,
                             &pooled_db_session,
-                            None,
+                            Some(&session_pool_sender),
                             &current_mysql_cancel_context,
                             &cancel_flag,
                             query_timeout,
