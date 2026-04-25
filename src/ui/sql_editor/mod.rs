@@ -901,16 +901,18 @@ impl SqlEditorWidget {
         if !Self::pooled_session_is_idle_for_release(
             self.is_query_running(),
             self.active_lazy_fetch_session(),
+            crate::db::pooled_session_lease_is_releasable(&self.pooled_db_session),
         ) {
             return false;
         }
-        self.release_pooled_db_session()
+        crate::db::clear_releasable_pooled_session_lease(&self.pooled_db_session)
     }
 
     pub fn has_idle_pooled_db_session(&self) -> bool {
         if !Self::pooled_session_is_idle_for_release(
             self.is_query_running(),
             self.active_lazy_fetch_session(),
+            crate::db::pooled_session_lease_is_releasable(&self.pooled_db_session),
         ) {
             return false;
         }
@@ -923,8 +925,9 @@ impl SqlEditorWidget {
     fn pooled_session_is_idle_for_release(
         query_running: bool,
         active_lazy_fetch_session: Option<u64>,
+        lease_releasable: bool,
     ) -> bool {
-        !query_running && active_lazy_fetch_session.is_none()
+        !query_running && active_lazy_fetch_session.is_none() && lease_releasable
     }
 
     pub fn clear_pooled_db_session(&self) {
@@ -1744,19 +1747,31 @@ impl SqlEditorWidget {
                                 activity_label,
                                 oracle_action,
                             );
-                            if result
+                            let should_clear_pooled_conn = result
                                 .as_ref()
                                 .err()
                                 .is_some_and(|message| {
                                     !SqlEditorWidget::oracle_error_message_allows_session_reuse(
                                         message,
                                     )
-                                })
-                            {
+                                });
+                            if should_clear_pooled_conn {
                                 crate::db::clear_oracle_pooled_session_lease_if_current_connection(
                                     &pooled_db_session,
                                     connection_generation,
                                     &db_conn,
+                                );
+                            } else {
+                                let may_have_uncommitted_work =
+                                    SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                        db_conn.as_ref(),
+                                        activity_label,
+                                    );
+                                crate::db::set_pooled_session_may_have_uncommitted_work(
+                                    &pooled_db_session,
+                                    connection_generation,
+                                    crate::db::DatabaseType::Oracle,
+                                    may_have_uncommitted_work,
                                 );
                             }
                             result
@@ -1794,7 +1809,8 @@ impl SqlEditorWidget {
                             activity_label,
                             auto_commit,
                             false,
-                            |mysql_conn| mysql_conn.query_drop(mysql_sql),
+                            SqlEditorWidget::mysql_session_state_hint_for_sql(mysql_sql),
+                            |mysql_conn: &mut mysql::PooledConn| mysql_conn.query_drop(mysql_sql),
                         )
                     }
                 };

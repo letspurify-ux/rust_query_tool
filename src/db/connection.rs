@@ -703,7 +703,13 @@ pub enum DbSessionLease {
     MySQL(mysql::PooledConn),
 }
 
-pub type SharedDbSessionLease = Arc<Mutex<Option<(u64, DbSessionLease)>>>;
+pub struct DbSessionLeaseEntry {
+    connection_generation: u64,
+    lease: DbSessionLease,
+    may_have_uncommitted_work: bool,
+}
+
+pub type SharedDbSessionLease = Arc<Mutex<Option<DbSessionLeaseEntry>>>;
 
 #[derive(Clone)]
 pub struct DbPoolSessionContext {
@@ -815,6 +821,24 @@ impl DbSessionLease {
     }
 }
 
+impl DbSessionLeaseEntry {
+    fn new(
+        connection_generation: u64,
+        lease: DbSessionLease,
+        may_have_uncommitted_work: bool,
+    ) -> Self {
+        Self {
+            connection_generation,
+            lease,
+            may_have_uncommitted_work,
+        }
+    }
+
+    fn matches(&self, connection_generation: u64, db_type: DatabaseType) -> bool {
+        self.connection_generation == connection_generation && self.lease.db_type() == db_type
+    }
+}
+
 pub fn create_shared_db_session_lease() -> SharedDbSessionLease {
     Arc::new(Mutex::new(None))
 }
@@ -838,9 +862,9 @@ pub fn clear_pooled_session_lease_if_current(
         let mut lease = pooled_db_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let should_clear = lease.as_ref().is_some_and(|(lease_generation, existing)| {
-            *lease_generation == connection_generation && existing.db_type() == db_type
-        });
+        let should_clear = lease
+            .as_ref()
+            .is_some_and(|existing| existing.matches(connection_generation, db_type));
         if should_clear {
             lease.take()
         } else {
@@ -859,10 +883,10 @@ pub fn clear_oracle_pooled_session_lease_if_current_connection(
         let mut lease = pooled_db_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let should_clear = lease.as_ref().is_some_and(|(lease_generation, existing)| {
-            *lease_generation == connection_generation
+        let should_clear = lease.as_ref().is_some_and(|existing| {
+            existing.connection_generation == connection_generation
                 && matches!(
-                    existing,
+                    &existing.lease,
                     DbSessionLease::Oracle(conn) if Arc::ptr_eq(conn, expected_conn)
                 )
         });
@@ -885,8 +909,8 @@ pub fn current_oracle_pooled_session_lease(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match lease.as_ref() {
-            Some((lease_generation, existing)) if *lease_generation == connection_generation => {
-                if let Some(conn) = existing.oracle_connection() {
+            Some(existing) if existing.connection_generation == connection_generation => {
+                if let Some(conn) = existing.lease.oracle_connection() {
                     Some(conn)
                 } else {
                     lease_to_drop = lease.take();
@@ -904,21 +928,23 @@ pub fn current_oracle_pooled_session_lease(
     conn
 }
 
-pub fn take_reusable_pooled_session_lease(
+pub fn take_reusable_pooled_session_lease_with_state(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
     db_type: DatabaseType,
-) -> Option<DbSessionLease> {
+) -> Option<(DbSessionLease, bool)> {
     let mut stale_lease_to_drop = None;
     let reusable_lease = {
         let mut lease = pooled_db_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reusable = lease.as_ref().is_some_and(|(generation, existing)| {
-            *generation == connection_generation && existing.db_type() == db_type
-        });
+        let reusable = lease
+            .as_ref()
+            .is_some_and(|existing| existing.matches(connection_generation, db_type));
         if reusable {
-            lease.take().map(|(_, lease)| lease)
+            lease
+                .take()
+                .map(|entry| (entry.lease, entry.may_have_uncommitted_work))
         } else {
             if lease.is_some() {
                 stale_lease_to_drop = lease.take();
@@ -930,10 +956,20 @@ pub fn take_reusable_pooled_session_lease(
     reusable_lease
 }
 
+pub fn take_reusable_pooled_session_lease(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    db_type: DatabaseType,
+) -> Option<DbSessionLease> {
+    take_reusable_pooled_session_lease_with_state(pooled_db_session, connection_generation, db_type)
+        .map(|(lease, _)| lease)
+}
+
 pub fn store_pooled_session_lease_if_empty(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
     lease_to_store: DbSessionLease,
+    may_have_uncommitted_work: bool,
 ) -> bool {
     let lease_db_type = lease_to_store.db_type();
     let mut lease_to_store = Some(lease_to_store);
@@ -943,14 +979,19 @@ pub fn store_pooled_session_lease_if_empty(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let should_store = match lease.as_ref() {
             None => true,
-            Some((existing_generation, existing)) => {
-                *existing_generation != connection_generation || existing.db_type() != lease_db_type
+            Some(existing) => {
+                existing.connection_generation != connection_generation
+                    || existing.lease.db_type() != lease_db_type
             }
         };
         if should_store {
             let old_lease = lease.take();
             if let Some(lease_to_store) = lease_to_store.take() {
-                *lease = Some((connection_generation, lease_to_store));
+                *lease = Some(DbSessionLeaseEntry::new(
+                    connection_generation,
+                    lease_to_store,
+                    may_have_uncommitted_work,
+                ));
             }
             old_lease
         } else {
@@ -959,6 +1000,50 @@ pub fn store_pooled_session_lease_if_empty(
     };
     drop(old_lease_to_drop);
     lease_to_store.is_none()
+}
+
+pub fn set_pooled_session_may_have_uncommitted_work(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    db_type: DatabaseType,
+    may_have_uncommitted_work: bool,
+) -> bool {
+    let mut lease = pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(existing) = lease.as_mut() else {
+        return false;
+    };
+    if !existing.matches(connection_generation, db_type) {
+        return false;
+    }
+    existing.may_have_uncommitted_work = may_have_uncommitted_work;
+    true
+}
+
+pub fn pooled_session_lease_is_releasable(pooled_db_session: &SharedDbSessionLease) -> bool {
+    pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|entry| !entry.may_have_uncommitted_work)
+}
+
+pub fn clear_releasable_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) -> bool {
+    let lease_to_drop = {
+        let mut lease = pooled_db_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lease
+            .as_ref()
+            .is_some_and(|entry| !entry.may_have_uncommitted_work)
+        {
+            lease.take()
+        } else {
+            None
+        }
+    };
+    lease_to_drop.is_some()
 }
 
 pub(crate) trait DbBackend: Sync {
