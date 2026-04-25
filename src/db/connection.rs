@@ -151,7 +151,9 @@ impl ConnectionAdvancedSettings {
         {
             settings.default_transaction_access_mode = self.default_transaction_access_mode;
         }
-        if self.session_time_zone != previous_defaults.session_time_zone {
+        if self.session_time_zone != previous_defaults.session_time_zone
+            && validate_session_time_zone_for_db(new_db_type, self.session_time_zone.trim()).is_ok()
+        {
             settings.session_time_zone = self.session_time_zone.clone();
         }
 
@@ -1992,6 +1994,16 @@ impl DatabaseConnection {
     }
 
     fn sync_default_transaction_isolation(&mut self, db_type: DatabaseType) {
+        let configured = self.info.advanced.default_transaction_isolation;
+        if configured != TransactionIsolation::Default
+            && db_type
+                .supported_transaction_isolations()
+                .contains(&configured)
+        {
+            self.default_transaction_isolation = configured;
+            return;
+        }
+
         self.default_transaction_isolation = self
             .read_current_default_transaction_isolation(db_type)
             .ok()
@@ -2910,6 +2922,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_default_transaction_isolation_trusts_applied_advanced_setting() {
+        let mut connection = DatabaseConnection::new();
+        connection.info = ConnectionInfo::new_with_type(
+            "local",
+            "system",
+            "pw",
+            "localhost",
+            1521,
+            "FREE",
+            DatabaseType::Oracle,
+        );
+        connection.info.advanced.default_transaction_isolation = TransactionIsolation::Serializable;
+
+        connection.sync_default_transaction_isolation(DatabaseType::Oracle);
+
+        assert_eq!(
+            connection.default_transaction_isolation(),
+            TransactionIsolation::Serializable
+        );
+    }
+
+    #[test]
     fn oracle_advanced_session_statements_use_configured_values() {
         let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
         advanced.default_transaction_isolation = TransactionIsolation::Serializable;
@@ -3049,6 +3083,19 @@ mod tests {
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
         oracle.session_time_zone = "+15:00".to_string();
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
+    }
+
+    #[test]
+    fn migrate_for_db_type_drops_session_time_zone_unsupported_by_target_db() {
+        let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        oracle.session_time_zone = "+14:59".to_string();
+
+        let migrated = oracle.migrate_for_db_type(DatabaseType::Oracle, DatabaseType::MySQL);
+
+        assert_eq!(
+            migrated.session_time_zone,
+            ConnectionAdvancedSettings::default_for(DatabaseType::MySQL).session_time_zone
+        );
     }
 
     #[test]
@@ -3795,12 +3842,16 @@ mod tests {
             .query_first::<String, _>("SELECT @@SESSION.collation_connection")
             .expect("read collation_connection")
             .unwrap_or_default();
+        let isolation = DatabaseConnection::read_mysql_default_transaction_isolation(conn)
+            .expect("read transaction isolation")
+            .expect("transaction isolation should be available");
 
         assert!(sql_mode.contains("ANSI_QUOTES"));
         assert!(sql_mode.contains("STRICT_TRANS_TABLES"));
         assert_eq!(time_zone, "+09:00");
         assert_eq!(character_set_client, "utf8mb4");
         assert_eq!(collation_connection, "utf8mb4_unicode_ci");
+        assert_eq!(isolation, TransactionIsolation::RepeatableRead);
     }
 
     #[test]
