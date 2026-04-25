@@ -93,6 +93,8 @@ struct ExecutionStartupPolicy {
 pub(super) struct MySqlSessionStateHint {
     clears_session_state: bool,
     may_leave_session_bound_state: bool,
+    may_hold_session_lock: bool,
+    requires_retention_when_autocommit_off: bool,
 }
 
 struct QueryExecutionCleanupGuard {
@@ -214,7 +216,7 @@ impl Drop for QueryExecutionCleanupGuard {
                         conn.as_ref(),
                         "sql_editor::cleanup",
                     );
-                crate::db::store_pooled_session_lease_if_empty(
+                crate::db::store_pooled_session_lease_if_retained(
                     pooled_db_session,
                     *connection_generation,
                     DbSessionLease::Oracle(Arc::clone(conn)),
@@ -1826,7 +1828,7 @@ impl SqlEditorWidget {
                                 conn.as_ref(),
                                 "oracle lazy fetch cleanup",
                             );
-                        crate::db::store_pooled_session_lease_if_empty(
+                        crate::db::store_pooled_session_lease_if_retained(
                             &pooled_db_session,
                             connection_generation,
                             DbSessionLease::Oracle(Arc::clone(&conn)),
@@ -1930,6 +1932,8 @@ impl SqlEditorWidget {
                     let mut fetched_rows = 0usize;
                     let mut last_select_row: Option<Vec<String>> = None;
                     let mut keep_session = false;
+                    let mut had_active_transaction_before_statement =
+                        prior_may_have_uncommitted_work;
                     let mut pending_commands = VecDeque::new();
                     let lazy_fetch_timeout = Self::lazy_fetch_query_timeout(query_timeout);
                     *lazy_cancel_context
@@ -1964,6 +1968,18 @@ impl SqlEditorWidget {
                                 "mysql lazy fetch cancel",
                             );
                             return Ok(LazyFetchWorkerOutcome::Cancelled);
+                        }
+                        if Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                            auto_commit,
+                            false,
+                            state_hint,
+                        ) {
+                            had_active_transaction_before_statement =
+                                Self::mysql_session_may_have_uncommitted_work(
+                                    conn,
+                                    "mysql lazy fetch preflight",
+                                    prior_may_have_uncommitted_work,
+                                );
                         }
                         let mut result =
                             conn.query_iter(sql_to_execute.as_str()).map_err(|err| {
@@ -2335,7 +2351,7 @@ impl SqlEditorWidget {
                     if should_release_session
                         && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
                             auto_commit,
-                            prior_may_have_uncommitted_work,
+                            had_active_transaction_before_statement,
                             state_hint,
                         )
                     {
@@ -2614,11 +2630,21 @@ impl SqlEditorWidget {
             source_path: None,
         }];
 
+        let mysql_batch_may_have_uncommitted_work = std::cell::Cell::new(false);
+        let mysql_batch_may_hold_session_lock = std::cell::Cell::new(false);
+        let mysql_batch_has_session_bound_state = std::cell::Cell::new(false);
+
         let execute_mysql_sql =
             |sql: &str, auto_commit: bool| -> Result<Vec<QueryResult>, String> {
                 let refresh_encoding_after =
                     crate::db::query::mysql_executor::MysqlExecutor::is_use_statement(sql);
-                let state_hint = SqlEditorWidget::mysql_session_state_hint_for_sql(sql);
+                let state_hint = SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+                    sql,
+                    auto_commit,
+                    &mysql_batch_may_have_uncommitted_work,
+                    &mysql_batch_may_hold_session_lock,
+                    &mysql_batch_has_session_bound_state,
+                );
                 SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                     shared_connection,
                     pooled_db_session,
@@ -3582,7 +3608,13 @@ impl SqlEditorWidget {
                                 let (colsep, null_text, _trimspool_enabled) =
                                     SqlEditorWidget::current_text_output_settings(session);
                                 let state_hint =
-                                    SqlEditorWidget::mysql_session_state_hint_for_sql(&sql_text);
+                                    SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+                                        &sql_text,
+                                        auto_commit,
+                                        &mysql_batch_may_have_uncommitted_work,
+                                        &mysql_batch_may_hold_session_lock,
+                                        &mysql_batch_has_session_bound_state,
+                                    );
                                 let session_id = next_lazy_fetch_session_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let _ = sender.send(QueryProgress::StatementStart {
@@ -3760,6 +3792,13 @@ impl SqlEditorWidget {
                 }
             }
         }
+        SqlEditorWidget::finalize_mysql_batch_pooled_session(
+            shared_connection,
+            pooled_db_session,
+            mysql_batch_may_have_uncommitted_work.get(),
+            mysql_batch_may_hold_session_lock.get(),
+            db_activity,
+        );
     }
 
     fn execute_sql(&self, sql: &str, script_mode: bool) {
@@ -9717,13 +9756,10 @@ impl SqlEditorWidget {
     ) -> bool {
         let has_active_transaction =
             Self::mysql_session_may_have_uncommitted_work(conn, log_context, fallback_on_error);
-        if state_hint.clears_session_state {
-            state_hint.may_leave_session_bound_state || has_active_transaction
-        } else {
-            prior_may_have_uncommitted_work
-                || state_hint.may_leave_session_bound_state
-                || has_active_transaction
-        }
+        has_active_transaction
+            || state_hint.may_hold_session_lock
+            || (prior_may_have_uncommitted_work && !state_hint.clears_session_state)
+            || (fallback_on_error && state_hint.requires_retention_when_autocommit_off)
     }
 
     fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
@@ -9783,11 +9819,151 @@ impl SqlEditorWidget {
         false
     }
 
+    fn mysql_statement_may_leave_uncommitted_work(sql: &str) -> bool {
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("INSERT")
+                | Some("UPDATE")
+                | Some("DELETE")
+                | Some("REPLACE")
+                | Some("WITH")
+                | Some("CALL")
+                | Some("START")
+                | Some("BEGIN")
+                | Some("SAVEPOINT")
+                | Some("XA")
+        )
+    }
+
+    fn mysql_statement_acquires_session_lock(sql: &str) -> bool {
+        match QueryExecutor::leading_keyword(sql).as_deref() {
+            Some("LOCK") => true,
+            Some("SELECT") => sql.to_ascii_uppercase().contains("GET_LOCK"),
+            _ => false,
+        }
+    }
+
+    fn mysql_statement_releases_session_lock(sql: &str) -> bool {
+        match QueryExecutor::leading_keyword(sql).as_deref() {
+            Some("UNLOCK") => true,
+            Some("SELECT") => {
+                let upper = sql.to_ascii_uppercase();
+                upper.contains("RELEASE_LOCK") || upper.contains("RELEASE_ALL_LOCKS")
+            }
+            _ => false,
+        }
+    }
+
+    fn mysql_select_assigns_user_variable(sql: &str) -> bool {
+        let cleaned = QueryExecutor::strip_leading_comments(sql);
+        let mut compact = cleaned.to_ascii_uppercase();
+        compact.retain(|ch| !ch.is_whitespace());
+        compact.contains("INTO@")
+    }
+
+    fn mysql_batch_session_state_hint_for_sql(
+        sql: &str,
+        auto_commit: bool,
+        batch_may_have_uncommitted_work: &std::cell::Cell<bool>,
+        batch_may_hold_session_lock: &std::cell::Cell<bool>,
+        batch_has_session_bound_state: &std::cell::Cell<bool>,
+    ) -> MySqlSessionStateHint {
+        let mut state_hint = SqlEditorWidget::mysql_session_state_hint_for_sql(sql);
+        if batch_has_session_bound_state.get()
+            && (QueryExecutor::is_plain_commit(sql)
+                || (QueryExecutor::is_plain_rollback(sql)
+                    && !SqlEditorWidget::mysql_rollback_targets_savepoint(sql)))
+        {
+            state_hint.clears_session_state = false;
+            state_hint.may_leave_session_bound_state = true;
+            state_hint.requires_retention_when_autocommit_off = true;
+        }
+
+        if Self::mysql_statement_releases_session_lock(sql) {
+            batch_may_hold_session_lock.set(false);
+        } else if Self::mysql_statement_acquires_session_lock(sql) {
+            batch_may_hold_session_lock.set(true);
+        }
+
+        if QueryExecutor::is_plain_commit(sql)
+            || (QueryExecutor::is_plain_rollback(sql)
+                && !SqlEditorWidget::mysql_rollback_targets_savepoint(sql))
+        {
+            batch_may_have_uncommitted_work
+                .set(SqlEditorWidget::mysql_transaction_control_starts_chain(sql));
+        } else if !auto_commit && SqlEditorWidget::mysql_statement_may_leave_uncommitted_work(sql) {
+            batch_may_have_uncommitted_work.set(true);
+        }
+
+        batch_has_session_bound_state
+            .set(batch_has_session_bound_state.get() || state_hint.may_leave_session_bound_state);
+
+        state_hint.clears_session_state = false;
+        state_hint.may_leave_session_bound_state = true;
+        state_hint.requires_retention_when_autocommit_off = true;
+        state_hint
+    }
+
+    fn finalize_mysql_batch_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        batch_may_have_uncommitted_work: bool,
+        batch_may_hold_session_lock: bool,
+        db_activity: &str,
+    ) {
+        let connection_generation = {
+            let conn_guard =
+                lock_connection_with_activity(shared_connection, db_activity.to_string());
+            conn_guard.connection_generation()
+        };
+        let Some((lease, prior_may_have_uncommitted_work)) =
+            crate::db::take_reusable_pooled_session_lease_with_state(
+                pooled_db_session,
+                connection_generation,
+                crate::db::DatabaseType::MySQL,
+            )
+        else {
+            return;
+        };
+        let Some(mut conn) = lease.into_mysql_connection() else {
+            return;
+        };
+
+        let server_reports_active_transaction = Self::mysql_session_may_have_uncommitted_work(
+            &mut conn,
+            db_activity,
+            batch_may_have_uncommitted_work || prior_may_have_uncommitted_work,
+        );
+        let should_retain = batch_may_hold_session_lock
+            || batch_may_have_uncommitted_work
+            || server_reports_active_transaction;
+        if should_retain {
+            Self::release_mysql_pooled_session_if_current(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                conn,
+                true,
+                db_activity,
+            );
+            return;
+        }
+
+        if let Err(err) = conn.query_drop("ROLLBACK") {
+            crate::utils::logging::log_error(
+                db_activity,
+                &format!("Failed to close MySQL batch-scoped session state: {err}"),
+            );
+        }
+    }
+
     pub(super) fn mysql_session_state_hint_for_sql(sql: &str) -> MySqlSessionStateHint {
         if QueryExecutor::is_plain_commit(sql) || QueryExecutor::is_plain_rollback(sql) {
             return MySqlSessionStateHint {
                 clears_session_state: true,
                 may_leave_session_bound_state: false,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: false,
             };
         }
 
@@ -9795,6 +9971,8 @@ impl SqlEditorWidget {
             return MySqlSessionStateHint {
                 clears_session_state: enabled,
                 may_leave_session_bound_state: !enabled,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: !enabled,
             };
         }
 
@@ -9805,11 +9983,15 @@ impl SqlEditorWidget {
                     MySqlSessionStateHint {
                         clears_session_state: false,
                         may_leave_session_bound_state: true,
+                        may_hold_session_lock: false,
+                        requires_retention_when_autocommit_off: true,
                     }
                 } else {
                     MySqlSessionStateHint {
                         clears_session_state: true,
                         may_leave_session_bound_state: false,
+                        may_hold_session_lock: false,
+                        requires_retention_when_autocommit_off: false,
                     }
                 }
             }
@@ -9818,11 +10000,15 @@ impl SqlEditorWidget {
                     MySqlSessionStateHint {
                         clears_session_state: false,
                         may_leave_session_bound_state: true,
+                        may_hold_session_lock: false,
+                        requires_retention_when_autocommit_off: true,
                     }
                 } else {
                     MySqlSessionStateHint {
                         clears_session_state: true,
                         may_leave_session_bound_state: false,
+                        may_hold_session_lock: false,
+                        requires_retention_when_autocommit_off: false,
                     }
                 }
             }
@@ -9830,42 +10016,72 @@ impl SqlEditorWidget {
                 MySqlSessionStateHint {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
+                    may_hold_session_lock: false,
+                    requires_retention_when_autocommit_off: true,
                 }
             }
             Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE") | Some("WITH") => {
                 MySqlSessionStateHint {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
+                    may_hold_session_lock: false,
+                    requires_retention_when_autocommit_off: true,
                 }
             }
+            Some("PREPARE") | Some("EXECUTE") | Some("DEALLOCATE") => MySqlSessionStateHint {
+                clears_session_state: false,
+                may_leave_session_bound_state: true,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: true,
+            },
             Some("LOCK") => MySqlSessionStateHint {
                 clears_session_state: true,
                 may_leave_session_bound_state: true,
+                may_hold_session_lock: true,
+                requires_retention_when_autocommit_off: true,
             },
             Some("UNLOCK") => MySqlSessionStateHint {
                 clears_session_state: true,
                 may_leave_session_bound_state: false,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: false,
             },
             Some("CREATE") if Self::mysql_create_statement_is_temporary(sql) => {
                 MySqlSessionStateHint {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
+                    may_hold_session_lock: false,
+                    requires_retention_when_autocommit_off: true,
                 }
             }
             Some("CREATE") | Some("ALTER") | Some("DROP") | Some("RENAME") | Some("TRUNCATE") => {
                 MySqlSessionStateHint {
                     clears_session_state: true,
                     may_leave_session_bound_state: false,
+                    may_hold_session_lock: false,
+                    requires_retention_when_autocommit_off: false,
                 }
             }
             Some("SET") => MySqlSessionStateHint {
                 clears_session_state: false,
                 may_leave_session_bound_state: true,
+                may_hold_session_lock: false,
+                requires_retention_when_autocommit_off: true,
             },
+            Some("SELECT") if Self::mysql_select_assigns_user_variable(sql) => {
+                MySqlSessionStateHint {
+                    clears_session_state: false,
+                    may_leave_session_bound_state: true,
+                    may_hold_session_lock: false,
+                    requires_retention_when_autocommit_off: true,
+                }
+            }
             Some("SELECT") if sql.to_ascii_uppercase().contains("GET_LOCK") => {
                 MySqlSessionStateHint {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
+                    may_hold_session_lock: true,
+                    requires_retention_when_autocommit_off: true,
                 }
             }
             _ => MySqlSessionStateHint::default(),
@@ -9874,11 +10090,11 @@ impl SqlEditorWidget {
 
     fn mysql_pooled_session_should_rollback_read_only_autocommit_off(
         auto_commit: bool,
-        prior_may_have_uncommitted_work: bool,
+        had_active_transaction_before_statement: bool,
         state_hint: MySqlSessionStateHint,
     ) -> bool {
         !auto_commit
-            && !prior_may_have_uncommitted_work
+            && !had_active_transaction_before_statement
             && !state_hint.clears_session_state
             && !state_hint.may_leave_session_bound_state
     }
@@ -10339,7 +10555,7 @@ impl SqlEditorWidget {
         conn: mysql::PooledConn,
         may_have_uncommitted_work: bool,
     ) {
-        crate::db::store_pooled_session_lease_if_empty(
+        crate::db::store_pooled_session_lease_if_retained(
             pooled_db_session,
             connection_generation,
             DbSessionLease::MySQL(conn),
@@ -10412,19 +10628,20 @@ impl SqlEditorWidget {
         let state_hint = MySqlSessionStateHint {
             clears_session_state: enabled,
             may_leave_session_bound_state: !enabled,
+            may_hold_session_lock: false,
+            requires_retention_when_autocommit_off: !enabled,
         };
-        let fallback_on_error = if enabled {
-            false
+        let may_have_uncommitted_work = if enabled {
+            Self::mysql_pooled_session_may_need_preservation(
+                &mut conn,
+                db_activity,
+                prior_may_have_uncommitted_work,
+                state_hint,
+                false,
+            )
         } else {
-            prior_may_have_uncommitted_work
+            true
         };
-        let may_have_uncommitted_work = Self::mysql_pooled_session_may_need_preservation(
-            &mut conn,
-            db_activity,
-            prior_may_have_uncommitted_work,
-            state_hint,
-            fallback_on_error,
-        );
         Self::release_mysql_pooled_session_if_current(
             shared_connection,
             pooled_db_session,
@@ -10637,6 +10854,21 @@ impl SqlEditorWidget {
             return Err(cancelled);
         }
 
+        let had_active_transaction_before_statement =
+            if Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                auto_commit,
+                false,
+                state_hint,
+            ) {
+                Self::mysql_session_may_have_uncommitted_work(
+                    &mut conn,
+                    log_context,
+                    prior_may_have_uncommitted_work,
+                )
+            } else {
+                prior_may_have_uncommitted_work
+            };
+
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             action(&mut conn)
                 .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout))
@@ -10671,7 +10903,7 @@ impl SqlEditorWidget {
         if should_release_session
             && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
                 auto_commit,
-                prior_may_have_uncommitted_work,
+                had_active_transaction_before_statement,
                 state_hint,
             )
         {
@@ -10793,9 +11025,14 @@ mod query_execution_cleanup_tests {
         LazyFetchAllTimeout, LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext,
         QueryExecutionCleanupGuard, QueryProgress, SqlEditorWidget,
     };
-    use crate::db::{ScriptItem, TransactionAccessMode, TransactionIsolation, TransactionMode};
+    use crate::db::{
+        connection::{ConnectionInfo, DatabaseType},
+        DatabaseConnection, ScriptItem, TransactionAccessMode, TransactionIsolation,
+        TransactionMode,
+    };
     use mysql::{Error as MysqlError, MySqlError};
     use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind};
+    use std::env;
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
@@ -10883,6 +11120,156 @@ mod query_execution_cleanup_tests {
             .try_recv()
             .expect("BatchFinished should be emitted");
         assert!(matches!(msg, QueryProgress::BatchFinished));
+    }
+
+    fn oracle_test_connection() -> Option<(DatabaseConnection, Arc<Connection>)> {
+        let Some(username) = env::var("ORACLE_TEST_USERNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping: ORACLE_TEST_USERNAME is not set");
+            return None;
+        };
+        let Some(password) = env::var("ORACLE_TEST_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping: ORACLE_TEST_PASSWORD is not set");
+            return None;
+        };
+        let Some(service_name) = env::var("ORACLE_TEST_SERVICE_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping: ORACLE_TEST_SERVICE_NAME is not set");
+            return None;
+        };
+        let host = env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "ORACLE_TEST",
+                &username,
+                &password,
+                &host,
+                port,
+                &service_name,
+                DatabaseType::Oracle,
+            ))
+            .expect("Oracle test connection should succeed");
+        let conn = connection
+            .require_live_connection()
+            .expect("Oracle test connection should be live");
+        Some((connection, conn))
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* environment variables"]
+    fn oracle_cleanup_retains_open_transaction_until_rollback() {
+        let Some((_connection, conn)) = oracle_test_connection() else {
+            return;
+        };
+        let _ = conn.execute("DROP TABLE qt_oracle_session_rule PURGE", &[]);
+        conn.execute("CREATE TABLE qt_oracle_session_rule (id NUMBER)", &[])
+            .expect("create Oracle session-rule table");
+        conn.commit().expect("commit Oracle session-rule setup");
+
+        assert!(!SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+            conn.as_ref(),
+            "oracle session-rule initial probe"
+        ));
+        conn.execute("INSERT INTO qt_oracle_session_rule (id) VALUES (1)", &[])
+            .expect("insert Oracle session-rule row");
+        assert!(SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+            conn.as_ref(),
+            "oracle session-rule DML probe"
+        ));
+
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        {
+            let (sender, _receiver) = mpsc::channel();
+            let mut cleanup = QueryExecutionCleanupGuard::new(
+                sender,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(false)),
+                Arc::new(Mutex::new(true)),
+            );
+            cleanup.track_oracle_pooled_session(pooled_db_session.clone(), 7, Arc::clone(&conn));
+        }
+
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("open Oracle transaction should retain a pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::Oracle);
+        assert!(
+            snapshot.may_have_uncommitted_work,
+            "open Oracle transaction should be visible as retained session state"
+        );
+
+        conn.rollback()
+            .expect("rollback Oracle retained transaction");
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
+        {
+            let (sender, _receiver) = mpsc::channel();
+            let mut cleanup = QueryExecutionCleanupGuard::new(
+                sender,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(false)),
+                Arc::new(Mutex::new(true)),
+            );
+            cleanup.track_oracle_pooled_session(pooled_db_session.clone(), 7, Arc::clone(&conn));
+        }
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
+            "rolled back Oracle transaction should not leave retained session state"
+        );
+
+        let _ = conn.execute("DROP TABLE qt_oracle_session_rule PURGE", &[]);
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* environment variables"]
+    fn oracle_cleanup_returns_read_only_transaction_session() {
+        let Some((_connection, conn)) = oracle_test_connection() else {
+            return;
+        };
+        DatabaseConnection::apply_oracle_transaction_mode(
+            conn.as_ref(),
+            TransactionMode::new(
+                TransactionIsolation::Default,
+                TransactionAccessMode::ReadOnly,
+            ),
+        )
+        .expect("apply Oracle read-only transaction mode");
+        let value = conn
+            .query_row_as::<i64>("SELECT 1 FROM dual", &[])
+            .expect("Oracle read-only transaction should allow SELECT");
+        assert_eq!(value, 1);
+
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        {
+            let (sender, _receiver) = mpsc::channel();
+            let mut cleanup = QueryExecutionCleanupGuard::new(
+                sender,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(false)),
+                Arc::new(Mutex::new(true)),
+            );
+            cleanup.track_oracle_pooled_session(pooled_db_session.clone(), 8, Arc::clone(&conn));
+            cleanup.track_oracle_read_only_transaction(Arc::clone(&conn));
+        }
+
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
+            "Oracle read-only transaction cleanup should return the session"
+        );
     }
 
     #[test]
@@ -11420,10 +11807,12 @@ mod query_execution_cleanup_tests {
         let start_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("START TRANSACTION");
         assert!(!start_hint.clears_session_state);
         assert!(start_hint.may_leave_session_bound_state);
+        assert!(!start_hint.may_hold_session_lock);
 
         let select_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT 1");
         assert!(!select_hint.clears_session_state);
         assert!(!select_hint.may_leave_session_bound_state);
+        assert!(!select_hint.may_hold_session_lock);
         assert!(
             SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
                 false,
@@ -11473,6 +11862,23 @@ mod query_execution_cleanup_tests {
         let lock_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("LOCK TABLES t WRITE");
         assert!(lock_hint.clears_session_state);
         assert!(lock_hint.may_leave_session_bound_state);
+        assert!(lock_hint.may_hold_session_lock);
+
+        let get_lock_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT GET_LOCK('x', 1)");
+        assert!(!get_lock_hint.clears_session_state);
+        assert!(get_lock_hint.may_leave_session_bound_state);
+        assert!(get_lock_hint.may_hold_session_lock);
+
+        let select_into_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT COUNT(*) INTO @cnt FROM t");
+        assert!(!select_into_hint.clears_session_state);
+        assert!(select_into_hint.may_leave_session_bound_state);
+
+        let prepare_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("PREPARE stmt FROM @sql");
+        assert!(!prepare_hint.clears_session_state);
+        assert!(prepare_hint.may_leave_session_bound_state);
 
         let insert_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("INSERT INTO t VALUES (1)");
@@ -11996,6 +12402,7 @@ mod mysql_batch_execution_regression_tests {
         DatabaseConnection, SessionState, TransactionAccessMode, TransactionIsolation,
         TransactionMode,
     };
+    use mysql::prelude::Queryable;
     use std::env;
     use std::sync::atomic::AtomicU64;
     use std::sync::{mpsc, Arc, Mutex};
@@ -12003,6 +12410,63 @@ mod mysql_batch_execution_regression_tests {
 
     fn mysql_test_env(name: &str) -> Option<String> {
         env::var(name).ok().filter(|value| !value.trim().is_empty())
+    }
+
+    fn mysql_test_server_version() -> Option<String> {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return None;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return None;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return None;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return None;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL/MariaDB version probe connection should succeed");
+        let Some(conn) = connection.get_mysql_connection_mut() else {
+            return None;
+        };
+        conn.query_first::<String, _>("SELECT VERSION()")
+            .expect("MySQL/MariaDB version probe should succeed")
+    }
+
+    fn mysql_test_server_is_mariadb() -> Option<bool> {
+        mysql_test_server_version().map(|version| version.to_ascii_lowercase().contains("mariadb"))
+    }
+
+    fn mysql_test_server_is_mysql8_or_newer() -> Option<bool> {
+        let version = mysql_test_server_version()?;
+        if version.to_ascii_lowercase().contains("mariadb") {
+            return Some(false);
+        }
+        let major = version
+            .split(|ch: char| !ch.is_ascii_digit())
+            .find(|part| !part.is_empty())
+            .and_then(|part| part.parse::<u32>().ok())
+            .unwrap_or(0);
+        Some(major >= 8)
     }
 
     fn mysql_test_connection_with_mode(mode: TransactionMode) -> Option<DatabaseConnection> {
@@ -12372,6 +12836,129 @@ mod mysql_batch_execution_regression_tests {
         );
     }
 
+    fn execute_mysql_session_rule_script(
+        script: &str,
+        initial_auto_commit: bool,
+        db_activity: &str,
+    ) -> Option<(Vec<QueryProgress>, crate::db::SharedDbSessionLease)> {
+        let Some(host) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_HOST is not set");
+            return None;
+        };
+        let Some(database) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_DATABASE is not set");
+            return None;
+        };
+        let Some(user) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_USER is not set");
+            return None;
+        };
+        let Some(password) = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD") else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_PASSWORD is not set");
+            return None;
+        };
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection.set_auto_commit(initial_auto_commit);
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "MYSQL_TEST",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                DatabaseType::MySQL,
+            ))
+            .expect("MySQL/MariaDB session-rule test connection should succeed");
+
+        let shared_connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(SessionState {
+            db_type: DatabaseType::MySQL,
+            ..SessionState::default()
+        }));
+        let current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
+            Arc::new(Mutex::new(None));
+        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
+        let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
+        let cancel_flag = Arc::new(Mutex::new(false));
+        let (sender, receiver) = mpsc::channel();
+
+        SqlEditorWidget::execute_mysql_batch(
+            &shared_connection,
+            &sender,
+            script,
+            "MYSQL_TEST",
+            &session,
+            &pooled_db_session,
+            &active_lazy_fetch,
+            &next_lazy_fetch_session_id,
+            &current_mysql_cancel_context,
+            &cancel_flag,
+            true,
+            None,
+            None,
+            initial_auto_commit,
+            db_activity,
+        );
+        drop(sender);
+
+        Some((receiver.try_iter().collect::<Vec<_>>(), pooled_db_session))
+    }
+
+    fn assert_no_failed_mysql_statement(progress: &[QueryProgress]) {
+        let progress_summary = summarize_progress(progress);
+        let failed_statement = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. } if !result.success => {
+                Some((*index, result.message.clone()))
+            }
+            _ => None,
+        });
+
+        assert!(
+            failed_statement.is_none(),
+            "batch execution should not emit a failed statement: {failed_statement:?}\n{progress_summary}"
+        );
+    }
+
+    fn assert_mysql_final_status_pass(progress: &[QueryProgress]) {
+        let progress_summary = summarize_progress(progress);
+        let final_status_index = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. }
+                if result.sql.contains("'FINAL_STATUS' AS section_name") =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        });
+
+        assert!(
+            final_status_index.is_some(),
+            "batch execution should emit FINAL_STATUS\n{progress_summary}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|message| match (final_status_index, message) {
+                    (
+                        Some(index),
+                        QueryProgress::Rows {
+                            index: row_index,
+                            rows,
+                        },
+                    ) if *row_index == index => {
+                        rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
+                    }
+                    _ => false,
+                }),
+            "batch execution should reach FINAL_STATUS PASS\n{progress_summary}"
+        );
+    }
+
     fn assert_mysql_pooled_execution_reports_transaction_mode(
         connection: DatabaseConnection,
         expected_isolation: &str,
@@ -12480,6 +13067,191 @@ mod mysql_batch_execution_regression_tests {
         };
 
         assert_mysql_pooled_execution_reports_transaction_mode(connection, "READ COMMITTED", true);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_preserves_complex_session_state_until_commit() {
+        let script = "\
+DROP PROCEDURE IF EXISTS qt_session_rule_call;
+DROP TABLE IF EXISTS qt_session_rule_result;
+CREATE TABLE qt_session_rule_result (id INT PRIMARY KEY, note VARCHAR(64));
+DELIMITER //
+CREATE PROCEDURE qt_session_rule_call()
+BEGIN
+    INSERT INTO qt_session_rule_result (id, note) VALUES (3, 'call');
+END//
+DELIMITER ;
+@TRANSACTION
+CREATE TEMPORARY TABLE tmp_qt_session_rule (id INT PRIMARY KEY);
+INSERT INTO tmp_qt_session_rule VALUES (1);
+SET @qt_session_rule_note = 'session-var';
+SELECT COUNT(*)
+INTO @qt_session_rule_count
+FROM tmp_qt_session_rule;
+SET @qt_session_rule_sql = 'INSERT INTO tmp_qt_session_rule VALUES (2)';
+PREPARE qt_session_rule_stmt FROM @qt_session_rule_sql;
+EXECUTE qt_session_rule_stmt;
+DEALLOCATE PREPARE qt_session_rule_stmt;
+CALL qt_session_rule_call();
+INSERT INTO qt_session_rule_result
+SELECT id, @qt_session_rule_note
+FROM tmp_qt_session_rule;
+COMMIT;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE
+           WHEN COUNT(*) = 3
+                AND SUM(note = 'session-var') = 2
+                AND SUM(note = 'call') = 1
+                AND @qt_session_rule_count = 1
+           THEN 'PASS'
+           ELSE CONCAT('FAIL count=', COUNT(*), ', session_count=', COALESCE(@qt_session_rule_count, -1))
+       END AS result_status
+FROM qt_session_rule_result;
+DROP PROCEDURE IF EXISTS qt_session_rule_call;
+DROP TABLE IF EXISTS qt_session_rule_result;
+";
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            script,
+            true,
+            "mysql complex session retention regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_final_status_pass(&progress);
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
+            "session should be returned after the script no longer needs retained state\n{}",
+            summarize_progress(&progress)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_returns_read_only_autocommit_off_statement() {
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            "@TRANSACTION\nSELECT 1 AS read_only_probe;",
+            true,
+            "mysql read-only autocommit-off release regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
+            "read-only autocommit-off statement should be rolled back and returned\n{}",
+            summarize_progress(&progress)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_retains_open_transaction_until_rollback() {
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            "\
+DROP TABLE IF EXISTS qt_session_rule_open_tx;
+CREATE TABLE qt_session_rule_open_tx (id INT PRIMARY KEY);
+@TRANSACTION
+INSERT INTO qt_session_rule_open_tx VALUES (1);
+SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_open_tx;
+",
+            true,
+            "mysql open transaction retention regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("open transaction should retain a pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        assert!(
+            snapshot.may_have_uncommitted_work,
+            "open transaction should be visible as retained session state"
+        );
+
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
+
+        let Some((cleanup_progress, cleanup_pooled_db_session)) = execute_mysql_session_rule_script(
+            "ROLLBACK; DROP TABLE IF EXISTS qt_session_rule_open_tx;",
+            true,
+            "mysql open transaction cleanup regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&cleanup_progress);
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&cleanup_pooled_db_session).is_none(),
+            "rollback cleanup should not leave retained session state\n{}",
+            summarize_progress(&cleanup_progress)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_returns_named_lock_released_in_selected_range() {
+        let script = "\
+SET @qt_session_rule_lock_name = CONCAT('qt_session_rule_lock_release_', CONNECTION_ID());
+SELECT GET_LOCK(@qt_session_rule_lock_name, 0) AS lock_taken;
+SELECT RELEASE_LOCK(@qt_session_rule_lock_name) AS lock_released;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE
+           WHEN IS_FREE_LOCK(@qt_session_rule_lock_name) = 1 THEN 'PASS'
+           ELSE CONCAT('FAIL lock_state=', COALESCE(IS_FREE_LOCK(@qt_session_rule_lock_name), -1))
+       END AS result_status;
+";
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            script,
+            true,
+            "mysql selected-range lock release regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_final_status_pass(&progress);
+        assert!(
+            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
+            "released named lock should not leave a retained session\n{}",
+            summarize_progress(&progress)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_retains_named_lock_until_connection_closes() {
+        let script = "\
+SET @qt_session_rule_lock_name = CONCAT('qt_session_rule_lock_hold_', CONNECTION_ID());
+SELECT GET_LOCK(@qt_session_rule_lock_name, 0) AS lock_taken;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE
+           WHEN IS_USED_LOCK(@qt_session_rule_lock_name) = CONNECTION_ID() THEN 'PASS'
+           ELSE CONCAT('FAIL owner=', COALESCE(IS_USED_LOCK(@qt_session_rule_lock_name), -1))
+       END AS result_status;
+";
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            script,
+            true,
+            "mysql selected-range lock retention regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_final_status_pass(&progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("open named lock should retain a pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        assert!(
+            snapshot.may_have_uncommitted_work,
+            "open named lock should be visible as retained session state"
+        );
+
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
     }
 
     #[test]
@@ -12655,8 +13427,12 @@ mod mysql_batch_execution_regression_tests {
     }
 
     #[test]
-    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test1_reaches_pass_status() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: test_mysql/test1.txt requires MySQL 8 or newer");
+            return;
+        }
         assert_mysql_batch_script_reaches_status_pass(
             include_str!("../../../test_mysql/test1.txt"),
             "mysql test1 regression",
@@ -12664,8 +13440,12 @@ mod mysql_batch_execution_regression_tests {
     }
 
     #[test]
-    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test2_reaches_pass_status() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: test_mysql/test2.txt requires MySQL 8 or newer");
+            return;
+        }
         assert_mysql_batch_script_reaches_status_pass(
             include_str!("../../../test_mysql/test2.txt"),
             "mysql test2 regression",
@@ -12673,8 +13453,12 @@ mod mysql_batch_execution_regression_tests {
     }
 
     #[test]
-    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test3_reaches_pass_status() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: test_mysql/test3.txt requires MySQL 8 or newer");
+            return;
+        }
         assert_mysql_batch_script_reaches_status_pass(
             include_str!("../../../test_mysql/test3.txt"),
             "mysql test3 regression",
@@ -12684,6 +13468,10 @@ mod mysql_batch_execution_regression_tests {
     #[test]
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test8_reaches_final_status_after_transaction_directive() {
+        if !mysql_test_server_is_mariadb().unwrap_or(false) {
+            eprintln!("skipping: test_mariadb/test8.txt requires MariaDB");
+            return;
+        }
         assert_mysql_batch_script_reaches_final_status_pass(
             include_str!("../../../test_mariadb/test8.txt"),
             "mysql test8 regression",
@@ -12693,6 +13481,10 @@ mod mysql_batch_execution_regression_tests {
     #[test]
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test7_reaches_final_status_after_transaction_directive() {
+        if !mysql_test_server_is_mariadb().unwrap_or(false) {
+            eprintln!("skipping: test_mariadb/test7.txt requires MariaDB");
+            return;
+        }
         assert_mysql_batch_script_reaches_final_status_pass(
             include_str!("../../../test_mariadb/test7.txt"),
             "mysql test7 regression",

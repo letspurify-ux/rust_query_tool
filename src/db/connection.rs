@@ -711,6 +711,12 @@ pub struct DbSessionLeaseEntry {
 
 pub type SharedDbSessionLease = Arc<Mutex<Option<DbSessionLeaseEntry>>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PooledSessionLeaseSnapshot {
+    pub db_type: DatabaseType,
+    pub may_have_uncommitted_work: bool,
+}
+
 #[derive(Clone)]
 pub struct DbPoolSessionContext {
     pub connection_generation: u64,
@@ -853,6 +859,19 @@ pub fn clear_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) -> b
     lease_to_drop.is_some()
 }
 
+pub fn pooled_session_lease_snapshot(
+    pooled_db_session: &SharedDbSessionLease,
+) -> Option<PooledSessionLeaseSnapshot> {
+    pooled_db_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|entry| PooledSessionLeaseSnapshot {
+            db_type: entry.lease.db_type(),
+            may_have_uncommitted_work: entry.may_have_uncommitted_work,
+        })
+}
+
 pub fn clear_pooled_session_lease_if_current(
     pooled_db_session: &SharedDbSessionLease,
     connection_generation: u64,
@@ -971,6 +990,24 @@ pub fn store_pooled_session_lease_if_empty(
     };
     drop(old_lease_to_drop);
     lease_to_store.is_none()
+}
+
+pub fn store_pooled_session_lease_if_retained(
+    pooled_db_session: &SharedDbSessionLease,
+    connection_generation: u64,
+    lease_to_store: DbSessionLease,
+    retain_session: bool,
+) -> bool {
+    if !retain_session {
+        drop(lease_to_store);
+        return false;
+    }
+    store_pooled_session_lease_if_empty(
+        pooled_db_session,
+        connection_generation,
+        lease_to_store,
+        true,
+    )
 }
 
 pub fn pooled_session_lease_is_releasable(pooled_db_session: &SharedDbSessionLease) -> bool {

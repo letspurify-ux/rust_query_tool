@@ -13,6 +13,8 @@ pub struct MysqlExecutor;
 
 pub struct MysqlObjectBrowser;
 
+const DEFAULT_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MysqlStatementKind {
     Select,
@@ -38,10 +40,11 @@ impl MysqlExecutor {
     }
 
     fn lock_wait_timeout_seconds(timeout: Option<Duration>) -> String {
-        match timeout {
-            Some(value) => value.as_secs().max(1).to_string(),
-            None => "DEFAULT".to_string(),
-        }
+        timeout
+            .unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT)
+            .as_secs()
+            .max(1)
+            .to_string()
     }
 
     fn mysql_timeout_statement(timeout: Option<Duration>) -> String {
@@ -2177,7 +2180,7 @@ mod tests {
         );
         assert_eq!(
             MysqlExecutor::lock_wait_timeout_statement(None),
-            "SET SESSION lock_wait_timeout = DEFAULT"
+            "SET SESSION lock_wait_timeout = 60"
         );
     }
 

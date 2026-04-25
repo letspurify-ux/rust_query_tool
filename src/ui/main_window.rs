@@ -133,6 +133,7 @@ struct SessionActivityEntry {
     tab_name: String,
     result_tab: Option<usize>,
     state: String,
+    database: String,
     sql_preview: String,
     fetched_rows: usize,
     elapsed: String,
@@ -746,6 +747,23 @@ impl AppState {
         released_any
     }
 
+    fn background_transaction_pooled_session_label(&self) -> Option<String> {
+        self.editor_tabs
+            .iter()
+            .filter(|tab| tab.tab_id != self.active_editor_tab_id)
+            .find_map(|tab| {
+                let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
+                if !snapshot.may_have_uncommitted_work {
+                    return None;
+                }
+                Some(format!(
+                    "{} ({})",
+                    Self::tab_display_label(tab),
+                    snapshot.db_type
+                ))
+            })
+    }
+
     fn release_idle_pooled_db_sessions(&self) -> bool {
         let mut released_any = self.release_background_idle_pooled_db_sessions();
         released_any |= self.sql_editor.release_idle_pooled_db_session();
@@ -1169,6 +1187,7 @@ impl AppState {
                             .unwrap_or_else(|| format!("Tab {}", tab_id)),
                         result_tab,
                         state: context.state_label.clone(),
+                        database: db_type.clone(),
                         sql_preview: context.activity_label.clone(),
                         fetched_rows,
                         elapsed: format_session_activity_elapsed(context.started_at.elapsed()),
@@ -1176,6 +1195,33 @@ impl AppState {
                 )
             })
             .collect::<Vec<_>>();
+        let progress_tab_ids = entries
+            .iter()
+            .map(|(tab_id, _)| *tab_id)
+            .collect::<HashSet<_>>();
+        entries.extend(self.editor_tabs.iter().filter_map(|tab| {
+            if progress_tab_ids.contains(&tab.tab_id) {
+                return None;
+            }
+            let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
+            let state = if snapshot.may_have_uncommitted_work {
+                "Pooled session (session state retained)"
+            } else {
+                "Pooled session"
+            };
+            Some((
+                tab.tab_id,
+                SessionActivityEntry {
+                    tab_name: Self::tab_display_label(tab),
+                    result_tab: None,
+                    state: state.to_string(),
+                    database: snapshot.db_type.to_string(),
+                    sql_preview: "Idle pooled database session".to_string(),
+                    fetched_rows: 0,
+                    elapsed: "-".to_string(),
+                },
+            ))
+        }));
         entries.sort_by_key(|(tab_id, _)| *tab_id);
         let entries = entries
             .into_iter()
@@ -1512,19 +1558,29 @@ enum SqlExecutionRequest {
 }
 
 fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
-    let editor = {
-        let guard = state
+    let (editor, blocked_message) = {
+        let mut guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_any_query_running() {
-            None
+            (None, Some(crate::db::format_connection_busy_message()))
+        } else if let Some(blocker) = guard.background_transaction_pooled_session_label() {
+            (
+                None,
+                Some(format!(
+                    "Another query tab has an open transaction in a pooled session: {blocker}. Commit, rollback, or close that tab before running a query from this tab."
+                )),
+            )
         } else {
-            Some(guard.sql_editor.clone())
+            if guard.release_background_idle_pooled_db_sessions() {
+                guard.set_status_message("Released idle pooled sessions from background tabs");
+            }
+            (Some(guard.sql_editor.clone()), None)
         }
     };
 
-    if editor.is_none() {
-        SqlEditorWidget::show_alert_dialog(&crate::db::format_connection_busy_message());
+    if let Some(message) = blocked_message {
+        SqlEditorWidget::show_alert_dialog(&message);
     }
 
     editor
@@ -1742,7 +1798,7 @@ fn build_session_activity_result_request(
             .map(|entry| {
                 vec![
                     connection_name.to_string(),
-                    db_type.to_string(),
+                    entry.database,
                     pool_size.clone(),
                     entry.tab_name,
                     entry
@@ -1759,7 +1815,7 @@ fn build_session_activity_result_request(
             .collect::<Vec<_>>()
     };
     let message = if has_active_entries {
-        format!("{} active session(s)", rows.len())
+        format!("{} session(s)", rows.len())
     } else {
         "No active sessions".to_string()
     };
@@ -6845,13 +6901,14 @@ mod tests {
                 tab_name: "Query 1".to_string(),
                 result_tab: Some(2),
                 state: ResultTabStatus::Fetching.label().to_string(),
+                database: "Oracle".to_string(),
                 sql_preview: "select * from employees".to_string(),
                 fetched_rows: 42,
                 elapsed: "3s".to_string(),
             }],
         );
 
-        assert_eq!(request.result.message, "1 active session(s)");
+        assert_eq!(request.result.message, "1 session(s)");
         assert_eq!(
             request.result.rows[0],
             vec![

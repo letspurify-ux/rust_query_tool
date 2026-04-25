@@ -978,6 +978,12 @@ impl SqlEditorWidget {
             .map(|handle| handle.session_id)
     }
 
+    pub fn pooled_session_activity_snapshot(
+        &self,
+    ) -> Option<crate::db::PooledSessionLeaseSnapshot> {
+        crate::db::pooled_session_lease_snapshot(&self.pooled_db_session)
+    }
+
     fn cancel_active_lazy_fetch(&self) -> bool {
         Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session)
     }
