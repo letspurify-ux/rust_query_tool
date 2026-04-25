@@ -15,7 +15,7 @@ const MAX_RECENT_CONNECTIONS: usize = 50;
 pub const MAX_RECENT_SQL_FILES: usize = 10;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
 const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
-pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 4;
+pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
 
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_defaults_connection_pool_size_to_four() {
+    fn app_config_defaults_connection_pool_size_to_twelve() {
         assert_eq!(
             AppConfig::new().connection_pool_size,
             super::DEFAULT_CONNECTION_POOL_SIZE

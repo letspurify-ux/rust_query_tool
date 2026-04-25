@@ -2553,7 +2553,8 @@ impl MainWindow {
         rollback_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&rollback_btn, BUTTON_WIDTH);
 
-        let mut transaction_isolation_choice = Choice::default().with_size(145, BUTTON_HEIGHT);
+        let mut transaction_isolation_choice =
+            Choice::default().with_size(TRANSACTION_ISOLATION_CHOICE_WIDTH, BUTTON_HEIGHT);
         transaction_isolation_choice.add_choice(&transaction_isolation_choice_labels(
             DatabaseType::Oracle,
             TransactionIsolation::Default,
@@ -2562,15 +2563,19 @@ impl MainWindow {
         transaction_isolation_choice.set_color(theme::input_bg());
         transaction_isolation_choice.set_text_color(theme::text_primary());
         transaction_isolation_choice.set_tooltip("Transaction isolation for new executions");
-        query_toolbar.fixed(&transaction_isolation_choice, 145);
+        query_toolbar.fixed(
+            &transaction_isolation_choice,
+            TRANSACTION_ISOLATION_CHOICE_WIDTH,
+        );
 
-        let mut transaction_access_choice = Choice::default().with_size(105, BUTTON_HEIGHT);
+        let mut transaction_access_choice =
+            Choice::default().with_size(TRANSACTION_ACCESS_CHOICE_WIDTH, BUTTON_HEIGHT);
         transaction_access_choice.add_choice("Read write|Read only");
         transaction_access_choice.set_value(0);
         transaction_access_choice.set_color(theme::input_bg());
         transaction_access_choice.set_text_color(theme::text_primary());
         transaction_access_choice.set_tooltip("Transaction access mode for new executions");
-        query_toolbar.fixed(&transaction_access_choice, 105);
+        query_toolbar.fixed(&transaction_access_choice, TRANSACTION_ACCESS_CHOICE_WIDTH);
 
         let toolbar_spacer = Frame::default();
         query_toolbar.resizable(&toolbar_spacer);
@@ -4115,6 +4120,24 @@ impl MainWindow {
                     data
                 }
                 crate::db::DbSqlDialect::MySql => {
+                    let requested_schema = requested_scope
+                        .clone()
+                        .map(|scope| scope.trim().to_string())
+                        .filter(|scope| !scope.is_empty());
+                    let requested_schema = if let Some(schema) = requested_schema {
+                        let current_database =
+                            conn_guard.get_info().service_name.trim().to_string();
+                        if current_database.eq_ignore_ascii_case(&schema) {
+                            Some(schema)
+                        } else if let Err(err) = conn_guard.switch_mysql_database(&schema) {
+                            eprintln!("Warning: failed to select MySQL metadata database: {err}");
+                            None
+                        } else {
+                            Some(schema)
+                        }
+                    } else {
+                        None
+                    };
                     let current_database = conn_guard.get_info().service_name.trim().to_string();
                     let mysql_conn = conn_guard.get_mysql_connection_mut()?;
                     let mut schemas =
@@ -4132,9 +4155,7 @@ impl MainWindow {
                     schemas.sort();
                     schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
-                    let selected_schema = requested_scope
-                        .clone()
-                        .filter(|scope| !scope.trim().is_empty())
+                    let selected_schema = requested_schema
                         .or_else(|| {
                             (!current_database.is_empty()).then_some(current_database.clone())
                         })
@@ -4710,19 +4731,10 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
-                    if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
-                        if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") {
-                            if enabled {
-                                item.set();
-                            } else {
-                                item.clear();
-                            }
-                        }
-                    }
                     let status = if enabled {
-                        "Auto-commit enabled"
+                        "Tab auto-commit enabled"
                     } else {
-                        "Auto-commit disabled"
+                        "Tab auto-commit disabled"
                     };
                     s.set_status_message(status);
                 }
@@ -4775,6 +4787,32 @@ impl MainWindow {
                                 crate::ui::sql_editor::LazyFetchRequest::Cancel,
                             );
                         }
+                    }
+                }
+                QueryProgress::DatabaseChanged { info } => {
+                    let database = info.service_name.trim().to_string();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    *s.connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
+                    s.has_live_connection = true;
+                    if !database.is_empty() {
+                        s.object_browser.set_selected_scope(Some(database.clone()));
+                    }
+                    s.set_status_message(&format!("Database selected | {}", database));
+                    s.refresh_connection_dependent_controls();
+                    s.sync_transaction_mode_controls();
+                    if has_running_queries {
+                        s.pending_connection_metadata_refresh = true;
+                    } else {
+                        MainWindow::start_connection_metadata_refresh(
+                            &mut s,
+                            &schema_sender_for_progress,
+                        );
+                        s.pending_connection_metadata_refresh = false;
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {

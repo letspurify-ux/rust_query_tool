@@ -11,6 +11,12 @@ pub const BUTTON_WIDTH_SMALL: i32 = 70;
 /// Wide button width for primary actions needing more label space.
 pub const BUTTON_WIDTH_LARGE: i32 = 110;
 
+/// Width for the transaction isolation selector in the query toolbar.
+pub const TRANSACTION_ISOLATION_CHOICE_WIDTH: i32 = 230;
+
+/// Width for the transaction access mode selector in the query toolbar.
+pub const TRANSACTION_ACCESS_CHOICE_WIDTH: i32 = 130;
+
 /// Uniform button height across the entire UI.
 pub const BUTTON_HEIGHT: i32 = 28;
 

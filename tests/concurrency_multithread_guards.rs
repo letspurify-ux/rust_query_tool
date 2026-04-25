@@ -95,7 +95,9 @@ fn oracle_execution_takes_reusable_pool_session_exclusively() {
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
     assert!(
-        content.contains("crate::db::take_reusable_pooled_session_lease_with_state(\n                pooled_db_session,\n                connection_generation,\n                crate::db::DatabaseType::Oracle,"),
+        content.contains(
+            "pooled_db_session\n            .take_reusable_with_state(connection_generation, crate::db::DatabaseType::Oracle)"
+        ),
         "Oracle execution must take the reusable lease out of the shared slot before using it"
     );
     assert!(
@@ -117,7 +119,7 @@ fn oracle_transaction_actions_take_reusable_pool_session_exclusively() {
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
     assert!(
-        content.contains("crate::db::take_reusable_pooled_session_lease_with_state(\n                            &pooled_db_session,\n                            connection_generation,\n                            crate::db::DatabaseType::Oracle,"),
+        content.contains(".take_reusable_with_state(\n                                connection_generation,\n                                crate::db::DatabaseType::Oracle,"),
         "Oracle transaction actions must take the reusable lease out of the shared slot before using it"
     );
     assert!(
@@ -127,6 +129,28 @@ fn oracle_transaction_actions_take_reusable_pool_session_exclusively() {
     assert!(
         content.contains("DbSessionLease::Oracle(Arc::clone(&db_conn))"),
         "Reusable Oracle transaction action sessions should be stored back only after cleanup"
+    );
+}
+
+#[test]
+fn db_tab_session_slot_is_shared_abstraction_not_raw_arc_alias() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    assert!(
+        content.contains("pub struct SharedDbSessionLease"),
+        "Tab DB session ownership should be represented by a shared slot abstraction"
+    );
+    assert!(
+        !content.contains("pub type SharedDbSessionLease = Arc<Mutex"),
+        "Tab DB session ownership must not leak as a raw Arc<Mutex<...>> alias"
+    );
+    assert!(
+        content.contains("pub fn take_reusable_with_state(")
+            && content.contains("pub fn store_if_empty(")
+            && content.contains("pub fn clear("),
+        "Oracle/MySQL/MariaDB tab sessions should share the same take/store/clear lifecycle API"
     );
 }
 
@@ -147,5 +171,129 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
     assert!(
         !content.contains("track_oracle_read_only_transaction"),
         "Oracle read-only execution should not arm old read-only cleanup; the tab owns the pooled session until commit, rollback, cancel, or close"
+    );
+}
+
+#[test]
+fn mysql_reused_tab_session_does_not_reselect_global_database() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    let start = content
+        .find("fn reusable_mysql_pooled_session_is_ready(")
+        .expect("reusable MySQL session helper should exist");
+    let end = content[start..]
+        .find("fn prepare_mysql_pooled_session_or_retry_once(")
+        .map(|offset| start + offset)
+        .expect("fresh MySQL session preparation helper should follow reusable helper");
+    let helper_body = &content[start..end];
+
+    assert!(
+        !helper_body.contains("current_service_name"),
+        "Reusable MySQL/MariaDB tab sessions must not use the global current database"
+    );
+    assert!(
+        !helper_body.contains("prepare_mysql_pooled_session_database"),
+        "Reusable MySQL/MariaDB tab sessions must keep their own selected database; only fresh sessions should be prepared from global connection metadata"
+    );
+}
+
+#[test]
+fn mysql_use_refreshes_metadata_without_connection_transition() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    for (start_marker, end_marker) in [
+        (
+            "ToolCommand::Use { database } =>",
+            "ToolCommand::MysqlDelimiter",
+        ),
+        (
+            "ToolCommand::Use { ref database } =>",
+            "// MySQL-specific commands",
+        ),
+    ] {
+        let start = content
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("MySQL USE command branch should exist: {start_marker}"));
+        let end = content[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("USE branch end marker should exist: {end_marker}"));
+        let use_branch = &content[start..end];
+
+        assert!(
+            use_branch.contains("QueryProgress::DatabaseChanged"),
+            "USE should update the selected database without being treated as a connection transition"
+        );
+        assert!(
+            use_branch.contains("QueryProgress::MetadataRefreshNeeded"),
+            "USE should still fall back to metadata refresh when no UI connection info is available"
+        );
+        assert!(
+            !use_branch.contains("QueryProgress::ConnectionChanged"),
+            "USE is a tab-session database change, not a connection transition that clears all tab sessions"
+        );
+    }
+}
+
+#[test]
+fn mysql_database_changed_updates_object_browser_without_clearing_sessions() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    let start = content
+        .find("QueryProgress::DatabaseChanged { info } =>")
+        .expect("DatabaseChanged handler should exist");
+    let end = content[start..]
+        .find("QueryProgress::StatementFinished")
+        .map(|offset| start + offset)
+        .expect("StatementFinished handler should follow DatabaseChanged");
+    let handler = &content[start..end];
+
+    assert!(
+        handler.contains("object_browser.set_selected_scope"),
+        "DatabaseChanged should select the new database in the object browser"
+    );
+    assert!(
+        handler.contains("start_connection_metadata_refresh"),
+        "DatabaseChanged should reload object browser and schema metadata"
+    );
+    assert!(
+        !handler.contains("release_all_pooled_db_sessions"),
+        "DatabaseChanged must not clear tab-owned DB sessions"
+    );
+}
+
+#[test]
+fn mysql_script_autocommit_changes_are_tab_local() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    let batch_start = content
+        .find("fn execute_mysql_batch(")
+        .expect("MySQL batch executor should exist");
+    let branch_start = content[batch_start..]
+        .find("ToolCommand::SetAutoCommit { enabled } =>")
+        .map(|offset| batch_start + offset)
+        .expect("MySQL SET AUTOCOMMIT command branch should exist");
+    let branch_end = content[branch_start..]
+        .find("ToolCommand::Use { database }")
+        .map(|offset| branch_start + offset)
+        .expect("USE branch should follow SET AUTOCOMMIT branch");
+    let autocommit_branch = &content[branch_start..branch_end];
+
+    assert!(
+        autocommit_branch
+            .contains("store_mutex_bool_option(mysql_auto_commit_override, Some(enabled))"),
+        "MySQL/MariaDB script autocommit state should be stored on the editor tab"
+    );
+    assert!(
+        !autocommit_branch.contains("conn_guard.set_auto_commit(enabled)"),
+        "MySQL/MariaDB script autocommit changes must not mutate the shared connection default for other tabs"
     );
 }

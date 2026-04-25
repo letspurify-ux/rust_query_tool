@@ -307,6 +307,40 @@ impl ObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
+    pub fn set_selected_scope(&mut self, scope: Option<String>) {
+        let normalized_scope = scope
+            .map(|scope| scope.trim().to_string())
+            .filter(|scope| !scope.is_empty());
+        *self
+            .selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = normalized_scope.clone();
+
+        let available_scopes = {
+            let mut options = self
+                .scope_options
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(ref scope) = normalized_scope {
+                if !options
+                    .iter()
+                    .any(|option| option.trim().eq_ignore_ascii_case(scope))
+                {
+                    options.push(scope.clone());
+                    options.sort();
+                    options.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                }
+            }
+            options.clone()
+        };
+        Self::sync_scope_choice_widget(
+            &mut self.scope_choice,
+            &self.suppress_scope_events,
+            &available_scopes,
+            normalized_scope.as_deref(),
+        );
+    }
+
     pub fn set_scope_change_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
@@ -3312,6 +3346,22 @@ impl ObjectBrowserWidget {
                 Some((db_type, cache, available_scopes, selected_scope))
             }
             crate::db::DbSqlDialect::MySql => {
+                let requested_scope = requested_scope
+                    .map(|scope| scope.trim().to_string())
+                    .filter(|scope| !scope.is_empty());
+                let requested_scope = if let Some(scope) = requested_scope {
+                    let current_database = conn_guard.get_info().service_name.trim().to_string();
+                    if current_database.eq_ignore_ascii_case(&scope) {
+                        Some(scope)
+                    } else if let Err(err) = conn_guard.switch_mysql_database(&scope) {
+                        eprintln!("Warning: failed to select MySQL metadata database: {err}");
+                        None
+                    } else {
+                        Some(scope)
+                    }
+                } else {
+                    None
+                };
                 let current_database = conn_guard.get_info().service_name.trim().to_string();
                 let mysql_conn = conn_guard.get_mysql_connection_mut()?;
                 let mut available_scopes =

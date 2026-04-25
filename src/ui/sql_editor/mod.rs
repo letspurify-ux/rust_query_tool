@@ -169,6 +169,23 @@ fn store_mutex_i32_option(slot: &Arc<Mutex<Option<i32>>>, value: Option<i32>) {
     }
 }
 
+fn load_mutex_bool_option(slot: &Arc<Mutex<Option<bool>>>) -> Option<bool> {
+    match slot.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn store_mutex_bool_option(slot: &Arc<Mutex<Option<bool>>>, value: Option<bool>) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+        }
+    }
+}
+
 fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
     match query_running.lock() {
         Ok(mut guard) => {
@@ -253,6 +270,9 @@ pub enum QueryProgress {
     },
     ConnectionChanged {
         info: Option<ConnectionInfo>,
+    },
+    DatabaseChanged {
+        info: ConnectionInfo,
     },
     WorkerPanicked {
         message: String,
@@ -459,6 +479,7 @@ pub struct SqlEditorWidget {
     active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: Arc<AtomicU64>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+    mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
@@ -824,10 +845,11 @@ impl SqlEditorWidget {
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
-        let pooled_db_session = crate::db::create_shared_db_session_lease();
+        let pooled_db_session = SharedDbSessionLease::new();
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Self::shared_lazy_fetch_session_counter();
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
+        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
         let intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
@@ -867,6 +889,7 @@ impl SqlEditorWidget {
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_mysql_cancel_context,
+            mysql_auto_commit_override,
             cancel_flag,
             intellisense_data,
             intellisense_popup,
@@ -900,7 +923,7 @@ impl SqlEditorWidget {
     }
 
     pub fn release_pooled_db_session(&self) -> bool {
-        crate::db::clear_pooled_session_lease(&self.pooled_db_session)
+        self.pooled_db_session.clear()
     }
 
     fn restore_pooled_session_after_close_action_failure(
@@ -909,8 +932,7 @@ impl SqlEditorWidget {
         lease: DbSessionLease,
         may_have_uncommitted_work: bool,
     ) {
-        let _ = crate::db::store_pooled_session_lease_if_empty(
-            pooled_db_session,
+        let _ = pooled_db_session.store_if_empty(
             connection_generation,
             lease,
             may_have_uncommitted_work,
@@ -927,12 +949,9 @@ impl SqlEditorWidget {
             };
             (conn_guard.connection_generation(), conn_guard.db_type())
         };
-        let Some((lease, may_have_uncommitted_work)) =
-            crate::db::take_reusable_pooled_session_lease_with_state(
-                &self.pooled_db_session,
-                connection_generation,
-                db_type,
-            )
+        let Some((lease, may_have_uncommitted_work)) = self
+            .pooled_db_session
+            .take_reusable_with_state(connection_generation, db_type)
         else {
             return Ok(());
         };
@@ -1078,7 +1097,7 @@ impl SqlEditorWidget {
     pub fn pooled_session_activity_snapshot(
         &self,
     ) -> Option<crate::db::PooledSessionLeaseSnapshot> {
-        crate::db::pooled_session_lease_snapshot(&self.pooled_db_session)
+        self.pooled_db_session.snapshot()
     }
 
     fn cancel_active_lazy_fetch(&self) -> bool {
@@ -1119,7 +1138,7 @@ impl SqlEditorWidget {
         let Some((handle, first_cancel_request)) = cancel_request else {
             return false;
         };
-        crate::db::clear_pooled_session_lease(pooled_db_session);
+        pooled_db_session.clear();
         if first_cancel_request {
             if let Some(cancel_handle) = handle.cancel_handle {
                 cancel_handle.cancel();
@@ -1789,6 +1808,7 @@ impl SqlEditorWidget {
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
+        let mysql_auto_commit_override = self.mysql_auto_commit_override.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pooled_db_session = self.pooled_db_session.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
@@ -1826,12 +1846,14 @@ impl SqlEditorWidget {
                 let result = match conn_guard.db_type().execution_engine() {
                     crate::db::DbExecutionEngine::Oracle => {
                         let connection_generation = conn_guard.connection_generation();
-                        let pooled_lease = crate::db::take_reusable_pooled_session_lease_with_state(
-                            &pooled_db_session,
-                            connection_generation,
-                            crate::db::DatabaseType::Oracle,
-                        )
-                        .and_then(|(lease, _)| lease.oracle_connection().map(|conn| (lease, conn)));
+                        let pooled_lease = pooled_db_session
+                            .take_reusable_with_state(
+                                connection_generation,
+                                crate::db::DatabaseType::Oracle,
+                            )
+                            .and_then(|(lease, _)| {
+                                lease.oracle_connection().map(|conn| (lease, conn))
+                            });
                         if let Some((lease, db_conn)) = pooled_lease {
                             drop(conn_guard);
                             SqlEditorWidget::set_current_query_connection(
@@ -1866,8 +1888,7 @@ impl SqlEditorWidget {
                                             db_conn.as_ref(),
                                             activity_label,
                                         );
-                                    crate::db::store_pooled_session_lease_if_empty(
-                                        &pooled_db_session,
+                                    pooled_db_session.store_if_empty(
                                         connection_generation,
                                         DbSessionLease::Oracle(Arc::clone(&db_conn)),
                                         may_have_uncommitted_work,
@@ -1900,7 +1921,10 @@ impl SqlEditorWidget {
                         }
                     }
                     crate::db::DbExecutionEngine::MySql => {
-                        let auto_commit = conn_guard.auto_commit();
+                        let auto_commit = SqlEditorWidget::mysql_auto_commit_for_execution(
+                            conn_guard.auto_commit(),
+                            &mysql_auto_commit_override,
+                        );
                         drop(conn_guard);
                         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                             &connection,
