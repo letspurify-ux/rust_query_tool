@@ -14,11 +14,20 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::db::{ConnectionInfo, DatabaseConnection, DatabaseType};
+use crate::db::{
+    ConnectionAdvancedSettings, ConnectionInfo, ConnectionSslMode, DatabaseConnection,
+    DatabaseType, OracleNetworkProtocol, TransactionAccessMode, TransactionIsolation,
+};
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
 use crate::utils::AppConfig;
+
+const SAVED_CONNECTIONS_COLUMN_WIDTH: i32 = 200;
+const DB_SELECTION_COLUMN_WIDTH: i32 = 250;
+const CONNECTION_INFO_COLUMN_WIDTH: i32 = 300;
+const ADVANCED_SETTINGS_COLUMN_WIDTH: i32 = 390;
+const CONNECTION_DIALOG_COLUMN_SPACING: i32 = DIALOG_SPACING + 4;
 
 pub struct ConnectionDialog;
 
@@ -101,6 +110,128 @@ fn choice_index_from_oracle_connect_mode(mode: OracleConnectMode) -> i32 {
         OracleConnectMode::Direct => 0,
         OracleConnectMode::TnsAlias => 1,
     }
+}
+
+fn ssl_mode_from_choice_index(db_type: DatabaseType, idx: i32) -> ConnectionSslMode {
+    if db_type == DatabaseType::Oracle {
+        return if idx == 1 {
+            ConnectionSslMode::Required
+        } else {
+            ConnectionSslMode::Disabled
+        };
+    }
+
+    match idx {
+        1 => ConnectionSslMode::Required,
+        2 => ConnectionSslMode::VerifyCa,
+        3 => ConnectionSslMode::VerifyIdentity,
+        _ => ConnectionSslMode::Disabled,
+    }
+}
+
+fn choice_index_from_ssl_mode(db_type: DatabaseType, mode: ConnectionSslMode) -> i32 {
+    if db_type == DatabaseType::Oracle {
+        return if mode == ConnectionSslMode::Disabled {
+            0
+        } else {
+            1
+        };
+    }
+
+    match mode {
+        ConnectionSslMode::Disabled => 0,
+        ConnectionSslMode::Required => 1,
+        ConnectionSslMode::VerifyCa => 2,
+        ConnectionSslMode::VerifyIdentity => 3,
+    }
+}
+
+fn repopulate_ssl_choice(choice: &mut Choice, db_type: DatabaseType) {
+    choice.clear();
+    if db_type == DatabaseType::Oracle {
+        choice.add_choice("Disabled|Required (TCPS)");
+    } else {
+        choice.add_choice("Disabled|Required|Verify CA|Verify identity");
+    }
+}
+
+fn oracle_protocol_from_choice_index(idx: i32) -> OracleNetworkProtocol {
+    if idx == 1 {
+        OracleNetworkProtocol::Tcps
+    } else {
+        OracleNetworkProtocol::Tcp
+    }
+}
+
+fn choice_index_from_oracle_protocol(protocol: OracleNetworkProtocol) -> i32 {
+    match protocol {
+        OracleNetworkProtocol::Tcp => 0,
+        OracleNetworkProtocol::Tcps => 1,
+    }
+}
+
+fn transaction_isolation_from_choice_index(
+    db_type: DatabaseType,
+    index: i32,
+) -> TransactionIsolation {
+    db_type
+        .supported_transaction_isolations()
+        .get(index.max(0) as usize)
+        .copied()
+        .unwrap_or(TransactionIsolation::ReadCommitted)
+}
+
+fn choice_index_from_transaction_isolation(
+    db_type: DatabaseType,
+    isolation: TransactionIsolation,
+) -> i32 {
+    db_type
+        .supported_transaction_isolations()
+        .iter()
+        .position(|candidate| *candidate == isolation)
+        .unwrap_or_else(|| {
+            db_type
+                .supported_transaction_isolations()
+                .iter()
+                .position(|candidate| *candidate == TransactionIsolation::ReadCommitted)
+                .unwrap_or_default()
+        }) as i32
+}
+
+fn transaction_access_from_choice_index(idx: i32) -> TransactionAccessMode {
+    if idx == 1 {
+        TransactionAccessMode::ReadOnly
+    } else {
+        TransactionAccessMode::ReadWrite
+    }
+}
+
+fn choice_index_from_transaction_access(access: TransactionAccessMode) -> i32 {
+    match access {
+        TransactionAccessMode::ReadWrite => 0,
+        TransactionAccessMode::ReadOnly => 1,
+    }
+}
+
+fn repopulate_isolation_choice(choice: &mut Choice, db_type: DatabaseType) {
+    choice.clear();
+    let labels = db_type
+        .supported_transaction_isolations()
+        .iter()
+        .map(|isolation| isolation.label())
+        .collect::<Vec<_>>()
+        .join("|");
+    choice.add_choice(&labels);
+}
+
+fn connection_dialog_width() -> i32 {
+    DIALOG_MARGIN * 2
+        + SAVED_CONNECTIONS_COLUMN_WIDTH
+        + CONNECTION_DIALOG_COLUMN_SPACING
+        + DB_SELECTION_COLUMN_WIDTH
+        + CONNECTION_INFO_COLUMN_WIDTH
+        + ADVANCED_SETTINGS_COLUMN_WIDTH
+        + CONNECTION_DIALOG_COLUMN_SPACING * 2
 }
 
 fn oracle_connect_mode_for_info(info: &ConnectionInfo) -> OracleConnectMode {
@@ -186,8 +317,114 @@ fn replace_default_form_values_for_db_switch(
     }
 }
 
+fn set_advanced_form_values(
+    advanced: &ConnectionAdvancedSettings,
+    db_type: DatabaseType,
+    ssl_choice: &mut Choice,
+    isolation_choice: &mut Choice,
+    access_choice: &mut Choice,
+    timezone_input: &mut Input,
+    mysql_sql_mode_input: &mut Input,
+    mysql_charset_input: &mut Input,
+    mysql_collation_input: &mut Input,
+    mysql_ssl_ca_input: &mut Input,
+    oracle_protocol_choice: &mut Choice,
+    oracle_nls_date_input: &mut Input,
+    oracle_nls_timestamp_input: &mut Input,
+) {
+    repopulate_ssl_choice(ssl_choice, db_type);
+    repopulate_isolation_choice(isolation_choice, db_type);
+    ssl_choice.set_value(choice_index_from_ssl_mode(db_type, advanced.ssl_mode));
+    isolation_choice.set_value(choice_index_from_transaction_isolation(
+        db_type,
+        advanced.default_transaction_isolation,
+    ));
+    access_choice.set_value(choice_index_from_transaction_access(
+        advanced.default_transaction_access_mode,
+    ));
+    timezone_input.set_value(&advanced.session_time_zone);
+    mysql_sql_mode_input.set_value(&advanced.mysql_sql_mode);
+    mysql_charset_input.set_value(&advanced.mysql_charset);
+    mysql_collation_input.set_value(&advanced.mysql_collation);
+    mysql_ssl_ca_input.set_value(&advanced.mysql_ssl_ca_path);
+    oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(advanced.oracle_protocol));
+    oracle_nls_date_input.set_value(&advanced.oracle_nls_date_format);
+    oracle_nls_timestamp_input.set_value(&advanced.oracle_nls_timestamp_format);
+}
+
+fn advanced_settings_from_form(
+    db_type: DatabaseType,
+    ssl_choice: &Choice,
+    isolation_choice: &Choice,
+    access_choice: &Choice,
+    timezone_input: &Input,
+    mysql_sql_mode_input: &Input,
+    mysql_charset_input: &Input,
+    mysql_collation_input: &Input,
+    mysql_ssl_ca_input: &Input,
+    oracle_protocol_choice: &Choice,
+    oracle_nls_date_input: &Input,
+    oracle_nls_timestamp_input: &Input,
+) -> ConnectionAdvancedSettings {
+    let mut advanced = ConnectionAdvancedSettings::default_for(db_type);
+    advanced.ssl_mode = ssl_mode_from_choice_index(db_type, ssl_choice.value());
+    advanced.default_transaction_isolation =
+        transaction_isolation_from_choice_index(db_type, isolation_choice.value());
+    advanced.default_transaction_access_mode =
+        transaction_access_from_choice_index(access_choice.value());
+    advanced.session_time_zone = timezone_input.value().trim().to_string();
+    advanced.mysql_sql_mode = mysql_sql_mode_input.value().trim().to_string();
+    advanced.mysql_charset = mysql_charset_input.value().trim().to_string();
+    advanced.mysql_collation = mysql_collation_input.value().trim().to_string();
+    advanced.mysql_ssl_ca_path = mysql_ssl_ca_input.value().trim().to_string();
+    advanced.oracle_protocol = oracle_protocol_from_choice_index(oracle_protocol_choice.value());
+    advanced.oracle_nls_date_format = oracle_nls_date_input.value().trim().to_string();
+    advanced.oracle_nls_timestamp_format = oracle_nls_timestamp_input.value().trim().to_string();
+    advanced
+}
+
+fn apply_advanced_form_mode(
+    advanced_col: &mut Flex,
+    db_type: DatabaseType,
+    using_oracle_tns_alias: bool,
+    oracle_protocol_row: &mut Flex,
+    oracle_nls_date_row: &mut Flex,
+    oracle_nls_timestamp_row: &mut Flex,
+    mysql_sql_mode_row: &mut Flex,
+    mysql_charset_row: &mut Flex,
+    mysql_collation_row: &mut Flex,
+    mysql_ssl_ca_row: &mut Flex,
+    oracle_protocol_choice: &mut Choice,
+    ssl_choice: &mut Choice,
+) {
+    let is_oracle = db_type == DatabaseType::Oracle;
+    set_form_row_visible(advanced_col, oracle_protocol_row, is_oracle);
+    set_form_row_visible(advanced_col, oracle_nls_date_row, is_oracle);
+    set_form_row_visible(advanced_col, oracle_nls_timestamp_row, is_oracle);
+    set_form_row_visible(advanced_col, mysql_sql_mode_row, !is_oracle);
+    set_form_row_visible(advanced_col, mysql_charset_row, !is_oracle);
+    set_form_row_visible(advanced_col, mysql_collation_row, !is_oracle);
+    set_form_row_visible(advanced_col, mysql_ssl_ca_row, !is_oracle);
+
+    if is_oracle && using_oracle_tns_alias {
+        oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(
+            OracleNetworkProtocol::Tcp,
+        ));
+        ssl_choice.set_value(choice_index_from_ssl_mode(
+            db_type,
+            ConnectionSslMode::Disabled,
+        ));
+        oracle_protocol_choice.deactivate();
+        ssl_choice.deactivate();
+    } else {
+        oracle_protocol_choice.activate();
+        ssl_choice.activate();
+    }
+}
+
 fn apply_connection_form_mode(
     form_col: &mut Flex,
+    oracle_mode_col: &mut Flex,
     db_type: DatabaseType,
     oracle_mode: OracleConnectMode,
     mode_choice: &mut Choice,
@@ -201,7 +438,7 @@ fn apply_connection_form_mode(
     memory: &Arc<Mutex<OracleModeFieldMemory>>,
 ) {
     if db_type.supports_tns_alias() {
-        set_form_row_visible(form_col, oracle_mode_row, true);
+        set_form_row_visible(oracle_mode_col, oracle_mode_row, true);
         mode_choice.activate();
         let mut memory = memory
             .lock()
@@ -228,7 +465,7 @@ fn apply_connection_form_mode(
         }
     } else {
         let form = db_type.connection_form_spec();
-        set_form_row_visible(form_col, oracle_mode_row, false);
+        set_form_row_visible(oracle_mode_col, oracle_mode_row, false);
         mode_choice.set_value(choice_index_from_oracle_connect_mode(
             OracleConnectMode::Direct,
         ));
@@ -256,6 +493,7 @@ fn build_connection_info(
     service_name: &str,
     db_type: DatabaseType,
     oracle_mode: OracleConnectMode,
+    advanced: ConnectionAdvancedSettings,
 ) -> Result<ConnectionInfo, String> {
     fn is_valid_host(host: &str) -> bool {
         if host.is_empty() {
@@ -334,15 +572,12 @@ fn build_connection_info(
         (host.to_string(), port)
     };
 
-    Ok(ConnectionInfo::new_with_type(
-        name,
-        username,
-        password,
-        &host,
-        port,
-        service_name,
-        db_type,
-    ))
+    advanced.validate_for_db(db_type, using_tns_alias)?;
+
+    let mut info =
+        ConnectionInfo::new_with_type(name, username, password, &host, port, service_name, db_type);
+    info.advanced = advanced;
+    Ok(info)
 }
 
 fn resolved_password_for_saved_connection(
@@ -384,10 +619,8 @@ impl ConnectionDialog {
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
-        let dialog_w = 620;
-        // Oracle connection mode adds one more form row, so keep enough vertical
-        // space for the bottom action buttons to remain fully visible.
-        let dialog_h = 412 + INPUT_ROW_HEIGHT + DIALOG_SPACING;
+        let dialog_w = connection_dialog_width();
+        let dialog_h = 520;
         let mut dialog = Window::default()
             .with_size(dialog_w, dialog_h)
             .with_label("Connect to Database");
@@ -395,14 +628,13 @@ impl ConnectionDialog {
         dialog.set_color(theme::panel_raised());
         dialog.make_modal(true);
 
-        // Root layout: horizontal split — left panel (saved list) | right panel (form)
+        // Root layout: saved list | DB selection | connection info | advanced settings
         let mut root = Flex::default().with_pos(0, 0).with_size(dialog_w, dialog_h);
         root.set_type(fltk::group::FlexType::Row);
         root.set_margin(DIALOG_MARGIN);
-        root.set_spacing(DIALOG_SPACING + 4);
+        root.set_spacing(CONNECTION_DIALOG_COLUMN_SPACING);
 
         // ── Left panel: Saved Connections ──
-        let left_w = 200;
         let mut left_col = Flex::default();
         left_col.set_type(fltk::group::FlexType::Column);
         left_col.set_spacing(DIALOG_SPACING);
@@ -432,16 +664,20 @@ impl ConnectionDialog {
         left_col.fixed(&delete_btn, BUTTON_HEIGHT);
 
         left_col.end();
-        root.fixed(&left_col, left_w);
+        root.fixed(&left_col, SAVED_CONNECTIONS_COLUMN_WIDTH);
 
-        // ── Right panel: Connection form ──
-        let mut right_col = Flex::default();
-        right_col.set_type(fltk::group::FlexType::Column);
-        right_col.set_spacing(DIALOG_SPACING);
+        let mut details_row = Flex::default();
+        details_row.set_type(fltk::group::FlexType::Row);
+        details_row.set_spacing(CONNECTION_DIALOG_COLUMN_SPACING);
 
-        let mut details_header = Frame::default().with_label("Connection Details");
-        details_header.set_label_color(theme::text_secondary());
-        right_col.fixed(&details_header, LABEL_ROW_HEIGHT);
+        // ── DB selection column ──
+        let mut db_col = Flex::default();
+        db_col.set_type(fltk::group::FlexType::Column);
+        db_col.set_spacing(DIALOG_SPACING);
+
+        let mut db_header = Frame::default().with_label("DB Selection");
+        db_header.set_label_color(theme::text_secondary());
+        db_col.fixed(&db_header, LABEL_ROW_HEIGHT);
 
         // Database Type selector
         let mut dbtype_flex = Flex::default();
@@ -460,7 +696,7 @@ impl ConnectionDialog {
         dbtype_choice.set_color(theme::input_bg());
         dbtype_choice.set_text_color(theme::text_primary());
         dbtype_flex.end();
-        right_col.fixed(&dbtype_flex, INPUT_ROW_HEIGHT);
+        db_col.fixed(&dbtype_flex, INPUT_ROW_HEIGHT);
 
         let mut oracle_mode_flex = Flex::default();
         oracle_mode_flex.set_type(fltk::group::FlexType::Row);
@@ -473,7 +709,21 @@ impl ConnectionDialog {
         oracle_mode_choice.set_color(theme::input_bg());
         oracle_mode_choice.set_text_color(theme::text_primary());
         oracle_mode_flex.end();
-        right_col.fixed(&oracle_mode_flex, INPUT_ROW_HEIGHT);
+        db_col.fixed(&oracle_mode_flex, INPUT_ROW_HEIGHT);
+
+        let db_spacer = Frame::default();
+        db_col.resizable(&db_spacer);
+        db_col.end();
+        details_row.fixed(&db_col, DB_SELECTION_COLUMN_WIDTH);
+
+        // ── Connection form column ──
+        let mut right_col = Flex::default();
+        right_col.set_type(fltk::group::FlexType::Column);
+        right_col.set_spacing(DIALOG_SPACING);
+
+        let mut details_header = Frame::default().with_label("Connection Info");
+        details_header.set_label_color(theme::text_secondary());
+        right_col.fixed(&details_header, LABEL_ROW_HEIGHT);
 
         // Connection Name
         let mut name_flex = Flex::default();
@@ -553,15 +803,6 @@ impl ConnectionDialog {
         service_flex.end();
         right_col.fixed(&service_flex, INPUT_ROW_HEIGHT);
 
-        let oracle_mode_memory = Arc::new(Mutex::new(OracleModeFieldMemory {
-            direct_host: host_input.value(),
-            direct_port: port_input.value(),
-            direct_service: service_input.value(),
-            tns_alias: String::new(),
-        }));
-        let current_oracle_mode = Arc::new(Mutex::new(OracleConnectMode::Direct));
-        let current_db_type = Arc::new(Mutex::new(DatabaseType::Oracle));
-
         // Save connection button
         let mut save_flex = Flex::default();
         save_flex.set_type(fltk::group::FlexType::Row);
@@ -574,16 +815,176 @@ impl ConnectionDialog {
         save_flex.end();
         right_col.fixed(&save_flex, CHECKBOX_ROW_HEIGHT);
 
+        let connection_spacer = Frame::default();
+        right_col.resizable(&connection_spacer);
+        right_col.end();
+        details_row.fixed(&right_col, CONNECTION_INFO_COLUMN_WIDTH);
+
+        // ── Advanced settings column ──
+        let mut advanced_col = Flex::default();
+        advanced_col.set_type(fltk::group::FlexType::Column);
+        advanced_col.set_spacing(DIALOG_SPACING);
+
+        let mut advanced_header = Frame::default().with_label("Advanced Settings");
+        advanced_header.set_label_color(theme::text_secondary());
+        advanced_col.fixed(&advanced_header, LABEL_ROW_HEIGHT);
+
+        let initial_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+
+        let mut ssl_flex = Flex::default();
+        ssl_flex.set_type(fltk::group::FlexType::Row);
+        let mut ssl_label = Frame::default().with_label("SSL:");
+        ssl_label.set_label_color(theme::text_primary());
+        ssl_flex.fixed(&ssl_label, FORM_LABEL_WIDTH);
+        let mut ssl_choice = Choice::default();
+        repopulate_ssl_choice(&mut ssl_choice, DatabaseType::Oracle);
+        ssl_choice.set_value(choice_index_from_ssl_mode(
+            DatabaseType::Oracle,
+            initial_advanced.ssl_mode,
+        ));
+        ssl_choice.set_color(theme::input_bg());
+        ssl_choice.set_text_color(theme::text_primary());
+        ssl_flex.end();
+        advanced_col.fixed(&ssl_flex, INPUT_ROW_HEIGHT);
+
+        let mut isolation_flex = Flex::default();
+        isolation_flex.set_type(fltk::group::FlexType::Row);
+        let mut isolation_label = Frame::default().with_label("Isolation:");
+        isolation_label.set_label_color(theme::text_primary());
+        isolation_flex.fixed(&isolation_label, FORM_LABEL_WIDTH);
+        let mut isolation_choice = Choice::default();
+        repopulate_isolation_choice(&mut isolation_choice, DatabaseType::Oracle);
+        isolation_choice.set_value(choice_index_from_transaction_isolation(
+            DatabaseType::Oracle,
+            initial_advanced.default_transaction_isolation,
+        ));
+        isolation_choice.set_color(theme::input_bg());
+        isolation_choice.set_text_color(theme::text_primary());
+        isolation_flex.end();
+        advanced_col.fixed(&isolation_flex, INPUT_ROW_HEIGHT);
+
+        let mut access_flex = Flex::default();
+        access_flex.set_type(fltk::group::FlexType::Row);
+        let mut access_label = Frame::default().with_label("Access:");
+        access_label.set_label_color(theme::text_primary());
+        access_flex.fixed(&access_label, FORM_LABEL_WIDTH);
+        let mut access_choice = Choice::default();
+        access_choice.add_choice("Read write|Read only");
+        access_choice.set_value(choice_index_from_transaction_access(
+            initial_advanced.default_transaction_access_mode,
+        ));
+        access_choice.set_color(theme::input_bg());
+        access_choice.set_text_color(theme::text_primary());
+        access_flex.end();
+        advanced_col.fixed(&access_flex, INPUT_ROW_HEIGHT);
+
+        let mut timezone_flex = Flex::default();
+        timezone_flex.set_type(fltk::group::FlexType::Row);
+        let mut timezone_label = Frame::default().with_label("Time zone:");
+        timezone_label.set_label_color(theme::text_primary());
+        timezone_flex.fixed(&timezone_label, FORM_LABEL_WIDTH);
+        let mut timezone_input = Input::default();
+        timezone_input.set_value(&initial_advanced.session_time_zone);
+        timezone_input.set_color(theme::input_bg());
+        timezone_input.set_text_color(theme::text_primary());
+        timezone_flex.end();
+        advanced_col.fixed(&timezone_flex, INPUT_ROW_HEIGHT);
+
+        let mut oracle_protocol_flex = Flex::default();
+        oracle_protocol_flex.set_type(fltk::group::FlexType::Row);
+        let mut oracle_protocol_label = Frame::default().with_label("Protocol:");
+        oracle_protocol_label.set_label_color(theme::text_primary());
+        oracle_protocol_flex.fixed(&oracle_protocol_label, FORM_LABEL_WIDTH);
+        let mut oracle_protocol_choice = Choice::default();
+        oracle_protocol_choice.add_choice("TCP|TCPS");
+        oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(
+            initial_advanced.oracle_protocol,
+        ));
+        oracle_protocol_choice.set_color(theme::input_bg());
+        oracle_protocol_choice.set_text_color(theme::text_primary());
+        oracle_protocol_flex.end();
+        advanced_col.fixed(&oracle_protocol_flex, INPUT_ROW_HEIGHT);
+
+        let mut oracle_nls_date_flex = Flex::default();
+        oracle_nls_date_flex.set_type(fltk::group::FlexType::Row);
+        let mut oracle_nls_date_label = Frame::default().with_label("NLS Date:");
+        oracle_nls_date_label.set_label_color(theme::text_primary());
+        oracle_nls_date_flex.fixed(&oracle_nls_date_label, FORM_LABEL_WIDTH);
+        let mut oracle_nls_date_input = Input::default();
+        oracle_nls_date_input.set_value(&initial_advanced.oracle_nls_date_format);
+        oracle_nls_date_input.set_color(theme::input_bg());
+        oracle_nls_date_input.set_text_color(theme::text_primary());
+        oracle_nls_date_flex.end();
+        advanced_col.fixed(&oracle_nls_date_flex, INPUT_ROW_HEIGHT);
+
+        let mut oracle_nls_timestamp_flex = Flex::default();
+        oracle_nls_timestamp_flex.set_type(fltk::group::FlexType::Row);
+        let mut oracle_nls_timestamp_label = Frame::default().with_label("NLS TS:");
+        oracle_nls_timestamp_label.set_label_color(theme::text_primary());
+        oracle_nls_timestamp_flex.fixed(&oracle_nls_timestamp_label, FORM_LABEL_WIDTH);
+        let mut oracle_nls_timestamp_input = Input::default();
+        oracle_nls_timestamp_input.set_value(&initial_advanced.oracle_nls_timestamp_format);
+        oracle_nls_timestamp_input.set_color(theme::input_bg());
+        oracle_nls_timestamp_input.set_text_color(theme::text_primary());
+        oracle_nls_timestamp_flex.end();
+        advanced_col.fixed(&oracle_nls_timestamp_flex, INPUT_ROW_HEIGHT);
+
+        let mut mysql_sql_mode_flex = Flex::default();
+        mysql_sql_mode_flex.set_type(fltk::group::FlexType::Row);
+        let mut mysql_sql_mode_label = Frame::default().with_label("SQL mode:");
+        mysql_sql_mode_label.set_label_color(theme::text_primary());
+        mysql_sql_mode_flex.fixed(&mysql_sql_mode_label, FORM_LABEL_WIDTH);
+        let mut mysql_sql_mode_input = Input::default();
+        mysql_sql_mode_input.set_value(&initial_advanced.mysql_sql_mode);
+        mysql_sql_mode_input.set_color(theme::input_bg());
+        mysql_sql_mode_input.set_text_color(theme::text_primary());
+        mysql_sql_mode_flex.end();
+        advanced_col.fixed(&mysql_sql_mode_flex, INPUT_ROW_HEIGHT);
+
+        let mut mysql_charset_flex = Flex::default();
+        mysql_charset_flex.set_type(fltk::group::FlexType::Row);
+        let mut mysql_charset_label = Frame::default().with_label("Charset:");
+        mysql_charset_label.set_label_color(theme::text_primary());
+        mysql_charset_flex.fixed(&mysql_charset_label, FORM_LABEL_WIDTH);
+        let mut mysql_charset_input = Input::default();
+        mysql_charset_input.set_value(&initial_advanced.mysql_charset);
+        mysql_charset_input.set_color(theme::input_bg());
+        mysql_charset_input.set_text_color(theme::text_primary());
+        mysql_charset_flex.end();
+        advanced_col.fixed(&mysql_charset_flex, INPUT_ROW_HEIGHT);
+
+        let mut mysql_collation_flex = Flex::default();
+        mysql_collation_flex.set_type(fltk::group::FlexType::Row);
+        let mut mysql_collation_label = Frame::default().with_label("Collation:");
+        mysql_collation_label.set_label_color(theme::text_primary());
+        mysql_collation_flex.fixed(&mysql_collation_label, FORM_LABEL_WIDTH);
+        let mut mysql_collation_input = Input::default();
+        mysql_collation_input.set_value(&initial_advanced.mysql_collation);
+        mysql_collation_input.set_color(theme::input_bg());
+        mysql_collation_input.set_text_color(theme::text_primary());
+        mysql_collation_flex.end();
+        advanced_col.fixed(&mysql_collation_flex, INPUT_ROW_HEIGHT);
+
+        let mut mysql_ssl_ca_flex = Flex::default();
+        mysql_ssl_ca_flex.set_type(fltk::group::FlexType::Row);
+        let mut mysql_ssl_ca_label = Frame::default().with_label("SSL CA:");
+        mysql_ssl_ca_label.set_label_color(theme::text_primary());
+        mysql_ssl_ca_flex.fixed(&mysql_ssl_ca_label, FORM_LABEL_WIDTH);
+        let mut mysql_ssl_ca_input = Input::default();
+        mysql_ssl_ca_input.set_value(&initial_advanced.mysql_ssl_ca_path);
+        mysql_ssl_ca_input.set_color(theme::input_bg());
+        mysql_ssl_ca_input.set_text_color(theme::text_primary());
+        mysql_ssl_ca_flex.end();
+        advanced_col.fixed(&mysql_ssl_ca_flex, INPUT_ROW_HEIGHT);
+
         // Flexible spacer to push buttons to bottom
         let spacer_frame = Frame::default();
-        right_col.resizable(&spacer_frame);
+        advanced_col.resizable(&spacer_frame);
 
         // Buttons row
         let mut button_flex = Flex::default();
         button_flex.set_type(fltk::group::FlexType::Row);
         button_flex.set_spacing(DIALOG_SPACING);
-
-        let _btn_spacer = Frame::default();
 
         let mut test_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -610,9 +1011,20 @@ impl ConnectionDialog {
         button_flex.fixed(&connect_btn, BUTTON_WIDTH);
         button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
         button_flex.end();
-        right_col.fixed(&button_flex, BUTTON_ROW_HEIGHT);
+        advanced_col.fixed(&button_flex, BUTTON_ROW_HEIGHT);
 
-        right_col.end();
+        advanced_col.end();
+        details_row.fixed(&advanced_col, ADVANCED_SETTINGS_COLUMN_WIDTH);
+        details_row.end();
+
+        let oracle_mode_memory = Arc::new(Mutex::new(OracleModeFieldMemory {
+            direct_host: host_input.value(),
+            direct_port: port_input.value(),
+            direct_service: service_input.value(),
+            tns_alias: String::new(),
+        }));
+        let current_oracle_mode = Arc::new(Mutex::new(OracleConnectMode::Direct));
+        let current_db_type = Arc::new(Mutex::new(DatabaseType::Oracle));
 
         root.end();
         dialog.end();
@@ -624,6 +1036,7 @@ impl ConnectionDialog {
             let current_oracle_mode_dt = Arc::clone(&current_oracle_mode);
             let current_db_type_dt = Arc::clone(&current_db_type);
             let mut right_col_dt = right_col.clone();
+            let mut db_col_dt = db_col.clone();
             let mut oracle_mode_choice_dt = oracle_mode_choice.clone();
             let mut oracle_mode_flex_dt = oracle_mode_flex.clone();
             let mut host_flex_dt = host_flex.clone();
@@ -632,6 +1045,25 @@ impl ConnectionDialog {
             let mut host_input_dt = host_input.clone();
             let mut service_input_dt = service_input.clone();
             let mut svc_label_dt = svc_label.clone();
+            let mut advanced_col_dt = advanced_col.clone();
+            let mut ssl_choice_dt = ssl_choice.clone();
+            let mut isolation_choice_dt = isolation_choice.clone();
+            let mut access_choice_dt = access_choice.clone();
+            let mut timezone_input_dt = timezone_input.clone();
+            let mut mysql_sql_mode_input_dt = mysql_sql_mode_input.clone();
+            let mut mysql_charset_input_dt = mysql_charset_input.clone();
+            let mut mysql_collation_input_dt = mysql_collation_input.clone();
+            let mut mysql_ssl_ca_input_dt = mysql_ssl_ca_input.clone();
+            let mut oracle_protocol_choice_dt = oracle_protocol_choice.clone();
+            let mut oracle_nls_date_input_dt = oracle_nls_date_input.clone();
+            let mut oracle_nls_timestamp_input_dt = oracle_nls_timestamp_input.clone();
+            let mut oracle_protocol_flex_dt = oracle_protocol_flex.clone();
+            let mut oracle_nls_date_flex_dt = oracle_nls_date_flex.clone();
+            let mut oracle_nls_timestamp_flex_dt = oracle_nls_timestamp_flex.clone();
+            let mut mysql_sql_mode_flex_dt = mysql_sql_mode_flex.clone();
+            let mut mysql_charset_flex_dt = mysql_charset_flex.clone();
+            let mut mysql_collation_flex_dt = mysql_collation_flex.clone();
+            let mut mysql_ssl_ca_flex_dt = mysql_ssl_ca_flex.clone();
             dbtype_choice.set_callback(move |choice| {
                 let db_type = db_type_from_choice_index(choice.value());
                 let previous_db_type = *current_db_type_dt
@@ -663,6 +1095,7 @@ impl ConnectionDialog {
                 }
                 apply_connection_form_mode(
                     &mut right_col_dt,
+                    &mut db_col_dt,
                     db_type,
                     oracle_connect_mode_from_choice_index(oracle_mode_choice_dt.value()),
                     &mut oracle_mode_choice_dt,
@@ -675,6 +1108,38 @@ impl ConnectionDialog {
                     &mut service_input_dt,
                     &oracle_mode_memory_dt,
                 );
+                let advanced = ConnectionAdvancedSettings::default_for(db_type);
+                set_advanced_form_values(
+                    &advanced,
+                    db_type,
+                    &mut ssl_choice_dt,
+                    &mut isolation_choice_dt,
+                    &mut access_choice_dt,
+                    &mut timezone_input_dt,
+                    &mut mysql_sql_mode_input_dt,
+                    &mut mysql_charset_input_dt,
+                    &mut mysql_collation_input_dt,
+                    &mut mysql_ssl_ca_input_dt,
+                    &mut oracle_protocol_choice_dt,
+                    &mut oracle_nls_date_input_dt,
+                    &mut oracle_nls_timestamp_input_dt,
+                );
+                apply_advanced_form_mode(
+                    &mut advanced_col_dt,
+                    db_type,
+                    db_type.supports_tns_alias()
+                        && oracle_connect_mode_from_choice_index(oracle_mode_choice_dt.value())
+                            == OracleConnectMode::TnsAlias,
+                    &mut oracle_protocol_flex_dt,
+                    &mut oracle_nls_date_flex_dt,
+                    &mut oracle_nls_timestamp_flex_dt,
+                    &mut mysql_sql_mode_flex_dt,
+                    &mut mysql_charset_flex_dt,
+                    &mut mysql_collation_flex_dt,
+                    &mut mysql_ssl_ca_flex_dt,
+                    &mut oracle_protocol_choice_dt,
+                    &mut ssl_choice_dt,
+                );
                 *current_db_type_dt
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = db_type;
@@ -685,6 +1150,7 @@ impl ConnectionDialog {
             let oracle_mode_memory_cb = Arc::clone(&oracle_mode_memory);
             let current_oracle_mode_cb = Arc::clone(&current_oracle_mode);
             let mut right_col_cb = right_col.clone();
+            let mut db_col_cb = db_col.clone();
             let mut oracle_mode_choice_cb = oracle_mode_choice.clone();
             let mut oracle_mode_flex_cb = oracle_mode_flex.clone();
             let mut host_flex_cb = host_flex.clone();
@@ -694,6 +1160,16 @@ impl ConnectionDialog {
             let mut port_input_cb = port_input.clone();
             let mut service_input_cb = service_input.clone();
             let mut svc_label_cb = svc_label.clone();
+            let mut advanced_col_cb = advanced_col.clone();
+            let mut oracle_protocol_flex_cb = oracle_protocol_flex.clone();
+            let mut oracle_nls_date_flex_cb = oracle_nls_date_flex.clone();
+            let mut oracle_nls_timestamp_flex_cb = oracle_nls_timestamp_flex.clone();
+            let mut mysql_sql_mode_flex_cb = mysql_sql_mode_flex.clone();
+            let mut mysql_charset_flex_cb = mysql_charset_flex.clone();
+            let mut mysql_collation_flex_cb = mysql_collation_flex.clone();
+            let mut mysql_ssl_ca_flex_cb = mysql_ssl_ca_flex.clone();
+            let mut oracle_protocol_choice_cb = oracle_protocol_choice.clone();
+            let mut ssl_choice_cb = ssl_choice.clone();
             oracle_mode_choice.set_callback(move |_| {
                 let previous_mode = *current_oracle_mode_cb
                     .lock()
@@ -709,6 +1185,7 @@ impl ConnectionDialog {
                 );
                 apply_connection_form_mode(
                     &mut right_col_cb,
+                    &mut db_col_cb,
                     db_type_from_choice_index(dbtype_choice_cb.value()),
                     next_mode,
                     &mut oracle_mode_choice_cb,
@@ -721,6 +1198,21 @@ impl ConnectionDialog {
                     &mut service_input_cb,
                     &oracle_mode_memory_cb,
                 );
+                let db_type = db_type_from_choice_index(dbtype_choice_cb.value());
+                apply_advanced_form_mode(
+                    &mut advanced_col_cb,
+                    db_type,
+                    db_type.supports_tns_alias() && next_mode == OracleConnectMode::TnsAlias,
+                    &mut oracle_protocol_flex_cb,
+                    &mut oracle_nls_date_flex_cb,
+                    &mut oracle_nls_timestamp_flex_cb,
+                    &mut mysql_sql_mode_flex_cb,
+                    &mut mysql_charset_flex_cb,
+                    &mut mysql_collation_flex_cb,
+                    &mut mysql_ssl_ca_flex_cb,
+                    &mut oracle_protocol_choice_cb,
+                    &mut ssl_choice_cb,
+                );
                 *current_oracle_mode_cb
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_mode;
@@ -729,6 +1221,7 @@ impl ConnectionDialog {
 
         apply_connection_form_mode(
             &mut right_col,
+            &mut db_col,
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
             &mut oracle_mode_choice,
@@ -740,6 +1233,20 @@ impl ConnectionDialog {
             &mut port_input,
             &mut service_input,
             &oracle_mode_memory,
+        );
+        apply_advanced_form_mode(
+            &mut advanced_col,
+            DatabaseType::Oracle,
+            false,
+            &mut oracle_protocol_flex,
+            &mut oracle_nls_date_flex,
+            &mut oracle_nls_timestamp_flex,
+            &mut mysql_sql_mode_flex,
+            &mut mysql_charset_flex,
+            &mut mysql_collation_flex,
+            &mut mysql_ssl_ca_flex,
+            &mut oracle_protocol_choice,
+            &mut ssl_choice,
         );
 
         let mut connect_btn_for_enter = connect_btn.clone();
@@ -771,10 +1278,30 @@ impl ConnectionDialog {
         let mut dbtype_choice_cb = dbtype_choice.clone();
         let mut oracle_mode_choice_cb = oracle_mode_choice.clone();
         let mut right_col_saved = right_col.clone();
+        let mut db_col_saved = db_col.clone();
         let mut oracle_mode_flex_saved = oracle_mode_flex.clone();
         let mut host_flex_saved = host_flex.clone();
         let mut port_flex_saved = port_flex.clone();
         let mut svc_label_cb = svc_label.clone();
+        let mut advanced_col_saved = advanced_col.clone();
+        let mut ssl_choice_saved = ssl_choice.clone();
+        let mut isolation_choice_saved = isolation_choice.clone();
+        let mut access_choice_saved = access_choice.clone();
+        let mut timezone_input_saved = timezone_input.clone();
+        let mut mysql_sql_mode_input_saved = mysql_sql_mode_input.clone();
+        let mut mysql_charset_input_saved = mysql_charset_input.clone();
+        let mut mysql_collation_input_saved = mysql_collation_input.clone();
+        let mut mysql_ssl_ca_input_saved = mysql_ssl_ca_input.clone();
+        let mut oracle_protocol_choice_saved = oracle_protocol_choice.clone();
+        let mut oracle_nls_date_input_saved = oracle_nls_date_input.clone();
+        let mut oracle_nls_timestamp_input_saved = oracle_nls_timestamp_input.clone();
+        let mut oracle_protocol_flex_saved = oracle_protocol_flex.clone();
+        let mut oracle_nls_date_flex_saved = oracle_nls_date_flex.clone();
+        let mut oracle_nls_timestamp_flex_saved = oracle_nls_timestamp_flex.clone();
+        let mut mysql_sql_mode_flex_saved = mysql_sql_mode_flex.clone();
+        let mut mysql_charset_flex_saved = mysql_charset_flex.clone();
+        let mut mysql_collation_flex_saved = mysql_collation_flex.clone();
+        let mut mysql_ssl_ca_flex_saved = mysql_ssl_ca_flex.clone();
         let oracle_mode_memory_saved = Arc::clone(&oracle_mode_memory);
         let current_oracle_mode_saved = Arc::clone(&current_oracle_mode);
         let current_db_type_saved = Arc::clone(&current_db_type);
@@ -827,6 +1354,7 @@ impl ConnectionDialog {
                     }
                     apply_connection_form_mode(
                         &mut right_col_saved,
+                        &mut db_col_saved,
                         conn.db_type,
                         oracle_mode,
                         &mut oracle_mode_choice_cb,
@@ -839,6 +1367,36 @@ impl ConnectionDialog {
                         &mut service_input_cb,
                         &oracle_mode_memory_saved,
                     );
+                    set_advanced_form_values(
+                        &conn.advanced,
+                        conn.db_type,
+                        &mut ssl_choice_saved,
+                        &mut isolation_choice_saved,
+                        &mut access_choice_saved,
+                        &mut timezone_input_saved,
+                        &mut mysql_sql_mode_input_saved,
+                        &mut mysql_charset_input_saved,
+                        &mut mysql_collation_input_saved,
+                        &mut mysql_ssl_ca_input_saved,
+                        &mut oracle_protocol_choice_saved,
+                        &mut oracle_nls_date_input_saved,
+                        &mut oracle_nls_timestamp_input_saved,
+                    );
+                    apply_advanced_form_mode(
+                        &mut advanced_col_saved,
+                        conn.db_type,
+                        conn.db_type.supports_tns_alias()
+                            && oracle_mode == OracleConnectMode::TnsAlias,
+                        &mut oracle_protocol_flex_saved,
+                        &mut oracle_nls_date_flex_saved,
+                        &mut oracle_nls_timestamp_flex_saved,
+                        &mut mysql_sql_mode_flex_saved,
+                        &mut mysql_charset_flex_saved,
+                        &mut mysql_collation_flex_saved,
+                        &mut mysql_ssl_ca_flex_saved,
+                        &mut oracle_protocol_choice_saved,
+                        &mut ssl_choice_saved,
+                    );
 
                     // Double click to connect immediately
                     if app::event_clicks() && !keyring_load_failed {
@@ -848,15 +1406,8 @@ impl ConnectionDialog {
                             );
                             return;
                         }
-                        let info = ConnectionInfo::new_with_type(
-                            &conn.name,
-                            &conn.username,
-                            &password,
-                            &conn.host,
-                            conn.port,
-                            &conn.service_name,
-                            conn.db_type,
-                        );
+                        let mut info = conn.clone();
+                        info.password = password;
                         let _ = sender_for_click.send(DialogMessage::Connect(info, false));
                         app::awake();
                     }
@@ -881,8 +1432,34 @@ impl ConnectionDialog {
         let service_input_save = service_input.clone();
         let dbtype_choice_save = dbtype_choice.clone();
         let oracle_mode_choice_save = oracle_mode_choice.clone();
+        let ssl_choice_save = ssl_choice.clone();
+        let isolation_choice_save = isolation_choice.clone();
+        let access_choice_save = access_choice.clone();
+        let timezone_input_save = timezone_input.clone();
+        let mysql_sql_mode_input_save = mysql_sql_mode_input.clone();
+        let mysql_charset_input_save = mysql_charset_input.clone();
+        let mysql_collation_input_save = mysql_collation_input.clone();
+        let mysql_ssl_ca_input_save = mysql_ssl_ca_input.clone();
+        let oracle_protocol_choice_save = oracle_protocol_choice.clone();
+        let oracle_nls_date_input_save = oracle_nls_date_input.clone();
+        let oracle_nls_timestamp_input_save = oracle_nls_timestamp_input.clone();
 
         save_btn.set_callback(move |_| {
+            let db_type = db_type_from_choice_index(dbtype_choice_save.value());
+            let advanced = advanced_settings_from_form(
+                db_type,
+                &ssl_choice_save,
+                &isolation_choice_save,
+                &access_choice_save,
+                &timezone_input_save,
+                &mysql_sql_mode_input_save,
+                &mysql_charset_input_save,
+                &mysql_collation_input_save,
+                &mysql_ssl_ca_input_save,
+                &oracle_protocol_choice_save,
+                &oracle_nls_date_input_save,
+                &oracle_nls_timestamp_input_save,
+            );
             let info = match build_connection_info(
                 &name_input_save.value(),
                 &user_input_save.value(),
@@ -890,8 +1467,9 @@ impl ConnectionDialog {
                 &host_input_save.value(),
                 &port_input_save.value(),
                 &service_input_save.value(),
-                db_type_from_choice_index(dbtype_choice_save.value()),
+                db_type,
                 oracle_connect_mode_from_choice_index(oracle_mode_choice_save.value()),
+                advanced,
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -916,6 +1494,17 @@ impl ConnectionDialog {
         let service_input_test = service_input.clone();
         let dbtype_choice_test = dbtype_choice.clone();
         let oracle_mode_choice_test = oracle_mode_choice.clone();
+        let ssl_choice_test = ssl_choice.clone();
+        let isolation_choice_test = isolation_choice.clone();
+        let access_choice_test = access_choice.clone();
+        let timezone_input_test = timezone_input.clone();
+        let mysql_sql_mode_input_test = mysql_sql_mode_input.clone();
+        let mysql_charset_input_test = mysql_charset_input.clone();
+        let mysql_collation_input_test = mysql_collation_input.clone();
+        let mysql_ssl_ca_input_test = mysql_ssl_ca_input.clone();
+        let oracle_protocol_choice_test = oracle_protocol_choice.clone();
+        let oracle_nls_date_input_test = oracle_nls_date_input.clone();
+        let oracle_nls_timestamp_input_test = oracle_nls_timestamp_input.clone();
 
         test_btn.set_callback(move |_| {
             {
@@ -928,6 +1517,21 @@ impl ConnectionDialog {
                 *guard = true;
             }
 
+            let db_type = db_type_from_choice_index(dbtype_choice_test.value());
+            let advanced = advanced_settings_from_form(
+                db_type,
+                &ssl_choice_test,
+                &isolation_choice_test,
+                &access_choice_test,
+                &timezone_input_test,
+                &mysql_sql_mode_input_test,
+                &mysql_charset_input_test,
+                &mysql_collation_input_test,
+                &mysql_ssl_ca_input_test,
+                &oracle_protocol_choice_test,
+                &oracle_nls_date_input_test,
+                &oracle_nls_timestamp_input_test,
+            );
             let info = match build_connection_info(
                 &name_input_test.value(),
                 &user_input_test.value(),
@@ -935,8 +1539,9 @@ impl ConnectionDialog {
                 &host_input_test.value(),
                 &port_input_test.value(),
                 &service_input_test.value(),
-                db_type_from_choice_index(dbtype_choice_test.value()),
+                db_type,
                 oracle_connect_mode_from_choice_index(oracle_mode_choice_test.value()),
+                advanced,
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -964,8 +1569,34 @@ impl ConnectionDialog {
         let service_input_conn = service_input.clone();
         let dbtype_choice_conn = dbtype_choice.clone();
         let oracle_mode_choice_conn = oracle_mode_choice.clone();
+        let ssl_choice_conn = ssl_choice.clone();
+        let isolation_choice_conn = isolation_choice.clone();
+        let access_choice_conn = access_choice.clone();
+        let timezone_input_conn = timezone_input.clone();
+        let mysql_sql_mode_input_conn = mysql_sql_mode_input.clone();
+        let mysql_charset_input_conn = mysql_charset_input.clone();
+        let mysql_collation_input_conn = mysql_collation_input.clone();
+        let mysql_ssl_ca_input_conn = mysql_ssl_ca_input.clone();
+        let oracle_protocol_choice_conn = oracle_protocol_choice.clone();
+        let oracle_nls_date_input_conn = oracle_nls_date_input.clone();
+        let oracle_nls_timestamp_input_conn = oracle_nls_timestamp_input.clone();
 
         connect_btn.set_callback(move |_| {
+            let db_type = db_type_from_choice_index(dbtype_choice_conn.value());
+            let advanced = advanced_settings_from_form(
+                db_type,
+                &ssl_choice_conn,
+                &isolation_choice_conn,
+                &access_choice_conn,
+                &timezone_input_conn,
+                &mysql_sql_mode_input_conn,
+                &mysql_charset_input_conn,
+                &mysql_collation_input_conn,
+                &mysql_ssl_ca_input_conn,
+                &oracle_protocol_choice_conn,
+                &oracle_nls_date_input_conn,
+                &oracle_nls_timestamp_input_conn,
+            );
             let info = match build_connection_info(
                 &name_input_conn.value(),
                 &user_input_conn.value(),
@@ -973,8 +1604,9 @@ impl ConnectionDialog {
                 &host_input_conn.value(),
                 &port_input_conn.value(),
                 &service_input_conn.value(),
-                db_type_from_choice_index(dbtype_choice_conn.value()),
+                db_type,
                 oracle_connect_mode_from_choice_index(oracle_mode_choice_conn.value()),
+                advanced,
             ) {
                 Ok(info) => info,
                 Err(message) => {
@@ -1153,8 +1785,26 @@ impl ConnectionDialog {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_connection_info, OracleConnectMode};
-    use crate::db::DatabaseType;
+    use super::{build_connection_info, connection_dialog_width, OracleConnectMode};
+    use crate::db::{
+        ConnectionAdvancedSettings, ConnectionSslMode, DatabaseType, TransactionIsolation,
+    };
+
+    fn default_advanced(db_type: DatabaseType) -> ConnectionAdvancedSettings {
+        ConnectionAdvancedSettings::default_for(db_type)
+    }
+
+    #[test]
+    fn connection_dialog_width_covers_fixed_columns_and_spacing() {
+        let required_width = crate::ui::constants::DIALOG_MARGIN * 2
+            + super::SAVED_CONNECTIONS_COLUMN_WIDTH
+            + super::DB_SELECTION_COLUMN_WIDTH
+            + super::CONNECTION_INFO_COLUMN_WIDTH
+            + super::ADVANCED_SETTINGS_COLUMN_WIDTH
+            + super::CONNECTION_DIALOG_COLUMN_SPACING * 3;
+
+        assert_eq!(connection_dialog_width(), required_width);
+    }
 
     #[test]
     fn build_connection_info_rejects_empty_required_fields() {
@@ -1167,6 +1817,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
 
@@ -1179,6 +1830,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
 
@@ -1191,6 +1843,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
 
@@ -1203,6 +1856,7 @@ mod tests {
             "",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
     }
@@ -1218,6 +1872,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
 
@@ -1230,6 +1885,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(result.is_err());
     }
@@ -1245,6 +1901,7 @@ mod tests {
             "ORCL",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(invalid_host.is_err());
 
@@ -1257,6 +1914,7 @@ mod tests {
             "ORCL!",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         );
         assert!(invalid_service.is_err());
     }
@@ -1272,6 +1930,7 @@ mod tests {
             " ORCL ",
             DatabaseType::Oracle,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::Oracle),
         )
         .expect("should build valid connection info");
 
@@ -1294,6 +1953,7 @@ mod tests {
             "   ",
             DatabaseType::MySQL,
             OracleConnectMode::Direct,
+            default_advanced(DatabaseType::MySQL),
         )
         .expect("should allow MySQL connection without default database");
 
@@ -1303,6 +1963,30 @@ mod tests {
         assert_eq!(info.port, 3306);
         assert!(info.service_name.is_empty());
         assert_eq!(info.db_type, DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn build_connection_info_preserves_advanced_settings() {
+        let mut advanced = default_advanced(DatabaseType::MySQL);
+        advanced.ssl_mode = ConnectionSslMode::VerifyCa;
+        advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
+        advanced.session_time_zone = "+09:00".to_string();
+        advanced.mysql_ssl_ca_path = "/tmp/mysql-ca.pem".to_string();
+
+        let info = build_connection_info(
+            " local ",
+            " root ",
+            "secret",
+            " localhost ",
+            " 3306 ",
+            " query_tool_test ",
+            DatabaseType::MySQL,
+            OracleConnectMode::Direct,
+            advanced.clone(),
+        )
+        .expect("should build valid MySQL connection info");
+
+        assert_eq!(info.advanced, advanced);
     }
 
     #[test]
@@ -1316,6 +2000,7 @@ mod tests {
             " FREE_LOCAL ",
             DatabaseType::Oracle,
             OracleConnectMode::TnsAlias,
+            default_advanced(DatabaseType::Oracle),
         )
         .expect("should build TNS alias connection info");
 

@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::db::ConnectionInfo;
+use crate::utils::arithmetic::safe_div;
 use crate::utils::{logging, AppConfig};
 use crate::version;
 
@@ -675,18 +676,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(safe_div(100 - percent_y, 2)),
             Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(safe_div(100 - percent_y, 2)),
         ])
         .split(area);
 
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(safe_div(100 - percent_x, 2)),
             Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(safe_div(100 - percent_x, 2)),
         ])
         .split(popup_layout[1])[1]
 }
@@ -709,6 +710,7 @@ mod tests {
             },
             service_name: "FREE".to_string(),
             db_type,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(db_type),
         }
     }
 
@@ -750,6 +752,7 @@ mod tests {
             port: 1521,
             service_name: "FREE".to_string(),
             db_type: DatabaseType::Oracle,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
         };
 
         assert_eq!(display_service_name(&connection), "FREE (TNS alias)");

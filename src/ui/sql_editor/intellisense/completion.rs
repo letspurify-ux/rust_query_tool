@@ -1354,7 +1354,7 @@ impl SqlEditorWidget {
     fn expected_grant_revoke_object_suggestion_kind(
         words: &[String],
     ) -> Option<ExpectedObjectSuggestionKind> {
-        if !words.last().is_some_and(|word| word == "ON") {
+        if words.last().is_none_or(|word| word != "ON") {
             return None;
         }
         let grant_idx = words

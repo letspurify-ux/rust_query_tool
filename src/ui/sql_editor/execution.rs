@@ -903,17 +903,18 @@ impl SqlEditorWidget {
 
     fn reset_mysql_pooled_session_to_no_database(
         conn: &mut mysql::PooledConn,
+        advanced: &crate::db::ConnectionAdvancedSettings,
     ) -> Result<(), String> {
         conn.as_mut()
             .reset()
             .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?;
-        crate::db::DatabaseConnection::apply_mysql_default_session_settings(conn);
-        Ok(())
+        crate::db::DatabaseConnection::apply_mysql_session_settings(conn, advanced)
     }
 
     fn prepare_mysql_pooled_session_database(
         conn: &mut mysql::PooledConn,
         current_service_name: &str,
+        advanced: &crate::db::ConnectionAdvancedSettings,
     ) -> Result<(), String> {
         let database = current_service_name.trim();
         if database.is_empty() {
@@ -925,7 +926,9 @@ impl SqlEditorWidget {
         // that name as its default schema; COM_INIT_DB validates it before use.
         match conn.as_mut().select_db(database) {
             Ok(()) => {
-                crate::db::DatabaseConnection::apply_mysql_connection_encoding(conn);
+                crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings(
+                    conn, advanced,
+                )?;
                 Ok(())
             }
             Err(err) if Self::mysql_missing_current_database_error(&err) => {
@@ -935,7 +938,7 @@ impl SqlEditorWidget {
                         "Current database `{database}` is not available; continuing without a default database"
                     ),
                 );
-                Self::reset_mysql_pooled_session_to_no_database(conn)
+                Self::reset_mysql_pooled_session_to_no_database(conn, advanced)
             }
             Err(err) => Err(SqlEditorWidget::mysql_error_message(&err, None)),
         }
@@ -974,6 +977,17 @@ impl SqlEditorWidget {
             crate::db::current_oracle_pooled_session_lease(pooled_db_session, connection_generation)
         {
             if conn.ping().is_ok() {
+                if let Err(message) = crate::db::DatabaseConnection::apply_oracle_session_settings(
+                    conn.as_ref(),
+                    &conn_guard.get_info().advanced,
+                ) {
+                    crate::db::clear_oracle_pooled_session_lease_if_current_connection(
+                        pooled_db_session,
+                        connection_generation,
+                        &conn,
+                    );
+                    return (conn_guard, Err(message));
+                }
                 if let Err(message) = conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())
                 {
                     crate::db::clear_oracle_pooled_session_lease_if_current_connection(
@@ -5665,6 +5679,9 @@ impl SqlEditorWidget {
                                         port,
                                         service_name,
                                         db_type: crate::db::DatabaseType::Oracle,
+                                        advanced: crate::db::ConnectionAdvancedSettings::default_for(
+                                            crate::db::DatabaseType::Oracle,
+                                        ),
                                     };
 
                                     let connect_result = {
@@ -9611,12 +9628,14 @@ impl SqlEditorWidget {
     fn reusable_mysql_pooled_session_is_ready(
         conn: &mut mysql::PooledConn,
         current_service_name: &str,
+        advanced: &crate::db::ConnectionAdvancedSettings,
     ) -> Result<bool, String> {
         if conn.as_mut().ping().is_err() {
             return Ok(false);
         }
+        crate::db::DatabaseConnection::apply_mysql_session_settings(conn, advanced)?;
 
-        match Self::prepare_mysql_pooled_session_database(conn, current_service_name) {
+        match Self::prepare_mysql_pooled_session_database(conn, current_service_name, advanced) {
             Ok(()) => Ok(true),
             Err(message) if Self::mysql_error_allows_session_reuse(&message) => Err(message),
             Err(_) => Ok(false),
@@ -9628,8 +9647,11 @@ impl SqlEditorWidget {
         session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
         mut conn: mysql::PooledConn,
     ) -> Result<mysql::PooledConn, String> {
-        match Self::prepare_mysql_pooled_session_database(&mut conn, &context.current_service_name)
-        {
+        match Self::prepare_mysql_pooled_session_database(
+            &mut conn,
+            &context.current_service_name,
+            &context.connection_info.advanced,
+        ) {
             Ok(()) => Ok(conn),
             Err(message) if !Self::mysql_error_allows_session_reuse(&message) => {
                 drop(conn);
@@ -9638,6 +9660,7 @@ impl SqlEditorWidget {
                 Self::prepare_mysql_pooled_session_database(
                     &mut conn,
                     &context.current_service_name,
+                    &context.connection_info.advanced,
                 )?;
                 Ok(conn)
             }
@@ -9668,6 +9691,7 @@ impl SqlEditorWidget {
             if Self::reusable_mysql_pooled_session_is_ready(
                 &mut conn,
                 &context.current_service_name,
+                &context.connection_info.advanced,
             )? {
                 conn
             } else {
@@ -11486,12 +11510,7 @@ mod mysql_batch_execution_regression_tests {
             };
             match name.as_str() {
                 "transaction_isolation" | "tx_isolation" => {
-                    isolation = Some(
-                        value
-                            .replace('-', " ")
-                            .replace('_', " ")
-                            .to_ascii_uppercase(),
-                    );
+                    isolation = Some(value.replace(['-', '_'], " ").to_ascii_uppercase());
                 }
                 "transaction_read_only" | "tx_read_only" => {
                     read_only = Some(value.to_ascii_uppercase());

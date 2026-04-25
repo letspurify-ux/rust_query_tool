@@ -323,6 +323,9 @@ mod tests {
             username: "scott".to_string(),
             password: String::new(),
             db_type: crate::db::DatabaseType::Oracle,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(
+                crate::db::DatabaseType::Oracle,
+            ),
         }
     }
 
@@ -378,6 +381,7 @@ mod tests {
             username: "root".to_string(),
             password: String::new(),
             db_type: DatabaseType::MySQL,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
         });
 
         let serialized =
@@ -429,6 +433,75 @@ mod tests {
     }
 
     #[test]
+    fn app_config_deserializes_old_connection_without_advanced_settings() {
+        let restored: AppConfig = serde_json::from_str(
+            r#"{
+                "recent_connections": [{
+                    "name": "maria",
+                    "host": "localhost",
+                    "port": 3306,
+                    "service_name": "query_tool_test",
+                    "username": "root",
+                    "db_type": "MySQL"
+                }],
+                "last_connection": null,
+                "editor_font": "Courier",
+                "ui_font_size": 16,
+                "editor_font_size": 16,
+                "result_font": "Courier",
+                "result_font_size": 16,
+                "result_cell_max_chars": 50,
+                "max_rows": 1000,
+                "auto_commit": false
+            }"#,
+        )
+        .expect("old config should deserialize");
+
+        let advanced = &restored.recent_connections[0].advanced;
+        assert_eq!(advanced.mysql_sql_mode, "TRADITIONAL");
+        assert_eq!(advanced.mysql_charset, "utf8mb4");
+        assert_eq!(advanced.session_time_zone, "+00:00");
+        assert_eq!(
+            advanced.default_transaction_isolation,
+            crate::db::transaction::TransactionIsolation::ReadCommitted
+        );
+    }
+
+    #[test]
+    fn app_config_merges_partial_advanced_settings_with_db_defaults() {
+        let restored: AppConfig = serde_json::from_str(
+            r#"{
+                "recent_connections": [{
+                    "name": "maria",
+                    "host": "localhost",
+                    "port": 3306,
+                    "service_name": "query_tool_test",
+                    "username": "root",
+                    "db_type": "MySQL",
+                    "advanced": {
+                        "mysql_sql_mode": "ANSI_QUOTES"
+                    }
+                }],
+                "last_connection": null,
+                "editor_font": "Courier",
+                "ui_font_size": 16,
+                "editor_font_size": 16,
+                "result_font": "Courier",
+                "result_font_size": 16,
+                "result_cell_max_chars": 50,
+                "max_rows": 1000,
+                "auto_commit": false
+            }"#,
+        )
+        .expect("partial advanced config should deserialize");
+
+        let advanced = &restored.recent_connections[0].advanced;
+        assert_eq!(advanced.mysql_sql_mode, "ANSI_QUOTES");
+        assert_eq!(advanced.mysql_charset, "utf8mb4");
+        assert_eq!(advanced.session_time_zone, "+00:00");
+    }
+
+    #[test]
     fn recent_sql_files_are_deduplicated_and_limited_to_ten() {
         let mut config = AppConfig::new();
         for idx in 0..12 {
@@ -463,6 +536,7 @@ mod tests {
             username: "scott".to_string(),
             password: "secret".to_string(),
             db_type: DatabaseType::Oracle,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
         });
 
         let serialized = serde_json::to_string(&config).expect("config should serialize");

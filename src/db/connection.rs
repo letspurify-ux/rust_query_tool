@@ -1,5 +1,7 @@
 use mysql::prelude::*;
-use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind, InitParams};
+use oracle::{
+    Connection, Connector, Error as OracleError, ErrorKind as OracleErrorKind, InitParams,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt;
@@ -27,6 +29,239 @@ pub enum DatabaseType {
     #[default]
     Oracle,
     MySQL,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionSslMode {
+    #[default]
+    Disabled,
+    Required,
+    VerifyCa,
+    VerifyIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OracleNetworkProtocol {
+    #[default]
+    Tcp,
+    Tcps,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionAdvancedSettings {
+    #[serde(default)]
+    pub ssl_mode: ConnectionSslMode,
+    #[serde(default = "ConnectionAdvancedSettings::default_transaction_isolation")]
+    pub default_transaction_isolation: TransactionIsolation,
+    #[serde(default)]
+    pub default_transaction_access_mode: TransactionAccessMode,
+    #[serde(default)]
+    pub session_time_zone: String,
+    #[serde(default = "ConnectionAdvancedSettings::default_mysql_sql_mode")]
+    pub mysql_sql_mode: String,
+    #[serde(default = "ConnectionAdvancedSettings::default_mysql_charset")]
+    pub mysql_charset: String,
+    #[serde(default)]
+    pub mysql_collation: String,
+    #[serde(default)]
+    pub mysql_ssl_ca_path: String,
+    #[serde(default)]
+    pub oracle_protocol: OracleNetworkProtocol,
+    #[serde(default = "ConnectionAdvancedSettings::default_oracle_nls_date_format")]
+    pub oracle_nls_date_format: String,
+    #[serde(default = "ConnectionAdvancedSettings::default_oracle_nls_timestamp_format")]
+    pub oracle_nls_timestamp_format: String,
+}
+
+impl ConnectionSslMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::Required => "Required",
+            Self::VerifyCa => "Verify CA",
+            Self::VerifyIdentity => "Verify identity",
+        }
+    }
+}
+
+impl OracleNetworkProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Tcps => "TCPS",
+        }
+    }
+}
+
+impl ConnectionAdvancedSettings {
+    fn default_transaction_isolation() -> TransactionIsolation {
+        TransactionIsolation::ReadCommitted
+    }
+
+    fn default_mysql_sql_mode() -> String {
+        "TRADITIONAL".to_string()
+    }
+
+    fn default_mysql_charset() -> String {
+        "utf8mb4".to_string()
+    }
+
+    fn default_oracle_nls_date_format() -> String {
+        "yyyy-mm-dd hh24:mi:ss".to_string()
+    }
+
+    fn default_oracle_nls_timestamp_format() -> String {
+        "yyyy-mm-dd hh24:mi:ss.ff6".to_string()
+    }
+
+    pub fn default_for(db_type: DatabaseType) -> Self {
+        let mut settings = Self::default();
+        if db_type == DatabaseType::MySQL {
+            settings.session_time_zone = "+00:00".to_string();
+        }
+        settings
+    }
+
+    pub fn validate_for_db(
+        &self,
+        db_type: DatabaseType,
+        using_tns_alias: bool,
+    ) -> Result<(), String> {
+        if !db_type
+            .supported_transaction_isolations()
+            .contains(&self.default_transaction_isolation)
+        {
+            return Err(format!(
+                "{} does not support {} as a default transaction isolation",
+                db_type,
+                self.default_transaction_isolation.label()
+            ));
+        }
+
+        if !self.session_time_zone.trim().is_empty()
+            && !is_safe_session_time_zone(self.session_time_zone.trim())
+        {
+            return Err(
+                "Session time zone must be blank or an offset like +00:00 or -05:30".to_string(),
+            );
+        }
+
+        match db_type {
+            DatabaseType::Oracle => self.validate_oracle(using_tns_alias),
+            DatabaseType::MySQL => self.validate_mysql(),
+        }
+    }
+
+    fn validate_oracle(&self, using_tns_alias: bool) -> Result<(), String> {
+        if matches!(
+            self.ssl_mode,
+            ConnectionSslMode::VerifyCa | ConnectionSslMode::VerifyIdentity
+        ) {
+            return Err(
+                "Oracle SSL certificate verification is not configured in this dialog; use Required/TCPS or configure verification through a TNS alias"
+                    .to_string(),
+            );
+        }
+        if using_tns_alias
+            && (self.oracle_protocol == OracleNetworkProtocol::Tcps
+                || self.ssl_mode != ConnectionSslMode::Disabled)
+        {
+            return Err(
+                "Oracle TNS alias mode uses Oracle Net settings; disable direct SSL/TCPS options in this dialog"
+                    .to_string(),
+            );
+        }
+        validate_oracle_nls_format("Oracle NLS date format", self.oracle_nls_date_format.trim())?;
+        validate_oracle_nls_format(
+            "Oracle NLS timestamp format",
+            self.oracle_nls_timestamp_format.trim(),
+        )?;
+        Ok(())
+    }
+
+    fn validate_mysql(&self) -> Result<(), String> {
+        validate_mysql_sql_mode(self.mysql_sql_mode.trim())?;
+        validate_mysql_identifier("MySQL character set", self.mysql_charset.trim(), false)?;
+        validate_mysql_identifier("MySQL collation", self.mysql_collation.trim(), true)?;
+        Ok(())
+    }
+
+    fn oracle_effective_protocol(&self) -> OracleNetworkProtocol {
+        if self.ssl_mode == ConnectionSslMode::Disabled {
+            self.oracle_protocol
+        } else {
+            OracleNetworkProtocol::Tcps
+        }
+    }
+}
+
+impl Default for ConnectionAdvancedSettings {
+    fn default() -> Self {
+        Self {
+            ssl_mode: ConnectionSslMode::Disabled,
+            default_transaction_isolation: Self::default_transaction_isolation(),
+            default_transaction_access_mode: TransactionAccessMode::ReadWrite,
+            session_time_zone: String::new(),
+            mysql_sql_mode: Self::default_mysql_sql_mode(),
+            mysql_charset: Self::default_mysql_charset(),
+            mysql_collation: String::new(),
+            mysql_ssl_ca_path: String::new(),
+            oracle_protocol: OracleNetworkProtocol::Tcp,
+            oracle_nls_date_format: Self::default_oracle_nls_date_format(),
+            oracle_nls_timestamp_format: Self::default_oracle_nls_timestamp_format(),
+        }
+    }
+}
+
+fn is_safe_session_time_zone(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return false;
+    }
+    let hour = value[1..3].parse::<u8>().ok();
+    let minute = value[4..6].parse::<u8>().ok();
+    matches!((hour, minute), (Some(hour), Some(minute)) if hour <= 14 && minute <= 59)
+}
+
+fn validate_oracle_nls_format(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b' ' | b':' | b'.' | b'-' | b'_' | b'/' | b',' | b';')
+    }) {
+        return Err(format!("{label} contains invalid characters"));
+    }
+    Ok(())
+}
+
+fn validate_mysql_sql_mode(value: &str) -> Result<(), String> {
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'_'))
+    {
+        return Err("MySQL sql_mode contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+fn validate_mysql_identifier(label: &str, value: &str, allow_empty: bool) -> Result<(), String> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err(format!("{label} is required"))
+        };
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(format!("{label} contains invalid characters"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,17 +355,115 @@ impl fmt::Display for DatabaseType {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ConnectionInfo {
     pub name: String,
     pub username: String,
-    #[serde(skip_serializing, default)]
+    #[serde(skip_serializing)]
     pub password: String,
     pub host: String,
     pub port: u16,
     pub service_name: String,
-    #[serde(default)]
     pub db_type: DatabaseType,
+    pub advanced: ConnectionAdvancedSettings,
+}
+
+#[derive(Deserialize)]
+struct ConnectionInfoSerde {
+    name: String,
+    username: String,
+    #[serde(default)]
+    password: String,
+    host: String,
+    port: u16,
+    service_name: String,
+    #[serde(default)]
+    db_type: DatabaseType,
+    advanced: Option<ConnectionAdvancedSettingsPatch>,
+}
+
+#[derive(Default, Deserialize)]
+struct ConnectionAdvancedSettingsPatch {
+    ssl_mode: Option<ConnectionSslMode>,
+    default_transaction_isolation: Option<TransactionIsolation>,
+    default_transaction_access_mode: Option<TransactionAccessMode>,
+    session_time_zone: Option<String>,
+    mysql_sql_mode: Option<String>,
+    mysql_charset: Option<String>,
+    mysql_collation: Option<String>,
+    mysql_ssl_ca_path: Option<String>,
+    oracle_protocol: Option<OracleNetworkProtocol>,
+    oracle_nls_date_format: Option<String>,
+    oracle_nls_timestamp_format: Option<String>,
+}
+
+impl ConnectionAdvancedSettings {
+    fn default_for_with_patch(
+        db_type: DatabaseType,
+        patch: Option<ConnectionAdvancedSettingsPatch>,
+    ) -> Self {
+        let mut settings = Self::default_for(db_type);
+        let Some(patch) = patch else {
+            return settings;
+        };
+
+        if let Some(value) = patch.ssl_mode {
+            settings.ssl_mode = value;
+        }
+        if let Some(value) = patch.default_transaction_isolation {
+            settings.default_transaction_isolation = value;
+        }
+        if let Some(value) = patch.default_transaction_access_mode {
+            settings.default_transaction_access_mode = value;
+        }
+        if let Some(value) = patch.session_time_zone {
+            settings.session_time_zone = value;
+        }
+        if let Some(value) = patch.mysql_sql_mode {
+            settings.mysql_sql_mode = value;
+        }
+        if let Some(value) = patch.mysql_charset {
+            settings.mysql_charset = value;
+        }
+        if let Some(value) = patch.mysql_collation {
+            settings.mysql_collation = value;
+        }
+        if let Some(value) = patch.mysql_ssl_ca_path {
+            settings.mysql_ssl_ca_path = value;
+        }
+        if let Some(value) = patch.oracle_protocol {
+            settings.oracle_protocol = value;
+        }
+        if let Some(value) = patch.oracle_nls_date_format {
+            settings.oracle_nls_date_format = value;
+        }
+        if let Some(value) = patch.oracle_nls_timestamp_format {
+            settings.oracle_nls_timestamp_format = value;
+        }
+        settings
+    }
+}
+
+impl<'de> Deserialize<'de> for ConnectionInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = ConnectionInfoSerde::deserialize(deserializer)?;
+        Ok(Self {
+            name: fields.name,
+            username: fields.username,
+            password: fields.password,
+            host: fields.host,
+            port: fields.port,
+            service_name: fields.service_name,
+            db_type: fields.db_type,
+            advanced: ConnectionAdvancedSettings::default_for_with_patch(
+                fields.db_type,
+                fields.advanced,
+            ),
+        })
+    }
 }
 
 impl ConnectionInfo {
@@ -170,6 +503,7 @@ impl ConnectionInfo {
             port,
             service_name: service_name.to_string(),
             db_type: DatabaseType::Oracle,
+            advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
         }
     }
 
@@ -190,6 +524,7 @@ impl ConnectionInfo {
             port,
             service_name: service_name.to_string(),
             db_type,
+            advanced: ConnectionAdvancedSettings::default_for(db_type),
         }
     }
 
@@ -226,8 +561,14 @@ pub enum DbConnection {
 
 #[derive(Clone)]
 pub enum DbConnectionPool {
-    Oracle(oracle::pool::Pool),
-    MySQL(mysql::Pool),
+    Oracle {
+        pool: oracle::pool::Pool,
+        advanced: ConnectionAdvancedSettings,
+    },
+    MySQL {
+        pool: mysql::Pool,
+        advanced: ConnectionAdvancedSettings,
+    },
 }
 
 pub enum DbPoolSession {
@@ -254,16 +595,24 @@ pub struct DbPoolSessionContext {
 impl DbConnectionPool {
     pub fn acquire_session(&self) -> Result<DbPoolSession, String> {
         let mut session = match self {
-            DbConnectionPool::Oracle(pool) => DbPoolSession::Oracle(
+            DbConnectionPool::Oracle { pool, .. } => DbPoolSession::Oracle(
                 pool.get()
                     .map_err(|err| Self::format_oracle_pool_acquire_error(pool, &err))?,
             ),
-            DbConnectionPool::MySQL(pool) => DbPoolSession::MySQL(
+            DbConnectionPool::MySQL { pool, .. } => DbPoolSession::MySQL(
                 pool.try_get_conn(MYSQL_POOL_ACQUIRE_TIMEOUT)
                     .map_err(|err| Self::format_mysql_pool_acquire_error(&err))?,
             ),
         };
-        backend_for(session.db_type()).apply_pool_session_defaults(&mut session);
+        match (self, &mut session) {
+            (DbConnectionPool::Oracle { advanced, .. }, DbPoolSession::Oracle(conn)) => {
+                DatabaseConnection::apply_oracle_session_settings(conn, advanced)?;
+            }
+            (DbConnectionPool::MySQL { advanced, .. }, DbPoolSession::MySQL(conn)) => {
+                DatabaseConnection::apply_mysql_session_settings(conn, advanced)?;
+            }
+            _ => {}
+        }
         Ok(session)
     }
 
@@ -511,7 +860,6 @@ pub(crate) trait DbBackend: Sync {
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
     fn after_connect(&self, _connection: &mut DatabaseConnection) {}
     fn apply_auto_commit(&self, _connection: &mut DbConnection, _enabled: bool) {}
-    fn apply_pool_session_defaults(&self, _session: &mut DbPoolSession) {}
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
         &DEFAULT_TRANSACTION_ISOLATIONS
     }
@@ -600,12 +948,18 @@ impl DbBackend for OracleBackend {
             port: form.default_port,
             service_name: form.default_service_name.to_string(),
             db_type: DatabaseType::Oracle,
+            advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
         }
     }
 
     fn connection_string(&self, info: &ConnectionInfo) -> String {
         if info.uses_oracle_tns_alias() {
             info.service_name.trim().to_string()
+        } else if info.advanced.oracle_effective_protocol() == OracleNetworkProtocol::Tcps {
+            format!(
+                "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})))",
+                info.host, info.port, info.service_name
+            )
         } else {
             format!("//{}:{}/{}", info.host, info.port, info.service_name)
         }
@@ -624,33 +978,35 @@ impl DbBackend for OracleBackend {
         ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
         let conn_str = info.connection_string();
         let connection = Arc::new(
-            Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
-                eprintln!("Connection error: {err}");
-                err.to_string()
-            })?,
+            Connector::new(&info.username, &info.password, &conn_str)
+                .connect()
+                .map_err(|err| {
+                    eprintln!("Connection error: {err}");
+                    err.to_string()
+                })?,
         );
-        DatabaseConnection::apply_oracle_default_session_settings(connection.as_ref());
+        DatabaseConnection::apply_oracle_session_settings(connection.as_ref(), &info.advanced)?;
         let pool = DatabaseConnection::build_oracle_pool(info, pool_size)?;
         Ok((
             DbConnection::Oracle(connection),
-            DbConnectionPool::Oracle(pool),
+            DbConnectionPool::Oracle {
+                pool,
+                advanced: info.advanced.clone(),
+            },
         ))
     }
 
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
         ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
         let conn_str = info.connection_string();
-        Connection::connect(&info.username, &info.password, &conn_str).map_err(|err| {
-            eprintln!("Connection error: {err}");
-            err.to_string()
-        })?;
+        let connection = Connector::new(&info.username, &info.password, &conn_str)
+            .connect()
+            .map_err(|err| {
+                eprintln!("Connection error: {err}");
+                err.to_string()
+            })?;
+        DatabaseConnection::apply_oracle_session_settings(&connection, &info.advanced)?;
         Ok(())
-    }
-
-    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession) {
-        if let DbPoolSession::Oracle(conn) = session {
-            DatabaseConnection::apply_oracle_default_session_settings(conn);
-        }
     }
 
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
@@ -736,6 +1092,7 @@ impl DbBackend for MysqlBackend {
             port: form.default_port,
             service_name: form.default_service_name.to_string(),
             db_type: DatabaseType::MySQL,
+            advanced: ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
         }
     }
 
@@ -763,18 +1120,25 @@ impl DbBackend for MysqlBackend {
             eprintln!("MySQL connection error: {err}");
             err.to_string()
         })?;
-        DatabaseConnection::apply_mysql_default_session_settings(&mut conn);
+        DatabaseConnection::apply_mysql_session_settings(&mut conn, &info.advanced)?;
         DatabaseConnection::apply_mysql_autocommit_setting(&mut conn, auto_commit);
         let pool = DatabaseConnection::build_mysql_pool(info, pool_size)?;
-        Ok((DbConnection::MySQL(conn), DbConnectionPool::MySQL(pool)))
+        Ok((
+            DbConnection::MySQL(conn),
+            DbConnectionPool::MySQL {
+                pool,
+                advanced: info.advanced.clone(),
+            },
+        ))
     }
 
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
         let opts = DatabaseConnection::build_mysql_opts(info);
-        mysql::Conn::new(opts).map_err(|err| {
+        let mut conn = mysql::Conn::new(opts).map_err(|err| {
             eprintln!("MySQL connection error: {err}");
             err.to_string()
         })?;
+        DatabaseConnection::apply_mysql_session_settings(&mut conn, &info.advanced)?;
         Ok(())
     }
 
@@ -787,12 +1151,6 @@ impl DbBackend for MysqlBackend {
     fn apply_auto_commit(&self, connection: &mut DbConnection, enabled: bool) {
         if let DbConnection::MySQL(conn) = connection {
             DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled);
-        }
-    }
-
-    fn apply_pool_session_defaults(&self, session: &mut DbPoolSession) {
-        if let DbPoolSession::MySQL(conn) = session {
-            DatabaseConnection::apply_mysql_default_session_settings(conn);
         }
     }
 
@@ -849,6 +1207,10 @@ impl DatabaseConnection {
         Self::build_mysql_opts_with_pool_size(info, None)
     }
 
+    pub(crate) fn build_mysql_opts_without_database(info: &ConnectionInfo) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size_and_database(info, None, false)
+    }
+
     fn build_mysql_opts_with_pool_size(
         info: &ConnectionInfo,
         pool_size: Option<u32>,
@@ -869,12 +1231,15 @@ impl DatabaseConnection {
             .ip_or_hostname(Some(&info.host))
             .tcp_port(info.port)
             .user(Some(&info.username))
-            .pass(Some(&info.password));
+            .pass(Some(&info.password))
+            .prefer_socket(false);
 
         let database = info.service_name.trim();
         if include_database && !database.is_empty() {
             opts = opts.db_name(Some(database));
         }
+
+        opts = Self::apply_mysql_driver_options(opts, &info.advanced);
 
         if let Some(pool_size) = pool_size {
             let pool_size = Self::clamp_connection_pool_size(pool_size) as usize;
@@ -885,6 +1250,29 @@ impl DatabaseConnection {
             }
         }
 
+        opts
+    }
+
+    fn apply_mysql_driver_options(
+        mut opts: mysql::OptsBuilder,
+        advanced: &ConnectionAdvancedSettings,
+    ) -> mysql::OptsBuilder {
+        if advanced.ssl_mode != ConnectionSslMode::Disabled {
+            let mut ssl_opts = mysql::SslOpts::default();
+            let ca_path = advanced.mysql_ssl_ca_path.trim();
+            if !ca_path.is_empty() {
+                ssl_opts = ssl_opts.with_root_cert_path(Some(std::path::PathBuf::from(ca_path)));
+            }
+            ssl_opts = match advanced.ssl_mode {
+                ConnectionSslMode::Disabled => ssl_opts,
+                ConnectionSslMode::Required => ssl_opts
+                    .with_danger_skip_domain_validation(true)
+                    .with_danger_accept_invalid_certs(true),
+                ConnectionSslMode::VerifyCa => ssl_opts.with_danger_skip_domain_validation(true),
+                ConnectionSslMode::VerifyIdentity => ssl_opts,
+            };
+            opts = opts.ssl_opts(ssl_opts);
+        }
         opts
     }
 
@@ -914,10 +1302,16 @@ impl DatabaseConnection {
     ) -> Result<DbConnectionPool, String> {
         match info.db_type {
             DatabaseType::Oracle => {
-                Self::build_oracle_pool(info, pool_size).map(DbConnectionPool::Oracle)
+                Self::build_oracle_pool(info, pool_size).map(|pool| DbConnectionPool::Oracle {
+                    pool,
+                    advanced: info.advanced.clone(),
+                })
             }
             DatabaseType::MySQL => {
-                Self::build_mysql_pool(info, pool_size).map(DbConnectionPool::MySQL)
+                Self::build_mysql_pool(info, pool_size).map(|pool| DbConnectionPool::MySQL {
+                    pool,
+                    advanced: info.advanced.clone(),
+                })
             }
         }
     }
@@ -941,6 +1335,8 @@ impl DatabaseConnection {
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), String> {
+        info.advanced
+            .validate_for_db(info.db_type, info.uses_oracle_tns_alias())?;
         let (db_conn, pool) = backend_for(info.db_type).connect(
             &info,
             self.connection_pool_size,
@@ -959,7 +1355,10 @@ impl DatabaseConnection {
         self.info = info;
         self.oracle_current_schema = None;
         self.sync_default_transaction_isolation(db_type);
-        self.transaction_mode = TransactionMode::default();
+        self.transaction_mode = TransactionMode::new(
+            TransactionIsolation::Default,
+            self.info.advanced.default_transaction_access_mode,
+        );
         backend_for(db_type).after_connect(self);
         self.connected = true;
         self.last_disconnect_reason = None;
@@ -974,18 +1373,42 @@ impl DatabaseConnection {
         Ok(())
     }
 
-    pub(crate) fn apply_oracle_default_session_settings(conn: &Connection) {
-        let statements = [
-            "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'yyyy-mm-dd hh24:mi:ss.ff6'",
-            "ALTER SESSION SET NLS_DATE_FORMAT = 'yyyy-mm-dd hh24:mi:ss'",
-            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
-        ];
+    pub(crate) fn apply_oracle_session_settings(
+        conn: &Connection,
+        advanced: &ConnectionAdvancedSettings,
+    ) -> Result<(), String> {
+        let statements = Self::oracle_session_setting_statements(advanced);
 
         for statement in statements {
-            if let Err(err) = conn.execute(statement, &[]) {
-                eprintln!("Warning: failed to apply default session setting `{statement}`: {err}");
+            if let Err(err) = conn.execute(statement.as_str(), &[]) {
+                return Err(format!(
+                    "Failed to apply Oracle session setting `{statement}`: {err}"
+                ));
             }
         }
+        Ok(())
+    }
+
+    fn oracle_session_setting_statements(advanced: &ConnectionAdvancedSettings) -> Vec<String> {
+        let mut statements = vec![
+            format!(
+                "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = '{}'",
+                advanced.oracle_nls_timestamp_format.trim()
+            ),
+            format!(
+                "ALTER SESSION SET NLS_DATE_FORMAT = '{}'",
+                advanced.oracle_nls_date_format.trim()
+            ),
+        ];
+
+        if let Some(level) = advanced.default_transaction_isolation.sql_level() {
+            statements.push(format!("ALTER SESSION SET ISOLATION_LEVEL = {level}"));
+        }
+        let time_zone = advanced.session_time_zone.trim();
+        if !time_zone.is_empty() {
+            statements.push(format!("ALTER SESSION SET TIME_ZONE = '{time_zone}'"));
+        }
+        statements
     }
 
     fn normalize_oracle_current_schema_name(schema: &str) -> Option<String> {
@@ -1003,29 +1426,53 @@ impl DatabaseConnection {
             .and_then(Self::normalize_oracle_current_schema_name);
     }
 
-    pub(crate) fn apply_mysql_default_session_settings<C: Queryable>(conn: &mut C) {
-        let statements = [
-            "SET SESSION sql_mode = 'TRADITIONAL'",
-            "SET SESSION time_zone = '+00:00'",
-            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        ];
+    pub(crate) fn apply_mysql_session_settings<C: Queryable>(
+        conn: &mut C,
+        advanced: &ConnectionAdvancedSettings,
+    ) -> Result<(), String> {
+        let statements = Self::mysql_session_setting_statements(advanced);
 
         for statement in statements {
-            if let Err(err) = conn.query_drop(statement) {
-                eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
+            if let Err(err) = conn.query_drop(statement.as_str()) {
+                return Err(format!(
+                    "Failed to apply MySQL session setting `{statement}`: {err}"
+                ));
             }
         }
 
-        Self::apply_mysql_connection_encoding(conn);
+        Self::apply_mysql_connection_encoding_with_settings(conn, advanced)
     }
 
-    pub(crate) fn apply_mysql_connection_encoding<C: Queryable>(conn: &mut C) {
+    fn mysql_session_setting_statements(advanced: &ConnectionAdvancedSettings) -> Vec<String> {
+        let mut statements = Vec::new();
+        statements.push(format!(
+            "SET SESSION sql_mode = '{}'",
+            advanced.mysql_sql_mode.trim()
+        ));
+        let time_zone = advanced.session_time_zone.trim();
+        if !time_zone.is_empty() {
+            statements.push(format!("SET SESSION time_zone = '{time_zone}'"));
+        }
+        if let Some(level) = advanced.default_transaction_isolation.sql_level() {
+            statements.push(format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"));
+        }
+        statements
+    }
+
+    pub(crate) fn apply_mysql_connection_encoding_with_settings<C: Queryable>(
+        conn: &mut C,
+        advanced: &ConnectionAdvancedSettings,
+    ) -> Result<(), String> {
         let database_collation = Self::mysql_current_database_collation(conn);
-        let statement = Self::mysql_set_names_statement(database_collation.as_deref());
+        let statement =
+            Self::mysql_set_names_statement_with_settings(database_collation.as_deref(), advanced);
 
         if let Err(err) = conn.query_drop(statement.as_str()) {
-            eprintln!("Warning: failed to apply MySQL session setting `{statement}`: {err}");
+            return Err(format!(
+                "Failed to apply MySQL session setting `{statement}`: {err}"
+            ));
         }
+        Ok(())
     }
 
     fn mysql_current_database_collation<C: Queryable>(conn: &mut C) -> Option<String> {
@@ -1054,16 +1501,35 @@ impl DatabaseConnection {
         }
     }
 
+    #[cfg(test)]
     fn mysql_set_names_statement(database_collation: Option<&str>) -> String {
+        Self::mysql_set_names_statement_with_settings(
+            database_collation,
+            &ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
+        )
+    }
+
+    fn mysql_set_names_statement_with_settings(
+        database_collation: Option<&str>,
+        advanced: &ConnectionAdvancedSettings,
+    ) -> String {
+        let charset = advanced.mysql_charset.trim();
+        let configured_collation = advanced.mysql_collation.trim();
+        if !configured_collation.is_empty()
+            && Self::mysql_collation_name_is_safe(configured_collation)
+        {
+            return format!("SET NAMES {charset} COLLATE {configured_collation}");
+        }
+
         match database_collation.map(str::trim) {
             Some(collation)
                 if !collation.is_empty()
                     && Self::mysql_collation_name_is_safe(collation)
-                    && collation.starts_with("utf8mb4_") =>
+                    && collation.starts_with(&format!("{charset}_")) =>
             {
-                format!("SET NAMES utf8mb4 COLLATE {collation}")
+                format!("SET NAMES {charset} COLLATE {collation}")
             }
-            _ => "SET NAMES utf8mb4".to_string(),
+            _ => format!("SET NAMES {charset}"),
         }
     }
 
@@ -1455,6 +1921,7 @@ impl DatabaseConnection {
     }
 
     pub fn sync_mysql_current_database_name(&mut self) -> Result<String, String> {
+        let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
             return Err("Expected MySQL connection but none is active".to_string());
         };
@@ -1465,7 +1932,7 @@ impl DatabaseConnection {
             .flatten()
             .map(|database| database.trim().to_string())
             .unwrap_or_default();
-        Self::apply_mysql_connection_encoding(conn);
+        Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)?;
         self.info.service_name = current_database.clone();
         Ok(current_database)
     }
@@ -1486,7 +1953,7 @@ impl DatabaseConnection {
             .map(|database| database.trim().to_string())
             .unwrap_or_default();
         if refresh_encoding {
-            Self::apply_mysql_connection_encoding(conn);
+            Self::apply_mysql_connection_encoding_with_settings(conn, &self.info.advanced)?;
         }
         self.info.service_name = current_database.clone();
         Ok(current_database)
@@ -1498,13 +1965,14 @@ impl DatabaseConnection {
         }
 
         let target_database = database.trim();
+        let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
             return Err("Expected MySQL connection but none is active".to_string());
         };
 
         conn.select_db(target_database)
             .map_err(|err| err.to_string())?;
-        Self::apply_mysql_connection_encoding(conn);
+        Self::apply_mysql_connection_encoding_with_settings(conn, &advanced)?;
         self.info.service_name = target_database.to_string();
         Ok(())
     }
@@ -1559,6 +2027,8 @@ impl DatabaseConnection {
     }
 
     pub fn test_connection(info: &ConnectionInfo) -> Result<(), String> {
+        info.advanced
+            .validate_for_db(info.db_type, info.uses_oracle_tns_alias())?;
         backend_for(info.db_type).test_connection(info)
     }
 
@@ -1942,6 +2412,27 @@ mod tests {
         )
     }
 
+    fn read_oracle_session_parameter(conn: &Connection, parameter: &str) -> String {
+        let mut stmt = conn
+            .statement("SELECT value FROM nls_session_parameters WHERE parameter = :1")
+            .build()
+            .expect("build Oracle session parameter query");
+        let row = stmt
+            .query_row(&[&parameter])
+            .expect("read Oracle session parameter");
+        row.get::<_, String>(0)
+            .expect("Oracle session parameter value")
+    }
+
+    fn read_oracle_session_time_zone(conn: &Connection) -> String {
+        let mut stmt = conn
+            .statement("SELECT SESSIONTIMEZONE FROM dual")
+            .build()
+            .expect("build Oracle session time zone query");
+        let row = stmt.query_row(&[]).expect("read Oracle session time zone");
+        row.get::<_, String>(0).expect("Oracle session time zone")
+    }
+
     #[test]
     fn require_live_connection_returns_default_message_when_never_connected() {
         let mut conn = DatabaseConnection::new();
@@ -2231,6 +2722,173 @@ mod tests {
     }
 
     #[test]
+    fn advanced_defaults_preserve_existing_db_specific_session_settings() {
+        let oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        assert_eq!(
+            oracle.default_transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert_eq!(
+            oracle.default_transaction_access_mode,
+            TransactionAccessMode::ReadWrite
+        );
+        assert!(oracle.session_time_zone.is_empty());
+        assert_eq!(
+            oracle.oracle_nls_timestamp_format,
+            "yyyy-mm-dd hh24:mi:ss.ff6"
+        );
+        assert_eq!(oracle.oracle_nls_date_format, "yyyy-mm-dd hh24:mi:ss");
+
+        let mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        assert_eq!(
+            mysql.default_transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+        assert_eq!(
+            mysql.default_transaction_access_mode,
+            TransactionAccessMode::ReadWrite
+        );
+        assert_eq!(mysql.session_time_zone, "+00:00");
+        assert_eq!(mysql.mysql_sql_mode, "TRADITIONAL");
+        assert_eq!(mysql.mysql_charset, "utf8mb4");
+    }
+
+    #[test]
+    fn oracle_advanced_session_statements_use_configured_values() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        advanced.default_transaction_isolation = TransactionIsolation::Serializable;
+        advanced.session_time_zone = "+09:00".to_string();
+        advanced.oracle_nls_date_format = "YYYY/MM/DD HH24:MI:SS".to_string();
+        advanced.oracle_nls_timestamp_format = "YYYY/MM/DD HH24:MI:SS.FF3".to_string();
+
+        assert_eq!(
+            DatabaseConnection::oracle_session_setting_statements(&advanced),
+            vec![
+                "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY/MM/DD HH24:MI:SS.FF3'",
+                "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY/MM/DD HH24:MI:SS'",
+                "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+                "ALTER SESSION SET TIME_ZONE = '+09:00'",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_advanced_session_statements_use_configured_values() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
+        advanced.session_time_zone = "+09:00".to_string();
+        advanced.mysql_sql_mode = "ANSI_QUOTES,STRICT_TRANS_TABLES".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_session_setting_statements(&advanced),
+            vec![
+                "SET SESSION sql_mode = 'ANSI_QUOTES,STRICT_TRANS_TABLES'",
+                "SET SESSION time_zone = '+09:00'",
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            ]
+        );
+    }
+
+    #[test]
+    fn oracle_direct_connection_string_uses_tcps_for_ssl_or_protocol() {
+        let mut info = ConnectionInfo::new_with_type(
+            "local",
+            "system",
+            "pw",
+            "localhost",
+            2484,
+            "FREE",
+            DatabaseType::Oracle,
+        );
+        info.advanced.ssl_mode = ConnectionSslMode::Required;
+
+        assert_eq!(
+            info.connection_string(),
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=2484))(CONNECT_DATA=(SERVICE_NAME=FREE)))"
+        );
+
+        info.advanced.ssl_mode = ConnectionSslMode::Disabled;
+        info.advanced.oracle_protocol = OracleNetworkProtocol::Tcps;
+        assert_eq!(
+            info.connection_string(),
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=2484))(CONNECT_DATA=(SERVICE_NAME=FREE)))"
+        );
+    }
+
+    #[test]
+    fn mysql_driver_ssl_options_follow_advanced_mode() {
+        let mut info = ConnectionInfo::new_with_type(
+            "local",
+            "root",
+            "pw",
+            "localhost",
+            3306,
+            "initial_db",
+            DatabaseType::MySQL,
+        );
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        assert!(opts.get_ssl_opts().is_none());
+
+        info.advanced.ssl_mode = ConnectionSslMode::Required;
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let ssl = opts.get_ssl_opts().expect("required SSL should be enabled");
+        assert!(ssl.skip_domain_validation());
+        assert!(ssl.accept_invalid_certs());
+
+        info.advanced.ssl_mode = ConnectionSslMode::VerifyCa;
+        info.advanced.mysql_ssl_ca_path = "/tmp/mysql-ca.pem".to_string();
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let ssl = opts.get_ssl_opts().expect("Verify CA should enable SSL");
+        assert!(ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
+        assert_eq!(
+            ssl.root_cert_path(),
+            Some(std::path::Path::new("/tmp/mysql-ca.pem"))
+        );
+
+        info.advanced.ssl_mode = ConnectionSslMode::VerifyIdentity;
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let ssl = opts
+            .get_ssl_opts()
+            .expect("Verify identity should enable SSL");
+        assert!(!ssl.skip_domain_validation());
+        assert!(!ssl.accept_invalid_certs());
+    }
+
+    #[test]
+    fn advanced_validation_rejects_unsafe_values() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql.session_time_zone = "UTC".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_err());
+
+        mysql.session_time_zone = "+00:00".to_string();
+        mysql.mysql_sql_mode = "TRADITIONAL;DROP".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_err());
+
+        let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        oracle.ssl_mode = ConnectionSslMode::Required;
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, true).is_err());
+
+        oracle.ssl_mode = ConnectionSslMode::VerifyCa;
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
+    }
+
+    #[test]
+    fn mysql_set_names_statement_uses_configured_charset_and_collation() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        advanced.mysql_charset = "utf8mb4".to_string();
+        advanced.mysql_collation = "utf8mb4_0900_ai_ci".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement_with_settings(
+                Some("utf8mb4_unicode_ci"),
+                &advanced,
+            ),
+            "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+        );
+    }
+
+    #[test]
     fn mysql_set_names_statement_uses_utf8mb4_database_collation_when_available() {
         assert_eq!(
             DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci")),
@@ -2380,6 +3038,53 @@ mod tests {
             TransactionIsolation::ReadCommitted
         );
         assert_eq!(connection.transaction_mode(), TransactionMode::default());
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_connect_applies_advanced_session_settings_from_local_xe() {
+        let mut info = oracle_test_connection_info_from_env();
+        info.advanced.default_transaction_isolation = TransactionIsolation::Serializable;
+        info.advanced.session_time_zone = "+09:00".to_string();
+        info.advanced.oracle_nls_date_format = "YYYY-MM-DD HH24:MI:SS".to_string();
+        info.advanced.oracle_nls_timestamp_format = "YYYY-MM-DD HH24:MI:SS.FF3".to_string();
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("Direct localhost Oracle connection should succeed");
+        let conn = connection
+            .require_live_connection()
+            .expect("Oracle connection should be live");
+
+        assert_eq!(
+            DatabaseConnection::read_oracle_default_transaction_isolation(conn.as_ref())
+                .expect("read Oracle current transaction isolation"),
+            Some(TransactionIsolation::Serializable)
+        );
+        assert_eq!(
+            read_oracle_session_parameter(conn.as_ref(), "NLS_DATE_FORMAT"),
+            "YYYY-MM-DD HH24:MI:SS"
+        );
+        assert_eq!(
+            read_oracle_session_parameter(conn.as_ref(), "NLS_TIMESTAMP_FORMAT"),
+            "YYYY-MM-DD HH24:MI:SS.FF3"
+        );
+        assert_eq!(read_oracle_session_time_zone(conn.as_ref()), "+09:00");
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle TCPS listener plus ORACLE_TEST_* environment variables"]
+    fn oracle_tcps_connection_uses_advanced_ssl_protocol() {
+        let mut info = oracle_test_connection_info_from_env();
+        info.port = std::env::var("ORACLE_TEST_TCPS_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(2484);
+        info.advanced.ssl_mode = ConnectionSslMode::Required;
+
+        DatabaseConnection::test_connection(&info)
+            .expect("Oracle TCPS connection should succeed against configured listener");
     }
 
     #[test]
@@ -2645,6 +3350,101 @@ mod tests {
         assert_eq!(time_zone, "+00:00");
         assert_eq!(character_set_client, "utf8mb4");
         assert_eq!(isolation, TransactionIsolation::ReadCommitted);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_connect_applies_advanced_session_settings() {
+        let mut info = mysql_test_connection_info_from_env();
+        info.advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
+        info.advanced.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
+        info.advanced.session_time_zone = "+09:00".to_string();
+        info.advanced.mysql_sql_mode = "ANSI_QUOTES,STRICT_TRANS_TABLES".to_string();
+        info.advanced.mysql_charset = "utf8mb4".to_string();
+        info.advanced.mysql_collation = "utf8mb4_unicode_ci".to_string();
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("MySQL/MariaDB connection should succeed");
+        assert_eq!(
+            connection.default_transaction_isolation(),
+            TransactionIsolation::RepeatableRead
+        );
+        assert_eq!(
+            connection.transaction_mode(),
+            TransactionMode::new(
+                TransactionIsolation::Default,
+                TransactionAccessMode::ReadOnly
+            )
+        );
+
+        let conn = connection
+            .get_mysql_connection_mut()
+            .expect("MySQL connection should be live");
+        let sql_mode = conn
+            .query_first::<String, _>("SELECT @@SESSION.sql_mode")
+            .expect("read sql_mode")
+            .unwrap_or_default();
+        let time_zone = conn
+            .query_first::<String, _>("SELECT @@SESSION.time_zone")
+            .expect("read time_zone")
+            .unwrap_or_default();
+        let character_set_client = conn
+            .query_first::<String, _>("SELECT @@SESSION.character_set_client")
+            .expect("read character_set_client")
+            .unwrap_or_default();
+        let collation_connection = conn
+            .query_first::<String, _>("SELECT @@SESSION.collation_connection")
+            .expect("read collation_connection")
+            .unwrap_or_default();
+
+        assert!(sql_mode.contains("ANSI_QUOTES"));
+        assert!(sql_mode.contains("STRICT_TRANS_TABLES"));
+        assert_eq!(time_zone, "+09:00");
+        assert_eq!(character_set_client, "utf8mb4");
+        assert_eq!(collation_connection, "utf8mb4_unicode_ci");
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_connect_reports_invalid_advanced_session_setting() {
+        let mut info = mysql_test_connection_info_from_env();
+        info.advanced.mysql_collation = "utf8mb4_not_a_real_ci".to_string();
+
+        let mut connection = DatabaseConnection::new();
+        let err = connection
+            .connect(info)
+            .expect_err("invalid collation should fail connection setup");
+
+        assert!(err.contains("Failed to apply MySQL session setting"));
+        assert!(err.contains("SET NAMES"));
+    }
+
+    #[test]
+    #[ignore = "requires MySQL or MariaDB TLS config via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_ssl_required_connects_when_server_tls_is_configured() {
+        let mut info = mysql_test_connection_info_from_env();
+        info.advanced.ssl_mode = ConnectionSslMode::Required;
+        if let Ok(ca_path) = std::env::var("SPACE_QUERY_TEST_MYSQL_SSL_CA") {
+            info.advanced.ssl_mode = ConnectionSslMode::VerifyCa;
+            info.advanced.mysql_ssl_ca_path = ca_path;
+        }
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("MySQL/MariaDB TLS connection should succeed");
+        let conn = connection
+            .get_mysql_connection_mut()
+            .expect("MySQL connection should be live");
+        let ssl_cipher = conn
+            .query_first::<(String, String), _>("SHOW STATUS LIKE 'Ssl_cipher'")
+            .expect("read SSL cipher")
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+
+        assert!(!ssl_cipher.is_empty());
     }
 
     #[test]

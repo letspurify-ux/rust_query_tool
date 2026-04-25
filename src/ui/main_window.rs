@@ -1391,7 +1391,7 @@ pub struct MainWindow {
 
 #[derive(Clone)]
 enum ConnectionResult {
-    Success(crate::db::ConnectionInfo),
+    Success(Box<crate::db::ConnectionInfo>),
     Failure(String),
 }
 
@@ -5008,7 +5008,7 @@ impl MainWindow {
                                 }
                                 let mut info = info;
                                 info.clear_password();
-                                let _ = conn_sender.send(ConnectionResult::Success(info));
+                                let _ = conn_sender.send(ConnectionResult::Success(Box::new(info)));
                                 app::awake();
                             }
                             Err(e) => {
@@ -6167,6 +6167,7 @@ impl MainWindow {
                             processed_message = true;
                             match result {
                                 ConnectionResult::Success(info) => {
+                                    let info = *info;
                                     crate::utils::logging::log_info(
                                         "connection",
                                         &format!("Connected to {} ({})", info.name, info.db_type),

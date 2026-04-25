@@ -526,11 +526,7 @@ impl MysqlExecutor {
     }
 
     fn build_cancel_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
-        mysql::OptsBuilder::new()
-            .ip_or_hostname(Some(&info.host))
-            .tcp_port(info.port)
-            .user(Some(&info.username))
-            .pass(Some(&info.password))
+        crate::db::DatabaseConnection::build_mysql_opts_without_database(info)
     }
 
     pub fn cancel_running_query(
@@ -2155,6 +2151,7 @@ mod tests {
             port: 3306,
             service_name: "possibly_dropped_database".to_string(),
             db_type: DatabaseType::MySQL,
+            advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
         }));
 
         assert_eq!(opts.get_db_name(), None);
