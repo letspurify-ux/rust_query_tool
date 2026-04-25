@@ -128,28 +128,45 @@ impl ConnectionAdvancedSettings {
     /// access mode, SSL mode, time zone). DB-specific fields fall back to
     /// the defaults for `new_db_type` because the `self` value holds fields
     /// for the other backend.
-    pub fn migrate_for_db_type(&self, new_db_type: DatabaseType) -> Self {
-        let mut settings = Self::default_for(new_db_type);
+    pub fn migrate_for_db_type(
+        &self,
+        previous_db_type: DatabaseType,
+        new_db_type: DatabaseType,
+    ) -> Self {
+        if previous_db_type == new_db_type {
+            return self.clone();
+        }
 
-        if new_db_type
-            .supported_transaction_isolations()
-            .contains(&self.default_transaction_isolation)
+        let mut settings = Self::default_for(new_db_type);
+        let previous_defaults = Self::default_for(previous_db_type);
+
+        if self.default_transaction_isolation != previous_defaults.default_transaction_isolation
+            && new_db_type
+                .supported_transaction_isolations()
+                .contains(&self.default_transaction_isolation)
         {
             settings.default_transaction_isolation = self.default_transaction_isolation;
         }
-        settings.default_transaction_access_mode = self.default_transaction_access_mode;
-        settings.session_time_zone = self.session_time_zone.clone();
+        if self.default_transaction_access_mode != previous_defaults.default_transaction_access_mode
+        {
+            settings.default_transaction_access_mode = self.default_transaction_access_mode;
+        }
+        if self.session_time_zone != previous_defaults.session_time_zone {
+            settings.session_time_zone = self.session_time_zone.clone();
+        }
 
         // Oracle only supports Disabled or Required (TCPS); remap the stricter
         // MySQL modes onto Required so the user does not silently "downgrade"
         // to Disabled when switching databases.
-        settings.ssl_mode = match (new_db_type, self.ssl_mode) {
-            (DatabaseType::Oracle, ConnectionSslMode::VerifyCa)
-            | (DatabaseType::Oracle, ConnectionSslMode::VerifyIdentity) => {
-                ConnectionSslMode::Required
+        if self.ssl_mode != previous_defaults.ssl_mode {
+            settings.ssl_mode = match (new_db_type, self.ssl_mode) {
+                (DatabaseType::Oracle, ConnectionSslMode::VerifyCa)
+                | (DatabaseType::Oracle, ConnectionSslMode::VerifyIdentity) => {
+                    ConnectionSslMode::Required
+                }
+                (_, mode) => mode,
             }
-            (_, mode) => mode,
-        };
+        }
 
         settings
     }
@@ -170,12 +187,8 @@ impl ConnectionAdvancedSettings {
             ));
         }
 
-        if !self.session_time_zone.trim().is_empty()
-            && !is_safe_session_time_zone(self.session_time_zone.trim())
-        {
-            return Err(
-                "Session time zone must be blank or an offset like +00:00 or -05:30".to_string(),
-            );
+        if !self.session_time_zone.trim().is_empty() {
+            validate_session_time_zone_for_db(db_type, self.session_time_zone.trim())?;
         }
 
         match db_type {
@@ -185,21 +198,14 @@ impl ConnectionAdvancedSettings {
     }
 
     fn validate_oracle(&self, using_tns_alias: bool) -> Result<(), String> {
-        if matches!(
-            self.ssl_mode,
-            ConnectionSslMode::VerifyCa | ConnectionSslMode::VerifyIdentity
-        ) {
-            return Err(
-                "Oracle SSL certificate verification is not configured in this dialog; use Required/TCPS or configure verification through a TNS alias"
-                    .to_string(),
-            );
-        }
-        if using_tns_alias
-            && (self.oracle_protocol == OracleNetworkProtocol::Tcps
-                || self.ssl_mode != ConnectionSslMode::Disabled)
+        if !using_tns_alias
+            && matches!(
+                self.ssl_mode,
+                ConnectionSslMode::VerifyCa | ConnectionSslMode::VerifyIdentity
+            )
         {
             return Err(
-                "Oracle TNS alias mode uses Oracle Net settings; disable direct SSL/TCPS options in this dialog"
+                "Oracle SSL certificate verification is not configured in this dialog; use Required/TCPS or configure verification through a TNS alias"
                     .to_string(),
             );
         }
@@ -212,9 +218,16 @@ impl ConnectionAdvancedSettings {
     }
 
     fn validate_mysql(&self) -> Result<(), String> {
+        let charset = self.mysql_charset.trim();
+        let collation = self.mysql_collation.trim();
         validate_mysql_sql_mode(self.mysql_sql_mode.trim())?;
-        validate_mysql_identifier("MySQL character set", self.mysql_charset.trim(), false)?;
-        validate_mysql_identifier("MySQL collation", self.mysql_collation.trim(), true)?;
+        validate_mysql_identifier("MySQL character set", charset, false)?;
+        validate_mysql_identifier("MySQL collation", collation, true)?;
+        if !collation.is_empty() && !mysql_collation_matches_charset(collation, charset) {
+            return Err(format!(
+                "MySQL collation `{collation}` does not match character set `{charset}`"
+            ));
+        }
         Ok(())
     }
 
@@ -245,14 +258,76 @@ impl Default for ConnectionAdvancedSettings {
     }
 }
 
-fn is_safe_session_time_zone(value: &str) -> bool {
+#[derive(Clone, Copy)]
+struct SessionTimeZoneOffset {
+    sign: u8,
+    hour: u8,
+    minute: u8,
+}
+
+fn parse_session_time_zone_offset(value: &str) -> Option<SessionTimeZoneOffset> {
     let bytes = value.as_bytes();
     if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
-        return false;
+        return None;
     }
-    let hour = value[1..3].parse::<u8>().ok();
-    let minute = value[4..6].parse::<u8>().ok();
-    matches!((hour, minute), (Some(hour), Some(minute)) if hour <= 14 && minute <= 59)
+    let hour = value[1..3].parse::<u8>().ok()?;
+    let minute = value[4..6].parse::<u8>().ok()?;
+    if minute > 59 {
+        return None;
+    }
+    Some(SessionTimeZoneOffset {
+        sign: bytes[0],
+        hour,
+        minute,
+    })
+}
+
+fn oracle_session_time_zone_in_range(offset: SessionTimeZoneOffset) -> bool {
+    offset.hour <= 14
+}
+
+fn mysql_session_time_zone_in_range(offset: SessionTimeZoneOffset) -> bool {
+    match offset.sign {
+        b'+' => offset.hour < 14 || (offset.hour == 14 && offset.minute == 0),
+        b'-' => offset.hour < 14,
+        _ => false,
+    }
+}
+
+fn mariadb_session_time_zone_in_range(offset: SessionTimeZoneOffset) -> bool {
+    match offset.sign {
+        b'+' => offset.hour < 13 || (offset.hour == 13 && offset.minute == 0),
+        b'-' => offset.hour < 13,
+        _ => false,
+    }
+}
+
+fn validate_session_time_zone_for_db(db_type: DatabaseType, value: &str) -> Result<(), String> {
+    let Some(offset) = parse_session_time_zone_offset(value) else {
+        return Err(
+            "Session time zone must be blank or an offset like +00:00 or -05:30".to_string(),
+        );
+    };
+
+    let valid = match db_type {
+        DatabaseType::Oracle => oracle_session_time_zone_in_range(offset),
+        DatabaseType::MySQL => mysql_session_time_zone_in_range(offset),
+    };
+
+    if valid {
+        return Ok(());
+    }
+
+    match db_type {
+        DatabaseType::Oracle => Err(
+            "Oracle session time zone must be blank or an offset from -14:59 through +14:59"
+                .to_string(),
+        ),
+        DatabaseType::MySQL => Err(
+            "MySQL/MariaDB session time zone must be blank or an offset from -13:59 through +14:00"
+                .to_string(),
+        ),
+    }
 }
 
 fn validate_oracle_nls_format(label: &str, value: &str) -> Result<(), String> {
@@ -293,6 +368,20 @@ fn validate_mysql_identifier(label: &str, value: &str, allow_empty: bool) -> Res
         return Err(format!("{label} contains invalid characters"));
     }
     Ok(())
+}
+
+fn mysql_collation_matches_charset(collation: &str, charset: &str) -> bool {
+    let collation = collation.to_ascii_lowercase();
+    let charset = charset.to_ascii_lowercase();
+    if collation.starts_with(&format!("{charset}_")) {
+        return true;
+    }
+    if charset == "binary" && collation == "binary" {
+        return true;
+    }
+
+    matches!(charset.as_str(), "utf8" | "utf8mb3")
+        && (collation.starts_with("utf8_") || collation.starts_with("utf8mb3_"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1461,6 +1550,7 @@ impl DatabaseConnection {
         conn: &mut C,
         advanced: &ConnectionAdvancedSettings,
     ) -> Result<(), String> {
+        Self::validate_mysql_session_time_zone_for_server(conn, advanced.session_time_zone.trim())?;
         let statements = Self::mysql_session_setting_statements(advanced);
 
         for statement in statements {
@@ -1472,6 +1562,41 @@ impl DatabaseConnection {
         }
 
         Self::apply_mysql_connection_encoding_with_settings(conn, advanced)
+    }
+
+    fn validate_mysql_session_time_zone_for_server<C: Queryable>(
+        conn: &mut C,
+        time_zone: &str,
+    ) -> Result<(), String> {
+        let Some(offset) = parse_session_time_zone_offset(time_zone) else {
+            return Ok(());
+        };
+        if mariadb_session_time_zone_in_range(offset) {
+            return Ok(());
+        }
+
+        if let Ok(Some(version)) = conn.query_first::<String, _>("SELECT VERSION()") {
+            Self::validate_mysql_session_time_zone_for_server_version(time_zone, &version)?;
+        }
+        Ok(())
+    }
+
+    fn validate_mysql_session_time_zone_for_server_version(
+        time_zone: &str,
+        server_version: &str,
+    ) -> Result<(), String> {
+        let Some(offset) = parse_session_time_zone_offset(time_zone) else {
+            return Ok(());
+        };
+        if mariadb_session_time_zone_in_range(offset)
+            || !server_version.to_ascii_lowercase().contains("mariadb")
+        {
+            return Ok(());
+        }
+
+        Err(format!(
+            "MariaDB session time zone `{time_zone}` is outside MariaDB's supported offset range (-12:59 through +13:00)"
+        ))
     }
 
     fn mysql_session_setting_statements(advanced: &ConnectionAdvancedSettings) -> Vec<String> {
@@ -1556,7 +1681,7 @@ impl DatabaseConnection {
             Some(collation)
                 if !collation.is_empty()
                     && Self::mysql_collation_name_is_safe(collation)
-                    && collation.starts_with(&format!("{charset}_")) =>
+                    && mysql_collation_matches_charset(collation, charset) =>
             {
                 format!("SET NAMES {charset} COLLATE {collation}")
             }
@@ -2898,10 +3023,115 @@ mod tests {
 
         let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
         oracle.ssl_mode = ConnectionSslMode::Required;
-        assert!(oracle.validate_for_db(DatabaseType::Oracle, true).is_err());
+        oracle.oracle_protocol = OracleNetworkProtocol::Tcps;
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, true).is_ok());
 
         oracle.ssl_mode = ConnectionSslMode::VerifyCa;
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
+    }
+
+    #[test]
+    fn session_time_zone_validation_matches_database_ranges() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql.session_time_zone = "+14:00".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
+        mysql.session_time_zone = "-13:59".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
+        mysql.session_time_zone = "+14:01".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_err());
+        mysql.session_time_zone = "-14:00".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_err());
+
+        let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        oracle.session_time_zone = "+14:59".to_string();
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
+        oracle.session_time_zone = "-14:59".to_string();
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
+        oracle.session_time_zone = "+15:00".to_string();
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
+    }
+
+    #[test]
+    fn mariadb_time_zone_range_is_narrower_than_mysql() {
+        let mysql_only_positive = parse_session_time_zone_offset("+13:01").unwrap();
+        assert!(mysql_session_time_zone_in_range(mysql_only_positive));
+        assert!(!mariadb_session_time_zone_in_range(mysql_only_positive));
+
+        let mysql_only_negative = parse_session_time_zone_offset("-13:00").unwrap();
+        assert!(mysql_session_time_zone_in_range(mysql_only_negative));
+        assert!(!mariadb_session_time_zone_in_range(mysql_only_negative));
+
+        assert!(mariadb_session_time_zone_in_range(
+            parse_session_time_zone_offset("+13:00").unwrap()
+        ));
+        assert!(mariadb_session_time_zone_in_range(
+            parse_session_time_zone_offset("-12:59").unwrap()
+        ));
+    }
+
+    #[test]
+    fn mysql_server_version_time_zone_validation_handles_mariadb_only_limits() {
+        assert!(
+            DatabaseConnection::validate_mysql_session_time_zone_for_server_version(
+                "+13:01", "8.0.46"
+            )
+            .is_ok()
+        );
+        assert!(
+            DatabaseConnection::validate_mysql_session_time_zone_for_server_version(
+                "-13:00", "8.0.46"
+            )
+            .is_ok()
+        );
+
+        let positive_err = DatabaseConnection::validate_mysql_session_time_zone_for_server_version(
+            "+13:01",
+            "12.2.2-MariaDB",
+        )
+        .expect_err("MariaDB should reject offsets above +13:00");
+        assert!(positive_err.contains("outside MariaDB's supported offset range"));
+
+        let negative_err = DatabaseConnection::validate_mysql_session_time_zone_for_server_version(
+            "-13:00",
+            "12.2.2-MariaDB",
+        )
+        .expect_err("MariaDB should reject offsets below -12:59");
+        assert!(negative_err.contains("outside MariaDB's supported offset range"));
+    }
+
+    #[test]
+    fn mysql_advanced_validation_rejects_charset_collation_mismatch() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql.mysql_charset = "utf8mb4".to_string();
+        mysql.mysql_collation = "latin1_swedish_ci".to_string();
+
+        let err = mysql
+            .validate_for_db(DatabaseType::MySQL, false)
+            .expect_err("collation must belong to the selected character set");
+
+        assert!(err.contains("does not match character set"));
+    }
+
+    #[test]
+    fn mysql_advanced_validation_accepts_utf8_utf8mb3_alias_collations() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+
+        mysql.mysql_charset = "utf8".to_string();
+        mysql.mysql_collation = "utf8mb3_general_ci".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
+
+        mysql.mysql_charset = "utf8mb3".to_string();
+        mysql.mysql_collation = "utf8_general_ci".to_string();
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
+    }
+
+    #[test]
+    fn mysql_advanced_validation_accepts_binary_charset_collation() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql.mysql_charset = "binary".to_string();
+        mysql.mysql_collation = "binary".to_string();
+
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
     }
 
     #[test]
@@ -2924,6 +3154,55 @@ mod tests {
         assert_eq!(
             DatabaseConnection::mysql_set_names_statement(Some("utf8mb4_unicode_ci")),
             "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"
+        );
+    }
+
+    #[test]
+    fn mysql_set_names_statement_matches_database_collation_case_insensitively() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        advanced.mysql_charset = "UTF8MB4".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement_with_settings(
+                Some("utf8mb4_unicode_ci"),
+                &advanced,
+            ),
+            "SET NAMES UTF8MB4 COLLATE utf8mb4_unicode_ci"
+        );
+    }
+
+    #[test]
+    fn mysql_set_names_statement_accepts_utf8_utf8mb3_alias_collations() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        advanced.mysql_charset = "utf8".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement_with_settings(
+                Some("utf8mb3_general_ci"),
+                &advanced,
+            ),
+            "SET NAMES utf8 COLLATE utf8mb3_general_ci"
+        );
+
+        advanced.mysql_charset = "utf8mb3".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement_with_settings(
+                Some("utf8_general_ci"),
+                &advanced,
+            ),
+            "SET NAMES utf8mb3 COLLATE utf8_general_ci"
+        );
+    }
+
+    #[test]
+    fn mysql_set_names_statement_accepts_binary_database_collation() {
+        let mut advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        advanced.mysql_charset = "binary".to_string();
+
+        assert_eq!(
+            DatabaseConnection::mysql_set_names_statement_with_settings(Some("binary"), &advanced,),
+            "SET NAMES binary COLLATE binary"
         );
     }
 
@@ -3102,6 +3381,43 @@ mod tests {
             "YYYY-MM-DD HH24:MI:SS.FF3"
         );
         assert_eq!(read_oracle_session_time_zone(conn.as_ref()), "+09:00");
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle XE plus ORACLE_TEST_* environment variables"]
+    fn oracle_pool_session_applies_advanced_session_settings_from_local_xe() {
+        let mut info = oracle_test_connection_info_from_env();
+        info.advanced.default_transaction_isolation = TransactionIsolation::Serializable;
+        info.advanced.session_time_zone = "+09:00".to_string();
+        info.advanced.oracle_nls_date_format = "YYYY-MM-DD HH24:MI:SS".to_string();
+        info.advanced.oracle_nls_timestamp_format = "YYYY-MM-DD HH24:MI:SS.FF3".to_string();
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("Direct localhost Oracle connection should succeed");
+
+        let Some(DbPoolSession::Oracle(conn)) = connection
+            .acquire_pool_session()
+            .expect("Oracle pool session should be acquired")
+        else {
+            panic!("expected Oracle pool session");
+        };
+
+        assert_eq!(
+            DatabaseConnection::read_oracle_default_transaction_isolation(&conn)
+                .expect("read Oracle current transaction isolation"),
+            Some(TransactionIsolation::Serializable)
+        );
+        assert_eq!(
+            read_oracle_session_parameter(&conn, "NLS_DATE_FORMAT"),
+            "YYYY-MM-DD HH24:MI:SS"
+        );
+        assert_eq!(
+            read_oracle_session_parameter(&conn, "NLS_TIMESTAMP_FORMAT"),
+            "YYYY-MM-DD HH24:MI:SS.FF3"
+        );
+        assert_eq!(read_oracle_session_time_zone(&conn), "+09:00");
     }
 
     #[test]
@@ -3381,6 +3697,56 @@ mod tests {
         assert_eq!(time_zone, "+00:00");
         assert_eq!(character_set_client, "utf8mb4");
         assert_eq!(isolation, TransactionIsolation::ReadCommitted);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pool_session_applies_advanced_session_settings() {
+        let mut info = mysql_test_connection_info_from_env();
+        info.advanced.default_transaction_isolation = TransactionIsolation::RepeatableRead;
+        info.advanced.session_time_zone = "+09:00".to_string();
+        info.advanced.mysql_sql_mode = "ANSI_QUOTES,STRICT_TRANS_TABLES".to_string();
+        info.advanced.mysql_charset = "utf8mb4".to_string();
+        info.advanced.mysql_collation = "utf8mb4_unicode_ci".to_string();
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("MySQL/MariaDB connection should succeed");
+
+        let Some(DbPoolSession::MySQL(mut conn)) = connection
+            .acquire_pool_session()
+            .expect("MySQL pool session should be acquired")
+        else {
+            panic!("expected MySQL pool session");
+        };
+
+        let sql_mode = conn
+            .query_first::<String, _>("SELECT @@SESSION.sql_mode")
+            .expect("read sql_mode")
+            .unwrap_or_default();
+        let time_zone = conn
+            .query_first::<String, _>("SELECT @@SESSION.time_zone")
+            .expect("read time_zone")
+            .unwrap_or_default();
+        let character_set_client = conn
+            .query_first::<String, _>("SELECT @@SESSION.character_set_client")
+            .expect("read character_set_client")
+            .unwrap_or_default();
+        let collation_connection = conn
+            .query_first::<String, _>("SELECT @@SESSION.collation_connection")
+            .expect("read collation_connection")
+            .unwrap_or_default();
+        let isolation = DatabaseConnection::read_mysql_default_transaction_isolation(&mut conn)
+            .expect("read transaction isolation")
+            .expect("transaction isolation should be available");
+
+        assert!(sql_mode.contains("ANSI_QUOTES"));
+        assert!(sql_mode.contains("STRICT_TRANS_TABLES"));
+        assert_eq!(time_zone, "+09:00");
+        assert_eq!(character_set_client, "utf8mb4");
+        assert_eq!(collation_connection, "utf8mb4_unicode_ci");
+        assert_eq!(isolation, TransactionIsolation::RepeatableRead);
     }
 
     #[test]

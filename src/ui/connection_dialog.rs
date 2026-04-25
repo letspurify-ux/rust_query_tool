@@ -1128,7 +1128,7 @@ impl ConnectionDialog {
                     &oracle_nls_date_input_dt,
                     &oracle_nls_timestamp_input_dt,
                 );
-                let advanced = previous_advanced.migrate_for_db_type(db_type);
+                let advanced = previous_advanced.migrate_for_db_type(previous_db_type, db_type);
                 set_advanced_form_values(
                     &advanced,
                     db_type,
@@ -2153,13 +2153,13 @@ mod tests {
         // MySQL-specific fields fall back to Oracle defaults.
         let mut mysql_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
         mysql_advanced.default_transaction_isolation = TransactionIsolation::Serializable;
-        mysql_advanced.default_transaction_access_mode =
-            crate::db::TransactionAccessMode::ReadOnly;
+        mysql_advanced.default_transaction_access_mode = crate::db::TransactionAccessMode::ReadOnly;
         mysql_advanced.session_time_zone = "+09:00".to_string();
         mysql_advanced.ssl_mode = ConnectionSslMode::VerifyIdentity;
         mysql_advanced.mysql_charset = "latin1".to_string();
 
-        let migrated = mysql_advanced.migrate_for_db_type(DatabaseType::Oracle);
+        let migrated =
+            mysql_advanced.migrate_for_db_type(DatabaseType::MySQL, DatabaseType::Oracle);
 
         assert_eq!(
             migrated.default_transaction_isolation,
@@ -2186,13 +2186,43 @@ mod tests {
     }
 
     #[test]
+    fn migrate_for_db_type_uses_target_defaults_for_unchanged_shared_settings() {
+        // The dialog starts as Oracle. Switching to MySQL without editing the
+        // shared fields should use MySQL's own defaults, including +00:00 for
+        // session time zone.
+        let oracle_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        let migrated =
+            oracle_advanced.migrate_for_db_type(DatabaseType::Oracle, DatabaseType::MySQL);
+        let mysql_default = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+
+        assert_eq!(migrated.session_time_zone, mysql_default.session_time_zone);
+        assert_eq!(
+            migrated.default_transaction_isolation,
+            mysql_default.default_transaction_isolation
+        );
+        assert_eq!(
+            migrated.default_transaction_access_mode,
+            mysql_default.default_transaction_access_mode
+        );
+        assert_eq!(migrated.ssl_mode, mysql_default.ssl_mode);
+
+        let migrated_back =
+            mysql_default.migrate_for_db_type(DatabaseType::MySQL, DatabaseType::Oracle);
+        assert_eq!(
+            migrated_back.session_time_zone,
+            ConnectionAdvancedSettings::default_for(DatabaseType::Oracle).session_time_zone
+        );
+    }
+
+    #[test]
     fn migrate_for_db_type_falls_back_when_isolation_unsupported() {
         // Oracle does not support ReadUncommitted. When migrating to Oracle,
         // the form must not end up with an invalid isolation selection.
         let mut mysql_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
         mysql_advanced.default_transaction_isolation = TransactionIsolation::ReadUncommitted;
 
-        let migrated = mysql_advanced.migrate_for_db_type(DatabaseType::Oracle);
+        let migrated =
+            mysql_advanced.migrate_for_db_type(DatabaseType::MySQL, DatabaseType::Oracle);
 
         assert!(DatabaseType::Oracle
             .supported_transaction_isolations()
