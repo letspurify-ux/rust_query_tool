@@ -33392,7 +33392,7 @@ END;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test1_function_parens_tight() {
-        let source = include_str!("../../../test_mariadb/test1.txt");
+        let source = include_str!("../../../test_mysql/test1.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33420,7 +33420,7 @@ END;"#;
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test1_mysql_identifier_case_and_values_function_calls(
     ) {
-        let source = include_str!("../../../test_mariadb/test1.txt");
+        let source = include_str!("../../../test_mysql/test1.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33684,7 +33684,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test2_function_parens_tight() {
-        let source = include_str!("../../../test_mariadb/test2.txt");
+        let source = include_str!("../../../test_mysql/test2.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33710,7 +33710,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test2_values_function_calls_tight() {
-        let source = include_str!("../../../test_mariadb/test2.txt");
+        let source = include_str!("../../../test_mysql/test2.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33751,7 +33751,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test3_function_parens_tight() {
-        let source = include_str!("../../../test_mariadb/test3.txt");
+        let source = include_str!("../../../test_mysql/test3.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33780,7 +33780,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test3_values_function_calls_tight() {
-        let source = include_str!("../../../test_mariadb/test3.txt");
+        let source = include_str!("../../../test_mysql/test3.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -33825,15 +33825,15 @@ FROM emp_score s;"#;
     fn format_sql_basic_for_mysql_db_type_keeps_mariadb_function_headers_split() {
         let cases = [
             (
-                include_str!("../../../test_mariadb/test1.txt"),
+                include_str!("../../../test_mysql/test1.txt"),
                 "CREATE FUNCTION fn_currency_rate(p_currency_code CHAR(3))",
             ),
             (
-                include_str!("../../../test_mariadb/test2.txt"),
+                include_str!("../../../test_mysql/test2.txt"),
                 "CREATE FUNCTION fn_priority_weight(p_priority INT)",
             ),
             (
-                include_str!("../../../test_mariadb/test3.txt"),
+                include_str!("../../../test_mysql/test3.txt"),
                 "CREATE FUNCTION fn_priority_factor(p_priority INT)",
             ),
             (
@@ -33872,7 +33872,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test1_declare_cursor_and_handlers_nested() {
-        let source = include_str!("../../../test_mariadb/test1.txt");
+        let source = include_str!("../../../test_mysql/test1.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -34013,7 +34013,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test2_declare_cursor_and_handlers_nested() {
-        let source = include_str!("../../../test_mariadb/test2.txt");
+        let source = include_str!("../../../test_mysql/test2.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -34154,7 +34154,7 @@ FROM emp_score s;"#;
 
     #[test]
     fn format_sql_basic_for_mysql_db_type_keeps_test3_declare_cursor_and_handlers_nested() {
-        let source = include_str!("../../../test_mariadb/test3.txt");
+        let source = include_str!("../../../test_mysql/test3.txt");
         let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
             source,
             crate::db::connection::DatabaseType::MySQL,
@@ -35231,15 +35231,15 @@ DELIMITER ;"#;
     fn format_sql_basic_for_mysql_db_type_keeps_multiline_values_blocks_in_mariadb_regressions() {
         let cases = [
             (
-                include_str!("../../../test_mariadb/test1.txt"),
+                include_str!("../../../test_mysql/test1.txt"),
                 "INSERT INTO order_audit (order_id, action_type, action_note)",
             ),
             (
-                include_str!("../../../test_mariadb/test2.txt"),
+                include_str!("../../../test_mysql/test2.txt"),
                 "INSERT INTO task_log (task_id, log_type, old_status, new_status, log_note)",
             ),
             (
-                include_str!("../../../test_mariadb/test3.txt"),
+                include_str!("../../../test_mysql/test3.txt"),
                 "INSERT INTO run_audit (run_id, audit_type, old_status, new_status, audit_note)",
             ),
             (

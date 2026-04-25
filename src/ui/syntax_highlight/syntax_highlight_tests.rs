@@ -3,10 +3,14 @@ use std::fs;
 use std::path::PathBuf;
 
 fn load_mariadb_highlight_test_file(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("test_mariadb");
-    path.push(name);
-    fs::read_to_string(path).unwrap_or_default()
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for dir in ["test_mysql", "test_mariadb"] {
+        let path = manifest_dir.join(dir).join(name);
+        if let Ok(contents) = fs::read_to_string(path) {
+            return contents;
+        }
+    }
+    String::new()
 }
 
 fn assert_token_has_style(text: &str, styles: &str, token: &str, expected_style: char) {
@@ -2507,10 +2511,7 @@ fn test_mysql_drop_table_if_exists_highlights_if_as_keyword() {
 #[test]
 fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
     let text = load_mariadb_highlight_test_file("test1.txt");
-    assert!(
-        !text.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!text.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);
@@ -2554,7 +2555,7 @@ fn test_mysql_highlighting_handles_mariadb_final_boss_regression() {
 
     assert!(
         text.contains("RESIGNAL"),
-        "test_mariadb/test1.txt should contain RESIGNAL"
+        "test_mysql/test1.txt should contain RESIGNAL"
     );
     let resignal_start = text.find("RESIGNAL").unwrap_or(0);
     let resignal_end = resignal_start + "RESIGNAL".len();

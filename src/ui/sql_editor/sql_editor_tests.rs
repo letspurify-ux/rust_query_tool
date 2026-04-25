@@ -16,10 +16,14 @@ fn load_test_file(name: &str) -> String {
 }
 
 fn load_mariadb_test_file(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("test_mariadb");
-    path.push(name);
-    fs::read_to_string(path).unwrap_or_default()
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for dir in ["test_mysql", "test_mariadb"] {
+        let path = manifest_dir.join(dir).join(name);
+        if let Ok(contents) = fs::read_to_string(path) {
+            return contents;
+        }
+    }
+    String::new()
 }
 
 fn count_slash_lines(text: &str) -> usize {
@@ -723,7 +727,7 @@ fn format_sql_preserves_mariadb_final_boss_script() {
     let input = load_mariadb_test_file("test1.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
+        "test_mysql/test1.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -752,12 +756,12 @@ fn format_sql_preserves_mariadb_final_boss_script() {
     assert_eq!(
         count_script_statements(&formatted_items),
         count_script_statements(&original_items),
-        "Formatting changed execution statement count for test_mariadb/test1.txt: {formatted_statements:?}"
+        "Formatting changed execution statement count for test_mysql/test1.txt: {formatted_statements:?}"
     );
     assert_eq!(
         count_script_tool_commands(&formatted_items),
         count_script_tool_commands(&original_items),
-        "Formatting changed tool-command count for test_mariadb/test1.txt"
+        "Formatting changed tool-command count for test_mysql/test1.txt"
     );
     assert!(
         formatted_statements.iter().any(|stmt| {
@@ -787,7 +791,7 @@ fn format_sql_preserves_mariadb_final_boss_script() {
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(
         formatted, formatted_again,
-        "Formatting should be idempotent for test_mariadb/test1.txt"
+        "Formatting should be idempotent for test_mysql/test1.txt"
     );
 }
 
@@ -796,7 +800,7 @@ fn format_sql_preserves_mariadb_parser_killer_script() {
     let input = load_mariadb_test_file("test2.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test2.txt should not be empty"
+        "test_mysql/test2.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -826,12 +830,12 @@ fn format_sql_preserves_mariadb_parser_killer_script() {
     assert_eq!(
         count_script_statements(&formatted_items),
         count_script_statements(&original_items),
-        "Formatting changed execution statement count for test_mariadb/test2.txt: {formatted_statements:?}"
+        "Formatting changed execution statement count for test_mysql/test2.txt: {formatted_statements:?}"
     );
     assert_eq!(
         count_script_tool_commands(&formatted_items),
         count_script_tool_commands(&original_items),
-        "Formatting changed tool-command count for test_mariadb/test2.txt"
+        "Formatting changed tool-command count for test_mysql/test2.txt"
     );
     assert!(
         formatted_statements.iter().any(|stmt| {
@@ -861,7 +865,7 @@ fn format_sql_preserves_mariadb_parser_killer_script() {
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(
         formatted, formatted_again,
-        "Formatting should be idempotent for test_mariadb/test2.txt"
+        "Formatting should be idempotent for test_mysql/test2.txt"
     );
 }
 
@@ -870,7 +874,7 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -900,12 +904,12 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
     assert_eq!(
         count_script_statements(&formatted_items),
         count_script_statements(&original_items),
-        "Formatting changed execution statement count for test_mariadb/test3.txt: {formatted_statements:?}"
+        "Formatting changed execution statement count for test_mysql/test3.txt: {formatted_statements:?}"
     );
     assert_eq!(
         count_script_tool_commands(&formatted_items),
         count_script_tool_commands(&original_items),
-        "Formatting changed tool-command count for test_mariadb/test3.txt"
+        "Formatting changed tool-command count for test_mysql/test3.txt"
     );
     assert!(
         formatted_statements.iter().any(|stmt| {
@@ -936,7 +940,7 @@ fn format_sql_preserves_mariadb_ultra_final_boss_script() {
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(
         formatted, formatted_again,
-        "Formatting should be idempotent for test_mariadb/test3.txt"
+        "Formatting should be idempotent for test_mysql/test3.txt"
     );
 }
 
@@ -945,7 +949,7 @@ fn format_sql_keeps_mariadb_test3_collect_status_counts_select_item_depths() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic_no_cache(&input);
@@ -1312,7 +1316,7 @@ fn format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths() {
     let input = load_mariadb_test_file("test1.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
+        "test_mysql/test1.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -1409,7 +1413,7 @@ fn format_sql_keeps_mariadb_test2_loop_and_case_branch_depths() {
     let input = load_mariadb_test_file("test2.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test2.txt should not be empty"
+        "test_mysql/test2.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -1522,7 +1526,7 @@ fn format_sql_keeps_mariadb_test3_nested_case_and_window_sibling_depths() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -1613,7 +1617,7 @@ fn format_sql_keeps_mariadb_helper_procedure_closing_paren_aligned() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -1636,7 +1640,7 @@ fn format_sql_keeps_mariadb_trigger_end_delimiter_aligned() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -1674,7 +1678,7 @@ fn format_sql_keeps_mariadb_trigger_cast_type_inline() {
     let input = load_mariadb_test_file("test3.txt");
     assert!(
         !input.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -8810,7 +8814,7 @@ fn format_mariadb_test1_keeps_inline_over_body_and_on_duplicate_function_args_ne
     let source = load_mariadb_test_file("test1.txt");
     assert!(
         !source.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
+        "test_mysql/test1.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -8877,7 +8881,7 @@ fn format_mariadb_test2_keeps_labeled_main_block_and_inline_over_body_nested() {
     let source = load_mariadb_test_file("test2.txt");
     assert!(
         !source.is_empty(),
-        "test_mariadb/test2.txt should not be empty"
+        "test_mysql/test2.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
@@ -8941,7 +8945,7 @@ fn format_mariadb_test3_keeps_labeled_begin_blocks_and_inline_over_body_nested()
     let source = load_mariadb_test_file("test3.txt");
     assert!(
         !source.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
+        "test_mysql/test3.txt should not be empty"
     );
 
     let formatted = SqlEditorWidget::format_sql_basic_for_db_type(

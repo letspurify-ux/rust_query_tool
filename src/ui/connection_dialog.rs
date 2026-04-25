@@ -24,10 +24,14 @@ use crate::ui::theme;
 use crate::utils::AppConfig;
 
 const SAVED_CONNECTIONS_COLUMN_WIDTH: i32 = 200;
-const DB_SELECTION_COLUMN_WIDTH: i32 = 250;
-const CONNECTION_INFO_COLUMN_WIDTH: i32 = 300;
-const ADVANCED_SETTINGS_COLUMN_WIDTH: i32 = 390;
+const CONNECTION_DETAILS_COLUMN_WIDTH: i32 = 300;
+const ADVANCED_SETTINGS_COLUMN_WIDTH: i32 = CONNECTION_DETAILS_COLUMN_WIDTH;
 const CONNECTION_DIALOG_COLUMN_SPACING: i32 = DIALOG_SPACING + 4;
+const DB_SELECTION_SECTION_HEIGHT: i32 =
+    LABEL_ROW_HEIGHT + INPUT_ROW_HEIGHT * 2 + DIALOG_SPACING * 2;
+const SAVE_CONNECTION_BUTTON_WIDTH: i32 = 170;
+const CONNECTION_ACTION_BUTTONS_WIDTH: i32 =
+    SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 3 + DIALOG_SPACING * 3;
 
 pub struct ConnectionDialog;
 
@@ -228,10 +232,9 @@ fn connection_dialog_width() -> i32 {
     DIALOG_MARGIN * 2
         + SAVED_CONNECTIONS_COLUMN_WIDTH
         + CONNECTION_DIALOG_COLUMN_SPACING
-        + DB_SELECTION_COLUMN_WIDTH
-        + CONNECTION_INFO_COLUMN_WIDTH
+        + CONNECTION_DETAILS_COLUMN_WIDTH
         + ADVANCED_SETTINGS_COLUMN_WIDTH
-        + CONNECTION_DIALOG_COLUMN_SPACING * 2
+        + CONNECTION_DIALOG_COLUMN_SPACING
 }
 
 fn oracle_connect_mode_for_info(info: &ConnectionInfo) -> OracleConnectMode {
@@ -634,11 +637,15 @@ impl ConnectionDialog {
         dialog.set_color(theme::panel_raised());
         dialog.make_modal(true);
 
-        // Root layout: saved list | DB selection | connection info | advanced settings
+        // Root layout: form content over dialog actions
         let mut root = Flex::default().with_pos(0, 0).with_size(dialog_w, dialog_h);
-        root.set_type(fltk::group::FlexType::Row);
+        root.set_type(fltk::group::FlexType::Column);
         root.set_margin(DIALOG_MARGIN);
-        root.set_spacing(CONNECTION_DIALOG_COLUMN_SPACING);
+        root.set_spacing(DIALOG_SPACING);
+
+        let mut content_row = Flex::default();
+        content_row.set_type(fltk::group::FlexType::Row);
+        content_row.set_spacing(CONNECTION_DIALOG_COLUMN_SPACING);
 
         // ── Left panel: Saved Connections ──
         let mut left_col = Flex::default();
@@ -663,20 +670,19 @@ impl ConnectionDialog {
             }
         }
 
-        let mut delete_btn = Button::default().with_label("Delete");
-        delete_btn.set_color(theme::button_danger());
-        delete_btn.set_label_color(theme::text_primary());
-        delete_btn.set_frame(FrameType::RFlatBox);
-        left_col.fixed(&delete_btn, BUTTON_HEIGHT);
-
         left_col.end();
-        root.fixed(&left_col, SAVED_CONNECTIONS_COLUMN_WIDTH);
+        content_row.fixed(&left_col, SAVED_CONNECTIONS_COLUMN_WIDTH);
 
         let mut details_row = Flex::default();
         details_row.set_type(fltk::group::FlexType::Row);
         details_row.set_spacing(CONNECTION_DIALOG_COLUMN_SPACING);
 
-        // ── DB selection column ──
+        // ── Connection details column ──
+        let mut connection_details_col = Flex::default();
+        connection_details_col.set_type(fltk::group::FlexType::Column);
+        connection_details_col.set_spacing(DIALOG_SPACING);
+
+        // DB selection section
         let mut db_col = Flex::default();
         db_col.set_type(fltk::group::FlexType::Column);
         db_col.set_spacing(DIALOG_SPACING);
@@ -717,12 +723,10 @@ impl ConnectionDialog {
         oracle_mode_flex.end();
         db_col.fixed(&oracle_mode_flex, INPUT_ROW_HEIGHT);
 
-        let db_spacer = Frame::default();
-        db_col.resizable(&db_spacer);
         db_col.end();
-        details_row.fixed(&db_col, DB_SELECTION_COLUMN_WIDTH);
+        connection_details_col.fixed(&db_col, DB_SELECTION_SECTION_HEIGHT);
 
-        // ── Connection form column ──
+        // Connection form section
         let mut right_col = Flex::default();
         right_col.set_type(fltk::group::FlexType::Column);
         right_col.set_spacing(DIALOG_SPACING);
@@ -809,22 +813,12 @@ impl ConnectionDialog {
         service_flex.end();
         right_col.fixed(&service_flex, INPUT_ROW_HEIGHT);
 
-        // Save connection button
-        let mut save_flex = Flex::default();
-        save_flex.set_type(fltk::group::FlexType::Row);
-        let _spacer = Frame::default();
-        save_flex.fixed(&_spacer, FORM_LABEL_WIDTH);
-        let mut save_btn = Button::default().with_label("Save this connection");
-        save_btn.set_color(theme::button_success());
-        save_btn.set_label_color(theme::text_primary());
-        save_btn.set_frame(FrameType::RFlatBox);
-        save_flex.end();
-        right_col.fixed(&save_flex, CHECKBOX_ROW_HEIGHT);
-
         let connection_spacer = Frame::default();
         right_col.resizable(&connection_spacer);
         right_col.end();
-        details_row.fixed(&right_col, CONNECTION_INFO_COLUMN_WIDTH);
+        connection_details_col.resizable(&right_col);
+        connection_details_col.end();
+        details_row.fixed(&connection_details_col, CONNECTION_DETAILS_COLUMN_WIDTH);
 
         // ── Advanced settings column ──
         let mut advanced_col = Flex::default();
@@ -983,14 +977,39 @@ impl ConnectionDialog {
         mysql_ssl_ca_flex.end();
         advanced_col.fixed(&mysql_ssl_ca_flex, INPUT_ROW_HEIGHT);
 
-        // Flexible spacer to push buttons to bottom
+        // Flexible spacer to fill the advanced settings column.
         let spacer_frame = Frame::default();
         advanced_col.resizable(&spacer_frame);
+
+        advanced_col.end();
+        details_row.fixed(&advanced_col, ADVANCED_SETTINGS_COLUMN_WIDTH);
+        details_row.end();
+        content_row.end();
+        root.resizable(&content_row);
 
         // Buttons row
         let mut button_flex = Flex::default();
         button_flex.set_type(fltk::group::FlexType::Row);
-        button_flex.set_spacing(DIALOG_SPACING);
+        button_flex.set_spacing(0);
+
+        let mut delete_btn = Button::default()
+            .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("Delete");
+        delete_btn.set_color(theme::button_danger());
+        delete_btn.set_label_color(theme::text_primary());
+        delete_btn.set_frame(FrameType::RFlatBox);
+
+        let button_spacer = Frame::default();
+        let mut action_button_flex = Flex::default();
+        action_button_flex.set_type(fltk::group::FlexType::Row);
+        action_button_flex.set_spacing(DIALOG_SPACING);
+
+        let mut save_btn = Button::default()
+            .with_size(SAVE_CONNECTION_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("Save this connection");
+        save_btn.set_color(theme::button_success());
+        save_btn.set_label_color(theme::text_primary());
+        save_btn.set_frame(FrameType::RFlatBox);
 
         let mut test_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -1013,15 +1032,17 @@ impl ConnectionDialog {
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
 
-        button_flex.fixed(&test_btn, BUTTON_WIDTH);
-        button_flex.fixed(&connect_btn, BUTTON_WIDTH);
-        button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
-        button_flex.end();
-        advanced_col.fixed(&button_flex, BUTTON_ROW_HEIGHT);
+        action_button_flex.fixed(&save_btn, SAVE_CONNECTION_BUTTON_WIDTH);
+        action_button_flex.fixed(&test_btn, BUTTON_WIDTH);
+        action_button_flex.fixed(&connect_btn, BUTTON_WIDTH);
+        action_button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
+        action_button_flex.end();
 
-        advanced_col.end();
-        details_row.fixed(&advanced_col, ADVANCED_SETTINGS_COLUMN_WIDTH);
-        details_row.end();
+        button_flex.fixed(&delete_btn, BUTTON_WIDTH);
+        button_flex.resizable(&button_spacer);
+        button_flex.fixed(&action_button_flex, CONNECTION_ACTION_BUTTONS_WIDTH);
+        button_flex.end();
+        root.fixed(&button_flex, BUTTON_ROW_HEIGHT);
 
         let oracle_mode_memory = Arc::new(Mutex::new(OracleModeFieldMemory {
             direct_host: host_input.value(),
@@ -1830,10 +1851,9 @@ mod tests {
     fn connection_dialog_width_covers_fixed_columns_and_spacing() {
         let required_width = crate::ui::constants::DIALOG_MARGIN * 2
             + super::SAVED_CONNECTIONS_COLUMN_WIDTH
-            + super::DB_SELECTION_COLUMN_WIDTH
-            + super::CONNECTION_INFO_COLUMN_WIDTH
+            + super::CONNECTION_DETAILS_COLUMN_WIDTH
             + super::ADVANCED_SETTINGS_COLUMN_WIDTH
-            + super::CONNECTION_DIALOG_COLUMN_SPACING * 3;
+            + super::CONNECTION_DIALOG_COLUMN_SPACING * 2;
 
         assert_eq!(connection_dialog_width(), required_width);
     }

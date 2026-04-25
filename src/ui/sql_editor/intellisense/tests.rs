@@ -52,15 +52,15 @@ fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
     match name {
         "test1.txt" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_mariadb/test1.txt"
+            "/test_mysql/test1.txt"
         )),
         "test2.txt" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_mariadb/test2.txt"
+            "/test_mysql/test2.txt"
         )),
         "test3.txt" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_mariadb/test3.txt"
+            "/test_mysql/test3.txt"
         )),
         "test4.txt" => include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

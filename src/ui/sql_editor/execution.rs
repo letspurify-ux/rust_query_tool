@@ -2332,6 +2332,18 @@ impl SqlEditorWidget {
                             false,
                         );
                     }
+                    if should_release_session
+                        && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                            auto_commit,
+                            prior_may_have_uncommitted_work,
+                            state_hint,
+                        )
+                    {
+                        should_release_session = Self::rollback_mysql_read_only_pooled_session(
+                            conn,
+                            "mysql lazy fetch cleanup",
+                        );
+                    }
                     if should_release_session {
                         let fallback_on_error = if state_hint.clears_session_state {
                             state_hint.may_leave_session_bound_state
@@ -9820,6 +9832,12 @@ impl SqlEditorWidget {
                     may_leave_session_bound_state: true,
                 }
             }
+            Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE") | Some("WITH") => {
+                MySqlSessionStateHint {
+                    clears_session_state: false,
+                    may_leave_session_bound_state: true,
+                }
+            }
             Some("LOCK") => MySqlSessionStateHint {
                 clears_session_state: true,
                 may_leave_session_bound_state: true,
@@ -9851,6 +9869,33 @@ impl SqlEditorWidget {
                 }
             }
             _ => MySqlSessionStateHint::default(),
+        }
+    }
+
+    fn mysql_pooled_session_should_rollback_read_only_autocommit_off(
+        auto_commit: bool,
+        prior_may_have_uncommitted_work: bool,
+        state_hint: MySqlSessionStateHint,
+    ) -> bool {
+        !auto_commit
+            && !prior_may_have_uncommitted_work
+            && !state_hint.clears_session_state
+            && !state_hint.may_leave_session_bound_state
+    }
+
+    fn rollback_mysql_read_only_pooled_session<C: Queryable>(
+        conn: &mut C,
+        log_context: &str,
+    ) -> bool {
+        match conn.query_drop("ROLLBACK") {
+            Ok(()) => true,
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    log_context,
+                    &format!("Failed to close MySQL read-only transaction: {err}"),
+                );
+                false
+            }
         }
     }
 
@@ -10611,7 +10656,7 @@ impl SqlEditorWidget {
                 Err(payload) => panic::resume_unwind(payload),
             };
         }
-        let should_release_session = if Self::mysql_pooled_action_can_reuse_session(&result) {
+        let mut should_release_session = if Self::mysql_pooled_action_can_reuse_session(&result) {
             Self::sync_mysql_pooled_session_info(
                 shared_connection,
                 &mut conn,
@@ -10623,6 +10668,16 @@ impl SqlEditorWidget {
             false
         };
         Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
+        if should_release_session
+            && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                auto_commit,
+                prior_may_have_uncommitted_work,
+                state_hint,
+            )
+        {
+            should_release_session =
+                Self::rollback_mysql_read_only_pooled_session(&mut conn, log_context);
+        }
         if should_release_session {
             let fallback_on_error = if state_hint.clears_session_state {
                 state_hint.may_leave_session_bound_state
@@ -11369,6 +11424,20 @@ mod query_execution_cleanup_tests {
         let select_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT 1");
         assert!(!select_hint.clears_session_state);
         assert!(!select_hint.may_leave_session_bound_state);
+        assert!(
+            SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                false,
+                false,
+                select_hint
+            )
+        );
+        assert!(
+            !SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                true,
+                false,
+                select_hint
+            )
+        );
 
         let commit_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("COMMIT");
         assert!(commit_hint.clears_session_state);
@@ -11404,6 +11473,18 @@ mod query_execution_cleanup_tests {
         let lock_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("LOCK TABLES t WRITE");
         assert!(lock_hint.clears_session_state);
         assert!(lock_hint.may_leave_session_bound_state);
+
+        let insert_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("INSERT INTO t VALUES (1)");
+        assert!(!insert_hint.clears_session_state);
+        assert!(insert_hint.may_leave_session_bound_state);
+        assert!(
+            !SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
+                false,
+                false,
+                insert_hint
+            )
+        );
 
         let autocommit_on_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("SET SESSION autocommit = 1");
@@ -11747,7 +11828,7 @@ mod script_include_guard_tests {
 
     #[test]
     fn build_mysql_batch_items_treats_top_level_script_as_self_contained_without_override() {
-        let sql = include_str!("../../../test_mariadb/test1.txt");
+        let sql = include_str!("../../../test_mysql/test1.txt");
 
         let items = SqlEditorWidget::build_mysql_batch_items(sql, None);
         let statement_count = items
@@ -12577,7 +12658,7 @@ mod mysql_batch_execution_regression_tests {
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test1_reaches_pass_status() {
         assert_mysql_batch_script_reaches_status_pass(
-            include_str!("../../../test_mariadb/test1.txt"),
+            include_str!("../../../test_mysql/test1.txt"),
             "mysql test1 regression",
         );
     }
@@ -12586,7 +12667,7 @@ mod mysql_batch_execution_regression_tests {
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test2_reaches_pass_status() {
         assert_mysql_batch_script_reaches_status_pass(
-            include_str!("../../../test_mariadb/test2.txt"),
+            include_str!("../../../test_mysql/test2.txt"),
             "mysql test2 regression",
         );
     }
@@ -12595,7 +12676,7 @@ mod mysql_batch_execution_regression_tests {
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn execute_mysql_batch_test3_reaches_pass_status() {
         assert_mysql_batch_script_reaches_status_pass(
-            include_str!("../../../test_mariadb/test3.txt"),
+            include_str!("../../../test_mysql/test3.txt"),
             "mysql test3 regression",
         );
     }

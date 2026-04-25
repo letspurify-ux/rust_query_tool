@@ -21,10 +21,14 @@ fn load_query_test_file(name: &str) -> String {
 }
 
 fn load_mariadb_query_test_file(name: &str) -> String {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("test_mariadb");
-    path.push(name);
-    fs::read_to_string(path).unwrap_or_default()
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for dir in ["test_mysql", "test_mariadb"] {
+        let path = manifest_dir.join(dir).join(name);
+        if let Ok(contents) = fs::read_to_string(path) {
+            return contents;
+        }
+    }
+    String::new()
 }
 
 #[derive(Clone, Copy)]
@@ -11443,10 +11447,7 @@ fn test_split_script_items_mysql_backtick_identifier_with_semicolon_stays_single
 #[test]
 fn test_split_script_items_mariadb_final_boss_regression() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let items = QueryExecutor::split_script_items(&sql);
     let statement_count = items
@@ -11564,10 +11565,7 @@ fn test_split_script_items_mariadb_comment_final_boss_keeps_transaction_directiv
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_emp_table_regression() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let emp_statement_start = sql.find("CREATE TABLE emp").unwrap_or(0);
     let emp_statement_end = sql
@@ -11605,10 +11603,7 @@ fn test_statement_bounds_at_cursor_mariadb_emp_table_regression() {
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_final_boss_procedure_body_regression() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let expected_prefix = "CREATE PROCEDURE sp_run_final_boss ()";
     let anchors = [
@@ -11656,10 +11651,7 @@ fn test_statement_bounds_at_cursor_mariadb_final_boss_procedure_body_regression(
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_end_delimiter_line_resolves_current_routine() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let cases = [
         (
@@ -11706,10 +11698,7 @@ fn test_statement_bounds_at_cursor_mariadb_end_delimiter_line_resolves_current_r
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_custom_delimiter_gap_prefers_following_routine() {
     let sql = load_mariadb_query_test_file("test3.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test3.txt should not be empty");
 
     let cases = [
         (
@@ -11772,10 +11761,7 @@ fn test_statement_bounds_at_cursor_mariadb_executable_comment_stays_runnable_sta
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_comment_gap_prefers_following_statement() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let cases = [
         (
@@ -11814,10 +11800,7 @@ fn test_statement_bounds_at_cursor_mariadb_comment_gap_prefers_following_stateme
 #[test]
 fn test_split_format_items_mariadb_final_boss_regression() {
     let sql = load_mariadb_query_test_file("test1.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test1.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test1.txt should not be empty");
 
     let items = QueryExecutor::split_format_items(&sql);
     let statement_count = items
@@ -11866,10 +11849,7 @@ fn test_split_format_items_mariadb_final_boss_regression() {
 #[test]
 fn test_split_script_items_mariadb_parser_killer_regression() {
     let sql = load_mariadb_query_test_file("test2.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test2.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test2.txt should not be empty");
 
     let items = QueryExecutor::split_script_items(&sql);
     let statement_count = items
@@ -11931,10 +11911,7 @@ fn test_split_script_items_mariadb_parser_killer_regression() {
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_parser_killer_procedure_body_regression() {
     let sql = load_mariadb_query_test_file("test2.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test2.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test2.txt should not be empty");
 
     let expected_prefix = "CREATE PROCEDURE sp_run_parser_killer ()";
     let anchors = [
@@ -11982,10 +11959,7 @@ fn test_statement_bounds_at_cursor_mariadb_parser_killer_procedure_body_regressi
 #[test]
 fn test_split_script_items_mariadb_ultra_final_boss_regression() {
     let sql = load_mariadb_query_test_file("test3.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test3.txt should not be empty");
 
     let items = QueryExecutor::split_script_items(&sql);
     let statement_count = items
@@ -12047,10 +12021,7 @@ fn test_split_script_items_mariadb_ultra_final_boss_regression() {
 #[test]
 fn test_statement_bounds_at_cursor_mariadb_ultra_final_boss_procedure_body_regression() {
     let sql = load_mariadb_query_test_file("test3.txt");
-    assert!(
-        !sql.is_empty(),
-        "test_mariadb/test3.txt should not be empty"
-    );
+    assert!(!sql.is_empty(), "test_mysql/test3.txt should not be empty");
 
     let expected_prefix = "CREATE PROCEDURE sp_run_ultra_final_boss ()";
     let anchors = [

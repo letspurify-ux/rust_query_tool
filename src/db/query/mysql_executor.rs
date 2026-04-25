@@ -37,6 +37,13 @@ impl MysqlExecutor {
         timeout.map(|value| value.as_millis()).unwrap_or(0)
     }
 
+    fn lock_wait_timeout_seconds(timeout: Option<Duration>) -> String {
+        match timeout {
+            Some(value) => value.as_secs().max(1).to_string(),
+            None => "DEFAULT".to_string(),
+        }
+    }
+
     fn mysql_timeout_statement(timeout: Option<Duration>) -> String {
         format!(
             "SET SESSION MAX_EXECUTION_TIME = {}",
@@ -47,6 +54,20 @@ impl MysqlExecutor {
     fn mariadb_timeout_statement(timeout: Option<Duration>) -> String {
         let timeout_seconds = timeout.map(|value| value.as_secs_f64()).unwrap_or(0.0);
         format!("SET SESSION max_statement_time = {:.3}", timeout_seconds)
+    }
+
+    fn lock_wait_timeout_statement(timeout: Option<Duration>) -> String {
+        format!(
+            "SET SESSION lock_wait_timeout = {}",
+            Self::lock_wait_timeout_seconds(timeout)
+        )
+    }
+
+    fn innodb_lock_wait_timeout_statement(timeout: Option<Duration>) -> String {
+        format!(
+            "SET SESSION innodb_lock_wait_timeout = {}",
+            Self::lock_wait_timeout_seconds(timeout)
+        )
     }
 
     fn is_unknown_system_variable_error(err: &MysqlError, variable_name: &str) -> bool {
@@ -73,7 +94,9 @@ impl MysqlExecutor {
                 conn.query_drop(fallback.as_str())
             }
             Err(err) => Err(err),
-        }
+        }?;
+        conn.query_drop(Self::lock_wait_timeout_statement(timeout).as_str())?;
+        conn.query_drop(Self::innodb_lock_wait_timeout_statement(timeout).as_str())
     }
 
     fn classify_statement(sql: &str) -> MysqlStatementKind {
@@ -637,6 +660,7 @@ impl MysqlExecutor {
             || lowered.contains("max statement time exceeded")
             || lowered.contains("maximum statement execution time exceeded")
             || lowered.contains("query timed out")
+            || lowered.contains("lock wait timeout exceeded")
     }
 
     pub fn is_cancel_error(err: &MysqlError) -> bool {
@@ -2138,6 +2162,22 @@ mod tests {
         assert_eq!(
             MysqlExecutor::mysql_timeout_statement(None),
             "SET SESSION MAX_EXECUTION_TIME = 0"
+        );
+    }
+
+    #[test]
+    fn mysql_lock_wait_timeout_statements_follow_query_timeout_seconds() {
+        assert_eq!(
+            MysqlExecutor::lock_wait_timeout_statement(Some(Duration::from_millis(500))),
+            "SET SESSION lock_wait_timeout = 1"
+        );
+        assert_eq!(
+            MysqlExecutor::innodb_lock_wait_timeout_statement(Some(Duration::from_secs(5))),
+            "SET SESSION innodb_lock_wait_timeout = 5"
+        );
+        assert_eq!(
+            MysqlExecutor::lock_wait_timeout_statement(None),
+            "SET SESSION lock_wait_timeout = DEFAULT"
         );
     }
 
