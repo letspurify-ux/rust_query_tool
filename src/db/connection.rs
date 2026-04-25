@@ -123,6 +123,37 @@ impl ConnectionAdvancedSettings {
         settings
     }
 
+    /// Produce a settings value appropriate for `new_db_type` while keeping
+    /// cross-database fields the user has already customized (isolation,
+    /// access mode, SSL mode, time zone). DB-specific fields fall back to
+    /// the defaults for `new_db_type` because the `self` value holds fields
+    /// for the other backend.
+    pub fn migrate_for_db_type(&self, new_db_type: DatabaseType) -> Self {
+        let mut settings = Self::default_for(new_db_type);
+
+        if new_db_type
+            .supported_transaction_isolations()
+            .contains(&self.default_transaction_isolation)
+        {
+            settings.default_transaction_isolation = self.default_transaction_isolation;
+        }
+        settings.default_transaction_access_mode = self.default_transaction_access_mode;
+        settings.session_time_zone = self.session_time_zone.clone();
+
+        // Oracle only supports Disabled or Required (TCPS); remap the stricter
+        // MySQL modes onto Required so the user does not silently "downgrade"
+        // to Disabled when switching databases.
+        settings.ssl_mode = match (new_db_type, self.ssl_mode) {
+            (DatabaseType::Oracle, ConnectionSslMode::VerifyCa)
+            | (DatabaseType::Oracle, ConnectionSslMode::VerifyIdentity) => {
+                ConnectionSslMode::Required
+            }
+            (_, mode) => mode,
+        };
+
+        settings
+    }
+
     pub fn validate_for_db(
         &self,
         db_type: DatabaseType,

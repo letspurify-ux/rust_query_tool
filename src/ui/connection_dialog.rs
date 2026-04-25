@@ -407,13 +407,10 @@ fn apply_advanced_form_mode(
     set_form_row_visible(advanced_col, mysql_ssl_ca_row, !is_oracle);
 
     if is_oracle && using_oracle_tns_alias {
-        oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(
-            OracleNetworkProtocol::Tcp,
-        ));
-        ssl_choice.set_value(choice_index_from_ssl_mode(
-            db_type,
-            ConnectionSslMode::Disabled,
-        ));
+        // TNS alias mode relies on Oracle Net for SSL/protocol; keep the
+        // user's previous selections in the form (just disabled) so toggling
+        // back to Direct mode restores them. build_connection_info neutralises
+        // these fields before validation.
         oracle_protocol_choice.deactivate();
         ssl_choice.deactivate();
     } else {
@@ -571,6 +568,15 @@ fn build_connection_info(
 
         (host.to_string(), port)
     };
+
+    let mut advanced = advanced;
+    if using_tns_alias {
+        // TNS alias uses Oracle Net for SSL/protocol; neutralise the form
+        // values that no longer apply so validation succeeds and we do not
+        // persist stale SSL state alongside the alias.
+        advanced.ssl_mode = ConnectionSslMode::Disabled;
+        advanced.oracle_protocol = OracleNetworkProtocol::Tcp;
+    }
 
     advanced.validate_for_db(db_type, using_tns_alias)?;
 
@@ -1108,7 +1114,21 @@ impl ConnectionDialog {
                     &mut service_input_dt,
                     &oracle_mode_memory_dt,
                 );
-                let advanced = ConnectionAdvancedSettings::default_for(db_type);
+                let previous_advanced = advanced_settings_from_form(
+                    previous_db_type,
+                    &ssl_choice_dt,
+                    &isolation_choice_dt,
+                    &access_choice_dt,
+                    &timezone_input_dt,
+                    &mysql_sql_mode_input_dt,
+                    &mysql_charset_input_dt,
+                    &mysql_collation_input_dt,
+                    &mysql_ssl_ca_input_dt,
+                    &oracle_protocol_choice_dt,
+                    &oracle_nls_date_input_dt,
+                    &oracle_nls_timestamp_input_dt,
+                );
+                let advanced = previous_advanced.migrate_for_db_type(db_type);
                 set_advanced_form_values(
                     &advanced,
                     db_type,
@@ -2082,5 +2102,88 @@ mod tests {
             super::resolved_password_for_saved_connection("LOCAL", "DEV", "typed-password", None);
 
         assert_eq!(resolved, "");
+    }
+
+    #[test]
+    fn build_connection_info_neutralises_ssl_and_protocol_for_tns_alias_mode() {
+        // User configured TCPS/Required in Direct mode, then toggled to TNS
+        // alias. The form retains the previous selections, but the info we
+        // hand back must sanitise them so the connection uses the alias'
+        // own network settings.
+        let mut advanced = default_advanced(DatabaseType::Oracle);
+        advanced.ssl_mode = ConnectionSslMode::Required;
+        advanced.oracle_protocol = crate::db::OracleNetworkProtocol::Tcps;
+
+        let info = build_connection_info(
+            "local",
+            "system",
+            "password",
+            "ignored-host",
+            "1521",
+            "FREE_LOCAL",
+            DatabaseType::Oracle,
+            OracleConnectMode::TnsAlias,
+            advanced,
+        )
+        .expect("TNS alias should silently drop direct-mode SSL/protocol");
+
+        assert_eq!(info.advanced.ssl_mode, ConnectionSslMode::Disabled);
+        assert_eq!(
+            info.advanced.oracle_protocol,
+            crate::db::OracleNetworkProtocol::Tcp
+        );
+    }
+
+    #[test]
+    fn migrate_for_db_type_preserves_shared_settings_across_db_switch() {
+        // Simulates the user customising the Advanced Settings for MySQL and
+        // then toggling the DB type to Oracle. Shared fields must stay; the
+        // MySQL-specific fields fall back to Oracle defaults.
+        let mut mysql_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql_advanced.default_transaction_isolation = TransactionIsolation::Serializable;
+        mysql_advanced.default_transaction_access_mode =
+            crate::db::TransactionAccessMode::ReadOnly;
+        mysql_advanced.session_time_zone = "+09:00".to_string();
+        mysql_advanced.ssl_mode = ConnectionSslMode::VerifyIdentity;
+        mysql_advanced.mysql_charset = "latin1".to_string();
+
+        let migrated = mysql_advanced.migrate_for_db_type(DatabaseType::Oracle);
+
+        assert_eq!(
+            migrated.default_transaction_isolation,
+            TransactionIsolation::Serializable
+        );
+        assert_eq!(
+            migrated.default_transaction_access_mode,
+            crate::db::TransactionAccessMode::ReadOnly
+        );
+        assert_eq!(migrated.session_time_zone, "+09:00");
+        // Oracle cannot express VerifyIdentity, so we keep the SSL intent by
+        // remapping to Required rather than silently downgrading to Disabled.
+        assert_eq!(migrated.ssl_mode, ConnectionSslMode::Required);
+        // Oracle-specific fields take the Oracle defaults.
+        let oracle_default = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        assert_eq!(
+            migrated.oracle_nls_date_format,
+            oracle_default.oracle_nls_date_format
+        );
+        assert_eq!(
+            migrated.oracle_nls_timestamp_format,
+            oracle_default.oracle_nls_timestamp_format
+        );
+    }
+
+    #[test]
+    fn migrate_for_db_type_falls_back_when_isolation_unsupported() {
+        // Oracle does not support ReadUncommitted. When migrating to Oracle,
+        // the form must not end up with an invalid isolation selection.
+        let mut mysql_advanced = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql_advanced.default_transaction_isolation = TransactionIsolation::ReadUncommitted;
+
+        let migrated = mysql_advanced.migrate_for_db_type(DatabaseType::Oracle);
+
+        assert!(DatabaseType::Oracle
+            .supported_transaction_isolations()
+            .contains(&migrated.default_transaction_isolation));
     }
 }
