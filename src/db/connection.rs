@@ -992,49 +992,6 @@ pub fn store_pooled_session_lease_if_empty(
     lease_to_store.is_none()
 }
 
-pub fn store_pooled_session_lease_if_retained(
-    pooled_db_session: &SharedDbSessionLease,
-    connection_generation: u64,
-    lease_to_store: DbSessionLease,
-    retain_session: bool,
-) -> bool {
-    if !retain_session {
-        drop(lease_to_store);
-        return false;
-    }
-    store_pooled_session_lease_if_empty(
-        pooled_db_session,
-        connection_generation,
-        lease_to_store,
-        true,
-    )
-}
-
-pub fn pooled_session_lease_is_releasable(pooled_db_session: &SharedDbSessionLease) -> bool {
-    pooled_db_session
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_some_and(|entry| !entry.may_have_uncommitted_work)
-}
-
-pub fn clear_releasable_pooled_session_lease(pooled_db_session: &SharedDbSessionLease) -> bool {
-    let lease_to_drop = {
-        let mut lease = pooled_db_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lease
-            .as_ref()
-            .is_some_and(|entry| !entry.may_have_uncommitted_work)
-        {
-            lease.take()
-        } else {
-            None
-        }
-    };
-    lease_to_drop.is_some()
-}
-
 pub(crate) trait DbBackend: Sync {
     fn display_name(&self) -> &'static str;
     fn choice_label(&self) -> &'static str {

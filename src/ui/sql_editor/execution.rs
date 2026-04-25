@@ -107,7 +107,6 @@ struct QueryExecutionCleanupGuard {
     previous_timeout: Option<Duration>,
     oracle_pooled_session: Option<(SharedDbSessionLease, u64, Arc<Connection>)>,
     oracle_pooled_session_invalidated: bool,
-    oracle_read_only_transaction: Option<Arc<Connection>>,
 }
 
 impl QueryExecutionCleanupGuard {
@@ -128,7 +127,6 @@ impl QueryExecutionCleanupGuard {
             previous_timeout: None,
             oracle_pooled_session: None,
             oracle_pooled_session_invalidated: false,
-            oracle_read_only_transaction: None,
         }
     }
 
@@ -159,29 +157,10 @@ impl QueryExecutionCleanupGuard {
         self.timeout_connection = None;
         self.previous_timeout = None;
     }
-
-    fn track_oracle_read_only_transaction(&mut self, connection: Arc<Connection>) {
-        self.oracle_read_only_transaction = Some(connection);
-    }
-
-    fn clear_oracle_read_only_transaction_tracking(&mut self) {
-        self.oracle_read_only_transaction = None;
-    }
 }
 
 impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
-        let mut oracle_read_only_close_failed = false;
-        if let Some(conn) = self.oracle_read_only_transaction.as_ref() {
-            if let Err(err) = conn.rollback() {
-                oracle_read_only_close_failed = true;
-                crate::utils::logging::log_error(
-                    "sql_editor::cleanup",
-                    &format!("Failed to close Oracle read-only transaction: {err}"),
-                );
-            }
-        }
-
         // Restore per-session driver state before the editor is marked idle.
         // Otherwise a fast follow-up execution can reuse the same pooled Oracle
         // session while this guard is still resetting its call timeout.
@@ -199,7 +178,6 @@ impl Drop for QueryExecutionCleanupGuard {
         let should_invalidate_oracle_session = self.oracle_pooled_session_invalidated
             || load_mutex_bool(&self.cancel_flag)
             || oracle_timeout_reset_failed
-            || oracle_read_only_close_failed
             || std::thread::panicking();
         if let Some((pooled_db_session, connection_generation, conn)) =
             self.oracle_pooled_session.as_ref()
@@ -216,7 +194,7 @@ impl Drop for QueryExecutionCleanupGuard {
                         conn.as_ref(),
                         "sql_editor::cleanup",
                     );
-                crate::db::store_pooled_session_lease_if_retained(
+                crate::db::store_pooled_session_lease_if_empty(
                     pooled_db_session,
                     *connection_generation,
                     DbSessionLease::Oracle(Arc::clone(conn)),
@@ -1505,7 +1483,6 @@ impl SqlEditorWidget {
         session_id: u64,
         query_timeout: Option<Duration>,
         previous_timeout: Option<Duration>,
-        close_read_only_transaction: bool,
     ) -> Result<(), OracleError> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         Self::register_lazy_fetch_handle(
@@ -1804,23 +1781,8 @@ impl SqlEditorWidget {
                             false
                         }
                     };
-                    let read_only_close_ok = if close_read_only_transaction {
-                        match conn.rollback() {
-                            Ok(()) => true,
-                            Err(err) => {
-                                crate::utils::logging::log_error(
-                                    "oracle lazy fetch cleanup",
-                                    &format!("Failed to close Oracle read-only transaction: {err}"),
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        true
-                    };
                     let should_keep_session = keep_session
                         && timeout_reset_ok
-                        && read_only_close_ok
                         && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
                     if should_keep_session {
                         let may_have_uncommitted_work =
@@ -1828,7 +1790,7 @@ impl SqlEditorWidget {
                                 conn.as_ref(),
                                 "oracle lazy fetch cleanup",
                             );
-                        crate::db::store_pooled_session_lease_if_retained(
+                        crate::db::store_pooled_session_lease_if_empty(
                             &pooled_db_session,
                             connection_generation,
                             DbSessionLease::Oracle(Arc::clone(&conn)),
@@ -1932,8 +1894,6 @@ impl SqlEditorWidget {
                     let mut fetched_rows = 0usize;
                     let mut last_select_row: Option<Vec<String>> = None;
                     let mut keep_session = false;
-                    let mut had_active_transaction_before_statement =
-                        prior_may_have_uncommitted_work;
                     let mut pending_commands = VecDeque::new();
                     let lazy_fetch_timeout = Self::lazy_fetch_query_timeout(query_timeout);
                     *lazy_cancel_context
@@ -1968,18 +1928,6 @@ impl SqlEditorWidget {
                                 "mysql lazy fetch cancel",
                             );
                             return Ok(LazyFetchWorkerOutcome::Cancelled);
-                        }
-                        if Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                            auto_commit,
-                            false,
-                            state_hint,
-                        ) {
-                            had_active_transaction_before_statement =
-                                Self::mysql_session_may_have_uncommitted_work(
-                                    conn,
-                                    "mysql lazy fetch preflight",
-                                    prior_may_have_uncommitted_work,
-                                );
                         }
                         let mut result =
                             conn.query_iter(sql_to_execute.as_str()).map_err(|err| {
@@ -2348,18 +2296,6 @@ impl SqlEditorWidget {
                             false,
                         );
                     }
-                    if should_release_session
-                        && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                            auto_commit,
-                            had_active_transaction_before_statement,
-                            state_hint,
-                        )
-                    {
-                        should_release_session = Self::rollback_mysql_read_only_pooled_session(
-                            conn,
-                            "mysql lazy fetch cleanup",
-                        );
-                    }
                     if should_release_session {
                         let fallback_on_error = if state_hint.clears_session_state {
                             state_hint.may_leave_session_bound_state
@@ -2631,8 +2567,9 @@ impl SqlEditorWidget {
         }];
 
         let mysql_batch_may_have_uncommitted_work = std::cell::Cell::new(false);
-        let mysql_batch_may_hold_session_lock = std::cell::Cell::new(false);
-        let mysql_batch_has_session_bound_state = std::cell::Cell::new(false);
+        let mysql_batch_may_hold_table_lock = std::cell::Cell::new(false);
+        let mysql_batch_may_hold_named_lock = std::cell::Cell::new(false);
+        let mysql_batch_saw_uncertain_named_lock_release = std::cell::Cell::new(false);
 
         let execute_mysql_sql =
             |sql: &str, auto_commit: bool| -> Result<Vec<QueryResult>, String> {
@@ -2642,8 +2579,9 @@ impl SqlEditorWidget {
                     sql,
                     auto_commit,
                     &mysql_batch_may_have_uncommitted_work,
-                    &mysql_batch_may_hold_session_lock,
-                    &mysql_batch_has_session_bound_state,
+                    &mysql_batch_may_hold_table_lock,
+                    &mysql_batch_may_hold_named_lock,
+                    &mysql_batch_saw_uncertain_named_lock_release,
                 );
                 SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                     shared_connection,
@@ -3612,8 +3550,9 @@ impl SqlEditorWidget {
                                         &sql_text,
                                         auto_commit,
                                         &mysql_batch_may_have_uncommitted_work,
-                                        &mysql_batch_may_hold_session_lock,
-                                        &mysql_batch_has_session_bound_state,
+                                        &mysql_batch_may_hold_table_lock,
+                                        &mysql_batch_may_hold_named_lock,
+                                        &mysql_batch_saw_uncertain_named_lock_release,
                                     );
                                 let session_id = next_lazy_fetch_session_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3796,7 +3735,10 @@ impl SqlEditorWidget {
             shared_connection,
             pooled_db_session,
             mysql_batch_may_have_uncommitted_work.get(),
-            mysql_batch_may_hold_session_lock.get(),
+            mysql_batch_may_hold_table_lock.get(),
+            mysql_batch_may_hold_named_lock.get(),
+            mysql_batch_saw_uncertain_named_lock_release.get(),
+            load_mutex_bool(cancel_flag),
             db_activity,
         );
     }
@@ -4109,11 +4051,6 @@ impl SqlEditorWidget {
                             );
                             return;
                         }
-                    }
-                    if should_apply_oracle_transaction_mode
-                        && transaction_mode.access_mode == crate::db::TransactionAccessMode::ReadOnly
-                    {
-                        cleanup.track_oracle_read_only_transaction(Arc::clone(conn));
                     }
                     if !requires_transaction_first_statement {
                         if let Err(err) =
@@ -5983,7 +5920,6 @@ impl SqlEditorWidget {
                                         )) => {
                                             crate::db::clear_pooled_session_lease(&pooled_db_session);
                                             cleanup.clear_oracle_pooled_session_tracking();
-                                            cleanup.clear_oracle_read_only_transaction_tracking();
                                             conn_opt = next_conn_opt;
                                             conn_name = next_conn_name;
                                             // Update cancel connection so break_execution() uses the new connection
@@ -6033,15 +5969,7 @@ impl SqlEditorWidget {
                                                     conn.as_ref(),
                                                     transaction_mode,
                                                 ) {
-                                                    Ok(()) => {
-                                                        if transaction_mode.access_mode
-                                                            == crate::db::TransactionAccessMode::ReadOnly
-                                                        {
-                                                            cleanup.track_oracle_read_only_transaction(
-                                                                Arc::clone(conn),
-                                                            );
-                                                        }
-                                                    }
+                                                    Ok(()) => {}
                                                     Err(err) => {
                                                         SqlEditorWidget::emit_script_message(
                                                             &sender,
@@ -7528,16 +7456,12 @@ impl SqlEditorWidget {
                                         session_id,
                                         query_timeout,
                                         previous_timeout,
-                                        should_apply_oracle_transaction_mode
-                                            && transaction_mode.access_mode
-                                                == crate::db::TransactionAccessMode::ReadOnly,
                                     ) {
                                         Ok(()) => {
                                             // The lazy worker now owns this pooled connection and
                                             // restores its timeout when the cursor closes.
                                             cleanup.clear_timeout_tracking();
                                             cleanup.clear_oracle_pooled_session_tracking();
-                                            cleanup.clear_oracle_read_only_transaction_tracking();
                                             result_index += 1;
                                             continue;
                                         }
@@ -9834,23 +9758,39 @@ impl SqlEditorWidget {
         )
     }
 
-    fn mysql_statement_acquires_session_lock(sql: &str) -> bool {
+    fn mysql_statement_acquires_table_lock(sql: &str) -> bool {
         match QueryExecutor::leading_keyword(sql).as_deref() {
             Some("LOCK") => true,
-            Some("SELECT") => sql.to_ascii_uppercase().contains("GET_LOCK"),
             _ => false,
         }
     }
 
-    fn mysql_statement_releases_session_lock(sql: &str) -> bool {
+    fn mysql_statement_releases_table_lock(sql: &str) -> bool {
         match QueryExecutor::leading_keyword(sql).as_deref() {
             Some("UNLOCK") => true,
-            Some("SELECT") => {
-                let upper = sql.to_ascii_uppercase();
-                upper.contains("RELEASE_LOCK") || upper.contains("RELEASE_ALL_LOCKS")
-            }
             _ => false,
         }
+    }
+
+    fn mysql_statement_acquires_named_lock(sql: &str) -> bool {
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("SELECT")
+        ) && sql.to_ascii_uppercase().contains("GET_LOCK")
+    }
+
+    fn mysql_statement_releases_named_lock(sql: &str) -> bool {
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("SELECT")
+        ) && sql.to_ascii_uppercase().contains("RELEASE_LOCK")
+    }
+
+    fn mysql_statement_releases_all_named_locks(sql: &str) -> bool {
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("SELECT")
+        ) && sql.to_ascii_uppercase().contains("RELEASE_ALL_LOCKS")
     }
 
     fn mysql_select_assigns_user_variable(sql: &str) -> bool {
@@ -9864,24 +9804,27 @@ impl SqlEditorWidget {
         sql: &str,
         auto_commit: bool,
         batch_may_have_uncommitted_work: &std::cell::Cell<bool>,
-        batch_may_hold_session_lock: &std::cell::Cell<bool>,
-        batch_has_session_bound_state: &std::cell::Cell<bool>,
+        batch_may_hold_table_lock: &std::cell::Cell<bool>,
+        batch_may_hold_named_lock: &std::cell::Cell<bool>,
+        batch_saw_uncertain_named_lock_release: &std::cell::Cell<bool>,
     ) -> MySqlSessionStateHint {
-        let mut state_hint = SqlEditorWidget::mysql_session_state_hint_for_sql(sql);
-        if batch_has_session_bound_state.get()
-            && (QueryExecutor::is_plain_commit(sql)
-                || (QueryExecutor::is_plain_rollback(sql)
-                    && !SqlEditorWidget::mysql_rollback_targets_savepoint(sql)))
-        {
-            state_hint.clears_session_state = false;
-            state_hint.may_leave_session_bound_state = true;
-            state_hint.requires_retention_when_autocommit_off = true;
+        let state_hint = SqlEditorWidget::mysql_session_state_hint_for_sql(sql);
+
+        if Self::mysql_statement_releases_table_lock(sql) {
+            batch_may_hold_table_lock.set(false);
+        } else if Self::mysql_statement_acquires_table_lock(sql) {
+            batch_may_hold_table_lock.set(true);
         }
 
-        if Self::mysql_statement_releases_session_lock(sql) {
-            batch_may_hold_session_lock.set(false);
-        } else if Self::mysql_statement_acquires_session_lock(sql) {
-            batch_may_hold_session_lock.set(true);
+        if Self::mysql_statement_releases_all_named_locks(sql) {
+            batch_may_hold_named_lock.set(false);
+            batch_saw_uncertain_named_lock_release.set(false);
+        } else if Self::mysql_statement_acquires_named_lock(sql) {
+            batch_may_hold_named_lock.set(true);
+        } else if Self::mysql_statement_releases_named_lock(sql) {
+            // A single RELEASE_LOCK() can fail or leave other named locks held.
+            // Keep the existing named-lock state unless RELEASE_ALL_LOCKS() appears.
+            batch_saw_uncertain_named_lock_release.set(true);
         }
 
         if QueryExecutor::is_plain_commit(sql)
@@ -9894,12 +9837,6 @@ impl SqlEditorWidget {
             batch_may_have_uncommitted_work.set(true);
         }
 
-        batch_has_session_bound_state
-            .set(batch_has_session_bound_state.get() || state_hint.may_leave_session_bound_state);
-
-        state_hint.clears_session_state = false;
-        state_hint.may_leave_session_bound_state = true;
-        state_hint.requires_retention_when_autocommit_off = true;
         state_hint
     }
 
@@ -9907,7 +9844,10 @@ impl SqlEditorWidget {
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
         batch_may_have_uncommitted_work: bool,
-        batch_may_hold_session_lock: bool,
+        batch_may_hold_table_lock: bool,
+        batch_may_hold_named_lock: bool,
+        batch_saw_uncertain_named_lock_release: bool,
+        batch_cancelled: bool,
         db_activity: &str,
     ) {
         let connection_generation = {
@@ -9927,33 +9867,29 @@ impl SqlEditorWidget {
         let Some(mut conn) = lease.into_mysql_connection() else {
             return;
         };
+        if batch_cancelled {
+            drop(conn);
+            return;
+        }
 
         let server_reports_active_transaction = Self::mysql_session_may_have_uncommitted_work(
             &mut conn,
             db_activity,
             batch_may_have_uncommitted_work || prior_may_have_uncommitted_work,
         );
-        let should_retain = batch_may_hold_session_lock
+        let should_retain = batch_may_hold_table_lock
+            || batch_may_hold_named_lock
+            || (batch_saw_uncertain_named_lock_release && prior_may_have_uncommitted_work)
             || batch_may_have_uncommitted_work
             || server_reports_active_transaction;
-        if should_retain {
-            Self::release_mysql_pooled_session_if_current(
-                shared_connection,
-                pooled_db_session,
-                connection_generation,
-                conn,
-                true,
-                db_activity,
-            );
-            return;
-        }
-
-        if let Err(err) = conn.query_drop("ROLLBACK") {
-            crate::utils::logging::log_error(
-                db_activity,
-                &format!("Failed to close MySQL batch-scoped session state: {err}"),
-            );
-        }
+        Self::release_mysql_pooled_session_if_current(
+            shared_connection,
+            pooled_db_session,
+            connection_generation,
+            conn,
+            should_retain,
+            db_activity,
+        );
     }
 
     pub(super) fn mysql_session_state_hint_for_sql(sql: &str) -> MySqlSessionStateHint {
@@ -9971,7 +9907,7 @@ impl SqlEditorWidget {
                 clears_session_state: enabled,
                 may_leave_session_bound_state: !enabled,
                 may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: !enabled,
+                requires_retention_when_autocommit_off: false,
             };
         }
 
@@ -10031,7 +9967,7 @@ impl SqlEditorWidget {
                 clears_session_state: false,
                 may_leave_session_bound_state: true,
                 may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: true,
+                requires_retention_when_autocommit_off: false,
             },
             Some("LOCK") => MySqlSessionStateHint {
                 clears_session_state: true,
@@ -10050,7 +9986,7 @@ impl SqlEditorWidget {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
                     may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: true,
+                    requires_retention_when_autocommit_off: false,
                 }
             }
             Some("CREATE") | Some("ALTER") | Some("DROP") | Some("RENAME") | Some("TRUNCATE") => {
@@ -10065,14 +10001,14 @@ impl SqlEditorWidget {
                 clears_session_state: false,
                 may_leave_session_bound_state: true,
                 may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: true,
+                requires_retention_when_autocommit_off: false,
             },
             Some("SELECT") if Self::mysql_select_assigns_user_variable(sql) => {
                 MySqlSessionStateHint {
                     clears_session_state: false,
                     may_leave_session_bound_state: true,
                     may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: true,
+                    requires_retention_when_autocommit_off: false,
                 }
             }
             Some("SELECT") if sql.to_ascii_uppercase().contains("GET_LOCK") => {
@@ -10084,33 +10020,6 @@ impl SqlEditorWidget {
                 }
             }
             _ => MySqlSessionStateHint::default(),
-        }
-    }
-
-    fn mysql_pooled_session_should_rollback_read_only_autocommit_off(
-        auto_commit: bool,
-        had_active_transaction_before_statement: bool,
-        state_hint: MySqlSessionStateHint,
-    ) -> bool {
-        !auto_commit
-            && !had_active_transaction_before_statement
-            && !state_hint.clears_session_state
-            && !state_hint.may_leave_session_bound_state
-    }
-
-    fn rollback_mysql_read_only_pooled_session<C: Queryable>(
-        conn: &mut C,
-        log_context: &str,
-    ) -> bool {
-        match conn.query_drop("ROLLBACK") {
-            Ok(()) => true,
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Failed to close MySQL read-only transaction: {err}"),
-                );
-                false
-            }
         }
     }
 
@@ -10144,7 +10053,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn cancel_message() -> String {
+    pub(super) fn cancel_message() -> String {
         "Query cancelled".to_string()
     }
 
@@ -10233,7 +10142,7 @@ impl SqlEditorWidget {
         .any(|needle| lower.contains(needle))
     }
 
-    fn mysql_error_allows_session_reuse(message: &str) -> bool {
+    pub(super) fn mysql_error_allows_session_reuse(message: &str) -> bool {
         let trimmed = message.trim();
         if trimmed == Self::cancel_message()
             || Self::timeout_error_message_contains_timeout_signal(trimmed)
@@ -10554,7 +10463,7 @@ impl SqlEditorWidget {
         conn: mysql::PooledConn,
         may_have_uncommitted_work: bool,
     ) {
-        crate::db::store_pooled_session_lease_if_retained(
+        crate::db::store_pooled_session_lease_if_empty(
             pooled_db_session,
             connection_generation,
             DbSessionLease::MySQL(conn),
@@ -10628,19 +10537,15 @@ impl SqlEditorWidget {
             clears_session_state: enabled,
             may_leave_session_bound_state: !enabled,
             may_hold_session_lock: false,
-            requires_retention_when_autocommit_off: !enabled,
+            requires_retention_when_autocommit_off: false,
         };
-        let may_have_uncommitted_work = if enabled {
-            Self::mysql_pooled_session_may_need_preservation(
-                &mut conn,
-                db_activity,
-                prior_may_have_uncommitted_work,
-                state_hint,
-                false,
-            )
-        } else {
-            true
-        };
+        let may_have_uncommitted_work = Self::mysql_pooled_session_may_need_preservation(
+            &mut conn,
+            db_activity,
+            prior_may_have_uncommitted_work,
+            state_hint,
+            prior_may_have_uncommitted_work,
+        );
         Self::release_mysql_pooled_session_if_current(
             shared_connection,
             pooled_db_session,
@@ -10659,6 +10564,16 @@ impl SqlEditorWidget {
             Ok(Ok(_)) => true,
             Ok(Err(message)) => Self::mysql_error_allows_session_reuse(message),
             Err(_) => false,
+        }
+    }
+
+    fn mysql_pooled_action_result_after_cancel<T>(
+        result: thread::Result<Result<T, String>>,
+    ) -> Result<T, String> {
+        match result {
+            Ok(Ok(_)) => Err(Self::cancel_message()),
+            Ok(Err(message)) => Err(message),
+            Err(payload) => panic::resume_unwind(payload),
         }
     }
 
@@ -10825,48 +10740,18 @@ impl SqlEditorWidget {
             return Err(message);
         }
         if let Err(cancelled) = Self::abort_if_cancelled(cancel_flag) {
-            if crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+            if let Err(err) = crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
                 &mut conn, None,
-            )
-            .is_ok()
-            {
-                let may_have_uncommitted_work = Self::mysql_pooled_session_may_need_preservation(
-                    &mut conn,
+            ) {
+                crate::utils::logging::log_error(
                     log_context,
-                    prior_may_have_uncommitted_work,
-                    MySqlSessionStateHint::default(),
-                    prior_may_have_uncommitted_work,
+                    &format!("Failed to reset MySQL pooled session timeout after cancel: {err}"),
                 );
-                Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
-                Self::release_mysql_pooled_session_if_current(
-                    shared_connection,
-                    pooled_db_session,
-                    connection_generation,
-                    conn,
-                    may_have_uncommitted_work,
-                    log_context,
-                );
-            } else {
-                Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
-                drop(conn);
             }
+            Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
+            drop(conn);
             return Err(cancelled);
         }
-
-        let had_active_transaction_before_statement =
-            if Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                auto_commit,
-                false,
-                state_hint,
-            ) {
-                Self::mysql_session_may_have_uncommitted_work(
-                    &mut conn,
-                    log_context,
-                    prior_may_have_uncommitted_work,
-                )
-            } else {
-                prior_may_have_uncommitted_work
-            };
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             action(&mut conn)
@@ -10887,7 +10772,12 @@ impl SqlEditorWidget {
                 Err(payload) => panic::resume_unwind(payload),
             };
         }
-        let mut should_release_session = if Self::mysql_pooled_action_can_reuse_session(&result) {
+        if load_mutex_bool(cancel_flag) {
+            Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
+            drop(conn);
+            return Self::mysql_pooled_action_result_after_cancel(result);
+        }
+        let should_release_session = if Self::mysql_pooled_action_can_reuse_session(&result) {
             Self::sync_mysql_pooled_session_info(
                 shared_connection,
                 &mut conn,
@@ -10899,16 +10789,6 @@ impl SqlEditorWidget {
             false
         };
         Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
-        if should_release_session
-            && Self::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                auto_commit,
-                had_active_transaction_before_statement,
-                state_hint,
-            )
-        {
-            should_release_session =
-                Self::rollback_mysql_read_only_pooled_session(&mut conn, log_context);
-        }
         if should_release_session {
             let fallback_on_error = if state_hint.clears_session_state {
                 state_hint.may_leave_session_bound_state
@@ -11169,7 +11049,7 @@ mod query_execution_cleanup_tests {
 
     #[test]
     #[ignore = "requires local Oracle database via ORACLE_TEST_* environment variables"]
-    fn oracle_cleanup_retains_open_transaction_until_rollback() {
+    fn oracle_cleanup_marks_transaction_state_but_keeps_tab_session_after_rollback() {
         let Some((_connection, conn)) = oracle_test_connection() else {
             return;
         };
@@ -11224,9 +11104,12 @@ mod query_execution_cleanup_tests {
             );
             cleanup.track_oracle_pooled_session(pooled_db_session.clone(), 7, Arc::clone(&conn));
         }
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("rolled back Oracle transaction should keep the tab pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::Oracle);
         assert!(
-            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
-            "rolled back Oracle transaction should not leave retained session state"
+            !snapshot.may_have_uncommitted_work,
+            "rolled back Oracle transaction should not be marked as transaction state"
         );
 
         let _ = conn.execute("DROP TABLE qt_oracle_session_rule PURGE", &[]);
@@ -11234,7 +11117,7 @@ mod query_execution_cleanup_tests {
 
     #[test]
     #[ignore = "requires local Oracle database via ORACLE_TEST_* environment variables"]
-    fn oracle_cleanup_returns_read_only_transaction_session() {
+    fn oracle_cleanup_keeps_read_only_transaction_tab_session() {
         let Some((_connection, conn)) = oracle_test_connection() else {
             return;
         };
@@ -11262,13 +11145,13 @@ mod query_execution_cleanup_tests {
                 Arc::new(Mutex::new(true)),
             );
             cleanup.track_oracle_pooled_session(pooled_db_session.clone(), 8, Arc::clone(&conn));
-            cleanup.track_oracle_read_only_transaction(Arc::clone(&conn));
         }
 
-        assert!(
-            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
-            "Oracle read-only transaction cleanup should return the session"
-        );
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("Oracle read-only transaction should keep the tab pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::Oracle);
+        let _ = conn.rollback();
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
     }
 
     #[test]
@@ -11784,48 +11667,18 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn pooled_session_idle_release_skips_running_or_lazy_editor() {
-        assert!(SqlEditorWidget::pooled_session_is_idle_for_release(
-            false, None, true
-        ));
-        assert!(!SqlEditorWidget::pooled_session_is_idle_for_release(
-            true, None, true
-        ));
-        assert!(!SqlEditorWidget::pooled_session_is_idle_for_release(
-            false,
-            Some(42),
-            true
-        ));
-        assert!(!SqlEditorWidget::pooled_session_is_idle_for_release(
-            false, None, false
-        ));
-    }
-
-    #[test]
     fn mysql_session_state_hints_preserve_manual_transaction_until_commit() {
         let start_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("START TRANSACTION");
         assert!(!start_hint.clears_session_state);
         assert!(start_hint.may_leave_session_bound_state);
         assert!(!start_hint.may_hold_session_lock);
+        assert!(start_hint.requires_retention_when_autocommit_off);
 
         let select_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT 1");
         assert!(!select_hint.clears_session_state);
         assert!(!select_hint.may_leave_session_bound_state);
         assert!(!select_hint.may_hold_session_lock);
-        assert!(
-            SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                false,
-                false,
-                select_hint
-            )
-        );
-        assert!(
-            !SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                true,
-                false,
-                select_hint
-            )
-        );
+        assert!(!select_hint.requires_retention_when_autocommit_off);
 
         let commit_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("COMMIT");
         assert!(commit_hint.clears_session_state);
@@ -11857,44 +11710,109 @@ mod query_execution_cleanup_tests {
             SqlEditorWidget::mysql_session_state_hint_for_sql("CREATE TEMPORARY TABLE t (id INT)");
         assert!(!temp_hint.clears_session_state);
         assert!(temp_hint.may_leave_session_bound_state);
+        assert!(!temp_hint.requires_retention_when_autocommit_off);
 
         let lock_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("LOCK TABLES t WRITE");
         assert!(lock_hint.clears_session_state);
         assert!(lock_hint.may_leave_session_bound_state);
         assert!(lock_hint.may_hold_session_lock);
+        assert!(lock_hint.requires_retention_when_autocommit_off);
 
         let get_lock_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT GET_LOCK('x', 1)");
         assert!(!get_lock_hint.clears_session_state);
         assert!(get_lock_hint.may_leave_session_bound_state);
         assert!(get_lock_hint.may_hold_session_lock);
+        assert!(get_lock_hint.requires_retention_when_autocommit_off);
 
         let select_into_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT COUNT(*) INTO @cnt FROM t");
         assert!(!select_into_hint.clears_session_state);
         assert!(select_into_hint.may_leave_session_bound_state);
+        assert!(!select_into_hint.requires_retention_when_autocommit_off);
 
         let prepare_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("PREPARE stmt FROM @sql");
         assert!(!prepare_hint.clears_session_state);
         assert!(prepare_hint.may_leave_session_bound_state);
+        assert!(!prepare_hint.requires_retention_when_autocommit_off);
 
         let insert_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("INSERT INTO t VALUES (1)");
         assert!(!insert_hint.clears_session_state);
         assert!(insert_hint.may_leave_session_bound_state);
-        assert!(
-            !SqlEditorWidget::mysql_pooled_session_should_rollback_read_only_autocommit_off(
-                false,
-                false,
-                insert_hint
-            )
-        );
+        assert!(insert_hint.requires_retention_when_autocommit_off);
 
         let autocommit_on_hint =
             SqlEditorWidget::mysql_session_state_hint_for_sql("SET SESSION autocommit = 1");
         assert!(autocommit_on_hint.clears_session_state);
         assert!(!autocommit_on_hint.may_leave_session_bound_state);
+        assert!(!autocommit_on_hint.requires_retention_when_autocommit_off);
+    }
+
+    #[test]
+    fn mysql_batch_lock_hints_track_table_and_named_locks_separately() {
+        let batch_may_have_uncommitted_work = std::cell::Cell::new(false);
+        let batch_may_hold_table_lock = std::cell::Cell::new(false);
+        let batch_may_hold_named_lock = std::cell::Cell::new(false);
+        let batch_saw_uncertain_named_lock_release = std::cell::Cell::new(false);
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "LOCK TABLES t WRITE",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(batch_may_hold_table_lock.get());
+        assert!(!batch_may_hold_named_lock.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "UNLOCK TABLES",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(!batch_may_hold_table_lock.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "SELECT GET_LOCK('qt_lock_a', 0)",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(batch_may_hold_named_lock.get());
+        assert!(!batch_saw_uncertain_named_lock_release.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "SELECT RELEASE_LOCK('qt_lock_a')",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            batch_may_hold_named_lock.get(),
+            "single RELEASE_LOCK may fail or leave other named locks held"
+        );
+        assert!(batch_saw_uncertain_named_lock_release.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "SELECT RELEASE_ALL_LOCKS()",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(!batch_may_hold_named_lock.get());
+        assert!(!batch_saw_uncertain_named_lock_release.get());
     }
 
     #[test]
@@ -11997,6 +11915,21 @@ mod query_execution_cleanup_tests {
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &timeout_error
         ));
+    }
+
+    #[test]
+    fn mysql_pooled_action_result_after_cancel_never_reports_success() {
+        let success: std::thread::Result<Result<(), String>> = Ok(Ok(()));
+        let sql_error: std::thread::Result<Result<(), String>> = Ok(Err("SQL failed".to_string()));
+
+        assert_eq!(
+            SqlEditorWidget::mysql_pooled_action_result_after_cancel(success),
+            Err(SqlEditorWidget::cancel_message())
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_pooled_action_result_after_cancel(sql_error),
+            Err("SQL failed".to_string())
+        );
     }
 
     #[test]
@@ -13120,30 +13053,34 @@ DROP TABLE IF EXISTS qt_session_rule_result;
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session).expect(
+            "session-scoped state should keep the tab pooled session after selected range execution",
+        );
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
-            "session should be returned after the script no longer needs retained state\n{}",
+            !snapshot.may_have_uncommitted_work,
+            "committed script should not be marked as transaction or lock state\n{}",
             summarize_progress(&progress)
         );
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
     }
 
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
-    fn mysql_pooled_session_returns_read_only_autocommit_off_statement() {
+    fn mysql_pooled_session_retains_read_only_autocommit_off_statement() {
         let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
             "@TRANSACTION\nSELECT 1 AS read_only_probe;",
             true,
-            "mysql read-only autocommit-off release regression",
+            "mysql read-only autocommit-off tab session regression",
         ) else {
             return;
         };
 
         assert_no_failed_mysql_statement(&progress);
-        assert!(
-            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
-            "read-only autocommit-off statement should be rolled back and returned\n{}",
-            summarize_progress(&progress)
-        );
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("read-only autocommit-off statement should keep the tab pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
     }
 
     #[test]
@@ -13183,20 +13120,25 @@ SELECT 'OPEN_TX' AS section_name, COUNT(*) AS row_count FROM qt_session_rule_ope
         };
 
         assert_no_failed_mysql_statement(&cleanup_progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&cleanup_pooled_db_session).expect(
+            "rollback cleanup should keep the tab pooled session after selected range execution",
+        );
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            crate::db::pooled_session_lease_snapshot(&cleanup_pooled_db_session).is_none(),
-            "rollback cleanup should not leave retained session state\n{}",
+            !snapshot.may_have_uncommitted_work,
+            "rollback cleanup should not be marked as transaction or lock state\n{}",
             summarize_progress(&cleanup_progress)
         );
+        crate::db::clear_pooled_session_lease(&cleanup_pooled_db_session);
     }
 
     #[test]
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
-    fn mysql_pooled_session_returns_named_lock_released_in_selected_range() {
+    fn mysql_pooled_session_keeps_tab_session_after_named_locks_released_in_selected_range() {
         let script = "\
 SET @qt_session_rule_lock_name = CONCAT('qt_session_rule_lock_release_', CONNECTION_ID());
 SELECT GET_LOCK(@qt_session_rule_lock_name, 0) AS lock_taken;
-SELECT RELEASE_LOCK(@qt_session_rule_lock_name) AS lock_released;
+SELECT RELEASE_ALL_LOCKS() AS locks_released;
 SELECT 'FINAL_STATUS' AS section_name,
        CASE
            WHEN IS_FREE_LOCK(@qt_session_rule_lock_name) = 1 THEN 'PASS'
@@ -13213,11 +13155,49 @@ SELECT 'FINAL_STATUS' AS section_name,
 
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_final_status_pass(&progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("released named lock should keep the tab pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
         assert!(
-            crate::db::pooled_session_lease_snapshot(&pooled_db_session).is_none(),
-            "released named lock should not leave a retained session\n{}",
+            !snapshot.may_have_uncommitted_work,
+            "released named lock should not be marked as transaction or lock state\n{}",
             summarize_progress(&progress)
         );
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_pooled_session_conservatively_retains_after_single_named_lock_release() {
+        let script = "\
+SET @qt_session_rule_lock_name = CONCAT('qt_session_rule_lock_single_release_', CONNECTION_ID());
+SELECT GET_LOCK(@qt_session_rule_lock_name, 0) AS lock_taken;
+SELECT RELEASE_LOCK(@qt_session_rule_lock_name) AS lock_released;
+SELECT 'FINAL_STATUS' AS section_name,
+       CASE
+           WHEN IS_FREE_LOCK(@qt_session_rule_lock_name) = 1 THEN 'PASS'
+           ELSE CONCAT('FAIL lock_state=', COALESCE(IS_FREE_LOCK(@qt_session_rule_lock_name), -1))
+       END AS result_status;
+";
+        let Some((progress, pooled_db_session)) = execute_mysql_session_rule_script(
+            script,
+            true,
+            "mysql selected-range single lock release retention regression",
+        ) else {
+            return;
+        };
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_final_status_pass(&progress);
+        let snapshot = crate::db::pooled_session_lease_snapshot(&pooled_db_session)
+            .expect("single RELEASE_LOCK should conservatively retain a pooled session");
+        assert_eq!(snapshot.db_type, DatabaseType::MySQL);
+        assert!(
+            snapshot.may_have_uncommitted_work,
+            "single RELEASE_LOCK retention should be visible as retained session state"
+        );
+
+        crate::db::clear_pooled_session_lease(&pooled_db_session);
     }
 
     #[test]

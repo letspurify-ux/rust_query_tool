@@ -384,6 +384,12 @@ enum UiActionResult {
     ConnectionBusy,
 }
 
+#[derive(Clone, Copy)]
+enum CloseSessionAction {
+    Commit,
+    Rollback,
+}
+
 #[derive(Clone)]
 pub(crate) struct MySqlQueryCancelContext {
     connection_info: ConnectionInfo,
@@ -897,37 +903,128 @@ impl SqlEditorWidget {
         crate::db::clear_pooled_session_lease(&self.pooled_db_session)
     }
 
-    pub fn release_idle_pooled_db_session(&self) -> bool {
-        if !Self::pooled_session_is_idle_for_release(
-            self.is_query_running(),
-            self.active_lazy_fetch_session(),
-            crate::db::pooled_session_lease_is_releasable(&self.pooled_db_session),
-        ) {
-            return false;
-        }
-        crate::db::clear_releasable_pooled_session_lease(&self.pooled_db_session)
+    fn restore_pooled_session_after_close_action_failure(
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        lease: DbSessionLease,
+        may_have_uncommitted_work: bool,
+    ) {
+        let _ = crate::db::store_pooled_session_lease_if_empty(
+            pooled_db_session,
+            connection_generation,
+            lease,
+            may_have_uncommitted_work,
+        );
     }
 
-    pub fn has_idle_pooled_db_session(&self) -> bool {
-        if !Self::pooled_session_is_idle_for_release(
-            self.is_query_running(),
-            self.active_lazy_fetch_session(),
-            crate::db::pooled_session_lease_is_releasable(&self.pooled_db_session),
-        ) {
-            return false;
+    fn run_pooled_session_close_action(&self, action: CloseSessionAction) -> Result<(), String> {
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
+        let (connection_generation, db_type) = {
+            let Some(conn_guard) =
+                crate::db::try_lock_connection_with_activity(&self.connection, "Closing query tab")
+            else {
+                return Err(crate::db::format_connection_busy_message());
+            };
+            (conn_guard.connection_generation(), conn_guard.db_type())
+        };
+        let Some((lease, may_have_uncommitted_work)) =
+            crate::db::take_reusable_pooled_session_lease_with_state(
+                &self.pooled_db_session,
+                connection_generation,
+                db_type,
+            )
+        else {
+            return Ok(());
+        };
+
+        match lease {
+            DbSessionLease::Oracle(conn) => {
+                let result = Self::run_oracle_action_with_timeout(
+                    Arc::clone(&conn),
+                    query_timeout,
+                    "Closing query tab",
+                    move |db_conn| match action {
+                        CloseSessionAction::Commit => {
+                            db_conn.commit().map_err(|err| err.to_string())
+                        }
+                        CloseSessionAction::Rollback => {
+                            db_conn.rollback().map_err(|err| err.to_string())
+                        }
+                    },
+                );
+                if let Err(message) = &result {
+                    if Self::oracle_error_message_allows_session_reuse(message) {
+                        Self::restore_pooled_session_after_close_action_failure(
+                            &self.pooled_db_session,
+                            connection_generation,
+                            DbSessionLease::Oracle(conn),
+                            may_have_uncommitted_work,
+                        );
+                    }
+                }
+                result
+            }
+            DbSessionLease::MySQL(mut conn) => {
+                if let Err(err) =
+                    crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                        &mut conn,
+                        query_timeout,
+                    )
+                {
+                    let message = SqlEditorWidget::mysql_error_message(&err, query_timeout);
+                    if Self::mysql_error_allows_session_reuse(&message) {
+                        Self::restore_pooled_session_after_close_action_failure(
+                            &self.pooled_db_session,
+                            connection_generation,
+                            DbSessionLease::MySQL(conn),
+                            may_have_uncommitted_work,
+                        );
+                    }
+                    return Err(message);
+                }
+
+                let sql = match action {
+                    CloseSessionAction::Commit => "COMMIT",
+                    CloseSessionAction::Rollback => "ROLLBACK",
+                };
+                let result = conn
+                    .query_drop(sql)
+                    .map_err(|err| SqlEditorWidget::mysql_error_message(&err, query_timeout));
+                let reset_result =
+                    crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout(
+                        &mut conn, None,
+                    )
+                    .map_err(|err| {
+                        format!("Failed to reset MySQL session timeout while closing tab: {err}")
+                    });
+
+                let result = match (result, reset_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(message), Ok(())) => Err(message),
+                    (Ok(()), Err(message)) | (Err(_), Err(message)) => Err(message),
+                };
+
+                if let Err(message) = &result {
+                    if Self::mysql_error_allows_session_reuse(message) {
+                        Self::restore_pooled_session_after_close_action_failure(
+                            &self.pooled_db_session,
+                            connection_generation,
+                            DbSessionLease::MySQL(conn),
+                            may_have_uncommitted_work,
+                        );
+                    }
+                }
+                result
+            }
         }
-        self.pooled_db_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
     }
 
-    fn pooled_session_is_idle_for_release(
-        query_running: bool,
-        active_lazy_fetch_session: Option<u64>,
-        lease_releasable: bool,
-    ) -> bool {
-        !query_running && active_lazy_fetch_session.is_none() && lease_releasable
+    pub fn commit_pooled_session_for_close(&self) -> Result<(), String> {
+        self.run_pooled_session_close_action(CloseSessionAction::Commit)
+    }
+
+    pub fn rollback_pooled_session_for_close(&self) -> Result<(), String> {
+        self.run_pooled_session_close_action(CloseSessionAction::Rollback)
     }
 
     pub fn clear_pooled_db_session(&self) {
@@ -1750,29 +1847,35 @@ impl SqlEditorWidget {
                                 activity_label,
                                 oracle_action,
                             );
-                            let should_clear_pooled_conn = result
-                                .as_ref()
-                                .err()
-                                .is_some_and(|message| {
-                                    !SqlEditorWidget::oracle_error_message_allows_session_reuse(
-                                        message,
-                                    )
-                                });
-                            if !should_clear_pooled_conn {
-                                let may_have_uncommitted_work =
-                                    SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                                        db_conn.as_ref(),
-                                        activity_label,
+                            if load_mutex_bool(&cancel_flag) {
+                                drop(lease);
+                                match result {
+                                    Ok(()) => Err(SqlEditorWidget::cancel_message()),
+                                    Err(message) => Err(message),
+                                }
+                            } else {
+                                let should_clear_pooled_conn =
+                                    result.as_ref().err().is_some_and(|message| {
+                                        !SqlEditorWidget::oracle_error_message_allows_session_reuse(
+                                            message,
+                                        )
+                                    });
+                                if !should_clear_pooled_conn {
+                                    let may_have_uncommitted_work =
+                                        SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                            db_conn.as_ref(),
+                                            activity_label,
+                                        );
+                                    crate::db::store_pooled_session_lease_if_empty(
+                                        &pooled_db_session,
+                                        connection_generation,
+                                        DbSessionLease::Oracle(Arc::clone(&db_conn)),
+                                        may_have_uncommitted_work,
                                     );
-                                crate::db::store_pooled_session_lease_if_empty(
-                                    &pooled_db_session,
-                                    connection_generation,
-                                    DbSessionLease::Oracle(Arc::clone(&db_conn)),
-                                    may_have_uncommitted_work,
-                                );
+                                }
+                                drop(lease);
+                                result
                             }
-                            drop(lease);
-                            result
                         } else {
                             let primary_conn = conn_guard.require_live_connection();
                             drop(conn_guard);

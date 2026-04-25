@@ -145,7 +145,7 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
         "Oracle transaction mode application should be guarded by the open-transaction check"
     );
     assert!(
-        content.contains("should_apply_oracle_transaction_mode\n                                            && transaction_mode.access_mode"),
-        "Oracle lazy fetch read-only cleanup should only be armed when read-only mode was applied"
+        !content.contains("track_oracle_read_only_transaction"),
+        "Oracle read-only execution should not arm old read-only cleanup; the tab owns the pooled session until commit, rollback, cancel, or close"
     );
 }

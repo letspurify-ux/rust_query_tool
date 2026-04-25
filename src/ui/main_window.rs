@@ -729,47 +729,6 @@ impl AppState {
         released_any
     }
 
-    fn background_idle_pooled_db_session_count(&self) -> usize {
-        self.editor_tabs
-            .iter()
-            .filter(|tab| tab.tab_id != self.active_editor_tab_id)
-            .filter(|tab| tab.sql_editor.has_idle_pooled_db_session())
-            .count()
-    }
-
-    fn release_background_idle_pooled_db_sessions(&self) -> bool {
-        let mut released_any = false;
-        for tab in &self.editor_tabs {
-            if tab.tab_id != self.active_editor_tab_id {
-                released_any |= tab.sql_editor.release_idle_pooled_db_session();
-            }
-        }
-        released_any
-    }
-
-    fn background_transaction_pooled_session_label(&self) -> Option<String> {
-        self.editor_tabs
-            .iter()
-            .filter(|tab| tab.tab_id != self.active_editor_tab_id)
-            .find_map(|tab| {
-                let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
-                if !snapshot.may_have_uncommitted_work {
-                    return None;
-                }
-                Some(format!(
-                    "{} ({})",
-                    Self::tab_display_label(tab),
-                    snapshot.db_type
-                ))
-            })
-    }
-
-    fn release_idle_pooled_db_sessions(&self) -> bool {
-        let mut released_any = self.release_background_idle_pooled_db_sessions();
-        released_any |= self.sql_editor.release_idle_pooled_db_session();
-        released_any
-    }
-
     fn oldest_lazy_fetch_session(&self) -> Option<u64> {
         self.lazy_fetch_sessions_for_abort().into_iter().min()
     }
@@ -823,6 +782,25 @@ impl AppState {
             self.sql_editor.active_lazy_fetch_session(),
         );
         session_ids
+    }
+
+    fn mark_progress_context_canceling(&mut self, tab_id: QueryTabId) -> bool {
+        let tab_count = self.result_tabs.tab_count();
+        let Some(context) = self.progress_contexts.get_mut(&tab_id) else {
+            return false;
+        };
+        context.state_label = ResultTabStatus::Canceling.label().to_string();
+        let Some(statement_index) = context.active_statement_index else {
+            return false;
+        };
+        let tab_index = resolve_progress_tab_index(
+            tab_count,
+            context.result_tab_offset,
+            context.execution_target,
+            statement_index,
+        );
+        self.result_tabs.mark_statement_canceling(tab_index);
+        true
     }
 
     fn mark_running_progress_contexts_canceling(&mut self) {
@@ -1205,9 +1183,9 @@ impl AppState {
             }
             let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
             let state = if snapshot.may_have_uncommitted_work {
-                "Pooled session (session state retained)"
+                "Pooled session (transaction or lock retained)"
             } else {
-                "Pooled session"
+                "Pooled session (tab session retained)"
             };
             Some((
                 tab.tab_id,
@@ -1470,10 +1448,6 @@ fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
     !has_running_queries
 }
 
-fn should_cancel_fallback_editor(fallback_editor_running: bool) -> bool {
-    fallback_editor_running
-}
-
 fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), String> {
     if has_running_queries {
         Err("A query is running. Wait for completion before editing result rows.".to_string())
@@ -1508,21 +1482,16 @@ fn should_finish_progress_after_lazy_fetch_close(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionPoolSlotAction {
     None,
-    ReleaseIdleSessions,
     CancelLazyFetch,
 }
 
 fn session_pool_slot_action(
     active_lazy_fetches: usize,
-    idle_pooled_sessions: usize,
     connection_pool_size: u32,
 ) -> SessionPoolSlotAction {
     let connection_pool_size = (connection_pool_size as usize).max(1);
     if active_lazy_fetches >= connection_pool_size {
         return SessionPoolSlotAction::CancelLazyFetch;
-    }
-    if active_lazy_fetches.saturating_add(idle_pooled_sessions) >= connection_pool_size {
-        return SessionPoolSlotAction::ReleaseIdleSessions;
     }
     SessionPoolSlotAction::None
 }
@@ -1559,22 +1528,12 @@ enum SqlExecutionRequest {
 
 fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
     let (editor, blocked_message) = {
-        let mut guard = state
+        let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_any_query_running() {
             (None, Some(crate::db::format_connection_busy_message()))
-        } else if let Some(blocker) = guard.background_transaction_pooled_session_label() {
-            (
-                None,
-                Some(format!(
-                    "Another query tab has an open transaction in a pooled session: {blocker}. Commit, rollback, or close that tab before running a query from this tab."
-                )),
-            )
         } else {
-            if guard.release_background_idle_pooled_db_sessions() {
-                guard.set_status_message("Released idle pooled sessions from background tabs");
-            }
             (Some(guard.sql_editor.clone()), None)
         }
     };
@@ -1600,23 +1559,12 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         .connection_pool_size();
 
     let session_id = {
-        let mut guard = state
+        let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let active_sessions = guard.lazy_fetch_sessions_for_abort();
-        let idle_pooled_sessions = guard.background_idle_pooled_db_session_count();
-        match session_pool_slot_action(
-            active_sessions.len(),
-            idle_pooled_sessions,
-            connection_pool_size,
-        ) {
+        match session_pool_slot_action(active_sessions.len(), connection_pool_size) {
             SessionPoolSlotAction::None => return false,
-            SessionPoolSlotAction::ReleaseIdleSessions => {
-                if guard.release_background_idle_pooled_db_sessions() {
-                    guard.set_status_message("Released idle pooled sessions for new query");
-                }
-                return false;
-            }
             SessionPoolSlotAction::CancelLazyFetch => {}
         }
         let Some(session_id) = guard.oldest_lazy_fetch_session() else {
@@ -2218,28 +2166,22 @@ impl MainWindow {
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
-        let (running_editors, fallback_editor, lazy_fetch_sessions) = {
+        let (running_editors, lazy_fetch_sessions) = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let running_editors = s
+            let mut running_editors = s
                 .editor_tabs
                 .iter()
                 .filter(|tab| tab.sql_editor.is_query_running())
                 .map(|tab| tab.sql_editor.clone())
                 .collect::<Vec<_>>();
-            (
-                running_editors,
-                s.sql_editor.clone(),
-                s.lazy_fetch_sessions_for_abort(),
-            )
+            if s.find_tab_index(s.active_editor_tab_id).is_none() && s.sql_editor.is_query_running()
+            {
+                running_editors.push(s.sql_editor.clone());
+            }
+            (running_editors, s.lazy_fetch_sessions_for_abort())
         };
-
-        let fallback_editor_running = fallback_editor.is_query_running();
-
-        if should_cancel_fallback_editor(fallback_editor_running) {
-            fallback_editor.cancel_current();
-        }
 
         let lazy_fetch_requests = lazy_fetch_sessions
             .iter()
@@ -2287,6 +2229,56 @@ impl MainWindow {
             )
         };
         s.set_status_message(&status);
+    }
+
+    fn cancel_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
+        let Some((editor, query_running, lazy_fetch_session)) = ({
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.find_tab_index(tab_id).map(|index| {
+                let editor = s.editor_tabs[index].sql_editor.clone();
+                (
+                    editor.clone(),
+                    editor.is_query_running(),
+                    editor.active_lazy_fetch_session(),
+                )
+            })
+        }) else {
+            return false;
+        };
+
+        let mut requested = false;
+        if let Some(session_id) = lazy_fetch_session {
+            requested |= editor
+                .request_lazy_fetch(session_id, crate::ui::sql_editor::LazyFetchRequest::Cancel);
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if requested {
+                s.mark_lazy_fetch_canceling(session_id);
+            } else {
+                s.mark_lazy_fetch_result_tab_closed(session_id);
+                s.result_tabs.abort_lazy_fetch_session(session_id);
+            }
+            s.refresh_result_edit_controls();
+        }
+
+        if query_running {
+            editor.cancel_current();
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.mark_progress_context_canceling(tab_id);
+            s.set_status_message(&format!(
+                "{} running query...",
+                ResultTabStatus::Canceling.label()
+            ));
+            s.refresh_result_edit_controls();
+            requested = true;
+        }
+
+        requested
     }
 
     fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
@@ -2396,6 +2388,81 @@ impl MainWindow {
             Some(2) => true,
             _ => false,
         }
+    }
+
+    fn confirm_cancel_running_query_for_close(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+    ) -> bool {
+        let tab_label = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.tab_display_name(tab_id)
+                .unwrap_or_else(|| "Query".to_string())
+        };
+        matches!(
+            fltk::dialog::choice2_default(
+                &format!(
+                    "Tab '{}' has a running query or open lazy fetch.\nCancel it and close the tab?",
+                    tab_label
+                ),
+                "Keep Open",
+                "Cancel Query and Close",
+                "",
+            ),
+            Some(1)
+        )
+    }
+
+    fn resolve_pooled_session_before_close(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+    ) -> bool {
+        let Some((tab_label, editor, snapshot)) = ({
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.find_tab_index(tab_id).and_then(|index| {
+                let editor = s.editor_tabs[index].sql_editor.clone();
+                let snapshot = editor.pooled_session_activity_snapshot()?;
+                Some((
+                    s.tab_display_name(tab_id)
+                        .unwrap_or_else(|| "Query".to_string()),
+                    editor,
+                    snapshot,
+                ))
+            })
+        }) else {
+            return true;
+        };
+
+        if !snapshot.may_have_uncommitted_work {
+            return true;
+        }
+
+        let choice = fltk::dialog::choice2_default(
+            &format!(
+                "Tab '{}' has a DB session that may need commit or rollback.\nChoose how to close it.",
+                tab_label
+            ),
+            "Cancel",
+            "Commit and Close",
+            "Rollback and Close",
+        );
+
+        let result = match choice {
+            Some(1) => editor.commit_pooled_session_for_close(),
+            Some(2) => editor.rollback_pooled_session_for_close(),
+            _ => return false,
+        };
+
+        if let Err(err) = result {
+            fltk::dialog::alert_default(&format!("Failed to resolve DB session: {}", err));
+            return false;
+        }
+
+        true
     }
 
     fn confirm_save_for_all_dirty_tabs(state: &Arc<Mutex<AppState>>) -> bool {
@@ -3701,21 +3768,37 @@ impl MainWindow {
     }
 
     fn close_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
-        let is_running = {
+        let had_running_session = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(index) = s.find_tab_index(tab_id) else {
                 return false;
             };
-            s.editor_tabs[index].sql_editor.is_query_running()
+            let editor = &s.editor_tabs[index].sql_editor;
+            editor.is_query_running() || editor.active_lazy_fetch_session().is_some()
         };
-        if is_running {
-            fltk::dialog::alert_default("A query is running in this tab. Stop it before closing.");
+        if had_running_session && !Self::confirm_cancel_running_query_for_close(state, tab_id) {
             return false;
         }
 
         if !Self::confirm_save_if_dirty(state, tab_id, "closing this tab") {
+            return false;
+        }
+
+        let has_running_session = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(index) = s.find_tab_index(tab_id) else {
+                return false;
+            };
+            let editor = &s.editor_tabs[index].sql_editor;
+            editor.is_query_running() || editor.active_lazy_fetch_session().is_some()
+        };
+        if has_running_session {
+            Self::cancel_query_editor_tab(state, tab_id);
+        } else if !Self::resolve_pooled_session_before_close(state, tab_id) {
             return false;
         }
 
@@ -4605,12 +4688,7 @@ impl MainWindow {
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
-                    if s.release_idle_pooled_db_sessions() {
-                        s.set_status_message("Session pool full; released idle pooled sessions");
-                        s.refresh_result_edit_controls();
-                        drop(s);
-                        let _ = response.send(true);
-                    } else if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                    if let Some(session_id) = s.oldest_lazy_fetch_session() {
                         drop(s);
                         let requested = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -4623,10 +4701,7 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
-                    if s.release_idle_pooled_db_sessions() {
-                        s.set_status_message("Session pool full; released idle pooled sessions");
-                        s.refresh_result_edit_controls();
-                    } else if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                    if let Some(session_id) = s.oldest_lazy_fetch_session() {
                         drop(s);
                         let _ = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -6821,37 +6896,19 @@ mod tests {
     }
 
     #[test]
-    fn session_pool_slot_action_preserves_idle_sessions_when_pool_has_room() {
-        assert_eq!(
-            session_pool_slot_action(0, 0, 4),
-            SessionPoolSlotAction::None
-        );
-        assert_eq!(
-            session_pool_slot_action(2, 1, 4),
-            SessionPoolSlotAction::None
-        );
-    }
-
-    #[test]
-    fn session_pool_slot_action_releases_idle_sessions_before_canceling_lazy_fetch() {
-        assert_eq!(
-            session_pool_slot_action(3, 1, 4),
-            SessionPoolSlotAction::ReleaseIdleSessions
-        );
-        assert_eq!(
-            session_pool_slot_action(0, 4, 4),
-            SessionPoolSlotAction::ReleaseIdleSessions
-        );
+    fn session_pool_slot_action_allows_tab_retained_sessions() {
+        assert_eq!(session_pool_slot_action(0, 4), SessionPoolSlotAction::None);
+        assert_eq!(session_pool_slot_action(2, 4), SessionPoolSlotAction::None);
     }
 
     #[test]
     fn session_pool_slot_action_cancels_when_lazy_fetches_fill_pool() {
         assert_eq!(
-            session_pool_slot_action(4, 0, 4),
+            session_pool_slot_action(4, 4),
             SessionPoolSlotAction::CancelLazyFetch
         );
         assert_eq!(
-            session_pool_slot_action(5, 3, 4),
+            session_pool_slot_action(5, 4),
             SessionPoolSlotAction::CancelLazyFetch
         );
     }
