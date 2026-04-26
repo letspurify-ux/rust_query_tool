@@ -965,11 +965,13 @@ impl SqlEditorWidget {
         connection_generation: u64,
         lease: DbSessionLease,
         may_have_uncommitted_work: bool,
+        requires_transaction_decision: bool,
     ) {
-        let _ = pooled_db_session.store_if_empty(
+        let _ = pooled_db_session.store_if_empty_with_transaction_decision(
             connection_generation,
             lease,
             may_have_uncommitted_work,
+            requires_transaction_decision,
         );
     }
 
@@ -983,9 +985,9 @@ impl SqlEditorWidget {
             };
             (conn_guard.connection_generation(), conn_guard.db_type())
         };
-        let Some((lease, may_have_uncommitted_work)) = self
+        let Some((lease, may_have_uncommitted_work, requires_transaction_decision)) = self
             .pooled_db_session
-            .take_reusable_with_state(connection_generation, db_type)
+            .take_reusable_with_decision_state(connection_generation, db_type)
         else {
             return Ok(());
         };
@@ -1012,6 +1014,7 @@ impl SqlEditorWidget {
                             connection_generation,
                             DbSessionLease::Oracle(conn),
                             may_have_uncommitted_work,
+                            requires_transaction_decision,
                         );
                     }
                 }
@@ -1031,6 +1034,7 @@ impl SqlEditorWidget {
                             connection_generation,
                             DbSessionLease::MySQL(conn),
                             may_have_uncommitted_work,
+                            requires_transaction_decision,
                         );
                     }
                     return Err(message);
@@ -1064,6 +1068,7 @@ impl SqlEditorWidget {
                             connection_generation,
                             DbSessionLease::MySQL(conn),
                             may_have_uncommitted_work,
+                            requires_transaction_decision,
                         );
                     }
                 }
@@ -1078,6 +1083,56 @@ impl SqlEditorWidget {
 
     pub fn rollback_pooled_session_for_close(&self) -> Result<(), String> {
         self.run_pooled_session_close_action(CloseSessionAction::Rollback)
+    }
+
+    pub fn discard_pooled_session_for_close(&self) -> Result<(), String> {
+        self.release_pooled_db_session();
+        Ok(())
+    }
+
+    pub fn resolve_required_transaction_decision(&self, action_verb: &str) -> bool {
+        let Some(snapshot) = self.pooled_db_session.snapshot() else {
+            return true;
+        };
+        if !snapshot.requires_transaction_decision {
+            return true;
+        }
+
+        let choice = fltk::dialog::choice2_default(
+            &format!(
+                "This tab has a cancelled statement with an uncertain transaction state.\nResolve it before {}.",
+                action_verb
+            ),
+            "Cancel",
+            "Commit/Rollback",
+            "Discard Session",
+        );
+
+        let result = match choice {
+            Some(1) => {
+                let decision = fltk::dialog::choice2_default(
+                    "Choose how to resolve the retained transaction.",
+                    "Cancel",
+                    "Commit",
+                    "Rollback",
+                );
+                match decision {
+                    Some(1) => self.commit_pooled_session_for_close(),
+                    Some(2) => self.rollback_pooled_session_for_close(),
+                    _ => return false,
+                }
+            }
+            Some(2) => self.discard_pooled_session_for_close(),
+            _ => return false,
+        };
+
+        if let Err(err) = result {
+            SqlEditorWidget::show_alert_dialog(&format!("Failed to resolve DB session: {}", err));
+            return false;
+        }
+
+        self.emit_status("Transaction decision resolved");
+        true
     }
 
     pub fn clear_pooled_db_session(&self) {
@@ -1930,14 +1985,17 @@ impl SqlEditorWidget {
                     crate::db::DbExecutionEngine::Oracle => {
                         let connection_generation = conn_guard.connection_generation();
                         let pooled_lease = pooled_db_session
-                            .take_reusable_with_state(
+                            .take_reusable_with_decision_state(
                                 connection_generation,
                                 crate::db::DatabaseType::Oracle,
                             )
-                            .and_then(|(lease, _)| {
-                                lease.oracle_connection().map(|conn| (lease, conn))
+                            .and_then(|(lease, _, requires_transaction_decision)| {
+                                lease
+                                    .oracle_connection()
+                                    .map(|conn| (lease, conn, requires_transaction_decision))
                             });
-                        if let Some((lease, db_conn)) = pooled_lease {
+                        if let Some((lease, db_conn, requires_transaction_decision)) = pooled_lease
+                        {
                             drop(conn_guard);
                             SqlEditorWidget::set_current_query_connection(
                                 &current_query_connection,
@@ -1971,10 +2029,11 @@ impl SqlEditorWidget {
                                             db_conn.as_ref(),
                                             activity_label,
                                         );
-                                    pooled_db_session.store_if_empty(
+                                    pooled_db_session.store_if_empty_with_transaction_decision(
                                         connection_generation,
                                         DbSessionLease::Oracle(Arc::clone(&db_conn)),
                                         may_have_uncommitted_work,
+                                        result.is_err() && requires_transaction_decision,
                                     );
                                 }
                                 drop(lease);

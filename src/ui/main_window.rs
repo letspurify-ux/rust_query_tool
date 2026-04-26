@@ -1245,7 +1245,9 @@ impl AppState {
                 return None;
             }
             let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
-            let state = if snapshot.may_have_uncommitted_work {
+            let state = if snapshot.requires_transaction_decision {
+                "Pooled session (transaction decision required)"
+            } else if snapshot.may_have_uncommitted_work {
                 "Pooled session (transaction or lock retained)"
             } else {
                 "Pooled session (tab session retained)"
@@ -2522,23 +2524,35 @@ impl MainWindow {
             return true;
         };
 
-        if !snapshot.may_have_uncommitted_work {
+        if !snapshot.may_have_uncommitted_work && !snapshot.requires_transaction_decision {
             return true;
         }
 
         let choice = fltk::dialog::choice2_default(
             &format!(
-                "Tab '{}' has a DB session that may need commit or rollback.\nChoose how to close it.",
+                "Tab '{}' has a DB session that may need commit, rollback, or discard.\nChoose how to close it.",
                 tab_label
             ),
             "Cancel",
-            "Commit and Close",
-            "Rollback and Close",
+            "Commit/Rollback",
+            "Discard Session",
         );
 
         let result = match choice {
-            Some(1) => editor.commit_pooled_session_for_close(),
-            Some(2) => editor.rollback_pooled_session_for_close(),
+            Some(1) => {
+                let decision = fltk::dialog::choice2_default(
+                    "Choose how to resolve the DB session before closing.",
+                    "Cancel",
+                    "Commit and Close",
+                    "Rollback and Close",
+                );
+                match decision {
+                    Some(1) => editor.commit_pooled_session_for_close(),
+                    Some(2) => editor.rollback_pooled_session_for_close(),
+                    _ => return false,
+                }
+            }
+            Some(2) => editor.discard_pooled_session_for_close(),
             _ => return false,
         };
 

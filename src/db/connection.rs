@@ -707,6 +707,7 @@ pub struct DbSessionLeaseEntry {
     connection_generation: u64,
     lease: DbSessionLease,
     may_have_uncommitted_work: bool,
+    requires_transaction_decision: bool,
 }
 
 /// One editor tab's owned DB session slot.
@@ -723,6 +724,7 @@ pub struct SharedDbSessionLease {
 pub struct PooledSessionLeaseSnapshot {
     pub db_type: DatabaseType,
     pub may_have_uncommitted_work: bool,
+    pub requires_transaction_decision: bool,
 }
 
 #[derive(Clone)]
@@ -840,11 +842,13 @@ impl DbSessionLeaseEntry {
         connection_generation: u64,
         lease: DbSessionLease,
         may_have_uncommitted_work: bool,
+        requires_transaction_decision: bool,
     ) -> Self {
         Self {
             connection_generation,
             lease,
             may_have_uncommitted_work,
+            requires_transaction_decision,
         }
     }
 
@@ -878,7 +882,41 @@ impl SharedDbSessionLease {
             .map(|entry| PooledSessionLeaseSnapshot {
                 db_type: entry.lease.db_type(),
                 may_have_uncommitted_work: entry.may_have_uncommitted_work,
+                requires_transaction_decision: entry.requires_transaction_decision,
             })
+    }
+
+    pub fn take_reusable_with_decision_state(
+        &self,
+        connection_generation: u64,
+        db_type: DatabaseType,
+    ) -> Option<(DbSessionLease, bool, bool)> {
+        let mut stale_lease_to_drop = None;
+        let reusable_lease = {
+            let mut lease = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let reusable = lease
+                .as_ref()
+                .is_some_and(|existing| existing.matches(connection_generation, db_type));
+            if reusable {
+                lease.take().map(|entry| {
+                    (
+                        entry.lease,
+                        entry.may_have_uncommitted_work,
+                        entry.requires_transaction_decision,
+                    )
+                })
+            } else {
+                if lease.is_some() {
+                    stale_lease_to_drop = lease.take();
+                }
+                None
+            }
+        };
+        drop(stale_lease_to_drop);
+        reusable_lease
     }
 
     pub fn clear_oracle_if_current_connection(
@@ -912,28 +950,8 @@ impl SharedDbSessionLease {
         connection_generation: u64,
         db_type: DatabaseType,
     ) -> Option<(DbSessionLease, bool)> {
-        let mut stale_lease_to_drop = None;
-        let reusable_lease = {
-            let mut lease = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let reusable = lease
-                .as_ref()
-                .is_some_and(|existing| existing.matches(connection_generation, db_type));
-            if reusable {
-                lease
-                    .take()
-                    .map(|entry| (entry.lease, entry.may_have_uncommitted_work))
-            } else {
-                if lease.is_some() {
-                    stale_lease_to_drop = lease.take();
-                }
-                None
-            }
-        };
-        drop(stale_lease_to_drop);
-        reusable_lease
+        self.take_reusable_with_decision_state(connection_generation, db_type)
+            .map(|(lease, may_have_uncommitted_work, _)| (lease, may_have_uncommitted_work))
     }
 
     pub fn store_if_empty(
@@ -941,6 +959,21 @@ impl SharedDbSessionLease {
         connection_generation: u64,
         lease_to_store: DbSessionLease,
         may_have_uncommitted_work: bool,
+    ) -> bool {
+        self.store_if_empty_with_transaction_decision(
+            connection_generation,
+            lease_to_store,
+            may_have_uncommitted_work,
+            false,
+        )
+    }
+
+    pub fn store_if_empty_with_transaction_decision(
+        &self,
+        connection_generation: u64,
+        lease_to_store: DbSessionLease,
+        may_have_uncommitted_work: bool,
+        requires_transaction_decision: bool,
     ) -> bool {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
@@ -963,6 +996,7 @@ impl SharedDbSessionLease {
                         connection_generation,
                         lease_to_store,
                         may_have_uncommitted_work,
+                        requires_transaction_decision,
                     ));
                 }
                 old_lease
