@@ -4,6 +4,9 @@
 // action path); this module provides the named types, classifier, and
 // decision functions the spec requires so they can be referenced uniformly.
 
+use mysql::prelude::Queryable;
+use oracle::Connection as OracleConnection;
+
 use crate::{db::connection::DatabaseType, sql_text};
 
 /// SQL classification for cancel / session-reuse decisions (session.md §6).
@@ -235,6 +238,84 @@ pub fn apply_session_decision<A: SessionDecisionApplier>(
         SessionDecision::MarkDirtyAndBlockNextExecution => {
             applier.mark_connected();
             applier.mark_dirty_and_block_next_execution();
+        }
+    }
+}
+
+/// Borrowed handle to a physical DB session for the unified health check
+/// described in session.md §27.5. Centralising the dispatch here lets cancel /
+/// timeout post-processing call a single function regardless of DB driver.
+pub enum PhysicalSession<'a> {
+    Oracle(&'a OracleConnection),
+    MySql(&'a mut mysql::PooledConn),
+}
+
+/// Unified health check (session.md §13 / §27.5). Performs `ping` followed by
+/// `SELECT 1 [FROM dual]`. Returns `true` only if both succeed and the row
+/// equals `1`. Errors are logged with `log_context` and surfaced as `false`.
+pub fn health_check_session(session: PhysicalSession<'_>, log_context: &str) -> bool {
+    match session {
+        PhysicalSession::Oracle(conn) => health_check_oracle_session(conn, log_context),
+        PhysicalSession::MySql(conn) => health_check_mysql_session(conn, log_context),
+    }
+}
+
+/// Oracle-specific health check used by [`health_check_session`].
+pub fn health_check_oracle_session(conn: &OracleConnection, log_context: &str) -> bool {
+    if let Err(err) = conn.ping() {
+        crate::utils::logging::log_error(
+            log_context,
+            &format!("Oracle pooled session ping failed: {err}"),
+        );
+        return false;
+    }
+    match conn.query_row_as::<i64>("SELECT 1 FROM dual", &[]) {
+        Ok(1) => true,
+        Ok(value) => {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("Oracle pooled session health check returned {value}"),
+            );
+            false
+        }
+        Err(err) => {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("Oracle pooled session health check failed: {err}"),
+            );
+            false
+        }
+    }
+}
+
+/// MySQL/MariaDB health check used by [`health_check_session`].
+pub fn health_check_mysql_session(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
+    if conn.as_mut().ping().is_err() {
+        crate::utils::logging::log_error(log_context, "MySQL pooled session ping failed");
+        return false;
+    }
+    match conn.query_first::<u8, _>("SELECT 1") {
+        Ok(Some(1)) => true,
+        Ok(Some(value)) => {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("MySQL pooled session health check returned {value}"),
+            );
+            false
+        }
+        Ok(None) => {
+            crate::utils::logging::log_error(
+                log_context,
+                "MySQL pooled session health check returned no rows",
+            );
+            false
+        }
+        Err(err) => {
+            crate::utils::logging::log_error(
+                log_context,
+                &format!("MySQL pooled session health check failed: {err}"),
+            );
+            false
         }
     }
 }

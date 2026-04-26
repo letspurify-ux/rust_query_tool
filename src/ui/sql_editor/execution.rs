@@ -11212,61 +11212,17 @@ impl SqlEditorWidget {
     }
 
     fn oracle_pooled_session_health_check(conn: &Connection, log_context: &str) -> bool {
-        if let Err(err) = conn.ping() {
-            crate::utils::logging::log_error(
-                log_context,
-                &format!("Oracle pooled session ping failed: {err}"),
-            );
-            return false;
-        }
-        match conn.query_row_as::<i64>("SELECT 1 FROM dual", &[]) {
-            Ok(1) => true,
-            Ok(value) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Oracle pooled session health check returned {value}"),
-                );
-                false
-            }
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Oracle pooled session health check failed: {err}"),
-                );
-                false
-            }
-        }
+        crate::db::session_policy::health_check_session(
+            crate::db::session_policy::PhysicalSession::Oracle(conn),
+            log_context,
+        )
     }
 
     fn mysql_pooled_session_health_check(conn: &mut mysql::PooledConn, log_context: &str) -> bool {
-        if conn.as_mut().ping().is_err() {
-            crate::utils::logging::log_error(log_context, "MySQL pooled session ping failed");
-            return false;
-        }
-        match conn.query_first::<u8, _>("SELECT 1") {
-            Ok(Some(1)) => true,
-            Ok(Some(value)) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("MySQL pooled session health check returned {value}"),
-                );
-                false
-            }
-            Ok(None) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    "MySQL pooled session health check returned no rows",
-                );
-                false
-            }
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("MySQL pooled session health check failed: {err}"),
-                );
-                false
-            }
-        }
+        crate::db::session_policy::health_check_session(
+            crate::db::session_policy::PhysicalSession::MySql(conn),
+            log_context,
+        )
     }
 
     fn sync_mysql_pooled_session_info(
