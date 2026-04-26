@@ -2909,7 +2909,8 @@ impl SqlEditorWidget {
         let mysql_interruption_flags = |message: &str| {
             (
                 message == SqlEditorWidget::cancel_message(),
-                message == SqlEditorWidget::timeout_message(query_timeout),
+                SqlEditorWidget::mysql_message_is_recoverable_timeout(message)
+                    || SqlEditorWidget::mysql_message_is_lock_wait_timeout(message),
             )
         };
 
@@ -10427,6 +10428,26 @@ impl SqlEditorWidget {
             || lowered.contains("timed out after")
     }
 
+    fn mysql_message_is_lock_wait_timeout(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        lowered.contains("error 1205") || lowered.contains("lock wait timeout exceeded")
+    }
+
+    fn mysql_message_is_recoverable_timeout(message: &str) -> bool {
+        if Self::mysql_message_is_lock_wait_timeout(message) {
+            return false;
+        }
+
+        let lowered = message.trim().to_ascii_lowercase();
+        Self::timeout_error_message_contains_timeout_signal(message)
+            || lowered.contains("error 3024")
+            || lowered.contains("er_query_timeout")
+            || lowered.contains("max_execution_time")
+            || lowered.contains("max_statement_time")
+            || lowered.contains("max statement time exceeded")
+            || lowered.contains("maximum statement execution time exceeded")
+    }
+
     fn is_timeout_error(err: &OracleError) -> bool {
         Self::timeout_error_message_contains_timeout_signal(&err.to_string())
     }
@@ -10583,7 +10604,8 @@ impl SqlEditorWidget {
     pub(super) fn mysql_error_allows_session_reuse(message: &str) -> bool {
         let trimmed = message.trim();
         if trimmed == Self::cancel_message()
-            || Self::timeout_error_message_contains_timeout_signal(trimmed)
+            || Self::mysql_message_is_recoverable_timeout(trimmed)
+            || Self::mysql_message_is_lock_wait_timeout(trimmed)
         {
             return false;
         }
@@ -10675,19 +10697,19 @@ impl SqlEditorWidget {
     fn mysql_interrupt_kind_for_message(message: &str) -> InterruptKind {
         let trimmed = message.trim();
         let has_connection_error = Self::mysql_error_message_has_connection_error(trimmed);
-        let timed_out = Self::timeout_error_message_contains_timeout_signal(trimmed)
-            || trimmed.to_ascii_lowercase().contains("error 3024")
-            || trimmed
-                .to_ascii_lowercase()
-                .contains("maximum statement execution time exceeded");
-        if has_connection_error && timed_out {
+        let recoverable_timeout = Self::mysql_message_is_recoverable_timeout(trimmed);
+        let lock_wait_timeout = Self::mysql_message_is_lock_wait_timeout(trimmed);
+        if has_connection_error && (recoverable_timeout || lock_wait_timeout) {
             return InterruptKind::NonRecoverableTimeout;
         }
         if has_connection_error {
             return InterruptKind::ConnectionError;
         }
-        if timed_out {
+        if recoverable_timeout {
             return InterruptKind::RecoverableTimeout;
+        }
+        if lock_wait_timeout {
+            return InterruptKind::UnsafeOrUnknown;
         }
         if trimmed == Self::cancel_message()
             || trimmed
@@ -11091,6 +11113,18 @@ impl SqlEditorWidget {
         }
     }
 
+    fn mysql_pooled_action_requires_transaction_decision(
+        was_cancelled: bool,
+        recoverable_timeout: bool,
+        lock_wait_timeout: bool,
+        auto_commit: bool,
+        state_hint: MySqlSessionStateHint,
+    ) -> bool {
+        (was_cancelled || recoverable_timeout || lock_wait_timeout)
+            && !auto_commit
+            && state_hint.requires_retention_when_autocommit_off
+    }
+
     fn mysql_explicit_cancel_can_reuse_session(state_hint: MySqlSessionStateHint) -> bool {
         !state_hint.clears_session_state
             && !state_hint.may_leave_session_bound_state
@@ -11397,10 +11431,18 @@ impl SqlEditorWidget {
             Ok(Err(message)) => Self::mysql_interrupt_kind_for_message(message),
             _ => InterruptKind::None,
         };
+        let lock_wait_timeout = match &result {
+            Ok(Err(message)) => Self::mysql_message_is_lock_wait_timeout(message),
+            _ => false,
+        };
         let recoverable_timeout = matches!(interrupt_kind, InterruptKind::RecoverableTimeout);
-        let requires_transaction_decision = (was_cancelled || recoverable_timeout)
-            && !auto_commit
-            && state_hint.requires_retention_when_autocommit_off;
+        let requires_transaction_decision = Self::mysql_pooled_action_requires_transaction_decision(
+            was_cancelled,
+            recoverable_timeout,
+            lock_wait_timeout,
+            auto_commit,
+            state_hint,
+        );
         let should_retain_session = if requires_transaction_decision {
             Self::sync_mysql_pooled_session_info(
                 shared_connection,
@@ -11418,6 +11460,8 @@ impl SqlEditorWidget {
                     connection_generation,
                     refresh_encoding_after,
                 )
+        } else if lock_wait_timeout {
+            false
         } else if Self::mysql_pooled_action_can_reuse_session(&result) {
             Self::sync_mysql_pooled_session_info(
                 shared_connection,
@@ -11486,6 +11530,11 @@ impl SqlEditorWidget {
     pub(super) fn mysql_error_message(err: &MysqlError, timeout: Option<Duration>) -> String {
         let cancelled = crate::db::query::mysql_executor::MysqlExecutor::is_cancel_error(err);
         let timed_out = crate::db::query::mysql_executor::MysqlExecutor::is_timeout_error(err);
+        let lock_wait_timeout =
+            crate::db::query::mysql_executor::MysqlExecutor::is_lock_wait_timeout_error(err);
+        if timed_out && lock_wait_timeout && !cancelled {
+            return err.to_string();
+        }
         Self::choose_execution_error_message(cancelled, timed_out, timeout, err.to_string())
     }
 
@@ -12729,6 +12778,14 @@ mod query_execution_cleanup_tests {
         let timeout_error: std::thread::Result<Result<(), String>> = Ok(Err(
             SqlEditorWidget::timeout_message(Some(Duration::from_secs(5))),
         ));
+        let mariadb_timeout_error: std::thread::Result<Result<(), String>> = Ok(Err(
+            "ERROR 1969 (70100): Query execution was interrupted (max_statement_time exceeded)"
+                .to_string(),
+        ));
+        let lock_wait_timeout_error: std::thread::Result<Result<(), String>> = Ok(Err(
+            "ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction"
+                .to_string(),
+        ));
 
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &connection_error
@@ -12754,6 +12811,12 @@ mod query_execution_cleanup_tests {
         assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
             &timeout_error
         ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
+            &mariadb_timeout_error
+        ));
+        assert!(!SqlEditorWidget::mysql_pooled_action_can_reuse_session(
+            &lock_wait_timeout_error
+        ));
     }
 
     #[test]
@@ -12770,9 +12833,53 @@ mod query_execution_cleanup_tests {
         );
         assert_eq!(
             SqlEditorWidget::mysql_interrupt_kind_for_message(
+                "ER_QUERY_TIMEOUT: query exceeded max_execution_time"
+            ),
+            InterruptKind::RecoverableTimeout
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_interrupt_kind_for_message(
+                "ERROR 1969 (70100): Query execution was interrupted (max_statement_time exceeded)"
+            ),
+            InterruptKind::RecoverableTimeout
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_interrupt_kind_for_message(
+                "ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction"
+            ),
+            InterruptKind::UnsafeOrUnknown
+        );
+        assert_eq!(
+            SqlEditorWidget::mysql_interrupt_kind_for_message(
                 "Query execution was interrupted; lost connection to MySQL server during query"
             ),
             InterruptKind::ConnectionError
+        );
+    }
+
+    #[test]
+    fn mysql_lock_wait_timeout_requires_decision_only_for_dirty_transaction_candidates() {
+        let dml_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("UPDATE t SET id = 1");
+        assert!(
+            SqlEditorWidget::mysql_pooled_action_requires_transaction_decision(
+                false, false, true, false, dml_hint
+            )
+        );
+        assert!(
+            !SqlEditorWidget::mysql_pooled_action_requires_transaction_decision(
+                false, false, true, true, dml_hint
+            )
+        );
+
+        let select_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("SELECT * FROM t");
+        assert!(
+            !SqlEditorWidget::mysql_pooled_action_requires_transaction_decision(
+                false,
+                false,
+                true,
+                false,
+                select_hint
+            )
         );
     }
 
@@ -12964,6 +13071,11 @@ mod query_execution_cleanup_tests {
             code: 1317,
             message: "Query execution was interrupted".to_string(),
         });
+        let lock_wait_err = MysqlError::MySqlError(MySqlError {
+            state: "HY000".to_string(),
+            code: 1205,
+            message: "Lock wait timeout exceeded; try restarting transaction".to_string(),
+        });
 
         assert_eq!(
             SqlEditorWidget::mysql_error_message(&timeout_err, timeout),
@@ -12972,6 +13084,10 @@ mod query_execution_cleanup_tests {
         assert_eq!(
             SqlEditorWidget::mysql_error_message(&cancel_err, timeout),
             SqlEditorWidget::cancel_message()
+        );
+        assert!(
+            SqlEditorWidget::mysql_error_message(&lock_wait_err, timeout)
+                .contains("Lock wait timeout exceeded")
         );
     }
 }

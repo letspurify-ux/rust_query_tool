@@ -655,15 +655,23 @@ impl MysqlExecutor {
         }
     }
 
+    pub fn is_lock_wait_timeout_error(err: &MysqlError) -> bool {
+        let lowered = err.to_string().to_ascii_lowercase();
+        matches!(err, MysqlError::MySqlError(server_err) if server_err.code == 1205)
+            || lowered.contains("lock wait timeout exceeded")
+    }
+
     /// Check if a MySQL error is a timeout/cancelled error.
     pub fn is_timeout_error(err: &MysqlError) -> bool {
         let lowered = err.to_string().to_ascii_lowercase();
         matches!(err, MysqlError::MySqlError(server_err) if server_err.code == 3024)
+            || lowered.contains("er_query_timeout")
             || lowered.contains("max_execution_time")
+            || lowered.contains("max_statement_time")
             || lowered.contains("max statement time exceeded")
             || lowered.contains("maximum statement execution time exceeded")
             || lowered.contains("query timed out")
-            || lowered.contains("lock wait timeout exceeded")
+            || Self::is_lock_wait_timeout_error(err)
     }
 
     pub fn is_cancel_error(err: &MysqlError) -> bool {
@@ -2209,7 +2217,28 @@ mod tests {
                 .to_string(),
         });
         assert!(MysqlExecutor::is_timeout_error(&timeout_err));
+        assert!(!MysqlExecutor::is_lock_wait_timeout_error(&timeout_err));
         assert!(!MysqlExecutor::is_cancel_error(&timeout_err));
+
+        let mariadb_timeout_err = MysqlError::MySqlError(MySqlError {
+            state: "70100".to_string(),
+            code: 1969,
+            message: "Query execution was interrupted (max_statement_time exceeded)".to_string(),
+        });
+        assert!(MysqlExecutor::is_timeout_error(&mariadb_timeout_err));
+        assert!(!MysqlExecutor::is_lock_wait_timeout_error(
+            &mariadb_timeout_err
+        ));
+        assert!(!MysqlExecutor::is_cancel_error(&mariadb_timeout_err));
+
+        let lock_wait_err = MysqlError::MySqlError(MySqlError {
+            state: "HY000".to_string(),
+            code: 1205,
+            message: "Lock wait timeout exceeded; try restarting transaction".to_string(),
+        });
+        assert!(MysqlExecutor::is_timeout_error(&lock_wait_err));
+        assert!(MysqlExecutor::is_lock_wait_timeout_error(&lock_wait_err));
+        assert!(!MysqlExecutor::is_cancel_error(&lock_wait_err));
 
         let cancel_err = MysqlError::MySqlError(MySqlError {
             state: "70100".to_string(),
