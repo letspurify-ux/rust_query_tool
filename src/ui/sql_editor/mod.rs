@@ -290,6 +290,12 @@ pub enum QueryProgress {
         connection_name: String,
         timed_out: bool,
     },
+    /// Single completion event carrying §27.4 policy metadata (db_type,
+    /// sql_kind, operation_id, connection_generation, cancelled, timed_out,
+    /// recoverable_timeout, has_connection_error, timeout_settings_restored).
+    /// Emitted from `QueryExecutionCleanupGuard::drop` after all session
+    /// reuse / replace decisions have been made.
+    ExecutionFinished(crate::db::session_policy::ExecutionFinishedEvent),
     BatchFinished,
     MetadataRefreshNeeded,
 }
@@ -2165,7 +2171,102 @@ impl SqlEditorWidget {
         );
     }
 
+    /// Capture the cancel-target state at request time so late-arriving
+    /// completion events can be matched against the correct (operation,
+    /// connection generation, lazy fetch) tuple. See session.md §4.
+    pub fn cancel_target_snapshot(&self) -> crate::db::session_policy::CancelTargetSnapshot {
+        use crate::db::session_policy::{
+            CancelTargetSnapshot, ExecutionState, LazyFetchState, SqlKind,
+        };
+
+        let lazy_handle = self
+            .active_lazy_fetch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let (lazy_state, operation_id, lazy_connection_generation) = match lazy_handle.as_ref() {
+            Some(handle) => {
+                let cancel_requested = handle.cancel_requested.load(Ordering::Relaxed);
+                let fetch_in_progress = handle.fetch_in_progress.load(Ordering::Relaxed);
+                let state = if cancel_requested && fetch_in_progress {
+                    LazyFetchState::CancelRequested
+                } else if cancel_requested {
+                    LazyFetchState::CloseRequested
+                } else if fetch_in_progress {
+                    LazyFetchState::Fetching
+                } else {
+                    LazyFetchState::Waiting
+                };
+                (state, handle.operation_id, handle.connection_generation)
+            }
+            None => (LazyFetchState::None, 0, 0),
+        };
+
+        let query_running = load_mutex_bool(&self.query_running);
+        let cancel_already_set = load_mutex_bool(&self.cancel_flag);
+        let execution_state = if cancel_already_set {
+            ExecutionState::CancelRequested
+        } else if query_running && matches!(lazy_state, LazyFetchState::None) {
+            ExecutionState::RunningStatement
+        } else if query_running {
+            ExecutionState::RunningStatement
+        } else if !matches!(lazy_state, LazyFetchState::None) {
+            ExecutionState::LazyFetchOnly
+        } else {
+            ExecutionState::Idle
+        };
+
+        let (db_type, connection_generation) = match self.connection.lock() {
+            Ok(guard) => (guard.db_type(), guard.connection_generation()),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                (guard.db_type(), guard.connection_generation())
+            }
+        };
+
+        let connection_generation = if lazy_connection_generation != 0 {
+            lazy_connection_generation
+        } else {
+            connection_generation
+        };
+
+        let autocommit = SqlEditorWidget::mysql_auto_commit_for_execution(
+            true,
+            &self.mysql_auto_commit_override,
+        );
+
+        CancelTargetSnapshot {
+            tab_id: 0,
+            editor_id: Arc::as_ptr(&self.active_lazy_fetch) as u64,
+            operation_id,
+            connection_generation,
+            db_type,
+            sql_kind: SqlKind::Unknown,
+            execution_state,
+            lazy_state,
+            autocommit,
+        }
+    }
+
     pub fn cancel_current(&self) {
+        // Snapshot the cancel target before flipping any flags so completion
+        // events arriving after this point can be matched against a stable
+        // (operation_id, connection_generation, lazy_state) tuple.
+        let snapshot = self.cancel_target_snapshot();
+        crate::utils::logging::log_info(
+            "sql_editor::cancel",
+            &format!(
+                "cancel snapshot: db_type={:?} exec={:?} lazy={:?} op_id={} conn_gen={} autocommit={}",
+                snapshot.db_type,
+                snapshot.execution_state,
+                snapshot.lazy_state,
+                snapshot.operation_id,
+                snapshot.connection_generation,
+                snapshot.autocommit,
+            ),
+        );
+
         // Set cancel flag immediately so the execution thread can check it
         store_mutex_bool(&self.cancel_flag, true);
         self.cancel_active_lazy_fetch();
