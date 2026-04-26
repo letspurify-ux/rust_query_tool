@@ -1524,6 +1524,27 @@ fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
     !has_running_queries
 }
 
+fn should_accept_lazy_fetch_session_event(
+    event_is_current: bool,
+    active_lazy_fetch_session: Option<u64>,
+    context: Option<&QueryProgressContext>,
+    statement_index: usize,
+) -> bool {
+    if event_is_current {
+        return true;
+    }
+
+    if active_lazy_fetch_session.is_some() {
+        return false;
+    }
+
+    context.is_some_and(|context| {
+        !context.batch_finished
+            && context.active_statement_index == Some(statement_index)
+            && !context.closed_statement_indices.contains(&statement_index)
+    })
+}
+
 fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), String> {
     if has_running_queries {
         Err("A query is running. Wait for completion before editing result rows.".to_string())
@@ -4741,17 +4762,26 @@ impl MainWindow {
                     operation_id,
                     connection_generation,
                 } => {
-                    let event_is_current = s
+                    let (active_lazy_fetch_session, event_is_current) = s
                         .find_tab_index(tab_id)
                         .and_then(|tab_index| s.editor_tabs.get(tab_index))
-                        .is_some_and(|tab| {
-                            tab.sql_editor.lazy_fetch_progress_event_is_current(
-                                session_id,
-                                operation_id,
-                                connection_generation,
+                        .map(|tab| {
+                            (
+                                tab.sql_editor.active_lazy_fetch_session(),
+                                tab.sql_editor.lazy_fetch_progress_event_is_current(
+                                    session_id,
+                                    operation_id,
+                                    connection_generation,
+                                ),
                             )
-                        });
-                    if !event_is_current {
+                        })
+                        .unwrap_or((None, false));
+                    if !should_accept_lazy_fetch_session_event(
+                        event_is_current,
+                        active_lazy_fetch_session,
+                        s.progress_contexts.get(&tab_id),
+                        index,
+                    ) {
                         return;
                     }
                     let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
@@ -7544,6 +7574,45 @@ mod tests {
         assert!(!context.fetch_row_counts.contains_key(&2));
         assert_eq!(context.active_statement_index, None);
         assert_eq!(context.lazy_fetch_sessions.get(&44), Some(&2));
+    }
+
+    #[test]
+    fn lazy_fetch_session_event_accepts_fast_completed_worker_for_active_statement() {
+        let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
+        context.active_statement_index = Some(0);
+
+        assert!(should_accept_lazy_fetch_session_event(
+            false,
+            None,
+            Some(&context),
+            0
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_session_event_rejects_mismatched_active_worker() {
+        let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
+        context.active_statement_index = Some(0);
+
+        assert!(!should_accept_lazy_fetch_session_event(
+            false,
+            Some(99),
+            Some(&context),
+            0
+        ));
+    }
+
+    #[test]
+    fn lazy_fetch_session_event_rejects_inactive_statement_fallback() {
+        let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
+        context.active_statement_index = Some(1);
+
+        assert!(!should_accept_lazy_fetch_session_event(
+            false,
+            None,
+            Some(&context),
+            0
+        ));
     }
 
     #[test]

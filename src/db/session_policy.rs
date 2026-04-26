@@ -188,7 +188,7 @@ pub fn decide_session_after_interrupt(ctx: InterruptDecisionContext) -> SessionD
         return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
     }
 
-    if !ctx.cancelled && !(ctx.timed_out && ctx.recoverable_timeout) {
+    if !(ctx.cancelled || ctx.timed_out && ctx.recoverable_timeout) {
         return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
     }
 

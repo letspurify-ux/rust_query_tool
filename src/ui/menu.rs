@@ -96,6 +96,13 @@ Highlights\n\
 - Explain Plan / EXPLAIN, SQL*Plus-style script execution, and transaction controls\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
 \n\
+Session Policy\n\
+- Each query tab owns its logical session and connection profile\n\
+- Cancel/timeout does not immediately mean Disconnected; the tab stays Connected when possible\n\
+- Physical DB sessions are reused only after cleanup, transaction safety, timeout restore, and health check succeed\n\
+- DML/DDL, PL/SQL, scripts, open transactions, failed cleanup, and unknown errors are handled conservatively with a fresh physical session on the next execution\n\
+- Commit/Rollback targets the tab selected when the command was requested\n\
+\n\
 Runtime\n\
 - Build: {build_profile}\n\
 - Platform: {platform}"

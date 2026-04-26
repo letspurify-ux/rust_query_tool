@@ -10141,17 +10141,14 @@ impl SqlEditorWidget {
     }
 
     fn mysql_statement_acquires_table_lock(sql: &str) -> bool {
-        match QueryExecutor::leading_keyword(sql).as_deref() {
-            Some("LOCK") => true,
-            _ => false,
-        }
+        matches!(QueryExecutor::leading_keyword(sql).as_deref(), Some("LOCK"))
     }
 
     fn mysql_statement_releases_table_lock(sql: &str) -> bool {
-        match QueryExecutor::leading_keyword(sql).as_deref() {
-            Some("UNLOCK") => true,
-            _ => false,
-        }
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("UNLOCK")
+        )
     }
 
     fn mysql_statement_acquires_named_lock(sql: &str) -> bool {

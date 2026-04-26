@@ -2372,8 +2372,6 @@ impl SqlEditorWidget {
             ExecutionState::CancelRequested
         } else if query_running && matches!(current_sql_kind, SqlKind::Script) {
             ExecutionState::RunningScript
-        } else if query_running && matches!(lazy_state, LazyFetchState::None) {
-            ExecutionState::RunningStatement
         } else if query_running {
             ExecutionState::RunningStatement
         } else if !matches!(lazy_state, LazyFetchState::None) {
