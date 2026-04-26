@@ -969,6 +969,7 @@ impl ResultTableWidget {
         display.set_text_font(font_profile.normal);
         display.set_text_size(font_size as i32);
         display.wrap_mode(fltk::text::WrapMode::AtBounds, 0);
+        theme::style_text_display_scrollbars(&display);
 
         let mut buf = TextBuffer::default();
         buf.set_text(value);
@@ -1493,6 +1494,7 @@ impl ResultTableWidget {
         table.set_row_height_all(Self::row_height_for_font(DEFAULT_FONT_SIZE as u32));
         table.set_rows(0);
         table.set_cols(0);
+        theme::style_table_scrollbars(&table);
         // Keep the default super_handle_first=true so Fl_Table's native handler
         // runs first. This lets the native Drag handler manage cell selection
         // (including auto-scroll) while our closure only tracks auxiliary state.

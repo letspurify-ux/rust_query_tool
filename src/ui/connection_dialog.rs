@@ -659,6 +659,7 @@ impl ConnectionDialog {
         let mut saved_browser = HoldBrowser::default();
         saved_browser.set_color(theme::input_bg());
         saved_browser.set_selection_color(theme::selection_strong());
+        theme::style_browser_scrollbars(&saved_browser);
 
         // Load saved connections
         {

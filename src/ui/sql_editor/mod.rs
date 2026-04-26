@@ -983,6 +983,7 @@ impl SqlEditorWidget {
         editor.set_linenumber_bgcolor(theme::panel_bg());
         editor.set_linenumber_font(editor_profile.normal);
         editor.set_linenumber_size((editor_size.saturating_sub(2)) as i32);
+        theme::style_text_editor_scrollbars(&editor);
 
         // Windows 11 selection color
         editor.set_selection_color(theme::selection_soft());

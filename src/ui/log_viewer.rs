@@ -87,6 +87,7 @@ impl LogViewerDialog {
         let mut browser = HoldBrowser::default();
         browser.set_color(theme::input_bg());
         browser.set_selection_color(theme::selection_strong());
+        theme::style_browser_scrollbars(&browser);
 
         list_flex.end();
         content_flex.fixed(&list_flex, 420);
@@ -108,6 +109,7 @@ impl LogViewerDialog {
         detail_display.set_text_font(configured_editor_profile().normal);
         detail_display.set_text_size(configured_ui_font_size());
         detail_display.wrap_mode(fltk::text::WrapMode::AtBounds, 0);
+        theme::style_text_display_scrollbars(&detail_display);
 
         detail_flex.end();
 

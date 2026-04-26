@@ -416,6 +416,7 @@ impl QueryHistoryDialog {
         let mut browser = HoldBrowser::default();
         browser.set_color(theme::input_bg());
         browser.set_selection_color(theme::selection_strong());
+        theme::style_browser_scrollbars(&browser);
 
         list_flex.end();
         content_flex.fixed(&list_flex, 350);
@@ -443,6 +444,7 @@ impl QueryHistoryDialog {
         preview_display.set_linenumber_font(configured_editor_profile().normal);
         preview_display.set_linenumber_size(configured_ui_font_size().saturating_sub(2));
         preview_display.set_highlight_data(preview_style_buffer.clone(), preview_style_table());
+        theme::style_text_display_scrollbars(&preview_display);
         install_history_text_shortcuts(&mut preview_display, preview_buffer.clone());
 
         let mut error_label = fltk::frame::Frame::default().with_label("Error details:");
@@ -456,6 +458,7 @@ impl QueryHistoryDialog {
         error_display.set_text_color(theme::text_primary());
         error_display.set_text_font(configured_editor_profile().normal);
         error_display.set_text_size(configured_ui_font_size());
+        theme::style_text_display_scrollbars(&error_display);
         install_history_text_shortcuts(&mut error_display, error_buffer.clone());
         error_display.hide();
         error_label.hide();

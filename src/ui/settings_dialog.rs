@@ -213,6 +213,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut font_browser = HoldBrowser::default().with_size(0, 260);
     font_browser.set_color(theme::input_bg());
     font_browser.set_selection_color(theme::selection_strong());
+    theme::style_browser_scrollbars(&font_browser);
     font_flex.resizable(&font_browser);
 
     let mut selected_row = Flex::default().with_size(0, CHECKBOX_ROW_HEIGHT);

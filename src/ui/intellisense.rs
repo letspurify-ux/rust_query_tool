@@ -1845,6 +1845,7 @@ impl IntellisensePopup {
         let mut browser = HoldBrowser::default().with_size(320, 200).with_pos(0, 0);
         browser.set_color(theme::panel_alt());
         browser.set_selection_color(theme::selection_strong());
+        theme::style_browser_scrollbars(&browser);
 
         window.end();
 

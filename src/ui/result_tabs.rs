@@ -561,6 +561,7 @@ impl ResultTabsWidget {
         let mut script_buffer = TextBuffer::default();
         script_buffer.set_text("");
         script_display.set_buffer(script_buffer.clone());
+        theme::style_text_display_scrollbars(&script_display);
         script_group.resizable(&script_display);
         script_group.end();
         tabs.end();

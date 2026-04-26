@@ -41,6 +41,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     display.set_text_font(configured_editor_profile().normal);
     display.set_text_size(configured_ui_font_size());
     display.wrap_mode(WrapMode::AtBounds, 0);
+    theme::style_text_display_scrollbars(&display);
 
     let mut buffer = TextBuffer::default();
     buffer.set_text(content);

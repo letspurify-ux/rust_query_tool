@@ -197,6 +197,7 @@ impl ObjectBrowserWidget {
         tree.set_item_label_fgcolor(theme::text_secondary());
         tree.set_connector_color(theme::tree_connector());
         tree.set_select_mode(TreeSelect::Single);
+        theme::style_tree_scrollbars(&mut tree);
 
         // Initialize tree structure
         tree.set_show_root(false);

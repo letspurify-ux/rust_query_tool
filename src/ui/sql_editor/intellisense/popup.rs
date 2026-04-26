@@ -17,6 +17,7 @@ impl SqlEditorWidget {
         display.set_text_color(theme::text_primary());
         display.set_text_font(crate::ui::configured_editor_profile().normal);
         display.set_text_size(crate::ui::configured_ui_font_size());
+        theme::style_text_display_scrollbars(&display);
 
         let mut buffer = fltk::text::TextBuffer::default();
         buffer.set_text(content);

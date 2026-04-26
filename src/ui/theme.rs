@@ -1,4 +1,12 @@
-use fltk::enums::Color;
+use fltk::{
+    browser::HoldBrowser,
+    enums::{Color, FrameType},
+    prelude::*,
+    table::Table,
+    text::{TextDisplay, TextEditor},
+    tree::Tree,
+    valuator::Scrollbar,
+};
 
 // Windows 11-inspired dark palette tuned for FLTK widgets.
 
@@ -104,4 +112,75 @@ pub fn table_border() -> Color {
 
 pub fn tree_connector() -> Color {
     Color::from_rgb(82, 82, 82)
+}
+
+pub fn scrollbar_thumb() -> Color {
+    Color::from_rgb(88, 88, 88)
+}
+
+pub fn scrollbar_track() -> Color {
+    panel_raised()
+}
+
+pub fn style_scrollbar(scrollbar: &mut Scrollbar) {
+    scrollbar.set_color(scrollbar_track());
+    scrollbar.set_selection_color(scrollbar_thumb());
+    scrollbar.set_slider_frame(FrameType::RFlatBox);
+    scrollbar.redraw();
+}
+
+pub fn style_table_scrollbars(table: &Table) {
+    let mut scrollbar = table.scrollbar();
+    style_scrollbar(&mut scrollbar);
+    let mut hscrollbar = table.hscrollbar();
+    style_scrollbar(&mut hscrollbar);
+}
+
+pub fn style_browser_scrollbars(browser: &HoldBrowser) {
+    let mut scrollbar = browser.scrollbar();
+    style_scrollbar(&mut scrollbar);
+    let mut hscrollbar = browser.hscrollbar();
+    style_scrollbar(&mut hscrollbar);
+}
+
+pub fn style_tree_scrollbars(tree: &mut Tree) {
+    let Some(group) = tree.as_group() else {
+        return;
+    };
+
+    for idx in 0..group.children() {
+        let Some(child) = group.child(idx) else {
+            continue;
+        };
+        if tree.is_scrollbar(&child) {
+            unsafe {
+                let mut scrollbar = Scrollbar::from_widget_ptr(child.as_widget_ptr());
+                style_scrollbar(&mut scrollbar);
+            }
+        }
+    }
+}
+
+fn style_group_children_as_scrollbars<W: WidgetExt>(widget: &W) {
+    let Some(group) = widget.as_group() else {
+        return;
+    };
+
+    for idx in 0..group.children() {
+        let Some(child) = group.child(idx) else {
+            continue;
+        };
+        unsafe {
+            let mut scrollbar = Scrollbar::from_widget_ptr(child.as_widget_ptr());
+            style_scrollbar(&mut scrollbar);
+        }
+    }
+}
+
+pub fn style_text_display_scrollbars(display: &TextDisplay) {
+    style_group_children_as_scrollbars(display);
+}
+
+pub fn style_text_editor_scrollbars(editor: &TextEditor) {
+    style_group_children_as_scrollbars(editor);
 }
