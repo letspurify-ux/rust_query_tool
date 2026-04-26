@@ -313,6 +313,7 @@ pub(crate) struct LazyFetchHandle {
     pub sender: mpsc::Sender<LazyFetchCommand>,
     pub cancel_handle: Option<LazyFetchCancelHandle>,
     pub cancel_requested: Arc<AtomicBool>,
+    pub retain_session_on_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -498,6 +499,7 @@ pub struct SqlEditorWidget {
     suppress_buffer_callbacks: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
+    lazy_fetch_batch_size: Arc<Mutex<usize>>,
     display_metrics_ready: Arc<AtomicBool>,
 }
 impl SqlEditorWidget {
@@ -869,6 +871,9 @@ impl SqlEditorWidget {
         let suppress_buffer_callbacks = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
+        let lazy_fetch_batch_size = Arc::new(Mutex::new(
+            editor_config.normalized_lazy_fetch_batch_size() as usize,
+        ));
         let display_metrics_ready = Arc::new(AtomicBool::new(true));
 
         let mut widget = Self {
@@ -908,6 +913,7 @@ impl SqlEditorWidget {
             suppress_buffer_callbacks,
             undo_redo_state,
             preferred_insert_position,
+            lazy_fetch_batch_size,
             display_metrics_ready,
         };
 
@@ -1051,6 +1057,22 @@ impl SqlEditorWidget {
         self.cancel_active_lazy_fetch();
     }
 
+    pub fn set_lazy_fetch_batch_size(&self, size: u32) {
+        let size = AppConfig::clamp_lazy_fetch_batch_size(size) as usize;
+        *self
+            .lazy_fetch_batch_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
+    }
+
+    fn lazy_fetch_batch_size(&self) -> usize {
+        let size = *self
+            .lazy_fetch_batch_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        AppConfig::clamp_lazy_fetch_batch_size(size as u32) as usize
+    }
+
     pub fn request_lazy_fetch(&self, session_id: u64, request: LazyFetchRequest) -> bool {
         let handle = self
             .active_lazy_fetch
@@ -1077,9 +1099,7 @@ impl SqlEditorWidget {
             return false;
         }
         let command = match request {
-            LazyFetchRequest::More => {
-                LazyFetchCommand::FetchMore(execution::PROGRESS_ROWS_INITIAL_BATCH)
-            }
+            LazyFetchRequest::More => LazyFetchCommand::FetchMore(self.lazy_fetch_batch_size()),
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
             LazyFetchRequest::Cancel => LazyFetchCommand::Cancel,
         };
@@ -1101,7 +1121,7 @@ impl SqlEditorWidget {
     }
 
     fn cancel_active_lazy_fetch(&self) -> bool {
-        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session)
+        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session, true)
     }
 
     fn cancel_lazy_fetch_session(&self, session_id: u64) -> bool {
@@ -1109,20 +1129,28 @@ impl SqlEditorWidget {
             &self.active_lazy_fetch,
             &self.pooled_db_session,
             Some(session_id),
+            true,
         )
     }
 
     fn cancel_lazy_fetch_handle(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         pooled_db_session: &SharedDbSessionLease,
+        retain_session_on_cancel: bool,
     ) -> bool {
-        Self::cancel_lazy_fetch_handle_for_session(active_lazy_fetch, pooled_db_session, None)
+        Self::cancel_lazy_fetch_handle_for_session(
+            active_lazy_fetch,
+            pooled_db_session,
+            None,
+            retain_session_on_cancel,
+        )
     }
 
     fn cancel_lazy_fetch_handle_for_session(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         pooled_db_session: &SharedDbSessionLease,
         expected_session_id: Option<u64>,
+        retain_session_on_cancel: bool,
     ) -> bool {
         let cancel_request = active_lazy_fetch
             .lock()
@@ -1132,13 +1160,20 @@ impl SqlEditorWidget {
                 if expected_session_id.is_some_and(|session_id| handle.session_id != session_id) {
                     return None;
                 }
+                if retain_session_on_cancel {
+                    handle
+                        .retain_session_on_cancel
+                        .store(true, Ordering::Relaxed);
+                }
                 let first_cancel_request = !handle.cancel_requested.swap(true, Ordering::Relaxed);
                 Some((handle.clone(), first_cancel_request))
             });
         let Some((handle, first_cancel_request)) = cancel_request else {
             return false;
         };
-        pooled_db_session.clear();
+        if !retain_session_on_cancel {
+            pooled_db_session.clear();
+        }
         if first_cancel_request {
             if let Some(cancel_handle) = handle.cancel_handle {
                 cancel_handle.cancel();

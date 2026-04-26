@@ -533,12 +533,34 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    fn has_running_query_or_lazy_fetch_for_tab(&self, tab_id: QueryTabId) -> bool {
+        let editor_has_work = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| {
+                tab.sql_editor.is_query_running()
+                    || tab.sql_editor.active_lazy_fetch_session().is_some()
+            })
+            .unwrap_or(false);
+        let progress_has_lazy_fetch = self
+            .progress_contexts
+            .get(&tab_id)
+            .map(|context| !context.lazy_fetch_sessions.is_empty())
+            .unwrap_or(false);
+        editor_has_work || progress_has_lazy_fetch
+    }
+
     fn should_show_progress_status_for_tab(&self, tab_id: QueryTabId) -> bool {
         self.is_query_running_for_tab(tab_id) || !self.is_any_query_running()
     }
 
     fn has_active_lazy_fetches(&self) -> bool {
         !self.lazy_fetch_sessions_for_abort().is_empty()
+    }
+
+    fn has_running_query_or_lazy_fetch(&self) -> bool {
+        self.is_any_query_running() || self.has_active_lazy_fetches()
     }
 
     fn mark_lazy_fetch_result_tab_closed(&mut self, session_id: u64) {
@@ -2408,7 +2430,29 @@ impl MainWindow {
                     tab_label
                 ),
                 "Keep Open",
-                "Cancel Query and Close",
+                "Cancel and Close",
+                "",
+            ),
+            Some(1)
+        )
+    }
+
+    fn confirm_cancel_running_query_for_exit(state: &Arc<Mutex<AppState>>) -> bool {
+        let has_running_work = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.has_running_query_or_lazy_fetch()
+        };
+        if !has_running_work {
+            return true;
+        }
+
+        matches!(
+            fltk::dialog::choice2_default(
+                "A query is running or a lazy fetch is open.\nCancel it and exit?",
+                "Keep Open",
+                "Cancel and Exit",
                 "",
             ),
             Some(1)
@@ -2473,6 +2517,20 @@ impl MainWindow {
             .tab_ids();
         for tab_id in tab_ids {
             if !Self::confirm_save_if_dirty(state, tab_id, "exiting") {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn resolve_pooled_sessions_before_exit(state: &Arc<Mutex<AppState>>) -> bool {
+        let tab_ids = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .query_tabs
+            .tab_ids();
+        for tab_id in tab_ids {
+            if !Self::resolve_pooled_session_before_close(state, tab_id) {
                 return false;
             }
         }
@@ -3253,6 +3311,7 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::adjust_query_layout(&mut state_borrow);
             Self::apply_font_settings(&mut state_borrow);
+            Self::apply_lazy_fetch_settings(&mut state_borrow);
         }
 
         let weak_state_for_history_btn = Arc::downgrade(&state);
@@ -3575,6 +3634,21 @@ impl MainWindow {
         app::awake();
     }
 
+    fn apply_lazy_fetch_settings(state: &mut AppState) {
+        let lazy_fetch_batch_size = state
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_lazy_fetch_batch_size();
+        for tab in &state.editor_tabs {
+            tab.sql_editor
+                .set_lazy_fetch_batch_size(lazy_fetch_batch_size);
+        }
+        state
+            .sql_editor
+            .set_lazy_fetch_batch_size(lazy_fetch_batch_size);
+    }
+
     fn apply_runtime_ui_font(state: &mut AppState, font: fltk::enums::Font, ui_size: i32) {
         fn apply_widget_font_recursive(widget: &mut Widget, font: fltk::enums::Font, size: i32) {
             widget.set_label_font(font);
@@ -3773,21 +3847,55 @@ impl MainWindow {
     }
 
     fn close_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
-        let had_running_session = {
-            let s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(index) = s.find_tab_index(tab_id) else {
-                return false;
+        Self::close_query_editor_tab_with_dirty_check(state, tab_id, true)
+    }
+
+    fn defer_close_query_editor_tab_until_idle(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
+        let state_for_retry = Arc::clone(state);
+        app::add_timeout3(0.2, move |_| {
+            let should_wait = {
+                let s = state_for_retry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                s.find_tab_index(tab_id).is_some()
+                    && s.has_running_query_or_lazy_fetch_for_tab(tab_id)
             };
-            let editor = &s.editor_tabs[index].sql_editor;
-            editor.is_query_running() || editor.active_lazy_fetch_session().is_some()
-        };
-        if had_running_session && !Self::confirm_cancel_running_query_for_close(state, tab_id) {
+            if should_wait {
+                MainWindow::defer_close_query_editor_tab_until_idle(&state_for_retry, tab_id);
+                return;
+            }
+            MainWindow::close_query_editor_tab_with_dirty_check(&state_for_retry, tab_id, false);
+        });
+    }
+
+    fn close_query_editor_tab_with_dirty_check(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+        check_dirty: bool,
+    ) -> bool {
+        if check_dirty && !Self::confirm_save_if_dirty(state, tab_id, "closing this tab") {
             return false;
         }
 
-        if !Self::confirm_save_if_dirty(state, tab_id, "closing this tab") {
+        let has_running_work = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if s.find_tab_index(tab_id).is_none() {
+                return false;
+            }
+            s.has_running_query_or_lazy_fetch_for_tab(tab_id)
+        };
+        if has_running_work && !Self::confirm_cancel_running_query_for_close(state, tab_id) {
+            return false;
+        }
+        if has_running_work {
+            Self::cancel_query_editor_tab(state, tab_id);
+            Self::defer_close_query_editor_tab_until_idle(state, tab_id);
+            return false;
+        }
+
+        if !Self::resolve_pooled_session_before_close(state, tab_id) {
             return false;
         }
 
@@ -3795,15 +3903,14 @@ impl MainWindow {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(index) = s.find_tab_index(tab_id) else {
+            if s.find_tab_index(tab_id).is_none() {
                 return false;
-            };
-            let editor = &s.editor_tabs[index].sql_editor;
-            editor.is_query_running() || editor.active_lazy_fetch_session().is_some()
+            }
+            s.has_running_query_or_lazy_fetch_for_tab(tab_id)
         };
         if has_running_session {
             Self::cancel_query_editor_tab(state, tab_id);
-        } else if !Self::resolve_pooled_session_before_close(state, tab_id) {
+            Self::defer_close_query_editor_tab_until_idle(state, tab_id);
             return false;
         }
 
@@ -5741,12 +5848,14 @@ impl MainWindow {
                             config.result_font = settings.font;
                             config.result_font_size = settings.result_size;
                             config.result_cell_max_chars = settings.result_cell_max_chars;
+                            config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
                             config.connection_pool_size = settings.connection_pool_size;
                             config.save()
                         };
                         if pool_size_changed {
                             s.release_all_pooled_db_sessions();
                         }
+                        MainWindow::apply_lazy_fetch_settings(&mut s);
                         MainWindow::apply_font_settings(&mut s);
                         save_result.map_err(|err| err.to_string())
                     });
@@ -6653,6 +6762,83 @@ impl MainWindow {
         }
     }
 
+    fn continue_application_exit(state: Arc<Mutex<AppState>>, window: Window, check_dirty: bool) {
+        if check_dirty && !Self::confirm_save_for_all_dirty_tabs(&state) {
+            return;
+        }
+
+        let has_running_work = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.has_running_query_or_lazy_fetch()
+        };
+        if has_running_work {
+            if !Self::confirm_cancel_running_query_for_exit(&state) {
+                return;
+            }
+            Self::cancel_all_running_queries(&state);
+            Self::defer_application_exit_until_idle(state, window);
+            return;
+        }
+
+        if !Self::resolve_pooled_sessions_before_exit(&state) {
+            return;
+        }
+
+        Self::finish_application_exit(&state, window);
+    }
+
+    fn defer_application_exit_until_idle(state: Arc<Mutex<AppState>>, window: Window) {
+        app::add_timeout3(0.2, move |_| {
+            let should_wait = {
+                let s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                s.has_running_query_or_lazy_fetch()
+            };
+            if should_wait {
+                Self::defer_application_exit_until_idle(state.clone(), window.clone());
+                return;
+            }
+            Self::continue_application_exit(state.clone(), window.clone(), false);
+        });
+    }
+
+    fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
+        crate::db::clear_tracked_db_activity();
+        let (popups, editor_tabs, mut result_tabs) = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                s.popups.clone(),
+                s.editor_tabs.clone(),
+                s.result_tabs.clone(),
+            )
+        };
+        let mut popups = popups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for mut popup in popups.drain(..) {
+            if popup.was_deleted() {
+                continue;
+            }
+            popup.hide();
+            Window::delete(popup);
+        }
+        for mut tab in editor_tabs {
+            tab.sql_editor.cleanup_for_close();
+        }
+        result_tabs.clear();
+        crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
+        if let Err(err) = crate::utils::logging::flush_log_writer() {
+            eprintln!("Application log flush on exit failed: {err}");
+        }
+        window.hide();
+        app::quit();
+    }
+
     pub fn show(&mut self) {
         let state = self.state.clone();
         let mut window = {
@@ -6664,42 +6850,15 @@ impl MainWindow {
         let weak_state_for_close = Arc::downgrade(&state);
         window.set_callback(move |w| {
             if let Some(state) = weak_state_for_close.upgrade() {
-                if !MainWindow::confirm_save_for_all_dirty_tabs(&state) {
-                    return;
+                MainWindow::continue_application_exit(state, w.clone(), true);
+            } else {
+                crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
+                if let Err(err) = crate::utils::logging::flush_log_writer() {
+                    eprintln!("Application log flush on exit failed: {err}");
                 }
-                crate::db::clear_tracked_db_activity();
-                let (popups, editor_tabs, mut result_tabs) = {
-                    let s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    (
-                        s.popups.clone(),
-                        s.editor_tabs.clone(),
-                        s.result_tabs.clone(),
-                    )
-                };
-                let mut popups = popups
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for mut popup in popups.drain(..) {
-                    if popup.was_deleted() {
-                        continue;
-                    }
-                    popup.hide();
-                    Window::delete(popup);
-                }
-                for mut tab in editor_tabs {
-                    tab.sql_editor.cleanup_for_close();
-                }
-                // Clean up result tabs to release FLTK widget callbacks and data buffers
-                result_tabs.clear();
+                w.hide();
+                app::quit();
             }
-            crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
-            if let Err(err) = crate::utils::logging::flush_log_writer() {
-                eprintln!("Application log flush on exit failed: {err}");
-            }
-            w.hide();
-            app::quit();
         });
         window.show();
         app::flush();

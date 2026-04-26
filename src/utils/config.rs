@@ -18,6 +18,9 @@ const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
+pub const DEFAULT_LAZY_FETCH_BATCH_SIZE: u32 = 100;
+pub const MIN_LAZY_FETCH_BATCH_SIZE: u32 = 1;
+pub const MAX_LAZY_FETCH_BATCH_SIZE: u32 = 10_000;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -31,6 +34,7 @@ pub struct AppConfig {
     pub result_font: String,
     pub result_font_size: u32,
     pub result_cell_max_chars: u32,
+    pub lazy_fetch_batch_size: u32,
     pub max_rows: u32,
     pub auto_commit: bool,
     pub connection_pool_size: u32,
@@ -64,6 +68,7 @@ impl AppConfig {
             result_font: "맑은 고딕".to_string(),
             result_font_size: 16,
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
+            lazy_fetch_batch_size: DEFAULT_LAZY_FETCH_BATCH_SIZE,
             max_rows: 1000,
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
@@ -76,6 +81,14 @@ impl AppConfig {
 
     pub fn normalized_connection_pool_size(&self) -> u32 {
         Self::clamp_connection_pool_size(self.connection_pool_size)
+    }
+
+    pub fn clamp_lazy_fetch_batch_size(size: u32) -> u32 {
+        size.clamp(MIN_LAZY_FETCH_BATCH_SIZE, MAX_LAZY_FETCH_BATCH_SIZE)
+    }
+
+    pub fn normalized_lazy_fetch_batch_size(&self) -> u32 {
+        Self::clamp_lazy_fetch_batch_size(self.lazy_fetch_batch_size)
     }
 
     pub fn config_path() -> Option<PathBuf> {
@@ -402,10 +415,25 @@ mod tests {
     }
 
     #[test]
+    fn app_config_defaults_lazy_fetch_batch_size_to_one_hundred() {
+        assert_eq!(
+            AppConfig::new().lazy_fetch_batch_size,
+            super::DEFAULT_LAZY_FETCH_BATCH_SIZE
+        );
+    }
+
+    #[test]
     fn app_config_clamps_connection_pool_size_to_supported_range() {
         assert_eq!(AppConfig::clamp_connection_pool_size(0), 1);
         assert_eq!(AppConfig::clamp_connection_pool_size(4), 4);
         assert_eq!(AppConfig::clamp_connection_pool_size(99), 16);
+    }
+
+    #[test]
+    fn app_config_clamps_lazy_fetch_batch_size_to_supported_range() {
+        assert_eq!(AppConfig::clamp_lazy_fetch_batch_size(0), 1);
+        assert_eq!(AppConfig::clamp_lazy_fetch_batch_size(100), 100);
+        assert_eq!(AppConfig::clamp_lazy_fetch_batch_size(50_000), 10_000);
     }
 
     #[test]
@@ -429,6 +457,10 @@ mod tests {
         assert_eq!(
             restored.connection_pool_size,
             super::DEFAULT_CONNECTION_POOL_SIZE
+        );
+        assert_eq!(
+            restored.lazy_fetch_batch_size,
+            super::DEFAULT_LAZY_FETCH_BATCH_SIZE
         );
     }
 
@@ -528,6 +560,7 @@ mod tests {
     fn app_config_serializes_connection_pool_size_without_passwords() {
         let mut config = AppConfig::new();
         config.connection_pool_size = 8;
+        config.lazy_fetch_batch_size = 500;
         config.recent_connections.push(ConnectionInfo {
             name: "prod".to_string(),
             host: "localhost".to_string(),
@@ -542,6 +575,7 @@ mod tests {
         let serialized = serde_json::to_string(&config).expect("config should serialize");
 
         assert!(serialized.contains("\"connection_pool_size\":8"));
+        assert!(serialized.contains("\"lazy_fetch_batch_size\":500"));
         assert!(!serialized.contains("secret"));
     }
 }

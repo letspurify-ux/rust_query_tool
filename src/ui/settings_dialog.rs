@@ -17,7 +17,10 @@ fn fold_for_case_insensitive(value: &str) -> String {
 
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
-use crate::utils::{AppConfig, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE};
+use crate::utils::{
+    AppConfig, MAX_CONNECTION_POOL_SIZE, MAX_LAZY_FETCH_BATCH_SIZE, MIN_CONNECTION_POOL_SIZE,
+    MIN_LAZY_FETCH_BATCH_SIZE,
+};
 
 pub struct FontSettings {
     pub font: String,
@@ -25,6 +28,7 @@ pub struct FontSettings {
     pub editor_size: u32,
     pub result_size: u32,
     pub result_cell_max_chars: u32,
+    pub lazy_fetch_batch_size: u32,
     pub connection_pool_size: u32,
 }
 
@@ -63,6 +67,21 @@ fn validate_result_cell_max_chars(value: &str) -> Option<u32> {
             fltk::dialog::alert_default(&format!(
                 "Cell preview max length must be a number between {} and {}.",
                 RESULT_CELL_MAX_DISPLAY_CHARS_MIN, RESULT_CELL_MAX_DISPLAY_CHARS_MAX
+            ));
+            None
+        }
+    }
+}
+
+fn validate_lazy_fetch_batch_size(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(size) if (MIN_LAZY_FETCH_BATCH_SIZE..=MAX_LAZY_FETCH_BATCH_SIZE).contains(&size) => {
+            Some(size)
+        }
+        _ => {
+            fltk::dialog::alert_default(&format!(
+                "Lazy fetch size must be a number between {} and {}.",
+                MIN_LAZY_FETCH_BATCH_SIZE, MAX_LAZY_FETCH_BATCH_SIZE
             ));
             None
         }
@@ -291,12 +310,34 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_cell_max_row.end();
     result_flex.fixed(&result_cell_max_row, INPUT_ROW_HEIGHT);
 
+    let mut lazy_fetch_batch_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    lazy_fetch_batch_row.set_type(FlexType::Row);
+    lazy_fetch_batch_row.set_spacing(DIALOG_SPACING);
+    let mut lazy_fetch_batch_label = Frame::default().with_label("Lazy Fetch:");
+    lazy_fetch_batch_label.set_label_color(theme::text_primary());
+    lazy_fetch_batch_row.fixed(&lazy_fetch_batch_label, FORM_LABEL_WIDTH);
+    let mut lazy_fetch_batch_input = IntInput::default();
+    lazy_fetch_batch_input.set_value(&config.normalized_lazy_fetch_batch_size().to_string());
+    lazy_fetch_batch_input.set_color(theme::input_bg());
+    lazy_fetch_batch_input.set_text_color(theme::text_primary());
+    lazy_fetch_batch_row.fixed(&lazy_fetch_batch_input, NUMERIC_INPUT_WIDTH);
+    let _lazy_fetch_batch_spacer = Frame::default();
+    lazy_fetch_batch_row.end();
+    result_flex.fixed(&lazy_fetch_batch_row, INPUT_ROW_HEIGHT);
+
     let mut preview_hint = Frame::default().with_label(&format!(
         "Cell preview max: {} ~ {} chars",
         RESULT_CELL_MAX_DISPLAY_CHARS_MIN, RESULT_CELL_MAX_DISPLAY_CHARS_MAX
     ));
     preview_hint.set_label_color(theme::text_secondary());
     result_flex.fixed(&preview_hint, LABEL_ROW_HEIGHT);
+
+    let mut lazy_fetch_hint = Frame::default().with_label(&format!(
+        "Lazy fetch size: {} ~ {} rows",
+        MIN_LAZY_FETCH_BATCH_SIZE, MAX_LAZY_FETCH_BATCH_SIZE
+    ));
+    lazy_fetch_hint.set_label_color(theme::text_secondary());
+    result_flex.fixed(&lazy_fetch_hint, LABEL_ROW_HEIGHT);
 
     let filler = Frame::default();
     result_flex.resizable(&filler);
@@ -441,6 +482,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let result_size_input_ok = result_size_input.clone();
     let global_size_input_ok = global_size_input.clone();
     let result_cell_max_input_ok = result_cell_max_input.clone();
+    let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
     let pool_size_input_ok = pool_size_input.clone();
     let selected_font_ok = selected_font.clone();
     ok_btn.set_callback(move |_| {
@@ -458,6 +500,11 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
         };
         let result_cell_max_chars =
             match validate_result_cell_max_chars(&result_cell_max_input_ok.value()) {
+                Some(size) => size,
+                None => return,
+            };
+        let lazy_fetch_batch_size =
+            match validate_lazy_fetch_batch_size(&lazy_fetch_batch_input_ok.value()) {
                 Some(size) => size,
                 None => return,
             };
@@ -483,6 +530,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             editor_size,
             result_size,
             result_cell_max_chars,
+            lazy_fetch_batch_size,
             connection_pool_size,
         });
         dialog_handle.hide();
