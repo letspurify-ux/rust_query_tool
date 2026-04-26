@@ -33,7 +33,7 @@ use crate::ui::syntax_highlight::{
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
-use crate::ui::ResultTabRequest;
+use crate::ui::{QueryTabId, ResultTabRequest};
 use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
 
@@ -513,6 +513,8 @@ pub struct SqlEditorWidget {
     pooled_db_session: SharedDbSessionLease,
     active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: Arc<AtomicU64>,
+    owner_tab_id: Arc<AtomicU64>,
+    editor_id: u64,
     current_operation_id: Arc<AtomicU64>,
     current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
     current_operation_autocommit: Arc<Mutex<bool>>,
@@ -540,9 +542,18 @@ pub struct SqlEditorWidget {
     display_metrics_ready: Arc<AtomicBool>,
 }
 impl SqlEditorWidget {
+    fn shared_editor_instance_counter() -> Arc<AtomicU64> {
+        static COUNTER: OnceLock<Arc<AtomicU64>> = OnceLock::new();
+        Arc::clone(COUNTER.get_or_init(|| Arc::new(AtomicU64::new(1))))
+    }
+
     fn shared_lazy_fetch_session_counter() -> Arc<AtomicU64> {
         static COUNTER: OnceLock<Arc<AtomicU64>> = OnceLock::new();
         Arc::clone(COUNTER.get_or_init(|| Arc::new(AtomicU64::new(1))))
+    }
+
+    pub(crate) fn set_owner_tab_id(&self, tab_id: QueryTabId) {
+        self.owner_tab_id.store(tab_id, Ordering::Relaxed);
     }
 
     fn next_operation_id(&self) -> u64 {
@@ -589,6 +600,12 @@ impl SqlEditorWidget {
         *autocommit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
+
+    fn update_current_operation_autocommit(autocommit: &Arc<Mutex<bool>>, enabled: bool) {
+        *autocommit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
     }
 
     fn is_main_window_visible() -> bool {
@@ -933,6 +950,8 @@ impl SqlEditorWidget {
         let pooled_db_session = SharedDbSessionLease::new();
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Self::shared_lazy_fetch_session_counter();
+        let owner_tab_id = Arc::new(AtomicU64::new(0));
+        let editor_id = Self::shared_editor_instance_counter().fetch_add(1, Ordering::Relaxed);
         let current_operation_id = Arc::new(AtomicU64::new(0));
         let current_operation_sql_kind =
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown));
@@ -980,6 +999,8 @@ impl SqlEditorWidget {
             pooled_db_session,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
+            owner_tab_id,
+            editor_id,
             current_operation_id,
             current_operation_sql_kind,
             current_operation_autocommit,
@@ -2311,8 +2332,8 @@ impl SqlEditorWidget {
         };
 
         CancelTargetSnapshot {
-            tab_id: 0,
-            editor_id: Arc::as_ptr(&self.active_lazy_fetch) as u64,
+            tab_id: self.owner_tab_id.load(Ordering::Relaxed),
+            editor_id: self.editor_id,
             operation_id,
             connection_generation,
             db_type,

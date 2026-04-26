@@ -103,6 +103,7 @@ struct QueryExecutionCleanupGuard {
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
+    owner_tab_id: Arc<AtomicU64>,
     current_operation_id: Arc<AtomicU64>,
     current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
     current_operation_autocommit: Arc<Mutex<bool>>,
@@ -124,6 +125,7 @@ impl QueryExecutionCleanupGuard {
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
+        owner_tab_id: Arc<AtomicU64>,
         current_operation_id: Arc<AtomicU64>,
         current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
         current_operation_autocommit: Arc<Mutex<bool>>,
@@ -134,6 +136,7 @@ impl QueryExecutionCleanupGuard {
             current_mysql_cancel_context,
             cancel_flag,
             query_running,
+            owner_tab_id,
             current_operation_id,
             current_operation_sql_kind,
             current_operation_autocommit,
@@ -158,6 +161,7 @@ impl QueryExecutionCleanupGuard {
         operation_id: u64,
         connection_generation: u64,
     ) {
+        self.execution_metadata.tab_id = self.owner_tab_id.load(Ordering::Relaxed);
         self.execution_metadata.db_type = db_type;
         self.execution_metadata.sql_kind = sql_kind;
         self.execution_metadata.operation_id = operation_id;
@@ -2977,6 +2981,7 @@ impl SqlEditorWidget {
         initial_auto_commit: bool,
         db_activity: &str,
         mut execution_metadata: Option<&mut crate::db::session_policy::ExecutionFinishedEvent>,
+        current_operation_autocommit: Option<&Arc<Mutex<bool>>>,
     ) {
         let items =
             Self::build_mysql_batch_items(sql_text, initial_mysql_delimiter_override.as_deref());
@@ -3371,6 +3376,12 @@ impl SqlEditorWidget {
                             };
                             store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
                             auto_commit = enabled;
+                            if let Some(operation_autocommit) = current_operation_autocommit {
+                                SqlEditorWidget::update_current_operation_autocommit(
+                                    operation_autocommit,
+                                    enabled,
+                                );
+                            }
                             match SqlEditorWidget::apply_mysql_autocommit_to_reusable_pooled_session(
                                 shared_connection,
                                 pooled_db_session,
@@ -4288,6 +4299,7 @@ impl SqlEditorWidget {
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let pooled_db_session = self.pooled_db_session.clone();
+        let owner_tab_id = self.owner_tab_id.clone();
         let current_operation_id = self.current_operation_id.clone();
         let current_operation_sql_kind = self.current_operation_sql_kind.clone();
         let current_operation_autocommit = self.current_operation_autocommit.clone();
@@ -4323,6 +4335,7 @@ impl SqlEditorWidget {
                     current_mysql_cancel_context.clone(),
                     cancel_flag.clone(),
                     query_running.clone(),
+                    owner_tab_id.clone(),
                     current_operation_id.clone(),
                     current_operation_sql_kind.clone(),
                     current_operation_autocommit.clone(),
@@ -4401,6 +4414,7 @@ impl SqlEditorWidget {
                             auto_commit,
                             &db_activity,
                             Some(cleanup.execution_metadata_mut()),
+                            Some(&current_operation_autocommit),
                         );
                         return;
                     }
@@ -5863,6 +5877,10 @@ impl SqlEditorWidget {
                                         conn_guard.set_auto_commit(enabled);
                                     }
                                     auto_commit = enabled;
+                                    SqlEditorWidget::update_current_operation_autocommit(
+                                        &current_operation_autocommit,
+                                        enabled,
+                                    );
                                     SqlEditorWidget::emit_script_message(
                                         &sender,
                                         &session,
@@ -11858,12 +11876,31 @@ mod query_execution_cleanup_tests {
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
     ) -> QueryExecutionCleanupGuard {
+        new_test_cleanup_guard_with_owner(
+            sender,
+            current_query_connection,
+            current_mysql_cancel_context,
+            cancel_flag,
+            query_running,
+            0,
+        )
+    }
+
+    fn new_test_cleanup_guard_with_owner(
+        sender: mpsc::Sender<QueryProgress>,
+        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        cancel_flag: Arc<Mutex<bool>>,
+        query_running: Arc<Mutex<bool>>,
+        owner_tab_id: u64,
+    ) -> QueryExecutionCleanupGuard {
         QueryExecutionCleanupGuard::new(
             sender,
             current_query_connection,
             current_mysql_cancel_context,
             cancel_flag,
             query_running,
+            Arc::new(AtomicU64::new(owner_tab_id)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown)),
             Arc::new(Mutex::new(true)),
@@ -11964,6 +12001,36 @@ mod query_execution_cleanup_tests {
             .lock()
             .expect("MySQL cancel context mutex should not be poisoned")
             .is_none());
+    }
+
+    #[test]
+    fn cleanup_guard_execution_finished_carries_owner_tab_id() {
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut guard = new_test_cleanup_guard_with_owner(
+                sender,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(false)),
+                Arc::new(Mutex::new(true)),
+                77,
+            );
+            guard.track_execution_metadata(
+                crate::db::DatabaseType::Oracle,
+                crate::db::session_policy::SqlKind::SelectLike,
+                11,
+                13,
+            );
+        }
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|msg| matches!(
+            msg,
+            QueryProgress::ExecutionFinished(event)
+                if event.tab_id == 77
+                    && event.operation_id == 11
+                    && event.connection_generation == 13
+        )));
     }
 
     #[test]
@@ -13937,6 +14004,7 @@ mod mysql_batch_execution_regression_tests {
                 self.initial_auto_commit,
                 db_activity,
                 None,
+                None,
             );
             drop(sender);
 
@@ -13986,6 +14054,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             initial_auto_commit,
             db_activity,
+            None,
             None,
         );
         drop(sender);
@@ -14150,6 +14219,7 @@ mod mysql_batch_execution_regression_tests {
             true,
             db_activity,
             None,
+            None,
         );
         drop(sender);
 
@@ -14261,6 +14331,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
             db_activity,
+            None,
             None,
         );
         drop(sender);
@@ -14406,6 +14477,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
             "mysql transaction mode integration",
+            None,
             None,
         );
         drop(sender);
@@ -14858,6 +14930,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             lazy_fetch_batch,
             true,
             "mysql lazy fetch integration",
+            None,
             None,
         );
         drop(sender);

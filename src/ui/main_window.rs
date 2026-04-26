@@ -3073,6 +3073,7 @@ impl MainWindow {
         let first_tab_group = first_tab_group.unwrap_or_else(|| query_top_group.clone());
         first_tab_group.begin();
         let first_editor = SqlEditorWidget::new(connection.clone(), timeout_input.clone());
+        first_editor.set_owner_tab_id(first_tab_id);
         let mut first_editor_group = first_editor.get_group().clone();
         first_editor_group.resize(
             first_tab_group.x(),
@@ -3863,6 +3864,7 @@ impl MainWindow {
         group.begin();
         let mut editor =
             SqlEditorWidget::new(state.connection.clone(), state.query_timeout_input.clone());
+        editor.set_owner_tab_id(tab_id);
         let mut editor_group = editor.get_group().clone();
         editor_group.resize(group.x(), group.y(), group.w(), group.h());
         editor_group.layout();
