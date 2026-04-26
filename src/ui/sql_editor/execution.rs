@@ -111,6 +111,7 @@ struct QueryExecutionCleanupGuard {
     oracle_pooled_session_requires_health_check: bool,
     oracle_pooled_session_transaction_decision_on_cancel: bool,
     oracle_pooled_session_transaction_decision_required: bool,
+    execution_metadata: crate::db::session_policy::ExecutionFinishedEvent,
 }
 
 impl QueryExecutionCleanupGuard {
@@ -135,7 +136,38 @@ impl QueryExecutionCleanupGuard {
             oracle_pooled_session_requires_health_check: false,
             oracle_pooled_session_transaction_decision_on_cancel: false,
             oracle_pooled_session_transaction_decision_required: false,
+            execution_metadata:
+                crate::db::session_policy::ExecutionFinishedEvent::new(
+                    crate::db::DatabaseType::Oracle,
+                ),
         }
+    }
+
+    fn track_execution_metadata(
+        &mut self,
+        db_type: crate::db::DatabaseType,
+        sql_kind: crate::db::session_policy::SqlKind,
+        operation_id: u64,
+        connection_generation: u64,
+    ) {
+        self.execution_metadata.db_type = db_type;
+        self.execution_metadata.sql_kind = sql_kind;
+        self.execution_metadata.operation_id = operation_id;
+        self.execution_metadata.connection_generation = connection_generation;
+    }
+
+    #[allow(dead_code)]
+    fn note_execution_outcome(
+        &mut self,
+        cancelled: bool,
+        timed_out: bool,
+        recoverable_timeout: bool,
+        has_connection_error: bool,
+    ) {
+        self.execution_metadata.cancelled = cancelled;
+        self.execution_metadata.timed_out = timed_out;
+        self.execution_metadata.recoverable_timeout = recoverable_timeout;
+        self.execution_metadata.has_connection_error = has_connection_error;
     }
 
     fn track_timeout(&mut self, connection: Arc<Connection>, previous_timeout: Option<Duration>) {
@@ -243,6 +275,16 @@ impl Drop for QueryExecutionCleanupGuard {
                 }
             }
         }
+
+        // session.md §27.4: emit a single named completion event capturing
+        // the policy-relevant execution metadata once timeout restore and
+        // session-reuse decisions have been finalised.
+        self.execution_metadata.cancelled =
+            self.execution_metadata.cancelled || cancel_requested;
+        self.execution_metadata.timeout_settings_restored = !oracle_timeout_reset_failed;
+        let _ = self.sender.send(QueryProgress::ExecutionFinished(
+            self.execution_metadata.clone(),
+        ));
 
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
         SqlEditorWidget::set_current_mysql_cancel_context(&self.current_mysql_cancel_context, None);
@@ -4173,6 +4215,21 @@ impl SqlEditorWidget {
                 );
                 let selected_transaction_mode = conn_guard.transaction_mode();
                 let session = conn_guard.session_state();
+
+                // Populate the cleanup guard's §27.4 execution metadata up
+                // front. `note_execution_outcome` may refine these later
+                // when an interrupt or timeout outcome is known.
+                let snapshot_sql_kind = if script_mode {
+                    crate::db::session_policy::SqlKind::Script
+                } else {
+                    crate::db::session_policy::classify_sql(&sql_text)
+                };
+                cleanup.track_execution_metadata(
+                    db_type,
+                    snapshot_sql_kind,
+                    0,
+                    conn_guard.connection_generation(),
+                );
 
                 match db_type.execution_engine() {
                     crate::db::DbExecutionEngine::MySql => {
@@ -13728,6 +13785,13 @@ mod mysql_batch_execution_regression_tests {
                 ),
                 QueryProgress::BatchFinished => "BatchFinished".to_string(),
                 QueryProgress::MetadataRefreshNeeded => "MetadataRefreshNeeded".to_string(),
+                QueryProgress::ExecutionFinished(event) => format!(
+                    "ExecutionFinished(db={:?}, kind={:?}, cancelled={}, timed_out={})",
+                    event.db_type,
+                    event.sql_kind,
+                    event.cancelled,
+                    event.timed_out
+                ),
             })
             .collect::<Vec<_>>()
             .join("\n")

@@ -5114,6 +5114,24 @@ impl MainWindow {
                         &schema_sender_for_progress,
                     );
                 }
+                QueryProgress::ExecutionFinished(event) => {
+                    crate::utils::logging::log_info(
+                        "main_window::progress",
+                        &format!(
+                            "ExecutionFinished: db_type={:?} sql_kind={:?} op_id={} conn_gen={} \
+                             cancelled={} timed_out={} recoverable={} conn_err={} timeout_restored={}",
+                            event.db_type,
+                            event.sql_kind,
+                            event.operation_id,
+                            event.connection_generation,
+                            event.cancelled,
+                            event.timed_out,
+                            event.recoverable_timeout,
+                            event.has_connection_error,
+                            event.timeout_settings_restored,
+                        ),
+                    );
+                }
                 QueryProgress::BatchFinished => {
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
