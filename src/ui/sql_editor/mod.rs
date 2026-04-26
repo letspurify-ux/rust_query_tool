@@ -617,6 +617,39 @@ impl SqlEditorWidget {
             || current_operation_id.load(Ordering::Relaxed) == snapshot_operation_id
     }
 
+    fn cancel_snapshot_connection_generation_matches(
+        current_connection_generation: u64,
+        snapshot_connection_generation: u64,
+    ) -> bool {
+        snapshot_connection_generation == 0
+            || current_connection_generation == snapshot_connection_generation
+    }
+
+    fn current_connection_generation_for_cancel(
+        shared_connection: &crate::db::SharedConnection,
+    ) -> u64 {
+        match shared_connection.lock() {
+            Ok(guard) => guard.connection_generation(),
+            Err(poisoned) => {
+                eprintln!("Warning: connection lock was poisoned during cancel; recovering.");
+                poisoned.into_inner().connection_generation()
+            }
+        }
+    }
+
+    fn cancel_snapshot_matches(
+        current_operation_id: &Arc<AtomicU64>,
+        shared_connection: &crate::db::SharedConnection,
+        snapshot_operation_id: u64,
+        snapshot_connection_generation: u64,
+    ) -> bool {
+        Self::cancel_snapshot_operation_matches(current_operation_id, snapshot_operation_id)
+            && Self::cancel_snapshot_connection_generation_matches(
+                Self::current_connection_generation_for_cancel(shared_connection),
+                snapshot_connection_generation,
+            )
+    }
+
     fn is_main_window_visible() -> bool {
         app::widget_from_id::<Window>("main_window")
             .map(|window| is_window_shown_and_visible(window.shown(), window.visible()))
@@ -2396,6 +2429,8 @@ impl SqlEditorWidget {
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let current_operation_id = self.current_operation_id.clone();
         let snapshot_operation_id = snapshot.operation_id;
+        let snapshot_connection_generation = snapshot.connection_generation;
+        let shared_connection = self.connection.clone();
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
@@ -2411,9 +2446,11 @@ impl SqlEditorWidget {
                     &current_mysql_cancel_context,
                 );
 
-                if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                if !SqlEditorWidget::cancel_snapshot_matches(
                     &current_operation_id,
+                    &shared_connection,
                     snapshot_operation_id,
+                    snapshot_connection_generation,
                 ) {
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
@@ -2431,9 +2468,11 @@ impl SqlEditorWidget {
                         if !load_mutex_bool(&cancel_flag) {
                             break;
                         }
-                        if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                        if !SqlEditorWidget::cancel_snapshot_matches(
                             &current_operation_id,
+                            &shared_connection,
                             snapshot_operation_id,
+                            snapshot_connection_generation,
                         ) {
                             let _ = sender.send(UiActionResult::Cancel(Ok(())));
                             app::awake();
@@ -2462,9 +2501,11 @@ impl SqlEditorWidget {
                     // This editor is idle. Do not attempt to cancel through the
                     // global DB connection because that can interrupt a query that
                     // is currently running in a different editor tab.
-                    if SqlEditorWidget::cancel_snapshot_operation_matches(
+                    if SqlEditorWidget::cancel_snapshot_matches(
                         &current_operation_id,
+                        &shared_connection,
                         snapshot_operation_id,
+                        snapshot_connection_generation,
                     ) {
                         store_mutex_bool(&cancel_flag, false);
                     }
@@ -2480,9 +2521,11 @@ impl SqlEditorWidget {
                         if !load_mutex_bool(&cancel_flag) {
                             break;
                         }
-                        if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                        if !SqlEditorWidget::cancel_snapshot_matches(
                             &current_operation_id,
+                            &shared_connection,
                             snapshot_operation_id,
+                            snapshot_connection_generation,
                         ) {
                             let _ = sender.send(UiActionResult::Cancel(Ok(())));
                             app::awake();
@@ -2510,9 +2553,11 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                if !SqlEditorWidget::cancel_snapshot_matches(
                     &current_operation_id,
+                    &shared_connection,
                     snapshot_operation_id,
+                    snapshot_connection_generation,
                 ) {
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
@@ -2975,6 +3020,13 @@ mod execution_state_tests {
             &current_operation_id,
             0
         ));
+    }
+
+    #[test]
+    fn cancel_snapshot_generation_match_rejects_replaced_connection() {
+        assert!(SqlEditorWidget::cancel_snapshot_connection_generation_matches(12, 12));
+        assert!(SqlEditorWidget::cancel_snapshot_connection_generation_matches(12, 0));
+        assert!(!SqlEditorWidget::cancel_snapshot_connection_generation_matches(13, 12));
     }
 
     #[test]

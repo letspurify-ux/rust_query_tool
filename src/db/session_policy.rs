@@ -119,6 +119,8 @@ impl ExecutionFinishedEvent {
 pub struct InterruptDecisionContext {
     pub operation_matches: bool,
     pub connection_generation_matches: bool,
+    pub execution_state: ExecutionState,
+    pub worker_done: bool,
     pub has_connection_error: bool,
     pub sql_kind: SqlKind,
     pub lazy_state: LazyFetchState,
@@ -138,6 +140,10 @@ pub struct InterruptDecisionContext {
 /// post-processing can call a single function and get a consistent answer.
 pub fn decide_session_after_interrupt(ctx: InterruptDecisionContext) -> SessionDecision {
     if !ctx.operation_matches || !ctx.connection_generation_matches {
+        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
+    }
+
+    if matches!(ctx.execution_state, ExecutionState::Unknown) || !ctx.worker_done {
         return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
     }
 
@@ -289,16 +295,24 @@ fn has_fatal_connection_marker(lower: &str) -> bool {
         "ora-03135",
         "error 2006",
         "error 2013",
+        "not connected",
+        "closed connection",
+        "connection lost",
+        "connection refused",
         "server has gone away",
         "lost connection",
         "commands out of sync",
         "connection reset",
         "broken pipe",
+        "packet out of order",
+        "packets out of order",
         "socket timeout",
         "network timeout",
         "read timeout",
         "write timeout",
         "connection timeout",
+        "unexpected eof",
+        "malformed packet",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -645,6 +659,8 @@ mod tests {
         InterruptDecisionContext {
             operation_matches: true,
             connection_generation_matches: true,
+            execution_state: ExecutionState::Finished,
+            worker_done: true,
             has_connection_error: false,
             sql_kind: SqlKind::SelectLike,
             lazy_state: LazyFetchState::None,
@@ -681,6 +697,26 @@ mod tests {
     fn stale_connection_generation_replaces_session() {
         let mut ctx = base_ctx();
         ctx.connection_generation_matches = false;
+        assert_eq!(
+            decide_session_after_interrupt(ctx),
+            SessionDecision::ReplacePhysicalSessionKeepUiConnected
+        );
+    }
+
+    #[test]
+    fn unknown_execution_state_replaces_session() {
+        let mut ctx = base_ctx();
+        ctx.execution_state = ExecutionState::Unknown;
+        assert_eq!(
+            decide_session_after_interrupt(ctx),
+            SessionDecision::ReplacePhysicalSessionKeepUiConnected
+        );
+    }
+
+    #[test]
+    fn worker_not_done_replaces_session() {
+        let mut ctx = base_ctx();
+        ctx.worker_done = false;
         assert_eq!(
             decide_session_after_interrupt(ctx),
             SessionDecision::ReplacePhysicalSessionKeepUiConnected
@@ -984,6 +1020,18 @@ mod tests {
         assert!(!is_recoverable_timeout(
             DatabaseType::Oracle,
             "ORA-03113 end-of-file on communication channel; DPI-1067",
+            SqlKind::SelectLike,
+            LazyFetchState::None
+        ));
+        assert!(!is_recoverable_timeout(
+            DatabaseType::MySQL,
+            "read timeout while max_execution_time was exceeded",
+            SqlKind::SelectLike,
+            LazyFetchState::None
+        ));
+        assert!(!is_recoverable_timeout(
+            DatabaseType::MySQL,
+            "packet out of order after ER_QUERY_TIMEOUT",
             SqlKind::SelectLike,
             LazyFetchState::None
         ));

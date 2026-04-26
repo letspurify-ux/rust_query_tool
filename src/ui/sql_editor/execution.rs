@@ -10854,8 +10854,13 @@ impl SqlEditorWidget {
             "connection reset",
             "connection timed out",
             "broken pipe",
+            "socket timeout",
+            "network timeout",
+            "read timeout",
+            "write timeout",
             "dpi-1019",
             "dpi-1041",
+            "ora-3114",
             "tns:",
         ]
         .iter()
@@ -10915,13 +10920,17 @@ impl SqlEditorWidget {
             "packet out of order",
             "packets out of order",
             "pool disconnected",
+            "read timeout",
             "query execution was interrupted",
             "query was killed",
             "server closed the connection",
             "server has closed the connection",
             "server has gone away",
             "server shutdown in progress",
+            "socket timeout",
             "unexpected eof",
+            "network timeout",
+            "write timeout",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
@@ -10955,14 +10964,18 @@ impl SqlEditorWidget {
             "network is unreachable",
             "no connection available",
             "not connected to database",
+            "network timeout",
             "packet out of order",
             "packets out of order",
             "pool disconnected",
+            "read timeout",
             "server closed the connection",
             "server has closed the connection",
             "server has gone away",
             "server shutdown in progress",
+            "socket timeout",
             "unexpected eof",
+            "write timeout",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
@@ -13420,6 +13433,12 @@ mod query_execution_cleanup_tests {
             ),
             InterruptKind::ConnectionError
         );
+        assert_eq!(
+            SqlEditorWidget::mysql_interrupt_kind_for_message(
+                "Read timeout while reading result packet"
+            ),
+            InterruptKind::ConnectionError
+        );
     }
 
     #[test]
@@ -13478,6 +13497,10 @@ mod query_execution_cleanup_tests {
             "Pool disconnected before a connection could be acquired",
             "ERROR 1927 (70100): Connection was killed",
             "ERROR 1053 (08S01): Server shutdown in progress",
+            "Read timeout while reading result packet",
+            "Write timeout while sending packet",
+            "Socket timeout",
+            "Network timeout",
         ] {
             let result: std::thread::Result<Result<(), String>> = Ok(Err(message.to_string()));
             assert!(
@@ -13521,6 +13544,21 @@ mod query_execution_cleanup_tests {
         ));
         assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
             "Broken pipe"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Socket timeout while reading from Oracle"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Network timeout while writing to Oracle"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Read timeout"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "Write timeout"
+        ));
+        assert!(!SqlEditorWidget::oracle_error_message_allows_session_reuse(
+            "ORA-3114: not connected to ORACLE"
         ));
     }
 
