@@ -425,31 +425,6 @@ enum LazyFetchWorkerOutcome {
     Interrupted(InterruptKind),
 }
 
-struct MySqlLazyFetchTimeoutCancelGuard {
-    stop_sender: Option<mpsc::Sender<()>>,
-    fired: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-}
-
-impl MySqlLazyFetchTimeoutCancelGuard {
-    fn fired(&self) -> bool {
-        self.fired.load(Ordering::SeqCst)
-    }
-
-    fn finish(&self) {
-        self.finished.store(true, Ordering::SeqCst);
-    }
-}
-
-impl Drop for MySqlLazyFetchTimeoutCancelGuard {
-    fn drop(&mut self) {
-        self.finish();
-        if let Some(stop_sender) = self.stop_sender.take() {
-            let _ = stop_sender.send(());
-        }
-    }
-}
-
 impl LazyFetchAllTimeout {
     fn new(timeout: Option<Duration>) -> Self {
         Self {
@@ -464,21 +439,16 @@ impl LazyFetchAllTimeout {
         }
     }
 
+    #[cfg(test)]
     fn timed_out(&self) -> bool {
-        match (self.timeout, self.started_at) {
-            (Some(timeout), Some(started_at)) => started_at.elapsed() >= timeout,
-            _ => false,
-        }
+        // session.md §11: elapsed time alone is diagnostic, not a timeout
+        // classification. DB/driver timeout errors set the final state.
+        false
     }
 
     fn remaining_after_start(&self) -> Option<Duration> {
         let timeout = self.timeout?;
-        let started_at = self.started_at?;
-        Some(
-            timeout
-                .checked_sub(started_at.elapsed())
-                .unwrap_or(Duration::ZERO),
-        )
+        self.started_at.map(|_| timeout)
     }
 }
 
@@ -1544,7 +1514,7 @@ impl SqlEditorWidget {
         fetched_rows: &mut usize,
         last_select_row: &mut Option<Vec<String>>,
     ) -> Result<(Vec<Vec<String>>, bool), OracleError> {
-        let (rows, eof, _) = Self::fetch_lazy_oracle_rows_with_timeout(
+        let (rows, eof) = Self::fetch_lazy_oracle_rows_with_timeout(
             result_set,
             column_count,
             limit,
@@ -1566,24 +1536,19 @@ impl SqlEditorWidget {
         last_select_row: &mut Option<Vec<String>>,
         mut fetch_all_timeout: Option<&mut LazyFetchAllTimeout>,
         timeout_conn: Option<&Connection>,
-    ) -> Result<(Vec<Vec<String>>, bool, bool), OracleError> {
+    ) -> Result<(Vec<Vec<String>>, bool), OracleError> {
         let mut rows = Vec::new();
         for _ in 0..limit {
-            if let Some(timeout) = fetch_all_timeout.as_deref() {
-                if timeout.timed_out() {
-                    return Ok((rows, false, true));
-                }
-            }
             if let (Some(timeout), Some(conn)) = (fetch_all_timeout.as_deref(), timeout_conn) {
                 if let Some(remaining) = timeout.remaining_after_start() {
                     if remaining.is_zero() {
-                        return Ok((rows, false, true));
+                        return Ok((rows, false));
                     }
                     conn.set_call_timeout(Some(remaining))?;
                 }
             }
             let Some(row_result) = result_set.next() else {
-                return Ok((rows, true, false));
+                return Ok((rows, true));
             };
             let row = row_result?;
             let mut row_data = Vec::with_capacity(column_count);
@@ -1598,11 +1563,7 @@ impl SqlEditorWidget {
                 timeout.note_row_received();
             }
         }
-        let timed_out = fetch_all_timeout
-            .as_deref()
-            .map(|timeout| timeout.timed_out())
-            .unwrap_or(false);
-        Ok((rows, false, timed_out))
+        Ok((rows, false))
     }
 
     fn emit_lazy_rows(sender: &mpsc::Sender<QueryProgress>, index: usize, rows: Vec<Vec<String>>) {
@@ -1673,44 +1634,6 @@ impl SqlEditorWidget {
             cursor_closed,
             fetch_worker_done,
             error_kind,
-        });
-        app::awake();
-    }
-
-    fn emit_lazy_fetch_timeout_statement_result(
-        sender: &mpsc::Sender<QueryProgress>,
-        index: usize,
-        sql: &str,
-        column_info: &[ColumnInfo],
-        fetched_rows: usize,
-        execution_time: Duration,
-        heading_enabled: bool,
-        session: &Arc<Mutex<SessionState>>,
-        raw_column_names: &[String],
-        last_select_row: Option<&[String]>,
-        conn_name: &str,
-        query_timeout: Option<Duration>,
-    ) {
-        let mut query_result = QueryResult::new_select_streamed(
-            sql,
-            column_info.to_vec(),
-            fetched_rows,
-            execution_time,
-        );
-        SqlEditorWidget::apply_heading_to_result(&mut query_result, heading_enabled);
-        query_result.success = false;
-        query_result.message = SqlEditorWidget::timeout_message(query_timeout);
-        SqlEditorWidget::append_spool_output(session, std::slice::from_ref(&query_result.message));
-        SqlEditorWidget::apply_column_new_value_from_row(
-            session,
-            raw_column_names,
-            last_select_row,
-        );
-        let _ = sender.send(QueryProgress::StatementFinished {
-            index,
-            result: query_result,
-            connection_name: conn_name.to_string(),
-            timed_out: true,
         });
         app::awake();
     }
@@ -1996,7 +1919,7 @@ impl SqlEditorWidget {
                                     let mut fetch_all_timeout =
                                         LazyFetchAllTimeout::new(query_timeout);
                                     loop {
-                                        let (rows, eof, timed_out) =
+                                        let (rows, eof) =
                                             Self::fetch_lazy_oracle_rows_with_timeout(
                                                 &mut result_set,
                                                 column_count,
@@ -2017,26 +1940,6 @@ impl SqlEditorWidget {
                                                 Self::lazy_fetch_interrupt_kind_for_command(
                                                     &command,
                                                 ),
-                                            ));
-                                        }
-                                        if timed_out {
-                                            let _ = conn.break_execution();
-                                            Self::emit_lazy_fetch_timeout_statement_result(
-                                                &sender,
-                                                index,
-                                                &sql_to_execute,
-                                                &column_info,
-                                                fetched_rows,
-                                                statement_start.elapsed(),
-                                                heading_enabled,
-                                                &session,
-                                                &raw_column_names,
-                                                last_select_row.as_deref(),
-                                                &conn_name,
-                                                query_timeout,
-                                            );
-                                            return Ok(LazyFetchWorkerOutcome::Interrupted(
-                                                InterruptKind::RecoverableTimeout,
                                             ));
                                         }
                                         if eof {
@@ -2391,58 +2294,6 @@ impl SqlEditorWidget {
                             (rows, eof)
                         }};
                     }
-                        macro_rules! fetch_rows_with_timeout {
-                        ($limit:expr, $fetch_all_timeout:expr, $timeout_cancel:expr) => {{
-                            let mut rows = Vec::new();
-                            let mut eof = false;
-                            let mut timed_out = false;
-                            for _ in 0..$limit {
-                                if $fetch_all_timeout.timed_out()
-                                    || $timeout_cancel
-                                        .as_ref()
-                                        .is_some_and(|guard| guard.fired())
-                                {
-                                    timed_out = true;
-                                    break;
-                                }
-                                let Some(row_result) = result.next() else {
-                                    eof = true;
-                                    break;
-                                };
-                                let row: mysql::Row = row_result.map_err(|err| {
-                                    if $timeout_cancel
-                                        .as_ref()
-                                        .is_some_and(|guard| guard.fired())
-                                    {
-                                        SqlEditorWidget::timeout_message(query_timeout)
-                                    } else {
-                                        SqlEditorWidget::mysql_error_message(
-                                            &err,
-                                            lazy_fetch_timeout,
-                                        )
-                                    }
-                                })?;
-                                let mut row_data =
-                                    crate::db::query::mysql_executor::MysqlExecutor::row_to_strings(
-                                        &row,
-                                        column_count,
-                                    );
-                                last_select_row = Some(row_data.clone());
-                                SqlEditorWidget::apply_null_text_to_row(&mut row_data, &null_text);
-                                rows.push(row_data);
-                                fetched_rows = fetched_rows.saturating_add(1);
-                                $fetch_all_timeout.note_row_received();
-                            }
-                            if $fetch_all_timeout.timed_out()
-                                || $timeout_cancel
-                                    .as_ref()
-                                    .is_some_and(|guard| guard.fired())
-                            {
-                                timed_out = true;
-                            }
-                            (rows, eof, timed_out)
-                        }};
-                    }
                         let (rows, eof) = fetch_rows!(lazy_fetch_batch_size);
                         Self::set_lazy_fetch_in_progress(&active_lazy_fetch, session_id, false);
                         SqlEditorWidget::append_spool_rows(&session, &rows);
@@ -2561,23 +2412,8 @@ impl SqlEditorWidget {
                                         session_id,
                                         true,
                                     );
-                                    let timeout_cancel =
-                                        Self::start_mysql_lazy_fetch_timeout_cancel(
-                                            query_timeout,
-                                            lazy_cancel_context.clone(),
-                                            "mysql lazy fetch timeout",
-                                        );
-                                    let mut fetch_all_timeout =
-                                        LazyFetchAllTimeout::new(query_timeout);
-                                    if fetched_rows > 0 {
-                                        fetch_all_timeout.note_row_received();
-                                    }
                                     loop {
-                                        let (rows, eof, timed_out) = fetch_rows_with_timeout!(
-                                            PROGRESS_ROWS_MAX_BATCH,
-                                            fetch_all_timeout,
-                                            timeout_cancel
-                                        );
+                                        let (rows, eof) = fetch_rows!(PROGRESS_ROWS_MAX_BATCH);
                                         SqlEditorWidget::append_spool_rows(&session, &rows);
                                         Self::emit_lazy_rows(&sender, index, rows);
                                         if let Some(command) = Self::drain_lazy_cancel_request(
@@ -2596,38 +2432,7 @@ impl SqlEditorWidget {
                                                 ),
                                             ));
                                         }
-                                        if timed_out {
-                                            if !timeout_cancel
-                                                .as_ref()
-                                                .is_some_and(|guard| guard.fired())
-                                            {
-                                                Self::cancel_mysql_lazy_fetch_query(
-                                                    &lazy_cancel_context,
-                                                    "mysql lazy fetch timeout",
-                                                );
-                                            }
-                                            Self::emit_lazy_fetch_timeout_statement_result(
-                                                &sender,
-                                                index,
-                                                &sql_to_execute,
-                                                &column_info,
-                                                fetched_rows,
-                                                statement_start.elapsed(),
-                                                heading_enabled,
-                                                &session,
-                                                &raw_column_names,
-                                                last_select_row.as_deref(),
-                                                &conn_name,
-                                                query_timeout,
-                                            );
-                                            return Ok(LazyFetchWorkerOutcome::Interrupted(
-                                                InterruptKind::RecoverableTimeout,
-                                            ));
-                                        }
                                         if eof {
-                                            if let Some(timeout_cancel) = timeout_cancel.as_ref() {
-                                                timeout_cancel.finish();
-                                            }
                                             let mut query_result = QueryResult::new_select_streamed(
                                                 &sql_to_execute,
                                                 column_info.clone(),
@@ -2872,51 +2677,6 @@ impl SqlEditorWidget {
                     log_context,
                     &format!("Failed to cancel MySQL lazy fetch query: {err}"),
                 );
-            }
-        }
-    }
-
-    fn start_mysql_lazy_fetch_timeout_cancel(
-        timeout: Option<Duration>,
-        cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-        log_context: &'static str,
-    ) -> Option<MySqlLazyFetchTimeoutCancelGuard> {
-        let timeout = timeout?;
-        let (stop_sender, stop_receiver) = mpsc::channel();
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_thread = fired.clone();
-        let finished = Arc::new(AtomicBool::new(false));
-        let finished_for_thread = finished.clone();
-        match thread::Builder::new()
-            .name("mysql-lazy-fetch-timeout".to_string())
-            .spawn(move || {
-                if matches!(
-                    stop_receiver.recv_timeout(timeout),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    if finished_for_thread.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    fired_for_thread.store(true, Ordering::SeqCst);
-                    if !finished_for_thread.load(Ordering::SeqCst) {
-                        SqlEditorWidget::cancel_mysql_lazy_fetch_query(
-                            &cancel_context,
-                            log_context,
-                        );
-                    }
-                }
-            }) {
-            Ok(_) => Some(MySqlLazyFetchTimeoutCancelGuard {
-                stop_sender: Some(stop_sender),
-                fired,
-                finished,
-            }),
-            Err(err) => {
-                crate::utils::logging::log_error(
-                    log_context,
-                    &format!("Failed to start MySQL lazy fetch timeout watcher: {err}"),
-                );
-                None
             }
         }
     }
@@ -7558,7 +7318,6 @@ impl SqlEditorWidget {
                                     let mut cursor_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
                                     let mut has_flushed_rows = false;
-                                    let cursor_start = Instant::now();
                                     let mut cursor_timed_out = false;
                                     let (heading_enabled, feedback_enabled) =
                                         SqlEditorWidget::current_output_settings(&session);
@@ -7595,13 +7354,6 @@ impl SqlEditorWidget {
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
                                                 return false;
-                                            }
-                                            if let Some(timeout_duration) = query_timeout {
-                                                if cursor_start.elapsed() >= timeout_duration {
-                                                    cursor_timed_out = true;
-                                                    let _ = conn.break_execution();
-                                                    return false;
-                                                }
                                             }
                                             cursor_rows.push(row.clone());
                                             let mut display_row = row;
@@ -7759,7 +7511,6 @@ impl SqlEditorWidget {
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
                                     let mut has_flushed_rows = false;
-                                    let cursor_start = Instant::now();
                                     let mut cursor_timed_out = false;
                                     let (heading_enabled, feedback_enabled) =
                                         SqlEditorWidget::current_output_settings(&session);
@@ -7796,13 +7547,6 @@ impl SqlEditorWidget {
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
                                                 return false;
-                                            }
-                                            if let Some(timeout_duration) = query_timeout {
-                                                if cursor_start.elapsed() >= timeout_duration {
-                                                    cursor_timed_out = true;
-                                                    let _ = conn.break_execution();
-                                                    return false;
-                                                }
                                             }
                                             let mut display_row = row;
                                             SqlEditorWidget::apply_null_text_to_row(
@@ -8183,13 +7927,6 @@ impl SqlEditorWidget {
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
                                                 return false;
-                                            }
-                                            if let Some(timeout_duration) = query_timeout {
-                                                if statement_start.elapsed() >= timeout_duration {
-                                                    timed_out = true;
-                                                    let _ = conn.break_execution();
-                                                    return false;
-                                                }
                                             }
 
                                             let mut row = row;
@@ -12465,13 +12202,16 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn lazy_fetch_all_timeout_expires_after_started_elapsed_time() {
+    fn lazy_fetch_all_timeout_does_not_classify_elapsed_time_as_timeout() {
         let mut timeout = LazyFetchAllTimeout::new(Some(Duration::from_secs(1)));
         timeout.note_row_received();
         timeout.started_at = Some(Instant::now() - Duration::from_secs(2));
 
-        assert!(timeout.timed_out());
-        assert_eq!(timeout.remaining_after_start(), Some(Duration::ZERO));
+        assert!(!timeout.timed_out());
+        assert_eq!(
+            timeout.remaining_after_start(),
+            Some(Duration::from_secs(1))
+        );
     }
 
     #[test]

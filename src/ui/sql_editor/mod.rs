@@ -609,6 +609,7 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
     }
 
+    #[cfg(test)]
     fn cancel_snapshot_operation_matches(
         current_operation_id: &Arc<AtomicU64>,
         snapshot_operation_id: u64,
