@@ -608,6 +608,14 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
     }
 
+    fn cancel_snapshot_operation_matches(
+        current_operation_id: &Arc<AtomicU64>,
+        snapshot_operation_id: u64,
+    ) -> bool {
+        snapshot_operation_id == 0
+            || current_operation_id.load(Ordering::Relaxed) == snapshot_operation_id
+    }
+
     fn is_main_window_visible() -> bool {
         app::widget_from_id::<Window>("main_window")
             .map(|window| is_window_shown_and_visible(window.shown(), window.visible()))
@@ -2368,6 +2376,8 @@ impl SqlEditorWidget {
 
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
+        let current_operation_id = self.current_operation_id.clone();
+        let snapshot_operation_id = snapshot.operation_id;
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
@@ -2383,6 +2393,15 @@ impl SqlEditorWidget {
                     &current_mysql_cancel_context,
                 );
 
+                if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                    &current_operation_id,
+                    snapshot_operation_id,
+                ) {
+                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    app::awake();
+                    return;
+                }
+
                 if !SqlEditorWidget::is_query_running_flag(&query_running)
                     && conn.is_none()
                     && mysql_cancel_context.is_none()
@@ -2393,6 +2412,14 @@ impl SqlEditorWidget {
                     for _ in 0..40 {
                         if !load_mutex_bool(&cancel_flag) {
                             break;
+                        }
+                        if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                            &current_operation_id,
+                            snapshot_operation_id,
+                        ) {
+                            let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                            app::awake();
+                            return;
                         }
                         if SqlEditorWidget::is_query_running_flag(&query_running) {
                             break;
@@ -2417,7 +2444,12 @@ impl SqlEditorWidget {
                     // This editor is idle. Do not attempt to cancel through the
                     // global DB connection because that can interrupt a query that
                     // is currently running in a different editor tab.
-                    store_mutex_bool(&cancel_flag, false);
+                    if SqlEditorWidget::cancel_snapshot_operation_matches(
+                        &current_operation_id,
+                        snapshot_operation_id,
+                    ) {
+                        store_mutex_bool(&cancel_flag, false);
+                    }
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
                     return;
@@ -2429,6 +2461,14 @@ impl SqlEditorWidget {
                     for _ in 0..40 {
                         if !load_mutex_bool(&cancel_flag) {
                             break;
+                        }
+                        if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                            &current_operation_id,
+                            snapshot_operation_id,
+                        ) {
+                            let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                            app::awake();
+                            return;
                         }
                         thread::sleep(Duration::from_millis(25));
                         conn = SqlEditorWidget::clone_current_query_connection(
@@ -2447,6 +2487,15 @@ impl SqlEditorWidget {
                 // already false the previous query has already finished and reset it;
                 // breaking the connection now would interrupt a newly-started query.
                 if !load_mutex_bool(&cancel_flag) {
+                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    app::awake();
+                    return;
+                }
+
+                if !SqlEditorWidget::cancel_snapshot_operation_matches(
+                    &current_operation_id,
+                    snapshot_operation_id,
+                ) {
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
                     return;
@@ -2857,6 +2906,7 @@ mod execution_state_tests {
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
     use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -2886,6 +2936,27 @@ mod execution_state_tests {
         let second = SqlEditorWidget::shared_lazy_fetch_session_counter();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn cancel_snapshot_operation_match_rejects_stale_operation() {
+        let current_operation_id = Arc::new(AtomicU64::new(7));
+
+        assert!(SqlEditorWidget::cancel_snapshot_operation_matches(
+            &current_operation_id,
+            7
+        ));
+
+        current_operation_id.store(8, Ordering::Relaxed);
+
+        assert!(!SqlEditorWidget::cancel_snapshot_operation_matches(
+            &current_operation_id,
+            7
+        ));
+        assert!(SqlEditorWidget::cancel_snapshot_operation_matches(
+            &current_operation_id,
+            0
+        ));
     }
 
     #[test]

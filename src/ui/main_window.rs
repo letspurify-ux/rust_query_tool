@@ -2296,6 +2296,16 @@ impl MainWindow {
         s.set_status_message(&status);
     }
 
+    fn cancel_active_query_editor_tab(state: &Arc<Mutex<AppState>>) -> bool {
+        let active_tab_id = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.active_editor_tab_id
+        };
+        Self::cancel_query_editor_tab(state, active_tab_id)
+    }
+
     fn cancel_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
         let Some((editor, query_running, lazy_fetch_session)) = ({
             let s = state
@@ -3246,7 +3256,7 @@ impl MainWindow {
         let weak_state_for_cancel = Arc::downgrade(&state);
         cancel_btn.set_callback(move |_| {
             if let Some(state_for_cancel) = weak_state_for_cancel.upgrade() {
-                MainWindow::cancel_all_running_queries(&state_for_cancel);
+                MainWindow::cancel_active_query_editor_tab(&state_for_cancel);
             }
         });
 
