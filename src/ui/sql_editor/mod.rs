@@ -613,7 +613,19 @@ impl SqlEditorWidget {
         current_operation_id: &Arc<AtomicU64>,
         snapshot_operation_id: u64,
     ) -> bool {
-        snapshot_operation_id == 0
+        Self::cancel_snapshot_operation_matches_with_policy(
+            current_operation_id,
+            snapshot_operation_id,
+            true,
+        )
+    }
+
+    fn cancel_snapshot_operation_matches_with_policy(
+        current_operation_id: &Arc<AtomicU64>,
+        snapshot_operation_id: u64,
+        allow_empty_snapshot: bool,
+    ) -> bool {
+        (snapshot_operation_id == 0 && allow_empty_snapshot)
             || current_operation_id.load(Ordering::Relaxed) == snapshot_operation_id
     }
 
@@ -642,12 +654,16 @@ impl SqlEditorWidget {
         shared_connection: &crate::db::SharedConnection,
         snapshot_operation_id: u64,
         snapshot_connection_generation: u64,
+        allow_empty_operation_snapshot: bool,
     ) -> bool {
-        Self::cancel_snapshot_operation_matches(current_operation_id, snapshot_operation_id)
-            && Self::cancel_snapshot_connection_generation_matches(
-                Self::current_connection_generation_for_cancel(shared_connection),
-                snapshot_connection_generation,
-            )
+        Self::cancel_snapshot_operation_matches_with_policy(
+            current_operation_id,
+            snapshot_operation_id,
+            allow_empty_operation_snapshot,
+        ) && Self::cancel_snapshot_connection_generation_matches(
+            Self::current_connection_generation_for_cancel(shared_connection),
+            snapshot_connection_generation,
+        )
     }
 
     fn is_main_window_visible() -> bool {
@@ -2430,6 +2446,10 @@ impl SqlEditorWidget {
         let current_operation_id = self.current_operation_id.clone();
         let snapshot_operation_id = snapshot.operation_id;
         let snapshot_connection_generation = snapshot.connection_generation;
+        let allow_empty_operation_snapshot = !matches!(
+            snapshot.execution_state,
+            crate::db::session_policy::ExecutionState::Idle
+        );
         let shared_connection = self.connection.clone();
         let cancel_flag = self.cancel_flag.clone();
         let query_running = self.query_running.clone();
@@ -2451,6 +2471,7 @@ impl SqlEditorWidget {
                     &shared_connection,
                     snapshot_operation_id,
                     snapshot_connection_generation,
+                    allow_empty_operation_snapshot,
                 ) {
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
@@ -2473,6 +2494,7 @@ impl SqlEditorWidget {
                             &shared_connection,
                             snapshot_operation_id,
                             snapshot_connection_generation,
+                            allow_empty_operation_snapshot,
                         ) {
                             let _ = sender.send(UiActionResult::Cancel(Ok(())));
                             app::awake();
@@ -2506,6 +2528,7 @@ impl SqlEditorWidget {
                         &shared_connection,
                         snapshot_operation_id,
                         snapshot_connection_generation,
+                        allow_empty_operation_snapshot,
                     ) {
                         store_mutex_bool(&cancel_flag, false);
                     }
@@ -2526,6 +2549,7 @@ impl SqlEditorWidget {
                             &shared_connection,
                             snapshot_operation_id,
                             snapshot_connection_generation,
+                            allow_empty_operation_snapshot,
                         ) {
                             let _ = sender.send(UiActionResult::Cancel(Ok(())));
                             app::awake();
@@ -2558,6 +2582,7 @@ impl SqlEditorWidget {
                     &shared_connection,
                     snapshot_operation_id,
                     snapshot_connection_generation,
+                    allow_empty_operation_snapshot,
                 ) {
                     let _ = sender.send(UiActionResult::Cancel(Ok(())));
                     app::awake();
@@ -3020,6 +3045,20 @@ mod execution_state_tests {
             &current_operation_id,
             0
         ));
+        assert!(
+            !SqlEditorWidget::cancel_snapshot_operation_matches_with_policy(
+                &current_operation_id,
+                0,
+                false
+            )
+        );
+        assert!(
+            SqlEditorWidget::cancel_snapshot_operation_matches_with_policy(
+                &current_operation_id,
+                0,
+                true
+            )
+        );
     }
 
     #[test]

@@ -282,6 +282,26 @@ impl QueryExecutionCleanupGuard {
         }
     }
 
+    fn protect_oracle_script_session_after_interrupt(&mut self, auto_commit: bool) {
+        if auto_commit {
+            self.invalidate_oracle_pooled_session();
+        } else {
+            self.require_oracle_pooled_session_transaction_decision();
+        }
+    }
+
+    fn protect_oracle_select_session_after_interrupt(
+        &mut self,
+        script_mode: bool,
+        auto_commit: bool,
+    ) {
+        if script_mode {
+            self.protect_oracle_script_session_after_interrupt(auto_commit);
+        } else {
+            self.require_oracle_pooled_session_health_check();
+        }
+    }
+
     fn clear_oracle_pooled_session_tracking(&mut self) {
         self.oracle_pooled_session = None;
         self.oracle_pooled_session_invalidated = false;
@@ -3037,6 +3057,7 @@ impl SqlEditorWidget {
         let mysql_batch_may_hold_table_lock = std::cell::Cell::new(false);
         let mysql_batch_may_hold_named_lock = std::cell::Cell::new(false);
         let mysql_batch_saw_uncertain_named_lock_release = std::cell::Cell::new(false);
+        let mysql_batch_timed_out = std::cell::Cell::new(false);
 
         let execute_mysql_sql =
             |sql: &str, auto_commit: bool| -> Result<Vec<QueryResult>, String> {
@@ -3764,6 +3785,9 @@ impl SqlEditorWidget {
                                         &message,
                                     );
                                     let (cancelled, timed_out) = mysql_interruption_flags(&message);
+                                    if timed_out {
+                                        mysql_batch_timed_out.set(true);
+                                    }
                                     SqlEditorWidget::emit_script_message(
                                         sender,
                                         session,
@@ -3870,6 +3894,9 @@ impl SqlEditorWidget {
                                         &message,
                                     );
                                     let (cancelled, timed_out) = mysql_interruption_flags(&message);
+                                    if timed_out {
+                                        mysql_batch_timed_out.set(true);
+                                    }
                                     let emitted = SqlEditorWidget::emit_non_select_result(
                                         sender,
                                         session,
@@ -4062,6 +4089,9 @@ impl SqlEditorWidget {
                                     &message,
                                 );
                                 let (cancelled, timed_out) = mysql_interruption_flags(&message);
+                                if timed_out {
+                                    mysql_batch_timed_out.set(true);
+                                }
                                 if script_mode {
                                     let emitted = SqlEditorWidget::emit_non_select_result(
                                         sender,
@@ -4183,6 +4213,9 @@ impl SqlEditorWidget {
                                 &message,
                             );
                             let (cancelled, timed_out) = mysql_interruption_flags(&message);
+                            if timed_out {
+                                mysql_batch_timed_out.set(true);
+                            }
                             let emitted = SqlEditorWidget::emit_non_select_result(
                                 sender,
                                 session,
@@ -4217,7 +4250,7 @@ impl SqlEditorWidget {
             mysql_batch_may_hold_table_lock.get(),
             mysql_batch_may_hold_named_lock.get(),
             mysql_batch_saw_uncertain_named_lock_release.get(),
-            load_mutex_bool(cancel_flag),
+            load_mutex_bool(cancel_flag) || mysql_batch_timed_out.get(),
             script_mode,
             auto_commit,
             db_activity,
@@ -8274,7 +8307,10 @@ impl SqlEditorWidget {
                                                     false, true, true, false,
                                                 );
                                                 cleanup
-                                                    .require_oracle_pooled_session_health_check();
+                                                    .protect_oracle_select_session_after_interrupt(
+                                                        script_mode,
+                                                        auto_commit,
+                                                    );
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
@@ -8284,7 +8320,10 @@ impl SqlEditorWidget {
                                                     true, false, false, false,
                                                 );
                                                 cleanup
-                                                    .require_oracle_pooled_session_health_check();
+                                                    .protect_oracle_select_session_after_interrupt(
+                                                        script_mode,
+                                                        auto_commit,
+                                                    );
                                             }
                                             if !feedback_enabled {
                                                 query_result.message.clear();
@@ -8304,7 +8343,10 @@ impl SqlEditorWidget {
                                             statement_interrupted = timed_out || cancelled;
                                             if statement_interrupted {
                                                 cleanup
-                                                    .require_oracle_pooled_session_health_check();
+                                                    .protect_oracle_select_session_after_interrupt(
+                                                        script_mode,
+                                                        auto_commit,
+                                                    );
                                             }
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_select_error(
                                                 &mut cleanup,
@@ -10450,7 +10492,7 @@ impl SqlEditorWidget {
         batch_may_hold_table_lock: bool,
         batch_may_hold_named_lock: bool,
         batch_saw_uncertain_named_lock_release: bool,
-        batch_cancelled: bool,
+        batch_interrupted: bool,
         script_mode: bool,
         auto_commit: bool,
         db_activity: &str,
@@ -10471,7 +10513,7 @@ impl SqlEditorWidget {
         let Some(mut conn) = lease.into_mysql_connection() else {
             return;
         };
-        if batch_cancelled {
+        if batch_interrupted {
             let requires_transaction_decision =
                 Self::mysql_cancelled_batch_requires_transaction_decision(
                     prior_requires_transaction_decision,
@@ -10709,6 +10751,9 @@ impl SqlEditorWidget {
 
     fn mysql_message_is_recoverable_timeout(message: &str) -> bool {
         if Self::mysql_message_is_lock_wait_timeout(message) {
+            return false;
+        }
+        if Self::mysql_error_message_has_connection_error(message) {
             return false;
         }
 
@@ -11815,14 +11860,19 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn mysql_error_message(err: &MysqlError, timeout: Option<Duration>) -> String {
+        let raw_message = err.to_string();
+        if Self::mysql_error_message_has_connection_error(&raw_message) {
+            return raw_message;
+        }
+
         let cancelled = crate::db::query::mysql_executor::MysqlExecutor::is_cancel_error(err);
         let timed_out = crate::db::query::mysql_executor::MysqlExecutor::is_timeout_error(err);
         let lock_wait_timeout =
             crate::db::query::mysql_executor::MysqlExecutor::is_lock_wait_timeout_error(err);
         if timed_out && lock_wait_timeout && !cancelled {
-            return err.to_string();
+            return raw_message;
         }
-        Self::choose_execution_error_message(cancelled, timed_out, timeout, err.to_string())
+        Self::choose_execution_error_message(cancelled, timed_out, timeout, raw_message)
     }
 
     pub(super) fn parse_timeout(value: &str) -> Option<Duration> {
@@ -11980,6 +12030,45 @@ mod query_execution_cleanup_tests {
         cleanup.protect_oracle_dirty_statement_on_cancel(false);
         assert!(!cleanup.oracle_pooled_session_invalidated_on_cancel);
         assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+    }
+
+    #[test]
+    fn oracle_script_select_interrupt_policy_replaces_or_requires_decision() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        cleanup.protect_oracle_select_session_after_interrupt(true, true);
+        assert!(cleanup.oracle_pooled_session_invalidated);
+        assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
+
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        cleanup.protect_oracle_select_session_after_interrupt(true, false);
+        assert!(!cleanup.oracle_pooled_session_invalidated);
+        assert!(cleanup.oracle_pooled_session_transaction_decision_required);
+
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        cleanup.protect_oracle_select_session_after_interrupt(false, false);
+        assert!(!cleanup.oracle_pooled_session_invalidated);
+        assert!(cleanup.oracle_pooled_session_requires_health_check);
     }
 
     #[test]
@@ -13433,6 +13522,12 @@ mod query_execution_cleanup_tests {
             ),
             InterruptKind::ConnectionError
         );
+        assert!(
+            !SqlEditorWidget::mysql_message_is_recoverable_timeout(
+                "Lost connection to MySQL server during query after max_execution_time"
+            ),
+            "fatal connection markers must win over recoverable timeout markers"
+        );
         assert_eq!(
             SqlEditorWidget::mysql_interrupt_kind_for_message(
                 "Read timeout while reading result packet"
@@ -13679,6 +13774,12 @@ mod query_execution_cleanup_tests {
             code: 1205,
             message: "Lock wait timeout exceeded; try restarting transaction".to_string(),
         });
+        let fatal_timeout_err = MysqlError::MySqlError(MySqlError {
+            state: "HY000".to_string(),
+            code: 2013,
+            message: "Lost connection to MySQL server during query after max_execution_time"
+                .to_string(),
+        });
 
         assert_eq!(
             SqlEditorWidget::mysql_error_message(&timeout_err, timeout),
@@ -13691,6 +13792,13 @@ mod query_execution_cleanup_tests {
         assert!(
             SqlEditorWidget::mysql_error_message(&lock_wait_err, timeout)
                 .contains("Lock wait timeout exceeded")
+        );
+        let fatal_timeout_message =
+            SqlEditorWidget::mysql_error_message(&fatal_timeout_err, timeout);
+        assert!(fatal_timeout_message.contains("Lost connection"));
+        assert_eq!(
+            SqlEditorWidget::mysql_interrupt_kind_for_message(&fatal_timeout_message),
+            InterruptKind::ConnectionError
         );
     }
 }
