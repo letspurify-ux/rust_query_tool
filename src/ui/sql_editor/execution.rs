@@ -1467,6 +1467,23 @@ impl SqlEditorWidget {
             })
     }
 
+    fn lazy_fetch_interruption_can_retain_session(
+        active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
+        session_id: u64,
+        interrupt_kind: InterruptKind,
+    ) -> bool {
+        match interrupt_kind {
+            InterruptKind::Cancelled => {
+                Self::lazy_fetch_should_retain_session_after_cancel(active_lazy_fetch, session_id)
+            }
+            InterruptKind::RecoverableTimeout => true,
+            InterruptKind::None
+            | InterruptKind::NonRecoverableTimeout
+            | InterruptKind::ConnectionError
+            | InterruptKind::UnsafeOrUnknown => false,
+        }
+    }
+
     fn lazy_fetch_can_keep_session(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         session_id: u64,
@@ -2063,9 +2080,10 @@ impl SqlEditorWidget {
                         Ok(LazyFetchWorkerOutcome::Interrupted(error_kind)) => {
                             close_cancelled = true;
                             close_error_kind = error_kind;
-                            if Self::lazy_fetch_should_retain_session_after_cancel(
+                            if Self::lazy_fetch_interruption_can_retain_session(
                                 &active_lazy_fetch,
                                 session_id,
+                                error_kind,
                             ) {
                                 keep_session = true;
                             }
@@ -2649,9 +2667,10 @@ impl SqlEditorWidget {
                         Ok(LazyFetchWorkerOutcome::Interrupted(error_kind)) => {
                             close_cancelled = true;
                             close_error_kind = error_kind;
-                            if Self::lazy_fetch_should_retain_session_after_cancel(
+                            if Self::lazy_fetch_interruption_can_retain_session(
                                 &active_lazy_fetch,
                                 session_id,
+                                error_kind,
                             ) {
                                 keep_session = true;
                             }
@@ -4224,7 +4243,7 @@ impl SqlEditorWidget {
         }
 
         if let Some(session_id) = self.active_lazy_fetch_session() {
-            if self.cancel_lazy_fetch_session(session_id) {
+            if self.cancel_lazy_fetch_session(session_id, true) {
                 self.emit_status("Canceling previous lazy fetch...");
                 let _ = self
                     .progress_sender
@@ -12876,6 +12895,97 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn discard_lazy_fetch_cancel_does_not_mark_session_retained() {
+        let (sender, receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            fetch_in_progress: Arc::new(AtomicBool::new(false)),
+        })));
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session,
+            false,
+        ));
+
+        assert!(SqlEditorWidget::lazy_fetch_cancel_requested(&active, 42));
+        assert!(!SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
+        assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(LazyFetchCommand::GracefulClose)
+        ));
+    }
+
+    #[test]
+    fn discard_lazy_fetch_cancel_overrides_prior_retain_request() {
+        let (sender, _receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            fetch_in_progress: Arc::new(AtomicBool::new(false)),
+        })));
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session,
+            true,
+        ));
+        assert!(SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session,
+            false,
+        ));
+        assert!(!SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
+        assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
+    }
+
+    #[test]
+    fn retain_lazy_fetch_cancel_does_not_upgrade_existing_discard_request() {
+        let (sender, _receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            fetch_in_progress: Arc::new(AtomicBool::new(false)),
+        })));
+        let pooled_db_session = crate::db::SharedDbSessionLease::new();
+
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session,
+            false,
+        ));
+        assert!(SqlEditorWidget::cancel_lazy_fetch_handle(
+            &active,
+            &pooled_db_session,
+            true,
+        ));
+
+        assert!(!SqlEditorWidget::lazy_fetch_should_retain_session_after_cancel(&active, 42));
+        assert!(!SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
+    }
+
+    #[test]
     fn retained_lazy_fetch_cancel_can_keep_pooled_session() {
         let (sender, receiver) = mpsc::channel();
         let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
@@ -12903,6 +13013,51 @@ mod query_execution_cleanup_tests {
             receiver.try_recv(),
             Ok(LazyFetchCommand::CancelFetch)
         ));
+    }
+
+    #[test]
+    fn force_cancel_interruption_cannot_retain_lazy_fetch_session() {
+        let (sender, _receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(true)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(true)),
+            fetch_in_progress: Arc::new(AtomicBool::new(true)),
+        })));
+
+        assert!(
+            !SqlEditorWidget::lazy_fetch_interruption_can_retain_session(
+                &active,
+                42,
+                InterruptKind::UnsafeOrUnknown,
+            )
+        );
+    }
+
+    #[test]
+    fn recoverable_timeout_interruption_can_retain_lazy_fetch_session() {
+        let (sender, _receiver) = mpsc::channel();
+        let active = Arc::new(Mutex::new(Some(LazyFetchHandle {
+            session_id: 42,
+            operation_id: 42,
+            connection_generation: 7,
+            sender,
+            cancel_handle: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            retain_session_on_cancel: Arc::new(AtomicBool::new(false)),
+            fetch_in_progress: Arc::new(AtomicBool::new(true)),
+        })));
+
+        assert!(SqlEditorWidget::lazy_fetch_interruption_can_retain_session(
+            &active,
+            42,
+            InterruptKind::RecoverableTimeout,
+        ));
+        assert!(SqlEditorWidget::lazy_fetch_can_keep_session(&active, 42));
     }
 
     #[test]

@@ -1568,7 +1568,7 @@ fn request_lazy_fetch_cancel_for_session_pool(
     let requested = AppState::request_lazy_fetch_on_editors(
         state,
         session_id,
-        crate::ui::sql_editor::LazyFetchRequest::Cancel,
+        crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
     );
     let mut guard = state
         .lock()
@@ -2118,7 +2118,7 @@ impl MainWindow {
             AppState::request_lazy_fetch_on_editors(
                 state,
                 session_id,
-                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
             );
         }
     }
@@ -3342,7 +3342,7 @@ impl MainWindow {
                 AppState::request_lazy_fetch_on_editors(
                     &state_for_result_clear,
                     session_id,
-                    crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                    crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
                 );
             }
         });
@@ -4112,8 +4112,10 @@ impl MainWindow {
         };
 
         for session_id in &lazy_fetch_sessions {
-            editor_to_cleanup
-                .request_lazy_fetch(*session_id, crate::ui::sql_editor::LazyFetchRequest::Cancel);
+            editor_to_cleanup.request_lazy_fetch(
+                *session_id,
+                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+            );
         }
         editor_to_cleanup.cleanup_for_close();
 
@@ -4991,7 +4993,7 @@ impl MainWindow {
                             AppState::request_lazy_fetch_on_editors(
                                 &state_for_progress,
                                 session_id,
-                                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
                             );
                         }
                     } else {
@@ -5002,7 +5004,7 @@ impl MainWindow {
                             AppState::request_lazy_fetch_on_editors(
                                 &state_for_progress,
                                 session_id,
-                                crate::ui::sql_editor::LazyFetchRequest::Cancel,
+                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
                             );
                         }
                     }

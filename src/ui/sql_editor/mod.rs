@@ -315,6 +315,7 @@ pub enum LazyFetchRequest {
     More,
     All,
     Cancel,
+    CancelAndDiscard,
 }
 
 #[derive(Debug)]
@@ -1228,7 +1229,7 @@ impl SqlEditorWidget {
 
     pub fn clear_pooled_db_session(&self) {
         let _ = self.release_pooled_db_session();
-        self.cancel_active_lazy_fetch();
+        self.cancel_active_lazy_fetch(false);
     }
 
     pub fn set_lazy_fetch_batch_size(&self, size: u32) {
@@ -1259,8 +1260,12 @@ impl SqlEditorWidget {
         if handle.session_id != session_id {
             return false;
         }
-        if request == LazyFetchRequest::Cancel {
-            if self.cancel_lazy_fetch_session(session_id) {
+        if matches!(
+            request,
+            LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscard
+        ) {
+            let retain_session_on_cancel = request == LazyFetchRequest::Cancel;
+            if self.cancel_lazy_fetch_session(session_id, retain_session_on_cancel) {
                 let _ = self
                     .progress_sender
                     .send(QueryProgress::LazyFetchCanceling { session_id });
@@ -1275,7 +1280,9 @@ impl SqlEditorWidget {
         let command = match request {
             LazyFetchRequest::More => LazyFetchCommand::FetchMore(self.lazy_fetch_batch_size()),
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
-            LazyFetchRequest::Cancel => LazyFetchCommand::GracefulClose,
+            LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscard => {
+                LazyFetchCommand::GracefulClose
+            }
         };
         handle.sender.send(command).is_ok()
     }
@@ -1311,16 +1318,20 @@ impl SqlEditorWidget {
         self.pooled_db_session.snapshot()
     }
 
-    fn cancel_active_lazy_fetch(&self) -> bool {
-        Self::cancel_lazy_fetch_handle(&self.active_lazy_fetch, &self.pooled_db_session, true)
+    fn cancel_active_lazy_fetch(&self, retain_session_on_cancel: bool) -> bool {
+        Self::cancel_lazy_fetch_handle(
+            &self.active_lazy_fetch,
+            &self.pooled_db_session,
+            retain_session_on_cancel,
+        )
     }
 
-    fn cancel_lazy_fetch_session(&self, session_id: u64) -> bool {
+    fn cancel_lazy_fetch_session(&self, session_id: u64, retain_session_on_cancel: bool) -> bool {
         Self::cancel_lazy_fetch_handle_for_session(
             &self.active_lazy_fetch,
             &self.pooled_db_session,
             Some(session_id),
-            true,
+            retain_session_on_cancel,
         )
     }
 
@@ -1351,10 +1362,17 @@ impl SqlEditorWidget {
                 if expected_session_id.is_some_and(|session_id| handle.session_id != session_id) {
                     return None;
                 }
+                let cancel_already_requested = handle.cancel_requested.load(Ordering::Relaxed);
                 if retain_session_on_cancel {
+                    if !cancel_already_requested {
+                        handle
+                            .retain_session_on_cancel
+                            .store(true, Ordering::Relaxed);
+                    }
+                } else {
                     handle
                         .retain_session_on_cancel
-                        .store(true, Ordering::Relaxed);
+                        .store(false, Ordering::Relaxed);
                 }
                 let first_cancel_request = !handle.cancel_requested.swap(true, Ordering::Relaxed);
                 let fetch_in_progress = handle.fetch_in_progress.load(Ordering::Relaxed);
@@ -2372,7 +2390,7 @@ impl SqlEditorWidget {
 
         // Set cancel flag immediately so the execution thread can check it
         store_mutex_bool(&self.cancel_flag, true);
-        self.cancel_active_lazy_fetch();
+        self.cancel_active_lazy_fetch(true);
 
         let current_query_connection = self.current_query_connection.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();

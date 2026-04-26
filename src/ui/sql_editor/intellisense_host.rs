@@ -251,7 +251,7 @@ impl SqlEditorWidget {
 
     pub fn cleanup_for_close(&mut self) {
         let query_was_running = self.is_query_running();
-        self.cancel_active_lazy_fetch();
+        self.cancel_active_lazy_fetch(false);
         self.pooled_db_session.clear();
         if !query_was_running {
             Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
