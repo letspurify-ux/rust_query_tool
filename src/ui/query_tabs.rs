@@ -1,7 +1,6 @@
 use fltk::{
     app,
-    enums::Align,
-    enums::Event,
+    enums::{Align, Event, FrameType},
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
 };
@@ -367,6 +366,7 @@ impl QueryTabsWidget {
         tabs.end();
         tabs.set_color(theme::panel_bg());
         tabs.set_selection_color(theme::selection_strong());
+        tabs.set_frame(FrameType::RFlatBox);
         tabs.set_label_color(theme::text_secondary());
         tabs.set_label_size((TAB_HEADER_HEIGHT - 8).max(8));
         // Center labels in tab headers.

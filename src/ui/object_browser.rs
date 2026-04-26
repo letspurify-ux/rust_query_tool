@@ -156,6 +156,7 @@ impl ObjectBrowserWidget {
         // Create a flex container for the filter input and tree
         let mut flex = Flex::default().with_pos(x, y).with_size(w, h);
         flex.set_type(FlexType::Column);
+        flex.set_margins(TOOLBAR_SPACING, 0, TOOLBAR_SPACING, 0);
         flex.set_spacing(DIALOG_SPACING);
 
         let mut scope_row = Flex::default();

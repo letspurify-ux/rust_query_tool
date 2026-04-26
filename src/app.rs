@@ -1,6 +1,6 @@
 use crate::ui::{theme, MainWindow};
 use crate::utils::{self, AppConfig};
-use fltk::app;
+use fltk::{app, enums::FrameType};
 
 pub struct StartupContext {
     pub config: AppConfig,
@@ -73,4 +73,8 @@ pub(crate) fn configure_fltk_globals(config: &AppConfig) {
     app::background(bg_r, bg_g, bg_b);
     let (fg_r, fg_g, fg_b) = theme::app_foreground().to_rgb();
     app::foreground(fg_r, fg_g, fg_b);
+
+    app::set_frame_type2(FrameType::UpBox, FrameType::RFlatBox);
+    app::set_frame_type2(FrameType::DownBox, FrameType::RFlatBox);
+    app::set_frame_border_radius_max(8);
 }

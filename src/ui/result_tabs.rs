@@ -1,6 +1,6 @@
 use fltk::{
     app,
-    enums::{Align, Event, Key},
+    enums::{Align, Event, FrameType, Key},
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
     text::{TextBuffer, TextDisplay},
@@ -509,6 +509,7 @@ impl ResultTabsWidget {
         let mut tabs = Tabs::new(x, y, w, h, None);
         tabs.set_color(theme::panel_bg());
         tabs.set_selection_color(theme::selection_strong());
+        tabs.set_frame(FrameType::RFlatBox);
         tabs.set_label_color(theme::text_secondary());
         tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
         // Center labels in tab headers.
