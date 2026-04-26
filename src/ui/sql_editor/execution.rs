@@ -103,6 +103,9 @@ struct QueryExecutionCleanupGuard {
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     cancel_flag: Arc<Mutex<bool>>,
     query_running: Arc<Mutex<bool>>,
+    current_operation_id: Arc<AtomicU64>,
+    current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
+    current_operation_autocommit: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
     previous_timeout: Option<Duration>,
     oracle_pooled_session: Option<(SharedDbSessionLease, u64, Arc<Connection>)>,
@@ -121,6 +124,9 @@ impl QueryExecutionCleanupGuard {
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: Arc<Mutex<bool>>,
         query_running: Arc<Mutex<bool>>,
+        current_operation_id: Arc<AtomicU64>,
+        current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
+        current_operation_autocommit: Arc<Mutex<bool>>,
     ) -> Self {
         Self {
             sender,
@@ -128,6 +134,9 @@ impl QueryExecutionCleanupGuard {
             current_mysql_cancel_context,
             cancel_flag,
             query_running,
+            current_operation_id,
+            current_operation_sql_kind,
+            current_operation_autocommit,
             timeout_connection: None,
             previous_timeout: None,
             oracle_pooled_session: None,
@@ -136,10 +145,9 @@ impl QueryExecutionCleanupGuard {
             oracle_pooled_session_requires_health_check: false,
             oracle_pooled_session_transaction_decision_on_cancel: false,
             oracle_pooled_session_transaction_decision_required: false,
-            execution_metadata:
-                crate::db::session_policy::ExecutionFinishedEvent::new(
-                    crate::db::DatabaseType::Oracle,
-                ),
+            execution_metadata: crate::db::session_policy::ExecutionFinishedEvent::new(
+                crate::db::DatabaseType::Oracle,
+            ),
         }
     }
 
@@ -164,10 +172,68 @@ impl QueryExecutionCleanupGuard {
         recoverable_timeout: bool,
         has_connection_error: bool,
     ) {
-        self.execution_metadata.cancelled = cancelled;
-        self.execution_metadata.timed_out = timed_out;
-        self.execution_metadata.recoverable_timeout = recoverable_timeout;
-        self.execution_metadata.has_connection_error = has_connection_error;
+        self.execution_metadata.cancelled |= cancelled;
+        self.execution_metadata.timed_out |= timed_out;
+        self.execution_metadata.has_connection_error |= has_connection_error;
+        if has_connection_error {
+            self.execution_metadata.recoverable_timeout = false;
+        } else {
+            self.execution_metadata.recoverable_timeout |= recoverable_timeout;
+        }
+    }
+
+    fn execution_metadata_mut(&mut self) -> &mut crate::db::session_policy::ExecutionFinishedEvent {
+        &mut self.execution_metadata
+    }
+
+    fn note_interrupt_kind(
+        event: &mut crate::db::session_policy::ExecutionFinishedEvent,
+        interrupt_kind: InterruptKind,
+    ) {
+        match interrupt_kind {
+            InterruptKind::None => {}
+            InterruptKind::Cancelled => {
+                event.cancelled = true;
+            }
+            InterruptKind::RecoverableTimeout => {
+                event.timed_out = true;
+                if !event.has_connection_error {
+                    event.recoverable_timeout = true;
+                }
+            }
+            InterruptKind::NonRecoverableTimeout => {
+                event.timed_out = true;
+                event.has_connection_error = true;
+                event.recoverable_timeout = false;
+            }
+            InterruptKind::ConnectionError => {
+                event.has_connection_error = true;
+                event.recoverable_timeout = false;
+            }
+            InterruptKind::UnsafeOrUnknown => {}
+        }
+    }
+
+    fn note_oracle_error(&mut self, err: &OracleError) {
+        let interrupt_kind = SqlEditorWidget::oracle_interrupt_kind_for_error(err);
+        Self::note_interrupt_kind(&mut self.execution_metadata, interrupt_kind);
+    }
+
+    fn note_mysql_message(
+        event: &mut crate::db::session_policy::ExecutionFinishedEvent,
+        message: &str,
+    ) {
+        let interrupt_kind = SqlEditorWidget::mysql_interrupt_kind_for_message(message);
+        Self::note_interrupt_kind(event, interrupt_kind);
+    }
+
+    fn note_mysql_message_if_present(
+        event: &mut Option<&mut crate::db::session_policy::ExecutionFinishedEvent>,
+        message: &str,
+    ) {
+        if let Some(event) = event.as_deref_mut() {
+            Self::note_mysql_message(event, message);
+        }
     }
 
     fn track_timeout(&mut self, connection: Arc<Connection>, previous_timeout: Option<Duration>) {
@@ -204,6 +270,14 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_transaction_decision_required = true;
     }
 
+    fn protect_oracle_dirty_statement_on_cancel(&mut self, auto_commit: bool) {
+        if auto_commit {
+            self.invalidate_oracle_pooled_session_on_cancel();
+        } else {
+            self.require_oracle_pooled_session_transaction_decision_on_cancel();
+        }
+    }
+
     fn clear_oracle_pooled_session_tracking(&mut self) {
         self.oracle_pooled_session = None;
         self.oracle_pooled_session_invalidated = false;
@@ -216,6 +290,14 @@ impl QueryExecutionCleanupGuard {
     fn clear_timeout_tracking(&mut self) {
         self.timeout_connection = None;
         self.previous_timeout = None;
+    }
+
+    fn oracle_cleanup_requires_health_check(
+        cancel_requested: bool,
+        explicit_health_check_required: bool,
+        transaction_decision_required: bool,
+    ) -> bool {
+        cancel_requested || explicit_health_check_required || transaction_decision_required
     }
 }
 
@@ -251,8 +333,12 @@ impl Drop for QueryExecutionCleanupGuard {
             if should_invalidate_oracle_session {
                 pooled_db_session.clear_oracle_if_current_connection(*connection_generation, conn);
             } else {
-                let health_check_ok = (!self.oracle_pooled_session_requires_health_check
-                    && !transaction_decision_required)
+                let health_check_required = Self::oracle_cleanup_requires_health_check(
+                    cancel_requested,
+                    self.oracle_pooled_session_requires_health_check,
+                    transaction_decision_required,
+                );
+                let health_check_ok = !health_check_required
                     || SqlEditorWidget::oracle_pooled_session_health_check(
                         conn.as_ref(),
                         "sql_editor::cleanup",
@@ -279,15 +365,22 @@ impl Drop for QueryExecutionCleanupGuard {
         // session.md §27.4: emit a single named completion event capturing
         // the policy-relevant execution metadata once timeout restore and
         // session-reuse decisions have been finalised.
-        self.execution_metadata.cancelled =
-            self.execution_metadata.cancelled || cancel_requested;
+        self.execution_metadata.cancelled = self.execution_metadata.cancelled || cancel_requested;
         self.execution_metadata.timeout_settings_restored = !oracle_timeout_reset_failed;
+        if self.execution_metadata.has_connection_error {
+            self.execution_metadata.recoverable_timeout = false;
+        }
         let _ = self.sender.send(QueryProgress::ExecutionFinished(
             self.execution_metadata.clone(),
         ));
 
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
         SqlEditorWidget::set_current_mysql_cancel_context(&self.current_mysql_cancel_context, None);
+        SqlEditorWidget::clear_current_operation_snapshot(
+            &self.current_operation_id,
+            &self.current_operation_sql_kind,
+            &self.current_operation_autocommit,
+        );
         store_mutex_bool(&self.cancel_flag, false);
         // Keep execution state fail-safe even if the UI progress poller has
         // stopped (e.g. tab closed while worker thread is still unwinding).
@@ -2883,6 +2976,7 @@ impl SqlEditorWidget {
         lazy_fetch_batch_size: usize,
         initial_auto_commit: bool,
         db_activity: &str,
+        mut execution_metadata: Option<&mut crate::db::session_policy::ExecutionFinishedEvent>,
     ) {
         let items =
             Self::build_mysql_batch_items(sql_text, initial_mysql_delimiter_override.as_deref());
@@ -3635,6 +3729,10 @@ impl SqlEditorWidget {
                                     app::awake();
                                 }
                                 Err(message) => {
+                                    QueryExecutionCleanupGuard::note_mysql_message_if_present(
+                                        &mut execution_metadata,
+                                        &message,
+                                    );
                                     let (cancelled, timed_out) = mysql_interruption_flags(&message);
                                     SqlEditorWidget::emit_script_message(
                                         sender,
@@ -3737,6 +3835,10 @@ impl SqlEditorWidget {
                                     result_index += 1;
                                 }
                                 Err(message) => {
+                                    QueryExecutionCleanupGuard::note_mysql_message_if_present(
+                                        &mut execution_metadata,
+                                        &message,
+                                    );
                                     let (cancelled, timed_out) = mysql_interruption_flags(&message);
                                     let emitted = SqlEditorWidget::emit_non_select_result(
                                         sender,
@@ -3925,6 +4027,10 @@ impl SqlEditorWidget {
                                 continue;
                             }
                             Err(message) => {
+                                QueryExecutionCleanupGuard::note_mysql_message_if_present(
+                                    &mut execution_metadata,
+                                    &message,
+                                );
                                 let (cancelled, timed_out) = mysql_interruption_flags(&message);
                                 if script_mode {
                                     let emitted = SqlEditorWidget::emit_non_select_result(
@@ -4042,6 +4148,10 @@ impl SqlEditorWidget {
                             );
                         }
                         Err(message) => {
+                            QueryExecutionCleanupGuard::note_mysql_message_if_present(
+                                &mut execution_metadata,
+                                &message,
+                            );
                             let (cancelled, timed_out) = mysql_interruption_flags(&message);
                             let emitted = SqlEditorWidget::emit_non_select_result(
                                 sender,
@@ -4078,6 +4188,8 @@ impl SqlEditorWidget {
             mysql_batch_may_hold_named_lock.get(),
             mysql_batch_saw_uncertain_named_lock_release.get(),
             load_mutex_bool(cancel_flag),
+            script_mode,
+            auto_commit,
             db_activity,
         );
     }
@@ -4136,6 +4248,7 @@ impl SqlEditorWidget {
         // Build an execution policy once and reuse it for both UI pre-check and worker startup.
         let startup_policy = Self::execution_startup_policy(sql);
 
+        let operation_autocommit;
         // Pre-check connection status without holding lock for long
         {
             let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
@@ -4143,6 +4256,11 @@ impl SqlEditorWidget {
                 app::awake();
                 return;
             };
+
+            operation_autocommit = SqlEditorWidget::mysql_auto_commit_for_execution(
+                conn_guard.auto_commit(),
+                &self.mysql_auto_commit_override,
+            );
 
             // Keep UI responsive: avoid network round-trip checks (ping) on the UI thread.
             // The execution worker performs full liveness validation.
@@ -4162,11 +4280,17 @@ impl SqlEditorWidget {
         let shared_connection = self.connection.clone();
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let sql_text = sql.to_string();
+        let operation_id = self.next_operation_id();
+        let operation_sql_kind = Self::operation_sql_kind(&sql_text, script_mode);
+        self.set_current_operation_snapshot(operation_id, operation_sql_kind, operation_autocommit);
         let db_activity = Self::db_activity_label_for_sql(&sql_text, script_mode);
         let sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let pooled_db_session = self.pooled_db_session.clone();
+        let current_operation_id = self.current_operation_id.clone();
+        let current_operation_sql_kind = self.current_operation_sql_kind.clone();
+        let current_operation_autocommit = self.current_operation_autocommit.clone();
         let mysql_auto_commit_override = self.mysql_auto_commit_override.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
         let next_lazy_fetch_session_id = self.next_lazy_fetch_session_id.clone();
@@ -4186,6 +4310,9 @@ impl SqlEditorWidget {
         let spawn_error_cancel_flag = cancel_flag.clone();
         let spawn_error_current_query_connection = current_query_connection.clone();
         let spawn_error_current_mysql_cancel_context = current_mysql_cancel_context.clone();
+        let spawn_error_current_operation_id = current_operation_id.clone();
+        let spawn_error_current_operation_sql_kind = current_operation_sql_kind.clone();
+        let spawn_error_current_operation_autocommit = current_operation_autocommit.clone();
         let spawn_result = thread::Builder::new()
             .name("query-execution".to_string())
             .spawn(move || {
@@ -4196,6 +4323,9 @@ impl SqlEditorWidget {
                     current_mysql_cancel_context.clone(),
                     cancel_flag.clone(),
                     query_running.clone(),
+                    current_operation_id.clone(),
+                    current_operation_sql_kind.clone(),
+                    current_operation_autocommit.clone(),
                 );
 
                 // Acquire connection lock inside thread and hold it during execution
@@ -4219,15 +4349,10 @@ impl SqlEditorWidget {
                 // Populate the cleanup guard's §27.4 execution metadata up
                 // front. `note_execution_outcome` may refine these later
                 // when an interrupt or timeout outcome is known.
-                let snapshot_sql_kind = if script_mode {
-                    crate::db::session_policy::SqlKind::Script
-                } else {
-                    crate::db::session_policy::classify_sql(&sql_text)
-                };
                 cleanup.track_execution_metadata(
                     db_type,
-                    snapshot_sql_kind,
-                    0,
+                    operation_sql_kind,
+                    operation_id,
                     conn_guard.connection_generation(),
                 );
 
@@ -4275,6 +4400,7 @@ impl SqlEditorWidget {
                             lazy_fetch_batch_size,
                             auto_commit,
                             &db_activity,
+                            Some(cleanup.execution_metadata_mut()),
                         );
                         return;
                     }
@@ -6794,6 +6920,7 @@ impl SqlEditorWidget {
                                     },
                                     Err(err) => {
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        cleanup.note_oracle_error(&err);
                                         SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                             &mut cleanup,
                                             &err,
@@ -6868,6 +6995,7 @@ impl SqlEditorWidget {
                                     },
                                     Err(err) => {
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        cleanup.note_oracle_error(&err);
                                         SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                             &mut cleanup,
                                             &err,
@@ -6972,6 +7100,7 @@ impl SqlEditorWidget {
                             let is_select = QueryExecutor::is_select_statement(&sql_text);
 
                             if exec_call.is_some() || is_plsql_block {
+                                cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
                                 let mut sql_to_execute =
                                     exec_call.unwrap_or_else(|| sql_text.to_string());
                                 if is_plsql_block {
@@ -7028,6 +7157,7 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        cleanup.note_oracle_error(&err);
                                         if !auto_commit
                                             && (cancelled || timed_out)
                                             && !SqlEditorWidget::oracle_error_message_has_connection_error(
@@ -7180,6 +7310,7 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                            cleanup.note_oracle_error(&err);
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                                 &mut cleanup,
                                                 &err,
@@ -7246,6 +7377,7 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        cleanup.note_oracle_error(&err);
                                         SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                             &mut cleanup,
                                             &err,
@@ -7436,11 +7568,17 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::timeout_message(query_timeout);
                                                 query_result.success = false;
                                                 cursor_timed_out = true;
+                                                cleanup.note_execution_outcome(
+                                                    false, true, true, false,
+                                                );
                                                 cleanup.invalidate_oracle_pooled_session();
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
+                                                cleanup.note_execution_outcome(
+                                                    true, false, false, false,
+                                                );
                                             }
                                             let interrupted = cursor_timed_out || was_cancelled;
                                             SqlEditorWidget::flush_buffered_rows(
@@ -7504,6 +7642,7 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
+                                            cleanup.note_oracle_error(&err);
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                                 &mut cleanup,
                                                 &err,
@@ -7625,11 +7764,17 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::timeout_message(query_timeout);
                                                 query_result.success = false;
                                                 cursor_timed_out = true;
+                                                cleanup.note_execution_outcome(
+                                                    false, true, true, false,
+                                                );
                                                 cleanup.invalidate_oracle_pooled_session();
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
+                                                cleanup.note_execution_outcome(
+                                                    true, false, false, false,
+                                                );
                                             }
                                             let interrupted = cursor_timed_out || was_cancelled;
                                             SqlEditorWidget::flush_buffered_rows(
@@ -7678,6 +7823,7 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
+                                            cleanup.note_oracle_error(&err);
                                             SqlEditorWidget::invalidate_oracle_pooled_session_after_error(
                                                 &mut cleanup,
                                                 &err,
@@ -8087,6 +8233,9 @@ impl SqlEditorWidget {
                                                 query_result.success = false;
                                                 timed_out = true;
                                                 statement_interrupted = true;
+                                                cleanup.note_execution_outcome(
+                                                    false, true, true, false,
+                                                );
                                                 cleanup
                                                     .require_oracle_pooled_session_health_check();
                                             } else if was_cancelled {
@@ -8094,6 +8243,9 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
                                                 statement_interrupted = true;
+                                                cleanup.note_execution_outcome(
+                                                    true, false, false, false,
+                                                );
                                                 cleanup
                                                     .require_oracle_pooled_session_health_check();
                                             }
@@ -8111,6 +8263,7 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                            cleanup.note_oracle_error(&err);
                                             statement_interrupted = timed_out || cancelled;
                                             if statement_interrupted {
                                                 cleanup
@@ -8246,12 +8399,7 @@ impl SqlEditorWidget {
                                     stop_execution = true;
                                 }
                             } else {
-                                if auto_commit {
-                                    cleanup.invalidate_oracle_pooled_session_on_cancel();
-                                } else {
-                                    cleanup
-                                        .require_oracle_pooled_session_transaction_decision_on_cancel();
-                                }
+                                cleanup.protect_oracle_dirty_statement_on_cancel(auto_commit);
                                 let sql_to_execute = if is_compiled_plsql {
                                     SqlEditorWidget::ensure_plsql_terminator(&sql_text)
                                 } else {
@@ -8307,6 +8455,7 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        cleanup.note_oracle_error(&err);
                                         if !auto_commit
                                             && (cancelled || timed_out)
                                             && !SqlEditorWidget::oracle_error_message_has_connection_error(
@@ -8643,6 +8792,11 @@ impl SqlEditorWidget {
             SqlEditorWidget::set_current_mysql_cancel_context(
                 &spawn_error_current_mysql_cancel_context,
                 None,
+            );
+            SqlEditorWidget::clear_current_operation_snapshot(
+                &spawn_error_current_operation_id,
+                &spawn_error_current_operation_sql_kind,
+                &spawn_error_current_operation_autocommit,
             );
             SqlEditorWidget::finalize_execution_state(
                 &spawn_error_query_running,
@@ -10260,6 +10414,8 @@ impl SqlEditorWidget {
         batch_may_hold_named_lock: bool,
         batch_saw_uncertain_named_lock_release: bool,
         batch_cancelled: bool,
+        script_mode: bool,
+        auto_commit: bool,
         db_activity: &str,
     ) {
         let connection_generation = {
@@ -10279,11 +10435,17 @@ impl SqlEditorWidget {
             return;
         };
         if batch_cancelled {
-            let requires_transaction_decision = prior_requires_transaction_decision
-                || batch_may_have_uncommitted_work
-                || batch_may_hold_table_lock
-                || batch_may_hold_named_lock
-                || (batch_saw_uncertain_named_lock_release && prior_may_have_uncommitted_work);
+            let requires_transaction_decision =
+                Self::mysql_cancelled_batch_requires_transaction_decision(
+                    prior_requires_transaction_decision,
+                    batch_may_have_uncommitted_work,
+                    batch_may_hold_table_lock,
+                    batch_may_hold_named_lock,
+                    batch_saw_uncertain_named_lock_release,
+                    prior_may_have_uncommitted_work,
+                    script_mode,
+                    auto_commit,
+                );
             if requires_transaction_decision {
                 if Self::sync_mysql_pooled_session_info(
                     shared_connection,
@@ -10302,7 +10464,7 @@ impl SqlEditorWidget {
                         db_activity,
                     );
                 }
-            } else {
+            } else if !script_mode {
                 Self::retain_mysql_pooled_session_if_current(
                     shared_connection,
                     pooled_db_session,
@@ -10333,6 +10495,24 @@ impl SqlEditorWidget {
             prior_requires_transaction_decision,
             db_activity,
         );
+    }
+
+    fn mysql_cancelled_batch_requires_transaction_decision(
+        prior_requires_transaction_decision: bool,
+        batch_may_have_uncommitted_work: bool,
+        batch_may_hold_table_lock: bool,
+        batch_may_hold_named_lock: bool,
+        batch_saw_uncertain_named_lock_release: bool,
+        prior_may_have_uncommitted_work: bool,
+        script_mode: bool,
+        auto_commit: bool,
+    ) -> bool {
+        prior_requires_transaction_decision
+            || batch_may_have_uncommitted_work
+            || batch_may_hold_table_lock
+            || batch_may_hold_named_lock
+            || (batch_saw_uncertain_named_lock_release && prior_may_have_uncommitted_work)
+            || (script_mode && !auto_commit)
     }
 
     pub(super) fn mysql_session_state_hint_for_sql(sql: &str) -> MySqlSessionStateHint {
@@ -11667,9 +11847,71 @@ mod query_execution_cleanup_tests {
     use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind};
     use std::env;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    fn new_test_cleanup_guard(
+        sender: mpsc::Sender<QueryProgress>,
+        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        cancel_flag: Arc<Mutex<bool>>,
+        query_running: Arc<Mutex<bool>>,
+    ) -> QueryExecutionCleanupGuard {
+        QueryExecutionCleanupGuard::new(
+            sender,
+            current_query_connection,
+            current_mysql_cancel_context,
+            cancel_flag,
+            query_running,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown)),
+            Arc::new(Mutex::new(true)),
+        )
+    }
+
+    #[test]
+    fn oracle_cleanup_requires_health_check_after_cancel() {
+        assert!(
+            QueryExecutionCleanupGuard::oracle_cleanup_requires_health_check(true, false, false)
+        );
+        assert!(
+            QueryExecutionCleanupGuard::oracle_cleanup_requires_health_check(false, true, false)
+        );
+        assert!(
+            QueryExecutionCleanupGuard::oracle_cleanup_requires_health_check(false, false, true)
+        );
+        assert!(
+            !QueryExecutionCleanupGuard::oracle_cleanup_requires_health_check(false, false, false)
+        );
+    }
+
+    #[test]
+    fn oracle_dirty_statement_cancel_policy_replaces_or_requires_decision() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        cleanup.protect_oracle_dirty_statement_on_cancel(true);
+        assert!(cleanup.oracle_pooled_session_invalidated_on_cancel);
+        assert!(!cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+        cleanup.protect_oracle_dirty_statement_on_cancel(false);
+        assert!(!cleanup.oracle_pooled_session_invalidated_on_cancel);
+        assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+    }
 
     #[test]
     fn cleanup_guard_resets_cancel_and_emits_batch_finished_on_drop() {
@@ -11682,7 +11924,7 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(None));
 
         {
-            let _guard = QueryExecutionCleanupGuard::new(
+            let _guard = new_test_cleanup_guard(
                 sender,
                 current_query_connection.clone(),
                 current_mysql_cancel_context.clone(),
@@ -11699,10 +11941,21 @@ mod query_execution_cleanup_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
-        let msg = receiver
-            .try_recv()
-            .expect("BatchFinished should be emitted");
-        assert!(matches!(msg, QueryProgress::BatchFinished));
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|msg| matches!(msg, QueryProgress::BatchFinished)),
+            "BatchFinished should be emitted"
+        );
+        assert!(
+            events.iter().any(|msg| matches!(
+                msg,
+                QueryProgress::ExecutionFinished(event)
+                    if event.cancelled && event.timeout_settings_restored
+            )),
+            "ExecutionFinished should carry cancel cleanup metadata"
+        );
         assert!(current_query_connection
             .lock()
             .expect("connection mutex should not be poisoned")
@@ -11729,7 +11982,7 @@ mod query_execution_cleanup_tests {
             let current_mysql_cancel_context = current_mysql_cancel_context;
             let query_running = query_running.clone();
             move || {
-                let _guard = QueryExecutionCleanupGuard::new(
+                let _guard = new_test_cleanup_guard(
                     sender,
                     current_query_connection,
                     current_mysql_cancel_context,
@@ -11749,10 +12002,13 @@ mod query_execution_cleanup_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
-        let msg = receiver
-            .try_recv()
-            .expect("BatchFinished should be emitted");
-        assert!(matches!(msg, QueryProgress::BatchFinished));
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|msg| matches!(msg, QueryProgress::BatchFinished)),
+            "BatchFinished should be emitted"
+        );
     }
 
     fn oracle_test_connection() -> Option<(DatabaseConnection, Arc<Connection>)> {
@@ -11826,7 +12082,7 @@ mod query_execution_cleanup_tests {
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         {
             let (sender, _receiver) = mpsc::channel();
-            let mut cleanup = QueryExecutionCleanupGuard::new(
+            let mut cleanup = new_test_cleanup_guard(
                 sender,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -11850,7 +12106,7 @@ mod query_execution_cleanup_tests {
         pooled_db_session.clear();
         {
             let (sender, _receiver) = mpsc::channel();
-            let mut cleanup = QueryExecutionCleanupGuard::new(
+            let mut cleanup = new_test_cleanup_guard(
                 sender,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -11893,7 +12149,7 @@ mod query_execution_cleanup_tests {
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         {
             let (sender, _receiver) = mpsc::channel();
-            let mut cleanup = QueryExecutionCleanupGuard::new(
+            let mut cleanup = new_test_cleanup_guard(
                 sender,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -11924,7 +12180,7 @@ mod query_execution_cleanup_tests {
             Arc::new(Mutex::new(None));
 
         let drop_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = QueryExecutionCleanupGuard::new(
+            let _guard = new_test_cleanup_guard(
                 sender,
                 current_query_connection,
                 current_mysql_cancel_context,
@@ -11963,7 +12219,7 @@ mod query_execution_cleanup_tests {
         }));
 
         {
-            let _guard = QueryExecutionCleanupGuard::new(
+            let _guard = new_test_cleanup_guard(
                 sender,
                 current_query_connection,
                 current_mysql_cancel_context,
@@ -11980,10 +12236,13 @@ mod query_execution_cleanup_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
-        let msg = receiver
-            .try_recv()
-            .expect("BatchFinished should be emitted");
-        assert!(matches!(msg, QueryProgress::BatchFinished));
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|msg| matches!(msg, QueryProgress::BatchFinished)),
+            "BatchFinished should be emitted"
+        );
     }
 
     #[test]
@@ -12758,6 +13017,33 @@ mod query_execution_cleanup_tests {
         );
         assert!(!batch_may_hold_named_lock.get());
         assert!(!batch_saw_uncertain_named_lock_release.get());
+    }
+
+    #[test]
+    fn mysql_cancelled_script_with_autocommit_off_requires_transaction_decision() {
+        assert!(
+            SqlEditorWidget::mysql_cancelled_batch_requires_transaction_decision(
+                false, false, false, false, false, false, true, false
+            )
+        );
+    }
+
+    #[test]
+    fn mysql_cancelled_script_with_autocommit_on_does_not_request_transaction_decision() {
+        assert!(
+            !SqlEditorWidget::mysql_cancelled_batch_requires_transaction_decision(
+                false, false, false, false, false, false, true, true
+            )
+        );
+    }
+
+    #[test]
+    fn mysql_cancelled_statement_with_dirty_batch_requires_transaction_decision() {
+        assert!(
+            SqlEditorWidget::mysql_cancelled_batch_requires_transaction_decision(
+                false, true, false, false, false, false, false, true
+            )
+        );
     }
 
     #[test]
@@ -13650,6 +13936,7 @@ mod mysql_batch_execution_regression_tests {
                 crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
                 self.initial_auto_commit,
                 db_activity,
+                None,
             );
             drop(sender);
 
@@ -13699,6 +13986,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             initial_auto_commit,
             db_activity,
+            None,
         );
         drop(sender);
 
@@ -13787,10 +14075,7 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::MetadataRefreshNeeded => "MetadataRefreshNeeded".to_string(),
                 QueryProgress::ExecutionFinished(event) => format!(
                     "ExecutionFinished(db={:?}, kind={:?}, cancelled={}, timed_out={})",
-                    event.db_type,
-                    event.sql_kind,
-                    event.cancelled,
-                    event.timed_out
+                    event.db_type, event.sql_kind, event.cancelled, event.timed_out
                 ),
             })
             .collect::<Vec<_>>()
@@ -13864,6 +14149,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
             db_activity,
+            None,
         );
         drop(sender);
 
@@ -13975,6 +14261,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
             db_activity,
+            None,
         );
         drop(sender);
 
@@ -14119,6 +14406,7 @@ mod mysql_batch_execution_regression_tests {
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
             "mysql transaction mode integration",
+            None,
         );
         drop(sender);
 
@@ -14570,6 +14858,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             lazy_fetch_batch,
             true,
             "mysql lazy fetch integration",
+            None,
         );
         drop(sender);
 

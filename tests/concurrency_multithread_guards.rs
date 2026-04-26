@@ -119,7 +119,8 @@ fn oracle_transaction_actions_take_reusable_pool_session_exclusively() {
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
     assert!(
-        content.contains(".take_reusable_with_state(\n                                connection_generation,\n                                crate::db::DatabaseType::Oracle,"),
+        content.contains(".take_reusable_with_state(\n                                connection_generation,\n                                crate::db::DatabaseType::Oracle,")
+            || content.contains(".take_reusable_with_decision_state(\n                                connection_generation,\n                                crate::db::DatabaseType::Oracle,"),
         "Oracle transaction actions must take the reusable lease out of the shared slot before using it"
     );
     assert!(

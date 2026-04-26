@@ -4,7 +4,7 @@
 // action path); this module provides the named types, classifier, and
 // decision functions the spec requires so they can be referenced uniformly.
 
-use crate::db::connection::DatabaseType;
+use crate::{db::connection::DatabaseType, sql_text};
 
 /// SQL classification for cancel / session-reuse decisions (session.md §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +128,7 @@ pub struct InterruptDecisionContext {
     pub fetch_worker_done: bool,
     pub timed_out: bool,
     pub recoverable_timeout: bool,
+    pub cancelled: bool,
     pub timeout_settings_restored: bool,
     pub health_check_ok: bool,
     pub autocommit: bool,
@@ -175,6 +176,10 @@ pub fn decide_session_after_interrupt(ctx: InterruptDecisionContext) -> SessionD
     }
 
     if ctx.timed_out && !ctx.recoverable_timeout {
+        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
+    }
+
+    if !ctx.cancelled && !(ctx.timed_out && ctx.recoverable_timeout) {
         return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
     }
 
@@ -307,29 +312,103 @@ pub fn classify_sql(sql: &str) -> SqlKind {
         return SqlKind::Unknown;
     }
 
+    let first_word = first_sql_word(stripped).unwrap_or_default();
+
+    match first_word.as_str() {
+        "BEGIN" | "DECLARE" => return SqlKind::PlsqlOrProcedure,
+        _ => {}
+    }
+
     if contains_multiple_statements(stripped) {
         return SqlKind::Script;
     }
 
-    let upper = stripped.to_ascii_uppercase();
-    let first_word = upper.split_whitespace().next().unwrap_or("");
+    classify_first_word(&first_word, stripped)
+}
 
+fn classify_first_word(first_word: &str, sql: &str) -> SqlKind {
     match first_word {
-        "SELECT" | "WITH" | "EXPLAIN" | "DESCRIBE" | "DESC" | "SHOW" => SqlKind::SelectLike,
+        "WITH" => classify_with_sql(sql),
+        "SELECT" | "EXPLAIN" | "DESCRIBE" | "DESC" | "SHOW" => SqlKind::SelectLike,
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "REPLACE" | "LOAD" => SqlKind::Dml,
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => {
             SqlKind::Ddl
         }
-        "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE" => SqlKind::PlsqlOrProcedure,
+        "CALL" | "EXEC" | "EXECUTE" => SqlKind::PlsqlOrProcedure,
         "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "SET" | "START" => SqlKind::TransactionControl,
         _ => SqlKind::Unknown,
     }
+}
+
+fn classify_with_sql(sql: &str) -> SqlKind {
+    let Some((with_token, _, mut pos)) = next_top_level_word(sql, 0) else {
+        return SqlKind::Unknown;
+    };
+    if with_token != "WITH" {
+        return SqlKind::Unknown;
+    }
+
+    if let Some((token, _, after_token)) = next_top_level_word(sql, pos) {
+        if token == "RECURSIVE" {
+            pos = after_token;
+        }
+    }
+
+    loop {
+        let Some((_cte_name, _, after_name)) = next_top_level_word(sql, pos) else {
+            return SqlKind::Unknown;
+        };
+        pos = after_name;
+        pos = skip_ws_and_comments(sql, pos);
+
+        if sql.as_bytes().get(pos) == Some(&b'(') {
+            let Some(after_columns) = skip_balanced_parens(sql, pos) else {
+                return SqlKind::Unknown;
+            };
+            pos = skip_ws_and_comments(sql, after_columns);
+        }
+
+        let Some((as_token, _, after_as)) = next_top_level_word(sql, pos) else {
+            return SqlKind::Unknown;
+        };
+        if as_token != "AS" {
+            return SqlKind::Unknown;
+        }
+
+        pos = skip_ws_and_comments(sql, after_as);
+        if sql.as_bytes().get(pos) != Some(&b'(') {
+            return SqlKind::Unknown;
+        }
+        let Some(after_cte_body) = skip_balanced_parens(sql, pos) else {
+            return SqlKind::Unknown;
+        };
+
+        pos = skip_ws_and_comments(sql, after_cte_body);
+        if sql.as_bytes().get(pos) == Some(&b',') {
+            pos += 1;
+            continue;
+        }
+
+        let Some((main_token, main_start, _)) = next_top_level_word(sql, pos) else {
+            return SqlKind::Unknown;
+        };
+        return classify_first_word(&main_token, &sql[main_start..]);
+    }
+}
+
+fn first_sql_word(sql: &str) -> Option<String> {
+    next_top_level_word(sql, 0).map(|(word, _, _)| word)
 }
 
 fn strip_leading_comments_and_whitespace(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
         if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(idx) => s = rest[idx + 1..].trim_start(),
+                None => return "",
+            }
+        } else if let Some(rest) = s.strip_prefix('#') {
             match rest.find('\n') {
                 Some(idx) => s = rest[idx + 1..].trim_start(),
                 None => return "",
@@ -347,13 +426,215 @@ fn strip_leading_comments_and_whitespace(sql: &str) -> &str {
 }
 
 fn contains_multiple_statements(sql: &str) -> bool {
-    // Conservative heuristic: a `;` outside the trailing whitespace suggests
-    // a multi-statement script. Strings/quotes are not parsed here; this is
-    // intentionally lenient because Script -> ReplacePhysicalSession is the
-    // safe direction (session.md §6.5).
-    let trimmed = sql.trim_end();
-    let trimmed = trimmed.trim_end_matches(';');
-    trimmed.contains(';')
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if let Some(next) = skip_ignored_span(sql, idx) {
+            idx = next;
+            continue;
+        }
+        if bytes[idx] == b';' && has_significant_sql_after(sql, idx + 1) {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn has_significant_sql_after(sql: &str, mut idx: usize) -> bool {
+    let bytes = sql.as_bytes();
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() || bytes[idx] == b';' {
+            idx += 1;
+            continue;
+        }
+        if let Some(next) = skip_comment(sql, idx) {
+            idx = next;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn next_top_level_word(sql: &str, mut idx: usize) -> Option<(String, usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    while idx < bytes.len() {
+        if let Some(next) = skip_ignored_span(sql, idx) {
+            idx = next;
+            continue;
+        }
+        match bytes[idx] {
+            b'(' => {
+                depth = depth.saturating_add(1);
+                idx += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+            }
+            byte if depth == 0 && is_word_start(byte) => {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && is_word_part(bytes[idx]) {
+                    idx += 1;
+                }
+                let upper = sql[start..idx].to_ascii_uppercase();
+                return Some((upper, start, idx));
+            }
+            _ => idx += 1,
+        }
+    }
+    None
+}
+
+fn skip_ws_and_comments(sql: &str, mut idx: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+        if let Some(next) = skip_comment(sql, idx) {
+            idx = next;
+            continue;
+        }
+        break;
+    }
+    idx
+}
+
+fn skip_balanced_parens(sql: &str, mut idx: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(idx) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    while idx < bytes.len() {
+        if let Some(next) = skip_ignored_span(sql, idx) {
+            idx = next;
+            continue;
+        }
+        match bytes[idx] {
+            b'(' => {
+                depth += 1;
+                idx += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => idx += 1,
+        }
+    }
+    None
+}
+
+fn skip_ignored_span(sql: &str, idx: usize) -> Option<usize> {
+    skip_comment(sql, idx)
+        .or_else(|| skip_q_quote(sql, idx))
+        .or_else(|| skip_quoted(sql, idx))
+}
+
+fn skip_comment(sql: &str, idx: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(idx..idx + 2) == Some(b"--") {
+        return Some(
+            bytes[idx..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| idx + offset + 1)
+                .unwrap_or(bytes.len()),
+        );
+    }
+    if bytes.get(idx) == Some(&b'#') {
+        return Some(
+            bytes[idx..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| idx + offset + 1)
+                .unwrap_or(bytes.len()),
+        );
+    }
+    if bytes.get(idx..idx + 2) == Some(b"/*") {
+        return Some(
+            sql[idx + 2..]
+                .find("*/")
+                .map(|offset| idx + 2 + offset + 2)
+                .unwrap_or(bytes.len()),
+        );
+    }
+    None
+}
+
+fn skip_quoted(sql: &str, idx: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let quote = *bytes.get(idx)?;
+    if !matches!(quote, b'\'' | b'"' | b'`') {
+        return None;
+    }
+    let mut pos = idx + 1;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\\' {
+            pos = pos.saturating_add(2);
+            continue;
+        }
+        if bytes[pos] == quote {
+            if bytes.get(pos + 1) == Some(&quote) {
+                pos += 2;
+            } else {
+                return Some(pos + 1);
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    Some(bytes.len())
+}
+
+fn skip_q_quote(sql: &str, idx: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let (prefix_len, delimiter) = q_quote_prefix(bytes, idx)?;
+    let closing = sql_text::q_quote_closing_byte(delimiter);
+    let mut pos = idx + prefix_len;
+    while pos + 1 < bytes.len() {
+        if bytes[pos] == closing && bytes[pos + 1] == b'\'' {
+            return Some(pos + 2);
+        }
+        pos += 1;
+    }
+    Some(bytes.len())
+}
+
+fn q_quote_prefix(bytes: &[u8], idx: usize) -> Option<(usize, u8)> {
+    if idx > 0 && is_word_part(bytes[idx - 1]) {
+        return None;
+    }
+    let first = bytes.get(idx)?.to_ascii_uppercase();
+    if first == b'Q' && bytes.get(idx + 1) == Some(&b'\'') {
+        let delimiter = *bytes.get(idx + 2)?;
+        return sql_text::is_valid_q_quote_delimiter_byte(delimiter).then_some((3, delimiter));
+    }
+    if first == b'N'
+        && bytes.get(idx + 1).map(u8::to_ascii_uppercase) == Some(b'Q')
+        && bytes.get(idx + 2) == Some(&b'\'')
+    {
+        let delimiter = *bytes.get(idx + 3)?;
+        return sql_text::is_valid_q_quote_delimiter_byte(delimiter).then_some((4, delimiter));
+    }
+    None
+}
+
+fn is_word_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_word_part(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte == b'#'
 }
 
 #[cfg(test)]
@@ -373,6 +654,7 @@ mod tests {
             fetch_worker_done: false,
             timed_out: false,
             recoverable_timeout: false,
+            cancelled: true,
             timeout_settings_restored: true,
             health_check_ok: true,
             autocommit: true,
@@ -522,11 +804,22 @@ mod tests {
     #[test]
     fn recoverable_timeout_select_reuses_session() {
         let mut ctx = base_ctx();
+        ctx.cancelled = false;
         ctx.timed_out = true;
         ctx.recoverable_timeout = true;
         assert_eq!(
             decide_session_after_interrupt(ctx),
             SessionDecision::ReuseSamePhysicalSession
+        );
+    }
+
+    #[test]
+    fn select_without_cancel_or_recoverable_timeout_replaces_session() {
+        let mut ctx = base_ctx();
+        ctx.cancelled = false;
+        assert_eq!(
+            decide_session_after_interrupt(ctx),
+            SessionDecision::ReplacePhysicalSessionKeepUiConnected
         );
     }
 
@@ -553,8 +846,22 @@ mod tests {
     #[test]
     fn classify_select() {
         assert_eq!(classify_sql("SELECT * FROM t"), SqlKind::SelectLike);
-        assert_eq!(classify_sql("  with x as (select 1) select * from x"), SqlKind::SelectLike);
-        assert_eq!(classify_sql("/* hi */ -- a\n select 1"), SqlKind::SelectLike);
+        assert_eq!(
+            classify_sql("  with x as (select 1) select * from x"),
+            SqlKind::SelectLike
+        );
+        assert_eq!(
+            classify_sql("/* hi */ -- a\n select 1"),
+            SqlKind::SelectLike
+        );
+        assert_eq!(
+            classify_sql("SELECT ';' AS semi FROM dual"),
+            SqlKind::SelectLike
+        );
+        assert_eq!(
+            classify_sql("SELECT q'[a;b]' AS semi FROM dual"),
+            SqlKind::SelectLike
+        );
     }
 
     #[test]
@@ -563,6 +870,14 @@ mod tests {
         assert_eq!(classify_sql("update t set a=1"), SqlKind::Dml);
         assert_eq!(classify_sql("DELETE FROM t"), SqlKind::Dml);
         assert_eq!(classify_sql("MERGE INTO t USING s ON ..."), SqlKind::Dml);
+        assert_eq!(
+            classify_sql("WITH x AS (SELECT 1 id) UPDATE t SET id = 1"),
+            SqlKind::Dml
+        );
+        assert_eq!(
+            classify_sql("WITH x AS (SELECT 1 id) DELETE FROM t WHERE id IN (SELECT id FROM x)"),
+            SqlKind::Dml
+        );
     }
 
     #[test]
@@ -575,7 +890,11 @@ mod tests {
 
     #[test]
     fn classify_plsql() {
-        assert_eq!(classify_sql("BEGIN NULL; END;"), SqlKind::Script);
+        assert_eq!(classify_sql("BEGIN NULL; END;"), SqlKind::PlsqlOrProcedure);
+        assert_eq!(
+            classify_sql("DECLARE x NUMBER; BEGIN NULL; END;"),
+            SqlKind::PlsqlOrProcedure
+        );
         assert_eq!(classify_sql("CALL my_proc(1)"), SqlKind::PlsqlOrProcedure);
         assert_eq!(classify_sql("DECLARE x int"), SqlKind::PlsqlOrProcedure);
     }
@@ -584,15 +903,17 @@ mod tests {
     fn classify_transaction_control() {
         assert_eq!(classify_sql("COMMIT"), SqlKind::TransactionControl);
         assert_eq!(classify_sql("rollback"), SqlKind::TransactionControl);
-        assert_eq!(classify_sql("SET autocommit = 0"), SqlKind::TransactionControl);
+        assert_eq!(
+            classify_sql("SET autocommit = 0"),
+            SqlKind::TransactionControl
+        );
     }
 
     #[test]
     fn classify_script() {
-        assert_eq!(
-            classify_sql("SELECT 1; SELECT 2;"),
-            SqlKind::Script
-        );
+        assert_eq!(classify_sql("SELECT 1; SELECT 2;"), SqlKind::Script);
+        assert_eq!(classify_sql("SELECT 1; -- done\nSELECT 2"), SqlKind::Script);
+        assert_eq!(classify_sql("SELECT 1; -- done"), SqlKind::SelectLike);
     }
 
     #[test]

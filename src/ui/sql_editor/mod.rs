@@ -513,6 +513,9 @@ pub struct SqlEditorWidget {
     pooled_db_session: SharedDbSessionLease,
     active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: Arc<AtomicU64>,
+    current_operation_id: Arc<AtomicU64>,
+    current_operation_sql_kind: Arc<Mutex<crate::db::session_policy::SqlKind>>,
+    current_operation_autocommit: Arc<Mutex<bool>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
     cancel_flag: Arc<Mutex<bool>>,
@@ -540,6 +543,52 @@ impl SqlEditorWidget {
     fn shared_lazy_fetch_session_counter() -> Arc<AtomicU64> {
         static COUNTER: OnceLock<Arc<AtomicU64>> = OnceLock::new();
         Arc::clone(COUNTER.get_or_init(|| Arc::new(AtomicU64::new(1))))
+    }
+
+    fn next_operation_id(&self) -> u64 {
+        self.next_lazy_fetch_session_id
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn operation_sql_kind(sql: &str, script_mode: bool) -> crate::db::session_policy::SqlKind {
+        if script_mode {
+            crate::db::session_policy::SqlKind::Script
+        } else {
+            crate::db::session_policy::classify_sql(sql)
+        }
+    }
+
+    fn set_current_operation_snapshot(
+        &self,
+        operation_id: u64,
+        sql_kind: crate::db::session_policy::SqlKind,
+        autocommit: bool,
+    ) {
+        self.current_operation_id
+            .store(operation_id, Ordering::Relaxed);
+        *self
+            .current_operation_sql_kind
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql_kind;
+        *self
+            .current_operation_autocommit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = autocommit;
+    }
+
+    fn clear_current_operation_snapshot(
+        operation_id: &Arc<AtomicU64>,
+        sql_kind: &Arc<Mutex<crate::db::session_policy::SqlKind>>,
+        autocommit: &Arc<Mutex<bool>>,
+    ) {
+        operation_id.store(0, Ordering::Relaxed);
+        *sql_kind
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            crate::db::session_policy::SqlKind::Unknown;
+        *autocommit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
     }
 
     fn is_main_window_visible() -> bool {
@@ -884,6 +933,10 @@ impl SqlEditorWidget {
         let pooled_db_session = SharedDbSessionLease::new();
         let active_lazy_fetch = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Self::shared_lazy_fetch_session_counter();
+        let current_operation_id = Arc::new(AtomicU64::new(0));
+        let current_operation_sql_kind =
+            Arc::new(Mutex::new(crate::db::session_policy::SqlKind::Unknown));
+        let current_operation_autocommit = Arc::new(Mutex::new(true));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let mysql_auto_commit_override = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -927,6 +980,9 @@ impl SqlEditorWidget {
             pooled_db_session,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
+            current_operation_id,
+            current_operation_sql_kind,
+            current_operation_autocommit,
             current_mysql_cancel_context,
             mysql_auto_commit_override,
             cancel_flag,
@@ -2185,7 +2241,8 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
 
-        let (lazy_state, operation_id, lazy_connection_generation) = match lazy_handle.as_ref() {
+        let (lazy_state, lazy_operation_id, lazy_connection_generation) = match lazy_handle.as_ref()
+        {
             Some(handle) => {
                 let cancel_requested = handle.cancel_requested.load(Ordering::Relaxed);
                 let fetch_in_progress = handle.fetch_in_progress.load(Ordering::Relaxed);
@@ -2203,10 +2260,21 @@ impl SqlEditorWidget {
             None => (LazyFetchState::None, 0, 0),
         };
 
+        let current_operation_id = self.current_operation_id.load(Ordering::Relaxed);
+        let current_sql_kind = *self
+            .current_operation_sql_kind
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_autocommit = *self
+            .current_operation_autocommit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let query_running = load_mutex_bool(&self.query_running);
         let cancel_already_set = load_mutex_bool(&self.cancel_flag);
         let execution_state = if cancel_already_set {
             ExecutionState::CancelRequested
+        } else if query_running && matches!(current_sql_kind, SqlKind::Script) {
+            ExecutionState::RunningScript
         } else if query_running && matches!(lazy_state, LazyFetchState::None) {
             ExecutionState::RunningStatement
         } else if query_running {
@@ -2231,10 +2299,16 @@ impl SqlEditorWidget {
             connection_generation
         };
 
-        let autocommit = SqlEditorWidget::mysql_auto_commit_for_execution(
-            true,
-            &self.mysql_auto_commit_override,
-        );
+        let operation_id = if lazy_operation_id != 0 {
+            lazy_operation_id
+        } else {
+            current_operation_id
+        };
+        let sql_kind = if !matches!(lazy_state, LazyFetchState::None) {
+            SqlKind::SelectLike
+        } else {
+            current_sql_kind
+        };
 
         CancelTargetSnapshot {
             tab_id: 0,
@@ -2242,10 +2316,10 @@ impl SqlEditorWidget {
             operation_id,
             connection_generation,
             db_type,
-            sql_kind: SqlKind::Unknown,
+            sql_kind,
             execution_state,
             lazy_state,
-            autocommit,
+            autocommit: current_autocommit,
         }
     }
 
