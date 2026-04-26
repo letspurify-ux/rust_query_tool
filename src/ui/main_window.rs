@@ -118,6 +118,7 @@ struct QueryProgressContext {
     execution_target: Option<usize>,
     fetch_row_counts: HashMap<usize, usize>,
     lazy_fetch_sessions: HashMap<u64, usize>,
+    lazy_fetch_tokens: HashMap<u64, LazyFetchProgressToken>,
     waiting_lazy_fetch_sessions: HashSet<u64>,
     closed_statement_indices: HashSet<usize>,
     batch_finished: bool,
@@ -126,6 +127,13 @@ struct QueryProgressContext {
     activity_label: String,
     active_statement_index: Option<usize>,
     state_label: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LazyFetchProgressToken {
+    statement_index: usize,
+    operation_id: u64,
+    connection_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +159,7 @@ impl QueryProgressContext {
             execution_target,
             fetch_row_counts: HashMap::new(),
             lazy_fetch_sessions: HashMap::new(),
+            lazy_fetch_tokens: HashMap::new(),
             waiting_lazy_fetch_sessions: HashSet::new(),
             closed_statement_indices: HashSet::new(),
             batch_finished: false,
@@ -191,6 +200,7 @@ impl QueryProgressContext {
             self.mark_statement_closed(statement_index);
         }
         self.lazy_fetch_sessions.clear();
+        self.lazy_fetch_tokens.clear();
         self.waiting_lazy_fetch_sessions.clear();
     }
 
@@ -206,9 +216,39 @@ impl QueryProgressContext {
             })
     }
 
-    fn register_lazy_fetch_session(&mut self, session_id: u64, statement_index: usize) {
+    fn register_lazy_fetch_session(
+        &mut self,
+        session_id: u64,
+        statement_index: usize,
+        operation_id: u64,
+        connection_generation: u64,
+    ) {
         self.lazy_fetch_sessions.insert(session_id, statement_index);
+        self.lazy_fetch_tokens.insert(
+            session_id,
+            LazyFetchProgressToken {
+                statement_index,
+                operation_id,
+                connection_generation,
+            },
+        );
         self.waiting_lazy_fetch_sessions.remove(&session_id);
+    }
+
+    fn lazy_fetch_event_matches(
+        &self,
+        session_id: u64,
+        statement_index: usize,
+        operation_id: u64,
+        connection_generation: u64,
+    ) -> bool {
+        self.lazy_fetch_tokens
+            .get(&session_id)
+            .is_some_and(|token| {
+                token.statement_index == statement_index
+                    && token.operation_id == operation_id
+                    && token.connection_generation == connection_generation
+            })
     }
 
     fn mark_lazy_fetch_active_for_statement(&mut self, statement_index: usize) {
@@ -227,6 +267,7 @@ impl QueryProgressContext {
 
     fn remove_lazy_fetch_session(&mut self, session_id: u64) -> Option<usize> {
         self.waiting_lazy_fetch_sessions.remove(&session_id);
+        self.lazy_fetch_tokens.remove(&session_id);
         self.lazy_fetch_sessions.remove(&session_id)
     }
 
@@ -4655,7 +4696,25 @@ impl MainWindow {
                     drop(s);
                     result_tabs.append_rows(tab_index, rows);
                 }
-                QueryProgress::LazyFetchSession { index, session_id } => {
+                QueryProgress::LazyFetchSession {
+                    index,
+                    session_id,
+                    operation_id,
+                    connection_generation,
+                } => {
+                    let event_is_current = s
+                        .find_tab_index(tab_id)
+                        .and_then(|tab_index| s.editor_tabs.get(tab_index))
+                        .is_some_and(|tab| {
+                            tab.sql_editor.lazy_fetch_progress_event_is_current(
+                                session_id,
+                                operation_id,
+                                connection_generation,
+                            )
+                        });
+                    if !event_is_current {
+                        return;
+                    }
                     let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
                     else {
                         return;
@@ -4665,7 +4724,12 @@ impl MainWindow {
                     let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                         return;
                     };
-                    context.register_lazy_fetch_session(session_id, index);
+                    context.register_lazy_fetch_session(
+                        session_id,
+                        index,
+                        operation_id,
+                        connection_generation,
+                    );
                     context.active_statement_index = Some(index);
                     context.state_label = if preserve_canceling {
                         ResultTabStatus::Canceling.label().to_string()
@@ -4740,28 +4804,46 @@ impl MainWindow {
                 QueryProgress::LazyFetchClosed {
                     index,
                     session_id,
+                    operation_id,
+                    connection_generation,
                     cancelled,
+                    cursor_closed,
+                    fetch_worker_done,
+                    error_kind,
                 } => {
-                    s.pending_lazy_fetch_canceling_sessions.remove(&session_id);
                     let should_show_status = s.should_show_progress_status_for_tab(tab_id);
                     let tab_count = s.result_tabs.tab_count();
                     let mut tab_index = None;
                     let mut finished_all_lazy_fetches = false;
                     let mut ignore_result_tab = false;
+                    let mut event_matches = false;
                     if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
                         if context.closed_statement_indices.remove(&index) {
                             ignore_result_tab = true;
                         }
-                        let mapped_statement_index =
-                            context.lazy_fetch_sessions.get(&session_id).copied();
-                        if mapped_statement_index == Some(index) {
+                        event_matches = context.lazy_fetch_event_matches(
+                            session_id,
+                            index,
+                            operation_id,
+                            connection_generation,
+                        );
+                        if event_matches {
                             context.remove_lazy_fetch_session(session_id);
                         } else if !ignore_result_tab {
                             ignore_result_tab = true;
                         }
                         if !ignore_result_tab {
                             context.active_statement_index = Some(index);
-                            context.state_label = if cancelled {
+                            context.state_label = if cancelled
+                                || !cursor_closed
+                                || !fetch_worker_done
+                                || matches!(
+                                    error_kind,
+                                    crate::ui::sql_editor::InterruptKind::UnsafeOrUnknown
+                                        | crate::ui::sql_editor::InterruptKind::ConnectionError
+                                        | crate::ui::sql_editor::InterruptKind::NonRecoverableTimeout
+                                )
+                            {
                                 ResultTabStatus::Cancelled.label().to_string()
                             } else {
                                 ResultTabStatus::Done.label().to_string()
@@ -4775,6 +4857,9 @@ impl MainWindow {
                         }
                         finished_all_lazy_fetches =
                             context.lazy_fetch_sessions.is_empty() && context.batch_finished;
+                    }
+                    if event_matches {
+                        s.pending_lazy_fetch_canceling_sessions.remove(&session_id);
                     }
                     if ignore_result_tab {
                         if finished_all_lazy_fetches {
@@ -7374,7 +7459,7 @@ mod tests {
     fn progress_context_distinguishes_registered_and_waiting_lazy_fetch() {
         let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
 
-        context.register_lazy_fetch_session(44, 2);
+        context.register_lazy_fetch_session(44, 2, 44, 7);
         assert!(!context.has_waiting_lazy_fetch());
 
         assert!(context.mark_lazy_fetch_waiting(44, 2));
@@ -7387,7 +7472,7 @@ mod tests {
     #[test]
     fn progress_context_rejects_stale_lazy_fetch_waiting_event() {
         let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
-        context.register_lazy_fetch_session(44, 2);
+        context.register_lazy_fetch_session(44, 2, 44, 7);
 
         assert!(!context.mark_lazy_fetch_waiting(44, 3));
         assert!(!context.mark_lazy_fetch_waiting(55, 2));
@@ -7395,9 +7480,20 @@ mod tests {
     }
 
     #[test]
+    fn progress_context_rejects_stale_lazy_fetch_close_token() {
+        let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
+        context.register_lazy_fetch_session(44, 2, 44, 7);
+
+        assert!(context.lazy_fetch_event_matches(44, 2, 44, 7));
+        assert!(!context.lazy_fetch_event_matches(44, 2, 45, 7));
+        assert!(!context.lazy_fetch_event_matches(44, 2, 44, 8));
+        assert!(!context.lazy_fetch_event_matches(44, 3, 44, 7));
+    }
+
+    #[test]
     fn progress_context_remove_lazy_fetch_clears_waiting_state() {
         let mut context = QueryProgressContext::new(0, None, "Executing".to_string());
-        context.register_lazy_fetch_session(44, 2);
+        context.register_lazy_fetch_session(44, 2, 44, 7);
         assert!(context.mark_lazy_fetch_waiting(44, 2));
 
         assert_eq!(context.remove_lazy_fetch_session(44), Some(2));
