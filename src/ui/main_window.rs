@@ -1462,6 +1462,17 @@ fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> St
     }
 }
 
+fn execution_finished_status_override(
+    event: &crate::db::session_policy::ExecutionFinishedEvent,
+    snapshot: Option<crate::db::PooledSessionLeaseSnapshot>,
+) -> Option<&'static str> {
+    if event.cancelled && snapshot.is_some_and(|snapshot| snapshot.requires_transaction_decision) {
+        Some("Cancelled | Transaction decision required")
+    } else {
+        None
+    }
+}
+
 fn should_update_fetch_status(previous_count: usize, elapsed: Duration) -> bool {
     previous_count == 0 || elapsed >= FETCH_STATUS_UPDATE_INTERVAL
 }
@@ -5145,6 +5156,17 @@ impl MainWindow {
                             event.timeout_settings_restored,
                         ),
                     );
+                    let snapshot = s
+                        .find_tab_index(tab_id)
+                        .and_then(|index| s.editor_tabs.get(index))
+                        .and_then(|tab| tab.sql_editor.pooled_session_activity_snapshot());
+                    if let Some(message) = execution_finished_status_override(&event, snapshot) {
+                        if s.should_show_progress_status_for_tab(tab_id) {
+                            s.set_status_message(message);
+                        }
+                        s.refresh_result_edit_controls();
+                        s.sync_transaction_mode_controls();
+                    }
                 }
                 QueryProgress::BatchFinished => {
                     let pending_canceling_sessions =
@@ -7412,6 +7434,40 @@ mod tests {
         assert!(should_finish_progress_after_lazy_fetch_close(true, true));
         assert!(should_finish_progress_after_lazy_fetch_close(false, true));
         assert!(!should_finish_progress_after_lazy_fetch_close(true, false));
+    }
+
+    #[test]
+    fn execution_finished_status_reports_transaction_decision_after_cancel() {
+        let mut event =
+            crate::db::session_policy::ExecutionFinishedEvent::new(crate::db::DatabaseType::MySQL);
+        event.cancelled = true;
+        let snapshot = crate::db::PooledSessionLeaseSnapshot {
+            db_type: crate::db::DatabaseType::MySQL,
+            may_have_uncommitted_work: true,
+            requires_transaction_decision: true,
+        };
+
+        assert_eq!(
+            execution_finished_status_override(&event, Some(snapshot)),
+            Some("Cancelled | Transaction decision required")
+        );
+    }
+
+    #[test]
+    fn execution_finished_status_does_not_override_plain_cancel() {
+        let mut event =
+            crate::db::session_policy::ExecutionFinishedEvent::new(crate::db::DatabaseType::MySQL);
+        event.cancelled = true;
+        let snapshot = crate::db::PooledSessionLeaseSnapshot {
+            db_type: crate::db::DatabaseType::MySQL,
+            may_have_uncommitted_work: false,
+            requires_transaction_decision: false,
+        };
+
+        assert_eq!(
+            execution_finished_status_override(&event, Some(snapshot)),
+            None
+        );
     }
 
     #[test]
