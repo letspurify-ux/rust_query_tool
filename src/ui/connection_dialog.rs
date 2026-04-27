@@ -296,6 +296,20 @@ fn set_input_choice_options(choice: &mut InputChoice, options: &[&str], value: &
     choice.set_value(value);
 }
 
+fn style_input_choice(choice: &mut InputChoice) {
+    choice.set_color(theme::input_bg());
+    choice.set_text_color(theme::text_primary());
+
+    let mut input = choice.input();
+    input.set_color(theme::input_bg());
+    input.set_text_color(theme::text_primary());
+
+    let mut menu_button = choice.menu_button();
+    menu_button.set_color(theme::input_bg());
+    menu_button.set_label_color(theme::text_primary());
+    menu_button.set_text_color(theme::text_primary());
+}
+
 fn mysql_collation_choices_for_charset(charset: &str) -> &'static [&'static str] {
     match charset.trim().to_ascii_lowercase().as_str() {
         "utf8mb4" => MYSQL_COLLATION_UTF8MB4_CHOICES,
@@ -1029,8 +1043,7 @@ impl ConnectionDialog {
             SESSION_TIME_ZONE_CHOICES,
             &initial_advanced.session_time_zone,
         );
-        timezone_input.set_color(theme::input_bg());
-        timezone_input.set_text_color(theme::text_primary());
+        style_input_choice(&mut timezone_input);
         timezone_flex.end();
         advanced_col.fixed(&timezone_flex, INPUT_ROW_HEIGHT);
 
@@ -1084,8 +1097,7 @@ impl ConnectionDialog {
             MYSQL_SQL_MODE_CHOICES,
             &initial_advanced.mysql_sql_mode,
         );
-        mysql_sql_mode_input.set_color(theme::input_bg());
-        mysql_sql_mode_input.set_text_color(theme::text_primary());
+        style_input_choice(&mut mysql_sql_mode_input);
         mysql_sql_mode_flex.end();
         advanced_col.fixed(&mysql_sql_mode_flex, INPUT_ROW_HEIGHT);
 
@@ -1101,8 +1113,7 @@ impl ConnectionDialog {
             &initial_advanced.mysql_charset,
         );
         mysql_charset_input.set_trigger(CallbackTrigger::Changed);
-        mysql_charset_input.set_color(theme::input_bg());
-        mysql_charset_input.set_text_color(theme::text_primary());
+        style_input_choice(&mut mysql_charset_input);
         mysql_charset_flex.end();
         advanced_col.fixed(&mysql_charset_flex, INPUT_ROW_HEIGHT);
 
@@ -1117,8 +1128,7 @@ impl ConnectionDialog {
             &initial_advanced.mysql_charset,
             &initial_advanced.mysql_collation,
         );
-        mysql_collation_input.set_color(theme::input_bg());
-        mysql_collation_input.set_text_color(theme::text_primary());
+        style_input_choice(&mut mysql_collation_input);
         mysql_collation_flex.end();
         advanced_col.fixed(&mysql_collation_flex, INPUT_ROW_HEIGHT);
 
