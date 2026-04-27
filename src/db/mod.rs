@@ -17,5 +17,6 @@ pub(crate) use transaction::{
     mysql_statement_releases_all_named_locks, mysql_statement_releases_named_lock,
     mysql_statement_releases_table_lock, mysql_transaction_control_starts_chain,
     oracle_statement_has_implicit_commit, oracle_statement_opens_or_preserves_transaction_state,
+    oracle_statement_requires_transaction_decision_after_success,
     oracle_statement_should_skip_auto_commit, TransactionStatementStateHint,
 };

@@ -300,6 +300,19 @@ pub(crate) fn oracle_statement_should_skip_auto_commit(sql: &str) -> bool {
             .is_some_and(|word| word == "ISOLATION_LEVEL")
 }
 
+pub(crate) fn oracle_statement_requires_transaction_decision_after_success(sql: &str) -> bool {
+    if QueryExecutor::is_plain_commit(sql) || QueryExecutor::is_plain_rollback(sql) {
+        return false;
+    }
+
+    let words = transaction_statement_words(sql);
+    match words.first().map(String::as_str) {
+        Some("COMMIT") => true,
+        Some("ROLLBACK") => !words.get(1).is_some_and(|word| word == "TO"),
+        _ => false,
+    }
+}
+
 fn mysql_select_assigns_user_variable(sql: &str) -> bool {
     let cleaned = QueryExecutor::strip_leading_comments(sql);
     let mut compact = cleaned.to_ascii_uppercase();

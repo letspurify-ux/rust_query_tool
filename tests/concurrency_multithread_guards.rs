@@ -136,6 +136,34 @@ fn oracle_transaction_actions_take_reusable_pool_session_exclusively() {
 }
 
 #[test]
+fn transaction_actions_require_current_tab_session() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/mod.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+    let start = content
+        .find("fn spawn_tracked_transaction_action")
+        .expect("transaction action helper should exist");
+    let end = content[start..]
+        .find("pub fn commit(&self)")
+        .map(|offset| start + offset)
+        .expect("commit method should follow transaction action helper");
+    let helper = &content[start..end];
+
+    assert!(
+        helper.contains("Err(\"No retained DB session for this tab.\".to_string())"),
+        "Commit/rollback should fail closed when the selected tab has no retained physical session"
+    );
+    assert!(
+        !helper.contains("require_live_connection()"),
+        "Oracle commit/rollback must not fall back to the shared primary connection"
+    );
+    assert!(
+        helper.contains("true,\n                            SqlEditorWidget::mysql_session_state_hint_for_sql(mysql_sql),"),
+        "MySQL commit/rollback must require an existing tab session instead of acquiring a fresh pool session"
+    );
+}
+
+#[test]
 fn db_tab_session_slot_is_shared_abstraction_not_raw_arc_alias() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs");
     let content = fs::read_to_string(&file)

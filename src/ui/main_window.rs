@@ -1598,6 +1598,14 @@ fn connection_transition_block_message(
     }
 }
 
+fn transaction_option_block_message(
+    has_running_query: bool,
+    has_active_lazy_fetches: bool,
+    action: &str,
+) -> Option<String> {
+    connection_transition_block_message(has_running_query, has_active_lazy_fetches, action)
+}
+
 fn should_finish_progress_after_lazy_fetch_close(
     _cancelled: bool,
     finished_all_lazy_fetches: bool,
@@ -1729,9 +1737,19 @@ fn execute_sql_request_with_session_pool_slot(
 
 fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     let (connection, previous_mode, mode, retained_editors) = {
-        let s = state
+        let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(message) = transaction_option_block_message(
+            s.is_any_query_running(),
+            s.has_active_lazy_fetches(),
+            "changing transaction mode",
+        ) {
+            fltk::dialog::alert_default(&message);
+            s.sync_transaction_mode_controls();
+            s.set_status_message(&message);
+            return;
+        }
         let Some((db_type, _, current_mode, _)) = s.transaction_control_state() else {
             fltk::dialog::alert_default(&format_connection_busy_message());
             return;
@@ -6006,9 +6024,25 @@ impl MainWindow {
                     "Auto-commit disabled"
                 };
                 let connection = {
-                    let s = state
+                    let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(message) = transaction_option_block_message(
+                        s.is_any_query_running(),
+                        s.has_active_lazy_fetches(),
+                        "changing auto-commit",
+                    ) {
+                        fltk::dialog::alert_default(&message);
+                        s.set_status_message(&message);
+                        if let Some(mut item) = item.take() {
+                            if enabled {
+                                item.clear();
+                            } else {
+                                item.set();
+                            }
+                        }
+                        return true;
+                    }
                     if let Some(message) = s.retained_transaction_option_blocker("auto-commit") {
                         fltk::dialog::alert_default(&message);
                         if let Some(mut item) = item.take() {
@@ -7586,6 +7620,25 @@ mod tests {
         );
         assert_eq!(
             connection_transition_block_message(false, false, "disconnecting"),
+            None
+        );
+    }
+
+    #[test]
+    fn transaction_option_changes_block_running_work() {
+        assert_eq!(
+            transaction_option_block_message(true, false, "changing auto-commit"),
+            Some("A query is running. Stop it before changing auto-commit.".to_string())
+        );
+        assert_eq!(
+            transaction_option_block_message(false, true, "changing transaction mode"),
+            Some(
+                "A lazy fetch is still open. Fetch all rows or cancel it before changing transaction mode."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            transaction_option_block_message(false, false, "changing auto-commit"),
             None
         );
     }

@@ -2165,7 +2165,7 @@ impl SqlEditorWidget {
             .spawn(move || {
             let sender_fallback = sender.clone();
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let Some(mut conn_guard) =
+                let Some(conn_guard) =
                     crate::db::try_lock_connection_with_activity(&connection, activity_label)
                 else {
                     let _ = sender.send(UiActionResult::QueryAlreadyRunning);
@@ -2241,26 +2241,8 @@ impl SqlEditorWidget {
                                 result
                             }
                         } else {
-                            let primary_conn = conn_guard.require_live_connection();
                             drop(conn_guard);
-                            match primary_conn {
-                                Ok(db_conn) => {
-                                    SqlEditorWidget::set_current_query_connection(
-                                        &current_query_connection,
-                                        Some(Arc::clone(&db_conn)),
-                                    );
-                                    if load_mutex_bool(&cancel_flag) {
-                                        let _ = db_conn.break_execution();
-                                    }
-                                    SqlEditorWidget::run_oracle_action_with_timeout(
-                                        db_conn,
-                                        query_timeout,
-                                        activity_label,
-                                        oracle_action,
-                                    )
-                                }
-                                Err(message) => Err(message),
-                            }
+                            Err("No retained DB session for this tab.".to_string())
                         }
                     }
                     crate::db::DbExecutionEngine::MySql => {
@@ -2279,6 +2261,7 @@ impl SqlEditorWidget {
                             activity_label,
                             auto_commit,
                             false,
+                            true,
                             SqlEditorWidget::mysql_session_state_hint_for_sql(mysql_sql),
                             |mysql_conn: &mut mysql::PooledConn| mysql_conn.query_drop(mysql_sql),
                         )

@@ -2880,6 +2880,7 @@ impl SqlEditorWidget {
                     db_activity,
                     auto_commit,
                     refresh_encoding_after,
+                    false,
                     state_hint,
                     |mysql_conn| {
                         crate::db::query::mysql_executor::MysqlExecutor::execute(mysql_conn, sql)
@@ -3857,6 +3858,7 @@ impl SqlEditorWidget {
                             db_activity,
                             auto_commit,
                             Some(sender),
+                            false,
                         ) {
                             Ok((
                                 connection_generation,
@@ -8539,6 +8541,10 @@ impl SqlEditorWidget {
                                     );
                                 let has_implicit_commit =
                                     crate::db::oracle_statement_has_implicit_commit(&sql_text);
+                                let requires_transaction_decision =
+                                    crate::db::oracle_statement_requires_transaction_decision_after_success(
+                                        &sql_text,
+                                    );
                                 let skip_auto_commit =
                                     crate::db::oracle_statement_should_skip_auto_commit(&sql_text);
 
@@ -8664,6 +8670,10 @@ impl SqlEditorWidget {
 
                                 if result.success && opens_or_preserves_transaction_state {
                                     cleanup.mark_oracle_pooled_session_maybe_dirty();
+                                }
+
+                                if result.success && requires_transaction_decision {
+                                    cleanup.require_oracle_pooled_session_transaction_decision();
                                 }
 
                                 if auto_commit && result.success && !skip_auto_commit {
@@ -10848,6 +10858,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         auto_commit: bool,
         session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
+        require_existing_session: bool,
     ) -> Result<(u64, ConnectionInfo, mysql::PooledConn, bool, bool), String> {
         let context = {
             let conn_guard =
@@ -10884,6 +10895,9 @@ impl SqlEditorWidget {
                     ),
                     Ok(false) => {
                         drop(conn);
+                        if require_existing_session {
+                            return Err("No reusable DB session for this tab.".to_string());
+                        }
                         let conn =
                             Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
                         (
@@ -10898,12 +10912,15 @@ impl SqlEditorWidget {
                     }
                     Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
                         crate::utils::logging::log_warning(
-                        "mysql pool session",
-                        &format!(
-                            "Discarding stale reusable MySQL pooled session and retrying with a fresh session: {message}"
-                        ),
-                    );
+                            "mysql pool session",
+                            &format!(
+                                "Discarding stale reusable MySQL pooled session and retrying with a fresh session: {message}"
+                            ),
+                        );
                         drop(conn);
+                        if require_existing_session {
+                            return Err(message);
+                        }
                         let conn =
                             Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
                         (
@@ -10919,6 +10936,9 @@ impl SqlEditorWidget {
                     Err(message) => return Err(message),
                 }
             } else {
+                if require_existing_session {
+                    return Err("No retained DB session for this tab.".to_string());
+                }
                 let conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
                 (
                     Self::prepare_mysql_pooled_session_or_retry_once(
@@ -10937,6 +10957,10 @@ impl SqlEditorWidget {
             prior_may_have_uncommitted_work || prior_requires_transaction_decision,
         ) {
             if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
+                if require_existing_session {
+                    drop(conn);
+                    return Err(message);
+                }
                 crate::utils::logging::log_warning(
                     "mysql pool session",
                     &format!(
@@ -11405,6 +11429,7 @@ impl SqlEditorWidget {
         log_context: &str,
         auto_commit: bool,
         refresh_encoding_after: bool,
+        require_existing_session: bool,
         state_hint: MySqlSessionStateHint,
         action: F,
     ) -> Result<T, String>
@@ -11423,6 +11448,7 @@ impl SqlEditorWidget {
             log_context,
             auto_commit,
             session_pool_sender,
+            require_existing_session,
         )?;
 
         if state_hint.changes_auto_commit
@@ -11844,6 +11870,21 @@ mod query_execution_cleanup_tests {
         assert!(crate::db::oracle_statement_should_skip_auto_commit(
             "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"
         ));
+        assert!(
+            crate::db::oracle_statement_requires_transaction_decision_after_success(
+                "COMMIT FORCE '1.2.3'"
+            )
+        );
+        assert!(
+            crate::db::oracle_statement_requires_transaction_decision_after_success(
+                "ROLLBACK FORCE '1.2.3'"
+            )
+        );
+        assert!(
+            !crate::db::oracle_statement_requires_transaction_decision_after_success(
+                "ROLLBACK TO SAVEPOINT sp1"
+            )
+        );
     }
 
     #[test]
