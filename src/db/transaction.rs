@@ -113,14 +113,10 @@ fn mysql_autocommit_assignment_value(sql: &str) -> Option<String> {
     assignments = assignments.strip_prefix("SESSION").unwrap_or(assignments);
 
     for assignment in assignments.split(',') {
-        let Some(value) = [
-            "AUTOCOMMIT",
-            "@@AUTOCOMMIT",
-            "@@SESSION.AUTOCOMMIT",
-        ]
-        .iter()
-        .find_map(|prefix| assignment.strip_prefix(prefix))
-        .and_then(|value| value.strip_prefix('=').or_else(|| value.strip_prefix(":=")))
+        let Some(value) = ["AUTOCOMMIT", "@@AUTOCOMMIT", "@@SESSION.AUTOCOMMIT"]
+            .iter()
+            .find_map(|prefix| assignment.strip_prefix(prefix))
+            .and_then(|value| value.strip_prefix('=').or_else(|| value.strip_prefix(":=")))
         else {
             continue;
         };
@@ -142,13 +138,42 @@ fn mysql_is_autocommit_assignment(sql: &str) -> bool {
     mysql_autocommit_assignment_value(sql).is_some()
 }
 
-pub(crate) fn mysql_create_statement_is_temporary(sql: &str) -> bool {
-    let cleaned = QueryExecutor::strip_leading_comments(sql);
-    let mut words = cleaned
+fn transaction_statement_words(sql: &str) -> Vec<String> {
+    QueryExecutor::strip_leading_comments(sql)
         .split_whitespace()
-        .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)));
-    matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("CREATE"))
-        && matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("TEMPORARY"))
+        .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+fn mysql_statement_words(sql: &str) -> Vec<String> {
+    transaction_statement_words(sql)
+}
+
+fn mysql_statement_starts_with_words(sql: &str, expected: &[&str]) -> bool {
+    let words = mysql_statement_words(sql);
+    words.len() >= expected.len()
+        && words
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| actual == expected)
+}
+
+pub(crate) fn mysql_create_statement_is_temporary(sql: &str) -> bool {
+    mysql_statement_starts_with_words(sql, &["CREATE", "TEMPORARY"])
+}
+
+pub(crate) fn mysql_drop_statement_is_temporary(sql: &str) -> bool {
+    mysql_statement_starts_with_words(sql, &["DROP", "TEMPORARY"])
+}
+
+fn mysql_set_password_statement(sql: &str) -> bool {
+    mysql_statement_starts_with_words(sql, &["SET", "PASSWORD"])
+}
+
+fn mysql_load_index_statement(sql: &str) -> bool {
+    mysql_statement_starts_with_words(sql, &["LOAD", "INDEX"])
 }
 
 pub(crate) fn mysql_rollback_targets_savepoint(sql: &str) -> bool {
@@ -178,6 +203,16 @@ pub(crate) fn mysql_transaction_control_starts_chain(sql: &str) -> bool {
         previous_was_and = word.eq_ignore_ascii_case("AND");
     }
     false
+}
+
+pub(crate) fn mysql_statement_opens_transaction_state(sql: &str) -> bool {
+    let words = mysql_statement_words(sql);
+    match words.first().map(String::as_str) {
+        Some("START") => words.get(1).is_some_and(|word| word == "TRANSACTION"),
+        Some("BEGIN") | Some("SAVEPOINT") | Some("CALL") | Some("XA") => true,
+        Some("COMMIT") | Some("ROLLBACK") => mysql_transaction_control_starts_chain(sql),
+        _ => false,
+    }
 }
 
 pub(crate) fn mysql_statement_may_leave_uncommitted_work(sql: &str) -> bool {
@@ -227,6 +262,42 @@ pub(crate) fn mysql_statement_releases_all_named_locks(sql: &str) -> bool {
         QueryExecutor::leading_keyword(sql).as_deref(),
         Some("SELECT")
     ) && sql.to_ascii_uppercase().contains("RELEASE_ALL_LOCKS")
+}
+
+pub(crate) fn oracle_statement_opens_or_preserves_transaction_state(sql: &str) -> bool {
+    let words = transaction_statement_words(sql);
+    match words.first().map(String::as_str) {
+        Some("SAVEPOINT") => true,
+        Some("ROLLBACK") => words.get(1).is_some_and(|word| word == "TO"),
+        Some("SET") => words.get(1).is_some_and(|word| word == "TRANSACTION"),
+        Some("LOCK") => words.get(1).is_some_and(|word| word == "TABLE"),
+        _ => false,
+    }
+}
+
+pub(crate) fn oracle_statement_has_implicit_commit(sql: &str) -> bool {
+    let words = transaction_statement_words(sql);
+    match words.first().map(String::as_str) {
+        Some("ALTER") if words.get(1).is_some_and(|word| word == "SESSION") => false,
+        Some("CREATE") | Some("ALTER") | Some("DROP") | Some("TRUNCATE") | Some("RENAME")
+        | Some("GRANT") | Some("REVOKE") | Some("COMMENT") => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn oracle_statement_should_skip_auto_commit(sql: &str) -> bool {
+    if oracle_statement_opens_or_preserves_transaction_state(sql) {
+        return true;
+    }
+
+    let words = transaction_statement_words(sql);
+    words.first().is_some_and(|word| word == "ALTER")
+        && words.get(1).is_some_and(|word| word == "SESSION")
+        && words.get(2).is_some_and(|word| word == "SET")
+        && words
+            .get(3)
+            .and_then(|word| word.split('=').next())
+            .is_some_and(|word| word == "ISOLATION_LEVEL")
 }
 
 fn mysql_select_assigns_user_variable(sql: &str) -> bool {
@@ -281,6 +352,9 @@ pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatemen
         Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE") | Some("WITH") => {
             mysql_hint(false, true, false, true, false)
         }
+        Some("LOAD") if mysql_load_index_statement(sql) => {
+            mysql_hint(true, false, false, false, false)
+        }
         Some("LOAD") => mysql_hint(false, true, false, true, false),
         Some("PREPARE") | Some("EXECUTE") | Some("DEALLOCATE") => {
             mysql_hint(false, true, false, false, false)
@@ -290,7 +364,16 @@ pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatemen
         Some("CREATE") if mysql_create_statement_is_temporary(sql) => {
             mysql_hint(false, true, false, false, false)
         }
+        Some("DROP") if mysql_drop_statement_is_temporary(sql) => {
+            mysql_hint(false, false, false, false, false)
+        }
         Some("CREATE") | Some("ALTER") | Some("DROP") | Some("RENAME") | Some("TRUNCATE") => {
+            mysql_hint(true, false, false, false, false)
+        }
+        Some("GRANT") | Some("REVOKE") | Some("ANALYZE") | Some("CACHE") | Some("CHECK")
+        | Some("OPTIMIZE") | Some("REPAIR") | Some("RESET") | Some("FLUSH") | Some("INSTALL")
+        | Some("UNINSTALL") => mysql_hint(true, false, false, false, false),
+        Some("SET") if mysql_set_password_statement(sql) => {
             mysql_hint(true, false, false, false, false)
         }
         Some("SET") => mysql_hint(false, true, false, false, false),

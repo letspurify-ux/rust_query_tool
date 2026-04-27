@@ -109,6 +109,7 @@ struct QueryExecutionCleanupGuard {
     oracle_pooled_session_requires_health_check: bool,
     oracle_pooled_session_transaction_decision_on_cancel: bool,
     oracle_pooled_session_transaction_decision_required: bool,
+    oracle_pooled_session_forced_maybe_dirty: bool,
     execution_metadata: crate::db::session_policy::ExecutionFinishedEvent,
 }
 
@@ -142,6 +143,7 @@ impl QueryExecutionCleanupGuard {
             oracle_pooled_session_requires_health_check: false,
             oracle_pooled_session_transaction_decision_on_cancel: false,
             oracle_pooled_session_transaction_decision_required: false,
+            oracle_pooled_session_forced_maybe_dirty: false,
             execution_metadata: crate::db::session_policy::ExecutionFinishedEvent::new(
                 crate::db::DatabaseType::Oracle,
             ),
@@ -268,6 +270,14 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_transaction_decision_required = true;
     }
 
+    fn mark_oracle_pooled_session_maybe_dirty(&mut self) {
+        self.oracle_pooled_session_forced_maybe_dirty = true;
+    }
+
+    fn clear_oracle_pooled_session_maybe_dirty(&mut self) {
+        self.oracle_pooled_session_forced_maybe_dirty = false;
+    }
+
     fn protect_oracle_dirty_statement_on_cancel(&mut self, auto_commit: bool) {
         if auto_commit {
             self.invalidate_oracle_pooled_session_on_cancel();
@@ -303,6 +313,7 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_requires_health_check = false;
         self.oracle_pooled_session_transaction_decision_on_cancel = false;
         self.oracle_pooled_session_transaction_decision_required = false;
+        self.oracle_pooled_session_forced_maybe_dirty = false;
     }
 
     fn clear_timeout_tracking(&mut self) {
@@ -366,6 +377,7 @@ impl Drop for QueryExecutionCleanupGuard {
                         .clear_oracle_if_current_connection(*connection_generation, conn);
                 } else {
                     let may_have_uncommitted_work = transaction_decision_required
+                        || self.oracle_pooled_session_forced_maybe_dirty
                         || SqlEditorWidget::oracle_session_may_have_uncommitted_work(
                             conn.as_ref(),
                             "sql_editor::cleanup",
@@ -6929,6 +6941,9 @@ impl SqlEditorWidget {
                                 let timing_duration = statement_start.elapsed();
                                 result.execution_time = timing_duration;
                                 let result_success = result.success;
+                                if result_success {
+                                    cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                }
                                 if script_mode {
                                     if result_success {
                                         SqlEditorWidget::emit_script_lines(
@@ -7004,6 +7019,9 @@ impl SqlEditorWidget {
                                 let timing_duration = statement_start.elapsed();
                                 result.execution_time = timing_duration;
                                 let result_success = result.success;
+                                if result_success {
+                                    cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                }
                                 if script_mode {
                                     if result_success {
                                         SqlEditorWidget::emit_script_lines(
@@ -7292,6 +7310,7 @@ impl SqlEditorWidget {
                                             &format!("Auto-commit failed: {}", err),
                                         );
                                     } else {
+                                        cleanup.clear_oracle_pooled_session_maybe_dirty();
                                         result.message =
                                             format!("{} | Auto-commit applied", result.message);
                                     }
@@ -8514,6 +8533,14 @@ impl SqlEditorWidget {
                                 } else {
                                     None
                                 };
+                                let opens_or_preserves_transaction_state =
+                                    crate::db::oracle_statement_opens_or_preserves_transaction_state(
+                                        &sql_text,
+                                    );
+                                let has_implicit_commit =
+                                    crate::db::oracle_statement_has_implicit_commit(&sql_text);
+                                let skip_auto_commit =
+                                    crate::db::oracle_statement_should_skip_auto_commit(&sql_text);
 
                                 let mut result = if let Some(statement_type) = dml_type {
                                     let affected_rows = stmt.row_count().unwrap_or(0);
@@ -8631,13 +8658,22 @@ impl SqlEditorWidget {
                                     continue;
                                 }
 
-                                if auto_commit && result.success {
+                                if result.success && has_implicit_commit {
+                                    cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                }
+
+                                if result.success && opens_or_preserves_transaction_state {
+                                    cleanup.mark_oracle_pooled_session_maybe_dirty();
+                                }
+
+                                if auto_commit && result.success && !skip_auto_commit {
                                     if let Err(err) = conn.commit() {
                                         result = QueryResult::new_error(
                                             &sql_text,
                                             &format!("Auto-commit failed: {}", err),
                                         );
                                     } else {
+                                        cleanup.clear_oracle_pooled_session_maybe_dirty();
                                         result.message =
                                             format!("{} | Auto-commit applied", result.message);
                                     }
@@ -10273,6 +10309,10 @@ impl SqlEditorWidget {
         {
             batch_may_have_uncommitted_work
                 .set(crate::db::mysql_transaction_control_starts_chain(sql));
+        } else if state_hint.clears_session_state {
+            batch_may_have_uncommitted_work.set(false);
+        } else if crate::db::mysql_statement_opens_transaction_state(sql) {
+            batch_may_have_uncommitted_work.set(true);
         } else if !auto_commit && crate::db::mysql_statement_may_leave_uncommitted_work(sql) {
             batch_may_have_uncommitted_work.set(true);
         }
@@ -11778,6 +11818,53 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn oracle_manual_transaction_control_hints_preserve_state() {
+        for sql in [
+            "SAVEPOINT sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "SET TRANSACTION READ ONLY",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+        ] {
+            assert!(
+                crate::db::oracle_statement_opens_or_preserves_transaction_state(sql),
+                "{sql} should preserve an Oracle transaction/session state"
+            );
+            assert!(
+                crate::db::oracle_statement_should_skip_auto_commit(sql),
+                "{sql} must not be followed by client auto-commit"
+            );
+        }
+
+        assert!(crate::db::oracle_statement_has_implicit_commit(
+            "CREATE TABLE t (id NUMBER)"
+        ));
+        assert!(!crate::db::oracle_statement_has_implicit_commit(
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"
+        ));
+        assert!(crate::db::oracle_statement_should_skip_auto_commit(
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"
+        ));
+    }
+
+    #[test]
+    fn cleanup_guard_tracks_forced_oracle_maybe_dirty_until_resolved() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+
+        cleanup.mark_oracle_pooled_session_maybe_dirty();
+        assert!(cleanup.oracle_pooled_session_forced_maybe_dirty);
+
+        cleanup.clear_oracle_pooled_session_maybe_dirty();
+        assert!(!cleanup.oracle_pooled_session_forced_maybe_dirty);
+    }
+
+    #[test]
     fn oracle_script_select_interrupt_policy_replaces_or_requires_decision() {
         let (sender, _receiver) = mpsc::channel();
         let mut cleanup = new_test_cleanup_guard(
@@ -13102,6 +13189,11 @@ mod query_execution_cleanup_tests {
         assert!(temp_hint.may_leave_session_bound_state);
         assert!(!temp_hint.requires_retention_when_autocommit_off);
 
+        let drop_temp_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("DROP TEMPORARY TABLE t");
+        assert!(!drop_temp_hint.clears_session_state);
+        assert!(!drop_temp_hint.may_leave_session_bound_state);
+
         let lock_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("LOCK TABLES t WRITE");
         assert!(lock_hint.clears_session_state);
         assert!(lock_hint.may_leave_session_bound_state);
@@ -13139,6 +13231,11 @@ mod query_execution_cleanup_tests {
         assert!(!autocommit_on_hint.may_leave_session_bound_state);
         assert!(!autocommit_on_hint.requires_retention_when_autocommit_off);
         assert!(autocommit_on_hint.changes_auto_commit);
+
+        let grant_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("GRANT SELECT ON db.* TO 'u'@'%'");
+        assert!(grant_hint.clears_session_state);
+        assert!(!grant_hint.may_leave_session_bound_state);
     }
 
     #[test]
@@ -13236,6 +13333,117 @@ mod query_execution_cleanup_tests {
         );
         assert!(!batch_may_hold_named_lock.get());
         assert!(!batch_saw_uncertain_named_lock_release.get());
+    }
+
+    #[test]
+    fn mysql_batch_implicit_commit_hints_update_dirty_state() {
+        let batch_may_have_uncommitted_work = std::cell::Cell::new(false);
+        let batch_may_hold_table_lock = std::cell::Cell::new(false);
+        let batch_may_hold_named_lock = std::cell::Cell::new(false);
+        let batch_saw_uncertain_named_lock_release = std::cell::Cell::new(false);
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "INSERT INTO t VALUES (1)",
+            false,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(batch_may_have_uncommitted_work.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "CREATE TABLE ddl_commits_prior_work (id INT)",
+            false,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            !batch_may_have_uncommitted_work.get(),
+            "implicit-commit DDL should clear the batch dirty flag after success candidates"
+        );
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "INSERT INTO t VALUES (2)",
+            false,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(batch_may_have_uncommitted_work.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "DROP TEMPORARY TABLE tmp_t",
+            false,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            batch_may_have_uncommitted_work.get(),
+            "DROP TEMPORARY TABLE must not be treated as an implicit commit"
+        );
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "GRANT SELECT ON db.* TO 'u'@'%'",
+            false,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            !batch_may_have_uncommitted_work.get(),
+            "privilege changes are MySQL implicit-commit statements"
+        );
+    }
+
+    #[test]
+    fn mysql_batch_transaction_open_hints_apply_with_autocommit_on() {
+        let batch_may_have_uncommitted_work = std::cell::Cell::new(false);
+        let batch_may_hold_table_lock = std::cell::Cell::new(false);
+        let batch_may_hold_named_lock = std::cell::Cell::new(false);
+        let batch_saw_uncertain_named_lock_release = std::cell::Cell::new(false);
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "START TRANSACTION",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            batch_may_have_uncommitted_work.get(),
+            "START TRANSACTION opens a transaction even when autocommit is enabled"
+        );
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "ROLLBACK",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(!batch_may_have_uncommitted_work.get());
+
+        SqlEditorWidget::mysql_batch_session_state_hint_for_sql(
+            "COMMIT AND CHAIN",
+            true,
+            &batch_may_have_uncommitted_work,
+            &batch_may_hold_table_lock,
+            &batch_may_hold_named_lock,
+            &batch_saw_uncertain_named_lock_release,
+        );
+        assert!(
+            batch_may_have_uncommitted_work.get(),
+            "COMMIT AND CHAIN starts the next transaction"
+        );
     }
 
     #[test]
