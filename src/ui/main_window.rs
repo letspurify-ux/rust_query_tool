@@ -448,6 +448,10 @@ fn transaction_access_choice_index(access_mode: TransactionAccessMode) -> i32 {
     }
 }
 
+fn transaction_mode_new_transaction_notice() -> &'static str {
+    "Isolation/access mode changes apply only to new transactions. Existing transactions keep their current transaction mode."
+}
+
 impl AppState {
     fn app_window_title() -> String {
         format!("SPACE Query {}", crate::version::display_version())
@@ -1699,34 +1703,35 @@ fn execute_sql_request_with_session_pool_slot(
 }
 
 fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
-    let (connection, mode) = {
+    let (connection, previous_mode, mode) = {
         let s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some((db_type, _, _, _)) = s.transaction_control_state() else {
+        let Some((db_type, _, current_mode, _)) = s.transaction_control_state() else {
             fltk::dialog::alert_default(&format_connection_busy_message());
             return;
         };
         (
             s.connection.clone(),
+            current_mode,
             s.selected_transaction_mode_from_controls(db_type),
         )
     };
 
-    let (status, should_sync_controls) = if let Some(mut connection) =
+    let (status, should_sync_controls, mode_applied) = if let Some(mut connection) =
         try_lock_connection_with_activity(&connection, "Updating transaction mode")
     {
         match connection.set_transaction_mode(mode) {
-            Ok(()) => (format!("Transaction mode: {}", mode.label()), true),
+            Ok(()) => (format!("Transaction mode: {}", mode.label()), true, true),
             Err(err) => {
                 fltk::dialog::alert_default(&err);
-                (format!("Transaction mode unchanged: {}", err), true)
+                (format!("Transaction mode unchanged: {}", err), true, false)
             }
         }
     } else {
         let busy_message = format_connection_busy_message();
         fltk::dialog::alert_default(&busy_message);
-        (busy_message, false)
+        (busy_message, false, false)
     };
 
     let mut s = state
@@ -1736,6 +1741,11 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         s.sync_transaction_mode_controls();
     }
     s.set_status_message(&status);
+    drop(s);
+
+    if mode_applied && mode != previous_mode {
+        fltk::dialog::message_default(transaction_mode_new_transaction_notice());
+    }
 }
 
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {

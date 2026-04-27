@@ -211,6 +211,14 @@ impl ConnectionAdvancedSettings {
                     .to_string(),
             );
         }
+        if self.default_transaction_access_mode == TransactionAccessMode::ReadOnly
+            && self.default_transaction_isolation != TransactionIsolation::Default
+        {
+            return Err(
+                "Oracle does not support combining READ ONLY with an explicit transaction isolation level"
+                    .to_string(),
+            );
+        }
         validate_oracle_nls_format("Oracle NLS date format", self.oracle_nls_date_format.trim())?;
         validate_oracle_nls_format(
             "Oracle NLS timestamp format",
@@ -3110,6 +3118,31 @@ mod tests {
 
         oracle.ssl_mode = ConnectionSslMode::VerifyCa;
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_err());
+    }
+
+    #[test]
+    fn oracle_advanced_validation_rejects_read_only_with_explicit_isolation() {
+        let mut oracle = ConnectionAdvancedSettings::default_for(DatabaseType::Oracle);
+        oracle.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
+        oracle.default_transaction_isolation = TransactionIsolation::ReadCommitted;
+
+        let err = oracle
+            .validate_for_db(DatabaseType::Oracle, false)
+            .expect_err("Oracle READ ONLY must not be combined with explicit isolation");
+
+        assert!(err.contains("combining READ ONLY with an explicit transaction isolation level"));
+
+        oracle.default_transaction_isolation = TransactionIsolation::Default;
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
+    }
+
+    #[test]
+    fn mysql_advanced_validation_allows_read_only_with_explicit_isolation() {
+        let mut mysql = ConnectionAdvancedSettings::default_for(DatabaseType::MySQL);
+        mysql.default_transaction_access_mode = TransactionAccessMode::ReadOnly;
+        mysql.default_transaction_isolation = TransactionIsolation::ReadCommitted;
+
+        assert!(mysql.validate_for_db(DatabaseType::MySQL, false).is_ok());
     }
 
     #[test]
