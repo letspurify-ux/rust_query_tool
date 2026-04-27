@@ -2,11 +2,12 @@ use fltk::{
     app,
     browser::HoldBrowser,
     button::Button,
-    enums::{Event, FrameType, Key},
+    enums::{CallbackTrigger, Event, FrameType, Key},
     frame::Frame,
     group::Flex,
     input::{Input, SecretInput},
     menu::Choice,
+    misc::InputChoice,
     prelude::*,
     window::Window,
 };
@@ -32,6 +33,53 @@ const DB_SELECTION_SECTION_HEIGHT: i32 =
 const SAVE_CONNECTION_BUTTON_WIDTH: i32 = 170;
 const CONNECTION_ACTION_BUTTONS_WIDTH: i32 =
     SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 3 + DIALOG_SPACING * 3;
+const SESSION_TIME_ZONE_CHOICES: &[&str] = &[
+    "",
+    "+00:00",
+    "+09:00",
+    "+08:00",
+    "+05:30",
+    "+01:00",
+    "-05:00",
+    "-08:00",
+];
+const MYSQL_SQL_MODE_CHOICES: &[&str] = &[
+    "",
+    "TRADITIONAL",
+    "ANSI",
+    "STRICT_TRANS_TABLES",
+    "STRICT_ALL_TABLES",
+    "ANSI_QUOTES",
+    "ONLY_FULL_GROUP_BY",
+    "TRADITIONAL,ANSI_QUOTES",
+];
+const MYSQL_CHARSET_CHOICES: &[&str] = &[
+    "utf8mb4", "utf8mb3", "utf8", "latin1", "ascii", "binary", "euckr",
+];
+const MYSQL_COLLATION_UTF8MB4_CHOICES: &[&str] = &[
+    "",
+    "utf8mb4_0900_ai_ci",
+    "utf8mb4_unicode_ci",
+    "utf8mb4_general_ci",
+    "utf8mb4_bin",
+];
+const MYSQL_COLLATION_UTF8MB3_CHOICES: &[&str] = &[
+    "",
+    "utf8mb3_general_ci",
+    "utf8mb3_unicode_ci",
+    "utf8_general_ci",
+    "utf8_unicode_ci",
+    "utf8_bin",
+];
+const MYSQL_COLLATION_LATIN1_CHOICES: &[&str] = &[
+    "",
+    "latin1_swedish_ci",
+    "latin1_general_ci",
+    "latin1_bin",
+];
+const MYSQL_COLLATION_ASCII_CHOICES: &[&str] = &["", "ascii_general_ci", "ascii_bin"];
+const MYSQL_COLLATION_BINARY_CHOICES: &[&str] = &["", "binary"];
+const MYSQL_COLLATION_EUCKR_CHOICES: &[&str] = &["", "euckr_korean_ci", "euckr_bin"];
 
 pub struct ConnectionDialog;
 
@@ -228,6 +276,81 @@ fn repopulate_isolation_choice(choice: &mut Choice, db_type: DatabaseType) {
     choice.add_choice(&labels);
 }
 
+fn input_choice_value(choice: &InputChoice) -> String {
+    choice.value().unwrap_or_default().trim().to_string()
+}
+
+fn set_input_choice_options(choice: &mut InputChoice, options: &[&str], value: &str) {
+    choice.clear();
+    let value = value.trim();
+    let mut value_is_option = false;
+    for option in options {
+        if option.eq_ignore_ascii_case(value) {
+            value_is_option = true;
+        }
+        choice.add(option);
+    }
+    if !value.is_empty() && !value_is_option {
+        choice.add(value);
+    }
+    choice.set_value(value);
+}
+
+fn mysql_collation_choices_for_charset(charset: &str) -> &'static [&'static str] {
+    match charset.trim().to_ascii_lowercase().as_str() {
+        "utf8mb4" => MYSQL_COLLATION_UTF8MB4_CHOICES,
+        "utf8mb3" | "utf8" => MYSQL_COLLATION_UTF8MB3_CHOICES,
+        "latin1" => MYSQL_COLLATION_LATIN1_CHOICES,
+        "ascii" => MYSQL_COLLATION_ASCII_CHOICES,
+        "binary" => MYSQL_COLLATION_BINARY_CHOICES,
+        "euckr" => MYSQL_COLLATION_EUCKR_CHOICES,
+        _ => &[""],
+    }
+}
+
+fn mysql_collation_is_known(collation: &str) -> bool {
+    let collation = collation.trim();
+    [
+        MYSQL_COLLATION_UTF8MB4_CHOICES,
+        MYSQL_COLLATION_UTF8MB3_CHOICES,
+        MYSQL_COLLATION_LATIN1_CHOICES,
+        MYSQL_COLLATION_ASCII_CHOICES,
+        MYSQL_COLLATION_BINARY_CHOICES,
+        MYSQL_COLLATION_EUCKR_CHOICES,
+    ]
+    .iter()
+    .flat_map(|choices| choices.iter())
+    .any(|candidate| !candidate.is_empty() && candidate.eq_ignore_ascii_case(collation))
+}
+
+fn mysql_collation_value_for_charset_change(current_collation: &str, next_charset: &str) -> String {
+    let current_collation = current_collation.trim();
+    if current_collation.is_empty()
+        || mysql_collation_choices_for_charset(next_charset)
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(current_collation))
+    {
+        return current_collation.to_string();
+    }
+    if mysql_collation_is_known(current_collation) {
+        String::new()
+    } else {
+        current_collation.to_string()
+    }
+}
+
+fn set_mysql_collation_choice_options(
+    choice: &mut InputChoice,
+    charset: &str,
+    collation: &str,
+) {
+    set_input_choice_options(
+        choice,
+        mysql_collation_choices_for_charset(charset),
+        collation,
+    );
+}
+
 fn connection_dialog_width() -> i32 {
     DIALOG_MARGIN * 2
         + SAVED_CONNECTIONS_COLUMN_WIDTH
@@ -326,10 +449,10 @@ fn set_advanced_form_values(
     ssl_choice: &mut Choice,
     isolation_choice: &mut Choice,
     access_choice: &mut Choice,
-    timezone_input: &mut Input,
-    mysql_sql_mode_input: &mut Input,
-    mysql_charset_input: &mut Input,
-    mysql_collation_input: &mut Input,
+    timezone_input: &mut InputChoice,
+    mysql_sql_mode_input: &mut InputChoice,
+    mysql_charset_input: &mut InputChoice,
+    mysql_collation_input: &mut InputChoice,
     mysql_ssl_ca_input: &mut Input,
     oracle_protocol_choice: &mut Choice,
     oracle_nls_date_input: &mut Input,
@@ -345,10 +468,26 @@ fn set_advanced_form_values(
     access_choice.set_value(choice_index_from_transaction_access(
         advanced.default_transaction_access_mode,
     ));
-    timezone_input.set_value(&advanced.session_time_zone);
-    mysql_sql_mode_input.set_value(&advanced.mysql_sql_mode);
-    mysql_charset_input.set_value(&advanced.mysql_charset);
-    mysql_collation_input.set_value(&advanced.mysql_collation);
+    set_input_choice_options(
+        timezone_input,
+        SESSION_TIME_ZONE_CHOICES,
+        &advanced.session_time_zone,
+    );
+    set_input_choice_options(
+        mysql_sql_mode_input,
+        MYSQL_SQL_MODE_CHOICES,
+        &advanced.mysql_sql_mode,
+    );
+    set_input_choice_options(
+        mysql_charset_input,
+        MYSQL_CHARSET_CHOICES,
+        &advanced.mysql_charset,
+    );
+    set_mysql_collation_choice_options(
+        mysql_collation_input,
+        &advanced.mysql_charset,
+        &advanced.mysql_collation,
+    );
     mysql_ssl_ca_input.set_value(&advanced.mysql_ssl_ca_path);
     oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(advanced.oracle_protocol));
     oracle_nls_date_input.set_value(&advanced.oracle_nls_date_format);
@@ -360,10 +499,10 @@ fn advanced_settings_from_form(
     ssl_choice: &Choice,
     isolation_choice: &Choice,
     access_choice: &Choice,
-    timezone_input: &Input,
-    mysql_sql_mode_input: &Input,
-    mysql_charset_input: &Input,
-    mysql_collation_input: &Input,
+    timezone_input: &InputChoice,
+    mysql_sql_mode_input: &InputChoice,
+    mysql_charset_input: &InputChoice,
+    mysql_collation_input: &InputChoice,
     mysql_ssl_ca_input: &Input,
     oracle_protocol_choice: &Choice,
     oracle_nls_date_input: &Input,
@@ -375,10 +514,10 @@ fn advanced_settings_from_form(
         transaction_isolation_from_choice_index(db_type, isolation_choice.value());
     advanced.default_transaction_access_mode =
         transaction_access_from_choice_index(access_choice.value());
-    advanced.session_time_zone = timezone_input.value().trim().to_string();
-    advanced.mysql_sql_mode = mysql_sql_mode_input.value().trim().to_string();
-    advanced.mysql_charset = mysql_charset_input.value().trim().to_string();
-    advanced.mysql_collation = mysql_collation_input.value().trim().to_string();
+    advanced.session_time_zone = input_choice_value(timezone_input);
+    advanced.mysql_sql_mode = input_choice_value(mysql_sql_mode_input);
+    advanced.mysql_charset = input_choice_value(mysql_charset_input);
+    advanced.mysql_collation = input_choice_value(mysql_collation_input);
     advanced.mysql_ssl_ca_path = mysql_ssl_ca_input.value().trim().to_string();
     advanced.oracle_protocol = oracle_protocol_from_choice_index(oracle_protocol_choice.value());
     advanced.oracle_nls_date_format = oracle_nls_date_input.value().trim().to_string();
@@ -884,8 +1023,12 @@ impl ConnectionDialog {
         let mut timezone_label = Frame::default().with_label("Time zone:");
         timezone_label.set_label_color(theme::text_primary());
         timezone_flex.fixed(&timezone_label, FORM_LABEL_WIDTH);
-        let mut timezone_input = Input::default();
-        timezone_input.set_value(&initial_advanced.session_time_zone);
+        let mut timezone_input = InputChoice::default();
+        set_input_choice_options(
+            &mut timezone_input,
+            SESSION_TIME_ZONE_CHOICES,
+            &initial_advanced.session_time_zone,
+        );
         timezone_input.set_color(theme::input_bg());
         timezone_input.set_text_color(theme::text_primary());
         timezone_flex.end();
@@ -935,8 +1078,12 @@ impl ConnectionDialog {
         let mut mysql_sql_mode_label = Frame::default().with_label("SQL mode:");
         mysql_sql_mode_label.set_label_color(theme::text_primary());
         mysql_sql_mode_flex.fixed(&mysql_sql_mode_label, FORM_LABEL_WIDTH);
-        let mut mysql_sql_mode_input = Input::default();
-        mysql_sql_mode_input.set_value(&initial_advanced.mysql_sql_mode);
+        let mut mysql_sql_mode_input = InputChoice::default();
+        set_input_choice_options(
+            &mut mysql_sql_mode_input,
+            MYSQL_SQL_MODE_CHOICES,
+            &initial_advanced.mysql_sql_mode,
+        );
         mysql_sql_mode_input.set_color(theme::input_bg());
         mysql_sql_mode_input.set_text_color(theme::text_primary());
         mysql_sql_mode_flex.end();
@@ -947,8 +1094,13 @@ impl ConnectionDialog {
         let mut mysql_charset_label = Frame::default().with_label("Charset:");
         mysql_charset_label.set_label_color(theme::text_primary());
         mysql_charset_flex.fixed(&mysql_charset_label, FORM_LABEL_WIDTH);
-        let mut mysql_charset_input = Input::default();
-        mysql_charset_input.set_value(&initial_advanced.mysql_charset);
+        let mut mysql_charset_input = InputChoice::default();
+        set_input_choice_options(
+            &mut mysql_charset_input,
+            MYSQL_CHARSET_CHOICES,
+            &initial_advanced.mysql_charset,
+        );
+        mysql_charset_input.set_trigger(CallbackTrigger::Changed);
         mysql_charset_input.set_color(theme::input_bg());
         mysql_charset_input.set_text_color(theme::text_primary());
         mysql_charset_flex.end();
@@ -959,8 +1111,12 @@ impl ConnectionDialog {
         let mut mysql_collation_label = Frame::default().with_label("Collation:");
         mysql_collation_label.set_label_color(theme::text_primary());
         mysql_collation_flex.fixed(&mysql_collation_label, FORM_LABEL_WIDTH);
-        let mut mysql_collation_input = Input::default();
-        mysql_collation_input.set_value(&initial_advanced.mysql_collation);
+        let mut mysql_collation_input = InputChoice::default();
+        set_mysql_collation_choice_options(
+            &mut mysql_collation_input,
+            &initial_advanced.mysql_charset,
+            &initial_advanced.mysql_collation,
+        );
         mysql_collation_input.set_color(theme::input_bg());
         mysql_collation_input.set_text_color(theme::text_primary());
         mysql_collation_flex.end();
@@ -1258,6 +1414,21 @@ impl ConnectionDialog {
                 *current_oracle_mode_cb
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_mode;
+            });
+        }
+
+        {
+            let mut mysql_collation_input_cb = mysql_collation_input.clone();
+            mysql_charset_input.set_callback(move |choice| {
+                let charset = input_choice_value(choice);
+                let current_collation = input_choice_value(&mysql_collation_input_cb);
+                let next_collation =
+                    mysql_collation_value_for_charset_change(&current_collation, &charset);
+                set_mysql_collation_choice_options(
+                    &mut mysql_collation_input_cb,
+                    &charset,
+                    &next_collation,
+                );
             });
         }
 
@@ -2105,6 +2276,33 @@ mod tests {
         assert_eq!(
             super::db_type_from_choice_index(supported.len() as i32),
             *supported.last().expect("at least one database type")
+        );
+    }
+
+    #[test]
+    fn mysql_collation_choices_follow_charset() {
+        assert!(super::mysql_collation_choices_for_charset("utf8mb4")
+            .contains(&"utf8mb4_0900_ai_ci"));
+        assert!(super::mysql_collation_choices_for_charset("utf8")
+            .contains(&"utf8_general_ci"));
+        assert!(super::mysql_collation_choices_for_charset("latin1")
+            .contains(&"latin1_swedish_ci"));
+        assert!(super::mysql_collation_choices_for_charset("binary").contains(&"binary"));
+    }
+
+    #[test]
+    fn mysql_charset_change_resets_known_mismatched_collation_only() {
+        assert_eq!(
+            super::mysql_collation_value_for_charset_change("utf8mb4_unicode_ci", "latin1"),
+            ""
+        );
+        assert_eq!(
+            super::mysql_collation_value_for_charset_change("custom_collation", "latin1"),
+            "custom_collation"
+        );
+        assert_eq!(
+            super::mysql_collation_value_for_charset_change("latin1_swedish_ci", "latin1"),
+            "latin1_swedish_ci"
         );
     }
 
