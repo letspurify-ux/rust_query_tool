@@ -148,6 +148,14 @@ impl MysqlExecutor {
         matches!(Self::classify_statement(sql), MysqlStatementKind::Use)
     }
 
+    fn transaction_control_sql_to_execute<'a>(sql: &'a str, keyword: &'static str) -> &'a str {
+        match keyword {
+            "COMMIT" if QueryExecutor::is_plain_commit(sql) => keyword,
+            "ROLLBACK" if QueryExecutor::is_plain_rollback(sql) => keyword,
+            _ => sql,
+        }
+    }
+
     fn value_to_string(value: &MysqlValue) -> String {
         match value {
             MysqlValue::NULL => "NULL".to_string(),
@@ -189,7 +197,7 @@ impl MysqlExecutor {
             MysqlStatementKind::Dml => Ok(vec![Self::execute_dml(conn, sql)?]),
             MysqlStatementKind::Commit => {
                 let start = Instant::now();
-                conn.query_drop("COMMIT")?;
+                conn.query_drop(Self::transaction_control_sql_to_execute(sql, "COMMIT"))?;
                 Ok(vec![QueryResult {
                     sql: sql.to_string(),
                     columns: vec![],
@@ -203,7 +211,7 @@ impl MysqlExecutor {
             }
             MysqlStatementKind::Rollback => {
                 let start = Instant::now();
-                conn.query_drop("ROLLBACK")?;
+                conn.query_drop(Self::transaction_control_sql_to_execute(sql, "ROLLBACK"))?;
                 Ok(vec![QueryResult {
                     sql: sql.to_string(),
                     columns: vec![],
@@ -2080,6 +2088,25 @@ mod tests {
         assert_eq!(
             super::MysqlObjectBrowser::quoted_identifier("odd`name"),
             "`odd``name`"
+        );
+    }
+
+    #[test]
+    fn transaction_control_sql_preserves_non_plain_variants() {
+        assert_eq!(
+            MysqlExecutor::transaction_control_sql_to_execute("COMMIT", "COMMIT"),
+            "COMMIT"
+        );
+        assert_eq!(
+            MysqlExecutor::transaction_control_sql_to_execute("COMMIT AND CHAIN", "COMMIT"),
+            "COMMIT AND CHAIN"
+        );
+        assert_eq!(
+            MysqlExecutor::transaction_control_sql_to_execute(
+                "ROLLBACK TO SAVEPOINT sp1",
+                "ROLLBACK"
+            ),
+            "ROLLBACK TO SAVEPOINT sp1"
         );
     }
 

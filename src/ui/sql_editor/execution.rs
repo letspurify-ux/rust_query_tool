@@ -89,13 +89,7 @@ struct ExecutionStartupPolicy {
     requires_connected_session: bool,
 }
 
-#[derive(Clone, Copy, Default)]
-pub(super) struct MySqlSessionStateHint {
-    clears_session_state: bool,
-    may_leave_session_bound_state: bool,
-    may_hold_session_lock: bool,
-    requires_retention_when_autocommit_off: bool,
-}
+pub(super) type MySqlSessionStateHint = crate::db::TransactionStatementStateHint;
 
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
@@ -1243,15 +1237,20 @@ impl SqlEditorWidget {
         }
 
         let connection_generation = conn_guard.connection_generation();
-        if let Some((lease, prior_may_have_uncommitted_work)) = pooled_db_session
-            .take_reusable_with_state(connection_generation, crate::db::DatabaseType::Oracle)
+        if let Some((lease, prior_may_have_uncommitted_work, prior_requires_transaction_decision)) =
+            pooled_db_session.take_reusable_with_decision_state(
+                connection_generation,
+                crate::db::DatabaseType::Oracle,
+            )
         {
             let Some(conn) = lease.oracle_connection() else {
                 return (conn_guard, Err("Expected Oracle pool session".to_string()));
             };
             let mut reuse_error = None;
             if conn.ping().is_ok() {
-                let setup_result = if prior_may_have_uncommitted_work {
+                let preserve_existing_session_state =
+                    prior_may_have_uncommitted_work || prior_requires_transaction_decision;
+                let setup_result = if preserve_existing_session_state {
                     Ok(())
                 } else {
                     crate::db::DatabaseConnection::apply_oracle_session_settings(
@@ -1264,7 +1263,7 @@ impl SqlEditorWidget {
                     Ok(()) => {
                         return (
                             conn_guard,
-                            Ok(Some((conn, prior_may_have_uncommitted_work))),
+                            Ok(Some((conn, preserve_existing_session_state))),
                         )
                     }
                     Err(message) => reuse_error = Some(message),
@@ -2572,6 +2571,7 @@ impl SqlEditorWidget {
                                 "mysql lazy fetch cleanup",
                                 prior_may_have_uncommitted_work,
                                 state_hint,
+                                false,
                                 fallback_on_error,
                             );
                     }
@@ -3174,14 +3174,6 @@ impl SqlEditorWidget {
                                 );
                                 conn_guard.connection_generation()
                             };
-                            store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
-                            auto_commit = enabled;
-                            if let Some(operation_autocommit) = current_operation_autocommit {
-                                SqlEditorWidget::update_current_operation_autocommit(
-                                    operation_autocommit,
-                                    enabled,
-                                );
-                            }
                             match SqlEditorWidget::apply_mysql_autocommit_to_reusable_pooled_session(
                                 shared_connection,
                                 pooled_db_session,
@@ -3200,6 +3192,19 @@ impl SqlEditorWidget {
                                             "Auto-commit disabled"
                                         },
                                     );
+                                    #[rustfmt::skip]
+                                    store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
+                                    auto_commit = enabled;
+                                    if let Some(operation_autocommit) = current_operation_autocommit
+                                    {
+                                        SqlEditorWidget::update_current_operation_autocommit(
+                                            operation_autocommit,
+                                            enabled,
+                                        );
+                                    }
+                                    let _ =
+                                        sender.send(QueryProgress::AutoCommitChanged { enabled });
+                                    app::awake();
                                 }
                                 Err(message) => {
                                     SqlEditorWidget::emit_script_message(
@@ -3211,8 +3216,6 @@ impl SqlEditorWidget {
                                     command_error = true;
                                 }
                             }
-                            let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
-                            app::awake();
                         }
                         ToolCommand::SetDefine {
                             enabled,
@@ -3797,6 +3800,7 @@ impl SqlEditorWidget {
                                 connection_info,
                                 conn,
                                 prior_may_have_uncommitted_work,
+                                _prior_requires_transaction_decision,
                             )) => {
                                 let (heading_enabled, feedback_enabled) =
                                     SqlEditorWidget::current_output_settings(session);
@@ -5681,31 +5685,60 @@ impl SqlEditorWidget {
                                     );
                                 }
                                 ToolCommand::SetAutoCommit { enabled } => {
-                                    {
+                                    let has_dirty_transaction = oracle_prior_may_have_uncommitted_work
+                                        || conn_opt.as_ref().is_some_and(|conn| {
+                                            SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                                conn.as_ref(),
+                                                &db_activity,
+                                            )
+                                        });
+                                    if has_dirty_transaction {
+                                        SqlEditorWidget::emit_script_message(
+                                            &sender,
+                                            &session,
+                                            "SET AUTOCOMMIT",
+                                            "Error: Auto-commit cannot be changed while this session has a dirty transaction.",
+                                        );
+                                        command_error = true;
+                                    } else {
                                         let mut conn_guard = lock_connection_with_activity(
                                             &shared_connection,
                                             db_activity.clone(),
                                         );
-                                        conn_guard.set_auto_commit(enabled);
+                                        match conn_guard.set_auto_commit(enabled) {
+                                            Ok(()) => {
+                                                auto_commit = enabled;
+                                                SqlEditorWidget::update_current_operation_autocommit(
+                                                    &current_operation_autocommit,
+                                                    enabled,
+                                                );
+                                                SqlEditorWidget::emit_script_message(
+                                                    &sender,
+                                                    &session,
+                                                    "SET AUTOCOMMIT",
+                                                    if enabled {
+                                                        "Auto-commit enabled"
+                                                    } else {
+                                                        "Auto-commit disabled"
+                                                    },
+                                                );
+                                                let _ = sender
+                                                    .send(QueryProgress::AutoCommitChanged {
+                                                        enabled,
+                                                    });
+                                                app::awake();
+                                            }
+                                            Err(message) => {
+                                                SqlEditorWidget::emit_script_message(
+                                                    &sender,
+                                                    &session,
+                                                    "SET AUTOCOMMIT",
+                                                    &format!("Error: {}", message),
+                                                );
+                                                command_error = true;
+                                            }
+                                        }
                                     }
-                                    auto_commit = enabled;
-                                    SqlEditorWidget::update_current_operation_autocommit(
-                                        &current_operation_autocommit,
-                                        enabled,
-                                    );
-                                    SqlEditorWidget::emit_script_message(
-                                        &sender,
-                                        &session,
-                                        "SET AUTOCOMMIT",
-                                        if enabled {
-                                            "Auto-commit enabled"
-                                        } else {
-                                            "Auto-commit disabled"
-                                        },
-                                    );
-                                    let _ =
-                                        sender.send(QueryProgress::AutoCommitChanged { enabled });
-                                    app::awake();
                                 }
                                 ToolCommand::SetDefine {
                                     enabled,
@@ -10058,125 +10091,18 @@ impl SqlEditorWidget {
         log_context: &str,
         prior_may_have_uncommitted_work: bool,
         state_hint: MySqlSessionStateHint,
+        statement_failed: bool,
         fallback_on_error: bool,
     ) -> bool {
         let has_active_transaction =
             Self::mysql_session_may_have_uncommitted_work(conn, log_context, fallback_on_error);
-        has_active_transaction
-            || state_hint.may_hold_session_lock
-            || (prior_may_have_uncommitted_work && !state_hint.clears_session_state)
-            || (fallback_on_error && state_hint.requires_retention_when_autocommit_off)
-    }
-
-    fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
-        let cleaned = QueryExecutor::strip_leading_comments(sql);
-        let mut normalized = cleaned
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_ascii_uppercase();
-        normalized.retain(|ch| !ch.is_whitespace());
-        let value = normalized
-            .strip_prefix("SETAUTOCOMMIT=")
-            .or_else(|| normalized.strip_prefix("SETSESSIONAUTOCOMMIT="))?;
-        match value {
-            "1" | "ON" | "TRUE" => Some(true),
-            "0" | "OFF" | "FALSE" => Some(false),
-            _ => None,
-        }
-    }
-
-    fn mysql_create_statement_is_temporary(sql: &str) -> bool {
-        let cleaned = QueryExecutor::strip_leading_comments(sql);
-        let mut words = cleaned
-            .split_whitespace()
-            .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)));
-        matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("CREATE"))
-            && matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("TEMPORARY"))
-    }
-
-    fn mysql_rollback_targets_savepoint(sql: &str) -> bool {
-        let cleaned = QueryExecutor::strip_leading_comments(sql);
-        let mut words = cleaned
-            .trim()
-            .trim_end_matches(';')
-            .split_whitespace()
-            .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)));
-        matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("ROLLBACK"))
-            && matches!(words.next(), Some(word) if word.eq_ignore_ascii_case("TO"))
-    }
-
-    fn mysql_transaction_control_starts_chain(sql: &str) -> bool {
-        let cleaned = QueryExecutor::strip_leading_comments(sql);
-        let mut previous_was_and = false;
-        for word in cleaned
-            .trim()
-            .trim_end_matches(';')
-            .split_whitespace()
-            .skip(1)
-            .map(|word| word.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)))
-        {
-            if previous_was_and && word.eq_ignore_ascii_case("CHAIN") {
-                return true;
-            }
-            previous_was_and = word.eq_ignore_ascii_case("AND");
-        }
-        false
-    }
-
-    fn mysql_statement_may_leave_uncommitted_work(sql: &str) -> bool {
-        matches!(
-            QueryExecutor::leading_keyword(sql).as_deref(),
-            Some("INSERT")
-                | Some("UPDATE")
-                | Some("DELETE")
-                | Some("REPLACE")
-                | Some("WITH")
-                | Some("CALL")
-                | Some("START")
-                | Some("BEGIN")
-                | Some("SAVEPOINT")
-                | Some("XA")
+        crate::db::mysql_session_may_need_preservation_after_statement(
+            prior_may_have_uncommitted_work,
+            state_hint,
+            has_active_transaction,
+            statement_failed,
+            fallback_on_error,
         )
-    }
-
-    fn mysql_statement_acquires_table_lock(sql: &str) -> bool {
-        matches!(QueryExecutor::leading_keyword(sql).as_deref(), Some("LOCK"))
-    }
-
-    fn mysql_statement_releases_table_lock(sql: &str) -> bool {
-        matches!(
-            QueryExecutor::leading_keyword(sql).as_deref(),
-            Some("UNLOCK")
-        )
-    }
-
-    fn mysql_statement_acquires_named_lock(sql: &str) -> bool {
-        matches!(
-            QueryExecutor::leading_keyword(sql).as_deref(),
-            Some("SELECT")
-        ) && sql.to_ascii_uppercase().contains("GET_LOCK")
-    }
-
-    fn mysql_statement_releases_named_lock(sql: &str) -> bool {
-        matches!(
-            QueryExecutor::leading_keyword(sql).as_deref(),
-            Some("SELECT")
-        ) && sql.to_ascii_uppercase().contains("RELEASE_LOCK")
-    }
-
-    fn mysql_statement_releases_all_named_locks(sql: &str) -> bool {
-        matches!(
-            QueryExecutor::leading_keyword(sql).as_deref(),
-            Some("SELECT")
-        ) && sql.to_ascii_uppercase().contains("RELEASE_ALL_LOCKS")
-    }
-
-    fn mysql_select_assigns_user_variable(sql: &str) -> bool {
-        let cleaned = QueryExecutor::strip_leading_comments(sql);
-        let mut compact = cleaned.to_ascii_uppercase();
-        compact.retain(|ch| !ch.is_whitespace());
-        compact.contains("INTO@")
     }
 
     fn mysql_batch_session_state_hint_for_sql(
@@ -10189,18 +10115,18 @@ impl SqlEditorWidget {
     ) -> MySqlSessionStateHint {
         let state_hint = SqlEditorWidget::mysql_session_state_hint_for_sql(sql);
 
-        if Self::mysql_statement_releases_table_lock(sql) {
+        if crate::db::mysql_statement_releases_table_lock(sql) {
             batch_may_hold_table_lock.set(false);
-        } else if Self::mysql_statement_acquires_table_lock(sql) {
+        } else if crate::db::mysql_statement_acquires_table_lock(sql) {
             batch_may_hold_table_lock.set(true);
         }
 
-        if Self::mysql_statement_releases_all_named_locks(sql) {
+        if crate::db::mysql_statement_releases_all_named_locks(sql) {
             batch_may_hold_named_lock.set(false);
             batch_saw_uncertain_named_lock_release.set(false);
-        } else if Self::mysql_statement_acquires_named_lock(sql) {
+        } else if crate::db::mysql_statement_acquires_named_lock(sql) {
             batch_may_hold_named_lock.set(true);
-        } else if Self::mysql_statement_releases_named_lock(sql) {
+        } else if crate::db::mysql_statement_releases_named_lock(sql) {
             // A single RELEASE_LOCK() can fail or leave other named locks held.
             // Keep the existing named-lock state unless RELEASE_ALL_LOCKS() appears.
             batch_saw_uncertain_named_lock_release.set(true);
@@ -10208,11 +10134,11 @@ impl SqlEditorWidget {
 
         if QueryExecutor::is_plain_commit(sql)
             || (QueryExecutor::is_plain_rollback(sql)
-                && !SqlEditorWidget::mysql_rollback_targets_savepoint(sql))
+                && !crate::db::mysql_rollback_targets_savepoint(sql))
         {
             batch_may_have_uncommitted_work
-                .set(SqlEditorWidget::mysql_transaction_control_starts_chain(sql));
-        } else if !auto_commit && SqlEditorWidget::mysql_statement_may_leave_uncommitted_work(sql) {
+                .set(crate::db::mysql_transaction_control_starts_chain(sql));
+        } else if !auto_commit && crate::db::mysql_statement_may_leave_uncommitted_work(sql) {
             batch_may_have_uncommitted_work.set(true);
         }
 
@@ -10329,139 +10255,7 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn mysql_session_state_hint_for_sql(sql: &str) -> MySqlSessionStateHint {
-        if QueryExecutor::is_plain_commit(sql) || QueryExecutor::is_plain_rollback(sql) {
-            return MySqlSessionStateHint {
-                clears_session_state: true,
-                may_leave_session_bound_state: false,
-                may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: false,
-            };
-        }
-
-        if let Some(enabled) = Self::mysql_set_autocommit_value(sql) {
-            return MySqlSessionStateHint {
-                clears_session_state: enabled,
-                may_leave_session_bound_state: !enabled,
-                may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: false,
-            };
-        }
-
-        let leading = QueryExecutor::leading_keyword(sql);
-        match leading.as_deref() {
-            Some("COMMIT") => {
-                if Self::mysql_transaction_control_starts_chain(sql) {
-                    MySqlSessionStateHint {
-                        clears_session_state: false,
-                        may_leave_session_bound_state: true,
-                        may_hold_session_lock: false,
-                        requires_retention_when_autocommit_off: true,
-                    }
-                } else {
-                    MySqlSessionStateHint {
-                        clears_session_state: true,
-                        may_leave_session_bound_state: false,
-                        may_hold_session_lock: false,
-                        requires_retention_when_autocommit_off: false,
-                    }
-                }
-            }
-            Some("ROLLBACK") if !Self::mysql_rollback_targets_savepoint(sql) => {
-                if Self::mysql_transaction_control_starts_chain(sql) {
-                    MySqlSessionStateHint {
-                        clears_session_state: false,
-                        may_leave_session_bound_state: true,
-                        may_hold_session_lock: false,
-                        requires_retention_when_autocommit_off: true,
-                    }
-                } else {
-                    MySqlSessionStateHint {
-                        clears_session_state: true,
-                        may_leave_session_bound_state: false,
-                        may_hold_session_lock: false,
-                        requires_retention_when_autocommit_off: false,
-                    }
-                }
-            }
-            Some("START") | Some("BEGIN") | Some("SAVEPOINT") | Some("CALL") | Some("XA") => {
-                MySqlSessionStateHint {
-                    clears_session_state: false,
-                    may_leave_session_bound_state: true,
-                    may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: true,
-                }
-            }
-            Some("WITH")
-                if crate::db::query::mysql_executor::MysqlExecutor::is_select_statement(sql) =>
-            {
-                MySqlSessionStateHint::default()
-            }
-            Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE") | Some("WITH") => {
-                MySqlSessionStateHint {
-                    clears_session_state: false,
-                    may_leave_session_bound_state: true,
-                    may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: true,
-                }
-            }
-            Some("PREPARE") | Some("EXECUTE") | Some("DEALLOCATE") => MySqlSessionStateHint {
-                clears_session_state: false,
-                may_leave_session_bound_state: true,
-                may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: false,
-            },
-            Some("LOCK") => MySqlSessionStateHint {
-                clears_session_state: true,
-                may_leave_session_bound_state: true,
-                may_hold_session_lock: true,
-                requires_retention_when_autocommit_off: true,
-            },
-            Some("UNLOCK") => MySqlSessionStateHint {
-                clears_session_state: true,
-                may_leave_session_bound_state: false,
-                may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: false,
-            },
-            Some("CREATE") if Self::mysql_create_statement_is_temporary(sql) => {
-                MySqlSessionStateHint {
-                    clears_session_state: false,
-                    may_leave_session_bound_state: true,
-                    may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: false,
-                }
-            }
-            Some("CREATE") | Some("ALTER") | Some("DROP") | Some("RENAME") | Some("TRUNCATE") => {
-                MySqlSessionStateHint {
-                    clears_session_state: true,
-                    may_leave_session_bound_state: false,
-                    may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: false,
-                }
-            }
-            Some("SET") => MySqlSessionStateHint {
-                clears_session_state: false,
-                may_leave_session_bound_state: true,
-                may_hold_session_lock: false,
-                requires_retention_when_autocommit_off: false,
-            },
-            Some("SELECT") if Self::mysql_select_assigns_user_variable(sql) => {
-                MySqlSessionStateHint {
-                    clears_session_state: false,
-                    may_leave_session_bound_state: true,
-                    may_hold_session_lock: false,
-                    requires_retention_when_autocommit_off: false,
-                }
-            }
-            Some("SELECT") if sql.to_ascii_uppercase().contains("GET_LOCK") => {
-                MySqlSessionStateHint {
-                    clears_session_state: false,
-                    may_leave_session_bound_state: true,
-                    may_hold_session_lock: true,
-                    requires_retention_when_autocommit_off: true,
-                }
-            }
-            _ => MySqlSessionStateHint::default(),
-        }
+        crate::db::mysql_session_state_hint_for_sql(sql)
     }
 
     fn ddl_message(sql_upper: &str) -> String {
@@ -10879,80 +10673,93 @@ impl SqlEditorWidget {
         db_activity: &str,
         auto_commit: bool,
         session_pool_sender: Option<&mpsc::Sender<QueryProgress>>,
-    ) -> Result<(u64, ConnectionInfo, mysql::PooledConn, bool), String> {
+    ) -> Result<(u64, ConnectionInfo, mysql::PooledConn, bool, bool), String> {
         let context = {
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
             conn_guard.pool_session_context_for(crate::db::DatabaseType::MySQL)?
         };
 
-        let (mut conn, prior_may_have_uncommitted_work) = if let Some((
-            lease,
-            prior_may_have_uncommitted_work,
-        )) = pooled_db_session
-            .take_reusable_with_state(
-                context.connection_generation,
-                crate::db::DatabaseType::MySQL,
-            )
-            .and_then(|(lease, prior)| lease.into_mysql_connection().map(|conn| (conn, prior)))
-        {
-            let mut conn = lease;
-            match Self::reusable_mysql_pooled_session_is_ready(
-                &mut conn,
-                &context.connection_info.advanced,
+        let (mut conn, prior_may_have_uncommitted_work, prior_requires_transaction_decision) =
+            if let Some((
+                lease,
                 prior_may_have_uncommitted_work,
-            ) {
-                Ok(true) => (conn, prior_may_have_uncommitted_work),
-                Ok(false) => {
-                    drop(conn);
-                    let conn =
-                        Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
-                    (
-                        Self::prepare_mysql_pooled_session_or_retry_once(
-                            &context,
-                            session_pool_sender,
-                            conn,
-                        )?,
-                        false,
-                    )
-                }
-                Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
-                    crate::utils::logging::log_warning(
+                prior_requires_transaction_decision,
+            )) = pooled_db_session
+                .take_reusable_with_decision_state(
+                    context.connection_generation,
+                    crate::db::DatabaseType::MySQL,
+                )
+                .and_then(|(lease, prior, decision)| {
+                    lease
+                        .into_mysql_connection()
+                        .map(|conn| (conn, prior, decision))
+                })
+            {
+                let mut conn = lease;
+                match Self::reusable_mysql_pooled_session_is_ready(
+                    &mut conn,
+                    &context.connection_info.advanced,
+                    prior_may_have_uncommitted_work || prior_requires_transaction_decision,
+                ) {
+                    Ok(true) => (
+                        conn,
+                        prior_may_have_uncommitted_work,
+                        prior_requires_transaction_decision,
+                    ),
+                    Ok(false) => {
+                        drop(conn);
+                        let conn =
+                            Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+                        (
+                            Self::prepare_mysql_pooled_session_or_retry_once(
+                                &context,
+                                session_pool_sender,
+                                conn,
+                            )?,
+                            false,
+                            false,
+                        )
+                    }
+                    Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
+                        crate::utils::logging::log_warning(
                         "mysql pool session",
                         &format!(
                             "Discarding stale reusable MySQL pooled session and retrying with a fresh session: {message}"
                         ),
                     );
-                    drop(conn);
-                    let conn =
-                        Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
-                    (
-                        Self::prepare_mysql_pooled_session_or_retry_once(
-                            &context,
-                            session_pool_sender,
-                            conn,
-                        )?,
-                        false,
-                    )
+                        drop(conn);
+                        let conn =
+                            Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+                        (
+                            Self::prepare_mysql_pooled_session_or_retry_once(
+                                &context,
+                                session_pool_sender,
+                                conn,
+                            )?,
+                            false,
+                            false,
+                        )
+                    }
+                    Err(message) => return Err(message),
                 }
-                Err(message) => return Err(message),
-            }
-        } else {
-            let conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
-            (
-                Self::prepare_mysql_pooled_session_or_retry_once(
-                    &context,
-                    session_pool_sender,
-                    conn,
-                )?,
-                false,
-            )
-        };
+            } else {
+                let conn = Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender)?;
+                (
+                    Self::prepare_mysql_pooled_session_or_retry_once(
+                        &context,
+                        session_pool_sender,
+                        conn,
+                    )?,
+                    false,
+                    false,
+                )
+            };
         if let Err(message) = Self::apply_mysql_pooled_execution_session_settings(
             &mut conn,
             auto_commit,
             context.transaction_mode,
-            prior_may_have_uncommitted_work,
+            prior_may_have_uncommitted_work || prior_requires_transaction_decision,
         ) {
             if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
                 crate::utils::logging::log_warning(
@@ -10980,16 +10787,20 @@ impl SqlEditorWidget {
                     context.connection_info,
                     fresh_conn,
                     false,
+                    false,
                 ));
             }
 
-            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
-                Self::retain_mysql_pooled_session_if_current(
+            if (prior_may_have_uncommitted_work || prior_requires_transaction_decision)
+                && Self::mysql_error_allows_session_reuse(&message)
+            {
+                Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
                     shared_connection,
                     pooled_db_session,
                     context.connection_generation,
                     conn,
                     prior_may_have_uncommitted_work,
+                    prior_requires_transaction_decision,
                     db_activity,
                 );
             } else {
@@ -11002,6 +10813,7 @@ impl SqlEditorWidget {
             context.connection_info,
             conn,
             prior_may_have_uncommitted_work,
+            prior_requires_transaction_decision,
         ))
     }
 
@@ -11112,19 +10924,40 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_mysql_autocommit_to_reusable_pooled_session(
+    pub(super) fn apply_mysql_autocommit_to_reusable_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
         connection_generation: u64,
         enabled: bool,
         db_activity: &str,
     ) -> Result<(), String> {
-        let Some((mut conn, prior_may_have_uncommitted_work)) = pooled_db_session
-            .take_reusable_with_state(connection_generation, crate::db::DatabaseType::MySQL)
-            .and_then(|(lease, prior)| lease.into_mysql_connection().map(|conn| (conn, prior)))
+        let Some((lease, prior_may_have_uncommitted_work, prior_requires_transaction_decision)) =
+            pooled_db_session.take_reusable_with_decision_state(
+                connection_generation,
+                crate::db::DatabaseType::MySQL,
+            )
         else {
             return Ok(());
         };
+        let Some(mut conn) = lease.into_mysql_connection() else {
+            return Ok(());
+        };
+
+        if prior_may_have_uncommitted_work || prior_requires_transaction_decision {
+            Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                conn,
+                prior_may_have_uncommitted_work,
+                prior_requires_transaction_decision,
+                db_activity,
+            );
+            return Err(
+                "Auto-commit cannot be changed while this tab has a dirty transaction session."
+                    .to_string(),
+            );
+        }
 
         if let Err(err) = conn.query_drop(if enabled {
             "SET autocommit=1"
@@ -11132,15 +10965,8 @@ impl SqlEditorWidget {
             "SET autocommit=0"
         }) {
             let message = SqlEditorWidget::mysql_error_message(&err, None);
-            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
-                Self::retain_mysql_pooled_session_if_current(
-                    shared_connection,
-                    pooled_db_session,
-                    connection_generation,
-                    conn,
-                    prior_may_have_uncommitted_work,
-                    db_activity,
-                );
+            if Self::mysql_error_allows_session_reuse(&message) {
+                drop(conn);
             }
             return Err(message);
         }
@@ -11150,12 +10976,14 @@ impl SqlEditorWidget {
             may_leave_session_bound_state: !enabled,
             may_hold_session_lock: false,
             requires_retention_when_autocommit_off: false,
+            requires_transaction_decision_after_success: false,
         };
         let may_have_uncommitted_work = Self::mysql_pooled_session_may_need_preservation(
             &mut conn,
             db_activity,
             prior_may_have_uncommitted_work,
             state_hint,
+            false,
             prior_may_have_uncommitted_work,
         );
         Self::retain_mysql_pooled_session_if_current(
@@ -11167,6 +10995,60 @@ impl SqlEditorWidget {
             db_activity,
         );
         Ok(())
+    }
+
+    pub(super) fn apply_mysql_transaction_mode_to_reusable_pooled_session(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        mode: crate::db::TransactionMode,
+        db_activity: &str,
+    ) -> Result<(), String> {
+        let Some((lease, prior_may_have_uncommitted_work, prior_requires_transaction_decision)) =
+            pooled_db_session.take_reusable_with_decision_state(
+                connection_generation,
+                crate::db::DatabaseType::MySQL,
+            )
+        else {
+            return Ok(());
+        };
+        let Some(mut conn) = lease.into_mysql_connection() else {
+            return Ok(());
+        };
+
+        if prior_may_have_uncommitted_work || prior_requires_transaction_decision {
+            Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
+                shared_connection,
+                pooled_db_session,
+                connection_generation,
+                conn,
+                prior_may_have_uncommitted_work,
+                prior_requires_transaction_decision,
+                db_activity,
+            );
+            return Err(
+                "Transaction mode cannot be changed while this tab has a dirty transaction session."
+                    .to_string(),
+            );
+        }
+
+        match crate::db::DatabaseConnection::apply_mysql_transaction_mode(&mut conn, mode) {
+            Ok(()) => {
+                Self::retain_mysql_pooled_session_if_current(
+                    shared_connection,
+                    pooled_db_session,
+                    connection_generation,
+                    conn,
+                    false,
+                    db_activity,
+                );
+                Ok(())
+            }
+            Err(message) => {
+                drop(conn);
+                Err(message)
+            }
+        }
     }
 
     fn mysql_pooled_action_can_reuse_session<T>(
@@ -11353,14 +11235,19 @@ impl SqlEditorWidget {
     where
         F: FnOnce(&mut mysql::PooledConn) -> Result<T, MysqlError>,
     {
-        let (connection_generation, connection_info, mut conn, prior_may_have_uncommitted_work) =
-            Self::acquire_mysql_pooled_session(
-                shared_connection,
-                pooled_db_session,
-                log_context,
-                auto_commit,
-                session_pool_sender,
-            )?;
+        let (
+            connection_generation,
+            connection_info,
+            mut conn,
+            prior_may_have_uncommitted_work,
+            prior_requires_transaction_decision,
+        ) = Self::acquire_mysql_pooled_session(
+            shared_connection,
+            pooled_db_session,
+            log_context,
+            auto_commit,
+            session_pool_sender,
+        )?;
 
         Self::set_current_mysql_cancel_context(
             current_mysql_cancel_context,
@@ -11376,13 +11263,16 @@ impl SqlEditorWidget {
         ) {
             let message = SqlEditorWidget::mysql_error_message(&err, query_timeout);
             Self::set_current_mysql_cancel_context(current_mysql_cancel_context, None);
-            if prior_may_have_uncommitted_work && Self::mysql_error_allows_session_reuse(&message) {
-                Self::retain_mysql_pooled_session_if_current(
+            if (prior_may_have_uncommitted_work || prior_requires_transaction_decision)
+                && Self::mysql_error_allows_session_reuse(&message)
+            {
+                Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
                     conn,
                     prior_may_have_uncommitted_work,
+                    prior_requires_transaction_decision,
                     log_context,
                 );
             } else {
@@ -11415,12 +11305,13 @@ impl SqlEditorWidget {
                     refresh_encoding_after,
                 )
             {
-                Self::retain_mysql_pooled_session_if_current(
+                Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
                     conn,
                     prior_may_have_uncommitted_work,
+                    prior_requires_transaction_decision,
                     log_context,
                 );
             } else {
@@ -11458,13 +11349,22 @@ impl SqlEditorWidget {
             _ => false,
         };
         let recoverable_timeout = matches!(interrupt_kind, InterruptKind::RecoverableTimeout);
-        let requires_transaction_decision = Self::mysql_pooled_action_requires_transaction_decision(
-            was_cancelled,
-            recoverable_timeout,
-            lock_wait_timeout,
-            auto_commit,
-            state_hint,
-        );
+        let statement_failed = matches!(result, Ok(Err(_)));
+        let interruption_requires_transaction_decision =
+            Self::mysql_pooled_action_requires_transaction_decision(
+                was_cancelled,
+                recoverable_timeout,
+                lock_wait_timeout,
+                auto_commit,
+                state_hint,
+            );
+        let requires_transaction_decision =
+            crate::db::mysql_requires_transaction_decision_after_statement(
+                prior_requires_transaction_decision,
+                state_hint,
+                statement_failed,
+                interruption_requires_transaction_decision,
+            );
         let should_retain_session = if requires_transaction_decision {
             Self::sync_mysql_pooled_session_info(
                 shared_connection,
@@ -11511,6 +11411,7 @@ impl SqlEditorWidget {
                 log_context,
                 prior_may_have_uncommitted_work,
                 state_hint,
+                statement_failed,
                 fallback_on_error,
             );
             Self::retain_mysql_pooled_session_if_current_with_transaction_decision(
@@ -12887,6 +12788,19 @@ mod query_execution_cleanup_tests {
             SqlEditorWidget::mysql_session_state_hint_for_sql("ROLLBACK TO SAVEPOINT sp1");
         assert!(!rollback_to_hint.clears_session_state);
         assert!(!rollback_to_hint.may_leave_session_bound_state);
+        assert!(!rollback_to_hint.requires_transaction_decision_after_success);
+
+        let unknown_commit_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("COMMIT RELEASE");
+        assert!(!unknown_commit_hint.clears_session_state);
+        assert!(unknown_commit_hint.may_leave_session_bound_state);
+        assert!(unknown_commit_hint.requires_transaction_decision_after_success);
+
+        let invalid_autocommit_hint =
+            SqlEditorWidget::mysql_session_state_hint_for_sql("SET AUTOCOMMIT = MAYBE");
+        assert!(!invalid_autocommit_hint.clears_session_state);
+        assert!(invalid_autocommit_hint.may_leave_session_bound_state);
+        assert!(invalid_autocommit_hint.requires_transaction_decision_after_success);
     }
 
     #[test]
@@ -13059,6 +12973,46 @@ mod query_execution_cleanup_tests {
         assert!(
             SqlEditorWidget::mysql_cancelled_batch_requires_transaction_decision(
                 false, true, false, false, false, false, false, true
+            )
+        );
+    }
+
+    #[test]
+    fn mysql_transaction_policy_preserves_prior_dirty_state_after_failed_clear_statement() {
+        let ddl_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("CREATE TABLE t (id INT)");
+        assert!(ddl_hint.clears_session_state);
+
+        assert!(
+            crate::db::mysql_session_may_need_preservation_after_statement(
+                true, ddl_hint, false, true, false
+            )
+        );
+        assert!(
+            !crate::db::mysql_session_may_need_preservation_after_statement(
+                true, ddl_hint, false, false, false
+            )
+        );
+    }
+
+    #[test]
+    fn mysql_transaction_policy_resolves_prior_decision_after_successful_commit() {
+        let commit_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("COMMIT");
+        assert!(
+            !crate::db::mysql_requires_transaction_decision_after_statement(
+                true,
+                commit_hint,
+                false,
+                false
+            )
+        );
+
+        let unknown_hint = SqlEditorWidget::mysql_session_state_hint_for_sql("COMMIT RELEASE");
+        assert!(
+            crate::db::mysql_requires_transaction_decision_after_statement(
+                false,
+                unknown_hint,
+                false,
+                false
             )
         );
     }
@@ -13947,7 +13901,9 @@ mod mysql_batch_execution_regression_tests {
                 .unwrap_or(3306);
 
             let mut connection = DatabaseConnection::new();
-            connection.set_auto_commit(initial_auto_commit);
+            connection
+                .set_auto_commit(initial_auto_commit)
+                .expect("set initial MySQL/MariaDB auto-commit");
             connection
                 .connect(ConnectionInfo::new_with_type(
                     "MYSQL_TEST",
@@ -14167,7 +14123,9 @@ mod mysql_batch_execution_regression_tests {
             .unwrap_or(3306);
 
         let mut connection = DatabaseConnection::new();
-        connection.set_auto_commit(true);
+        connection
+            .set_auto_commit(true)
+            .expect("set initial MySQL/MariaDB auto-commit");
         connection
             .connect(ConnectionInfo::new_with_type(
                 "MYSQL_TEST",
@@ -14280,7 +14238,9 @@ mod mysql_batch_execution_regression_tests {
             .unwrap_or(3306);
 
         let mut connection = DatabaseConnection::new();
-        connection.set_auto_commit(true);
+        connection
+            .set_auto_commit(true)
+            .expect("set initial MySQL/MariaDB auto-commit");
         connection
             .connect(ConnectionInfo::new_with_type(
                 "MYSQL_TEST",
@@ -14860,7 +14820,9 @@ SELECT 'FINAL_STATUS' AS section_name,
             .unwrap_or(3306);
 
         let mut connection = DatabaseConnection::new();
-        connection.set_auto_commit(true);
+        connection
+            .set_auto_commit(true)
+            .expect("set initial MySQL/MariaDB auto-commit");
         connection
             .connect(ConnectionInfo::new_with_type(
                 "MYSQL_TEST",

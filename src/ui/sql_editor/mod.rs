@@ -20,8 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::db::{
-    ColumnInfo, ConnectionInfo, DbSessionLease, QueryExecutor, QueryResult, SharedConnection,
-    SharedDbSessionLease, TableColumnDetail,
+    ColumnInfo, ConnectionInfo, DatabaseType, DbSessionLease, QueryExecutor, QueryResult,
+    SharedConnection, SharedDbSessionLease, TableColumnDetail, TransactionMode,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -1367,6 +1367,47 @@ impl SqlEditorWidget {
         &self,
     ) -> Option<crate::db::PooledSessionLeaseSnapshot> {
         self.pooled_db_session.snapshot()
+    }
+
+    pub fn apply_auto_commit_to_retained_session(
+        &self,
+        connection_generation: u64,
+        db_type: DatabaseType,
+        enabled: bool,
+        db_activity: &str,
+    ) -> Result<(), String> {
+        match db_type {
+            DatabaseType::MySQL => Self::apply_mysql_autocommit_to_reusable_pooled_session(
+                &self.connection,
+                &self.pooled_db_session,
+                connection_generation,
+                enabled,
+                db_activity,
+            ),
+            DatabaseType::Oracle => Ok(()),
+        }
+    }
+
+    pub fn apply_transaction_mode_to_retained_session(
+        &self,
+        connection_generation: u64,
+        db_type: DatabaseType,
+        mode: TransactionMode,
+        db_activity: &str,
+    ) -> Result<(), String> {
+        match db_type {
+            DatabaseType::MySQL => Self::apply_mysql_transaction_mode_to_reusable_pooled_session(
+                &self.connection,
+                &self.pooled_db_session,
+                connection_generation,
+                mode,
+                db_activity,
+            ),
+            DatabaseType::Oracle => {
+                self.release_pooled_db_session();
+                Ok(())
+            }
+        }
     }
 
     fn cancel_active_lazy_fetch(&self, retain_session_on_cancel: bool) -> bool {

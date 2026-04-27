@@ -96,6 +96,8 @@ fn oracle_execution_takes_reusable_pool_session_exclusively() {
 
     assert!(
         content.contains(
+            "pooled_db_session.take_reusable_with_decision_state(\n                connection_generation,\n                crate::db::DatabaseType::Oracle,"
+        ) || content.contains(
             "pooled_db_session\n            .take_reusable_with_state(connection_generation, crate::db::DatabaseType::Oracle)"
         ),
         "Oracle execution must take the reusable lease out of the shared slot before using it"
@@ -266,6 +268,37 @@ fn mysql_database_changed_updates_object_browser_without_clearing_sessions() {
     assert!(
         !handler.contains("release_all_pooled_db_sessions"),
         "DatabaseChanged must not clear tab-owned DB sessions"
+    );
+}
+
+#[test]
+fn connection_menu_transitions_resolve_dirty_tab_sessions_first() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    let connect_start = content
+        .find("\"File/Connect\" => {")
+        .expect("File/Connect branch should exist");
+    let connect_end = content[connect_start..]
+        .find("\"File/Disconnect\" => {")
+        .map(|offset| connect_start + offset)
+        .expect("File/Disconnect branch should follow File/Connect");
+    let connect_branch = &content[connect_start..connect_end];
+    assert!(
+        connect_branch.contains("resolve_pooled_sessions_before_connection_transition(state)"),
+        "Connect must resolve dirty/decision-required tab sessions before replacing the physical connection"
+    );
+
+    let disconnect_start = connect_end;
+    let disconnect_end = content[disconnect_start..]
+        .find("\"File/Open SQL File\" => {")
+        .map(|offset| disconnect_start + offset)
+        .expect("File/Open SQL File branch should follow File/Disconnect");
+    let disconnect_branch = &content[disconnect_start..disconnect_end];
+    assert!(
+        disconnect_branch.contains("resolve_pooled_sessions_before_connection_transition(state)"),
+        "Disconnect must resolve dirty/decision-required tab sessions before dropping physical sessions"
     );
 }
 

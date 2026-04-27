@@ -27,6 +27,7 @@ use crate::db::{
     create_shared_connection, format_connection_busy_message, lock_connection_with_activity,
     try_lock_connection_with_activity, ColumnInfo, DatabaseType, ObjectBrowser, QueryResult,
     SharedConnection, TransactionAccessMode, TransactionIsolation, TransactionMode,
+    TransactionSessionState,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
@@ -1173,6 +1174,30 @@ impl AppState {
         self.transaction_access_choice.activate();
     }
 
+    fn retained_transaction_option_blocker(&self, action: &str) -> Option<String> {
+        self.editor_tabs.iter().find_map(|tab| {
+            let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
+            let state: TransactionSessionState = snapshot.transaction_state();
+            if state.allows_transaction_option_change() {
+                None
+            } else {
+                Some(format!(
+                    "Cannot change {action} while tab '{}' has a {} DB session. Commit, rollback, or discard it first.",
+                    Self::tab_display_label(tab),
+                    state.label()
+                ))
+            }
+        })
+    }
+
+    fn retained_session_editors(&self) -> Vec<SqlEditorWidget> {
+        self.editor_tabs
+            .iter()
+            .filter(|tab| tab.sql_editor.pooled_session_activity_snapshot().is_some())
+            .map(|tab| tab.sql_editor.clone())
+            .collect()
+    }
+
     fn append_result_tab_request(&mut self, request: ResultTabRequest) {
         let mut result_tabs = self.result_tabs.clone();
         let tab_index = result_tabs.tab_count();
@@ -1703,7 +1728,7 @@ fn execute_sql_request_with_session_pool_slot(
 }
 
 fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
-    let (connection, previous_mode, mode) = {
+    let (connection, previous_mode, mode, retained_editors) = {
         let s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1711,18 +1736,45 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             fltk::dialog::alert_default(&format_connection_busy_message());
             return;
         };
+        if let Some(message) = s.retained_transaction_option_blocker("transaction mode") {
+            fltk::dialog::alert_default(&message);
+            return;
+        }
         (
             s.connection.clone(),
             current_mode,
             s.selected_transaction_mode_from_controls(db_type),
+            s.retained_session_editors(),
         )
     };
 
     let (status, should_sync_controls, mode_applied) = if let Some(mut connection) =
         try_lock_connection_with_activity(&connection, "Updating transaction mode")
     {
+        let db_type = connection.db_type();
+        let connection_generation = connection.connection_generation();
         match connection.set_transaction_mode(mode) {
-            Ok(()) => (format!("Transaction mode: {}", mode.label()), true, true),
+            Ok(()) => {
+                drop(connection);
+                let mut retained_errors = Vec::new();
+                for editor in retained_editors {
+                    if let Err(err) = editor.apply_transaction_mode_to_retained_session(
+                        connection_generation,
+                        db_type,
+                        mode,
+                        "Updating transaction mode",
+                    ) {
+                        retained_errors.push(err);
+                    }
+                }
+                if let Some(err) = retained_errors.first() {
+                    fltk::dialog::alert_default(&format!(
+                        "Transaction mode was changed, but a retained clean session could not be updated and was discarded: {}",
+                        err
+                    ));
+                }
+                (format!("Transaction mode: {}", mode.label()), true, true)
+            }
             Err(err) => {
                 fltk::dialog::alert_default(&err);
                 (format!("Transaction mode unchanged: {}", err), true, false)
@@ -2642,6 +2694,10 @@ impl MainWindow {
             }
         }
         true
+    }
+
+    fn resolve_pooled_sessions_before_connection_transition(state: &Arc<Mutex<AppState>>) -> bool {
+        Self::resolve_pooled_sessions_before_exit(state)
     }
 
     pub fn new() -> Self {
@@ -5442,6 +5498,10 @@ impl MainWindow {
                     (s.popups.clone(), s.connection.clone(), pool_size)
                 };
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
+                    if !Self::resolve_pooled_sessions_before_connection_transition(state) {
+                        return true;
+                    }
+
                     let conn_sender = conn_sender.clone();
                     {
                         let mut s = state
@@ -5502,6 +5562,10 @@ impl MainWindow {
                 };
                 if let Some(message) = block_message {
                     fltk::dialog::alert_default(&message);
+                    return true;
+                }
+
+                if !Self::resolve_pooled_sessions_before_connection_transition(state) {
                     return true;
                 }
 
@@ -5945,12 +6009,69 @@ impl MainWindow {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(message) = s.retained_transaction_option_blocker("auto-commit") {
+                        fltk::dialog::alert_default(&message);
+                        if let Some(mut item) = item.take() {
+                            if enabled {
+                                item.clear();
+                            } else {
+                                item.set();
+                            }
+                        }
+                        return true;
+                    }
                     s.connection.clone()
+                };
+                let retained_editors = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.retained_session_editors()
                 };
                 if let Some(mut connection) =
                     try_lock_connection_with_activity(&connection, "Updating auto-commit setting")
                 {
-                    connection.set_auto_commit(enabled);
+                    let db_type = connection.db_type();
+                    let connection_generation = connection.connection_generation();
+                    if let Err(err) = connection.set_auto_commit(enabled) {
+                        fltk::dialog::alert_default(&err);
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let conn_info = s
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        s.status_bar
+                            .set_label(&format_status("Auto-commit unchanged", &conn_info));
+                        if let Some(mut item) = item.take() {
+                            if enabled {
+                                item.clear();
+                            } else {
+                                item.set();
+                            }
+                        }
+                        return true;
+                    }
+                    drop(connection);
+                    let mut retained_errors = Vec::new();
+                    for editor in retained_editors {
+                        if let Err(err) = editor.apply_auto_commit_to_retained_session(
+                            connection_generation,
+                            db_type,
+                            enabled,
+                            "Updating auto-commit setting",
+                        ) {
+                            retained_errors.push(err);
+                        }
+                    }
+                    if let Some(err) = retained_errors.first() {
+                        fltk::dialog::alert_default(&format!(
+                            "Auto-commit was changed, but a retained clean session could not be updated and was discarded: {}",
+                            err
+                        ));
+                    }
                 } else {
                     let busy_message = format_connection_busy_message();
                     fltk::dialog::alert_default(&busy_message);

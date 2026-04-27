@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::db::session::SessionState;
-use crate::db::transaction::{TransactionAccessMode, TransactionIsolation, TransactionMode};
+use crate::db::transaction::{
+    TransactionAccessMode, TransactionIsolation, TransactionMode, TransactionSessionState,
+};
 use crate::utils::config::{
     DEFAULT_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE,
 };
@@ -735,6 +737,15 @@ pub struct PooledSessionLeaseSnapshot {
     pub requires_transaction_decision: bool,
 }
 
+impl PooledSessionLeaseSnapshot {
+    pub fn transaction_state(self) -> TransactionSessionState {
+        TransactionSessionState::from_flags(
+            self.may_have_uncommitted_work,
+            self.requires_transaction_decision,
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct DbPoolSessionContext {
     pub connection_generation: u64,
@@ -1037,7 +1048,13 @@ pub(crate) trait DbBackend: Sync {
     ) -> Result<(DbConnection, DbConnectionPool), String>;
     fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
     fn after_connect(&self, _connection: &mut DatabaseConnection) {}
-    fn apply_auto_commit(&self, _connection: &mut DbConnection, _enabled: bool) {}
+    fn apply_auto_commit(
+        &self,
+        _connection: &mut DbConnection,
+        _enabled: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
         &DEFAULT_TRANSACTION_ISOLATIONS
     }
@@ -1299,7 +1316,7 @@ impl DbBackend for MysqlBackend {
             err.to_string()
         })?;
         DatabaseConnection::apply_mysql_session_settings(&mut conn, &info.advanced)?;
-        DatabaseConnection::apply_mysql_autocommit_setting(&mut conn, auto_commit);
+        DatabaseConnection::apply_mysql_autocommit_setting(&mut conn, auto_commit)?;
         let pool = DatabaseConnection::build_mysql_pool(info, pool_size)?;
         Ok((
             DbConnection::MySQL(conn),
@@ -1326,10 +1343,15 @@ impl DbBackend for MysqlBackend {
         }
     }
 
-    fn apply_auto_commit(&self, connection: &mut DbConnection, enabled: bool) {
+    fn apply_auto_commit(
+        &self,
+        connection: &mut DbConnection,
+        enabled: bool,
+    ) -> Result<(), String> {
         if let DbConnection::MySQL(conn) = connection {
-            DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled);
+            DatabaseConnection::apply_mysql_autocommit_setting(conn, enabled)?;
         }
+        Ok(())
     }
 
     fn supported_transaction_isolations(&self) -> &'static [TransactionIsolation] {
@@ -1823,16 +1845,18 @@ impl DatabaseConnection {
             .map_err(|err| err.to_string())
     }
 
-    fn apply_mysql_autocommit_setting<C: Queryable>(conn: &mut C, enabled: bool) {
+    fn apply_mysql_autocommit_setting<C: Queryable>(
+        conn: &mut C,
+        enabled: bool,
+    ) -> Result<(), String> {
         let statement = if enabled {
             "SET autocommit = 1"
         } else {
             "SET autocommit = 0"
         };
 
-        if let Err(err) = conn.query_drop(statement) {
-            eprintln!("Warning: failed to apply MySQL autocommit setting `{statement}`: {err}");
-        }
+        conn.query_drop(statement)
+            .map_err(|err| format!("Failed to apply MySQL autocommit setting `{statement}`: {err}"))
     }
 
     pub fn disconnect(&mut self) {
@@ -2037,12 +2061,17 @@ impl DatabaseConnection {
             && self.connection_generation == connection_generation
     }
 
-    pub fn set_auto_commit(&mut self, enabled: bool) {
-        self.auto_commit = enabled;
+    pub fn set_auto_commit(&mut self, enabled: bool) -> Result<(), String> {
+        if self.auto_commit == enabled {
+            return Ok(());
+        }
+
         let db_type = self.info.db_type;
         if let Some(connection) = self.connection.as_mut() {
-            backend_for(db_type).apply_auto_commit(connection, enabled);
+            backend_for(db_type).apply_auto_commit(connection, enabled)?;
         }
+        self.auto_commit = enabled;
+        Ok(())
     }
 
     pub fn auto_commit(&self) -> bool {
@@ -2083,7 +2112,13 @@ impl DatabaseConnection {
     }
 
     pub fn set_transaction_mode(&mut self, mode: TransactionMode) -> Result<(), String> {
-        backend_for(self.info.db_type).transaction_mode_statements(mode)?;
+        let db_type = self.info.db_type;
+        backend_for(db_type).transaction_mode_statements(mode)?;
+        if let (DatabaseType::MySQL, Some(DbConnection::MySQL(conn))) =
+            (db_type, self.connection.as_mut())
+        {
+            Self::apply_mysql_transaction_mode(conn, mode)?;
+        }
         self.transaction_mode = mode;
         Ok(())
     }
@@ -4027,7 +4062,9 @@ mod tests {
     #[ignore = "requires local MySQL or MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
     fn mysql_read_only_transaction_mode_blocks_dml() {
         let mut connection = DatabaseConnection::new();
-        connection.set_auto_commit(true);
+        connection
+            .set_auto_commit(true)
+            .expect("set initial MySQL/MariaDB auto-commit");
         connection
             .connect(mysql_test_connection_info_from_env())
             .expect("MySQL/MariaDB connection should succeed");
