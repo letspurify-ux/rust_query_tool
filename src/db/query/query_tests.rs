@@ -7051,6 +7051,22 @@ fn test_transaction_at_command_maps_to_set_autocommit_off() {
 }
 
 #[test]
+fn test_set_autocommit_accepts_sql_assignment_values() {
+    for (sql, expected) in [
+        ("SET AUTOCOMMIT = 0", false),
+        ("SET AUTOCOMMIT=1", true),
+        ("SET AUTOCOMMIT TRUE", true),
+        ("SET AUTOCOMMIT = FALSE", false),
+    ] {
+        let command = QueryExecutor::parse_tool_command(sql);
+        assert!(
+            matches!(command, Some(ToolCommand::SetAutoCommit { enabled }) if enabled == expected),
+            "{sql} should parse as SET AUTOCOMMIT {expected}, got {command:?}"
+        );
+    }
+}
+
+#[test]
 fn test_connect_tool_command_rejects_host_port_without_service_name() {
     let sql = "CONNECT user/pass@localhost:1521";
     let items = QueryExecutor::split_script_items(sql);

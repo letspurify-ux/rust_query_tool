@@ -42,6 +42,7 @@ pub(crate) struct TransactionStatementStateHint {
     pub(crate) may_hold_session_lock: bool,
     pub(crate) requires_retention_when_autocommit_off: bool,
     pub(crate) requires_transaction_decision_after_success: bool,
+    pub(crate) changes_auto_commit: bool,
 }
 
 impl TransactionSessionState {
@@ -82,10 +83,22 @@ fn mysql_hint(
         may_hold_session_lock,
         requires_retention_when_autocommit_off,
         requires_transaction_decision_after_success,
+        changes_auto_commit: false,
     }
 }
 
-pub(crate) fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
+fn mysql_autocommit_hint(enabled: bool) -> TransactionStatementStateHint {
+    TransactionStatementStateHint {
+        clears_session_state: enabled,
+        may_leave_session_bound_state: !enabled,
+        may_hold_session_lock: false,
+        requires_retention_when_autocommit_off: false,
+        requires_transaction_decision_after_success: false,
+        changes_auto_commit: true,
+    }
+}
+
+fn mysql_autocommit_assignment_value(sql: &str) -> Option<String> {
     let cleaned = QueryExecutor::strip_leading_comments(sql);
     let mut normalized = cleaned
         .trim()
@@ -93,10 +106,32 @@ pub(crate) fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
         .trim()
         .to_ascii_uppercase();
     normalized.retain(|ch| !ch.is_whitespace());
-    let value = normalized
-        .strip_prefix("SETAUTOCOMMIT=")
-        .or_else(|| normalized.strip_prefix("SETSESSIONAUTOCOMMIT="))?;
-    match value {
+    let mut assignments = normalized.strip_prefix("SET")?;
+    if assignments.starts_with("GLOBAL") || assignments.starts_with("PERSIST") {
+        return None;
+    }
+    assignments = assignments.strip_prefix("SESSION").unwrap_or(assignments);
+
+    for assignment in assignments.split(',') {
+        let Some(value) = [
+            "AUTOCOMMIT",
+            "@@AUTOCOMMIT",
+            "@@SESSION.AUTOCOMMIT",
+        ]
+        .iter()
+        .find_map(|prefix| assignment.strip_prefix(prefix))
+        .and_then(|value| value.strip_prefix('=').or_else(|| value.strip_prefix(":=")))
+        else {
+            continue;
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
+pub(crate) fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
+    let value = mysql_autocommit_assignment_value(sql)?;
+    match value.as_str() {
         "1" | "ON" | "TRUE" => Some(true),
         "0" | "OFF" | "FALSE" => Some(false),
         _ => None,
@@ -104,14 +139,7 @@ pub(crate) fn mysql_set_autocommit_value(sql: &str) -> Option<bool> {
 }
 
 fn mysql_is_autocommit_assignment(sql: &str) -> bool {
-    let cleaned = QueryExecutor::strip_leading_comments(sql);
-    let mut normalized = cleaned
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .to_ascii_uppercase();
-    normalized.retain(|ch| !ch.is_whitespace());
-    normalized.starts_with("SETAUTOCOMMIT=") || normalized.starts_with("SETSESSIONAUTOCOMMIT=")
+    mysql_autocommit_assignment_value(sql).is_some()
 }
 
 pub(crate) fn mysql_create_statement_is_temporary(sql: &str) -> bool {
@@ -161,6 +189,7 @@ pub(crate) fn mysql_statement_may_leave_uncommitted_work(sql: &str) -> bool {
             | Some("REPLACE")
             | Some("WITH")
             | Some("CALL")
+            | Some("LOAD")
             | Some("START")
             | Some("BEGIN")
             | Some("SAVEPOINT")
@@ -213,11 +242,14 @@ pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatemen
     }
 
     if let Some(enabled) = mysql_set_autocommit_value(sql) {
-        return mysql_hint(enabled, !enabled, false, false, false);
+        return mysql_autocommit_hint(enabled);
     }
 
     if mysql_is_autocommit_assignment(sql) {
-        return mysql_hint(false, true, false, true, true);
+        return TransactionStatementStateHint {
+            changes_auto_commit: true,
+            ..mysql_hint(false, true, false, true, true)
+        };
     }
 
     let leading = QueryExecutor::leading_keyword(sql);
@@ -249,6 +281,7 @@ pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatemen
         Some("INSERT") | Some("UPDATE") | Some("DELETE") | Some("REPLACE") | Some("WITH") => {
             mysql_hint(false, true, false, true, false)
         }
+        Some("LOAD") => mysql_hint(false, true, false, true, false),
         Some("PREPARE") | Some("EXECUTE") | Some("DEALLOCATE") => {
             mysql_hint(false, true, false, false, false)
         }

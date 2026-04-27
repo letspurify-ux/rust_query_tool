@@ -10690,9 +10690,19 @@ impl QueryExecutor {
     }
 
     fn parse_autocommit_command(raw: &str) -> ToolCommand {
-        Self::parse_set_on_off_command(raw, "SET AUTOCOMMIT", |enabled| {
-            ToolCommand::SetAutoCommit { enabled }
-        })
+        let rest = raw.get("SET AUTOCOMMIT".len()..).unwrap_or_default().trim();
+        let value = rest.strip_prefix('=').unwrap_or(rest).trim();
+        let mode = value.split_whitespace().next().unwrap_or_default();
+
+        match mode.to_ascii_uppercase().as_str() {
+            "ON" | "1" | "TRUE" => ToolCommand::SetAutoCommit { enabled: true },
+            "OFF" | "0" | "FALSE" => ToolCommand::SetAutoCommit { enabled: false },
+            _ => ToolCommand::Unsupported {
+                raw: raw.to_string(),
+                message: "SET AUTOCOMMIT supports ON, OFF, 1, 0, TRUE, or FALSE.".to_string(),
+                is_error: true,
+            },
+        }
     }
 
     fn parse_define_command(raw: &str) -> ToolCommand {
